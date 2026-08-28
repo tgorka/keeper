@@ -3475,194 +3475,1374 @@ status: open
 - source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
   summary: `tests/hooks_never_run.rs` fails on any host whose git configuration sets `core.hooksPath`, which makes every repo-local `.git/hooks/*` inert.
   evidence: Pre-existing and unrelated to this story — it exercises `GitCli::push` and git hook behaviour, and touches nothing story 56.1 changed. Its own sanity assertion (`hooks_never_run.rs:87`) requires a planted `.git/hooks/pre-push` to block a plain `git push`, which cannot happen when `core.hooksPath` points elsewhere. Verified: `git config --show-origin --get-all core.hooksPath` reports `file:/home/dev/.gitconfig  /home/dev/.config/git/hooks`, and the test passes under `GIT_CONFIG_GLOBAL=/dev/null cargo test -p keeper-sync --test hooks_never_run`. The fix is for the test to plant its hook and force `-c core.hooksPath=.git/hooks` on the sanity push, so the fixture proves what it claims regardless of the developer's own git config.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    The fixture now sets a REPOSITORY-LOCAL `core.hooksPath` pointing at the fixture
+    repository's own `.git/hooks`, immediately after `git init`. A repo-local value outranks
+    the global one in git's config precedence, so the planted `pre-push` fires; keeper's own
+    `-c core.hooksPath=<sentinel>` on the command line outranks the repo-local one in turn,
+    so the assertion under test is if anything STRENGTHENED — the repository now genuinely
+    intends its hooks to run, and keeper still ignores them.
+
+    Chosen over neutralising the ambient config because the fixture drives git through a
+    plain `Command::new("git")` helper with no env control AND through `GitCli`, which
+    spawns its own process the test cannot env-wrap; an env-based fix would have had to
+    reach two different spawn sites. No assertion was weakened and the sanity check is
+    untouched.
+
+    Verified on this host by replaying the fixture by hand (git 2.53.0, ambient
+    `core.hooksPath = /home/dev/.config/git/hooks`): - negative control, without the fix:
+    the planted `pre-push` is inert and `git push origin refs/heads/main:refs/heads/main`
+    SUCCEEDS — i.e. the sanity assertion would have failed, which is this entry's claim
+    reproduced; - with the fix: the plain push is blocked (`error: failed to push some
+    refs`, exit 1) and keeper's `-c core.hooksPath=/dev/null` push succeeds and lands the
+    remote ref.
 
 - source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
   summary: No production path constructs a `VirtualPolicy`, so FR-329's "a malformed pattern refuses at startup" is not yet reachable by any user.
   evidence: This is 56.1's declared non-goal — 56.2 is the consumer in the epic's strict 56.1 → 56.2 chain — but FR-329 is listed as a requirement 56.1 must satisfy, and it is satisfied only in the sense that `compile` refuses when called. The sibling refusals are reachable (`ExcludeSet::new` at `engine.rs:6111` and `stability.rs:252`, `LfsPolicy::from_profile` at `lfs/stage.rs:1193`), and `SyncProfile::validate` deliberately validates no glob field, so it is not the gate either. 56.2's review must confirm its consumer compiles the policy before any materialization decision, or the refusal machinery ships unreachable.
-  status: open
+  status: stale 2026-08-28
+  resolution: |
+    No longer true, and has not been since story 56.2. `VirtualPolicy::compile` is called
+    from five production sites in `engine.rs`, each of which propagates its
+    `SyncError::Config` unchanged: the arrival/materialize leg (`:6066`), the second arrival
+    path (`:6205`), `Engine::verify` (`:8641`, whose own test
+    `a_malformed_policy_makes_verify_refuse_before_the_walk` asserts the refusal reaches the
+    caller rather than being read as a permissive pass), `Engine::release_schedules`
+    (`:9243`) and `release_mode_gate` (`:9756`, prefaced "FR-329: a policy keeper cannot
+    read is not a policy, and for a verb that deletes the direction is not a choice").
+
+    And as of story 56.14 the refusal is reachable strictly EARLIER than "at startup":
+    `SyncProfile::validate` now calls `lfs::virtual_policy::check_patterns`, and `validate`
+    runs on every profile write and every profile load — so a malformed pattern is refused
+    at the form field or at the config file, before any engine leg is reached. FR-329 is
+    satisfied at four layers, not one.
 
 - source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
   summary: A host cannot decline the repository's virtualization policy: an empty `virtualPatterns` is silence, so a machine can replace the committed list but never withdraw from it.
   evidence: `VirtualPolicy::compile` treats a profile list that says nothing as "this tier is silent", which is the right reading of an unset key and the wrong one for a key deliberately set to `[]`. The operator case that arises is a laptop that is often offline and wants everything materialized; today the only spellings are a pattern that matches nothing or a negation-only list, both accidental. Distinguishing key-absent from key-empty needs the `Option<Vec<String>>` shape on the profile field, which is entangled with the `SyncProfileReq` `Option` rule (DW-116) that 56.1 declared a non-goal. Settle it in the story that renders the control (56.7/56.9), together with the tier surface AD-132 asks for.
   status: open
+  keep: |
+    Reviewed and kept, and story 56.14 makes it slightly SHARPER rather than moot. This
+    entry noted that the only spellings of "this machine withdraws from the committed
+    policy" are a pattern that matches nothing or a negation-only list, both accidental —
+    and story 56.14 removed the second one deliberately: a `!`-only list no longer overrides
+    at all, because the override is now decided on the permissive half alone. So there is
+    one fewer accidental way to do it, and still no deliberate one.
+
+    The reading itself is right and must not change: an unset key is silence, and treating
+    `[]` as "withdraw" would make every profile that has never touched the field mean
+    something. Telling key-absent from key-empty needs `Option<Vec<String>>` on
+    `SyncProfile::virtual_patterns`, which is a profile-schema change that also has to reach
+    `SyncProfileVm` and `SyncProfileReq` — both defined in `keeper/src/sync_ipc.rs`, the
+    shell crate, which cannot be compiled on this host — plus `keeper-syncd`'s `[[profile]]`
+    table and every construction site. The request slot in the shell crate is ALREADY
+    `Option<Vec<String>>` for a different reason (`None` leaves the row untouched,
+    `Some(vec![])` is an expressed silence), so the wire half of the distinction exists and
+    the stored half does not.
+
+    It becomes worth doing when the operator case is real: a machine that is often offline
+    and wants everything materialized despite a committed permissive list. Today that
+    machine can say it with `lfsMode = materialize` and no policy, which is the supported
+    spelling, so the missing one is a convenience rather than a gap. If it lands, the honest
+    shape is `Option<Vec<String>>` end to end plus a documented meaning for `[]`, not a
+    sentinel pattern.
 
 - source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
   summary: `.keepervirtual` and the virtualization keys have no user-facing documentation; only `keeper-syncd`'s annotated `[[profile]]` template describes them.
   evidence: The daemon template gained both keys in this story, because the daemon accepts them the moment `SyncProfile` carries them and an operator setting a byte-affecting policy blind is the same failure one step earlier than the typo the module hard-refuses. The committed file is the artifact a whole team meets, and it is documented nowhere. Epic 56 assigns the chapter to story 56.8 (`docs/sync.md` grows a virtual-files section, last of all), which is where it belongs — recorded here so the file name, the `!` protection rule and the union-across-tiers behaviour are not left to be rediscovered from the source.
-  status: open
+  status: stale 2026-08-28 (story 56.14)
+  resolution: |
+    No longer true. Story 56.8 wrote the chapter this entry says does not exist, which is
+    exactly where this entry predicted it would land ("Epic 56 assigns the chapter to story
+    56.8"). `docs/sync.md` §9 "How a path becomes virtual" opens: "The policy lives in
+    **`.keepervirtual`** at the repository root, committed like any other file and read from
+    the **worktree**, never from `HEAD`" — and then documents the whole gitignore dialect
+    (basename, leading `/`, trailing `/`, `!` protections, `\!`/`\#` escapes), the
+    protection-wins-unconditionally departure, the wholesale-replacement rule for a
+    higher-tier positive list, the never-virtual control files, `virtualOverBytes` as an
+    inclusive size floor defaulting to `0`, the four-tier precedence chain
+    (`.keepervirtual` < stored profile row < `<folder>/.keeper/keeper.toml` <
+    `<folder>/.keeper/keeper.<host>.toml`), and the quoted-pattern refusal with its source
+    name. Story 56.12 then made all three keys typeable in the app — see the entry below
+    about `virtualPatterns`/`virtualOverBytes`/`releaseTtlMs` having no UI, also stale — so
+    the keys are documented AND reachable, and the daemon template is no longer the only
+    artifact that describes them.
 
 - source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
   summary: The shared gitignore dialect has no spelling for "root-anchored, single segment" outside the virtualization lists.
   evidence: `exclude::anchor` applies the basename rule to any pattern without a `/`, so `excludes = ["notes.md"]` and `lfsNever = ["notes.md"]` mean "at any depth" with no way to say "the root's own". Story 56.1 resolved this for its own lists by handling gitignore's leading `/` in `virtual_policy::anchor_line`, and deliberately did not change the two older fields, whose current meaning is depended upon. Teaching `add_pattern` the leading slash would make all three consistent; it is a behaviour change to two shipped config keys and needs its own story.
   status: open
+  keep: |
+    Reviewed and kept. `virtual_policy::anchor_line` resolves gitignore's leading `/` and
+    trailing `/` for the two virtualization lists; `exclude::anchor` deliberately does not,
+    and its current meaning is depended upon by every stored `excludes` and every stored
+    `lfsNever` list in every profile that exists. Teaching `add_pattern` the leading slash
+    would change what those lists MEAN — `excludes = ["/notes.md"]` would stop matching
+    `a/b/notes.md` — on the next load, with nothing on screen.
+
+    It becomes worth doing behind a migration: either a profile-schema version that marks a
+    list as written in the newer dialect, or a one-time rewrite that re-spells existing
+    patterns so their meaning is preserved. Both are decisions about stored user data rather
+    than edits, which is why this stays a `keep` and not a `stale`.
 
 - source_spec: spec-56-2-a-listing-that-knows-what-it-does-not-hold
   summary: A present `remote` key in a listing (or in `verify --json`) does not always mean the server was asked — `audit_remote_objects` returns a fully-formed intact audit with no round trip for `lfsMode = disabled` and for a filesystem remote with no `.lfsconfig`.
   evidence: `Engine::audit_remote_objects` short-circuits to `RemoteAudit::default()` on `LfsMode::Disabled` and returns `missing: []` without contacting anything when the remote is a local store, both by design (`engine.rs`, the two early returns before the batch client is built). The absent-vs-present contract story 56.2 built for `ls-files --remote` therefore holds for the *key* but not for the *answer*: a monitoring wrapper reading `listings[].remote.missing == []` as "every object is on the server" gets a false green for exactly the profiles whose objects were never uploaded. Pre-existing and shared with `verify --remote`, which has carried the same shape since DW-140; fixing it means the audit saying which of the three ways it answered, which is a change to a shipped JSON document and needs its own story.
   status: open
+  keep: |
+    Reviewed and kept, and the prose half is now fixed. Both short-circuits are correct:
+    there is no batch API to ask on a filesystem remote, and none on a folder with LFS
+    disabled. What was wrong was only what a reader could conclude, and `docs/sync.md` §13
+    now says it in these words (story 56.14's surface column): "`remote.missing == []` means
+    *nothing keeper could ask reported this object missing* — not *the server confirmed
+    every object*."
+
+    Worth recording, because it was checked while resolving this: `checked` is NOT a
+    discriminator a monitoring wrapper can use instead. The filesystem short-circuit counts
+    every tracked path into `checked` before returning, so only the `Disabled` and no-
+    pointers cases report `0`. The doc states that too.
+
+    A wire discriminator — a field saying whether a server was contacted — becomes worth
+    adding at the next deliberate `--json` version bump, alongside the `size`/`sizeBytes`
+    decision below. Adding one now is a published-contract addition for a claim prose
+    already makes correctly, and the same bump can carry both.
 
 - source_spec: spec-56-2-a-listing-that-knows-what-it-does-not-hold
   summary: `ls-files` is keyed by the index, so a path that was materialized and then removed from the index produces no row at all — not even `absent` — although the ledger still remembers it and the store may still hold the object.
   evidence: `lfs::listing::collect` iterates `stage::indexed_pointers`' answer and joins the `materialized` ledger into it, which is the right key for "which of this checkout's LFS paths do I hold" and the wrong one for "what is this clone still holding". A committed deletion or a sparse-cone change drops the row while `prune`'s candidate set and 56.5's release sweep both read the ledger, so the listing an operator would reach for to audit that sweep cannot show the same set of rows. Deliberate for this story — the module doc frames the verb as index-keyed — and worth settling in 56.5, where the sweep's own reporting makes the second key necessary.
   status: open
+  keep: |
+    Reviewed and kept. The index is the right key for the question this verb asks — "which
+    of this checkout's LFS paths do I hold" — and story 56.14 does not change that. It does
+    change the premise slightly in the entry's favour: since a release now retains the
+    `materialized` row with a `released_at_ms` stamp, the ledger remembers strictly more
+    than it used to, so the gap between what the ledger knows and what the listing can show
+    is wider, not narrower.
+
+    It is still not a filter change. Answering "what is this clone still holding" needs a
+    second, ledger-keyed document with its own state vocabulary, because a released row is
+    none of `virtual`, `materialized` or `absent` — it is "this machine held this and let it
+    go, at this instant" — and `docs/sync.md` §13 calls the `--json` field names the
+    contract, so inventing a fourth state on the existing document is a published-contract
+    change. It becomes worth doing when an operator has a concrete audit they cannot
+    perform, at which point the shape is a new verb rather than a widened one.
 
 - source_spec: spec-56-3-a-file-you-can-ask-for
   summary: `Engine::reserve` is an in-process map, so `keeper-syncd materialize` does not exclude a running `keeper-syncd watch` — and every one-shot CLI invocation runs `db::recover_running`, which flips the live daemon's in-flight rows back to `pending`.
   evidence: `reserve` (engine.rs) is a `Mutex<HashMap>` on the `Engine` instance and `Engine::open` calls `recover_running` unconditionally, so two processes over one `sync.db` and one index have no mutual exclusion: `with_db` is a mutex rather than a transaction, so `enqueue_unique`'s SELECT-then-INSERT can race the daemon's identical call, and `git::repo::refresh_index_stat` can write an index the daemon read a moment earlier. Pre-existing for every one-shot verb (`sync --once`, `verify`, `rescan`, `ls-files`), and the reason it is recorded here rather than fixed here is that the fix is a cross-process lock plus a `BEGIN IMMEDIATE` around the enqueue triple — a change to the whole CLI surface, not to one verb. Story 56.3 is nonetheless the first verb *designed* to be run beside a running daemon, and it states the honest limit on `Engine::materialize_entry` instead of claiming the exclusion it does not have. Asking for five files in a row resets the daemon's in-flight transfers five times.
   status: open
+  keep: |
+    Reviewed and kept. This is a design change rather than a repair, and the entry already
+    lists the pieces: `with_db` is a mutex where cross-process exclusion needs a
+    transaction, `enqueue_unique`'s SELECT-then-INSERT would have to become atomic,
+    `git::repo::refresh_index_stat` would need to stop writing an index another process may
+    have read, and `db::recover_running` would have to stop running unconditionally at every
+    one-shot `Engine::open` — which is the sharpest of the four, because a one-shot CLI
+    currently flips a live daemon's in-flight rows back to `pending`.
+
+    It becomes worth doing when running the daemon and a one-shot verb over one folder at
+    once is a SUPPORTED configuration rather than a documented misuse. Until then the honest
+    fix is narrower than this entry and belongs to it: an advisory lock file under the data
+    directory that a one-shot verb takes before `recover_running`, which would end the row-
+    stealing half without pretending to solve mutual exclusion over the index.
 
 - source_spec: spec-56-3-a-file-you-can-ask-for
   summary: `lfs::stage::worktree_pointer` folds a read failure into `None`, so an unreadable pointer file is reported to the user as a local modification they must undo.
   evidence: `worktree_pointer` ends `File::open(...).ok()?` (added by 56.2), so a permission error, an ACL or an immutable flag is indistinguishable from "these bytes are not pointer text". `lfs::hydrate::plan` then decides on length alone and answers `ContentRefusal::LocallyModified` — "does not hold the pointer this folder committed" — for a file that does hold it, and `AlreadyHeld` for an unreadable file whose length happens to equal the pointer's size. `plan`'s doc covers a failing `stat`, not a failing read. The honest fix changes `worktree_pointer` to a `Result` and gives the refusal an `Unreadable { path, reason }` variant, which touches the `browse` listing that shares the helper — the reason it is not done inside a story whose surface is the verb.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    Split into two functions. `lfs::stage::read_worktree_pointer` returns
+    `std::io::Result<Option<Pointer>>` and keeps the failure; `worktree_pointer` is now
+    `read_worktree_pointer(..).unwrap_or(None)` with its doc stating exactly what it folds
+    and pointing at the fallible twin. The fold stays for the marker callers — a listing's
+    state column, a footprint count, a browse mark — because each of them is choosing
+    between "shows as virtual" and "shows as materialized" for a file it cannot read either
+    way, and neither answer asserts anything about its bytes.
+
+    `lfs::hydrate::plan` calls the fallible one, and its error type changed from
+    `ContentRefusal` to `SyncError`: an unreachable file earns `SyncError::io` naming the
+    operation and the path, not a refusal. A refusal is a STATEMENT about the file, and
+    `LocallyModified` — *"does not hold the pointer this folder committed, so keeper will
+    not overwrite what is there"* — told a person their file has a modification to undo,
+    about a file with no modification at all, while the remedy it implies (overwrite it) is
+    the one thing they must not do. The failing `stat` arm, which had the same fold, was
+    fixed with it. `SyncError::io` is transient by construction, so a retry after the
+    permission is fixed succeeds. Absence is still `ContentRefusal::Missing` — that is a
+    fact about the file, and a decided one.
+
+    No new `ContentRefusal` variant, deliberately: the vocabulary is rendered verbatim to
+    users by two crates and one of them cannot be compiled on this host.
+
+    Test: `lfs::hydrate::tests::a_pointer_file_that_cannot_be_read_is_an_error_and_not_a_mod
+    ification`, `cfg(unix)`, mode `0o000` over a file holding the committed pointer exactly,
+    skipping when running as root rather than asserting a falsehood. It asserts the error is
+    NOT a `SyncError::Refused` and that it names the file. Without the fix it is
+    `ContentRefusal::LocallyModified`. The file's other `plan` tests were rewrapped through
+    a `refusal(..)` helper that unwraps `SyncError::Refused` and panics on any other error,
+    so each of those cases is still asserted to be a DECIDED fact.
 
 - source_spec: spec-56-3-a-file-you-can-ask-for
   summary: "keeper does not overwrite a local modification" is enforced when the decision is made and not re-checked immediately before `rename(2)`, so an editor save landing in that millisecond window is destroyed.
   evidence: `lfs::hydrate::plan` reads the worktree, and `lfs::stage::materialize` then re-checks only `store.contains` before its `.keeper.<name>.tmp` + `rename`. Nothing re-verifies that the target still holds the committed pointer. `Engine::materialize_landed` has had the identical shape since story 34.x, so the window is not new — what is new is that a *user* triggers it, and the user is the person most likely to be saving that file. Closing it means re-stating the target inside `stage::materialize` (a shared function both the request and the arrival path use) and deciding what a mismatch there costs a background arrival, which is a change to the publish primitive rather than to this verb.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `lfs::stage::materialize` now re-states the decision against the file as it is one
+    instant before `rename(2)`: it re-stats the target, re-reads it through the new
+    `read_worktree_pointer`, and refuses `SyncError::Integrity` — *expected the committed
+    pointer for <oid>, actual something else, written since keeper decided to publish here*
+    — if the target no longer holds that pointer. It also removes the staging file on any
+    failure, which it never did (`files_write::write_unmanaged`'s precedent, and the one
+    `dehydrate` already followed).
+
+    Re-stating the invariant rather than comparing a `FileSample`, deliberately. What all
+    three callers establish is "this path holds the pointer for THIS object" —
+    `hydrate::plan`'s Publish arm for the request door, `pending_smudges` for both sweeps —
+    so that is the sentence to re-read, and it is strictly stronger than an mtime/inode
+    sample: a same-length pointer-text rewrite that preserved the mtime fails it. The cost
+    is one `lstat` plus a bounded ~130-byte read against a copy of the whole object.
+
+    Tests: `lfs::stage::tests::a_target_that_no_longer_holds_the_committed_pointer_is_never_
+    published_over` (plain content of the pointer text's own length at the target: without
+    the fix `materialize` renames the object over it and the user's file is gone) and
+    `a_target_deleted_since_the_decision_is_not_recreated_by_the_publish` (without the fix
+    the rename creates the file, undoing the user's deletion). Both also assert no
+    `.keeper.*` staging file is left anywhere in the folder, through a `keeper_temp_files`
+    helper that lists the directory rather than probing one literal name — `staging_path`
+    may append a digest, so a literal check would pass while a truncated staging file was
+    left behind.
 
 - source_spec: spec-56-3-a-file-you-can-ask-for
   summary: An `alreadyMaterialized` answer writes no `materialized` ledger row, so a path a human explicitly asked for can be invisible to 56.5's release clocks.
   evidence: `Engine::materialize_entry`'s already-held arm returns before `db::remember_materialized`, deliberately — `at_ms` is the *materialization* clock and nothing was materialized — so a path materialized by `git lfs pull`, by a pre-ledger keeper, or by the documented same-length tie has no row. It is safe in the conservative direction (no row means the sweep has no candidate to release) and it is the wrong shape for FR-334's last-use fact, which 56.5 owns: the sweep's key is the question of whether the ledger or the worktree decides what "this clone holds" means. Settle it with the second key already recorded for `ls-files` (DW, story 56.2).
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `Engine::materialize_held`'s already-held arm now calls the new
+    `db::observe_materialized(conn, profile_id, path, now)` before it returns, best-effort
+    with a `warn!` — the content is here whatever SQLite says, and refusing a request that
+    has already succeeded because a memo failed would be the worse answer.
+
+    `observe_materialized` rather than `remember_materialized`, because this arm does not
+    know when the content landed and must not claim it landed now. Its insert sets `at_ms`
+    to now — the earliest instant this clone can honestly prove the content was here — and
+    its conflict arm leaves `at_ms` alone, so an existing row's landing clock is never moved
+    forward by a read. What both arms record is the USE, which is exactly what this call
+    means: somebody asked for the path. It also clears `released_at_ms`, because looking at
+    the file is how we found out the content is here.
+
+    `local_origin` is left `NULL` — *arrived from the remote* — which is the honest default
+    and the safe one: it selects the `last_used_ms` clock this call has just set to now, and
+    nothing is ever deleted on a clock alone, since `Engine::release_resolved` takes a fresh
+    remote proof at the moment of deletion. A path this clone actually authored is corrected
+    by `note_local_authorship`'s upsert the next time its commit runs.
+
+    Tests: `tests/materialize_entry.rs >
+    the_already_held_answer_records_the_use_without_restarting_the_arrival_clock`, which
+    drives the arm as the FIRST thing that could ever write a row (the worktree holds non-
+    pointer bytes of exactly the pointer's size — `hydrate::plan`'s documented same-length
+    tie, and the shape a `git lfs pull` leaves), so the assertion cannot pass on the publish
+    arm's row; it then advances `TestPlatform`'s clock by 60 s and asserts `at_ms` did not
+    move while `last_used_ms` did. Without the fix the first ledger read finds nothing. Plus
+    `db::tests::observing_content_records_the_use_and_never_moves_the_landing_clock`.
 
 - source_spec: spec-56-3-a-file-you-can-ask-for
   summary: A subpath containing a backslash is looked up under a normalized name but checked and probed under the literal one, so the verb can answer about a different file than the caller named.
   evidence: `lfs::stage::index_key` replaces `\` with `/` (correct on Windows, where it is a separator; on Linux and macOS it is an ordinary filename character), so `indexed_pointer(repo, "40-media\\clip.mp4")` returns the pointer committed for `40-media/clip.mp4`, while `SparseCone::includes` and `hydrate::plan` use the literal name and answer about a path that does not exist. The result is a refusal sentence naming the wrong file, or an oid and size belonging to a path the user did not ask for — never a write, because `plan`'s `stat` fails. Pre-existing in `index_key` and shared with 56.2's listing; the fix is either to refuse a segment containing the platform's other separator or to carry `index_key`'s normalized path through every consumer, which is a change to the crate's path frame.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `lfs::stage::index_key`'s `\` to `/` translation is now `#[cfg(windows)]`, with a
+    `#[cfg(not(windows))]` arm that returns the path as spelled. On Windows `\` is a path
+    separator and the translation is right; on Linux and macOS it is an ordinary filename
+    character, and translating it unconditionally made every verb taking a subpath look up a
+    DIFFERENT file than the caller named while `SparseCone::includes`, `hydrate::plan` and
+    every `std::fs` call beside them used the literal name.
+
+    Test:
+    `lfs::stage::tests::a_backslash_in_a_name_is_an_ordinary_character_and_keys_as_itself`,
+    `cfg(not(windows))`. It first asserts that `Path::new("40-media\clip.mp4")` really is
+    ONE component on this platform — so the premise cannot rot — then that `index_key` of it
+    is itself, and that a genuine `/` path still keys through untouched. Without the fix it
+    reads `40-media/clip.mp4`, which is a different file or no file at all, so a refusal
+    could name the wrong file and an oid and size could belong to a path the user never
+    asked about.
 
 - source_spec: spec-56-3-a-file-you-can-ask-for
   summary: An inline publish does not retire a pending `LfsDownload` row for the same object, so the daemon can later fetch bytes that are already on disk.
   evidence: `Engine::materialize_entry` publishes inline when `store.contains` is true and leaves any covering journal row alone; `materialize_pending` has always done the same. On a metered or slow link that is exactly the transfer the verb exists to avoid, in the case where the object arrived by another route (a pendrive copy, another profile sharing the store, a manual `git lfs pull`). Not fixed here because "the object is present, so this unit is satisfied" is a claim about the *store*, and the place that owns it is the transfer's own precondition rather than one verb — `do_lfs` could check the store before the batch request and complete the unit, which would benefit every caller and needs its own regression fixture.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    Fixed by retiring the WORK rather than the row. `Engine::do_lfs` now short-circuits a
+    DOWNLOAD when `store.contains(oid, size)`: it skips the `.lfsconfig` read, the endpoint
+    resolution and the whole transfer leg, and calls `materialize_landed` directly.
+
+    This entry's own reasoning is what chose the site: "the object is present, so this unit
+    is satisfied" is a claim about the STORE, and `do_lfs` is the one function that reads
+    the store on the transfer's behalf. Fixing it there covers every route the row can
+    arrive by, not just the inline publish — a pendrive copy, a second profile sharing the
+    store, a manual `git lfs pull` — and it is strictly better than deleting the row, which
+    would strand the object's OTHER paths: one download covers every path sharing an oid,
+    because `enqueue_unique` deduplicates on the payload, and `materialize_landed` is what
+    publishes them. Downloads only; an upload's job is to put the object on the SERVER,
+    which the local store says nothing about.
+
+    Test: `tests/materialize_entry.rs >
+    a_queued_download_the_store_already_holds_costs_no_transfer`. The object of the queued
+    path exists in the LOCAL store and in no remote store anywhere, so a real download of it
+    necessarily FAILS — `lfs::local::transfer` errs, the drain reschedules, the row survives
+    with a backoff and the worktree keeps its pointer text. Real bytes on disk PLUS a
+    retired row is therefore reachable only through the new gate. The drain is driven by a
+    request for a DIFFERENT path whose object really is only upstream, because a request for
+    the held path could never reach `do_lfs` at all (`materialize_held` publishes it
+    inline). What it does not prove, and says so: nothing about the HTTP batch path, since
+    this fixture's remote is a filesystem store — the gate precedes the `.lfsconfig` read
+    and is common to both.
 
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: A release deletes the `materialized` row outright, so `last_used_ms` and `synced_at_ms` are discarded at the exact moment the columns were designed to still answer.
   evidence: `db.rs`'s own doc says `oid`/`size_bytes` exist "so a row still answers after the worktree stops holding a pointer to consult", and the five late columns are described as "facts the ledger has to hold before anything can decide what to release" — but `forget_materialized` is a `DELETE`. The pin is protected (the refusal is upstream and the statement now carries `AND COALESCE(pinned, 0) = 0`), so nothing the owner asked for is lost today; what goes is the recency history 56.5's TTL sweep would use to choose what to release next, and the "content last landed here" fact a row can still answer. The right shape is a released marker (or a null `at_ms`) that retracts presence without erasing history, plus teaching `db::materialized_paths` to skip released rows — which is a schema decision that belongs with 56.5's own clock columns rather than ahead of them.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    The row is retained and stamped instead. `materialized` grew a nullable `released_at_ms`
+    (`db::ensure_materialized_columns`), `db::forget_materialized` became `UPDATE
+    materialized SET released_at_ms = ?3` with the same `AND COALESCE(pinned, 0) = 0` guard,
+    and both present-tense readers — `db::materialized_paths` and `db::materialized_rows` —
+    now carry `AND released_at_ms IS NULL`. `remember_materialized` and the new
+    `observe_materialized` clear the stamp when content lands again; `note_use`'s bare
+    UPDATE goes on recording a read of a released path, which is honest and is the fact a
+    later re-materialization wants.
+
+    Both halves of the original argument are satisfied. The `DELETE` existed because a
+    retained row is a false statement that would mislead `materialized_paths` —
+    `Engine::pending`'s `replacing` flag — into announcing a queued download as replacing
+    content that is not there; the filter is what makes that impossible, and it is on the
+    readers rather than on the writer so a future reader cannot forget it. What the `DELETE`
+    cost is now kept: `last_used_ms`, `synced_at_ms`, `local_origin`, `oid` and `size_bytes`
+    all survive, so a path released and re-materialized no longer comes back looking like a
+    path nobody ever touched.
+
+    The table now grows with the number of distinct paths a profile has ever hydrated rather
+    than with the number it holds. That is bounded by the folder and not by time: a release
+    is per path, so the row count cannot exceed the tracked paths in the cone however many
+    release cycles run.
+
+    Tests:
+    `db::tests::a_released_row_keeps_its_clocks_and_leaves_every_present_tense_reader`
+    (without the fix both `materialized_rows` reads are empty and the raw-column read cannot
+    find a row at all), and `forget_materialized_removes_exactly_one_row`, extended to
+    assert that a row the statement declined to retract still reads as held.
 
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: Releasing a hard-linked file reports bytes it did not reclaim, because `rename(2)` replaces one directory entry and the inode survives under the other name.
   evidence: `Release.size_bytes` is the pointer's size unconditionally and `dehydrate_line` renders it as `released 4.0 MB`, whose doc calls it the bytes this machine no longer holds. With `nlink > 1` the content is still on disk under the other name, so the figure — and any consumer totalling `sizeBytes` — over-counts by the whole file. Nothing in the guard chain reads `nlink`, though the `symlink_metadata` already in hand answers it on unix. Not a safety defect in either direction (the bytes are *more* safe, not less), which is why it is recorded rather than fixed: the honest answers are either refusing a multiply-linked file or reporting zero reclaimed, and choosing between them is a reporting decision that 56.9's space-freed surface should make once, for the sweep and the verb together.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `Engine::release_resolved` computes the reclaimed figure from the very `lstat` the
+    content proof was taken against — `if metadata.nlink() > 1 { 0 } else { pointer.size }`
+    under `cfg(unix)`, the pointer's size on a platform with no portable link count — and
+    returns it as `Release::size_bytes`, whose doc always claimed to be "the bytes this
+    machine no longer holds". An `info!` names the link count when it fires.
+
+    Not a guard, deliberately: refusing a hard-linked path would be a new refusal for a
+    request that succeeds, and nothing in the guard chain has ever read the link count. The
+    release is real and correct — the caller asked for THIS name to hold its pointer, and
+    afterwards it does. Only the figure changes, to the one that is true. `keeper-syncd`'s
+    `dehydrate_line` can therefore now legitimately print `released 0 B` for a successful
+    release, and `docs/sync.md` §13 says so (story 56.14's surface half).
+
+    Test: `tests/dehydrate_entry.rs >
+    a_released_hard_linked_file_reports_no_bytes_reclaimed`, `cfg(unix)`. The link is made
+    into a second `tempfile::tempdir()` so the sibling is untracked and invisible to `git
+    status`. Asserts the release SUCCEEDS, `size_bytes == 0`, the target holds the committed
+    blob, and the sibling still holds the original content byte-for-byte. Without the fix
+    the figure is the pointer's size, so the CLI line and the sweep's reclaimed total over-
+    count by the whole file, once per link, while the content is still on the disk.
 
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: A selector that is one profile's id and another profile's name makes both folders permanently unreleasable, and the refusal advises the one thing that cannot work.
   evidence: `select` filters `profile.id == wanted || profile.name == wanted` with no precedence, so both match, the single-profile destructure fails, and the message is "`{wanted}` matches 2 folders; name the one you mean by its id" — while the id is precisely what is ambiguous. Pre-existing and shared by every verb that calls `select` (`materialize`, `ls-files`, `pause`, `resume`, `verify`), and the fix — prefer an exact id match before filtering by name — changes the selector for all of them, which is why it is not made inside a story whose surface is one deleting verb. Nothing makes a profile name unique, so the collision is reachable by a user who names a folder after another folder's ULID.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `select` (`keeper-syncd/src/commands.rs`) now asks for an exact id FIRST and only filters
+    by name when nothing owns that id, so an id match is always exactly one folder and the
+    collision cannot arise. That also makes the surviving message TRUE: the only ambiguity
+    left is two folders sharing a NAME, for which "name the one you mean by its id" is the
+    correct instruction. Precedence rather than the reverse because an id is keeper's own
+    opaque key — resolving to it can never address a folder the caller did not name, whereas
+    preferring the name could. Tests (both fail without the change):
+    `an_id_that_is_also_another_folders_name_resolves_to_the_id`, which also asserts
+    declaration order does not decide it, and
+    `two_folders_sharing_a_name_still_both_match_that_name`, which pins the ambiguity that
+    remains. Applies to every caller of `select` — `materialize`, `dehydrate`, `pin`,
+    `unpin`, `ls-files`, `pause`, `resume`, `verify`, `status` — as the entry said it would.
 
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: `lfs::stage::dehydrate`'s post-create cleanup paths are structurally verified but not exercised, because none of them can be forced from a fixture without stubbing the filesystem.
   evidence: All three post-create failures (`write_all`, `File::set_permissions` on an owned handle, `rename` onto a file the identity re-check just proved regular) funnel through one `if published.is_err()` cleanup, so there is a single path to audit rather than three — but on Linux none of them can be provoked from a temp directory, and this tree does not stub the filesystem here. The pre-create refusal is covered (`a_target_whose_length_moved_is_refused_and_leaves_no_staging_file`), and a leaked `.keeper.*.tmp` is tier-0 excluded so it can never be committed; the residual risk is litter nobody sweeps, which is the same gap `.git/lfs/tmp` already has its own ledger entry for.
   status: open
+  keep: |
+    Reviewed and kept, with one thing now different in its favour: story 56.14 made
+    `materialize` follow the same shape — its failure paths funnel through one `if
+    published.is_err()` cleanup too — so there is one cleanup discipline in the module
+    rather than two, and it is asserted from the `materialize` side by
+    `a_target_that_no_longer_holds_the_committed_pointer_is_never_published_over` and
+    `a_target_deleted_since_the_decision_is_not_recreated_by_the_publish`, both of which
+    prove no `.keeper.*` file is left behind after a refusal. That is the same cleanup
+    branch, reached by a failure a fixture CAN arrange.
+
+    What is still unexercised is the trio this entry names — a failing `write_all`, a
+    failing `set_permissions` on an owned handle, and a failing `rename` onto a file the
+    identity re-check just proved regular — none of which can be provoked from a temp
+    directory on Linux, and this tree does not stub the filesystem here. It becomes worth
+    doing if a filesystem seam is introduced for another reason; introducing one for this
+    alone would add a stub layer to test three lines that share one exit.
 
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: A profile with a filesystem remote that also carries a committed `.lfsconfig` can never release anything, because the per-object proof is routed to an LFS server that cannot be addressed.
   evidence: `Engine::remote_serves` takes the filesystem-remote branch only when `lfsconfig.is_none()`, mirroring `Engine::audit_remote_objects` exactly — an explicit `.lfsconfig` names a server, so it outranks the shape of the remote URL, which is the right precedence. The consequence is that such a profile falls to `lfs_access`, which cannot derive an endpoint from a path remote, so every release refuses `UnprovenOnRemote` forever. Fail-closed and consistent with the existing audit, so it is not a defect — but it is a folder shape (a pendrive remote plus a committed `.lfsconfig` pointing at a forge) whose releases silently never happen, and the honest fix is for the proof to say which of the three ways it answered, which is the same change DW (story 56.2) already asks for on `audit_remote_objects`.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `Engine::remote_serves` gained a fallback in its `lfs_access` error arm: when no LFS
+    server can be addressed and `lfs::local::remote_store(&profile.remote_url)` is `Some`,
+    it asks that store for the per-object proof.
+
+    The precedence this entry defends is untouched. An explicit `.lfsconfig` still wins over
+    the shape of the remote URL, the named server is still asked first and its answer still
+    decides; this is the fallback for there being no server to ask. It is reachable exactly
+    in the dead-end case — a filesystem remote plus a `.lfsconfig` that names no usable
+    `lfs.url`, so the file sends the profile past the filesystem branch and
+    `endpoint::derive` then refuses a local path outright. And it is fail-closed in the same
+    direction as everything around it: a store that does not hold the object at that size
+    keeps the local copy.
+
+    "Fail-closed and consistent with the existing audit" was the original argument for
+    leaving it, and it was the right description and the wrong conclusion: the consequence
+    was not conservatism but a folder that could never release ANYTHING, forever, on every
+    pass, having already paid a whole-file hash to reach the refusal.
+
+    Test: `tests/dehydrate_entry.rs >
+    a_committed_lfsconfig_naming_no_server_still_releases_from_a_path_remote`. A
+    `.lfsconfig` setting only `concurrenttransfers` is committed at the repository root
+    before the fixture seeds, so the tree stays clean and the file is genuinely part of the
+    checkout; the release then succeeds and the ledger row is retracted. Without the fix
+    `remote_serves` returns false and the release refuses `UnprovenOnRemote`. The path
+    through the code was traced to confirm the test is falsifiable rather than vacuous:
+    `lfsconfig = Some` skips the filesystem branch, `SshRemote::parse` declines a plain
+    path, and `endpoint::derive` raises `SyncError::Config("remote is a local path and has
+    no LFS server")` — which is exactly the new `Err` arm.
+
+    The audit half is deliberately unchanged: `Engine::audit_remote_objects` raises rather
+    than answering silently, so its consequence is different and it is recorded separately.
 
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: The `.keeper.{name}.tmp` staging spelling adds 12 bytes to a file name, so a path whose name is within 12 bytes of `NAME_MAX` can never be materialized or released.
   evidence: Both `lfs::stage::materialize` and the new `lfs::stage::dehydrate` build the sibling staging name by prefixing `.keeper.` and suffixing `.tmp`, so the create fails `ENAMETOOLONG` every time and the error names the temp file rather than the cause. Inherited rather than introduced — `materialize` has had the shape since story 34.x — and it affects both directions equally, which is why it is recorded against the primitive rather than the verb. The fix is to truncate the base name in the staging spelling or fall back to a hash-derived name, which touches the shipped materialize path and wants its own fixture.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `lfs::stage::staging_path(root, target)` is now the single builder, used by BOTH
+    `materialize` and `dehydrate` — the entry was right to record this against the primitive
+    rather than either verb, and the two inline `format!`s were byte-identical duplicates.
+    When `name.len() + 12 > 255` it truncates the base on a char boundary and appends `-`
+    plus 8 hex characters of `sha256(name)`, so the component stays inside `NAME_MAX`.
+
+    Truncation with a digest rather than plain truncation, because two long names sharing a
+    prefix would otherwise collide at one staging path. The digest is of the name alone, so
+    the answer is deterministic: a crash-leaked staging file is found and removed by the
+    next attempt at the same path, exactly as an untruncated one is. `NAME_MAX` is a
+    conservative constant rather than a `pathconf` call — Linux, macOS and Windows all stop
+    a component at 255, and the cost of being a few bytes pessimistic is a slightly shorter
+    temp name.
+
+    Test:
+    `lfs::stage::tests::a_name_within_twelve_bytes_of_name_max_can_still_be_materialized`. A
+    250-byte name is committed pointer-shaped and materialized end to end, and
+    `staging_path` is asserted on directly: the component it returns is within 255 bytes,
+    and two different 250-byte names sharing their first 240 bytes get DIFFERENT staging
+    names. Without the truncation `create_new`/`copy` fails `ENAMETOOLONG` every time and
+    the error names the temp file rather than the cause, so such a path can never be
+    materialized and never be released — in both directions, for the life of the file.
 
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: `git::resolve`'s `the_three_ways_a_git_can_fail_are_reported_distinctly` fails under whole-suite process pressure while passing in isolation.
   evidence: Observed once during a full three-crate `cargo test` run on this branch (`881 passed; 1 failed`), then 5/5 passing — once alone with `--exact`, three times over the whole `keeper-sync --lib` binary, and in four subsequent full-suite runs (3395 and 3406 passing, 0 failed). The test writes fake `git` shell scripts and immediately execs them, which is the classic `ETXTBSY`/fork-pressure race when a dozen test binaries fork concurrently. It touches nothing story 56.4 changed; what the story contributed is 39 more tests and therefore more concurrent forks. The fixture wants the script written, closed and `fsync`ed — or a retry on `ETXTBSY` — before the exec.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `fake_git` now writes each script to a different path, sets the executable bit, closes
+    it, and `std::fs::rename`s the finished file into the path that will be executed.
+
+    That is the mechanism, not a retry: `ETXTBSY` fires because a concurrent `fork` in
+    another test thread inherits the still-open WRITE descriptor on the file about to be
+    `exec`'d. Renaming a fully-written, fully-closed file into place gives the exec path a
+    fresh inode that no inherited descriptor holds open, which removes the window.
+    Truncating and rewriting in place does not, because the inode — and therefore any
+    inherited descriptor — is the same one.
+
+    Nothing the test asserts changed. The comment at the helper records the mechanism and
+    why rename rather than write-in-place, so a later simplification back to `fs::write` has
+    a reason not to.
 
 - source_spec: spec-56-5-it-lets-go-a-day-after-it-landed
   summary: The release sweep pays a whole-file hash and a remote round trip per candidate before reaching the `OpenUnknown` refusal, so on every production host today each pass spends its whole byte budget to make no progress at all.
   evidence: `Engine::release_resolved` runs `lfs::stage::content_oid` and `Engine::remote_serves` before `platform.open_file_state`, which story 56.4 chose deliberately — the open-file answer is "the answer most likely to have changed while the steps above ran". `OpenFileState::Unknown` is, however, a statement about the *platform* and not about a path (its own doc says no platform answers it yet), so a single capability probe per pass would let the sweep decline before hashing anything, and the cost is real: up to `RELEASE_BUDGET_BYTES` of reads and a budget's worth of round trips per successful sync, forever, on every host, for zero releases. It is recorded rather than fixed because the probe's effect is not observable from a test — the candidate file survives either way — and this epic's own testing rule is that an unassertable change to the verb that deletes data is exactly the change not to make. It wants either a `TestPlatform` call counter (so "did not hash" becomes assertable) or a platform that answers the open-file question, at which point the whole question disappears.
   status: open
+  keep: |
+    Reviewed and kept. This entry rests on the premise that `open_file_state` answers
+    `Unknown` on every production host, and story 56.11 removed that premise on Linux:
+    `LinuxPlatform` and `ShellSyncPlatform` both delegate to
+    `keeper_sync::platform::probe_open_file_state`, which answers for real, so a Linux sweep
+    pass now spends its hash and its round trip on candidates that go on to be RELEASED —
+    which is the cost the guard order was designed to pay. The `OpenUnknown` refusal is now
+    the macOS and Windows answer only. Reordering the guards today would optimize a case
+    that no longer exists on the only platform that can answer, at the price of moving the
+    check whose own doc says it is placed last because it is the answer most likely to have
+    changed while the steps above ran.
+
+    It becomes worth doing when either of two things changes: a second platform ships a real
+    answer (at which point the entry is fully moot), or macOS still cannot answer and the
+    sweep gains a single per-pass capability probe — one call, saving the whole byte budget
+    per pass on that host. The 56.11 entry that annotated this one is recorded stale,
+    because its argument now lives here.
 
 - source_spec: spec-56-5-it-lets-go-a-day-after-it-landed
   summary: A folder config layer that fails validation is discarded whole, so any `Allowed` field's committed value silently reverts to the profile's default rather than to the value the file asked for.
   evidence: `profile::folder::in_force` applies `FolderTier::apply`, which returns the layer or a fault for the whole file — so one unknown key or one out-of-range number anywhere in `.keeper/keeper.toml` drops every key in it, and the profile record's defaults take over on every clone that reads the file. Story 56.5 fixed the direction that loses data for the one field whose default deletes, by declining the release sweep when `folder_config_is_faulted` reports a fault against that folder's own layer paths — but the general shape remains for `virtualPatterns`, `virtualOverBytes`, `lfsThresholdBytes` and every future `Allowed` field, and the fault is only visible on the settings surface. The honest fix is per-key rather than per-file refusal (keep the keys that parse, refuse and name the ones that do not), which changes what a fault *means* for every consumer of the tier and needs its own story and its own fixtures.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `FolderTier::apply` now retries a failed layer key by key. `overlay` takes the parsed
+    `toml::Table` instead of the text, and the new `salvage_keys` hands it one `[folder]`
+    key at a time against the profile as the keys before it left it — so every key meets the
+    identical rule table, the identical `SyncProfile::validate` and the identical
+    unobserved-key check it would have met in the whole layer. There is no second code path
+    and nothing about what is PERMITTED changed; only how much of a bad file survives.
+
+    The fault is still recorded, so `folder_config_is_faulted` still makes the release sweep
+    decline the folder — which is what already closed the data-loss direction, and is why
+    this entry was about a usability failure rather than a safety one. A layer with no
+    problems is not retried at all and behaves byte-identically to before; the retry costs
+    one `validate` per `[folder]` key and is paid only by a file that was going to be
+    discarded entirely. Keys are tried in `toml::Table`'s sorted order, which is
+    deterministic across clones and happens to be the order `validate`'s cross-field rules
+    want: `notes` before `recordings` before `sessions`.
+
+    Tests:
+    `profile::folder::tests::a_layer_that_trips_one_rule_keeps_the_keys_it_got_right`, which
+    covers BOTH refusal paths — the rule table (`branch` beside a forbidden `localPath`) and
+    `validate` (`excludes` beside a `releaseTtlMs = 500` under `MIN_RELEASE_TTL_MS`) — and
+    asserts in each case that the good key is in force AND named in `owned`, the bad one is
+    neither, and the fault names it. Without the fix `outcome.profile` is the stored row
+    untouched and `owned` is empty. Beside it,
+    `a_layer_with_no_problems_applies_whole_and_reports_nothing` proves the retry is
+    confined to the failure path.
+
+    Four pre-existing tests in the same file asserted the whole-layer discard and were
+    repaired rather than deleted, each one now asserting the salvaged key beside the refused
+    one: `a_refused_layer_leaves_the_stored_profile_exactly_as_it_was` (renamed
+    `a_refused_local_path_falls_alone_and_cannot_move_the_folder`),
+    `a_non_main_folder_may_not_carry_settings`,
+    `a_broken_file_makes_this_folders_config_read_as_faulted` — whose fail-closed claim now
+    rests on the recorded fault rather than on the default taking over — and
+    `owned_fields_never_names_a_key_the_overlay_refused`.
 
 - source_spec: spec-56-5-it-lets-go-a-day-after-it-landed
   summary: No test drives the two release clocks through the writers production actually calls, because the integration fixture has to keep keeper's committer off the paths whose provenance each test plants.
   evidence: `tests/release_sweep.rs` seeds content into the worktree behind keeper's back, which no real arrival does, so the fixture excludes those names from the committer — otherwise keeper's scan meets every seeded path as new local content and `note_local_authorship` correctly overwrites the provenance the test is about. The consequence is that `commit_local` → `note_local_authorship` and `do_lfs` → `note_unit_synced` are covered only at the `db` layer plus a read of the call sites; the wiring itself, including the stale-unit oid check and the post-commit ordering, has no end-to-end fence. Closing it means a fixture that reaches a materialized state the way production does — a real pull into a second clone, or a real commit-then-upload against a filesystem remote — which is a fixture shape this suite does not have yet and which story 56.6's `verify` work will need for its own reasons.
   status: open
+  keep: |
+    Reviewed and kept, unchanged in substance. The obstacle is the one the entry names and
+    it is structural: `tests/release_sweep.rs` seeds content into the worktree behind
+    keeper's back, which no real arrival does, so the fixture must exclude those names from
+    the committer — otherwise keeper's scan meets every seeded path as new local content and
+    `note_local_authorship` correctly overwrites the provenance the test is about. Wiring
+    the test to the real writers means driving a real arrival and a real commit for each
+    provenance the test plants, which is a different fixture (a live remote per case) rather
+    than a change to this one.
+
+    It becomes worth doing when a fixture exists that can produce a genuine arrival and a
+    genuine local authorship for the same folder without the test choosing the provenance by
+    hand — the `tests/virtual_arrival.rs` harness is the closest thing and would be the
+    place to grow it. What is covered today is the `db` layer plus a read of the call sites,
+    and story 56.14 added one real end-to-end use of `observe_materialized` through
+    `Engine::materialize_entry` (`tests/materialize_entry.rs >
+    the_already_held_answer_records_the_use_without_restarting_the_arrival_clock`), which is
+    the first test in the tree to drive a `last_used_ms` write through a production verb.
 
 - source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
   summary: `VerifyReport::virtual_paths` reaches `keeper-syncd` and nothing else, so the desktop surface cannot tell a clean folder from one where ten thousand paths were excused.
   evidence: `sync_verify` (`keeper/src/sync_ipc.rs`) flattens only `report.bad` into `Vec<String>`, so the Settings pane renders `SYNC_VERIFY_CLEAN_SENTENCE` and nothing else after a pass that excused most of the folder. The field's own doc says a row nobody reports anywhere is indistinguishable from a check that stopped running, and that guarantee is honoured on the CLI alone. Carrying the count to the app needs a wire type and a generated binding, which story 56.6 declared a non-goal (`git status --porcelain -- src/lib/ipc/gen` must stay empty) because 56.7 owns the row states and 56.9 owns the surface that reads them. The sentence was reworded so it no longer promises what the pass does not check, which is the honest half of the fix; the count itself belongs with the states.
-  status: open
+  status: stale 2026-08-28 (story 56.14)
+  resolution: |
+    No longer true; story 56.12 carried the count to the app. `src/lib/ipc/gen/SyncVerifyVm.ts`
+    is now `{ checked: number, virtualPaths: number, problems: Array<string> }` and its own doc
+    says `virtual_paths` "is the number that turns 'nothing was wrong' into 'nothing was wrong
+    AND N are away on purpose'". `settings/sync-section.tsx` renders it —
+    `syncVerifyCountSentence(verified.checked, verified.virtualPaths)` — beside
+    `SYNC_VERIFY_CLEAN_SENTENCE` rather than instead of it, and
+    `sync-section.test.tsx > says how many paths a clean check excused on purpose` asserts
+    "Read 12 files. 5 kept away on purpose." So the wire type and the generated binding this
+    entry called a non-goal both exist. Note the SECOND half of the same complaint was still
+    live and is fixed separately in this story: the counts were reachable only from a folder
+    keeper had already flagged (see the story-56.12 entry below about the verify counts).
 
 - source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
   summary: `Engine::verify` is no longer strictly read-only for a folder that carries a virtualization policy: it opens the repository, which can clear a stale `index.lock` and rewrite `.git/config`.
   evidence: The two-fact excuse needs the index, so `verify` now calls `git::repo::open`, whose door deliberately does housekeeping — `release_stale_index_lock` deletes an `index.lock` older than 60 s, `release_stale_ref_locks` does the same for refs, and `drop_foreign_lfs_driver` rewrites `.git/config` (the DW-140/DW-206 guards). `verify` is the one pass that takes no reservation, so it is the most likely to run beside a keeper commit or a user's own `git`. Narrowed rather than removed: a folder whose policy tier is `Unset` never opens the repository at all, so the overwhelming majority of folders are unaffected, and the comment claiming the pass only reads was corrected. A read-only open (or a reservation for verify) is a change to `git::repo::open`'s contract or to the engine's locking, not to this story.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `git::repo::open_read_only` is `open` minus its three housekeeping calls —
+    `release_stale_index_lock`, `release_stale_ref_locks` and `drop_foreign_lfs_driver` —
+    and `Engine::verify` uses it. `open` is now `open_read_only` plus those three, so there
+    is one `gix::open_opts` call and one error string between them.
+
+    A second door rather than a flag, because the difference is a promise to the rest of the
+    machine and not a tuning knob. This entry named the reason precisely: verify is the one
+    pass that takes no reservation, so it is the likeliest of all of them to run beside a
+    keeper commit or a person's own `git`, and the repairs are exactly the operations that
+    are dangerous next to a live writer — deleting an `index.lock` that is 61 seconds old
+    and genuinely held, or committing a config snapshot while another process is editing
+    `.git/config`. A check that repairs what it is checking is not a check. The cost dropped
+    with them is not incidental either: `release_stale_ref_locks` walks all of `refs/` and
+    polls for up to `STALE_REF_LOCK` per lock it finds.
+
+    The doc on `open_read_only` states the rule a future caller needs: reading an index, a
+    tree or a blob needs none of the three, and every leg that goes on to WRITE needs all of
+    them.
+
+    Test:
+    `git::repo::tests::open_read_only_leaves_a_stale_index_lock_that_open_would_remove` —
+    plant `.git/index.lock`, backdate it past `STALE_INDEX_LOCK` with `std::fs::FileTimes`
+    (the crate's own idiom, already used at `engine.rs`; no dependency added, and no
+    shelled-out `touch`, whose `-d` differs between GNU and BSD and would pass on Linux
+    while failing on the macOS host), then assert the lock SURVIVES `open_read_only` and is
+    GONE after `open`. Without the read-only door the first assertion reads a file the call
+    just deleted.
 
 - source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
   summary: A FIFO, socket or device node standing where a missing LFS object's path should be still reaches `lfs::stage::clean`, whose `File::open` blocks forever on a FIFO.
   evidence: The new gate asks `lfs::stage::worktree_pointer`, which answers `None` for anything that is not a regular file (`!meta.is_file()`), so a non-regular file falls through to the `clean` arm exactly as it did before this story. Pre-existing — `republish_missing_objects` has always called `clean` on whatever stood at the path — and the fix is the same `Metadata::is_file` filter `copy.rs` already applies before it opens anything (`classify`'s non-regular refusal), applied at the repair site. Left out here because the story's gate is about pointer text and widening it to a general "is this openable" guard is a change to the repair path's own contract, which has no other test coverage.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    Guarded in `lfs::stage::clean` itself rather than at the repair site, because `clean` is
+    the function that opens: `symlink_metadata` before the open refuses anything that is not
+    a regular file, and `file.metadata()` — the `fstat` the length was already being read
+    from — refuses again on the opened handle, which closes the window in which a regular
+    file is replaced between the two calls. The refusal is `SyncError::Integrity` whose
+    `actual` comes from `copy::describe_kind`, widened to `pub(crate)`, so the sentence is
+    the one `copy::classify` already gives for the same fact — *a named pipe* — instead of a
+    second vocabulary that would eventually disagree.
+
+    In `clean` and not only in `Engine::republish_missing_objects` because that is where the
+    hazard is: any future caller inherits the guard, and the alternative is a primitive that
+    can hang and a list of call sites that must remember not to let it.
+
+    Tests:
+    `lfs::stage::tests::cleaning_refuses_a_named_pipe_rather_than_blocking_on_it_forever`,
+    which makes a real fifo with `mkfifo` and runs `clean` on a `std::thread::spawn`
+    collected through `recv_timeout(10s)` — mandatory, because without the fix `File::open`
+    on a writerless fifo never returns and a direct call would hang the whole test binary
+    instead of failing one test — and
+    `cleaning_refuses_a_directory_standing_where_content_should_be`, which asserts on the
+    `Integrity` FIELDS rather than the rendered text, because `EISDIR` renders as "Is a
+    directory" and would satisfy a substring check while hiding the defect.
 
 - source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
   summary: A verified copy started while its folder is syncing refuses every virtual path with `SyncError::Busy`, and which paths refuse depends on where the ~1 Hz supervisor happens to be.
   evidence: `Engine::materialize_entry` takes the per-profile reservation and answers `SyncError::Busy` when the tick holds it, and the copy renders that sentence as the entry's refusal. The reservation is taken and released per path, so the same copy of the same folder run twice can produce different sets of copied and refused files, and the job still settles `Done`. The direction is safe — a refusal, never a stub — and it is named in the story's own I/O matrix, but a copy is the operation a user reaches for when they want a complete second copy. A bounded retry per path, or one job-level refusal instead of N entry-level ones, is a policy decision about the copy verb rather than a defect in the hydration seam.
   status: open
+  keep: |
+    Reviewed and kept. The direction is safe — a refusal, never a stub — and the defect is
+    that WHICH paths refuse depends on where the ~1 Hz supervisor happens to be, so the same
+    copy run twice can produce different sets. Fixing that means taking the folder's
+    reservation once for the whole copy instead of per path, which is the same question as
+    the `Engine::reserve` entry above: the reservation would have to outlive a single path,
+    and a copy of a large folder would then hold it for minutes and starve the journal drain
+    behind it — which is the cost `RELEASE_BUDGET_BYTES`' own doc says the engine exists to
+    avoid.
+
+    It becomes worth doing when a reservation can be held for a bounded, interruptible span
+    that the supervisor can preempt — i.e. when there is a way for the tick to ask for the
+    reservation back rather than simply failing to get it.
 
 - source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
   summary: `LfsMode::PointerOnly` keeps a whole folder's content as pointers by profile-wide configuration, and `verify` still reports every one of those paths as a fault unless a per-path policy also authorizes it.
   evidence: The excuse story 56.6 built is deliberately per path — the index plus `VirtualPolicy`, which AD-122 requires to be a separate type precisely because `LfsMode` is profile-wide and the ask is per path — so a folder set to `PointerOnly` with no `.keepervirtual` and no `virtualPatterns` produces the same wall of `LFS object … is missing locally` rows it produced before this story. Pre-existing (the mode shipped long before the policy) and deliberately not folded into the excuse conditions, because making the mode an authorization would tie the per-path selector back to the profile-wide lever that AD-122 exists to keep it away from. The honest resolution is for the mode to compile into a policy that authorizes everything, which is a change to how `VirtualPolicy` is built rather than to how `verify` reads it.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    Not stale — story 56.10's `PointerOnly` handling went into the arrival sweep and the
+    release gates and never touched verify's fault path, which was confirmed by reading the
+    code before changing it. Now fixed: `Engine::verify`'s `excusable` is `lfs_mode !=
+    Disabled && (lfs_mode == PointerOnly || policy.tier() != Unset)`, and the per-path
+    `authorized` fact is `lfs_mode == PointerOnly || policy.resolve(..) == Virtual`.
+
+    The mode replaces exactly ONE of the four facts and nothing else. `committed` (the index
+    carries the committed pointer, matching by oid AND size), `absent` (the object is
+    genuinely missing rather than sitting there truncated) and `elsewhere` (a plugged-in
+    filesystem remote still holds it) are all still earned per path, and `lfsMode =
+    disabled` still excuses nothing. Excused paths land in the same `report.virtual_paths`
+    counter, so the surface sentence is unchanged.
+
+    This is consistency rather than a widening. In `PointerOnly` the engine ALREADY treats
+    the whole folder as authorized to stay away: `materialize_pending` `continue`s past the
+    publish for every path, `release_mode_gate` answers `Ok(None)` without consulting the
+    policy, and `release_path_gate` answers `Ok(())`. Verify was the lone divergence, and
+    the only spelling of "yes, I meant it" was to restate the whole folder as a per-path
+    policy.
+
+    Tests: `tests/virtual_state_is_not_a_fault.rs >
+    a_pointer_only_folder_excuses_its_pointers_with_no_policy_at_all` (no `.keepervirtual`,
+    no `virtualPatterns`, asserted rather than assumed; `bad` is empty and `virtual_paths`
+    is the seeded count — without the fix every path is a `LFS object … is missing locally`
+    row) and `a_truncated_object_is_damage_even_in_a_pointer_only_folder`, which proves the
+    other facts survive.
+
+    One pre-existing test changed premise and was repaired rather than deleted:
+    `the_unauthorized_path_is_the_only_row_reported` used this file's `PointerOnly` helper,
+    so under the fix there is no such thing as an unauthorized path in its folder. It now
+    builds a `LfsMode::Materialize` folder, which is the default mode and the one story
+    56.10 made the policy load-bearing for, and its doc records why. Exactly one test in the
+    file failed, and it was exactly the one asserting the fact the mode now supplies.
 
 - source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
   summary: Two suites flake under heavy parallel load on the dev box — one Rust suite in the `keeper-sync`/`keeper-core`/`keeper-syncd` run and `files-pane.test.tsx > waits for a real list before deciding a profile is gone` — and neither reproduces in isolation.
   evidence: Observed twice across roughly six full gate runs of the epic-56 stack, on a machine simultaneously running vitest's six workers and a cargo test job. Neither failure printed a `failures:` block in the captured window, and four consecutive re-runs (two Rust, two frontend) were clean, including three isolated runs of the new `virtual_state_is_not_a_fault` suite (18 passed each time). The frontend test predates this epic and exists on `main`. Not diagnosed and deliberately not silenced: a flake named with its evidence is worth more than a `#[ignore]`, and the right fix is to find the shared resource — most likely a port, a temp path or a CPU-starved timeout — rather than to retry the assertion.
   status: open
+  keep: |
+    Reviewed and kept, and narrowed by one: the `git::resolve` flake recorded separately in
+    this epic was diagnosed as an `ETXTBSY` race and is FIXED in story 56.14, so if the Rust
+    half of this entry was that suite it is now accounted for. The frontend half (`files-
+    pane.test.tsx > waits for a real list before deciding a profile is gone`) predates this
+    epic, exists on `main`, and is untouched.
+
+    Deliberately not silenced. A flake that is retried away is a flake that has been hidden,
+    and the honest state is "observed twice across roughly six full gate runs on a machine
+    simultaneously running vitest's six workers and a cargo test job, never reproduced in
+    isolation". It becomes worth doing when it is reproducible under a bounded harness —
+    running the single suite under an artificial CPU load is the cheapest next step —
+    because a fix without a reproduction is a guess that will be re-litigated at the next
+    red run.
 
 - source_spec: spec-56-7-the-row-says-what-it-is-and-what-a-delete-will-do
   summary: The Files row's sync mark is not in the row's `aria-describedby`, so the sentence naming a file's sync state — including the three new virtual states — is never announced while a screen reader navigates the tree.
   evidence: The row carries `aria-label={node.name}`, and `files-pane.tsx`'s own comment states the rule this creates: "aria-label on the row replaces its subtree's contribution to the name, so a size or a vault marker rendered only as a child would be on screen and absent from the accessibility tree entirely". `countId`, `sizeId`, the new `mtimeId` and `roleId` are all in the list; `<SyncStatusMark>` has no id and is in none of them. Pre-existing — `session-tree.tsx` carries the identical omission under the identical comment, and the mark has had its own `aria-label` and `title` since 44.17, so it is reachable by direct inspection and only unreachable during row navigation. Story 56.7's tests query the mark element directly and cannot see this. The fix is a `syncId` in both trees, exactly as `mtimeId` was added, and it belongs in one pass over both surfaces rather than half-applied here.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `SyncStatusMark` gained an optional `id`, and BOTH callers now name it in their row's
+    `aria-describedby`: `files-pane.tsx` (`syncId`, in the list beside `countId`, `sizeId`,
+    `mtimeId`, `releaseId` and `roleId`) and `sessions/session-tree.tsx`, which this entry
+    correctly said carried the identical omission. The prop is optional rather than required
+    because the fact it repairs belongs to the ROW, not to the mark — and because a required
+    prop would force an id to exist without ever forcing a row to name it, which is the wrong
+    guard. Tests (each fails without the wiring, and every pre-existing assertion passed
+    WITH the defect because `toHaveAccessibleName` reads the mark directly):
+    `files-pane.test.tsx > names each row's sync mark in the row's own description`, asserted
+    over all eight sync states plus the profile root that must name none, and
+    `session-tree.test.tsx > carries the Files tab's own sync mark and sentence`, extended to
+    assert the row's `aria-describedby` contains the mark's id and that the row's accessible
+    DESCRIPTION now contains the sentence.
 
 - source_spec: spec-56-7-the-row-says-what-it-is-and-what-a-delete-will-do
   summary: A queued LFS download over a path whose worktree still holds the real bytes reads `Waiting` and says the content is still on the remote, while the bytes are on this disk.
   evidence: `classify`'s arriving-content rung requires the worktree to hold pointer text, so an `Incoming` reason over non-pointer bytes falls to `Waiting { Some(Incoming) }`, whose sentence is "This file's content is still on the remote and has not been downloaded yet." `Engine::pending` models exactly this state — it computes `replacing` from `db::materialized_paths`, i.e. "a download queued for a path this machine already holds content for". Both the classification and the sentence are unchanged by story 56.7, so this is pre-existing; it is narrow because a local modification takes precedence over the inbound half in `Engine::pending` and a pull writes the new pointer before the download is claimed. The proposed fix — preferring the ledger over `Waiting` on that branch — inverts `classify`'s documented precedence rule that waiting beats virtual and materialized, which is a decision about the ladder rather than a patch to it.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `browse::classify`'s arriving-content rung now accepts either confirmation that the row
+    names this path: the pointer-text probe as before, OR `PendingReason::Incoming {
+    replacing: true }`. `replacing` is `Engine::pending`'s answer to
+    `db::materialized_paths.contains(label)` — "a download is queued for a path this machine
+    already holds content for" — which is exactly the fact the probe cannot supply, because
+    the worktree holds an older version's real bytes rather than pointer text. The flag was
+    already computed and thrown away at the boundary; this entry's own evidence said so.
+
+    `replacing` is asked first because it is free and can spare the probe its `open`.
+
+    The sentence a person now reads is `Materializing`'s — "keeper has this file's content
+    queued to download to this computer" — which is true. The old fall-through said "This
+    file's content is still on the remote and has not been downloaded yet" about a file
+    whose content is on this disk.
+
+    Test: `browse::tests::a_download_replacing_content_this_machine_holds_is_materializing_n
+    ot_waiting`. Two files in one folder, both holding REAL bytes so `worktree_bytes()`
+    answers `Some(false)` for both: the `replacing: true` row must read `Materializing`, and
+    the `replacing: false` row beside it must still read `Waiting` — the second half pins
+    that the fix did not widen the rung. Without the fix the first row reads `Waiting`.
 
 - source_spec: spec-56-7-the-row-says-what-it-is-and-what-a-delete-will-do
   summary: `Engine::materialized_paths` reads a profile's whole `materialized` table on every folder expansion, unfiltered by the cone being listed.
   evidence: `db::materialized_paths` is `SELECT path FROM materialized WHERE profile_id = ?1` with no prefix filter and no cap, so its cost grows with everything the profile has ever hydrated and not released rather than with the folder on screen — while `list_resolved` caps itself at `LISTING_CAP` and `browse_marks_for` exists precisely because per-listing engine work was too expensive on this hardware. Narrowed rather than removed in this story: the read is skipped entirely when the pending view is unavailable, it is the same statement and the same table `Engine::pending` already reads once per marks walk, and it is taken exactly where `list_profiles` is taken two statements above it. A cone-scoped reader (`AND (path = ?2 OR path LIKE ?2 || '/%')`) is a new `db.rs` accessor beside `materialized_paths` rather than a change to it, because `Engine::pending`'s `replacing` flag needs the whole set.
   status: open
+  keep: |
+    Reviewed and kept, and the reason is the same one that keeps the story-56.9 double-scan
+    entry open: every caller is in `keeper/src/sync_ipc.rs` — `:2197`, `:3674` and
+    `sync_browse` — the Tauri shell crate, which cannot be compiled on this host. A cone-
+    filtered `db::materialized_paths_under` landing in keeper-sync today would be a public
+    API with no caller in any crate that builds here, which is a stub however well
+    documented.
+
+    The shape is not in doubt. A range predicate on the primary key — `path >= ?2 AND path <
+    ?3`, where the upper bound is the directory prefix with its trailing `/` incremented —
+    is an index range scan on `(profile_id, path)` rather than the `LIKE` this entry
+    proposed, which cannot use the index and has to escape `%` and `_` in a user's path.
+
+    It becomes worth doing as one shell-crate story that adds the filtered engine read AND
+    the single call site that consumes it, collapsing the double scan at the same time.
+    Neither half is worth landing without the other.
 
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: The Files row offers Release on a pinned row and on a folder whose LFS mode releases nothing, where the wire already carries Rust's word saying the request will be refused.
   evidence: `files-pane.tsx` gates Release and Pin on `entry.sync.status === "materialized"` and on nothing else, though the same row is holding `release.hold`. `Engine::dehydrate_entry` refuses a pinned path (`ContentRefusal::Pinned`) and refuses on the mode gate (`AlwaysMaterializes` / `LfsDisabled`), so for `hold === "Pinned"` and for both mode causes the press is a guaranteed red `role="alert"` from a control the pane had the information to withhold. Deliberately not fixed here for two reasons that pull the other way: epic 56's own acceptance criterion is that a materialized row offers Release and Pin, unconditionally; and on every host today `SyncPlatform::open_file_state` answers `Unknown`, so EVERY manual release already refuses with `OpenUnknown` — which story 56.4 recorded as its deliberate consequence — so a "hide the verb when it will refuse" rule would hide it always. The honest fix is a disabled-with-a-reason affordance, which needs `FilesRowAction` to grow a `disabled` field and both render sites to learn it, and which should land with the platform's real open-file answer rather than before it. `hold === "Not sent"` is NOT in this class: `dehydrate_entry` takes its remote proof fresh, so a row whose `synced_at_ms` memo was never written may still release.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `files-pane.tsx` now withholds Release when `release.hold` is `Pinned` or `Kept` —
+    `FILES_RELEASE_REFUSED_HOLDS` — leaving it on `Manual`, `Not sent` and a live countdown.
+    Both of the entry's two stated reasons for deferring are answered rather than waved:
+    (1) the wire had no way to say "refused", and it still has none — a `releasable` field on
+    `FilesReleaseVm` is impossible on this host because the struct literal is composed in
+    `keeper/src/sync_ipc.rs`, which does not build here — so instead `ReleaseSchedule::hold`
+    gained one word (see the `Kept` entry below); (2) the pane must not distinguish the three
+    `Kept` causes by their SENTENCE, and it does not: it reads the token, so a rewording in
+    Rust cannot silently re-enable the button. Pin is deliberately NOT gated — it is
+    idempotent in Rust and sends only `true`, and these are the rows most likely to want it.
+    Withheld rather than disabled, the pane's standing convention: the release cell on the
+    same row draws the word and speaks Rust's sentence, which explains more than a disabled
+    button's tooltip. Test: `files-pane.test.tsx > withholds Release exactly where Rust's
+    word says the request cannot succeed` — all five words in one tree, both the cluster and
+    the right-click menu, and it fails without the gate.
 
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: `ReleaseSchedule::hold()` renders the word "Kept" for a row whose Release works and for a row whose Release cannot, and nothing beside the button distinguishes them.
   evidence: `Indefinite` (the folder's `releaseTtlMs` is `0`) and the two mode causes all answer `"Kept"`. But `dehydrate_entry` has no TTL check anywhere — its gates are containment, tracking, subpaths, stat, pointer identity, size, the pin and content identity — so a `releaseTtlMs = 0` row releases on request, while a mode-gated row is refused. The sentences differ and are what a reader gets from the tooltip and the `sr-only` phrase, so nothing is misstated; what is missing is a word that separates "no automatic clock, but you may still ask" from "this folder does not release at all". Worth a distinct word rather than a longer sentence, and worth deciding together with the deferred disabled-verb affordance above, since the two answer the same question from opposite sides.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `ReleaseSchedule::Indefinite` has its own word, "Manual"; `ModeKeeps` and `LfsOff` keep
+    "Kept". No new variant, no sentence changed, and `instant_or_words` is still the single
+    place a word is decided, so the structural pairing `releases_after_ms().is_some() ==
+    hold().is_none()` is untouched.
+
+    The entry identified the fact exactly: `dehydrate_entry` has no TTL check anywhere, so a
+    `releaseTtlMs = 0` row releases on request — by hand is precisely how `Indefinite`'s own
+    sentence says its content leaves — while both mode causes are refused by
+    `release_mode_gate`. What was missing was a word that separates them, and the word is
+    load-bearing rather than cosmetic: it is the only signal the Files pane can gate its
+    Release control on, because `FilesReleaseVm` is built in the shell crate and cannot grow
+    a field on this host, and branching production behaviour on a prose sentence would let a
+    rewording in Rust silently re-enable a button whose press can only produce a red alert.
+
+    "Manual" because the cell it shares with "Pinned" and "23 hr" is six characters wide,
+    and it leaves "Kept" meaning exactly *keeper keeps this and you cannot release it*.
+
+    Test: `engine::tests::release_schedule_pairs_an_instant_with_words_exactly_one_way`,
+    extended to assert each word against its releasability and carrying the note a future
+    edit needs — the pane withholds Release on "Kept" and "Pinned", the two refuse-certain
+    words, and offers it otherwise, so re-merging the words re-enables the button. "Not
+    sent" is deliberately NOT withheld: `release_resolved` has no `synced_at_ms` guard
+    either, so an unconfirmed row also releases on request. The pairwise-distinct-sentences
+    assertion still holds for all six variants. The Files pane half is story 56.14's surface
+    column.
+  resolution: |
+    The word this entry says is missing now exists. `ReleaseSchedule::instant_or_words`
+    (`keeper-sync/src/engine.rs`) answers `Err("Manual")` for `Indefinite` on its own arm and
+    keeps `Err("Kept")` for `ModeKeeps | LfsOff`, so the word now separates the row whose
+    Release WORKS from the two whose Release cannot. No new variant, no sentence changed, and
+    the `releases_after_ms().is_some() == hold().is_none()` pairing is untouched — it is still
+    one `Result` away in one function. Six characters, so it still fits the `w-16` cell beside
+    `Pinned` and `23 hr`. The engine edit was made by the sibling agent `EngineSweep` at this
+    story's request over `hub`, because `keeper-sync` is that agent's file; every consumer of
+    the word was updated here (`files-pane.tsx`'s gate, `files-pane.test.tsx`,
+    `dev/mock-shell.ts`'s new `hold: "Kept"` row). Tests:
+    `release_schedule_pairs_an_instant_with_words_exactly_one_way` in `keeper-sync` pins the
+    word and carries a note saying the Files pane's gate branches on `Kept` meaning
+    refuse-certain, and `files-pane.test.tsx > draws a word, no digit and no timer for a row
+    on no clock` now runs over all FIVE words, including the `Manual`/`Kept` split.
 
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: `sync_browse` now scans the profile's whole `materialized` table twice for one directory listing — once for the marks and once for the deadlines.
   evidence: `sync_ipc::sync_browse` reads `engine.materialized_paths(&id)` for `browse::MaterializedView` and then `engine.release_schedules(&id)` for the countdown; both are unfiltered scans of the same table for the same profile (`db::materialized_paths`, `db::materialized_rows`), and the first read's own comment already calls itself "an unfiltered scan of everything this profile has ever hydrated, paid on every folder expansion". The keys `release_schedules` returns are exactly the keys `materialized_paths` returns, so one read could feed both views. Not folded in this story because it changes the failure coupling deliberately established by 56.7: a schedules read that fails currently costs the rows their countdown only, while a shared read would also cost them their `Materialized` mark, and the fix lands in the one crate that cannot be compiled on this host. It should be taken together with the cone-scoped reader already deferred by 56.7, which would make both reads cheap rather than making one of them disappear.
   status: open
+  keep: |
+    Kept, and blocked rather than merely deferred (story 56.14). The double scan is real and
+    the fix the entry proposes is the right one, but the caller is `sync_ipc::sync_browse` in
+    `src-tauri/crates/keeper/**` — the Tauri shell crate, which cannot be compiled on this
+    host, so a change there could not be built or verified and would leave the tree in a
+    state nobody could check. The engine half does NOT exist and was deliberately not added:
+    it waits for a shell-crate story that adds both the cone-filtered engine read and the
+    single call site — neither half is worth landing without the other, because the only
+    callers of `materialized_paths` are in `keeper/src/sync_ipc.rs`. What would have to change
+    for this to become worth doing: a story that can build the shell crate — i.e. one running
+    on macOS, or after `keeper` links on Linux — at which point it is one filtered read in
+    `sync_browse` instead of two unfiltered ones, plus the primitive beneath it.
 
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: `Engine::dehydrate_entry` hashes the whole file to prove content identity while it is an `async fn`, so awaiting it from a Tauri command blocks a runtime worker for the length of a multi-gigabyte read.
   evidence: `release_resolved` calls `content_oid`, a whole-file SHA-256, with no `spawn_blocking` and no yield point, inside an `async fn`. The shape is pre-existing — the release sweep already calls it from `mark_synced` on the engine's own runtime — but story 56.9 adds the first INTERACTIVE caller: `sync_release_entry` must `.await` it directly, because `spawn_blocking` cannot host a future. `sync_materialize_entry` beside it does not have the problem, precisely because `materialize_entry` is synchronous and is therefore already on the blocking pool. The fix belongs in `keeper-sync`, where the hash is: either `block_in_place` around the identity proof or a `spawn_blocking` inside `release_resolved`, so both doors get it and neither has to remember.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `Engine::release_resolved`'s `lfs::stage::content_oid` call now runs inside
+    `tokio::task::spawn_blocking`. A `JoinError` is reported rather than swallowed, for the
+    reason every other guard there raises instead of declining: the digest never ran, so
+    nothing about the content is established and the release must not proceed.
+
+    The scope is honest and narrower than "the method no longer blocks". The rest of
+    `release_resolved` is still blocking-in-async — the repository open and index parse, the
+    `lstat`, and since story 56.11 the `/proc` walk — but each of those is bounded by a
+    small amount of work, where this one is bounded only by the size of the user's file. It
+    is the one call that can hold a runtime worker for minutes, and story 56.9's interactive
+    caller (`sync_release_entry`, which must `.await` the method because `spawn_blocking`
+    cannot host a future) is what made that a desktop-wide symptom rather than a background
+    cost.
+
+    No new test, deliberately. The observable contract is unchanged — same digest, same
+    refusal, same success — and what changed is which thread pays. A test asserting "no
+    runtime worker was pinned" would be asserting on tokio's internals, and a timing
+    assertion would be the load-sensitive flake this same ledger records twice.
+    `tests/dehydrate_entry.rs` already proves the digest guard refuses a same-length edit
+    and permits a real release, which is the whole of what a caller can observe; both still
+    pass.
 
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: A second Files row verb pressed before the first resolves clears the first's refusal sentence and can replace it with "the folder is already syncing".
   evidence: `runRowVerb` calls `setWriteError(null)` before every attempt and there is one `writeError` slot for the pane, so two presses in flight together end with whichever rejected last — and the engine's per-profile reservation means the second is likely to reject `Busy` rather than on its own merits, so the sentence the person reads is about contention rather than about their file. The three verbs the pane already had share the same single sink and the same absence of an in-flight guard, so this is the shape of the surface rather than something 56.9 introduced; what 56.9 changed is that these verbs now REPORT rather than swallow, which is what makes the collision visible. The fix is one in-flight ref per pane (or per row) and a decision about whether a press during flight should queue, replace or be ignored — a small design question worth asking once for all six verbs.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `runRowVerb` (`files-pane.tsx`) now chains each attempt onto the previous one and clears
+    the sink per BURST rather than per press. Both halves of the defect are closed, and the
+    second is the one that mattered: because the verbs no longer overlap, the engine's
+    per-profile reservation cannot produce the `SyncError::Busy` this entry describes, so the
+    sentence a person reads is about their own file and never about keeper's contention with
+    itself. Nothing is dropped and nothing is silently ignored — a guard that swallowed the
+    second press was rejected for that reason — both verbs run, in press order, each against
+    a folder the previous one has finished with. Refusals within one burst accumulate as
+    joined sentences, the shape `requestDelete`'s multi-path receipt already uses; a new
+    burst (a press arriving with nothing in flight) still discards the previous one's
+    sentences, which is correct. The chain link never rejects, so one refusal cannot strand
+    every later press. Tests, both of which pin the in-flight window with a hanging mock
+    rather than relying on how many microtasks `act` drains:
+    `files-pane.test.tsx > keeps the first verb's refusal and does not run the second beside
+    it` (asserts the second invoke has NOT happened while the first is in flight, which is
+    what makes the `Busy` unreachable rather than merely unlikely) and
+    `> shows both sentences when two verbs in one burst are refused`.
 
 - source_spec: spec-56-8-a-virtual-files-chapter
   summary: `docs/sync.md` §13 says an `ls-files` row carries a modification time and what the ledger recorded, but the human row prints only state, size, path, oid and `[pinned]` — those four fields exist only under `--json`.
   evidence: `keeper-syncd/src/commands.rs:1395-1401` formats the human row as `"  {state:<12}  {size:>9}  {path}  {oid}{pinned}"` and nothing else, while `mtimeMs`, `materializedAtMs`, `lastUsedMs` and `syncedAtMs` appear only in the serialized `LfsFile` (`keeper-sync/src/lfs/listing.rs:109`). The claim at `docs/sync.md:1274-1276` ("plus a modification time and, once a path has been materialized, what the ledger recorded about it") therefore describes the JSON document while sitting in a paragraph about the printed rows, and an operator reading it will run the verb without `--json` and not find them. Pre-existing: written by story 56.2, surfaced while writing §9. Not fixed here because the honest repair is a choice between two changes of different size — reword the sentence to name `--json`, or print an mtime column in the human row, which is a behaviour change a docs branch must not make.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `docs/sync.md` §13 now separates the two renderings instead of describing one while
+    sitting in a paragraph about the other. It states outright that the printed row and the
+    `--json` document do not carry the same fields, shows a real transcript of the count line
+    plus two rows (with the object id in FULL, which is what `ls_files_lines` prints), and
+    says in its own paragraph that a modification time and the ledger facts exist only under
+    `--json`, naming them: `mtimeMs`, `materializedAtMs`, `lastUsedMs`, `syncedAtMs`. The
+    entry offered two repairs of different size and asked for a decision; the decision is to
+    correct the DOCUMENT rather than to widen the printed row, because the row is already four
+    columns of which one is a 64-character oid, and four more fields would make it unreadable
+    at any terminal width — the operator who wants them has `--json`, which is what the
+    paragraph now says. Also fixed while there: the paragraph noted the old claim explicitly
+    ("This paragraph used to claim the printed row carried a modification time. It never
+    has."), so a reader who remembers the wrong version is not left doubting the new one.
 
 - source_spec: spec-56-8-a-virtual-files-chapter
   summary: `docs/sync.md` §13 states "Every other refusal exits `1`" for `dehydrate`, but an unknown or ambiguous profile selector on the same verb exits `2`.
   evidence: `sync_exit_code` (`keeper-syncd/src/commands.rs:127-176`) maps `SyncError::Refused(_)` to `EXIT_FAILURE = 1` and `SyncError::Config(_)` to `EXIT_CONFIG = 2`, and the profile resolver raises `Config` for both "no such profile" and "`{wanted}` matches {n} folders; name the one you mean by its id" — reachable on `materialize`, `dehydrate`, `pin` and `unpin`. The sentence at `docs/sync.md:1318` is true of every refusal and false of the selector error beside it, so a script that branches on `1` versus non-zero mis-reads a typo'd profile name as a refusal. Pre-existing: written by story 56.4, surfaced while auditing §9's exit-code claims against §13. Not fixed here because the exit-code contract belongs to §13 and this branch is scoped to §9 plus the sentences epic 56 falsified.
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `docs/sync.md` §13 now carries its own paragraph on the selector, headed "The profile
+    selector is not a refusal, and does not exit `1`": a first argument that names no folder,
+    or that names two folders sharing one name, is a configuration error and exits **`2`** —
+    before any release gate is consulted, and on `materialize`, `dehydrate`, `pin` and `unpin`
+    alike. It spells out the consequence this entry named: a script branching on `1` versus
+    non-zero mis-reads a typo'd folder name as a refusal unless it separates the two. The
+    "Every other refusal exits `1`" sentence is left standing because it is TRUE of refusals;
+    what was missing was that the selector error is not one. Verified against
+    `sync_exit_code`, which maps `SyncError::Refused` to `EXIT_FAILURE` and
+    `SyncError::Config` to `EXIT_CONFIG` with no `_` arm. The paragraph also records the
+    narrowing story 56.14's `select` fix bought: an id always resolves to exactly one folder,
+    so a `2` from an existing folder now means two folders share a name.
+
+- source_spec: `spec-56-10-the-policy-decides-what-arrives`
+  summary: A `virtualPatterns` list consisting only of `!` protection lines sets `overrides = true` and discards the repository's committed permissive list wholesale, so a machine restating one exception silently switches the whole folder's virtualization off.
+  evidence: `VirtualPolicy::compile` (`lfs/virtual_policy.rs:196`) decides `overrides` from `Parsed::says_something()`, which is `!patterns.is_empty() || !never.is_empty()` (`:377-379`) — so a profile or folder-TOML list of `["!40-media/keep.mp4"]` replaces the committed file's positive list with an empty one while `tier()` reports `Profile`. AD-123's own rule is that a policy edit may widen what may leave and may never narrow what is protected; this narrows what is *authorized* to nothing from a line that was meant to protect one path. Pre-existing: written by story 56.1 and not reached by story 56.10's own changes, which only ask the compiled result. The honest fix is to let `overrides` consider the permissive half alone — `VirtualPolicy::authorizes_anything` added by 56.10 is already the accessor for that question — but it changes a precedence rule 56.1's tests pin, so it wants its own story and its own test over both tiers.
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `VirtualPolicy::compile` decides `overrides` from `!from_profile.patterns.is_empty()` —
+    the PERMISSIVE half alone — instead of `Parsed::says_something()`. Protections still
+    accumulate across every source, unchanged, so AD-123's rule holds in the direction it
+    was written for: a machine may widen what may leave and may never narrow what is
+    protected. What the old spelling did was the inverse — it narrowed what is AUTHORIZED to
+    nothing from a line written to protect one path.
+
+    The tier gained a fallback so it stays honest in both directions: `if overrides {
+    Profile } else if file.says_something() { PatternFile } else if
+    from_profile.says_something() { Profile } else { Unset }`. A protections-only profile
+    list over a committed file reports `PatternFile`, because the file supplied the list in
+    force; the same list over no file at all reports `Profile`, because the profile is the
+    only source that spoke and `Unset` would claim nothing configured anything.
+
+    Tests: `lfs::virtual_policy::tests::a_profile_list_of_only_protections_does_not_replace_
+    the_committed_zone` (committed `40-media/**` plus profile `["!40-media/keep.mp4"]`:
+    `other.mp4` still resolves `Virtual`, `keep.mp4` resolves `Materialize`,
+    `authorizes_anything()` is true, tier is `PatternFile` — without the fix
+    `authorizes_anything()` is false, every path resolves `Materialize`, and the tier claims
+    `Profile`) and
+    `a_protections_only_profile_list_over_no_file_is_still_the_profiles_policy`, which pins
+    the tier fallback. The four pre-existing override tests are unchanged and still pass,
+    because each of them carries a permissive pattern in its profile list.
+
+- source_spec: `spec-56-10-the-policy-decides-what-arrives`
+  summary: A path keeper has just materialized reads ` M` in `git status` until the next pass, because the sync's final `drain_journal` re-scan meets the entry inside the same wall second and keeper persists a zeroed index stat for it.
+  evidence: Measured with a temporary `git ls-files --debug` probe inside `engine.rs` across one `sync_once`: after `materialize_pending` the entry carries the content's size 4096 (its `refresh_index_stat` is correct), and after the closing `self.drain_journal(&profile, true, source)` (`engine.rs:6493`) it carries 0. gix reports the entry as racily-clean-then-modified and returns `Change::Modification { set_entry_stat_size_zero: true }`, which `git::repo::persist_observed_stats` applies through `outcome.write_changes()`. git then distrusts the cached stat, hashes the file and prints ` M`. Self-corrects on a later pass whose wall second differs, at the cost of one full-file hash, and keeper's committer repairs the stat when it stages the path — which is why no existing test sees it. Pre-existing and orthogonal to the policy: story 56.10 only surfaced it, because its fixtures are the first to assert `git status` over a path a pass materialized rather than released. `tests/virtual_arrival.rs`'s `porcelain_of` records the interaction where it bites.
   status: open
+  keep: |
+    Reviewed and kept, unchanged. It self-corrects on any later pass whose wall second
+    differs, at the cost of one full-file hash, and keeper's committer repairs the stat when
+    it stages the path — so nothing is lost and nothing is misreported for long. The
+    measurement in the evidence is the diagnosis and stands.
+
+    It becomes worth doing when gix offers a way to decline `set_entry_stat_size_zero` on a
+    `Change::Modification`, or when `persist_observed_stats` can be told to skip an entry
+    the same pass has just written — which is the honest shape, because the closing
+    `drain_journal` re-scan is meeting a file keeper itself created inside the same wall
+    second and has no business distrusting its own write.
+
+- source_spec: `spec-56-10-the-policy-decides-what-arrives`
+  summary: `virtualPatterns`, `virtualOverBytes` and `releaseTtlMs` still have no UI anywhere, so the policy story 56.10 made load-bearing can only be configured by editing `.keepervirtual` or a folder TOML by hand.
+  evidence: A repo-wide grep for those three keys finds them only in `keeper-sync`, in `keeper/src/sync_ipc.rs`'s `PRESERVED` set, and in test files; no form control, no `SyncProfileReq` field, no `ConfigTierVm` surface. AD-132 requires that a surface showing the policy also show which tier is in force, because a TOML layer outranks the form and keeps winning on every read, and `PRESERVED` means no request can express these fields today — so the UI story is a `SyncProfileReq` change plus a tier display, not a form field. Deliberately out of story 56.10's scope, which is the engine half; recorded because the owner's report was that the feature is invisible in the app, and the engine being correct is only half of that.
+  status: stale 2026-08-28 (story 56.14)
+  resolution: |
+    No longer true; story 56.12 built the surface. All three keys have form controls in
+    `src/components/sync/add-folder-form.tsx`: `SYNC_VIRTUAL_PATTERNS_LABEL` ("Files that may
+    stay away"), `SYNC_VIRTUAL_OVER_LABEL` ("Only files at or above (MB)") and
+    `SYNC_RELEASE_TTL_LABEL` ("Give local copies back after (hours)"), seeded from the profile
+    at `:576-578` and sent at `:977-988`. The entry's two specific claims are both falsified:
+    (1) `PRESERVED` no longer means no request can express them — `SyncProfileReq` carries
+    `virtualPatterns: Array<string> | null`, `virtualOverBytes` and `releaseTtlMs: number |
+    null` (`src/lib/ipc/gen/SyncProfileReq.ts:32,47`); and (2) AD-132's tier requirement is
+    met — each control is `disabled` when `folderOwned.has(<key>)` and renders
+    `syncFolderOwnedNote(<key>)` beside it, asserted by
+    `add-folder-form.test.tsx > … folder-owned …` which also proves the save omits the key.
+    The `releaseTtlMs = 0` case even has its own on-screen note (`SYNC_RELEASE_NEVER_NOTE`).
+    Story 56.14 added the missing symmetric note for the size floor — see the story-56.12
+    entry below about the size-floor box.
+
+- source_spec: spec-56-11-is-this-file-open-answered-for-real
+  summary: macOS cannot answer "is this file open", so the app's Release button and the TTL sweep still refuse `OpenUnknown` on the platform keeper is built for first.
+  evidence: Story 56.11 implements `keeper_sync::platform::probe_open_file_state` for Linux only; `probe_open_file_state`'s `#[cfg(not(target_os = "linux"))]` arm answers `OpenFileState::Unknown`, and `ShellSyncPlatform::open_file_state` delegates to it, so on macOS `Engine::release_resolved` reaches its `OpenFileState::Unknown` arm and returns `ContentRefusal::OpenUnknown` for every candidate — `sync_release_entry` from the Files pane and `release_expired`'s sweep alike. Three options were weighed and all three rejected with reasons. (1) `libproc`, the safe wrapper mirroring this crate's own `rlimit` precedent, carries an unconditional `bindgen` **build** dependency (measured from the crates.io index: `libproc` 0.14.11 → `bindgen ^0.72.1`), which puts libclang on the critical path of every macOS release build and ~30 crates into `Cargo.lock` for one function. (2) Hand-written `proc_listpids`/`proc_pidfdinfo` FFI under the audited `#[allow(unsafe_code)]` precedent: `libc` supplies `proc_listpids`, `proc_pidfdinfo`, `proc_fdinfo`, `vnode_info`, `vinfo_stat`, `PROC_PIDLISTFDS` and `PROX_FDTYPE_VNODE`, but **not** `proc_fileinfo` or the `PROC_PIDFDVNODEINFO` flavour, so the struct that carries the answer must be declared by hand, and a wrong layout reads the wrong offsets in silence. (3) `lsof` — a process spawn per candidate, absent on minimal systems, refused by AD-125 by name. Decisive on top of all three: no macOS target, SDK or runtime is reachable from the Linux development host, and the `keeper` shell crate does not compile there at all, so any macOS implementation written here would ship with zero evidence behind it. Shape when it is closed: a story run ON a macOS host, declaring `proc_fileinfo` and the `PROC_PIDFDVNODEINFO` flavour beside `libc`'s `vnode_info`/`vinfo_stat`, behind one function-level `#[allow(unsafe_code)]` in `ShellSyncPlatform` with a matching audit entry in `docs/constraints-and-limitations.md`, proved by a real held descriptor through `Engine::dehydrate_entry` exactly as `dehydrate_entry.rs::a_real_descriptor_makes_a_real_release_refuse` does on Linux — plus a runtime layout self-check so a wrong hand-declared struct fails CLOSED rather than answering `Closed`: ask the kernel about a descriptor the process itself holds on a path whose `dev`+`ino` it already knows, and answer `Unknown` on a mismatch.
+  status: open
+  keep: |
+    Reviewed and kept. All three options were weighed with reasons in the evidence above and
+    none of the facts has changed: `libproc` still carries an unconditional `bindgen` BUILD
+    dependency, which puts libclang on every machine that compiles keeper.
+
+    It becomes worth doing when one of two things changes: `libproc` drops that build
+    dependency, or the project accepts a hand-written FFI shim over
+    `proc_listpids`/`proc_pidfdinfo` with its own soundness argument and its own test on a
+    real Mac. Until then the platform answers `Unknown` and `release_resolved` refuses,
+    which is AD-125's fail-closed direction and the one that cannot lose bytes.
+
+- source_spec: spec-56-11-is-this-file-open-answered-for-real
+  summary: The Linux open-file answer carries one stated narrowing — a process owned by another uid, root included, has a descriptor table keeper cannot read — so `Closed` means "no process whose descriptor table this process may read holds this inode open" rather than "nothing holds it".
+  evidence: `/proc/<pid>/fd` is mode `0500`, so `open_file_state_under_proc`'s `PermissionDenied` arm continues the scan for a process whose `/proc/<pid>/stat` is still readable (an ordinary other-uid process) instead of refusing. Requiring total completeness was considered and rejected: pid 1 alone guarantees an unreadable descriptor table on every Linux box that has ever booted, so the strict rule answers `Unknown` — i.e. refuses every release — on every host, which is the exact failure mode the story exists to end. What is NOT narrowed, and does refuse, is a process keeper cannot even identify: an unenterable `/proc/<pid>` where the world-readable `stat` file is `EACCES` too (`hidepid=1`), a procfs in which keeper's own process does not appear (a masked container `/proc`, or a root with no resolvable `/proc/self`), an unreadable `/proc`, an unenumerable dirent, a descriptor table that stopped enumerating part-way, a descriptor whose `stat` failed for any reason but "it is gone", and a target that cannot be stat'ed. NOT `hidepid=2`: an adversarial review caught an earlier draft of this entry and of the code's own docs asserting that it refuses. It does not — it makes other users' `<pid>` directories invisible rather than unreadable, so an unprivileged keeper enumerates only its own user's processes and reads all of them, answers `Closed`, and that answer is inside the narrowed claim rather than a breach of it. Why it is not fixed here rather than merely not fixed: this refusal does not carry NFR-40 — refusal 1 (content identity) and refusal 3 (the per-object remote proof at the moment of the deletion) do — and a release is a `rename(2)` with truncation forbidden by AD-125, so an existing reader keeps its inode intact and the harm from a missed opener is that its NEXT open reads ~130 bytes of pointer text, recoverable by asking for the path again, which materializes it from the remote whose ability to serve that exact object refusal 3 had just proved. NOT from the local store: `lfsPruneLocal` defaults to on and releases the store copy precisely when the worktree holds the content, so a materialized path is exactly the state in which no local copy may be left — the same review caught that claim too. Shape if it ever needs closing: a privileged helper process that can read every descriptor table, or `F_SETLEASE` on the target before the rename — both of which need `libc`/`unsafe` in `keeper-sync` (which denies both) plus a capability the daemon does not currently ask for. Stated in `probe_open_file_state`'s doc, in `LinuxPlatform::open_file_state`'s doc and in `docs/sync.md` §"What a release refuses to do" rather than left to be discovered.
+  status: open
+  keep: |
+    Reviewed and kept as a deliberate and correct trade-off, not a defect. Requiring total
+    completeness was considered and rejected for a reason that is arithmetic rather than
+    aesthetic: pid 1 alone guarantees an unreadable descriptor table on every Linux box that
+    has ever booted, so the strict rule answers `Unknown` — refusing EVERY release — on
+    every host, which is the exact failure mode story 56.11 existed to end.
+
+    It would become worth revisiting only if keeper gained a privileged helper, which would
+    be a far larger security decision than the problem justifies. What is already NOT
+    narrowed is the case that matters: a process keeper cannot even identify refuses rather
+    than being skipped. This entry stays open because the narrowing is a documented property
+    of `Closed` that a future reader must not mistake for completeness.
+
+- source_spec: spec-56-11-is-this-file-open-answered-for-real
+  summary: The 56.5 entry above — "the release sweep pays a whole-file hash and a remote round trip per candidate before reaching the `OpenUnknown` refusal" — is now moot on Linux and still stands on macOS and Windows, so its remaining value is smaller than its original wording implies.
+  evidence: That entry (source_spec `spec-56-5-it-lets-go-a-day-after-it-landed`, search this file for `OpenUnknown`) rests on the premise that `open_file_state` answers `Unknown` on every production host, and quotes `OpenFileState::Unknown`'s own doc saying no platform answers it yet. Story 56.11 removes that premise on Linux: `LinuxPlatform` and `ShellSyncPlatform` both delegate to `keeper_sync::platform::probe_open_file_state`, so a Linux sweep pass now spends its hash and its round trip on candidates that go on to be RELEASED — the cost the guard order was designed to pay — rather than on candidates that were always going to be declined. The proposed fix in that entry, a single per-pass capability probe that lets the sweep decline before hashing, therefore only ever helps a platform that answers `Unknown` for the whole pass, which after this story means macOS and Windows. Left in place unedited and deliberately: the observation was correct when it was written and the shape it describes is still the right fix for the platforms it still applies to; what changed is which hosts it applies to, and the honest record of that is a new entry rather than a rewrite of an old one. When the macOS entry above is closed, this entry and the 56.5 one both die with it.
+  status: stale 2026-08-28
+  resolution: |
+    Discharged rather than outstanding. This entry's content is an annotation on the
+    story-56.5 guard-order entry — its purpose was to record that story 56.11 removed that
+    entry's premise on Linux and shrank its value — and story 56.14 folded the whole
+    argument into that entry's own `keep` block, including the condition under which it
+    becomes worth doing (a second platform shipping a real answer, or a per-pass capability
+    probe on a host that still cannot answer).
+
+    Nothing is left here for a reader to act on, and leaving it open would mean two entries
+    describing one decision, which is the state that made this epic's ledger hard to read.
+
+- source_spec: spec-56-11-is-this-file-open-answered-for-real
+  summary: A descriptor held on a hung hard-mounted NFS export or an unresponsive FUSE filesystem makes the `/proc` walk block with no bound, and the callers are `Engine::dehydrate_entry` (driven by the Files pane's Release action) and `release_expired`'s sweep, both holding the profile's reservation.
+  evidence: `open_file_state_under_proc` calls `std::fs::metadata` on `<pid>/fd/<n>`, which resolves the magic link and stats the target inode; for a hard NFS mount whose server has stopped answering that call is uninterruptible and std offers no timeout. The walk visits every descriptor of every readable process, so one such descriptor held by any same-uid process on the machine stalls the release. Before story 56.11 `open_file_state` returned a constant and could not block at all, so the exposure is new — though `release_resolved` already reads every byte of the candidate through `lfs::stage::content_oid` on the same thread, so blocking-in-async is this method's existing shape rather than something 56.11 introduced. The two mitigations that were considered and rejected here: a `read_link` prefilter that stats only descriptors whose path string could be the target reintroduces exactly the string comparison the inode identity exists to avoid, and it fails toward a false `Closed` for a hardlink or another mount namespace, which is the direction that must not be wrong; and moving the walk onto `spawn_blocking` relocates the stall without bounding it. Shape: a bounded probe on a dedicated thread whose result is abandoned after a deadline, with the abandonment answering `Unknown`.
+  status: open
+  keep: |
+    Reviewed and kept. Real, and new in story 56.11, and not fixable with `std`:
+    `std::fs::metadata` on a path under a hard-mounted NFS export whose server has stopped
+    answering is uninterruptible, and std offers no timeout. Story 56.14's `spawn_blocking`
+    around `content_oid` does NOT help here — it moves the hash off the runtime worker, and
+    the `/proc` walk still runs on the caller's thread while the profile's reservation is
+    held.
+
+    It becomes worth doing when the walk can be moved behind a bounded worker whose
+    abandonment is safe. That is the whole difficulty: a thread blocked in an
+    uninterruptible syscall cannot be cancelled, so the design has to accept LEAKING it and
+    answer `Unknown` on the timeout — which is a decision about leaking a thread per hung
+    mount per pass, not an edit.
+
+- source_spec: spec-56-11-is-this-file-open-answered-for-real
+  summary: `sync_release_entry`'s doc comment in the shell crate still tells the reader that no platform can answer the open-file question, "which is every host today" — false since story 56.11 for Linux, and it is the doc on the command the Files pane's Release action calls.
+  evidence: `src-tauri/crates/keeper/src/sync_ipc.rs:2518-2519` reads "On a host whose platform cannot answer \"is this file open\" race-free — which is every host today — the honest answer is `ContentRefusal::OpenUnknown`". `ShellSyncPlatform::open_file_state` now delegates to `keeper_sync::platform::probe_open_file_state`, so on Linux the command reaches the rename and that sentence is true only of macOS and Windows. Not fixed in story 56.11 because `sync_ipc.rs` is owned by a concurrent story in the same worktree and a drive-by doc edit there would collide; the coordinator confirmed it is being carried into that story's brief. Doc comment only, no behaviour.
+  status: open
+  keep: |
+    Kept, and the blocker is unchanged and now permanent for this branch (story 56.14). The
+    file is `src-tauri/crates/keeper/src/sync_ipc.rs`, the Tauri shell crate, which cannot be
+    compiled on this host — so neither agent on story 56.14 may touch it, for the same reason
+    the concurrent story could not: an edit nobody can build is worse than a stale comment.
+    The exact symbol and the exact false sentence, so the next person needs no search:
+    `sync_release_entry`'s doc comment reads "On a host whose platform cannot answer \"is this
+    file open\" race-free — which is every host today — the honest answer is
+    `ContentRefusal::OpenUnknown`". Since story 56.11 that is true of macOS and Windows only:
+    `ShellSyncPlatform::open_file_state` delegates to
+    `keeper_sync::platform::probe_open_file_state`, whose Linux arm reads `/proc/<pid>/fd`. The
+    replacement sentence should say exactly that. Doc comment only, no behaviour, and
+    `docs/sync.md` §9 and §13 already state the per-platform split correctly, so no user-facing
+    document is wrong — only the comment on the command.
+
+- source_spec: spec-56-11-is-this-file-open-answered-for-real
+  summary: Two of the ten fail-closed guards in the `/proc` walk cannot be reached by any test this repository can write — the `Err` dirent arms of the two `read_dir` iterators — and are therefore present but unproven.
+  evidence: A mutation sweep over every guard in `open_file_state_under_proc` (each replaced with a `Closed`-or-continue mutant, the single test run, the file restored and verified byte-for-byte by SHA-256) caught eight of ten. The two survivors are the `let Ok(entry) = entry else { return Unknown }` in the `/proc` enumeration and the `let Ok(fd) = fd else { return Unknown }` inside `<pid>/fd`: producing an `Err` from a `ReadDir` iterator needs `getdents` to fail part-way through, which no chmod, symlink, `ENOTDIR` fixture or unprivileged mount can arrange. The `dev` half of the `ino == ino && dev == dev` match is unprovable for the same class of reason — it needs two files on two different devices sharing an inode number. All three stay because removing them is a real defect; recorded so a future reviewer does not read their absence from the sweep as an oversight. Shape: a `fuse`-backed or `errno`-injecting test filesystem, which the permissive-only licence firewall and the no-new-dependency rule both argue against for this alone.
+  status: open
+  keep: |
+    Reviewed and kept. The two `Err` dirent arms need `getdents` to fail part-way through an
+    open directory, and the `dev` half of the inode match needs two files on two different
+    devices sharing an inode number; neither is arrangeable by any fixture this repository
+    can write, and the mutation sweep that found them caught the other eight guards, which
+    is the evidence that the eight are load-bearing and tested.
+
+    It becomes worth doing if the crate ever gains a filesystem seam that can inject a
+    failing `ReadDir` — at which point all three become one test. Removing the guards to
+    raise a coverage number is the wrong direction: they are the fail-closed arms, and an
+    untested guard that refuses is safer than no guard at all.
+
+- source_spec: spec-56-12-drive-settings-for-virtual-files
+  summary: On the ADD path the folder-owned key set is always empty, so a folder that already ships a `.keeper/keeper.toml` gets every Advanced control rendered as editable and its first save silently discarded — which is the canonical AD-132 scenario, not an edge case.
+  evidence: `add-folder-form.tsx` derives `folderOwned` from `profile?.folderOwned ?? []`, and an add form has no profile. By the time Save is pressed the form DOES have a chosen `localPath`, so the answer is knowable — but `SyncProfileVm.folderOwned` is minted by `SyncProfileVm::from`, which needs a stored profile. `profile::as_stored(incoming, None)` then restores the TYPE DEFAULT rather than the file's value, and the add branch blanks the form afterwards, so the person cannot even see what was dropped. The fix is a per-path question the form can ask before its first save — a `sync_folder_owned_fields(localPath)` command over `keeper_sync::profile::folder::owned_fields` against a synthetic profile — which is a new IPC command and outside a story that added none.
+  status: open
+  keep: |
+    Kept, and blocked on the shell crate (story 56.14). The entry is right that this is the
+    canonical AD-132 scenario rather than an edge case, and right about the fix: a
+    `sync_folder_owned_fields(localPath)` command over
+    `keeper_sync::profile::folder::owned_fields` against a synthetic profile, asked by the form
+    before its first save. It cannot be built here. A new `#[tauri::command]` lives in
+    `src-tauri/crates/keeper/src/sync_ipc.rs` and must be registered in that crate's handler
+    list, and the shell crate does not compile on this host — and `SyncProfileVm` itself is
+    defined in that same file, so there is no keeper-core seam to put it behind either. What
+    would have to change: a story that can build `keeper`, at which point the form change is
+    small (call the command when `localPath` is chosen, seed `folderOwned` from the answer,
+    and render the same disabled controls plus `syncFolderOwnedNote` the EDIT path already
+    renders — the whole UI half already exists and is tested).
+
+- source_spec: spec-56-12-drive-settings-for-virtual-files
+  summary: `branch`, `excludes` and `tags` are folder-ownable and have BARE slots on `SyncProfileReq`, so a form that disables them still re-sends the in-force value and makes `profile::as_stored` log a shadowed-change warning on every save of such a folder.
+  evidence: `as_stored` (`profile/folder.rs`) compares the incoming value against the TABLE row and pushes any difference into `shadowed` before its `tracing::warn!`. For an owned key the in-force value differs from the table value by definition — that is what "owned" means — so the warning fires for a change nobody could make, which poisons the one diagnostic this mechanism has. The data is safe (the value is restored). Every other ownable key the form renders (`lfsThresholdBytes`, `commitSubjectTemplate`, `notes`, `recordings`, `sessions`, and the three virtualization keys) has an `Option` slot and is omitted correctly. Fixing these three means widening three bare request fields to `Option`, which moves them across the EXPRESSED/PRESERVED classification and needs the guard test re-argued.
+  status: open
+  keep: |
+    Kept, and blocked on the shell crate (story 56.14). `SyncProfileReq` is defined in
+    `src-tauri/crates/keeper/src/sync_ipc.rs:648`, not in `keeper-core` — so widening `branch`,
+    `excludes` and `tags` to `Option` is a change to a crate that cannot be compiled on this
+    host, and it also moves those three fields across the EXPRESSED/PRESERVED classification
+    that the same file owns. Recorded rather than attempted because the DATA is safe: the
+    value is restored, and what is damaged is only the `shadowed` diagnostic, which fires for
+    a change nobody could make. What would have to change for it to become worth doing: a
+    story that can build `keeper` AND is willing to re-decide the EXPRESSED/PRESERVED split
+    for three fields at once — the two are not separable, which is why this is a decision and
+    not a chore.
+
+- source_spec: spec-56-12-drive-settings-for-virtual-files
+  summary: `SyncProfile::validate` still does not compile `virtual_patterns`, so the form now accepts a malformed glob that the engine will refuse at run time, nowhere near the box.
+  evidence: `VirtualPolicy::compile` states that a malformed pattern is "a hard `SyncError::Config` naming its source … never a silently dropped pattern (FR-329)". `validate` checks the release TTL floor and ceiling, the subject placeholders and subpath escapes — the `commit_subject_template` arm is even prefaced "Refused here, where the user can still see the field" — and never touches the two glob lists. Before this story `virtual_patterns` was reachable only from a daemon config or a TOML file; the form makes it typeable, so `scans/[` is now saveable and the next sync fails with a config error the person cannot connect to what they typed. The fix is a `PatternSet::anchored` check over the profile list inside `validate`, which is a behaviour change to a shipped field (`lfs_never` has the same gap) and needs its own story.
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `SyncProfile::validate` calls the new `lfs::virtual_policy::check_patterns`, which
+    compiles both halves of the list through the same `Parsed::of` with `Comments::Literal`
+    and the same `PatternSet::anchored` that `VirtualPolicy::compile` uses — so it can
+    neither accept something `compile` will refuse nor refuse something `compile` would
+    accept. The compiled sets are discarded: `validate` is asked whether this is writable,
+    not what it means.
+
+    `validate` runs on every write AND every load, so the refusal is now strictly earlier
+    than "at startup", and it lands where the entry said it had to: at the box the person
+    typed into. The message quotes the offending entry and names the config key, because the
+    Settings form renders the error string verbatim under the field and "invalid
+    configuration" alone is unactionable there.
+
+    An empty list and a `!`-only list both still validate. The first is the documented
+    spelling of "this machine says nothing"; the second is a policy about exceptions and now
+    compiles as one. Only `virtual_patterns` is checked — `excludes` and `lfsNever` predate
+    this and are validated where they are compiled, and widening the bar under a stored
+    profile that already carries a pattern would refuse to LOAD a folder that works today.
+
+    Tests:
+    `profile::tests::a_malformed_virtual_pattern_is_refused_where_the_person_typed_it`
+    (`validate` errs on `scans/[` with the entry quoted; the empty list and the `!`-only
+    list still pass) and `lfs::virtual_policy::tests::check_patterns_accepts_every_legitimat
+    e_list_and_refuses_a_malformed_glob`. Without the fix `scans/[` is saveable and the
+    folder then fails its next sync, its next verify and its next release with a config
+    error nobody can connect to what they typed.
+
+- source_spec: spec-56-12-drive-settings-for-virtual-files
+  summary: `SyncProfileVm.folder_owned` re-derives the folder overlay that `db::list_profiles` computed and threw away one line earlier, so the value and its ownership flag are read at two different instants and can disagree.
+  evidence: `db::list_profiles` calls `profile::in_force`, which runs `FolderTier::apply` and discards `FolderOutcome::owned`; `SyncProfileVm::from` then calls `profile::owned_fields`, running `apply` a second time. Besides the duplicated TOML parse and `validate` per layer, the two reads can straddle an edit of the file: if the key vanishes between them the VM carries the FILE's value with `folderOwned` not naming it, so the control renders editable holding a value the person never chose, and the next save writes it into the table as a deliberate choice. `owned_fields`' own doc calls that "the wrong direction to be wrong in". The fix is to thread `FolderOutcome` (or just `owned`) out of `in_force` and `db::list_profiles` instead of asking twice.
+  status: open
+  keep: |
+    Kept, and blocked in a way worth stating precisely, because the obvious fix is a dead end
+    (story 56.14). Threading `FolderOutcome` out of `profile::in_force` and `db::list_profiles`
+    would land in `SyncProfileVm::from`, and `SyncProfileVm` is defined in
+    `src-tauri/crates/keeper/src/sync_ipc.rs:76` — the shell crate, which cannot be compiled on
+    this host. So the keeper-sync signature change has nowhere to arrive: it would break the
+    only consumer and leave the tree uncompilable for the very agent who could not fix it. The
+    sibling agent offered to make the keeper-sync half and was asked NOT to, for that reason.
+    The design stands as the entry states it — thread `owned` out of `in_force` rather than
+    running `FolderTier::apply` a second time — and it also removes a duplicated TOML parse and
+    a `validate` per layer. What would have to change: a story that can build `keeper`.
+
+- source_spec: spec-56-12-drive-settings-for-virtual-files
+  summary: The verify counts are only reachable from a folder keeper has already flagged as needing attention, so a healthy virtual folder can never show them.
+  evidence: `sync-section.tsx` renders the "Check files" button inside `{status?.needsAttention === true && <Alert>…}`. `syncVerifyCountSentence`'s own argument is that "nothing was wrong" is also what a folder with nothing in it reports — precisely the healthy case the button cannot be pressed in. The per-folder footprint sentence does carry the same two counts on every folder card, so the story's visibility claim is met; this is about the second surface. Moving or duplicating the check action onto a healthy row is a Settings-pane layout decision, not a counts change.
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    The check action moved out of the needs-attention alert and onto every folder card's own
+    action row, beside Sync now / Pause / Edit / Remove (`settings/sync-section.tsx`). So a
+    healthy folder can press it, which is exactly the case `syncVerifyCountSentence`'s own
+    argument is about: "nothing was wrong" is also what a check over an empty folder reports,
+    and the count that separates them was reachable only from a folder keeper had already
+    flagged. MOVED rather than duplicated — two controls with one label in one card is two
+    things to keep in step and a reader wondering whether they do the same thing; the alert
+    keeps its sentence and the report still renders under it either way. The entry called this
+    a Settings-pane layout decision, and that is what it was: the decision is that a check is
+    a property of the folder, not of the fault. Tests:
+    `sync-section.test.tsx > offers the check on a healthy folder and reports its counts there`
+    (fails before the move — the button did not exist on a healthy card — and also asserts
+    there is exactly ONE such control, so the duplication that was rejected cannot creep back)
+    and `> keeps exactly one check control on a flagged folder`.
+
+- source_spec: spec-56-12-drive-settings-for-virtual-files
+  summary: The size-floor box silently means "no floor" for any input `pinnedValue` cannot read, with nothing on screen, while the release box beside it explains both of its coercions.
+  evidence: `add-folder-form.tsx` maps `pinnedValue(form.virtualOverMb) === null` to `0`, and `0` is not a neutral fallback — it is the documented instruction that every matched file may stay away. The release box next to it renders `SYNC_RELEASE_NEVER_NOTE` for its zero and an in-force note for its substitutions; this one renders only its static note. The seeded value is always a number so the common case is unaffected, which is why it was not fixed here, but the asymmetry between two adjacent boxes with the same failure shape is unexplained.
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    The size-floor box now renders `SYNC_VIRTUAL_OVER_NONE_NOTE` — "No size floor right now:
+    every matched file may stay away, however small it is." — whenever its content does not
+    read as a positive number, which is exactly the `pinnedValue(...) === null` that sends `0`.
+    The condition is `pinnedValue`'s own answer and not a second test, so what the note claims
+    and what the save sends cannot come apart. That closes the asymmetry the entry names: the
+    release box beside it explains both of its coercions and this one explained neither, while
+    `0` here is not a neutral fallback but the documented instruction that every matched file
+    may stay away — the WIDEST setting the field has, and the one nothing was said about. The
+    entry noted the seeded value is always a number so the common case is unaffected; that is
+    still true and the note is still right for it, because a fresh form's seeded `0` DOES mean
+    no floor. Test: `add-folder-form.test.tsx > says when the size floor is off, for every
+    input that means off` — a blank field, a typed `0` and a half-typed `1e`, then a real floor
+    that must take the note away again, then a save asserted to carry `virtualOverBytes: 0`.
+
+- source_spec: `spec-56-13-what-the-end-to-end-run-found.md`
+  summary: A profile whose repository has an **unborn HEAD** — a brand-new folder added against an empty remote — commits nothing and reports `0 file(s)` on every pass, forever, so the folder never starts syncing at all.
+  evidence: Reproduced end to end with the shipped `keeper-syncd` binary against a real empty bare remote. `keeper-syncd init`, then `keeper-syncd add --name author --path <new folder with three files> --remote <empty bare repo>`, then `keeper-syncd sync author --once`: the first pass adopts the folder and initializes the repository, and every subsequent pass — including passes separated by more than `settleMs`, so the stability gate is satisfied — reports `author: 0 file(s)` and commits nothing. Giving the repository one root commit by hand (`git -C <folder> commit --allow-empty -m root`) makes the very next `sync --once` commit all three files and push them, which isolates the cause to the unborn-HEAD state rather than to the stability gate, the excludes or the remote. Pre-existing and unrelated to Epic 56: it is in the commit leg, not in anything virtual files touch. `/tmp/vf-e2e.sh` works around it with exactly that one `--allow-empty` commit and says so in a comment, which is why the harness could prove the rest of the epic while this stayed open.
+  status: open
+  keep: |
+    Not diagnosed, and not fixable from this branch: finishing it needs a reproduction with
+    the shipped `keeper-syncd` binary, which is a `cargo build` story 56.14 is forbidden to
+    run. Recorded here is the narrowing that WAS done, so the next attempt does not repeat
+    it.
+
+    The printed `0` is `Engine::commit_local`'s `return Ok(0)`, reached only when
+    `staged.is_empty()`. The count is taken BEFORE any commit is attempted, so nothing in
+    the diff or commit leg can turn a non-empty change set into `0` — a failure there
+    raises. The empty set is therefore produced upstream, in the scan leg.
+
+    Four hypotheses are ruled out with quoted code: (1) `git::commit::stage_and_commit`
+    handles an unborn parent correctly — `head_commit_id` answers `Ok(None)`, `parent_tree`
+    is `None`, the `parent_tree == Some(tree_id)` short-circuit is false, and a ROOT COMMIT
+    is created; (2) `git::repo::head_commit_id` returns `Ok(None)` on an unborn branch by
+    design, asserted by `head_commit_id_is_none_on_an_unborn_branch`; (3) gix's status DOES
+    report untracked files on an unborn HEAD with an empty index — keeper's own
+    `status_reports_untracked_files_and_nothing_else` inits a bare repository, writes one
+    file and asserts `status.untracked == ["new.txt"]`; (4) the stability gate is HEAD-
+    blind: `is_stable` consults tier-0 excludes, the dataless probe, `FileSample` and
+    `verdict`, and reads no git object at all.
+
+    Three expressions can still empty the set, in evaluation order: the `claim_walk` guard,
+    which makes a whole pass stage nothing and return `Ok` when another walk holds the
+    claim; the `WalkPolicy::tracked_only` branch that sets `dirwalk_options = None` — NOT
+    reached by the reported `sync --once` reproduction, because `poll_walk_policy` returns
+    `WalkPolicy::full()` whenever no watcher is armed; and the gate loop's
+    `StabilityVerdict::Settling` arm, which increments `held` and pushes nothing into
+    `new_paths`. For the reported CLI reproduction the third is the only remaining producer.
+
+    The open question the next attempt should answer first is the one this narrowing does
+    not explain: why a single root commit made by hand changes any of those three, given
+    that the stability gate reads no git object. Either the gate is not the producer, or
+    something between the walk and the gate is HEAD-sensitive in a way the four ruled-out
+    reads do not cover.
+
+- source_spec: `spec-56-13-what-the-end-to-end-run-found.md`
+  summary: One `ls-files --remote --json` document spells a byte count two different ways — `sizeBytes` on an LFS row and `size` on a `remote.missing[]` entry — so a consumer reading `.size` over every object with a `path` key silently gets `null` for half of them.
+  evidence: `LfsFile::size_bytes` serializes as `sizeBytes` (`lfs/listing.rs:117`) and `MissingObject::size` as `size` (`lfs/audit.rs:57`); both types appear as objects carrying a `path` key inside the same document, `Materialization`/`Release` use `sizeBytes`, and `PendingReason::Incoming` uses `size_bytes` too. This is not hypothetical: the Epic 56 end-to-end harness asserted on `.size` and read `null` for a 4 MiB virtual path whose row said `sizeBytes: 4194304`, which cost a full round of investigation before the raw document settled it. Not fixed here because `docs/sync.md` §13 calls the `--json` field names the contract, so renaming `size` (or adding an alias) is a published-contract change that needs a deprecation decision rather than an unattended edit.
+  status: open
+  keep: |
+    Reviewed and kept, and deliberately not renamed or aliased. `docs/sync.md` §13 calls the
+    `--json` field names the contract, so renaming `MissingObject::size` is a breaking
+    change for any script that reads it, and adding an alias is a second spelling of the
+    same field maintained forever — which is the defect, doubled.
+
+    The asymmetry is now documented rather than merely present, and wider than this entry
+    said: it covers `ls-files --remote --json` AND `verify --json`, because `cmd_verify`
+    nests the same `RemoteAudit` under each folder's `remote` key, and
+    `repair.unrecoverable[]` is a `Vec<MissingObject>` and spells it `size` too. `LfsFile`,
+    `Materialization` and `Release` all spell it `sizeBytes`. §13 now calls the asymmetry
+    out explicitly instead of leaving a consumer to discover it with a `null`, which is what
+    cost the epic-56 harness a round of investigation.
+
+    It becomes worth doing at the next deliberate `--json` version bump, where every field
+    can be renamed at once behind one documented break.
+
+- source_spec: `spec-56-14-the-engine-side-deferred-sweep.md`
+  summary: Nothing prunes a released `materialized` row, so the ledger grows with every path a profile has ever hydrated rather than with the paths its cone holds.
+  evidence: Story 56.14 made `db::forget_materialized` retain the row and stamp `released_at_ms` instead of deleting it, so the recency history the release clocks reason with survives a release. There is no `DELETE FROM materialized` anywhere in the crate (grep), so a path deleted or renamed upstream leaves its released row behind forever: the bound is paths-ever-hydrated, which for a folder with renames, dated exports or a rolling archive grows with time and not with the folder. Both filtered readers (`materialized_paths`, `materialized_rows`) stay correct and index-ranged, and `is_pinned` is a single-row lookup, so the cost is disk rather than time. Found by story 56.14's own review pass, which caught the `keep`'s original claim that the growth was "bounded by the folder, not by time" — that sentence has been corrected to state the real bound.
+  status: open
+  keep: |
+    Not fixed here because the rule is a decision rather than an edit: a released row is
+    worth keeping precisely so that a re-materialization inherits its clocks, so a prune has
+    to name an age past which that no longer matters — some multiple of the folder's
+    `releaseTtlMs`, which is itself per-folder and can be switched off — and it has to know
+    the path is gone upstream, which is an index read the ledger layer deliberately cannot
+    do.
+
+    It becomes worth doing when a real profile's `materialized` table is measured large
+    enough to matter, or when `sync.db` size is reported as a complaint. The shape at that
+    point is a `db::prune_released(conn, profile_id, before_ms)` called from the same sweep
+    that already holds the profile's reservation and already has the index open, so the
+    "is it still tracked" question costs nothing extra there and cannot be asked cheaply
+    anywhere else.
+
+
+- source_spec: spec-56-14-the-surface-side-deferred-sweep
+  summary: CI's own runners flake roughly one test per run, in a different file each time, and three separate names have now been observed failing on branches that do not touch them.
+  evidence: |
+    On the epic-56 follow-up stack: `files-pane.test.tsx > re-reads a remembered
+    folder once when Refresh rescues a failed first list` failed on #285, whose
+    diff touches no frontend file at all (`git diff main..feat/56-11 -- src/` is
+    empty) and which passed on rerun; `find-panel.test.tsx > shows a query that
+    arrived from somewhere other than these fields` and
+    `keeper-core/tests/recordings_search_perf.rs::recording_search_p95_under_50ms_at_10k_sessions`
+    both failed on #288, whose diff touches neither `src/components/notes` nor
+    `keeper-core/tests`. The perf test is machine-scaled and also failed once on
+    the macOS gate host before passing on an immediate rerun (74.98 ms against a
+    64.36 ms scaled budget, worst shape "sub-trigram LIKE fallback" at 145 ms).
+    Locally all three pass. This is CI-runner contention, not three defects, and
+    the right fix is a decision about the runner size or about how a
+    machine-scaled budget absorbs a noisy neighbour - not a retry around the
+    assertions.
+  status: open
+  keep: |
+    Becomes worth doing when a flake blocks a merge train rather than costing one
+    rerun, or when the same test name repeats. A per-test retry would hide the
+    signal that the runners are oversubscribed, so the honest first step is to
+    measure how often it happens across a week of runs.

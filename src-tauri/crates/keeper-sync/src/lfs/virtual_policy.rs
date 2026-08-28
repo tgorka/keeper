@@ -189,11 +189,23 @@ impl VirtualPolicy {
         // is the first character of a path, not the start of a remark.
         let from_profile = Parsed::of(profile.virtual_patterns.iter(), Comments::Literal);
 
-        // A profile list that says something replaces the file's wholesale
-        // (AD-122). Judged on what it parses to, not on whether the key exists:
-        // a stray blank or comment-shaped entry must not silently mute a
-        // repository's committed policy while `tier` claims a policy is in force.
-        let overrides = from_profile.says_something();
+        // A profile list that says what may stay away replaces the file's
+        // permissive list wholesale (AD-122). Judged on what it parses to, not
+        // on whether the key exists: a stray blank or comment-shaped entry must
+        // not silently mute a repository's committed policy while `tier` claims
+        // a policy is in force.
+        //
+        // **The PERMISSIVE half decides it, and only that half** (Story 56.14).
+        // Asking `says_something()` — either half — let a list of nothing but
+        // `!` protections replace the committed permissive list with an EMPTY
+        // one: a machine restating one exception switched the whole folder's
+        // virtualization off, silently, while `tier()` reported `Profile`.
+        // AD-123's rule is that a policy edit may widen what may leave and may
+        // never narrow what is protected, and that spelling narrowed what is
+        // *authorized* to nothing from a line written to protect one path. A
+        // protection is not a claim about the zone; it is an exception inside
+        // whatever zone is in force, and the union below is where it belongs.
+        let overrides = !from_profile.patterns.is_empty();
         let (source, positive) = if overrides {
             (PROFILE_SOURCE, &from_profile.patterns)
         } else {
@@ -209,10 +221,17 @@ impl VirtualPolicy {
         never.extend(Parsed::entries(PROFILE_SOURCE, &from_profile.never));
         let never = PatternSet::anchored(&never)?;
 
+        // Which tier the list in force came from, in the order it is decided
+        // above: the profile when it supplied the permissive list, the file when
+        // it did, and the profile again when it is the only source that spoke at
+        // all — a protections-only profile list over no file is a policy, and
+        // reporting `Unset` for it would say nothing configured anything.
         let tier = if overrides {
             VirtualPolicyTier::Profile
         } else if file.says_something() {
             VirtualPolicyTier::PatternFile
+        } else if from_profile.says_something() {
+            VirtualPolicyTier::Profile
         } else {
             VirtualPolicyTier::Unset
         };
@@ -272,6 +291,52 @@ impl VirtualPolicy {
     pub fn tier(&self) -> VirtualPolicyTier {
         self.tier
     }
+
+    /// Whether **any** path could be answered [`Virtualization::Virtual`] at
+    /// all.
+    ///
+    /// Distinct from [`Self::tier`], and the distinction is load-bearing rather
+    /// than pedantic. `tier` answers *which list decided what may stay away*,
+    /// and it is `Unset` only when no source said anything — but a source that
+    /// consists of nothing but `!` protections **does** say something, so a
+    /// committed `.keepervirtual` holding only `!30-masters/**` compiles to an
+    /// empty permissive set and a tier of
+    /// [`VirtualPolicyTier::PatternFile`]. A caller asking "is there any point
+    /// consulting me?" — [`crate::engine`]'s release gate is the one that must,
+    /// because the alternative is opening the repository and reading the index
+    /// once per candidate row to be told no — has to ask this, not the tier.
+    ///
+    /// It answers about the permissive half only. A protection cannot make a
+    /// path virtual, so a policy that authorizes nothing answers `Materialize`
+    /// for every path however many protections it carries.
+    pub fn authorizes_anything(&self) -> bool {
+        !self.patterns.is_empty()
+    }
+}
+
+/// Refuse a `virtualPatterns` list [`VirtualPolicy::compile`] would refuse
+/// later (Story 56.14).
+///
+/// Called from [`crate::profile::SyncProfile::validate`], which runs on every
+/// write and on every load, so a malformed glob is refused at the box the
+/// person typed it into rather than at the next sync. `compile` is the
+/// authority on what is well formed and this shares its machinery — the same
+/// [`Parsed::of`] with [`Comments::Literal`], the same
+/// [`PatternSet::anchored`] — so it can neither accept something `compile`
+/// will refuse nor refuse something `compile` would accept.
+///
+/// It checks the profile list only, and both halves of it: a malformed
+/// protection is as fatal to `compile` as a malformed authorization, and
+/// `compile` reads both from the same field.
+///
+/// The compiled sets are discarded. `validate` is asked whether this is
+/// writable, not what it means, and the answer costs one `GlobSet` build over
+/// a list a person typed by hand.
+pub fn check_patterns(entries: &[String]) -> Result<()> {
+    let parsed = Parsed::of(entries.iter(), Comments::Literal);
+    PatternSet::anchored(&Parsed::entries(PROFILE_SOURCE, &parsed.patterns))?;
+    PatternSet::anchored(&Parsed::entries(PROFILE_SOURCE, &parsed.never))?;
+    Ok(())
 }
 
 /// Whether a leading `#` starts a remark in this source.
@@ -776,6 +841,150 @@ mod tests {
             policy.resolve(Path::new("90-stored/disk.img"), 10_000_000),
             Virtualization::Materialize,
             "the stored row is the base the file overrides, not a merge partner"
+        );
+    }
+
+    /// A policy made of nothing but protections is **in force** and authorizes
+    /// **nothing** — and the two questions have to be asked separately (Story
+    /// 56.10).
+    ///
+    /// A repository owner pre-protecting a zone before authorizing any is an
+    /// ordinary thing to commit, and `tier` says `PatternFile` for it, quite
+    /// correctly: a list did decide what may stay away, and the answer was
+    /// "nothing". A caller that read the tier as "there is something here worth
+    /// asking about" would open the repository and parse the index once per
+    /// candidate row on every sync of that folder, forever, to be told no.
+    #[test]
+    fn a_policy_of_only_protections_is_in_force_and_authorizes_nothing() {
+        let dir = worktree(Some("!30-masters/**\n"));
+        let policy = VirtualPolicy::compile(&profile(dir.path())).expect("compiles");
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::PatternFile,
+            "a `!` line is a source saying something"
+        );
+        assert!(
+            !policy.authorizes_anything(),
+            "...and it authorizes nothing, which is the question a caller has to ask"
+        );
+        for path in ["30-masters/a.mp4", "40-media/a.mp4", "a.mp4"] {
+            assert_eq!(
+                policy.resolve(Path::new(path), 10_000_000),
+                Virtualization::Materialize,
+                "{path}: nothing may stay away under a policy with no permissive line"
+            );
+        }
+
+        let named = worktree(Some("40-media/**\n!40-media/keep.mp4\n"));
+        let policy = VirtualPolicy::compile(&profile(named.path())).expect("compiles");
+        assert!(
+            policy.authorizes_anything(),
+            "one permissive line is what makes the policy worth consulting"
+        );
+    }
+
+    /// A profile list of nothing but `!` protections does **not** replace the
+    /// committed file's permissive list (Story 56.14).
+    ///
+    /// A protection is not a claim about the zone — it is an exception inside
+    /// whatever zone is in force — so only the PERMISSIVE half of a profile
+    /// list can override the committed one. Without the fix `overrides` asked
+    /// `says_something()`, which either half satisfies: the empty profile
+    /// permissive list replaced the committed `40-media/**`,
+    /// `authorizes_anything()` went false, `40-media/other.mp4` read
+    /// `Materialize` and `tier()` reported `Profile` — so a machine restating
+    /// ONE exception silently switched the whole folder's virtualization off
+    /// from a line written to PROTECT one path, which narrows what is
+    /// authorized to nothing and is the inverse of AD-123's rule.
+    #[test]
+    fn a_profile_list_of_only_protections_does_not_replace_the_committed_zone() {
+        let dir = worktree(Some("40-media/**\n"));
+        let mut p = profile(dir.path());
+        p.virtual_patterns = vec!["!40-media/keep.mp4".to_owned()];
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+        assert_eq!(
+            policy.resolve(Path::new("40-media/other.mp4"), 10_000_000),
+            Virtualization::Virtual,
+            "the repository's zone survives a machine that only named an exception"
+        );
+        assert_eq!(
+            policy.resolve(Path::new("40-media/keep.mp4"), 10_000_000),
+            Virtualization::Materialize,
+            "and the machine's own protection applies inside it"
+        );
+        assert!(
+            policy.authorizes_anything(),
+            "a protection cannot empty the permissive list it was written against"
+        );
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::PatternFile,
+            "the file supplied the list in force, so that is the file to edit"
+        );
+    }
+
+    /// A profile list of only protections, over no committed file at all, is
+    /// still a policy and still authorizes nothing (Story 56.14).
+    ///
+    /// This is the tier fallback the fix adds: the profile is the only source
+    /// that spoke, so reporting `Unset` would say nothing configured anything.
+    /// Without the fix the answer was `Profile` for the wrong reason — an
+    /// override that had discarded a list — and after the naive repair, which
+    /// only tightens `overrides`, it would read `Unset` for a folder that does
+    /// carry a policy.
+    #[test]
+    fn a_protections_only_profile_list_over_no_file_is_still_the_profiles_policy() {
+        let dir = worktree(None);
+        let mut p = profile(dir.path());
+        p.virtual_patterns = vec!["!30-masters/**".to_owned()];
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+        assert!(
+            !policy.authorizes_anything(),
+            "no source stated a permissive line, so nothing may stay away"
+        );
+        for path in ["30-masters/a.mp4", "40-media/a.mp4", "a.mp4"] {
+            assert_eq!(
+                policy.resolve(Path::new(path), 10_000_000),
+                Virtualization::Materialize,
+                "{path}: a policy with no permissive line authorizes nothing"
+            );
+        }
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::Profile,
+            "the profile is the only source that spoke, and it did speak"
+        );
+    }
+
+    /// `check_patterns` refuses exactly what `compile` would refuse, so the
+    /// Settings form can say no at the box (Story 56.14, FR-329).
+    ///
+    /// FR-329 says a malformed pattern is a hard `SyncError::Config` naming its
+    /// source and never a silently dropped pattern. Without the fix there was
+    /// no such entry point at all: nothing compiled the list before it was
+    /// stored, so `scans/[` was accepted and only the next sync said so.
+    #[test]
+    fn check_patterns_accepts_every_legitimate_list_and_refuses_a_malformed_glob() {
+        check_patterns(&[]).expect("an empty list is the documented spelling of silence");
+        check_patterns(&["!30-masters/**".to_owned()])
+            .expect("a list of only protections is a policy about exceptions");
+        check_patterns(&["40-media/**".to_owned(), "!40-media/keep.mp4".to_owned()])
+            .expect("and a well-formed list of both halves is the ordinary case");
+
+        let err = check_patterns(&["scans/[".to_owned()])
+            .expect_err("an unclosed character class must not be saveable");
+        assert!(
+            matches!(err, SyncError::Config(_)),
+            "a bad glob is a configuration refusal, got {err:?}"
+        );
+        let text = format!("{err}");
+        assert!(
+            text.contains("scans/["),
+            "the message must quote the entry as typed, got: {text}"
+        );
+        assert!(
+            text.contains(PROFILE_SOURCE),
+            "and name the list it is in, got: {text}"
         );
     }
 

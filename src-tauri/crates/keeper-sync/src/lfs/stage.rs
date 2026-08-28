@@ -750,13 +750,72 @@ pub fn ensure_attributes(root: &Path, patterns: &[String]) -> Result<bool> {
 /// Streams: the file is read in bounded chunks, hashed as it goes, and written
 /// straight into the store's staging area. Nothing is ever fully buffered,
 /// which is the whole point.
+///
+/// # It refuses anything that does not lead to a regular file, before it opens it
+///
+/// Story 56.14. `File::open` on a FIFO with no writer **blocks forever**, with
+/// no timeout std can offer — `copy::describe_kind` records the same hazard
+/// beside `copy::classify`'s `!meta.is_file()` refusal, which is the precedent
+/// this mirrors. Two callers reach here. [`prepare`] filters
+/// `!metadata.is_file()` itself before it ever calls this, so the refusal is
+/// dead code there; `Engine::republish_missing_objects` does not, and reaches
+/// here for any path whose worktree file is not the pointer for the object it
+/// is repairing — a FIFO, a socket or a device node standing at that path is
+/// one of those. Hanging is the worst possible answer: the repair pass holds
+/// the profile's reservation and the process never returns.
+///
+/// **A symlink is FOLLOWED, deliberately.** `File::open` has always followed
+/// one, so a path whose content lives on another volume behind a link is
+/// content `republish_missing_objects` has always been able to rebuild an
+/// object from, and refusing it on the strength of the `lstat` alone would
+/// report that object unrecoverable — "those bytes exist on some other machine
+/// or nowhere" — about a file sitting right there. So the question is asked
+/// twice: what is at the path, and, when that is a link, what it leads to. A
+/// link to a FIFO is refused by the second answer.
+///
+/// **The window is narrowed, not closed.** A regular file replaced by a FIFO
+/// between the `stat` and the `open` still blocks: `file.metadata()` is an
+/// `fstat` on the already-opened handle, so it cannot run until the `open`
+/// returns. Closing it needs `O_NONBLOCK`, which needs the constant, which
+/// needs `libc` — a dependency this crate does not carry and which its
+/// `deny(unsafe_code)` posture argues against. What the pre-open stat buys is
+/// the difference between "a FIFO standing at the path hangs the repair pass,
+/// always" and "a FIFO substituted inside a few microseconds does", and the
+/// second check catches every substitution that loses that race.
 pub fn clean(store: &LfsStore, absolute: &Path) -> Result<Pointer> {
+    let at_path = std::fs::symlink_metadata(absolute)
+        .map_err(|err| SyncError::io("stat for LFS staging", absolute, err))?;
+    // The second question, and only for a link: `metadata` follows, which is
+    // what `File::open` below is about to do anyway.
+    let followed = if at_path.is_symlink() {
+        Some(
+            std::fs::metadata(absolute)
+                .map_err(|err| SyncError::io("stat what a link leads to", absolute, err))?,
+        )
+    } else {
+        None
+    };
+    let leads_to = followed.as_ref().unwrap_or(&at_path);
+    if !leads_to.is_file() {
+        return Err(SyncError::Integrity {
+            subject: absolute.to_string_lossy().into_owned(),
+            expected: "a regular file".to_owned(),
+            actual: crate::copy::describe_kind(leads_to).to_owned(),
+        });
+    }
     let file = std::fs::File::open(absolute)
         .map_err(|err| SyncError::io("open for LFS staging", absolute, err))?;
-    let size = file
+    let opened = file
         .metadata()
-        .map_err(|err| SyncError::io("stat for LFS staging", absolute, err))?
-        .len();
+        .map_err(|err| SyncError::io("stat for LFS staging", absolute, err))?;
+    if !opened.is_file() {
+        return Err(SyncError::Integrity {
+            subject: absolute.to_string_lossy().into_owned(),
+            expected: "a regular file".to_owned(),
+            actual: crate::copy::describe_kind(&opened).to_owned(),
+        });
+    }
+    let size = opened.len();
     let (oid, written) = store.insert_streaming(file)?;
     if written != size {
         // The file changed under us mid-read. Retryable, and the caller
@@ -781,8 +840,29 @@ pub fn clean(store: &LfsStore, absolute: &Path) -> Result<Pointer> {
 /// and its reported path the same way it keyed the index lookup — otherwise on
 /// Windows a `\`-joined path would miss a pin and delete nothing from the
 /// ledger while reporting a `/`-joined path it never used.
+///
+/// # Why the translation is Windows-only (Story 56.14)
+///
+/// Because `\` is a path separator on Windows and an **ordinary filename
+/// character** everywhere else. Translating unconditionally made every verb
+/// that takes a subpath answer about a different file than the caller named on
+/// Linux and macOS: `indexed_pointer(repo, "40-media\\clip.mp4")` returned the
+/// pointer committed for `40-media/clip.mp4`, while `SparseCone::includes`,
+/// `hydrate::plan` and every `std::fs` call beside them used the literal name —
+/// so a refusal sentence could name the wrong file, and an oid and size could
+/// belong to a path the user did not ask for. A file genuinely called
+/// `40-media\clip.mp4` is legal on both those platforms and now resolves to
+/// itself, or to nothing.
+#[cfg(windows)]
 pub(crate) fn index_key(rela: &Path) -> String {
     rela.to_string_lossy().replace('\\', "/")
+}
+
+/// See the Windows arm for the whole contract. On a platform where `\` is an
+/// ordinary filename character, the index key is the path as spelled.
+#[cfg(not(windows))]
+pub(crate) fn index_key(rela: &Path) -> String {
+    rela.to_string_lossy().into_owned()
 }
 
 /// Could `blob` be an LFS pointer at all, judged from the object header?
@@ -956,31 +1036,68 @@ pub fn indexed_pointer_blob(repo: &gix::Repository, rela: &Path) -> Option<(Poin
 /// but an empty worktree file is a real size of its own and stands in for
 /// nothing, and calling every empty tracked file virtual is the failure that
 /// carve-out has already caused once (Story 34.13 review).
+///
+/// **This spelling folds an unreadable file into `None`.** A caller that would
+/// state something about the file's CONTENT on the strength of that answer must
+/// use [`read_worktree_pointer`] instead — see its doc for the sentence a fold
+/// produced.
 pub fn worktree_pointer(absolute: &Path, meta: &std::fs::Metadata) -> Option<Pointer> {
+    // The marker callers — a listing's state column, a footprint count, a
+    // browse mark — are choosing between "shows as virtual" and "shows as
+    // materialized" for a file they cannot read either way, and neither answer
+    // asserts anything about its bytes. `unwrap_or(None)` is that reading,
+    // written once here instead of at each of them.
+    read_worktree_pointer(absolute, meta).unwrap_or(None)
+}
+
+/// [`worktree_pointer`], with the read failure kept (Story 56.14).
+///
+/// Same three guards, same bounded read, same decision — the only difference is
+/// that a permission bit, an ACL, an immutable flag or an I/O error comes back
+/// as `Err` rather than as "these bytes are not pointer text".
+///
+/// # Why the distinction is not cosmetic
+///
+/// [`super::hydrate::plan`] answered `ContentRefusal::LocallyModified` —
+/// *"\"{path}\" does not hold the pointer this folder committed, so keeper will
+/// not overwrite what is there"* — for a file that does hold it and merely
+/// could not be opened. That sentence tells a person their file has a local
+/// modification to undo, about a file with no modification at all, and the
+/// remedy it implies (overwrite it) is the one thing they must not do. The same
+/// fold turned an unreadable file whose length happens to equal the pointer's
+/// into `Plan::AlreadyHeld`, i.e. "the content is here".
+///
+/// An `Err` is the honest answer for both: keeper does not know, the caller can
+/// say so and name the operating system's reason, and a retry after the
+/// permission is fixed succeeds.
+pub fn read_worktree_pointer(
+    absolute: &Path,
+    meta: &std::fs::Metadata,
+) -> std::io::Result<Option<Pointer>> {
     use std::io::Read as _;
 
     // `is_file` rather than `!is_dir`: a fifo, a socket or a device node has a
-    // length that is not a number of bytes anyone can read out of it.
+    // length that is not a number of bytes anyone can read out of it. Not an
+    // error either — the caller's own `stat` already said so, and this is a
+    // decision about the bytes rather than a failure to reach them.
     if !meta.is_file() {
-        return None;
+        return Ok(None);
     }
     let len = meta.len();
     if len == 0 || len > pointer::MAX_POINTER_BYTES as u64 {
-        return None;
+        return Ok(None);
     }
     let mut bytes = Vec::with_capacity(len as usize);
-    std::fs::File::open(absolute)
-        .ok()?
+    std::fs::File::open(absolute)?
         .take(pointer::MAX_POINTER_BYTES as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
+        .read_to_end(&mut bytes)?;
     // The cheap memcmp first, so a small ordinary file — a `.md`, a `.json` —
     // is rejected without a parse. A false positive here is harmless; the
     // parse below is the decision.
     if !pointer::is_pointer_candidate(&bytes) {
-        return None;
+        return Ok(None);
     }
-    Pointer::parse(&bytes)
+    Ok(Pointer::parse(&bytes))
 }
 
 /// Every pointer the index records, keyed by the path git spells it under.
@@ -1506,7 +1623,7 @@ pub fn pending_smudges(root: &Path, tracked: &[PathBuf]) -> Result<Vec<PendingSm
 /// and starves the journal drain — a folder that reads "Idle · 95 waiting to
 /// sync" while nothing whatsoever can run. Carrying the mode over keeps the
 /// entry clean, and the walk stat-clean with it.
-pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Result<()> {
+pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Result<Published> {
     let oid = &smudge.pointer.oid;
     if !store.contains(oid, smudge.pointer.size) {
         return Err(SyncError::Integrity {
@@ -1516,28 +1633,181 @@ pub fn materialize(store: &LfsStore, root: &Path, smudge: &PendingSmudge) -> Res
         });
     }
     let target = root.join(&smudge.path);
-    let parent = target.parent().unwrap_or(root);
-    let name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "object".to_owned());
-    let staging = parent.join(format!(".keeper.{name}.tmp"));
+    let staging = staging_path(root, &target);
 
     // Read before the copy: after the rename there is nothing left to ask.
     let mode = std::fs::symlink_metadata(&target)
         .map(|metadata| metadata.permissions())
         .ok();
-    std::fs::copy(store.object_path(oid), &staging)
-        .map_err(|err| SyncError::io("stage lfs object", staging.clone(), err))?;
-    // Applied to the staging file, so the published path never exists with the
-    // wrong mode — the same reason the copy is staged at all.
-    if let Some(mode) = mode {
-        std::fs::set_permissions(&staging, mode)
-            .map_err(|err| SyncError::io("carry the pointer's mode over", staging.clone(), err))?;
+    // Inside the fallible block, not ahead of it: an `ENOSPC` or an `EIO`
+    // part-way through a multi-gigabyte copy is the failure that leaves the
+    // LARGEST partial file, and an early `?` here would have skipped the
+    // cleanup below and left it in the owner's folder — where nothing collects
+    // it, because `exclude.rs` keeps `.keeper.*.tmp` out of every commit and
+    // out of the watcher.
+    let staged = std::fs::copy(store.object_path(oid), &staging)
+        .map_err(|err| SyncError::io("stage lfs object", staging.clone(), err))
+        .and_then(|_| {
+            // Applied to the staging file, so the published path never exists
+            // with the wrong mode — the same reason the copy is staged at all.
+            match mode {
+                Some(mode) => std::fs::set_permissions(&staging, mode).map_err(|err| {
+                    SyncError::io("carry the pointer's mode over", staging.clone(), err)
+                }),
+                None => Ok(()),
+            }
+        });
+    // The decision is re-stated here, against the file as it is one instant
+    // before the rename (Story 56.14).
+    //
+    // Every caller reaches this having established that the target holds the
+    // committed pointer — `hydrate::plan` for the request door,
+    // `pending_smudges` for both sweeps — and then spent a whole-file copy
+    // getting here. An editor save landing in that window used to be
+    // destroyed: nothing between the decision and `rename(2)` re-examined the
+    // target, so "keeper does not overwrite a local modification" was enforced
+    // where the decision was made and nowhere near where the bytes move.
+    // `dehydrate` has always re-stated its target (a `FileSample` guard); this
+    // is the other half of the same promise, and it is the half a *user* now
+    // triggers, on the file they are most likely to be saving.
+    //
+    // Re-stating the invariant rather than comparing a sample: what all three
+    // callers established is "this path holds the pointer for THIS object", so
+    // that is the sentence to re-read. It costs one `lstat` plus a bounded
+    // ~130-byte read against a copy of the whole object, and it is strictly
+    // stronger than an mtime/inode sample — a same-length pointer-text
+    // rewrite with a preserved mtime fails it.
+    let published = staged.and_then(|()| {
+        let now = match std::fs::symlink_metadata(&target) {
+            Ok(now) => now,
+            // The file is not there at all any more. A deletion, which is one
+            // of the two shapes of [`Published::TargetMoved`] — see its doc for
+            // why neither is an error. An I/O failure on the `lstat` IS one.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Published::TargetMoved);
+            }
+            Err(err) => {
+                return Err(SyncError::io(
+                    "re-stat before publishing content",
+                    target.clone(),
+                    err,
+                ));
+            }
+        };
+        let holds_it = read_worktree_pointer(&target, &now)
+            .map_err(|err| SyncError::io("re-read before publishing content", target.clone(), err))?
+            .is_some_and(|found| found.oid == *oid);
+        if !holds_it {
+            return Ok(Published::TargetMoved);
+        }
+        std::fs::rename(&staging, &target)
+            .map_err(|err| SyncError::io("publish lfs object", target.clone(), err))?;
+        Ok(Published::Content)
+    });
+    // Neither a refusal nor an error may leave a `.keeper.*.tmp` beside the
+    // user's file for a human to find: `files_write::write_unmanaged`'s
+    // precedent, and the one `dehydrate` already follows.
+    if !matches!(published, Ok(Published::Content)) {
+        let _ = std::fs::remove_file(&staging);
     }
-    std::fs::rename(&staging, &target)
-        .map_err(|err| SyncError::io("publish lfs object", target.clone(), err))?;
-    Ok(())
+    published
+}
+
+/// What [`materialize`] did, when it did not fail.
+///
+/// # Why the raced target is an outcome and not an error (Story 56.14)
+///
+/// Because two of `materialize`'s three callers are SWEEPS, and for a sweep
+/// "this path is not the committed pointer any more" is not a failure — it is
+/// the ordinary discovery the loop is built to make, arriving a few
+/// milliseconds later than usual. `Engine::materialize_pending`'s loop already
+/// `continue`s past exactly this fact twice, in its own words: *"Not a pointer
+/// any more: another arm materialized it, or the file has been replaced since
+/// the row was queued"* and *"the pointer in the worktree names a different
+/// object than the one that landed"*. A third spelling of the same discovery
+/// must land on the same rung.
+///
+/// Raising instead was measured and rejected: `materialize_pending`'s error
+/// escapes the loop, `Engine::sync_once` captures it as `arrival_fault` and
+/// **fails the whole pass**, which skips `mark_synced` — so one file being
+/// saved during a sync would abandon every remaining publish, report a failed
+/// sync, and leave the release window unarmed and `last_sync_ms` unmoved.
+/// Telling somebody their folder failed to sync because they pressed save is
+/// the class of lie this story exists to remove, not one to add.
+///
+/// The request door does the opposite and must: `Engine::materialize_held`
+/// turns this into `ContentRefusal::LocallyModified`, which is exactly what
+/// [`super::hydrate::plan`] would have answered had it looked an instant later,
+/// and exactly what a person who asked for one file needs to hear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Published {
+    /// The object's bytes are at the path now.
+    Content,
+    /// Nothing was written, and nothing is wrong. Between the caller's decision
+    /// and the `rename(2)` the target stopped holding the committed pointer —
+    /// it was edited, replaced, or deleted — so publishing over it would have
+    /// destroyed whatever is there.
+    TargetMoved,
+}
+
+/// The sibling path content is staged at before a `rename(2)` publishes it.
+///
+/// One helper for both directions, because the name is a contract with three
+/// other places and not a local detail: `exclude.rs`'s tier-0
+/// `.keeper.*.tmp` — which is what keeps the watcher from mistaking a staging
+/// file for user content, and what keeps it out of a commit — and the two
+/// publishers here, which must agree or one of them leaks a file the exclude
+/// list does not cover.
+///
+/// # It bounds the name, because the decoration is 12 bytes (Story 56.14)
+///
+/// `.keeper.` plus `.tmp` is 12 bytes on top of the file's own name, and
+/// `NAME_MAX` is a limit on one component, not on the path. So a name within 12
+/// bytes of the limit — ordinary for a generated export, a scanner's
+/// timestamped output, or any non-Latin name, where one character is 3 or 4
+/// bytes — made `create_new`/`copy` fail `ENAMETOOLONG` **every time**, and the
+/// error named the temp file rather than the cause. Such a path could never be
+/// materialized and never be released: it was invisible to both verbs, in both
+/// directions, for the life of the file.
+///
+/// The base is therefore truncated to fit, and a short digest of the *whole*
+/// original name replaces the tail — so two long names that share a prefix
+/// cannot collide at the staging path, which a plain truncation would let them
+/// do. The digest is of the name only, so the answer is deterministic: a
+/// crash-leaked staging file is found and removed by the next attempt at the
+/// same path, exactly as an untruncated one is.
+fn staging_path(root: &Path, target: &Path) -> PathBuf {
+    /// The tightest `NAME_MAX` keeper ships to. Linux and macOS both say 255
+    /// bytes; Windows counts UTF-16 units and stops at 255 for a component
+    /// too. A conservative constant beats a per-filesystem `pathconf` here:
+    /// the cost of being 4 bytes pessimistic is a slightly shorter temp name.
+    const NAME_MAX: usize = 255;
+    /// `.keeper.` (8) + `.tmp` (4).
+    const DECORATION: usize = 12;
+    /// `-` plus 8 hex characters of the digest.
+    const DIGEST: usize = 9;
+
+    let parent = target.parent().unwrap_or(root);
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "object".to_owned());
+
+    if name.len() + DECORATION <= NAME_MAX {
+        return parent.join(format!(".keeper.{name}.tmp"));
+    }
+
+    use sha2::{Digest as _, Sha256};
+    let digest = hex::encode(Sha256::digest(name.as_bytes()));
+    let room = NAME_MAX - DECORATION - DIGEST;
+    // On a char boundary: `floor_char_boundary` is unstable, and a truncation
+    // that split a multi-byte character would produce a name no filesystem
+    // accepts on Windows and a lossy one everywhere else.
+    let mut cut = room.min(name.len());
+    while cut > 0 && !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    parent.join(format!(".keeper.{}-{}.tmp", &name[..cut], &digest[..8]))
 }
 
 /// SHA-256 and length of the file at `absolute`, read in bounded chunks.
@@ -1694,12 +1964,7 @@ pub fn dehydrate(root: &Path, release: &PendingRelease) -> Result<()> {
     // nothing left to ask, and asking twice would be a second answer.
     let mode = metadata.permissions();
 
-    let parent = target.parent().unwrap_or(root);
-    let name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "object".to_owned());
-    let staging = parent.join(format!(".keeper.{name}.tmp"));
+    let staging = staging_path(root, &target);
 
     // Unlinks a symlink rather than following it; an absent path and a
     // directory both fall through to `create_new`, which refuses either way.
@@ -1789,6 +2054,181 @@ mod tests {
                 & 0o777,
             0o755,
             "and the mode is still git's, so the entry stays clean"
+        );
+    }
+
+    /// The `.keeper.*` staging files sitting in `dir`, whatever they are named.
+    ///
+    /// Listed rather than probed at one literal path because [`staging_path`]
+    /// may append a digest, so a test asserting only on `.keeper.<name>.tmp`
+    /// would pass while a truncated staging file was left in the owner's
+    /// folder.
+    fn keeper_temp_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read the folder")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .filter_map(|name| name.to_str().map(str::to_owned))
+            .filter(|name| name.starts_with(".keeper."))
+            .collect()
+    }
+
+    /// `materialize` declines a target that no longer holds the committed
+    /// pointer, and leaves the bytes standing there alone.
+    ///
+    /// Every production caller — `hydrate::plan`'s `Publish` arm and
+    /// `pending_smudges` for both sweeps — has already established that the
+    /// target holds the committed pointer, and then spent a whole-file copy
+    /// getting here. So this is that invariant re-stated one instant before
+    /// `rename(2)` rather than a new rule, and the window is wide enough for
+    /// an editor save on the very file keeper is materializing.
+    ///
+    /// The planted content is the pointer text's own length, so no length
+    /// comparison can refuse it. Without the fix `materialize` renames the
+    /// object over those bytes and the user's file is gone.
+    ///
+    /// `Published::TargetMoved` rather than an `Err`, because two of the three
+    /// callers are sweeps for which this is the ordinary discovery and not a
+    /// failure — see that variant's own doc for what raising here cost.
+    #[test]
+    fn a_target_that_no_longer_holds_the_committed_pointer_is_never_published_over() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (bytes, oid) = content(4_096);
+        let store = LfsStore::in_git_dir(root.join(".git"));
+        store
+            .insert_verified(&oid, &bytes[..], bytes.len() as u64)
+            .expect("seed the object");
+
+        let smudge = PendingSmudge {
+            path: PathBuf::from("clip.mp4"),
+            pointer: Pointer::new(oid, 4_096),
+        };
+        // Plain content, not pointer text, of exactly the length the pointer
+        // text would have had.
+        let saved = vec![b'A'; smudge.pointer.render().len()];
+        let target = root.join("clip.mp4");
+        std::fs::write(&target, &saved).expect("the save that landed in the window");
+
+        assert_eq!(
+            materialize(&store, root, &smudge).expect("declining is not a failure"),
+            Published::TargetMoved,
+            "the target does not hold the pointer any more, so nothing was written"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            saved,
+            "byte for byte what the owner left there"
+        );
+        let leftovers = keeper_temp_files(root);
+        assert!(
+            leftovers.is_empty(),
+            "and nothing was staged in their folder: {leftovers:?}"
+        );
+    }
+
+    /// `materialize` declines a target deleted since the decision, and creates
+    /// nothing.
+    ///
+    /// The other half of the same window. Without the fix the `rename(2)`
+    /// creates the file, so keeper silently undoes the deletion the user just
+    /// made and the path is present again with content they threw away.
+    #[test]
+    fn a_target_deleted_since_the_decision_is_not_recreated_by_the_publish() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (bytes, oid) = content(4_096);
+        let store = LfsStore::in_git_dir(root.join(".git"));
+        store
+            .insert_verified(&oid, &bytes[..], bytes.len() as u64)
+            .expect("seed the object");
+
+        let smudge = PendingSmudge {
+            path: PathBuf::from("clip.mp4"),
+            pointer: Pointer::new(oid, 4_096),
+        };
+        let target = root.join("clip.mp4");
+
+        assert_eq!(
+            materialize(&store, root, &smudge).expect("declining is not a failure"),
+            Published::TargetMoved,
+            "there is nothing at the target to publish over"
+        );
+        assert!(
+            !target.exists(),
+            "the deletion stands: keeper did not put the file back"
+        );
+        let leftovers = keeper_temp_files(root);
+        assert!(
+            leftovers.is_empty(),
+            "and nothing was staged in their folder: {leftovers:?}"
+        );
+    }
+
+    /// A name within 12 bytes of `NAME_MAX` can be materialized, because the
+    /// staged component is bounded.
+    ///
+    /// `.keeper.` plus `.tmp` is 12 bytes on top of the file's own name, and
+    /// `NAME_MAX` bounds one component rather than the path. Without the
+    /// truncation `create_new`/`copy` fails `ENAMETOOLONG` every time, so such
+    /// a path can never be materialized and never be released — in either
+    /// direction, for the life of the file — and the error names the temp file
+    /// rather than the cause. Generated exports, timestamped scanner output
+    /// and any non-Latin name (3 or 4 bytes per character) reach that length
+    /// as a matter of course.
+    ///
+    /// The digest half gets its own assertion: a plain truncation would let two
+    /// long names sharing a prefix collide at one staging path and publish
+    /// each other's content.
+    #[test]
+    fn a_name_within_twelve_bytes_of_name_max_can_still_be_materialized() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let (bytes, oid) = content(4_096);
+        let store = LfsStore::in_git_dir(root.join(".git"));
+        store
+            .insert_verified(&oid, &bytes[..], bytes.len() as u64)
+            .expect("seed the object");
+
+        let name = format!("{}.mp4", "a".repeat(246));
+        assert_eq!(
+            name.len(),
+            250,
+            "the fixture only bites within 12 bytes of 255"
+        );
+        let smudge = PendingSmudge {
+            path: PathBuf::from(name.clone()),
+            pointer: Pointer::new(oid, 4_096),
+        };
+        let target = root.join(&name);
+        std::fs::write(&target, smudge.pointer.render()).expect("check out the pointer");
+
+        materialize(&store, root, &smudge).expect("materialize a near-NAME_MAX name");
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            bytes,
+            "the content landed at the long name"
+        );
+
+        // The bound itself, so the reason that worked is pinned rather than
+        // inferred from one filesystem's tolerance.
+        let staged = staging_path(root, &target);
+        let component = staged
+            .file_name()
+            .expect("a staging path always has a file name")
+            .to_string_lossy();
+        assert!(
+            component.len() <= 255,
+            "the staged component is {} bytes: {component}",
+            component.len()
+        );
+
+        let shared = "b".repeat(240);
+        let first = staging_path(root, &root.join(format!("{shared}111111.mp4")));
+        let second = staging_path(root, &root.join(format!("{shared}222222.mp4")));
+        assert_ne!(
+            first, second,
+            "two names differing only past the truncation point must not share \
+             a staging path, or one publishes the other's content"
         );
     }
 
@@ -2288,6 +2728,42 @@ mod tests {
              loaded to find out"
         );
         assert_eq!(indexed_pointer(&repo, Path::new("big.bin")), None);
+    }
+
+    /// A backslash inside a file name keys as itself wherever `\` is an
+    /// ordinary filename character.
+    ///
+    /// Translating unconditionally made every verb that takes a subpath answer
+    /// about a *different* file than the caller named: `indexed_pointer` for
+    /// `40-media\clip.mp4` returned the pointer committed for
+    /// `40-media/clip.mp4`, while `SparseCone::includes`, `hydrate::plan` and
+    /// every `std::fs` call beside them used the literal name — so a refusal
+    /// sentence could name the wrong file, and an oid and a size could belong
+    /// to a path the user never asked about. Without the fix this reads
+    /// `"40-media/clip.mp4"`, which on Linux and macOS names a different file
+    /// or no file at all.
+    #[test]
+    #[cfg(not(windows))]
+    fn a_backslash_in_a_name_is_an_ordinary_character_and_keys_as_itself() {
+        // The fixture says something only if the platform agrees this is one
+        // component whose name happens to contain a backslash.
+        assert_eq!(
+            Path::new("40-media\\clip.mp4").components().count(),
+            1,
+            "one component, not two"
+        );
+        assert_eq!(
+            index_key(Path::new("40-media\\clip.mp4")),
+            "40-media\\clip.mp4",
+            "the key is the name as spelled, so it resolves to itself or to \
+             nothing"
+        );
+        // The separator that really is a separator here is still spelled
+        // through untouched.
+        assert_eq!(
+            index_key(Path::new("40-media/clip.mp4")),
+            "40-media/clip.mp4"
+        );
     }
 
     /// The guard that would have stopped 122 emptied recordings from being
@@ -3141,6 +3617,91 @@ mod tests {
         assert_eq!(pointer.oid, hex::encode(hasher.finalize()));
         // The worktree file is untouched — the user still sees their data.
         assert_eq!(std::fs::read(&file).expect("read"), payload);
+    }
+
+    /// `clean` refuses a named pipe instead of blocking on it forever.
+    ///
+    /// `File::open` on a FIFO with no writer **blocks in the kernel**, and std
+    /// offers no timeout for it. `Engine::republish_missing_objects` reaches
+    /// here for any path whose worktree file is not the pointer for the object
+    /// it is repairing, and a FIFO standing at that path is one of those.
+    /// Without the fix that open never returns: the repair pass hangs and the
+    /// operation the profile reserved never completes.
+    ///
+    /// That hang is why the call is made on a thread and collected through a
+    /// channel with a bounded `recv_timeout` — a direct call would hang the
+    /// whole test binary rather than fail one test, so the timeout elapsing is
+    /// itself the defect being asserted against.
+    #[test]
+    #[cfg(unix)]
+    fn cleaning_refuses_a_named_pipe_rather_than_blocking_on_it_forever() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let store = LfsStore::new(root.join("lfs"));
+        store.ensure_layout().expect("layout");
+
+        let fifo = root.join("pipe.bin");
+        match std::process::Command::new("mkfifo").arg(&fifo).status() {
+            Ok(status) if status.success() => {}
+            // No usable `mkfifo` on this builder. There is no fixture to
+            // assert against, and reaching for libc to build one would be a
+            // second way of making a FIFO for the sake of one platform.
+            _ => return,
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(clean(&store, &fifo));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("clean answered rather than blocking on the pipe forever");
+        worker.join().expect("the worker thread finished");
+
+        let err = outcome.expect_err("a named pipe is not content to stage");
+        assert!(
+            err.to_string().contains("a named pipe"),
+            "got: {err} — the refusal must name what is actually at the path"
+        );
+        assert!(
+            matches!(
+                &err,
+                SyncError::Integrity { expected, actual, .. }
+                    if expected == "a regular file" && actual == "a named pipe"
+            ),
+            "got: {err} — the refusal is about the kind of file, not about a \
+             byte count that came out wrong"
+        );
+    }
+
+    /// `clean` refuses a directory standing where content should be, with the
+    /// same refusal shape.
+    ///
+    /// No thread needed: opening a directory returns immediately on Linux, and
+    /// the read is what fails. Without the fix the person is told that a
+    /// stream read failed with `EISDIR` instead of being told a directory is
+    /// standing at their path — which is why this asserts on the error's
+    /// fields and not on its rendering: "Is a directory" would satisfy a
+    /// substring check for "a directory" and hide exactly that.
+    #[test]
+    fn cleaning_refuses_a_directory_standing_where_content_should_be() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let store = LfsStore::new(root.join("lfs"));
+        store.ensure_layout().expect("layout");
+
+        let occupied = root.join("clip.mp4");
+        std::fs::create_dir(&occupied).expect("occupy the path with a directory");
+
+        let err = clean(&store, &occupied).expect_err("a directory is not content to stage");
+        assert!(
+            matches!(
+                &err,
+                SyncError::Integrity { expected, actual, .. }
+                    if expected == "a regular file" && actual == "a directory"
+            ),
+            "got: {err} — the refusal must name the kind of file that is there"
+        );
     }
 
     /// The repair list, and what must stay off it.

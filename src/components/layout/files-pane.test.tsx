@@ -1707,6 +1707,45 @@ describe("FilesPane — is this file synced", () => {
     expect(within(root).queryByTestId(FILES_SYNC_MARK_TESTID)).toBeNull();
   });
 
+  /**
+   * Story 56.14: the mark's sentence is in the ROW's `aria-describedby`, so a
+   * reader moving down the tree hears where each file's bytes are.
+   *
+   * Fails without the `id` wiring in `files-pane.tsx` — and it is the only kind
+   * of assertion that catches this defect. Every test above passes on the broken
+   * pane: the mark HAS an accessible name, and `toHaveAccessibleName` reads the
+   * element directly. What was missing is the one thing a screen reader actually
+   * does with a `role="treeitem"` carrying `aria-label`: the label replaces the
+   * subtree's contribution to the name, so the mark was on screen, correct, named
+   * — and silent. Story 56.7 drew three virtual states nobody could hear.
+   *
+   * Asserted over every state in the folder rather than one, because the id is
+   * unconditional on the pane's side and a gate accidentally added to it would
+   * show up on exactly one row.
+   */
+  it("names each row's sync mark in the row's own description", async () => {
+    await openMixedFolder();
+
+    for (const [name] of STATES) {
+      const row = screen.getByRole("treeitem", { name });
+      const mark = markOf(name);
+      expect(mark.id).not.toBe("");
+      expect((row.getAttribute("aria-describedby") ?? "").split(" ")).toContain(mark.id);
+    }
+
+    // Ids are unique per row, so the description of one row never picks up the
+    // mark of another — the encoded row key is what guarantees it, and a shared
+    // constant would make every row read the first row's state.
+    const ids = STATES.map(([name]) => markOf(name).id);
+    expect(new Set(ids).size).toBe(STATES.length);
+
+    // A profile root has no entry and takes no mark, so it must name no mark
+    // either — the guard and the render condition are the same condition.
+    expect(
+      screen.getByRole("treeitem", { name: "Vault" }).getAttribute("aria-describedby") ?? "",
+    ).not.toContain("files-sync-");
+  });
+
   it("shows the new mark once sync has moved on", async () => {
     await openMixedFolder();
     expect(markOf("fresh.md")).toHaveAttribute("data-sync-status", "waiting");
@@ -3626,9 +3665,20 @@ describe("FilesPane — the state verbs and the release clock", () => {
     "This path is pinned, so keeper keeps its content on this computer until the pin is lifted";
   const UNCONFIRMED_SENTENCE =
     "Nothing has confirmed this content reached the server, so keeper will not put it on a release clock";
-  /** The folder's `releaseTtlMs` is `0`, so the sweep is off for every row in it. */
+  /** The folder's `releaseTtlMs` is `0`, so the sweep is off for every row in it.
+   *  Its word is `Manual` and not `Kept` since story 56.14: the two mode causes
+   *  below share `Kept` and are refuse-certain, this one is not, and the pane's
+   *  Release gate is what needs them told apart. */
   const INDEFINITE_SENTENCE =
     "This folder keeps content on this computer until someone releases it";
+  /** `ReleaseSchedule::ModeKeeps` — the folder is in `LfsMode::Materialize` and
+   *  this path is not authorized to stay away, so `release_mode_gate` refuses. */
+  const MODE_KEEPS_SENTENCE =
+    "This folder is set to keep large-file content on this computer, so nothing is released on a clock";
+  /** `ReleaseSchedule::LfsOff` — `LfsMode::Disabled` with ledger rows still in
+   *  place. The other refuse-certain mode cause, and the opposite setting. */
+  const LFS_OFF_SENTENCE =
+    "Large-file support is off for this folder, so keeper is not releasing anything from it on a clock";
 
   /** One of story 56.4's five refusals, verbatim. The whole point of the sink is
    *  that this sentence reaches the screen unaltered. */
@@ -3886,6 +3936,126 @@ describe("FilesPane — the state verbs and the release clock", () => {
     // here would throw all of that away.
     const alert = await screen.findByTestId(FILES_WRITE_ERROR_TESTID);
     expect(alert).toHaveAttribute("role", "alert");
+    expect(alert).toHaveTextContent(OPEN_UNKNOWN);
+  });
+
+  /**
+   * Story 56.14: a second row verb pressed before the first resolves does not
+   * erase the first's refusal, and does not run beside it.
+   *
+   * Fails on the old `runRowVerb`, which cleared the sink on every press and let
+   * the calls overlap. Two things went wrong at once and each is asserted here:
+   *
+   * 1. The second press cleared the sink BEFORE the first had produced its
+   *    sentence, so the refusal Rust wrote for the first file was never read.
+   * 2. `Engine` takes a per-profile reservation, so the overlapping second call
+   *    was likely to reject `SyncError::Busy` — and the sentence left standing
+   *    was "the folder is already syncing", which is about keeper's contention
+   *    with itself rather than about either of the person's files.
+   *
+   * The serialization is asserted on the CALL, not on the sentence, because that
+   * is what makes (2) unreachable: the second invoke must not have happened while
+   * the first was in flight. A pane that merely stopped clearing the sink would
+   * pass an assertion about the text and still hand the engine two concurrent
+   * requests for one folder.
+   */
+  it("keeps the first verb's refusal and does not run the second beside it", async () => {
+    await tree([
+      counting("first.mp4", Date.now() + 3_600_000),
+      counting("second.mp4", Date.now() + 7_200_000),
+    ]);
+    syncReleaseEntry.mockClear();
+
+    // The first call hangs until this test lets it fail, which is the whole
+    // point: the window the defect lived in is exactly "before the first
+    // resolves", and a mock that rejects synchronously has no such window.
+    let refuseFirst: () => void = () => undefined;
+    const hanging = new Promise<void>((_resolve, reject) => {
+      refuseFirst = () =>
+        reject({ code: "internal", message: OPEN_UNKNOWN, accountId: null, retriable: false });
+    });
+    syncReleaseEntry.mockReturnValueOnce(hanging).mockResolvedValueOnce(undefined);
+
+    const releaseButton = (name: string): HTMLElement =>
+      within(screen.getByRole("treeitem", { name })).getByRole("button", {
+        name: FILES_RELEASE_LABEL,
+      });
+
+    await click(releaseButton("first.mp4"));
+    await click(releaseButton("second.mp4"));
+
+    // The second press is QUEUED, not sent: one request per folder at a time.
+    expect(syncReleaseEntry).toHaveBeenCalledTimes(1);
+    expect(syncReleaseEntry).toHaveBeenCalledWith("01VAULT", "first.mp4");
+
+    await act(async () => {
+      refuseFirst();
+      await Promise.resolve();
+    });
+
+    // Now the second runs, against a folder the first has finished with — so it
+    // is answered on its own merits and cannot come back `Busy`.
+    await waitFor(() => expect(syncReleaseEntry).toHaveBeenCalledTimes(2));
+    expect(syncReleaseEntry).toHaveBeenLastCalledWith("01VAULT", "second.mp4");
+
+    // And the first file's refusal is still the sentence on screen, even though
+    // the second verb succeeded after it. A success does not answer for a file it
+    // was not about.
+    const alert = await screen.findByTestId(FILES_WRITE_ERROR_TESTID);
+    expect(alert).toHaveTextContent(OPEN_UNKNOWN);
+  });
+
+  /**
+   * And two refusals in ONE burst are both readable — the shape
+   * `requestDelete`'s multi-path receipt already uses.
+   *
+   * The alternative was to keep only the last, which is what the old code did by
+   * accident and is the wrong answer on purpose: two files refused for two
+   * reasons is two facts, and the person pressed twice.
+   *
+   * The first call hangs here for the same reason it does in the test above: the
+   * burst is defined by the second press arriving while the first is IN FLIGHT,
+   * and two already-rejected mocks would let the first settle between the clicks
+   * — which is a new burst, where discarding the previous sentence is correct.
+   * Pinning the window is what makes this test about accumulation rather than
+   * about how many microtasks `act` happens to drain.
+   */
+  it("shows both sentences when two verbs in one burst are refused", async () => {
+    await tree([
+      counting("first.mp4", Date.now() + 3_600_000),
+      counting("second.mp4", Date.now() + 7_200_000),
+    ]);
+    syncReleaseEntry.mockClear();
+
+    const secondSentence =
+      'keeper will not remove content from "second.mp4" while something has it open';
+    let refuseFirst: () => void = () => undefined;
+    const hanging = new Promise<void>((_resolve, reject) => {
+      refuseFirst = () =>
+        reject({ code: "internal", message: OPEN_UNKNOWN, accountId: null, retriable: false });
+    });
+    syncReleaseEntry.mockReturnValueOnce(hanging).mockRejectedValueOnce({
+      code: "internal",
+      message: secondSentence,
+      accountId: null,
+      retriable: false,
+    });
+
+    for (const name of ["first.mp4", "second.mp4"]) {
+      await click(
+        within(screen.getByRole("treeitem", { name })).getByRole("button", {
+          name: FILES_RELEASE_LABEL,
+        }),
+      );
+    }
+    await act(async () => {
+      refuseFirst();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(syncReleaseEntry).toHaveBeenCalledTimes(2));
+    const alert = await screen.findByTestId(FILES_WRITE_ERROR_TESTID);
+    await waitFor(() => expect(alert).toHaveTextContent(secondSentence));
     expect(alert).toHaveTextContent(OPEN_UNKNOWN);
   });
 
@@ -4236,10 +4406,13 @@ describe("FilesPane — the state verbs and the release clock", () => {
   /**
    * A row on no release clock draws Rust's WORD and no timer at all.
    *
-   * All three causes, because the pane must not distinguish them and Rust's own
-   * words are the only thing that does: the path is pinned, nothing has
-   * confirmed its content reached the server (FR-341), or the folder's
-   * `releaseTtlMs` is `0` and the sweep is off for everything in it.
+   * All FIVE causes, because Rust's words are the only thing that distinguishes
+   * them and since story 56.14 the pane's Release gate acts on that distinction:
+   * the path is pinned, nothing has confirmed its content reached the server
+   * (FR-341), the folder's `releaseTtlMs` is `0`, the folder's mode keeps
+   * large-file content, or large-file support is off for it. The last two share
+   * the word `Kept`; the `releaseTtlMs = 0` row does NOT, which is the split
+   * story 56.14 asked `ReleaseSchedule::hold` for.
    *
    * A timer that never moves is a lie with a second hand, so none of these rows
    * may contain a digit anywhere in its cell — the tooltip sentence included —
@@ -4255,22 +4428,22 @@ describe("FilesPane — the state verbs and the release clock", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     const spy = vi.spyOn(globalThis, "setInterval");
     try {
-      await tree([
-        held("pinned.mp4", "Pinned", PINNED_SENTENCE),
-        held("fresh.mp4", "Not sent", UNCONFIRMED_SENTENCE),
-        held("forever.mp4", "Kept", INDEFINITE_SENTENCE),
-      ]);
-
-      for (const [name, word, sentence] of [
+      const rows = [
         ["pinned.mp4", "Pinned", PINNED_SENTENCE],
         ["fresh.mp4", "Not sent", UNCONFIRMED_SENTENCE],
-        ["forever.mp4", "Kept", INDEFINITE_SENTENCE],
-      ] as const) {
+        ["forever.mp4", "Manual", INDEFINITE_SENTENCE],
+        ["mode.mp4", "Kept", MODE_KEEPS_SENTENCE],
+        ["nolfs.mp4", "Kept", LFS_OFF_SENTENCE],
+      ] as const;
+      await tree(rows.map(([name, word, sentence]) => held(name, word, sentence)));
+
+      for (const [name, word, sentence] of rows) {
         const cell = releaseCell(name);
         expect(cell).not.toBeNull();
         expect(releaseFigure(name)).toBe(word);
         // Rust's whole sentence is what a reader hears, because "Pinned" alone
-        // does not say what being pinned did.
+        // does not say what being pinned did — and because two rows reading
+        // `Kept` are told apart by nothing else.
         expect(cell?.textContent).toBe(`${word}${sentence}`);
         expect(cell?.textContent ?? "").not.toMatch(/\d/);
         expect(screen.getByRole("treeitem", { name }).getAttribute("aria-describedby")).toContain(
@@ -4287,6 +4460,67 @@ describe("FilesPane — the state verbs and the release clock", () => {
       spy.mockRestore();
       vi.useRealTimers();
     }
+  });
+
+  /**
+   * Story 56.14: Release is WITHHELD from a row whose own release standing says
+   * the request cannot succeed, and offered from every row where it can.
+   *
+   * Fails without the gate in `files-pane.tsx` — before it, `Release` appeared on
+   * every `materialized` row, so pressing it on a pinned row or in a folder whose
+   * mode releases nothing produced a guaranteed red `role="alert"` from a control
+   * the pane was already holding Rust's word for.
+   *
+   * All five words in one tree, because the claim is a partition and a test that
+   * checked only the withheld half would pass on a gate that withheld everything.
+   * `Manual` is the load-bearing one: `Engine::release_resolved` has no TTL guard
+   * anywhere in its chain, so a `releaseTtlMs = 0` row releases on request and the
+   * button is its only mechanism — a gate keyed on "has a hold word" rather than
+   * on WHICH word would silently take it away.
+   */
+  it("withholds Release exactly where Rust's word says the request cannot succeed", async () => {
+    await tree([
+      held("pinned.mp4", "Pinned", PINNED_SENTENCE),
+      held("mode.mp4", "Kept", MODE_KEEPS_SENTENCE),
+      held("nolfs.mp4", "Kept", LFS_OFF_SENTENCE),
+      held("forever.mp4", "Manual", INDEFINITE_SENTENCE),
+      held("fresh.mp4", "Not sent", UNCONFIRMED_SENTENCE),
+      counting("due.mp4", Date.now() + 3_600_000),
+    ]);
+
+    for (const [name, word, sentence] of [
+      ["pinned.mp4", "Pinned", PINNED_SENTENCE],
+      ["mode.mp4", "Kept", MODE_KEEPS_SENTENCE],
+      ["nolfs.mp4", "Kept", LFS_OFF_SENTENCE],
+    ] as const) {
+      const row = screen.getByRole("treeitem", { name });
+      expect(verbs(row)).not.toContain(FILES_RELEASE_LABEL);
+      // Pin stays: it is idempotent in Rust and sends only `true`, and these are
+      // the rows most likely to want it.
+      expect(verbs(row)).toContain(FILES_PIN_LABEL);
+      // And the reason is not lost by hiding the button — the row's own release
+      // cell draws the word and speaks Rust's sentence for it, which says more
+      // than a disabled button's tooltip would.
+      expect(releaseCell(name)?.textContent).toBe(`${word}${sentence}`);
+    }
+
+    for (const name of ["forever.mp4", "fresh.mp4", "due.mp4"]) {
+      expect(verbs(screen.getByRole("treeitem", { name }))).toContain(FILES_RELEASE_LABEL);
+    }
+
+    // The menu is the same array, so a verb withheld from the cluster is
+    // withheld from the right-click too — otherwise the fix would only cover the
+    // surface this test happened to read.
+    const pinned = screen.getByRole("treeitem", { name: "pinned.mp4" });
+    await act(async () => {
+      fireEvent.contextMenu(pinned);
+      await Promise.resolve();
+    });
+    expect(
+      within(await screen.findByRole("menu"))
+        .getAllByRole("menuitem")
+        .map((item) => item.textContent),
+    ).not.toContain(FILES_RELEASE_LABEL);
   });
 
   /** `materializing` promises no finish time (Story 56.7), and Rust enforces that

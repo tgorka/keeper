@@ -1192,9 +1192,45 @@ fn classify(
         // confirms the row is the path being replaced rather than a label for
         // a deleted one — or an unlabelled `LFS object …` row, which is not a
         // path on disk at all.
+        //
+        // `replacing` is the other way the same row can be confirmed against a
+        // real path (Story 56.14). It is `Engine::pending`'s answer to
+        // `db::materialized_paths.contains(label)` — "a download is queued for
+        // a path this machine already holds content for" — which is exactly the
+        // fact the pointer-text probe cannot supply, because the worktree holds
+        // an OLDER version's real bytes rather than pointer text. Such a row
+        // used to fall through to `Waiting`, whose sentence is "This file's
+        // content is still on the remote and has not been downloaded yet" over
+        // a file whose content is on this disk. It is not on the remote only,
+        // and it is not waiting to be uploaded: a newer version is arriving,
+        // which is what `Materializing` says.
+        //
+        // Either fact confirms the row names this path, which is the whole job
+        // of the conjunction — and `replacing` is free, so it is asked first
+        // and can spare the probe its `open`.
+        // `replacing` widens the rung from "the worktree holds pointer text" to
+        // "the worktree holds pointer text OR the ledger says this machine holds
+        // content for this path". It does NOT remove the rung's precondition
+        // that there be a readable regular file to have an opinion about: a
+        // `None` probe means the path is a directory, or is not there at all —
+        // and the ledger row outliving the file is the ordinary case, so a
+        // deleted-but-ledgered path with a queued download would otherwise read
+        // "this content is arriving" forever, over a file `materialize` will
+        // decline to publish on every pass (`Published::TargetMoved`).
+        let bytes = if matches!(reason, Some(PendingReason::Incoming { .. })) {
+            worktree_bytes()
+        } else {
+            None
+        };
         if in_repository
-            && matches!(reason, Some(PendingReason::Incoming { .. }))
-            && worktree_bytes() == Some(true)
+            && bytes.is_some()
+            && (matches!(
+                reason,
+                Some(PendingReason::Incoming {
+                    replacing: true,
+                    ..
+                })
+            ) || bytes == Some(true))
         {
             return EntrySyncStatus::Materializing;
         }
@@ -1969,6 +2005,77 @@ mod tests {
             ],
             "one pending reason, two answers, and the worktree is what decides \
              which"
+        );
+    }
+
+    /// A queued download over a path this machine ALREADY holds content for is
+    /// arriving, not waiting (Story 56.14).
+    ///
+    /// The pointer-text probe cannot see this case by construction: the
+    /// worktree holds an older version's real bytes, so `worktree_bytes()`
+    /// answers `Some(false)` exactly as it does for a file that is merely
+    /// queued for upload. The one fact that separates them is `replacing`,
+    /// which [`Engine::pending`] already computes from
+    /// `db::materialized_paths` — it was available and unused. Without the fix
+    /// the first row below reads `Waiting`, whose sentence in the shell is
+    /// "This file's content is still on the remote and has not been downloaded
+    /// yet" — said about a file whose content is on this disk, an older
+    /// version of it.
+    ///
+    /// Both halves are asserted, because the fix is only correct if it left
+    /// the `replacing: false` row alone: a download queued over real bytes
+    /// that this machine never materialized is still not confirmed to name
+    /// this path.
+    #[test]
+    fn a_download_replacing_content_this_machine_holds_is_materializing_not_waiting() {
+        let root = tempfile::tempdir().expect("temp");
+        std::fs::create_dir(root.path().join(".git")).expect("repo marker");
+        // Real bytes, not pointer text, in BOTH: the probe answers `Some(false)`
+        // either way, so `replacing` is the only thing that can differ.
+        std::fs::write(root.path().join("newer.mp4"), b"an older cut, on this disk")
+            .expect("real bytes");
+        std::fs::write(
+            root.path().join("stale.mp4"),
+            b"real bytes, never materialized",
+        )
+        .expect("real bytes");
+
+        let not_replacing = PendingReason::Incoming {
+            size_bytes: 9_000_000,
+            replacing: false,
+        };
+        let pending = PendingView::Known(BTreeMap::from([
+            (
+                "newer.mp4".to_owned(),
+                PendingReason::Incoming {
+                    size_bytes: 9_000_000,
+                    replacing: true,
+                },
+            ),
+            ("stale.mp4".to_owned(), not_replacing.clone()),
+        ]));
+
+        let listing = browse(
+            &profile(root.path()),
+            "",
+            &no_excludes(),
+            &pending,
+            &nothing_materialized(),
+        )
+        .expect("no refusal");
+        assert_eq!(
+            marks(&listing),
+            vec![
+                ("newer.mp4".to_owned(), EntrySyncStatus::Materializing),
+                (
+                    "stale.mp4".to_owned(),
+                    EntrySyncStatus::Waiting {
+                        reason: Some(not_replacing)
+                    }
+                ),
+            ],
+            "the ledger's `replacing` fact confirms the row names this path \
+             where the pointer-text probe cannot"
         );
     }
 

@@ -40,6 +40,8 @@ import {
   SYNC_POLL_LABEL,
   SYNC_RECORDINGS_LABEL,
   SYNC_RECORDINGS_SUBFOLDER_NOTE,
+  SYNC_RELEASE_NEVER_NOTE,
+  SYNC_RELEASE_TTL_LABEL,
   SYNC_REMOTE_URL_LABEL,
   SYNC_REMOVABLE_LABEL,
   SYNC_SETTLE_LABEL,
@@ -55,7 +57,12 @@ import {
   SYNC_TOKEN_READ_FAILED_PREFIX,
   SYNC_TOKEN_SHOW_LABEL,
   SYNC_TOKEN_UNREADABLE_NOTE,
+  SYNC_VIRTUAL_OVER_LABEL,
+  SYNC_VIRTUAL_OVER_NONE_NOTE,
+  SYNC_VIRTUAL_PATTERNS_LABEL,
+  syncFolderOwnedNote,
   syncInForceNote,
+  syncReleaseInForceNote,
 } from "@/components/sync/add-folder-form";
 import type { SyncProfileVm } from "@/lib/ipc/client";
 import {
@@ -97,6 +104,10 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     removable: false,
     lfsMode: "materialize",
     lfsThresholdBytes: 4 * 1024 * 1024,
+    virtualPatterns: [],
+    virtualOverBytes: 0,
+    releaseTtlMs: 24 * 60 * 60 * 1000,
+    folderOwned: [],
     settleMs: null,
     effectiveSettleMs: 5_000,
     pollIntervalMs: null,
@@ -405,6 +416,9 @@ describe("AddFolderForm editing an existing folder", () => {
         removable: true,
         lfsMode: "pointerOnly",
         lfsThresholdBytes: 8 * 1024 * 1024,
+        virtualPatterns: [],
+        virtualOverBytes: 0,
+        releaseTtlMs: 24 * 60 * 60 * 1000,
         settleMs: 12_000,
         pollIntervalMs: 45_000,
         tags: ["field"],
@@ -1030,5 +1044,209 @@ describe("AddFolderForm recordings switch (Story 41.7, AD-66)", () => {
     // empty and the promise under it is what keeper will do with that.
     expect(screen.getByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL)).toHaveValue("");
     expect(screen.getByText(SYNC_RECORDINGS_SUBFOLDER_NOTE)).toBeInTheDocument();
+  });
+});
+
+describe("AddFolderForm virtual-file controls (Story 56.12)", () => {
+  /** Fill the required fields and open the Advanced disclosure. */
+  async function openAdvanced() {
+    await fillRequired();
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+  }
+
+  it("sends keeper's own answers when nothing is typed", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // An untouched patterns box is an EXPRESSED empty list, not the
+          // omission: `VirtualPolicy::compile` reads `[]` as silence, which
+          // leaves the committed `.keepervirtual` deciding.
+          virtualPatterns: [],
+          virtualOverBytes: 0,
+          releaseTtlMs: 24 * 60 * 60 * 1000,
+        }),
+      ),
+    );
+  });
+
+  it("carries the patterns, the floor and the window as typed", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    fireEvent.change(screen.getByLabelText(SYNC_VIRTUAL_PATTERNS_LABEL), {
+      target: { value: " scans/** , *.psd ,, " },
+    });
+    fireEvent.change(screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL), { target: { value: "8" } });
+    fireEvent.change(screen.getByLabelText(SYNC_RELEASE_TTL_LABEL), { target: { value: "72" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // Trimmed, and the trailing empty entry dropped — an empty pattern
+          // reaching the engine would match everything.
+          virtualPatterns: ["scans/**", "*.psd"],
+          virtualOverBytes: 8 * 1024 * 1024,
+          releaseTtlMs: 72 * 60 * 60 * 1000,
+        }),
+      ),
+    );
+  });
+
+  it("reaches never-release with a zero, and says so in words", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    fireEvent.change(screen.getByLabelText(SYNC_RELEASE_TTL_LABEL), { target: { value: "0" } });
+
+    // The whole reason this box is not parsed by `pinnedValue`, which would
+    // collapse the zero and make "never" unreachable from the form.
+    expect(screen.getByText(SYNC_RELEASE_NEVER_NOTE)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ releaseTtlMs: 0 })),
+    );
+  });
+
+  it("names the window in force when the box holds nothing usable", async () => {
+    render(<AddFolderForm />);
+    await openAdvanced();
+    fireEvent.change(screen.getByLabelText(SYNC_RELEASE_TTL_LABEL), { target: { value: "" } });
+
+    expect(screen.getByText(syncReleaseInForceNote(24))).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(SYNC_RELEASE_TTL_LABEL), { target: { value: "6" } });
+    expect(screen.queryByText(syncReleaseInForceNote(24))).not.toBeInTheDocument();
+  });
+
+  /**
+   * Story 56.14: the size-floor box says when its content means "no floor".
+   *
+   * Fails before `SYNC_VIRTUAL_OVER_NONE_NOTE` was rendered. `0` is not a neutral
+   * fallback for this field — it is the documented instruction that every matched
+   * file may stay away, which is the widest setting it has — and anything
+   * `pinnedValue` cannot read as a positive number silently became it with
+   * nothing on screen, while the release box one line down explained both of its
+   * own coercions.
+   *
+   * Three inputs, because the failure is a CLASS and not the empty box: a blank
+   * field, a typed zero, and a half-typed number that parses to nothing. Each
+   * must show the note AND send `0`, so the sentence and the wire cannot drift.
+   */
+  it("says when the size floor is off, for every input that means off", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    const floor = screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL);
+
+    // The seeded value is keeper's own `0`, so the note is there from the start:
+    // a fresh form DOES mean no floor, and the previous silence made the widest
+    // setting in the field the one nothing was said about.
+    expect(screen.getByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).toBeInTheDocument();
+
+    for (const value of ["", "0", "1e"]) {
+      fireEvent.change(floor, { target: { value } });
+      expect(screen.getByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).toBeInTheDocument();
+    }
+
+    // A real floor takes it away again — otherwise the note would be furniture.
+    fireEvent.change(floor, { target: { value: "8" } });
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).not.toBeInTheDocument();
+
+    // And the note tells the truth about what is sent: the same `=== null` that
+    // renders it is what sends `0`.
+    fireEvent.change(floor, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ virtualOverBytes: 0 })),
+    );
+  });
+
+  it("seeds an edit form from the policy in force and saves it back unchanged", async () => {
+    const stored = profileVm({
+      virtualPatterns: ["scans/**", "*.psd"],
+      virtualOverBytes: 16 * 1024 * 1024,
+      releaseTtlMs: 0,
+    });
+    mockSave.mockResolvedValue(stored);
+    render(<AddFolderForm profile={stored} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p2"));
+
+    expect(screen.getByLabelText(SYNC_VIRTUAL_PATTERNS_LABEL)).toHaveValue("scans/**, *.psd");
+    expect(screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL)).toHaveValue(16);
+    expect(screen.getByLabelText(SYNC_RELEASE_TTL_LABEL)).toHaveValue(0);
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          virtualPatterns: ["scans/**", "*.psd"],
+          virtualOverBytes: 16 * 1024 * 1024,
+          releaseTtlMs: 0,
+        }),
+      ),
+    );
+  });
+
+  it("cannot edit a key the folder's own config file owns, and says why", async () => {
+    const stored = profileVm({
+      virtualPatterns: ["raw/**"],
+      virtualOverBytes: 32 * 1024 * 1024,
+      releaseTtlMs: 7 * 24 * 60 * 60 * 1000,
+      folderOwned: ["releaseTtlMs", "virtualOverBytes", "virtualPatterns"],
+    });
+    mockSave.mockResolvedValue(stored);
+    render(<AddFolderForm profile={stored} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p2"));
+
+    const patterns = screen.getByLabelText(SYNC_VIRTUAL_PATTERNS_LABEL);
+    expect(patterns).toBeDisabled();
+    expect(screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL)).toBeDisabled();
+    expect(screen.getByLabelText(SYNC_RELEASE_TTL_LABEL)).toBeDisabled();
+    // The reason, on screen rather than only in a log line nobody reads.
+    expect(screen.getByText(syncFolderOwnedNote("virtualPatterns"))).toBeInTheDocument();
+
+    // And it cannot be smuggled in by driving the input anyway: `parse_req`
+    // never sees the key, so `as_stored` has nothing to strip and nothing to
+    // warn about.
+    fireEvent.change(patterns, { target: { value: "everything/**" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+    await waitFor(() => expect(mockSave).toHaveBeenCalled());
+    expect(mockSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        virtualPatterns: null,
+        virtualOverBytes: null,
+        releaseTtlMs: null,
+      }),
+    );
+  });
+
+  it("leaves a key no folder file owns editable and expressed", async () => {
+    const stored = profileVm({ virtualPatterns: ["raw/**"], folderOwned: ["virtualOverBytes"] });
+    mockSave.mockResolvedValue(stored);
+    render(<AddFolderForm profile={stored} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p2"));
+
+    expect(screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL)).toBeDisabled();
+    const patterns = screen.getByLabelText(SYNC_VIRTUAL_PATTERNS_LABEL);
+    expect(patterns).not.toBeDisabled();
+    expect(screen.queryByText(syncFolderOwnedNote("virtualPatterns"))).not.toBeInTheDocument();
+
+    fireEvent.change(patterns, { target: { value: "media/**" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ virtualPatterns: ["media/**"], virtualOverBytes: null }),
+      ),
+    );
   });
 });

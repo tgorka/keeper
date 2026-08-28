@@ -15,6 +15,37 @@ export type SyncProfileReq = {
  */
 id: string | null, name: string, localPath: string, remoteUrl: string, branch: string, direction: string, lane: string, subpaths: Array<string>, excludes: Array<string>, removable: boolean, lfsMode: string, lfsThresholdBytes: number | null, 
 /**
+ * The virtual-file pattern list to store, in the committed pattern file's
+ * own gitignore dialect (Story 56.12).
+ *
+ * `Option<Vec<String>>` and not a bare `Vec`, which is the whole point of
+ * the wrapper here rather than a habit: a bare `Vec` cannot tell "the form
+ * did not show this" from "the user emptied the list", and empty-vs-unset
+ * is a real distinction for this key.
+ * `lfs::virtual_policy::VirtualPolicy::compile` judges the profile list on
+ * what it parses to, so `Some(vec![])` is an expressed *silence* that lets
+ * the committed `.keepervirtual` go back to deciding — a meaningful, safe
+ * instruction a person can give by clearing the box. `None` is a caller
+ * with no box at all (the daemon, an older client), whose save must leave
+ * the stored list exactly as it is.
+ */
+virtualPatterns: Array<string> | null, 
+/**
+ * The size floor to store, in bytes. `0` is keeper's documented "no floor"
+ * and is a value like any other, so a blank box sends `0` rather than
+ * omitting the key; `None` here is still only "no control for this".
+ */
+virtualOverBytes: number | null, 
+/**
+ * The retention window to store, in milliseconds. `0` is the documented
+ * "never release" and must survive the trip, which is why the form parses
+ * this box itself instead of reusing the "unpinned" idiom that collapses
+ * anything not `> 0` to nothing. A non-zero value below
+ * `MIN_RELEASE_TTL_MS` or above `RELEASE_TTL_CEILING_MS` is refused by
+ * `SyncProfile::validate` with its own sentence rather than clamped.
+ */
+releaseTtlMs: number | null, 
+/**
  * The quiescence window to pin. Sending `DEFAULT_SETTLE_MS` is how "let
  * keeper choose the wait" is expressed, which is what `effective_settle_ms`
  * reads as unpinned — so a removable folder gets its longer window back.

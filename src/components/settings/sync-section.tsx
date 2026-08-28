@@ -23,7 +23,7 @@
  */
 import { useEffect, useState } from "react";
 import { AddFolderForm, SYNC_ADD_TITLE, SYNC_EDIT_TITLE } from "@/components/sync/add-folder-form";
-import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -38,7 +38,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import type { SyncDeviceVm, SyncOutcomeVm, SyncProfileVm, SyncStatusVm } from "@/lib/ipc/client";
+import type {
+  SyncDeviceVm,
+  SyncOutcomeVm,
+  SyncProfileVm,
+  SyncStatusVm,
+  SyncVerifyVm,
+} from "@/lib/ipc/client";
 // Read and written straight through rather than through the mirror store: the
 // device name is one app-global string nothing else changes, so mirroring it
 // would be a second source of truth for a value read once per open. Opening a
@@ -91,7 +97,9 @@ export const SYNC_REMOVE_LABEL = "Remove";
  */
 export const SYNC_OPEN_PATH_LABEL = "Reveal in Finder";
 
-/** The needs-attention alert's inline action: re-check the folder's contents. */
+/** Every folder card's action: re-check the folder's contents. On the card's own
+ *  action row since story 56.14, not inside the needs-attention alert — the
+ *  counts it reports are exactly what a HEALTHY folder needs to show. */
 export const SYNC_VERIFY_LABEL = "Check files";
 
 /**
@@ -110,6 +118,29 @@ export const SYNC_VERIFY_LABEL = "Check files";
  */
 export const SYNC_VERIFY_CLEAN_SENTENCE =
   "Every file read cleanly, and every large file kept on this machine has its stored copy.";
+
+/**
+ * What the pass looked at, said before what it found (Story 56.12).
+ *
+ * The all-clear sentence below stops short of promising that every large file's
+ * copy is present, because since Epic 56 a folder may deliberately keep only
+ * the pointer for files its own policy authorizes to stay away. That is honest
+ * and it is also silent: "nothing was wrong" is what a folder with nothing in
+ * it reports too. These two numbers are what make the difference visible —
+ * `Engine::verify` has counted them since Story 56.6 and the IPC boundary threw
+ * them away until now.
+ *
+ * The excused count is left out entirely when it is zero rather than rendered
+ * as "0 kept away on purpose", following the folder footprint's rule: a
+ * quantity nobody has is not a fact worth a clause.
+ */
+export function syncVerifyCountSentence(checked: number, virtualPaths: number): string {
+  const read = `Read ${checked} file${checked === 1 ? "" : "s"}.`;
+  if (virtualPaths === 0) {
+    return read;
+  }
+  return `${read} ${virtualPaths} kept away on purpose.`;
+}
 
 /** Used only if Rust flagged attention without naming a reason. */
 export const SYNC_ATTENTION_FALLBACK_SENTENCE =
@@ -461,7 +492,12 @@ function SyncProfileRow({
    * leaves the status exactly as it was.
    */
   const [outcome, setOutcome] = useState<SyncOutcomeVm | null>(null);
-  const [problems, setProblems] = useState<string[] | null>(null);
+  /**
+   * The last check's whole report, or `null` before one has run. The faults
+   * alone were never enough to tell a clean pass from a pass that did not
+   * happen; the two counts beside them are (Story 56.12).
+   */
+  const [verified, setVerified] = useState<SyncVerifyVm | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   /**
    * Whether this row's configuration is open for editing. Per row, because the
@@ -521,6 +557,34 @@ function SyncProfileRow({
           >
             {SYNC_NOW_LABEL}
           </Button>
+          {/* Story 56.14: on EVERY folder, healthy or not.
+
+              It used to live only inside the needs-attention alert below, which
+              made the two counts story 56.12 added unreachable in exactly the
+              case they were added for: `syncVerifyCountSentence`'s own argument
+              is that "nothing was wrong" is also what a check over an empty
+              folder reports, so the number that separates them — how many paths
+              were excused because their content is away on purpose — could only
+              be seen on a folder keeper had already flagged. A healthy virtual
+              folder, the ordinary case, could never show it.
+
+              Moved rather than duplicated. Two controls with one label in one
+              card is two things to keep in step and a reader wondering whether
+              they do the same thing; the alert keeps its sentence, and the
+              report still renders under it either way. */}
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={busy}
+            onClick={() => {
+              void run(async () => {
+                setVerified(await verifySyncProfile(profile.id));
+              });
+            }}
+          >
+            {SYNC_VERIFY_LABEL}
+          </Button>
           <Button
             type="button"
             variant="outline"
@@ -576,39 +640,39 @@ function SyncProfileRow({
         // Persistent and non-modal, the ConversationHealthBanner shape: this
         // condition needs a human, so there is no dismiss control — it clears
         // when the profile recovers, not when it is waved away.
+        //
+        // No inline action since story 56.14: `Check files` was here and nowhere
+        // else, which put the counts out of reach of every healthy folder. It is
+        // now in the card's own action row above, one line up and always present.
         <Alert role="alert" variant="destructive" className="mt-1">
           <AlertDescription>
             {status.error ?? status.warning ?? SYNC_ATTENTION_FALLBACK_SENTENCE}
           </AlertDescription>
-          <AlertAction>
-            <Button
-              type="button"
-              variant="outline"
-              size="xs"
-              disabled={busy}
-              onClick={() => {
-                void run(async () => {
-                  setProblems(await verifySyncProfile(profile.id));
-                });
-              }}
-            >
-              {SYNC_VERIFY_LABEL}
-            </Button>
-          </AlertAction>
         </Alert>
       )}
-      {problems !== null &&
-        (problems.length === 0 ? (
-          <p className="text-muted-foreground text-xs">{SYNC_VERIFY_CLEAN_SENTENCE}</p>
-        ) : (
-          <ul className="flex flex-col gap-0.5">
-            {problems.map((problem) => (
-              <li key={problem} className="text-destructive text-xs">
-                {problem}
-              </li>
-            ))}
-          </ul>
-        ))}
+      {verified !== null && (
+        <>
+          {/* What the pass looked at, before what it found. Story 56.6 taught
+              verify to excuse a path whose content is away on purpose, and
+              until now that excuse was invisible: the folder simply reported
+              nothing wrong, which is also what a check over an empty folder
+              reports. */}
+          <p className="text-muted-foreground text-xs">
+            {syncVerifyCountSentence(verified.checked, verified.virtualPaths)}
+          </p>
+          {verified.problems.length === 0 ? (
+            <p className="text-muted-foreground text-xs">{SYNC_VERIFY_CLEAN_SENTENCE}</p>
+          ) : (
+            <ul className="flex flex-col gap-0.5">
+              {verified.problems.map((problem) => (
+                <li key={problem} className="text-destructive text-xs">
+                  {problem}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
       {outcome !== null && (
         // Inline, in the row that was acted on, exactly where Check files
         // already reports what it found — nothing on the sync surfaces is

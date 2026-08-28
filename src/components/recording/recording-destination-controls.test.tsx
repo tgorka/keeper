@@ -144,6 +144,10 @@ const STORED_TGDRIVE: SyncProfileVm = {
   removable: false,
   lfsMode: "materialize",
   lfsThresholdBytes: 4 * 1024 * 1024,
+  virtualPatterns: [],
+  virtualOverBytes: 0,
+  releaseTtlMs: 24 * 60 * 60 * 1000,
+  folderOwned: [],
   settleMs: 7_000,
   effectiveSettleMs: 7_000,
   pollIntervalMs: null,
@@ -1039,6 +1043,11 @@ describe("RecordingDestinationControls", () => {
         removable: false,
         lfsMode: "materialize",
         lfsThresholdBytes: 4 * 1024 * 1024,
+        // Carried through as the VM reports them, and the folder file owns none
+        // of the three in this fixture, so none is the omission (Story 56.12).
+        virtualPatterns: [],
+        virtualOverBytes: 0,
+        releaseTtlMs: 24 * 60 * 60 * 1000,
         settleMs: 7_000,
         pollIntervalMs: null,
         tags: ["laptop"],

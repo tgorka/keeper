@@ -1051,7 +1051,12 @@ fn children_of(root: &Path, rel: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 /// Name what something is, for a refusal a user can act on.
-fn describe_kind(meta: &std::fs::Metadata) -> &'static str {
+///
+/// `pub(crate)` because the same sentence is owed wherever the same refusal is
+/// made: [`crate::lfs::stage::clean`] refuses a non-regular file for exactly
+/// the reason [`classify`] does — the fifo note below — and a second vocabulary
+/// for the same fact would eventually disagree with this one.
+pub(crate) fn describe_kind(meta: &std::fs::Metadata) -> &'static str {
     let kind = meta.file_type();
     if kind.is_symlink() {
         return "a symbolic link";

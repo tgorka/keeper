@@ -54,6 +54,7 @@ use serde::{Deserialize, Serialize};
 use crate::browse::BrowseRefusal;
 use crate::lfs::pointer::Pointer;
 use crate::lfs::stage::{self, PendingSmudge};
+use crate::SyncError;
 
 /// Why keeper will not change the bytes at one path.
 ///
@@ -166,12 +167,14 @@ pub enum ContentRefusal {
     /// This machine cannot say whether the file is open, so it is left alone.
     ///
     /// [`crate::platform::SyncPlatform::open_file_state`]'s default, and the
-    /// answer every real host gives today: there is no race-free primitive
-    /// available to this crate, and an `lsof`-shaped snapshot is refused by
-    /// name (AD-125). Its own variant rather than folded into [`Self::Open`]
-    /// because the two say different things to the person reading the sentence
-    /// — "close it and ask again" versus "keeper cannot tell yet" — and only
-    /// one of them is something they can act on.
+    /// answer a platform that cannot see a descriptor table still gives —
+    /// macOS and Windows today. Linux answers for real (Story 56.11), and every
+    /// blind spot in that walk lands here too: no procfs, a `/proc/<pid>` that
+    /// cannot be entered, a procfs that does not show keeper itself, a target
+    /// that cannot be stat'ed. Its own variant rather than folded into
+    /// [`Self::Open`] because the two say different things to the person
+    /// reading the sentence — "close it and ask again" versus "keeper cannot
+    /// tell yet" — and only one of them is something they can act on.
     OpenUnknown {
         /// The subpath as asked for, verbatim.
         path: String,
@@ -216,21 +219,41 @@ pub enum ContentRefusal {
     /// This folder keeps every object it holds, so releasing one path's
     /// content would be undone.
     ///
-    /// A folder in the default mode re-materializes any path whose worktree
-    /// holds a pointer as soon as the next pass reaches it, copying the
-    /// content back from this machine's object store or queueing a download of
-    /// it. Removing one path's content there does not reclaim anything: it
-    /// costs the folder a fetch and gets the bytes back. So the release only
-    /// means something in a folder that is *meant* to hold pointers, and the
-    /// answer for a folder that keeps everything is to say so rather than to
-    /// do the work twice.
+    /// A folder in the default mode with **no virtualization policy at all**
+    /// re-materializes any path whose worktree holds a pointer as soon as the
+    /// next pass reaches it, copying the content back from this machine's object
+    /// store or queueing a download of it. Removing one path's content there
+    /// does not reclaim anything: it costs the folder a fetch and gets the bytes
+    /// back. So the release only means something where something is authorized
+    /// to stay away, and the answer for a folder that authorizes nothing is to
+    /// say so rather than to do the work twice.
     ///
     /// Carries the profile's **name**, like [`Self::Paused`] and
     /// [`Self::LfsDisabled`]: this is a fact about the folder, not about the
-    /// path that was asked for.
+    /// path that was asked for. Since Story 56.10 that is why it is no longer
+    /// the whole story — a folder that authorizes *some* paths refuses the rest
+    /// with [`Self::NotVirtual`], which is a fact about a path and names a
+    /// different thing to change.
     AlwaysMaterializes {
         /// The profile's name — the folder's setting is the thing to change.
         profile: String,
+    },
+    /// This folder authorizes some paths' content to stay away, and this path is
+    /// not one of them (Story 56.10, AD-122).
+    ///
+    /// Separate from [`Self::AlwaysMaterializes`] because the two send a person
+    /// to two different places, and sharing one sentence sent them to the wrong
+    /// one. That variant's text says the *folder* keeps its content and offers
+    /// the profile-wide `pointerOnly` lever as the remedy — false of a folder
+    /// that already virtualizes a zone, and the remedy is a hammer that makes
+    /// every path in the folder releasable at once, which is exactly the choice
+    /// a per-path policy exists to avoid having to make.
+    ///
+    /// Carries the **path**, because that is what the answer is about, and its
+    /// sentence names the pattern list as the thing to add a line to.
+    NotVirtual {
+        /// The subpath as asked for, verbatim.
+        path: String,
     },
     /// The path holds only its pointer here, so the bytes a caller asked to
     /// read are not on this machine.
@@ -338,6 +361,12 @@ impl std::fmt::Display for ContentRefusal {
                 "\"{profile}\" keeps its content on this machine, so letting one file go here \
                  would be undone the next time keeper looks at the folder; set the folder to \
                  keep pointers only if that is what you want"
+            ),
+            Self::NotVirtual { path } => write!(
+                f,
+                "nothing says the content of \"{path}\" may live only on the server, so keeper \
+                 would fetch it straight back; add a line covering it to this folder's \
+                 `.keepervirtual` if you want its content to stay away"
             ),
             Self::ContentNotHere { path } => write!(
                 f,
@@ -452,7 +481,21 @@ pub struct Release {
     /// The pointer's object id, bare hex — the object the remote proved it can
     /// serve, which is what made the release permissible.
     pub oid: String,
-    /// The pointer's size: the bytes this machine no longer holds.
+    /// The bytes this machine no longer holds — which is the pointer's size for
+    /// an ordinary file and **`0` for a hard-linked one** (Story 56.14).
+    ///
+    /// `rename(2)` replaces one directory entry. With `nlink > 1` the inode
+    /// survives under the other name and not a byte is reclaimed, so reporting
+    /// the pointer's size over-counted by the whole file, once per link — and
+    /// `keeper-syncd`'s `dehydrate_line` renders this figure as `released 4.0
+    /// MB`, while the sweep totals it into what one pass gave back. The release
+    /// is still real and still correct: the caller asked for THIS name to hold
+    /// its pointer, and afterwards it does.
+    ///
+    /// Read on unix from the same `lstat` the content proof was taken against.
+    /// No portable link count exists, so a non-unix host reports the pointer's
+    /// size; every platform keeper ships to today either answers this or has no
+    /// hard links to answer about.
     pub size_bytes: u64,
 }
 
@@ -498,7 +541,7 @@ pub enum Plan {
 ///
 /// A single [`std::fs::symlink_metadata`] settles the missing case, the
 /// not-a-regular-file case and the length question;
-/// [`stage::worktree_pointer`] reads at most
+/// [`stage::read_worktree_pointer`] reads at most
 /// [`crate::lfs::pointer::MAX_POINTER_BYTES`] and only for a file inside that
 /// window. A materialized four-gigabyte video therefore costs one `lstat` and
 /// no read at all.
@@ -509,25 +552,50 @@ pub enum Plan {
 /// each means *these are not the committed pointer's bytes*, which is the
 /// entire question this function asks. A fifo, a socket, a symlink, a folder
 /// and a valid pointer for some other object are all things a user put there,
-/// and the guarantee is that keeper does not replace them. A `stat` that fails
-/// for any reason other than absence lands here too, for the same reason: a
-/// path keeper cannot even see is a path it must not overwrite.
+/// and the guarantee is that keeper does not replace them.
+///
+/// # A file keeper cannot READ is an error, not a refusal (Story 56.14)
+///
+/// A refusal is a statement about the file: `LocallyModified` says it holds
+/// something other than the committed pointer, and the remedy a person infers
+/// from it is to overwrite what is there. Neither is true of a file that
+/// merely could not be opened — a permission bit, an ACL, a Linux immutable
+/// flag, a failing disk — and this function used to make exactly that
+/// statement, because both the failing `stat` arm and
+/// `stage::worktree_pointer`'s `.ok()?` collapsed into it. Worse in the other
+/// direction: an unreadable file whose length happened to equal the pointer's
+/// was answered `AlreadyHeld`, i.e. "your content is here".
+///
+/// So the error type is [`SyncError`] rather than `ContentRefusal`, and the two
+/// unreachable cases carry the operating system's own reason and the path.
+/// `SyncError::io` is transient by construction, so a caller retries once the
+/// permission is fixed instead of being told to undo an edit that does not
+/// exist. Absence is still [`ContentRefusal::Missing`] — that is a fact about
+/// the file, and a decided one.
 ///
 /// Not [`stage::pending_smudges`], which is the sweep's shape and *silently
 /// skips* a non-pointer. Skipping is right for a whole-tree pass and wrong
 /// here: a request for one path must answer, and "I ignored it" is the answer
 /// that would let this verb write nothing and report success.
-pub fn plan(root: &Path, rela: &Path, indexed: &Pointer) -> Result<Plan, ContentRefusal> {
+pub fn plan(root: &Path, rela: &Path, indexed: &Pointer) -> Result<Plan, SyncError> {
     let named = || rela.to_string_lossy().into_owned();
-    let modified = || ContentRefusal::LocallyModified { path: named() };
+    let modified = || SyncError::Refused(ContentRefusal::LocallyModified { path: named() });
 
     let absolute = root.join(rela);
     let metadata = match std::fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ContentRefusal::Missing { path: named() });
+            return Err(SyncError::Refused(ContentRefusal::Missing {
+                path: named(),
+            }));
         }
-        Err(_) => return Err(modified()),
+        Err(err) => {
+            return Err(SyncError::io(
+                "stat the path whose content was asked for",
+                &absolute,
+                err,
+            ));
+        }
     };
     // `is_file` rather than `!is_dir`, for `worktree_pointer`'s reason: a fifo,
     // a socket or a device node has a length that is not a number of bytes
@@ -536,7 +604,14 @@ pub fn plan(root: &Path, rela: &Path, indexed: &Pointer) -> Result<Plan, Content
         return Err(modified());
     }
 
-    match stage::worktree_pointer(&absolute, &metadata) {
+    let found = stage::read_worktree_pointer(&absolute, &metadata).map_err(|err| {
+        SyncError::io(
+            "read the path whose content was asked for, to see what it holds",
+            &absolute,
+            err,
+        )
+    })?;
+    match found {
         // The ordinary virtual path: the worktree bytes ARE the committed
         // pointer (FR-331), so this is the one case there is content to publish.
         Some(found) if found.oid == indexed.oid => Ok(Plan::Publish(PendingSmudge {
@@ -619,12 +694,22 @@ mod tests {
         );
     }
 
+    /// Every refusal `plan` can reach, unwrapped from the `SyncError` it now
+    /// travels in. A non-refusal error is a test failure here, because each of
+    /// these cases is a DECIDED fact about the file.
+    fn refusal(root: &Path, rela: &str, indexed: &Pointer) -> ContentRefusal {
+        match plan(root, Path::new(rela), indexed).expect_err("refused") {
+            SyncError::Refused(refusal) => refusal,
+            other => panic!("expected a refusal about the file, got {other}"),
+        }
+    }
+
     /// A deletion the user has not committed yet must not be silently undone.
     #[test]
     fn an_absent_file_is_missing_and_not_something_to_check_out() {
         let dir = temp();
         assert_eq!(
-            plan(dir.path(), Path::new("gone.mp4"), &pointer(10)).expect_err("refused"),
+            refusal(dir.path(), "gone.mp4", &pointer(10)),
             ContentRefusal::Missing {
                 path: "gone.mp4".to_owned()
             }
@@ -638,7 +723,7 @@ mod tests {
         let dir = temp();
         std::fs::create_dir(dir.path().join("clip.mp4")).expect("mkdir");
         assert_eq!(
-            plan(dir.path(), Path::new("clip.mp4"), &pointer(10)).expect_err("refused"),
+            refusal(dir.path(), "clip.mp4", &pointer(10)),
             ContentRefusal::LocallyModified {
                 path: "clip.mp4".to_owned()
             }
@@ -659,7 +744,7 @@ mod tests {
         std::fs::write(&target, edited).expect("write");
 
         assert_eq!(
-            plan(dir.path(), Path::new("notes.bin"), &pointer(4_096)).expect_err("refused"),
+            refusal(dir.path(), "notes.bin", &pointer(4_096)),
             ContentRefusal::LocallyModified {
                 path: "notes.bin".to_owned()
             }
@@ -681,10 +766,50 @@ mod tests {
         std::fs::write(dir.path().join("clip.mp4"), other.render()).expect("write");
 
         assert_eq!(
-            plan(dir.path(), Path::new("clip.mp4"), &pointer(4_096)).expect_err("refused"),
+            refusal(dir.path(), "clip.mp4", &pointer(4_096)),
             ContentRefusal::LocallyModified {
                 path: "clip.mp4".to_owned()
             }
+        );
+    }
+
+    /// Story 56.14. A file keeper cannot open is not a file with a local
+    /// modification: saying so tells the person to undo an edit that does not
+    /// exist, and the remedy that sentence implies — overwrite it — is the one
+    /// thing they must not do. The honest answer names the operating system's
+    /// reason and is transient, so a retry after `chmod` succeeds.
+    ///
+    /// Without the fix this asserts `ContentRefusal::LocallyModified` for a
+    /// file that holds the committed pointer exactly, because
+    /// `worktree_pointer`'s `File::open(..).ok()?` folded `EACCES` into "these
+    /// bytes are not pointer text".
+    #[test]
+    #[cfg(unix)]
+    fn a_pointer_file_that_cannot_be_read_is_an_error_and_not_a_modification() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp();
+        let indexed = pointer(4 * 1024 * 1024);
+        let target = dir.path().join("clip.mp4");
+        std::fs::write(&target, indexed.render()).expect("check out");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000))
+            .expect("make it unreadable");
+
+        // Running as root defeats the mode, and there is no unprivileged way to
+        // make a file unreadable to root. Skip rather than assert a falsehood.
+        if std::fs::File::open(&target).is_ok() {
+            return;
+        }
+
+        let err = plan(dir.path(), Path::new("clip.mp4"), &indexed).expect_err("cannot decide");
+        assert!(
+            !matches!(err, SyncError::Refused(_)),
+            "a file keeper cannot read earns no statement about its content: {err}"
+        );
+        let sentence = err.to_string();
+        assert!(
+            sentence.contains("clip.mp4"),
+            "the error names the file: {sentence}"
         );
     }
 
@@ -731,6 +856,9 @@ mod tests {
                 path: "40-media/clip.mp4".to_owned(),
             },
             ContentRefusal::AlreadyPointer {
+                path: "40-media/clip.mp4".to_owned(),
+            },
+            ContentRefusal::NotVirtual {
                 path: "40-media/clip.mp4".to_owned(),
             },
             ContentRefusal::ContentNotHere {

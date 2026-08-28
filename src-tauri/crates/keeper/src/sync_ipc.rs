@@ -87,6 +87,45 @@ pub struct SyncProfileVm {
     pub lfs_mode: String,
     #[ts(type = "number")]
     pub lfs_threshold_bytes: u64,
+    /// Which paths this folder may leave unmaterialized, in the committed
+    /// pattern file's own gitignore dialect (Story 56.1, AD-132).
+    ///
+    /// **Not half of a pinned/effective pair**, unlike `settle_ms` and
+    /// `effective_settle_ms` directly below, and the difference is worth stating
+    /// because the two shapes look alike. That pair exists because keeper
+    /// SUBSTITUTES a different number for the one it was given — 10 s on
+    /// removable media that pins nothing — so "what you pinned" and "what runs"
+    /// are two facts about one profile. Nothing is substituted for these three:
+    /// `SyncProfile::effective_release_ttl_ms()` is only `(> 0).then_some(..)`,
+    /// which a form reads straight off `releaseTtlMs === 0`. What DOES differ
+    /// from the stored row is the folder-TOML overlay — and `db::list_profiles`
+    /// applies `profile::in_force` before this view model is built, so the value
+    /// here is already **the value in force**. The fact that was missing was
+    /// never a number; it is who decided it, and that is `folder_owned` at the
+    /// bottom of this struct.
+    ///
+    /// An empty list is *silence* rather than a withdrawal:
+    /// `lfs::virtual_policy::VirtualPolicy::compile` judges the profile list on
+    /// what it parses to, so `[]` leaves the committed `.keepervirtual` deciding.
+    pub virtual_patterns: Vec<String>,
+    /// The smallest size, in bytes, a matched path may stay unmaterialized at
+    /// (inclusive).
+    ///
+    /// `0` is keeper's documented "no floor" and not an absence, which is why
+    /// this is a plain `u64` and not an `Option`: no value of this field means
+    /// "unset", so there is nothing for a `None` to say.
+    #[ts(type = "number")]
+    pub virtual_over_bytes: u64,
+    /// How long content may stay on this machine after its release clock last
+    /// moved, in milliseconds. The default is `DEFAULT_RELEASE_TTL_MS` (24 h).
+    ///
+    /// `0` is the documented "never release", and it disables the sweep before
+    /// the due clock is read — so a folder with the sweep off never arms a
+    /// window that would fire the moment somebody turns it back on. A real
+    /// value, therefore, for the same reason `virtual_over_bytes`'s zero is: a
+    /// form has to be able to show it and send it back unchanged.
+    #[ts(type = "number")]
+    pub release_ttl_ms: u64,
     /// The quiescence window this profile PINS, or `None` when it pins none and
     /// keeper picks (Story 34.5, AD-34-8). Not the same as the window in force:
     /// see `effective_settle_ms`. The distinction is load-bearing — a form that
@@ -167,6 +206,22 @@ pub struct SyncProfileVm {
     /// rather than `notes_subfolder` — the form prefills from the value that
     /// would actually be used, and `60-sessions` is spelled once, in Rust.
     pub sessions_subfolder: String,
+    /// The canonical camelCase profile keys a `.keeper/keeper.toml` layer
+    /// currently sets for this folder, sorted (Story 56.12).
+    ///
+    /// The one thing the three virtualization fields above cannot carry: not
+    /// what the value is, but WHO decided it. `profile::as_stored` strips
+    /// exactly these keys before every write and reports the shadowed change
+    /// with a `tracing::warn!` no user ever sees — so a control over an owned
+    /// key that accepted input would report success and silently revert. The
+    /// form disables such a control, names the file beside it, and omits the key
+    /// from the request.
+    ///
+    /// Already sorted, because `profile::owned_fields` answers a `BTreeSet`:
+    /// two reads of an unchanged folder therefore produce byte-identical JSON,
+    /// and nothing downstream has to sort to compare. Empty for every folder
+    /// with no config file, which is the normal case.
+    pub folder_owned: Vec<String>,
 }
 
 impl From<&SyncProfile> for SyncProfileVm {
@@ -184,6 +239,9 @@ impl From<&SyncProfile> for SyncProfileVm {
             removable: p.removable,
             lfs_mode: lfs_str(p.lfs_mode).to_owned(),
             lfs_threshold_bytes: p.lfs_threshold_bytes,
+            virtual_patterns: p.virtual_patterns.clone(),
+            virtual_over_bytes: p.virtual_over_bytes,
+            release_ttl_ms: p.release_ttl_ms,
             settle_ms: (p.settle_ms != DEFAULT_SETTLE_MS).then_some(p.settle_ms),
             effective_settle_ms: p.effective_settle_ms(),
             poll_interval_ms: (p.poll_interval_ms != DEFAULT_POLL_INTERVAL_MS)
@@ -208,6 +266,11 @@ impl From<&SyncProfile> for SyncProfileVm {
                 || DEFAULT_SESSIONS_SUBFOLDER.to_owned(),
                 |sessions| sessions.subfolder.clone(),
             ),
+            // Last, because it describes the fields above rather than adding
+            // one: the set of keys a folder file has taken out of this
+            // profile's hands. `owned_fields` is the read-side counterpart of
+            // the strip `as_stored` performs on the way in.
+            folder_owned: keeper_sync::profile::owned_fields(p).into_iter().collect(),
         }
     }
 }
@@ -249,6 +312,29 @@ pub struct SyncFootprintVm {
     /// number a virtual folder needs: `content` minus `on_disk` is what would
     /// still be out there.
     pub content: u64,
+    /// How many tracked paths are here as pointers rather than content, and how
+    /// many of the large ones actually hold their bytes.
+    ///
+    /// The other half of `content`'s sentence directly above. That number is
+    /// everything tracked at full size, fetched or not; these two say how much
+    /// of it is on this machine and how much is deliberately not — which is the
+    /// whole difference between a folder that looks mysteriously small and one
+    /// that is visibly working the way it was configured to.
+    ///
+    /// Counts, not sizes, and that shows up twice. Neither gets a `*_label`:
+    /// the rule that every size string is formatted in Rust exists because two
+    /// formatters disagree about the same bytes, and a count has only one
+    /// rendering. And both are annotated `number` where the five byte fields
+    /// above are left bare — those are bare because the argument stated on
+    /// `on_disk` is about SIZES, and because they were already crossing as
+    /// `bigint` before that reading was written down. A count of paths in one
+    /// folder is bounded by the number of files a person keeps in it, so
+    /// `number` is the honest type for it, and it keeps this wire's two count
+    /// pairs — these and [`SyncVerifyVm`]'s — spelled the same way.
+    #[ts(type = "number")]
+    pub virtual_paths: u64,
+    #[ts(type = "number")]
+    pub materialized_paths: u64,
     /// The same five numbers as people read them.
     ///
     /// Formatted here, by the one formatter, because a second one in TypeScript
@@ -298,6 +384,8 @@ pub async fn sync_footprint(
         reclaimable: measured.reclaimable,
         scratch: measured.scratch,
         content: measured.content,
+        virtual_paths: measured.virtual_paths,
+        materialized_paths: measured.materialized_paths,
         on_disk_label: keeper_core::size::format_file_size(measured.on_disk),
         lfs_cache_label: keeper_core::size::format_file_size(measured.lfs_cache),
         reclaimable_label: keeper_core::size::format_file_size(measured.reclaimable),
@@ -575,6 +663,36 @@ pub struct SyncProfileReq {
     pub lfs_mode: String,
     #[ts(type = "number | null")]
     pub lfs_threshold_bytes: Option<u64>,
+    /// The virtual-file pattern list to store, in the committed pattern file's
+    /// own gitignore dialect (Story 56.12).
+    ///
+    /// `Option<Vec<String>>` and not a bare `Vec`, which is the whole point of
+    /// the wrapper here rather than a habit: a bare `Vec` cannot tell "the form
+    /// did not show this" from "the user emptied the list", and empty-vs-unset
+    /// is a real distinction for this key.
+    /// `lfs::virtual_policy::VirtualPolicy::compile` judges the profile list on
+    /// what it parses to, so `Some(vec![])` is an expressed *silence* that lets
+    /// the committed `.keepervirtual` go back to deciding — a meaningful, safe
+    /// instruction a person can give by clearing the box. `None` is a caller
+    /// with no box at all (the daemon, an older client), whose save must leave
+    /// the stored list exactly as it is.
+    #[serde(default)]
+    pub virtual_patterns: Option<Vec<String>>,
+    /// The size floor to store, in bytes. `0` is keeper's documented "no floor"
+    /// and is a value like any other, so a blank box sends `0` rather than
+    /// omitting the key; `None` here is still only "no control for this".
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub virtual_over_bytes: Option<u64>,
+    /// The retention window to store, in milliseconds. `0` is the documented
+    /// "never release" and must survive the trip, which is why the form parses
+    /// this box itself instead of reusing the "unpinned" idiom that collapses
+    /// anything not `> 0` to nothing. A non-zero value below
+    /// `MIN_RELEASE_TTL_MS` or above `RELEASE_TTL_CEILING_MS` is refused by
+    /// `SyncProfile::validate` with its own sentence rather than clamped.
+    #[serde(default)]
+    #[ts(type = "number | null")]
+    pub release_ttl_ms: Option<u64>,
     /// The quiescence window to pin. Sending `DEFAULT_SETTLE_MS` is how "let
     /// keeper choose the wait" is expressed, which is what `effective_settle_ms`
     /// reads as unpinned — so a removable folder gets its longer window back.
@@ -915,6 +1033,13 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
     // engine on first sight of the media, where dropping it would leave the
     // profile unbound and free to adopt whatever stick is mounted at its path,
     // including one that would otherwise have been refused as `Foreign`.
+    // The three virtualization knobs (Story 56.12) sit in this block under
+    // exactly the same rule, with one wrinkle worth naming: for
+    // `virtual_patterns` the `Some`/`None` split is not merely bookkeeping.
+    // `Some(vec![])` is an expressed empty list, which `VirtualPolicy::compile`
+    // reads as silence and hands back to the committed `.keepervirtual`, while
+    // `None` leaves the stored list untouched — so the two must not be folded
+    // together on the way in either.
     if let Some(bytes) = req.lfs_threshold_bytes {
         profile.lfs_threshold_bytes = bytes;
     }
@@ -923,6 +1048,15 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
     }
     if let Some(ms) = req.poll_interval_ms {
         profile.poll_interval_ms = ms;
+    }
+    if let Some(patterns) = req.virtual_patterns.as_ref() {
+        profile.virtual_patterns = patterns.clone();
+    }
+    if let Some(bytes) = req.virtual_over_bytes {
+        profile.virtual_over_bytes = bytes;
+    }
+    if let Some(ms) = req.release_ttl_ms {
+        profile.release_ttl_ms = ms;
     }
     profile.tags = req.tags.clone();
     // An explicit value overrides; an explicit empty string clears back to the
@@ -1085,7 +1219,24 @@ pub async fn sync_statuses(
     Ok(statuses.iter().map(SyncStatusVm::from).collect())
 }
 
-/// Create or update a profile, returning the stored result.
+/// Create or update a profile, answering with it as the next read will report
+/// it.
+///
+/// **Not the request's merge**, which this returned until Story 56.12 and which
+/// is a different profile from the one that ends up stored. `parse_req`
+/// produces the merge; `db::upsert_profile` then runs `profile::as_stored`,
+/// which strips every key the folder's own `.keeper/keeper.toml` owns, restores
+/// the prior value, and reports the shadowed change with a `tracing::warn!` no
+/// user ever sees. Echoing the merge back was harmless while nothing a request
+/// could express was ever folder-owned; with `virtualPatterns` and its two
+/// neighbours reachable from the form it is not, because a folder that owns one
+/// of them would be answered with exactly the value the write threw away — and
+/// a form that re-seeds from the answer would show it as saved.
+///
+/// So the profile is re-read here, through `profile_by_id` and therefore
+/// through `engine.list_profiles()`, which applies `profile::in_force`. That is
+/// the same path `sync_profiles` takes, so the answer to a save and the answer
+/// to the next list cannot disagree.
 #[tauri::command]
 pub async fn sync_profile_save(
     app: tauri::AppHandle,
@@ -1112,7 +1263,15 @@ pub async fn sync_profile_save(
     // the same move `notes_vault_flag` makes for vaults. Idempotent and cheap
     // when nothing sessions-shaped changed.
     crate::sessions_root::refresh(&app);
-    Ok(SyncProfileVm::from(&profile))
+    // Best effort, and that word is load-bearing: the row is already committed,
+    // so a failure here is a failed READ of work that succeeded. Reporting it as
+    // an error would make an add whose write landed look like an add that did
+    // not — and the form would then retry with no id and create a SECOND profile
+    // for one folder, because `db::upsert_profile` has no duplicate-path guard.
+    // The merge is the honest fallback: it is what was written, minus only the
+    // folder-owned keys the write stripped.
+    let answer = profile_by_id(&state, &profile.id).unwrap_or(profile);
+    Ok(SyncProfileVm::from(&answer))
 }
 
 /// Forget a profile. The folder and its repository are left on disk untouched —
@@ -1562,6 +1721,32 @@ fn profile_by_id(state: &AppState, id: &str) -> Result<keeper_sync::SyncProfile,
     find_profile(&profiles, id).cloned()
 }
 
+/// What one verification pass found, and how much of the folder it looked at
+/// (Story 56.12).
+///
+/// `Engine::verify` has counted these since Story 56.6 and this boundary threw
+/// both away, which left the app with only the fault list — so a clean pass and
+/// a pass that never ran render identically. `checked` is how many files the
+/// pass actually read. `virtual_paths` is how many of them were excused because
+/// the folder's own policy authorizes their content to stay away; that is the
+/// number that turns "nothing was wrong" into "nothing was wrong AND N are away
+/// on purpose", which is the whole difference between a check that looks like
+/// it did nothing and one that shows the feature working.
+///
+/// `problems` keeps the existing `"{path}: {reason}"` rendering verbatim, so
+/// the list the frontend already renders is unchanged; only its container is
+/// new.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncVerifyVm {
+    #[ts(type = "number")]
+    pub checked: u64,
+    #[ts(type = "number")]
+    pub virtual_paths: u64,
+    pub problems: Vec<String>,
+}
+
 /// Re-read a profile's tracked files and report the ones that failed.
 ///
 /// NOT a digest comparison — keeper records no per-file hash (`file_state` has
@@ -1579,18 +1764,27 @@ fn profile_by_id(state: &AppState, id: &str) -> Result<keeper_sync::SyncProfile,
 /// whose remote is a directory this machine can see — that store to hold the
 /// object. Worth having, but the earlier "against its recorded digests" wording
 /// described a check that does not exist.
+///
+/// It reports the two counts as well as the faults (Story 56.12): how many
+/// files the pass read, and how many were excused as virtual. Both come
+/// straight off `VerifyReport`, which has carried them since 56.6 — this
+/// command simply stopped discarding them.
 #[tauri::command]
 pub async fn sync_verify(
     state: tauri::State<'_, AppState>,
     id: String,
-) -> Result<Vec<String>, IpcError> {
+) -> Result<SyncVerifyVm, IpcError> {
     let engine = engine_of(&state)?;
     let report = engine.verify(&id).await.map_err(|e| sync_ipc_error(&e))?;
-    Ok(report
-        .bad
-        .into_iter()
-        .map(|(path, reason)| format!("{path}: {reason}"))
-        .collect())
+    Ok(SyncVerifyVm {
+        checked: report.checked,
+        virtual_paths: report.virtual_paths,
+        problems: report
+            .bad
+            .into_iter()
+            .map(|(path, reason)| format!("{path}: {reason}"))
+            .collect(),
+    })
 }
 
 /// Forget what this profile remembers about its own tree, and look again.
@@ -2515,10 +2709,16 @@ pub async fn sync_materialize_entry(
 /// `Refused` arm, and is logged `warn!` for the reason
 /// [`sync_materialize_entry`] logs one (DW-162).
 ///
-/// On a host whose platform cannot answer "is this file open" race-free — which
-/// is every host today — the honest answer is `ContentRefusal::OpenUnknown`,
-/// and that sentence is what a person sees. That is 56.4's recorded and
-/// deliberate consequence, not a defect in this command.
+/// **On Linux this command reaches the rename; on macOS and Windows it still
+/// refuses.** Story 56.11 taught `ShellSyncPlatform::open_file_state` to
+/// delegate to `keeper_sync::platform::probe_open_file_state`, which reads
+/// `/proc/<pid>/fd` in-process and matches a descriptor to the target by device
+/// and inode identity — the kernel's own answer, so a release on a Linux
+/// desktop goes through. macOS and Windows still cannot answer "is this file
+/// open" without racing, so both answer `OpenFileState::Unknown`, the honest
+/// answer there rather than a skipped question, and a person sees
+/// `ContentRefusal::OpenUnknown`'s sentence. On those two hosts that is 56.4's
+/// recorded and deliberate consequence, not a defect in this command.
 ///
 /// Rejects with: `syncUnavailable` (the folder is already syncing), `internal`
 /// (no such profile, an unplugged removable volume, a subpath that escapes the
@@ -3800,6 +4000,9 @@ mod tests {
             removable: false,
             lfs_mode: "materialize".into(),
             lfs_threshold_bytes: None,
+            virtual_patterns: None,
+            virtual_over_bytes: None,
+            release_ttl_ms: None,
             settle_ms: None,
             poll_interval_ms: None,
             tags: vec![],
@@ -3820,7 +4023,7 @@ mod tests {
     /// struct: the bug is a lost KEY, and serde is what decides what a key is.
     ///
     /// A field the request has a slot for.
-    const EXPRESSED: [&str; 19] = [
+    const EXPRESSED: [&str; 22] = [
         "name",
         "localPath",
         "remoteUrl",
@@ -3847,6 +4050,23 @@ mod tests {
         // Expressed from birth (FR-222): the Sync form shipped its switch in the
         // same change that added the field, so it never had a PRESERVED phase.
         "sessions",
+        // Moved out of PRESERVED by Story 56.12, in the shape the `recordings`
+        // comment above records: the folder's Advanced settings now render all
+        // three, so a save from the app expresses what it shows.
+        //
+        // The AD-132 argument that put them in PRESERVED is NOT repealed by the
+        // move, and reading it as repealed is the mistake to avoid. Which paths
+        // may stay unmaterialized is still a fact the repository declares; the
+        // committed `.keepervirtual` and the folder's `.keeper/keeper.toml` are
+        // still the higher tiers, and `profile::as_stored` still strips any key
+        // a folder file owns before the row is written. What changed is only
+        // that the profile — the LAST precedence layer — is now reachable from
+        // the app. A caller with no control still omits the key, because all
+        // three request slots are `Option`, so the DW-116 leave-alone rule is
+        // exactly as strong as it was.
+        "virtualPatterns",
+        "virtualOverBytes",
+        "releaseTtlMs",
     ];
 
     /// A field no request can express, which `parse_req` must therefore never
@@ -3863,28 +4083,13 @@ mod tests {
     /// configured where the repository can say it — `.keeper/keeper.toml`, which
     /// travels with the folder — rather than clicked per machine. A save from a
     /// form that has never shown the list must not be able to empty it.
-    /// `virtualPatterns` and `virtualOverBytes` (Story 56.1) are here for
-    /// exactly the `regenerable` reason, and AD-132 states it: which paths may
-    /// stay unmaterialized is a fact the repository declares, so its home is the
-    /// committed pattern file and the folder's `.keeper/keeper.toml` tier, which
-    /// both the daemon and this app read. The profile is only the last
-    /// precedence layer. Until a form actually renders these — Story 56.9 — a
-    /// save that cannot express them must leave a daemon-set policy alone, which
-    /// is the DW-116 rule this whole list exists to enforce.
-    /// `releaseTtlMs` (Story 56.5) joins them on the same AD-132 reasoning: how
-    /// long this repository's content may stay is a fact about the repository,
-    /// this story ships no form control for it, and a save that cannot express
-    /// it must not reset a daemon-set retention window to the 24 h default.
-    const PRESERVED: [&str; 9] = [
+    const PRESERVED: [&str; 6] = [
         "id",
         "volumeId",
         "enabled",
         "lfsNever",
         "lfsPruneLocal",
         "regenerable",
-        "virtualPatterns",
-        "virtualOverBytes",
-        "releaseTtlMs",
     ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
@@ -3973,14 +4178,17 @@ mod tests {
         // The opt-out, because a fresh profile now releases the redundant copy.
         prior.lfs_prune_local = false;
         // Story 56.1's virtualization policy. A fresh profile virtualizes
-        // nothing and has no size floor, so both need a value a fresh profile
-        // never has, or the preservation assertion below would pass however
-        // `parse_req` behaved.
+        // nothing and has no size floor, so both carry a value a fresh profile
+        // never has. They were PRESERVED fields until Story 56.12 rendered them
+        // in the folder's Advanced settings; the distinctive values stay,
+        // because they are now what makes the EXPRESSED assertion below bite —
+        // an edit has to move each field OFF this value.
         prior.virtual_patterns = vec!["scans/**".into()];
         prior.virtual_over_bytes = 32 * 1024 * 1024;
-        // Story 56.5's retention window. A fresh profile carries the 24 h
-        // default, so it needs a value a fresh profile never has or the
-        // preservation assertion below would pass however `parse_req` behaved.
+        // Story 56.5's retention window, moved out of PRESERVED by the same
+        // story and kept distinctive for the same reason: a fresh profile
+        // carries the 24 h default, so seven days is a value it never has and
+        // the edit below has to move off it.
         prior.release_ttl_ms = 7 * 24 * 60 * 60 * 1000;
         // Story 41.1's block, set to something a fresh profile never has. It was
         // a PRESERVED field until Story 41.7 gave the form a switch for it; the
@@ -4025,6 +4233,17 @@ mod tests {
         // overlapping neither of the two subfolders above.
         edit.sessions = Some(true);
         edit.sessions_subfolder = Some("60-sessions".into());
+        // The three virtualization knobs (Story 56.12), each moved off `prior`'s
+        // distinctive value AND off a fresh profile's, so the EXPRESSED
+        // assertion cannot be satisfied by standing on either.
+        edit.virtual_patterns = Some(vec!["media/**".into()]);
+        edit.virtual_over_bytes = Some(64 * 1024 * 1024);
+        // `0` is legal here — it is the documented "never release", and
+        // `SyncProfile::validate` excludes it from the `MIN_RELEASE_TTL_MS`
+        // floor on purpose — and it is also a fresh profile's non-value. So this
+        // moves the field and exercises the branch that would be lost if a
+        // `> 0` guard were ever reintroduced on the way in.
+        edit.release_ttl_ms = Some(0);
         let merged = parse_req(&edit, Some(&prior)).expect("valid");
 
         let before = json_fields(&prior);
@@ -4071,6 +4290,74 @@ mod tests {
                  not change it"
             );
         }
+    }
+
+    /// The three virtualization keys under the same DW-116 rule, asserted
+    /// per-field and by name rather than only through the array loop above
+    /// (Story 56.12).
+    ///
+    /// The loop proves the general property over whatever is currently listed
+    /// as PRESERVED, and these three are no longer in that list — they are
+    /// EXPRESSED now, which is a claim about what a form CAN move. The claim
+    /// that survives the move, and the one this story could have broken, is the
+    /// other one: a caller with no control for them — the daemon, an older
+    /// client, or the same form with the Advanced disclosure never rendered —
+    /// must still leave a daemon-set or folder-set policy exactly where it was.
+    /// That is what `Option` on all three request slots buys, and it is worth an
+    /// assertion of its own because the cheapest way to lose it is for somebody
+    /// to "simplify" one of them to a bare `Vec` or `u64`.
+    #[test]
+    fn a_save_that_says_nothing_about_virtual_files_leaves_the_policy_alone() {
+        let mut prior = parse_req(&req(), None).expect("valid");
+        prior.virtual_patterns = vec!["scans/**".into(), "*.psd".into()];
+        prior.virtual_over_bytes = 32 * 1024 * 1024;
+        prior.release_ttl_ms = 7 * 24 * 60 * 60 * 1000;
+
+        // A form with none of the three controls at all.
+        let merged = parse_req(&req(), Some(&prior)).expect("valid");
+        assert_eq!(
+            merged.virtual_patterns,
+            vec!["scans/**".to_owned(), "*.psd".to_owned()],
+            "an unexpressed pattern list is not an emptied one"
+        );
+        assert_eq!(
+            merged.virtual_over_bytes,
+            32 * 1024 * 1024,
+            "and an unexpressed floor is not a floor of zero"
+        );
+        assert_eq!(
+            merged.release_ttl_ms,
+            7 * 24 * 60 * 60 * 1000,
+            "and an unexpressed window is not the 24 h default"
+        );
+
+        // An expressed EMPTY list is not an absent one. On the wire it is an
+        // instruction, and it has to reach the row; it is only once it is there
+        // that `VirtualPolicy::compile` reads it as silence and hands the
+        // decision back to the committed `.keepervirtual`. That two-step is the
+        // whole reason the slot is `Option<Vec<_>>` rather than `Vec<_>`.
+        let mut cleared = req();
+        cleared.virtual_patterns = Some(vec![]);
+        assert!(
+            parse_req(&cleared, Some(&prior))
+                .expect("valid")
+                .virtual_patterns
+                .is_empty(),
+            "clearing the box has to reach the row, or the user cannot undo a list"
+        );
+
+        // And `0` reaches the row on both numeric knobs, where it is a documented
+        // value rather than an absence: no floor, and never release.
+        let mut zeroed = req();
+        zeroed.virtual_over_bytes = Some(0);
+        zeroed.release_ttl_ms = Some(0);
+        let off = parse_req(&zeroed, Some(&prior)).expect("valid");
+        assert_eq!(off.virtual_over_bytes, 0);
+        assert_eq!(
+            off.release_ttl_ms, 0,
+            "`validate` exempts zero from the MIN_RELEASE_TTL_MS floor, so \
+             \"never release\" is reachable from a form"
+        );
     }
 
     /// The notes flag under the same rule, spelled out because its failure mode is

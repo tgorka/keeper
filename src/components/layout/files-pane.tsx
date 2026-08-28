@@ -312,6 +312,54 @@ export const FILES_MATERIALIZE_LABEL = "Materialize";
 export const FILES_RELEASE_LABEL = "Release";
 export const FILES_PIN_LABEL = "Pin";
 
+/**
+ * Rust's words for a row whose Release request is CERTAIN to be refused (story
+ * 56.14).
+ *
+ * Before this the row offered Release whenever `entry.sync.status` was
+ * `materialized` and on nothing else, while the SAME row was already holding
+ * Rust's word for why the request could not succeed. Pressing it on a pinned row
+ * or in a folder whose mode releases nothing produced a guaranteed red
+ * `role="alert"` from a control the pane had every fact needed to withhold —
+ * which is the worst version of this: the person is told no by a button that
+ * knew.
+ *
+ * **Why words and not a boolean on the wire.** `FilesReleaseVm` carries
+ * `releasesAfterMs`, `hold` and `detail`; a `releasable` discriminant is the
+ * structurally right shape and cannot be added on this host, because the struct
+ * literal is composed in the `keeper` shell crate, which does not build here. So
+ * the gate reads the one field that already exists to be read by a row.
+ *
+ * **Why `hold` and not `detail`.** `detail` is a SENTENCE. Branching on prose
+ * means a rewording in Rust silently re-enables a button that can only fail, and
+ * nothing anywhere would go red. `hold` is a one-or-two-word token that exists
+ * precisely so a surface can act on it, and story 56.14 split `Indefinite` out
+ * of the shared "Kept" so the token is now decisive:
+ *
+ * - `"Pinned"` — `Engine::release_resolved` reads `db::is_pinned` twice and
+ *   refuses. Withheld.
+ * - `"Kept"` — `ModeKeeps` or `LfsOff`: the folder's mode releases nothing, and
+ *   `release_mode_gate` refuses before anything else runs. Withheld.
+ * - `"Manual"` — `Indefinite`, i.e. `releaseTtlMs = 0`. `release_resolved` has no
+ *   TTL gate anywhere in its chain, so this row RELEASES ON REQUEST and the
+ *   button is the only mechanism it has. Offered.
+ * - `"Not sent"` — `Unconfirmed`. No `synced_at_ms` gate either, so it releases
+ *   on request. Offered.
+ * - `null` — on a clock (`Due`). Offered.
+ *
+ * Pin is NOT gated by this. It is idempotent in Rust and sends only `true`, so
+ * pressing it on an already-pinned row is pressing it once; withholding it would
+ * remove the one control that says "not this one" from the rows most likely to
+ * want it.
+ *
+ * A row with NO release standing at all is offered Release: an absent
+ * `FilesReleaseVm` is the pane knowing nothing, and withholding a verb on the
+ * strength of a missing fact hides a working control, where the refusal is the
+ * honest failure in that direction. So the test is on the word, not on the
+ * presence of the object.
+ */
+export const FILES_RELEASE_REFUSED_HOLDS: readonly string[] = ["Pinned", "Kept"];
+
 /** How the header counts what Delete would act on. A count, because the
  * confirmation is where the files are named. */
 export const FILES_SELECTED_TESTID = "files-selection-count";
@@ -1269,19 +1317,56 @@ export function FilesPane() {
    * one `role="alert"` Alert, verbatim — Story 56.4 wrote five refusal sentences
    * that each name the path and the next step, and a generic "failed" in their
    * place would throw away the whole of that work. No toast, no per-row error
-   * slot, no second channel: one sink, cleared before the attempt so a stale
-   * sentence is never read as this attempt's answer.
+   * slot, no second channel: one sink.
+   *
+   * **The verbs are SERIALIZED, and that is the fix for two presses** (story
+   * 56.14). This used to be `setWriteError(null)` followed by an unchained
+   * `void work()`, and two presses in flight together produced two wrong things
+   * at once: the second press erased the first's refusal before the first had
+   * even produced it, and — because `Engine` takes a per-profile reservation —
+   * the second was then likely to reject `SyncError::Busy`, so the sentence left
+   * on screen was about contention rather than about either file. A person who
+   * presses Release on two rows got told "the folder is already syncing", which
+   * is true of keeper and useless to them.
+   *
+   * So each attempt is chained onto the previous one. The chain link never
+   * rejects — every failure is swallowed into the sink inside it — so one refusal
+   * cannot strand every later press. Nothing is dropped and nothing is silently
+   * ignored: both verbs run, in the order they were pressed, each against a
+   * folder the previous one has finished with, and each is therefore answered on
+   * its own merits.
+   *
+   * **The sink is cleared per BURST, not per press,** and it accumulates. Clearing
+   * on every press is what lost the first sentence; never clearing would leave a
+   * refusal from ten minutes ago standing beside a fresh success. So the depth
+   * counter clears once, when a press arrives with nothing in flight, and each
+   * refusal after that is appended — the same joined-sentences shape
+   * `requestDelete`'s receipt already uses for a multi-path refusal, and for the
+   * same reason: two files refused for two reasons is two sentences.
    */
+  const verbChainRef = useRef<Promise<void>>(Promise.resolve());
+  const verbDepthRef = useRef(0);
   const runRowVerb = useCallback(
     (node: TreeNodeRow, work: () => Promise<void>) => {
-      setWriteError(null);
-      void work()
-        .then(() =>
-          load(node.profileId, nodeKeySubpath(node.parentKey ?? nodeKey(node.profileId, ""))),
-        )
-        .catch((error: unknown) => {
-          setWriteError(isIpcError(error) ? error.message : String(error));
-        });
+      // A press with nothing in flight opens a new burst, and a new burst is the
+      // only thing that discards the previous one's sentences.
+      if (verbDepthRef.current === 0) {
+        setWriteError(null);
+      }
+      verbDepthRef.current += 1;
+      verbChainRef.current = verbChainRef.current.then(() =>
+        work()
+          .then(() =>
+            load(node.profileId, nodeKeySubpath(node.parentKey ?? nodeKey(node.profileId, ""))),
+          )
+          .catch((error: unknown) => {
+            const sentence = isIpcError(error) ? error.message : String(error);
+            setWriteError((standing) => (standing === null ? sentence : `${standing} ${sentence}`));
+          })
+          .finally(() => {
+            verbDepthRef.current -= 1;
+          }),
+      );
     },
     [load],
   );
@@ -2040,6 +2125,7 @@ export function FilesPane() {
     const sizeId = `files-size-${encodeURIComponent(node.key)}`;
     const mtimeId = `files-mtime-${encodeURIComponent(node.key)}`;
     const releaseId = `files-release-${encodeURIComponent(node.key)}`;
+    const syncId = `files-sync-${encodeURIComponent(node.key)}`;
     const roleId = `files-role-${encodeURIComponent(node.key)}`;
     // When this file was last written (Story 56.7, FR-340), relative under a day
     // and an absolute date beyond it — `formatDraftAge`'s split, taken whole so
@@ -2115,11 +2201,29 @@ export function FilesPane() {
     // vault marker rendered only as a child would be on screen and absent from
     // the accessibility tree entirely (Story 44.11's finding, applied to two
     // more facts).
+    //
+    // **The sync mark is in this list (story 56.14).** It was the one fact in the
+    // row that carried its own `aria-label` and was named by nothing: the mark is
+    // `role="img"` with the sentence Rust composed as its accessible name, which
+    // is exactly the shape that reads as present in a tree dump and is silent
+    // under the rule the paragraph above states. So the whole point of story
+    // 56.7's three virtual states — that a placeholder is not a missing file and
+    // not an excluded one — was on screen and never spoken. It sits after the
+    // size and before the release standing because the size is the CONTENT's and
+    // the mark is what says whether those bytes are here, and the release
+    // standing is a consequence of that answer rather than a peer of it.
+    //
+    // Guarded on `entry`, not on `sync`: `FilesEntrySyncVm` is non-optional on an
+    // entry and the mark renders for every one of them, so the guard is the same
+    // `entry !== null` the mark itself uses (a profile root has no entry and
+    // takes no mark). One test — the row's description names the mark's id — is
+    // what keeps the two conditions from drifting apart.
     const describedBy =
       [
         node.count === null ? null : countId,
         entry?.size == null ? null : sizeId,
         modified === "" ? null : mtimeId,
+        entry === null ? null : syncId,
         releaseShort === "" ? null : releaseId,
         role === null ? null : roleId,
       ]
@@ -2214,14 +2318,21 @@ export function FilesPane() {
             // Release before Pin, because releasing is what a person came to this
             // row to do and pinning is how they say "not this one".
             //
-            // **Pin only ever sends `true`, and that is not an oversight.**
-            // Nothing on the wire says whether a path is pinned — the row learns
-            // it as Rust's own word in `release.hold` — so a toggle could not tell
-            // the person which way it was about to go, and a control whose effect
-            // depends on a fact it cannot show is worse than no control. Pin is
-            // idempotent in Rust, so pressing it twice is pressing it once, and
-            // `keeper-syncd unpin` is the door back out.
-            ...(entry.sync.status === "materialized"
+            // **Release is withheld when Rust's word already says no** (story
+            // 56.14). `entry.sync.status === "materialized"` alone was the gate,
+            // while the same row was holding `release.hold` — so a pinned row and
+            // a row in a folder whose mode releases nothing both offered a control
+            // whose only possible outcome was the red alert below. See
+            // {@link FILES_RELEASE_REFUSED_HOLDS} for which words those are and
+            // why the word rather than the sentence decides it.
+            //
+            // Withheld, not disabled: the pane's standing convention for a verb
+            // whose target cannot accept it (the `reveal` and create controls
+            // above), and the reason is not lost by hiding it — the release cell
+            // on this very row draws the word and speaks Rust's sentence for it,
+            // which is a better explanation than a disabled button's tooltip.
+            ...(entry.sync.status === "materialized" &&
+            !(releaseHold !== null && FILES_RELEASE_REFUSED_HOLDS.includes(releaseHold))
               ? [
                   {
                     id: "release",
@@ -2230,6 +2341,21 @@ export function FilesPane() {
                     onSelect: () =>
                       runRowVerb(node, () => syncReleaseEntry(node.profileId, entry.relativePath)),
                   },
+                ]
+              : []),
+            // **Pin only ever sends `true`, and that is not an oversight.**
+            // Nothing on the wire says whether a path is pinned — the row learns
+            // it as Rust's own word in `release.hold` — so a toggle could not tell
+            // the person which way it was about to go, and a control whose effect
+            // depends on a fact it cannot show is worse than no control. Pin is
+            // idempotent in Rust, so pressing it twice is pressing it once, and
+            // `keeper-syncd unpin` is the door back out.
+            //
+            // Deliberately NOT gated by the release words above: a pinned row
+            // pressing Pin is a no-op rather than a refusal, and the rows whose
+            // folder keeps content are exactly the rows someone wants to mark.
+            ...(entry.sync.status === "materialized"
+              ? [
                   {
                     id: "pin",
                     label: FILES_PIN_LABEL,
@@ -2492,8 +2618,13 @@ export function FilesPane() {
         )}
         {/* Between the name and the actions: what this file's sync state is.
         Never focusable — see {@link SyncStatusMark}. A profile root has no
-        entry of its own and takes no mark; its children answer for themselves. */}
-        {entry !== null && <SyncStatusMark sync={entry.sync} />}
+        entry of its own and takes no mark; its children answer for themselves.
+
+        The `id` is what puts the mark's sentence in the row's `aria-describedby`
+        (story 56.14). Without it the mark's accessible name was reachable only by
+        a reader who had already navigated INTO the row's subtree, which the row's
+        own `aria-label` is there to make unnecessary. */}
+        {entry !== null && <SyncStatusMark id={syncId} sync={entry.sync} />}
         {/* Create a file here (Story 45.3, FR-176, AD-89).
 
             On an OPEN folder only, because the answer to "may keeper write in

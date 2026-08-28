@@ -87,11 +87,14 @@ import {
   SYNC_DEFAULT_LANE,
   SYNC_DEFAULT_LFS_THRESHOLD_BYTES,
   SYNC_DEFAULT_POLL_INTERVAL_MS,
+  SYNC_DEFAULT_RELEASE_TTL_MS,
   SYNC_DEFAULT_SETTLE_MS,
   SYNC_DIRECTIONS,
   SYNC_LFS_MODES,
   SYNC_MIN_POLL_INTERVAL_MS,
+  SYNC_MIN_RELEASE_TTL_MS,
   SYNC_RECORDINGS_SUBFOLDER_LABEL,
+  SYNC_RELEASE_TTL_CEILING_MS,
   SYNC_REMOVABLE_SETTLE_MS,
   type SyncDirection,
   type SyncLfsMode,
@@ -162,6 +165,78 @@ export const SYNC_SUBJECT_NOTE =
 export const SYNC_EXCLUDES_LABEL = "Skip these files";
 export const SYNC_EXCLUDES_NOTE =
   "Comma-separated patterns, for example *.tmp, .DS_Store. Left empty, keeper syncs everything in the folder.";
+
+/**
+ * The virtual-file controls (Story 56.12, Epic 56, AD-122, AD-132).
+ *
+ * Epic 56 shipped the whole machinery for leaving a large file's content on the
+ * server and fetching it when somebody asks — and no way to say which files, or
+ * for how long. These three are that surface. They live under Advanced beside
+ * the two LFS knobs because they are about the same files: a path only has
+ * content to leave behind if keeper routed it through LFS in the first place.
+ *
+ * The wording avoids "virtual", which is jargon here, and says what happens to
+ * the file instead.
+ */
+export const SYNC_VIRTUAL_PATTERNS_LABEL = "Files that may stay away";
+export const SYNC_VIRTUAL_PATTERNS_NOTE =
+  "Comma-separated patterns, for example scans/**, *.psd. keeper keeps a matched file as a placeholder and fetches its content when you open it. Left empty, the folder's own committed .keepervirtual file decides — that list travels with the folder, so everyone syncing it gets the same answer.";
+export const SYNC_VIRTUAL_OVER_LABEL = "Only files at or above (MB)";
+export const SYNC_VIRTUAL_OVER_NOTE =
+  "A matched file smaller than this is downloaded anyway, because fetching it later costs more than keeping it. 0 lets every matched file stay away.";
+export const SYNC_RELEASE_TTL_LABEL = "Give local copies back after (hours)";
+export const SYNC_RELEASE_TTL_NOTE =
+  "How long a file keeps its content on this machine after keeper has confirmed that content reached the server. Then keeper drops back to the placeholder and fetches the file again when you ask for it. 0 never gives anything back.";
+
+/** The line under the release box when it says never. */
+export const SYNC_RELEASE_NEVER_NOTE =
+  "keeper will not release anything in this folder: every file stays here once its content arrives.";
+
+/**
+ * The line under the SIZE-FLOOR box when its content means "no floor" (story
+ * 56.14).
+ *
+ * The box's coercion was silent, and `0` is not a neutral fallback here — it is
+ * the documented instruction that every matched file may stay away, which is the
+ * widest setting the field has. Anything `pinnedValue` cannot read as a positive
+ * number lands on it: a blank box, a typed `0`, a minus sign, a half-typed
+ * `1e`. Meanwhile the release box beside it explains BOTH of its coercions, so
+ * two adjacent boxes with the same failure shape behaved differently for no
+ * reason a reader could see.
+ *
+ * Worded as the consequence rather than as the parse ("no size floor" and what
+ * that does), because the person reading it is looking at their own files and
+ * did not type a number they thought was invalid.
+ */
+export const SYNC_VIRTUAL_OVER_NONE_NOTE =
+  "No size floor right now: every matched file may stay away, however small it is.";
+
+/** The line under the release box when Rust will refuse the window outright. */
+export const SYNC_RELEASE_OUT_OF_RANGE_NOTE =
+  "keeper refuses a window under a minute or over ten years rather than rounding it, so this save will come back with an error. Use 0 to switch releasing off.";
+
+/**
+ * What a control wears when the folder's own config file decides its value
+ * (Story 56.12, AD-132).
+ *
+ * Two idioms already exist for this and they disagree, on purpose.
+ * `FileControlled` in Settings **says so and deliberately does not disable**,
+ * because `set_setting` still writes the settings table underneath the file and
+ * the value a person types there takes effect the moment the file stops setting
+ * the key — disabling would make an honest fallback unreachable. Every clause
+ * of that argument inverts here. `profile::as_stored` does not lose a race with
+ * a file; it STRIPS the key out of the row on every write and restores the
+ * previous value, reporting it with a `tracing::warn!` nobody sees. A control
+ * that accepted the edit would report success and revert. So this one follows
+ * the form's other "you cannot change this here" shape instead —
+ * {@link SYNC_PATH_FIXED_NOTE}, a plain note under a control that is not
+ * offered — and the save omits the key rather than sending a value that would
+ * be thrown away.
+ */
+export function syncFolderOwnedNote(profileKey: string): string {
+  return `${profileKey} is set by this folder's own config file (.keeper/keeper.toml). keeper keeps that value, so this cannot be changed here.`;
+}
+
 export const SYNC_SUBPATHS_LABEL = "Sync only these folders";
 export const SYNC_SUBPATHS_NOTE =
   "Comma-separated paths inside the folder. Left empty, keeper syncs the whole folder.";
@@ -327,6 +402,19 @@ export function syncInForceNote(seconds: number): string {
   return `keeper is using ${seconds} s here.`;
 }
 
+/**
+ * The same line for the one knob measured in hours (Story 56.12).
+ *
+ * A sibling rather than a unit parameter on {@link syncInForceNote}: that
+ * function's sentence is asserted verbatim by the tests of two other controls,
+ * and widening its signature to serve a third would make every one of those
+ * assertions depend on a call this file makes elsewhere. Two short sentences
+ * cost less than that coupling.
+ */
+export function syncReleaseInForceNote(hours: number): string {
+  return `keeper is using ${hours} h here.`;
+}
+
 /** Test id for the form's chosen-folder display (a read-only truncated path). */
 export const SYNC_FORM_PATH_TESTID = "sync-form-path";
 
@@ -353,6 +441,9 @@ const LFS_MODE_LABELS: Record<SyncLfsMode, string> = {
   disabled: "Do not use LFS",
 };
 
+/** Milliseconds in an hour — the unit the release box is typed in. */
+const MS_PER_HOUR = 60 * 60 * 1000;
+
 /** The form's fields, all as typed. */
 interface SyncFormValues {
   name: string;
@@ -363,6 +454,17 @@ interface SyncFormValues {
   lfsMode: SyncLfsMode;
   /** The LFS threshold in MB; empty defers to the Rust default. */
   lfsThresholdMb: string;
+  /** Comma-separated patterns whose content may stay away; empty is silence. */
+  virtualPatterns: string;
+  /** The size floor in MB below which a matched file is fetched anyway. */
+  virtualOverMb: string;
+  /**
+   * The retention window in hours. `0` is keeper's documented "never release"
+   * and is a real answer here, not the "keeper picks" an empty box means on the
+   * two windows below — which is exactly why this one is not parsed by
+   * {@link pinnedValue}.
+   */
+  releaseHours: string;
   removable: boolean;
   /**
    * The settle window in seconds; empty means the profile pins none and keeper
@@ -436,6 +538,13 @@ const EMPTY_FORM: SyncFormValues = {
   direction: "bidirectional",
   lfsMode: "materialize",
   lfsThresholdMb: String(SYNC_DEFAULT_LFS_THRESHOLD_BYTES / 1024 / 1024),
+  virtualPatterns: "",
+  // Both hold keeper's own number rather than being left blank, the way the
+  // threshold above does and unlike the two "keeper picks" windows below: there
+  // is no unpinned state for either. `0` IS the no-floor answer and 24 h IS the
+  // retention window, so an empty box would be a third state neither field has.
+  virtualOverMb: "0",
+  releaseHours: String(SYNC_DEFAULT_RELEASE_TTL_MS / MS_PER_HOUR),
   removable: false,
   settleSeconds: "",
   pollSeconds: "",
@@ -479,6 +588,13 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
     // back — never a number, which the next save would store as a choice the
     // user never made.
     lfsThresholdMb: String(profile.lfsThresholdBytes / 1024 / 1024),
+    // The three virtualization knobs, seeded from what is IN FORCE: the VM's
+    // values already carry the folder's own config layer, so a folder file that
+    // sets one of these is what the box shows — and `folderOwned` is what stops
+    // the box from pretending the number is editable.
+    virtualPatterns: profile.virtualPatterns.join(", "),
+    virtualOverMb: String(profile.virtualOverBytes / 1024 / 1024),
+    releaseHours: String(profile.releaseTtlMs / MS_PER_HOUR),
     settleSeconds: profile.settleMs === null ? "" : String(profile.settleMs / 1000),
     pollSeconds: profile.pollIntervalMs === null ? "" : String(profile.pollIntervalMs / 1000),
     removable: profile.removable,
@@ -518,6 +634,48 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
 function pinnedValue(raw: string): number | null {
   const parsed = Number.parseFloat(raw);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+/**
+ * The retention window the release box means, in milliseconds.
+ *
+ * Deliberately not {@link pinnedValue}, and this is the one numeric box in the
+ * form that could not reuse it. That helper collapses everything not `> 0` to
+ * `null`, which is right where "nothing" means "keeper picks" — and wrong here,
+ * because `0` is keeper's documented instruction to switch the release sweep
+ * off, and it switches it off *before* the due clock is read so that turning it
+ * back on later does not fire a window that armed while it was off. Routed
+ * through `pinnedValue`, "never release" would be unreachable from this form.
+ *
+ * A blank or unparseable box is the 24 h default rather than an omission: there
+ * is no unpinned state for this field, so `null` on the wire would mean "this
+ * form has no such control", which is false the moment the box is on screen.
+ * A negative number — which `min={0}` already refuses in the browser — reads as
+ * the default too, rather than being sent for Rust to refuse a second time.
+ *
+ * A non-zero window under {@link SYNC_MIN_RELEASE_TTL_MS} is NOT rounded up
+ * here. Rust refuses it by name and prints its own sentence beside the form,
+ * which is the answer; correcting it here would save a number nobody typed.
+ *
+ * The two guards below the parse exist because the *rounding* can change the
+ * instruction rather than merely blur it. Anything under half a millisecond of
+ * an hour rounds to `0`, which is not a small window — it is keeper's documented
+ * "never release", the opposite of what a person typing a tiny number asked for.
+ * And a number large enough to leave the safe-integer range serializes as
+ * `Infinity` → `null`, which the wire reads as "not expressed", so the save
+ * would report success and change nothing. Both are answered by handing Rust a
+ * value it will refuse by name, which is the outcome the person can act on.
+ */
+function releaseTtlMsFor(raw: string): number {
+  const hours = Number.parseFloat(raw);
+  if (!Number.isFinite(hours) || hours < 0) {
+    return SYNC_DEFAULT_RELEASE_TTL_MS;
+  }
+  const ms = Math.round(hours * MS_PER_HOUR);
+  if (!Number.isSafeInteger(ms)) {
+    return SYNC_RELEASE_TTL_CEILING_MS + 1;
+  }
+  return hours > 0 && ms === 0 ? 1 : ms;
 }
 
 /**
@@ -662,6 +820,16 @@ export function AddFolderForm({
     profile === undefined ? EMPTY_FORM : formValuesFor(profile),
   );
   const [expanded, setExpanded] = useState(false);
+  /**
+   * The profile keys this folder's own config file decides (Story 56.12).
+   *
+   * Read off the seeding profile rather than held in `form`, because it is not
+   * something the form can change: it is a fact about a file on disk. Empty for
+   * an add form, which has no folder bound yet, and for every folder with no
+   * `.keeper/keeper.toml` — the normal case, in which nothing below this line
+   * renders differently.
+   */
+  const folderOwned = new Set(profile?.folderOwned ?? []);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /**
@@ -818,6 +986,25 @@ export function AddFolderForm({
     const thresholdMb = pinnedValue(form.lfsThresholdMb);
     const settle = pinnedValue(form.settleSeconds);
     const poll = pinnedValue(form.pollSeconds);
+    // The three virtualization knobs. Each is sent as the omission when this
+    // folder's own config file owns the key: `profile::as_stored` would strip
+    // the value out of the row anyway and log a warning nobody sees, so sending
+    // it would only be this form claiming to have expressed something it did
+    // not. Everywhere else all three are always expressed, because all three
+    // are always on screen once Advanced is open — and their disclosure state
+    // does not change that, the fields hold their seeded values either way.
+    const virtualPatterns = folderOwned.has("virtualPatterns")
+      ? null
+      : splitSyncList(form.virtualPatterns);
+    const virtualOverMb = pinnedValue(form.virtualOverMb);
+    const virtualOverBytes = folderOwned.has("virtualOverBytes")
+      ? null
+      : virtualOverMb === null
+        ? 0
+        : Math.round(virtualOverMb * 1024 * 1024);
+    const releaseTtlMs = folderOwned.has("releaseTtlMs")
+      ? null
+      : releaseTtlMsFor(form.releaseHours);
     const author = form.authorOverride.trim();
     // Decided before anything is written, against the answer this form opened
     // with, so a keychain read landing mid-save cannot change what the save
@@ -859,10 +1046,25 @@ export function AddFolderForm({
         excludes: splitSyncList(form.excludes),
         removable: form.removable,
         lfsMode: form.lfsMode,
-        lfsThresholdBytes:
-          thresholdMb === null
+        // Every key below that a folder config file can own, and that has an
+        // `Option` slot, is sent as the omission when it is owned. `branch`,
+        // `excludes` and `tags` can be owned too and have no omission to send —
+        // their slots are bare — so those controls are disabled and re-send the
+        // value in force. That is not free and the earlier claim that it was is
+        // wrong: `profile::as_stored` compares the incoming value against the
+        // TABLE row, and for an owned key those differ by definition, so every
+        // such save logs a shadowed-change warning naming keys nobody could
+        // touch. The data is safe — the value is restored — but the diagnostic
+        // is noisy until those three slots become `Option` too, which is a wire
+        // change and is recorded as deferred work.
+        lfsThresholdBytes: folderOwned.has("lfsThresholdBytes")
+          ? null
+          : thresholdMb === null
             ? SYNC_DEFAULT_LFS_THRESHOLD_BYTES
             : Math.round(thresholdMb * 1024 * 1024),
+        virtualPatterns,
+        virtualOverBytes,
+        releaseTtlMs,
         settleMs: settle === null ? SYNC_DEFAULT_SETTLE_MS : Math.round(settle * 1000),
         pollIntervalMs: poll === null ? SYNC_DEFAULT_POLL_INTERVAL_MS : Math.round(poll * 1000),
         tags: splitSyncList(form.tags),
@@ -874,23 +1076,26 @@ export function AddFolderForm({
         // Always expressed, because the field is always on screen. An empty
         // string is a value here rather than an omission: it IS keeper's own
         // mechanical subject.
-        commitSubjectTemplate: form.commitSubjectTemplate.trim(),
+        commitSubjectTemplate: folderOwned.has("commitSubjectTemplate")
+          ? null
+          : form.commitSubjectTemplate.trim(),
         // The vault flag rides the profile save rather than a second command:
         // `notes` IS a field on the profile, so writing it here keeps the folder
-        // and its vault-ness atomic and saves a round trip. Always expressed,
-        // because the switch is always on screen — `null` would mean "this form
-        // does not show it", which would be untrue here (AD-34-9).
-        notes: notesVault,
+        // and its vault-ness atomic and saves a round trip. Expressed whenever
+        // the folder's own config file does not own it — `null` otherwise means
+        // "this form does not show it", which is exactly true of a switch the
+        // file has taken out of the person's hands (AD-34-9, AD-132). The
+        // subfolder rides the same gate: it is the other half of one key.
+        notes: folderOwned.has("notes") ? null : notesVault,
         // Only when the switch is on: the subfolder box is revealed with it, and
         // an unflagged save must not reset a subfolder the user chose earlier.
-        notesSubfolder: notesVault ? notesSubfolder : null,
+        notesSubfolder: folderOwned.has("notes") || !notesVault ? null : notesSubfolder,
         // The recordings flag, on the same terms as the vault flag above:
         // `recordings` IS a field on the profile, so it rides this save and the
-        // folder and its recordings-ness land together. Always expressed, for the
-        // AD-34-9 reason — the switch is on screen, so `null` would be a lie.
-        // `false` REMOVES the block rather than emptying it, which is what takes
-        // the folder back out of the Recording destination picker.
-        recordings,
+        // folder and its recordings-ness land together. `false` REMOVES the
+        // block rather than emptying it, which is what takes the folder back out
+        // of the Recording destination picker.
+        recordings: folderOwned.has("recordings") ? null : recordings,
         // Unflagged: say nothing, so an unflagged save cannot reset a subfolder
         // the owner chose earlier. Flagged and empty on an ADD: also nothing, and
         // keeper's own default stands — this form has no copy of it to send.
@@ -900,13 +1105,17 @@ export function AddFolderForm({
         // Correcting it here to make the save succeed would be this form picking
         // a folder the owner did not name.
         recordingsSubfolder:
-          !recordings || (recordingsSubfolder === "" && !editing) ? null : recordingsSubfolder,
+          folderOwned.has("recordings") || !recordings || (recordingsSubfolder === "" && !editing)
+            ? null
+            : recordingsSubfolder,
         // The sessions flag, on the recordings block's exact terms (AD-107):
-        // always expressed because the switch is on screen, `false` REMOVES the
-        // block, and the subfolder follows the recordings empty-box rules.
-        sessions,
+        // `false` REMOVES the block, and the subfolder follows the recordings
+        // empty-box rules.
+        sessions: folderOwned.has("sessions") ? null : sessions,
         sessionsSubfolder:
-          !sessions || (sessionsSubfolder === "" && !editing) ? null : sessionsSubfolder,
+          folderOwned.has("sessions") || !sessions || (sessionsSubfolder === "" && !editing)
+            ? null
+            : sessionsSubfolder,
       });
       // `saveSyncProfile` re-reads the profile/status mirror, but the Sync
       // view's three per-folder lists are a *second* mirror on a deliberately
@@ -1065,10 +1274,13 @@ export function AddFolderForm({
           id={`${fieldId}-branch`}
           className="w-32"
           value={form.branch}
-          disabled={disabled || saving}
+          disabled={disabled || saving || folderOwned.has("branch")}
           onChange={(event) => setForm((live) => ({ ...live, branch: event.target.value }))}
         />
       </div>
+      {folderOwned.has("branch") && (
+        <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("branch")}</p>
+      )}
       <div className="flex items-center justify-between gap-2">
         <Label id={`${fieldId}-direction-label`}>{SYNC_DIRECTION_LABEL}</Label>
         <Select
@@ -1103,11 +1315,14 @@ export function AddFolderForm({
         <Switch
           id={`${fieldId}-notes`}
           checked={form.notesVault}
-          disabled={disabled || saving}
+          disabled={disabled || saving || folderOwned.has("notes")}
           onCheckedChange={(checked) => setForm((live) => ({ ...live, notesVault: checked }))}
         />
       </div>
       <p className="text-muted-foreground text-xs">{SYNC_NOTES_NOTE}</p>
+      {folderOwned.has("notes") && (
+        <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("notes")}</p>
+      )}
       {form.notesVault && (
         <>
           <div className="flex items-center justify-between gap-2">
@@ -1151,11 +1366,14 @@ export function AddFolderForm({
         <Switch
           id={`${fieldId}-recordings`}
           checked={form.recordings}
-          disabled={disabled || saving}
+          disabled={disabled || saving || folderOwned.has("recordings")}
           onCheckedChange={(checked) => setForm((live) => ({ ...live, recordings: checked }))}
         />
       </div>
       <p className="text-muted-foreground text-xs">{SYNC_RECORDINGS_NOTE}</p>
+      {folderOwned.has("recordings") && (
+        <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("recordings")}</p>
+      )}
       {form.recordings && (
         <>
           <div className="flex items-center justify-between gap-2">
@@ -1196,11 +1414,14 @@ export function AddFolderForm({
         <Switch
           id={`${fieldId}-sessions`}
           checked={form.sessions}
-          disabled={disabled || saving}
+          disabled={disabled || saving || folderOwned.has("sessions")}
           onCheckedChange={(checked) => setForm((live) => ({ ...live, sessions: checked }))}
         />
       </div>
       <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_NOTE}</p>
+      {folderOwned.has("sessions") && (
+        <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("sessions")}</p>
+      )}
       {form.sessions && (
         <>
           <div className="flex items-center justify-between gap-2">
@@ -1290,12 +1511,132 @@ export function AddFolderForm({
               className="w-24"
               placeholder={String(SYNC_DEFAULT_LFS_THRESHOLD_BYTES / 1024 / 1024)}
               value={form.lfsThresholdMb}
-              disabled={disabled || saving}
+              disabled={disabled || saving || folderOwned.has("lfsThresholdBytes")}
               onChange={(event) =>
                 setForm((live) => ({ ...live, lfsThresholdMb: event.target.value }))
               }
             />
           </div>
+          {folderOwned.has("lfsThresholdBytes") && (
+            <p className="text-muted-foreground text-xs">
+              {syncFolderOwnedNote("lfsThresholdBytes")}
+            </p>
+          )}
+          {/* The three virtual-file controls (Story 56.12). They sit here, next
+              to the LFS pair and above everything else, because they are about
+              the same files: a path can only leave its content behind if keeper
+              routed that content through LFS to begin with. */}
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-virtual-patterns`}>{SYNC_VIRTUAL_PATTERNS_LABEL}</Label>
+            <Input
+              id={`${fieldId}-virtual-patterns`}
+              className="w-56"
+              value={form.virtualPatterns}
+              disabled={disabled || saving || folderOwned.has("virtualPatterns")}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, virtualPatterns: event.target.value }))
+              }
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_VIRTUAL_PATTERNS_NOTE}</p>
+          {folderOwned.has("virtualPatterns") && (
+            <p className="text-muted-foreground text-xs">
+              {syncFolderOwnedNote("virtualPatterns")}
+            </p>
+          )}
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-virtual-over`}>{SYNC_VIRTUAL_OVER_LABEL}</Label>
+            {/* `step="any"` for the threshold box's reason directly above: a
+                fraction of a megabyte is an ordinary answer here, and the
+                implicit step of 1 would turn one into a stepMismatch that makes
+                WKWebView refuse the whole submit. */}
+            <Input
+              id={`${fieldId}-virtual-over`}
+              type="number"
+              min={0}
+              step="any"
+              inputMode="decimal"
+              className="w-24"
+              placeholder="0"
+              value={form.virtualOverMb}
+              disabled={disabled || saving || folderOwned.has("virtualOverBytes")}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, virtualOverMb: event.target.value }))
+              }
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_VIRTUAL_OVER_NOTE}</p>
+          {/* The coercion, said out loud — {@link SYNC_VIRTUAL_OVER_NONE_NOTE}.
+              The condition is `pinnedValue`'s own answer and not a separate test,
+              so what the note claims and what the save sends cannot come apart:
+              the same `=== null` that puts this line on screen is what sends `0`.
+              Rendered even when the folder's file owns the key, because the
+              value in force is still no floor and the person is still looking at
+              it. */}
+          {pinnedValue(form.virtualOverMb) === null && (
+            <p className="text-muted-foreground text-xs">{SYNC_VIRTUAL_OVER_NONE_NOTE}</p>
+          )}
+          {folderOwned.has("virtualOverBytes") && (
+            <p className="text-muted-foreground text-xs">
+              {syncFolderOwnedNote("virtualOverBytes")}
+            </p>
+          )}
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-release-ttl`}>{SYNC_RELEASE_TTL_LABEL}</Label>
+            <Input
+              id={`${fieldId}-release-ttl`}
+              type="number"
+              min={0}
+              step="any"
+              inputMode="decimal"
+              className="w-24"
+              placeholder={String(SYNC_DEFAULT_RELEASE_TTL_MS / MS_PER_HOUR)}
+              value={form.releaseHours}
+              disabled={disabled || saving || folderOwned.has("releaseTtlMs")}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, releaseHours: event.target.value }))
+              }
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_RELEASE_TTL_NOTE}</p>
+          {/* `0` is not "keeper picks" here, it is an instruction — so it gets
+              said back in words rather than left to the reader to infer from a
+              box holding a zero. */}
+          {releaseTtlMsFor(form.releaseHours) === 0 && (
+            <p className="text-muted-foreground text-xs">{SYNC_RELEASE_NEVER_NOTE}</p>
+          )}
+          {/* A box holding something Rust will not use verbatim. Compared
+              against the SUBSTITUTION rather than against the raw product:
+              `1.1 * 3_600_000` is `3960000.0000000005` in binary floating point,
+              so a comparison with the unrounded product fired this note on
+              ordinary one-decimal input and then told the reader keeper was
+              using the very number they had typed. Only the coercions
+              `releaseTtlMsFor` actually performs reach here. */}
+          {releaseTtlMsFor(form.releaseHours) !== 0 &&
+            !Number.isNaN(Number.parseFloat(form.releaseHours)) &&
+            releaseTtlMsFor(form.releaseHours) !==
+              Math.round(Number.parseFloat(form.releaseHours) * MS_PER_HOUR) && (
+              <p className="text-muted-foreground text-xs">
+                {syncReleaseInForceNote(releaseTtlMsFor(form.releaseHours) / MS_PER_HOUR)}
+              </p>
+            )}
+          {/* An empty box is the 24 h default rather than a value Rust would
+              refuse, so it is not covered above — and neither is a window Rust
+              refuses outright, which needs saying before the save rather than
+              after it. */}
+          {Number.isNaN(Number.parseFloat(form.releaseHours)) && (
+            <p className="text-muted-foreground text-xs">
+              {syncReleaseInForceNote(SYNC_DEFAULT_RELEASE_TTL_MS / MS_PER_HOUR)}
+            </p>
+          )}
+          {releaseTtlMsFor(form.releaseHours) !== 0 &&
+            (releaseTtlMsFor(form.releaseHours) < SYNC_MIN_RELEASE_TTL_MS ||
+              releaseTtlMsFor(form.releaseHours) > SYNC_RELEASE_TTL_CEILING_MS) && (
+              <p className="text-muted-foreground text-xs">{SYNC_RELEASE_OUT_OF_RANGE_NOTE}</p>
+            )}
+          {folderOwned.has("releaseTtlMs") && (
+            <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("releaseTtlMs")}</p>
+          )}
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-removable`}>{SYNC_REMOVABLE_LABEL}</Label>
             <Checkbox
@@ -1375,11 +1716,14 @@ export function AddFolderForm({
               id={`${fieldId}-excludes`}
               className="w-56"
               value={form.excludes}
-              disabled={disabled || saving}
+              disabled={disabled || saving || folderOwned.has("excludes")}
               onChange={(event) => setForm((live) => ({ ...live, excludes: event.target.value }))}
             />
           </div>
           <p className="text-muted-foreground text-xs">{SYNC_EXCLUDES_NOTE}</p>
+          {folderOwned.has("excludes") && (
+            <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("excludes")}</p>
+          )}
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-subpaths`}>{SYNC_SUBPATHS_LABEL}</Label>
             <Input
@@ -1397,11 +1741,14 @@ export function AddFolderForm({
               id={`${fieldId}-tags`}
               className="w-56"
               value={form.tags}
-              disabled={disabled || saving}
+              disabled={disabled || saving || folderOwned.has("tags")}
               onChange={(event) => setForm((live) => ({ ...live, tags: event.target.value }))}
             />
           </div>
           <p className="text-muted-foreground text-xs">{SYNC_TAGS_NOTE}</p>
+          {folderOwned.has("tags") && (
+            <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("tags")}</p>
+          )}
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-subject`}>{SYNC_SUBJECT_LABEL}</Label>
             <Input
@@ -1413,13 +1760,18 @@ export function AddFolderForm({
               // commit turns out to carry.
               placeholder={`sync(${form.name.trim() === "" ? "folder" : form.name.trim()}): 3 added, 1 modified`}
               value={form.commitSubjectTemplate}
-              disabled={disabled || saving}
+              disabled={disabled || saving || folderOwned.has("commitSubjectTemplate")}
               onChange={(event) =>
                 setForm((live) => ({ ...live, commitSubjectTemplate: event.target.value }))
               }
             />
           </div>
           <p className="text-muted-foreground text-xs">{SYNC_SUBJECT_NOTE}</p>
+          {folderOwned.has("commitSubjectTemplate") && (
+            <p className="text-muted-foreground text-xs">
+              {syncFolderOwnedNote("commitSubjectTemplate")}
+            </p>
+          )}
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-author`}>{SYNC_AUTHOR_LABEL}</Label>
             <Input

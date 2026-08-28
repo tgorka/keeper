@@ -5,6 +5,49 @@
  */
 export type SyncProfileVm = { id: string, name: string, localPath: string, remoteUrl: string, branch: string, direction: string, lane: string, subpaths: Array<string>, excludes: Array<string>, removable: boolean, lfsMode: string, lfsThresholdBytes: number, 
 /**
+ * Which paths this folder may leave unmaterialized, in the committed
+ * pattern file's own gitignore dialect (Story 56.1, AD-132).
+ *
+ * **Not half of a pinned/effective pair**, unlike `settle_ms` and
+ * `effective_settle_ms` directly below, and the difference is worth stating
+ * because the two shapes look alike. That pair exists because keeper
+ * SUBSTITUTES a different number for the one it was given — 10 s on
+ * removable media that pins nothing — so "what you pinned" and "what runs"
+ * are two facts about one profile. Nothing is substituted for these three:
+ * `SyncProfile::effective_release_ttl_ms()` is only `(> 0).then_some(..)`,
+ * which a form reads straight off `releaseTtlMs === 0`. What DOES differ
+ * from the stored row is the folder-TOML overlay — and `db::list_profiles`
+ * applies `profile::in_force` before this view model is built, so the value
+ * here is already **the value in force**. The fact that was missing was
+ * never a number; it is who decided it, and that is `folder_owned` at the
+ * bottom of this struct.
+ *
+ * An empty list is *silence* rather than a withdrawal:
+ * `lfs::virtual_policy::VirtualPolicy::compile` judges the profile list on
+ * what it parses to, so `[]` leaves the committed `.keepervirtual` deciding.
+ */
+virtualPatterns: Array<string>, 
+/**
+ * The smallest size, in bytes, a matched path may stay unmaterialized at
+ * (inclusive).
+ *
+ * `0` is keeper's documented "no floor" and not an absence, which is why
+ * this is a plain `u64` and not an `Option`: no value of this field means
+ * "unset", so there is nothing for a `None` to say.
+ */
+virtualOverBytes: number, 
+/**
+ * How long content may stay on this machine after its release clock last
+ * moved, in milliseconds. The default is `DEFAULT_RELEASE_TTL_MS` (24 h).
+ *
+ * `0` is the documented "never release", and it disables the sweep before
+ * the due clock is read — so a folder with the sweep off never arms a
+ * window that would fire the moment somebody turns it back on. A real
+ * value, therefore, for the same reason `virtual_over_bytes`'s zero is: a
+ * form has to be able to show it and send it back unchanged.
+ */
+releaseTtlMs: number, 
+/**
  * The quiescence window this profile PINS, or `None` when it pins none and
  * keeper picks (Story 34.5, AD-34-8). Not the same as the window in force:
  * see `effective_settle_ms`. The distinction is load-bearing — a form that
@@ -101,4 +144,22 @@ sessions: boolean,
  * rather than `notes_subfolder` — the form prefills from the value that
  * would actually be used, and `60-sessions` is spelled once, in Rust.
  */
-sessionsSubfolder: string, };
+sessionsSubfolder: string, 
+/**
+ * The canonical camelCase profile keys a `.keeper/keeper.toml` layer
+ * currently sets for this folder, sorted (Story 56.12).
+ *
+ * The one thing the three virtualization fields above cannot carry: not
+ * what the value is, but WHO decided it. `profile::as_stored` strips
+ * exactly these keys before every write and reports the shadowed change
+ * with a `tracing::warn!` no user ever sees — so a control over an owned
+ * key that accepted input would report success and silently revert. The
+ * form disables such a control, names the file beside it, and omits the key
+ * from the request.
+ *
+ * Already sorted, because `profile::owned_fields` answers a `BTreeSet`:
+ * two reads of an unchanged folder therefore produce byte-identical JSON,
+ * and nothing downstream has to sort to compare. Empty for every folder
+ * with no config file, which is the normal case.
+ */
+folderOwned: Array<string>, };

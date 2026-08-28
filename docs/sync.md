@@ -325,15 +325,24 @@ The policy in force is read from the `.keepervirtual` standing in the
 **worktree**, never from `HEAD`, and a `virtualPatterns` list on the profile or
 in a folder TOML layer above it replaces the file's list wholesale — so what is
 in force may be neither committed nor in that file at all. (Protections, the
-`!` lines, are the union of every source and are never dropped.) A folder with
-no policy at all, and a folder whose `lfsMode` is `disabled`, excuse nothing.
+`!` lines, are the union of every source and are never dropped.)
+
+Two folders excuse nothing whatever else is true: one whose `lfsMode` is
+`disabled`, and one with no policy at all — **unless** its `lfsMode` is
+`pointerOnly`, which is itself the folder saying every tracked path may keep its
+pointer. A `pointerOnly` folder therefore needs no `.keepervirtual` and no
+`virtualPatterns` to have its absent objects excused. That is the only fact the
+mode replaces; a `pointerOnly` folder earns the other three per path exactly as
+every other folder does, and its excused paths are counted in the same
+`virtualPaths` number.
 
 An excuse needs every fact that is free, and misses none of them:
 
 - the **index** carries a pointer for that path whose oid and size are the ones
   on disk, which is what tells a checkout's committed pointer from a
   pointer-shaped file somebody saved by hand;
-- the **policy** answers that the path may stay away;
+- the path is **authorized** to stay away — either the policy says so, or the
+  folder's `lfsMode` is `pointerOnly`, which says so for the whole folder;
 - the object is genuinely **absent** from this machine's store rather than
   sitting there truncated;
 - and where the folder's remote is a **directory this machine can see**, that
@@ -842,24 +851,77 @@ failure, a refused batch, a repository the credential cannot see — collapses t
 store copy cannot be a precondition: `lfsPruneLocal` deletes the store object
 precisely when the worktree holds the content (§8), so a rule that leaned on the
 store would be leaning on the thing the other feature removes. The one local
-shortcut is a **filesystem remote's own** object store, proved per object, and
-only where no `.lfsconfig` names a server to ask instead.
+shortcut is a **filesystem remote's own** object store, proved per object.
+
+`.lfsconfig` still outranks it: a repository that names an LFS server has settled
+where the question goes, and that server's answer decides. The store is asked
+when there is no server keeper can actually address — either no `.lfsconfig` at
+all, or one whose named endpoint cannot be reached from a path remote. Before
+this, such a folder refused `UnprovenOnRemote` for ever and could never release
+anything. It is still fail-closed in the direction that matters: a store that
+does not hold the object at exactly that size keeps the local copy.
 
 **Where the operating system cannot answer "is this file open" without racing,
-keeper refuses rather than guesses.** `open_file_state` returns
-`OpenFileState::Unknown` by default, and that default is the honest answer: no
-shipping platform overrides it — not the Linux daemon's, not the desktop shell's
-on macOS or Windows. On Linux the only answer available to a crate that carries
-no `libc` and denies `unsafe` is a `/proc/*/fd` scan, which is a snapshot and so
-TOCTOU by construction, and which cannot read the descriptor table of a process
-owned by another uid — so it would answer *closed* for exactly the reader most
-likely to be there. macOS has no equivalent at all. The consequence is stated in
-§13 and repeated here so this chapter cannot be read as a promise: **a
-`pointerOnly` folder gets as far as the open-file question, and on every real
-host today both `dehydrate` and the release sweep answer it *cannot tell* and
-refuse.** An ordinary folder never reaches that question — its mode refuses
-first. The release path is exercised in tests, and a platform that can answer
-race-free will make it live for the folders whose mode allows it.
+keeper refuses rather than guesses.** On **Linux** it can be asked, and keeper
+asks it: `/proc/<pid>/fd` is read in-process — no `lsof`, no process spawn, no
+new dependency, no `libc` — and a descriptor is matched to the target by
+**device and inode identity**, taken by `stat`ing the magic link so procfs
+resolves it straight to the open file's inode. That is the kernel's own answer
+rather than a parsed text snapshot, and it is why a deleted-but-open file's
+` (deleted)` suffix, another mount namespace's path prefix, a hardlink and a
+`..` or symlink spelling of the same path are all non-issues. Both hosts answer
+the same way from the same code: the `keeper-syncd` daemon, and the desktop app
+when it runs on Linux.
+
+On Linux, `closed` therefore means something exact: **no process whose
+descriptor table keeper is permitted to read holds this file open.** `/proc/<pid>/fd`
+is readable only by the process's own user, so a program running as another
+user — root included — is a blind spot, and that narrowing is stated here rather
+than discovered. It is an accepted cost with a reason. Demanding *total*
+completeness would make the answer *cannot tell* on every Linux machine that has
+ever booted, because pid 1 alone guarantees an unreadable table — which is the
+refuse-everything outcome this whole section used to describe. And this
+particular refusal is not what the no-data-loss guarantee rests on: the content
+proof and the per-object remote proof are. A release is a `rename(2)` and never
+a truncation, so a program that already has the file open finishes reading it
+undisturbed; the harm from a missed opener is that its *next* open reads ~130
+bytes of pointer text, and the content it wanted comes back by asking for that
+path again — materialized from the server whose ability to serve that exact
+object was proved a moment earlier, in the same release. Not from the local
+store: `lfsPruneLocal` is on by default and releases the store copy precisely
+when the worktree holds the content, so a materialized path is exactly the state
+in which there may be no local copy left to fall back on.
+
+Every blind spot that is not that narrowing **refuses**, and the list is short
+and deliberate: no procfs at all, or one with no resolvable `/proc/self`, so
+keeper cannot even establish whose process table it is reading; a `/proc/<pid>`
+keeper cannot enter, where it cannot tell "somebody else's process" from "a
+process hidden from us" — the `hidepid=1` shape, on which keeper therefore
+refuses **every** release, correctly, because it can see that processes exist
+about which it knows nothing; a descriptor table that stopped enumerating
+part-way, because a table that was not finished was not examined; and a target
+that cannot be `stat`ed. Each of those answers *cannot tell*, which is
+`OpenUnknown`, which declines.
+
+`hidepid=2` is **not** on that list, and the distinction is worth stating
+because the intuitive reading is the wrong one. That setting makes other users'
+`/proc/<pid>` directories invisible rather than merely unreadable, so an
+unprivileged keeper enumerates only its own user's processes — and reads every
+one of them in full. So it answers *closed* there, and that answer sits inside
+the sentence above rather than contradicting it: what disappeared from the
+listing is exactly the set whose descriptor tables keeper was never allowed to
+read.
+
+**On macOS and Windows the answer is still *cannot tell*, so both `dehydrate`
+and the release sweep still refuse `OpenUnknown` there.** macOS publishes no
+`/proc`, and the only routes to its per-process descriptor list are a wrapper
+crate that drags a libclang build dependency into every release build, or
+hand-written foreign-function calls whose answer struct is not declared by the
+`libc` crate and would have to be laid out by hand — in the one crate that
+cannot be built on the machine this was developed on, where a wrong layout reads
+the wrong bytes in silence. `lsof` is refused by name. So the honest answer
+there is the refusing one, and it is recorded rather than guessed. An ordinary
+folder never reaches the question at all — its mode refuses first.
 
 When a release does go through it publishes with a `rename(2)` and never a
 truncation. The pointer is written to a sibling temporary file, given the
@@ -984,7 +1046,7 @@ declines to do; releasing by hand is here today, as `dehydrate` and as the
 | verb | what it does |
 | --- | --- |
 | `ls-files [profile] [--remote]` | what this clone actually holds, per LFS path; `--remote` adds the per-object question to the server |
-| `materialize <profile> <subpath>` | fetch one path's content, or queue the transfer that will |
+| `materialize <profile> <subpath>` | fetch one path's content, waiting for the transfer if the object is not here yet |
 | `dehydrate <profile> <subpath>` | release one path's content, leaving the committed pointer |
 | `pin <profile> <subpath>` | keep one path's content whatever the sweep says |
 | `unpin <profile> <subpath>` | withdraw that instruction |
@@ -993,9 +1055,11 @@ Two behaviours worth knowing before you script either of the first two.
 `ls-files --remote` propagates the audit error, so a server that cannot be asked
 fails the whole read-only command — and because the JSON document is printed once
 after the loop, `--json --remote` then emits no document at all; missing objects,
-by contrast, are reported and leave the exit code alone. And `materialize`'s
-queued transfer is delivered by a running `keeper-syncd watch` or by the app,
-never by the command itself, so on a host with no daemon running nothing arrives.
+by contrast, are reported and leave the exit code alone. And `materialize` on the
+**command line** does not hand its transfer to anybody else: it drains what it
+queued before it returns, and exits non-zero if the bytes did not arrive. The
+**app's** door still queues and returns, because the app's own engine is the
+supervisor that will deliver it and a UI must not block on a four-gigabyte fetch.
 
 `--json` is a **global** flag and works on either side of the subcommand. §13
 carries the wording contract — the lines each verb prints and the JSON field
@@ -1322,27 +1386,114 @@ keeper-syncd logs
 ```
 
 `ls-files` answers "what does this clone actually hold" for LFS-tracked paths.
-Each row carries the size and object id the **pointer** names — never the ~130
-bytes of pointer text a virtual path occupies on disk — plus a modification time
-and, once a path has been materialized, what the ledger recorded about it. The
-global `--json` flag makes the output a stable document whose field names are the
-contract. Remote presence is **absent unless you ask**: `--remote` adds the same
-batch round trip `verify --remote` makes, because whether the server holds an
-object cannot be known without asking it, and a listing that implied it did
-would be guessing about the one thing worth being sure of.
+
+**The printed row and the `--json` document do not carry the same fields**, and
+the difference matters if you are reading one and scripting the other. The
+printed form is a count line followed by one row per path, and a row is four
+columns — the state, the size, the path, and the object id — with `[pinned]`
+after it when the path is pinned:
+
+```
+tgdrive: 2 LFS path(s) — 1 virtual, 1 materialized, 0 absent
+  materialized     4.0 MB  40-media/clip.mp4  3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea
+  virtual        128.0 MB  scans/2019/box-7.tiff  9b2c1f04a7e5d3018f6b24cc90ae71d5386f0b4e2c7a915d68f3410b7d33ae10  [pinned]
+```
+
+The object id is printed **in full** rather than abbreviated: it is the handle
+`verify`, the store and every later verb take, and a prefix somebody has to
+expand by hand is not a handle. Every row's size and object id are the ones the
+**pointer** names — never the ~130 bytes of pointer text a virtual path occupies
+on disk.
+
+A **modification time**, and what the ledger recorded about a path once it has
+been materialized, exist only under `--json`: they are `mtimeMs`,
+`materializedAtMs`, `lastUsedMs` and `syncedAtMs`, and no `keeper-syncd ls-files`
+invocation without `--json` prints any of them. (This paragraph used to claim the
+printed row carried a modification time. It never has.)
+
+The global `--json` flag makes the output a stable document whose field names are
+the contract. The byte count on a listing row is `sizeBytes`, and it is a
+**number for every row**, `virtual`, `materialized` and `absent` alike: the
+pointer is the source in all three cases, so there is no state in which it can be
+`null`.
+
+**One document, two spellings of "byte count", deliberately named here so you do
+not find out by reading a `null`.** A listing row spells it `sizeBytes`; a
+`remote.missing[]` entry — and a `repair.unrecoverable[]` entry beside it —
+spells it `size`. Both kinds of record carry a `path`, so a consumer that walks
+every object with a `path` key and reads `.size` gets a number for half of them
+and `null` for the other half. This is not confined to `ls-files --remote --json`:
+`verify --json` nests the same audit under each folder's `remote` key, so the
+asymmetry is in that document too. Renaming either field would break a published
+contract, so it stays and is documented rather than quietly corrected — read
+`sizeBytes` on a listing row and `size` on an audit entry.
+
+Remote presence is **absent unless you ask**: `--remote` adds the same batch
+round trip `verify --remote` makes, because whether the server holds an object
+cannot be known without asking it, and a listing that implied it did would be
+guessing about the one thing worth being sure of.
+
+**A present `remote` key does not prove a server was asked, and this matters if
+you are monitoring.** `remote.missing == []` means *nothing keeper could ask
+reported this object missing* — not *the server confirmed every object*. Three
+folders produce a fully-formed, intact-looking audit with no round trip at all:
+one whose `lfsMode` is `disabled`, one with no LFS-tracked pointers, and one whose
+remote is a filesystem path with no `.lfsconfig` naming a server — for which there
+is no server in the picture at all, and the peer's own `verify` is the answer. All
+three are by design (see §8's division of labour and §9's note on the
+filesystem-remote shortcut), and all three mean a wrapper reading an empty
+`missing` list as "every object is safely on a server" is wrong about exactly the
+folders where it would most like to be right.
+
+**No field distinguishes them, and `checked` is not that field.** The first two
+cases report `checked: 0`, which looks like the discriminator until you meet the
+third: a filesystem remote counts every tracked path into `checked` and then
+returns without asking anything. So a monitor that needs "a server said yes" has
+to know the folder's `lfsMode` and the shape of its `remoteUrl`, both of which
+`keeper-syncd list --json` reports on the profile row (the human `list` line
+carries the remote but not the mode). Recorded rather than papered over: adding a
+flag would change a published `--json` contract.
 
 `materialize` is the verb that asks for one of those paths by name. If this
 machine already holds the object it is published straight into the worktree and
 the line says `materialized`; if the worktree already had the content the line
-says `already materialized` and nothing is written; if the object is not here
-the transfer is **queued** and the line names the journal unit that will deliver
-it. This command has no event loop and does not wait, so a queued object arrives
-only once `keeper-syncd watch` (or the app) reaches it on a later pass — and not
-at all if no daemon is running. Asking twice returns the same unit rather than
-queueing a second download of the same bytes; a requested unit is claimed ahead
-of background work in the same tick, though never as the *whole* tick, so the
-push that backs up your local edits still runs. Two paths committed with
-identical content share one download, and a request publishes every one of them.
+says `already materialized` and nothing is written; if the object is not here the
+transfer is queued **and this command performs it before returning**, then
+reports `materialized`. So a plain `keeper-syncd materialize` on a host with no
+daemon anywhere still leaves the content on disk — which is what makes it usable
+from a cron entry or a script, the same caller `sync --once` exists for. A run
+that reports `materialized` is a run whose bytes are on disk, and its `--json`
+document carries **no `unitId`**: the field names the row that *will* deliver
+the content, and after a successful fetch there is no such row.
+
+It waits for **your** transfer and nothing else. The wait ends the moment the
+journal row for the object you asked for is settled, so a request for one small
+file does not ride along behind the rest of a folder's download backlog; a queue
+making no progress at all also ends it, so a transfer that genuinely cannot land
+stops instead of spinning. And only transfers are performed — this verb never
+commits, merges, pushes or opens a pull request on the way to fetching a file,
+however much of that is sitting ready in the folder's queue.
+
+A run that did not deliver **exits non-zero** and prints no materialization
+document, so under `--json` stdout carries exactly one document per invocation:
+the materialization, or the failure envelope. The sentence says which of four
+things happened to the transfer, because they are not the same problem: another
+keeper process is performing it right now (ask again shortly — nothing is
+wrong); it will be retried, with the last recorded failure quoted; keeper has
+**given up** on it, with the reason, and asking again queues a fresh attempt —
+no `watch` daemon will ever pick a parked row up; or it finished and the content
+is somehow not on disk, which asking again fixes.
+
+Asking twice returns the same unit rather than queueing a second download of the
+same bytes; a requested unit is claimed ahead of background work in the same
+tick, though never as the *whole* tick, so the push that backs up your local
+edits still runs. Two paths committed with identical content share one download,
+and a request publishes every one of them.
+
+The **app's** door is deliberately the other shape: it queues, returns
+immediately and lets the app's own engine — which is the supervisor — deliver on
+its next tick, because a UI must not block on a four-gigabyte transfer. One
+engine function per shape, and no policy in either caller.
 
 A path whose bytes on disk are neither the committed pointer nor the content it
 names is **refused by name** and left exactly as it is: keeper does not
@@ -1355,7 +1506,15 @@ script can tell "you have the file" from "ask again".
 
 `dehydrate` is `materialize` pointing the other way: it removes one path's
 content and leaves the pointer the folder committed, byte for byte. The line
-says `released` with the size you got back. It is the one verb here that can
+says `released` with the bytes this machine **no longer holds** — which is not
+always the size of the file. A release is a `rename(2)`, and `rename(2)` replaces
+one directory entry: a file with more than one hard link still has its content on
+disk under the other name, so nothing was reclaimed and the figure is `0 B`
+(`sizeBytes: 0` under `--json`). That is a real, successful release — the pointer
+IS at that path afterwards — and the log line names the link count. On a platform
+with no hard-link count the figure is the pointer's size.
+
+It is the one verb here that can
 destroy data, so it refuses before it writes anything — the folder **keeps
 every object it holds**, which is what a folder does unless you set it to keep
 pointers only, and a release there would be undone on the next pass; the file
@@ -1370,6 +1529,16 @@ invisible repository — is also a refusal; the path is **pinned**; or it was
 `1` and changes nothing on disk. The release is a rename, so a program already
 reading the file finishes reading it.
 
+**The profile selector is not a refusal, and does not exit `1`.** A first
+argument that names no folder, or that names two folders sharing one name, is a
+configuration error and exits **`2`** — before any of the gates above is
+consulted, and on `materialize`, `dehydrate`, `pin` and `unpin` alike. So a
+script that reads `1` as "keeper declined" and anything non-zero as "keeper
+declined" will read a typo'd folder name as a refusal unless it separates the
+two. An id always resolves to exactly one folder (it is the profile row's
+primary key), so `2` from an existing folder means two of your folders share a
+name and you should name the one you mean by its id.
+
 Once the content is gone the release **succeeded**, even if keeper could not
 finish writing down that it happened: a locked database or a busy `.git` is
 logged and the release still reports `released` and exits `0`. Calling a
@@ -1378,12 +1547,14 @@ afford. Nothing is lost for good either — the note is rewritten the next time
 that path's content lands, and an index entry left stale is repaired by asking
 to release the path again.
 
-**Today it refuses on every real host**, and that is deliberate rather than
-broken: keeper has no way to ask this operating system whether a file is open
-without racing, and guessing is the one guess that deletes somebody's only
-copy — so the answer is "cannot tell" and the release declines. A platform that
-can answer race-free will make the verb live; until then it is exercised only
-in tests.
+**On Linux it goes through; on macOS and Windows it still refuses**, and that
+split is deliberate rather than broken. Linux publishes every process's open
+descriptors in a directory keeper can read, so keeper asks the kernel by inode
+identity and gets a real answer — see "What a release refuses to do" above for
+what *closed* claims there and the one narrowing it carries. macOS and Windows
+give keeper no way to ask the question without racing, and guessing is the one
+guess that deletes somebody's only copy, so the answer there is "cannot tell"
+and the release declines.
 
 ### Letting go on its own: `releaseTtlMs`, `pin` and `unpin`
 
@@ -1392,8 +1563,8 @@ content whose retention window has run out, without anybody asking, and it runs
 every one of the refusals above unchanged — the same hash of the actual bytes,
 the same per-object question to the server taken at the moment of the deletion,
 the same fail-closed answer when this machine cannot tell whether a file is
-open. It is not a privileged caller, so **on a real host today it refuses
-exactly as `dehydrate` does**, for the same reason.
+open. It is not a privileged caller, so **it releases where `dehydrate` releases
+and refuses where `dehydrate` refuses**, for the same reasons.
 
 Which clock applies to a path is decided by where its content came from, and it
 is recorded rather than guessed:
@@ -1650,17 +1821,21 @@ with the sentences and glyphs that carry them, `pin`/`unpin`, and — in a
 folder in the default `materialize` mode answers with a word and no instant, so
 no row counts there: a counting row needs `lfsMode = pointerOnly`, a non-zero
 `releaseTtlMs`, an unpinned row and, for content this clone authored, a
-`synced_at_ms` that is not NULL. Two parts are not reachable at runtime:
+`synced_at_ms` that is not NULL. One part is not reachable at runtime, and one
+is reachable on Linux only:
 
 - **§12 progress and warnings.** These are engine-side and correct — the tray
   decision, the status line and the warning onset logic are implemented and
   tested — but the desktop app surfaces that render them are not wired up.
-- **Releasing content (§9).** `dehydrate` and the release sweep are implemented
-  and covered by tests, but a folder only reaches the open-file question when its
-  `lfsMode` is `pointerOnly` — the default `materialize` mode refuses before it —
-  and no shipping platform can answer whether a file is open without racing, so
-  both refuse on every real host today. Nothing releases content on a production
-  machine until a platform can answer that question race-free.
+- **Releasing content (§9), on macOS and Windows.** `dehydrate` and the release
+  sweep are implemented, covered by tests, and **live on Linux**: the daemon and
+  the desktop app there both answer the open-file question from `/proc` by inode
+  identity, so a `pointerOnly` folder really does release. Two conditions still
+  gate it — a folder reaches the open-file question only when its `lfsMode` is
+  `pointerOnly`, because the default `materialize` mode refuses before it, and
+  macOS and Windows cannot answer that question without racing, so both refuse
+  `OpenUnknown` there. Nothing releases content on a macOS or Windows machine
+  until that platform can answer the question.
 
 ## 18. Measured envelopes
 

@@ -35,6 +35,15 @@
 //! completes and then hangs, and `serve_one_batch` for the one test that needs
 //! the server to actually answer. No name is ever resolved, so no resolver —
 //! hijacking, blackholing or otherwise — can change what these tests observe.
+//!
+//! **Two of these tests drive the platform's REAL answer** (Story 56.11). Every
+//! other test here injects the open-file word through [`TestPlatform`], which
+//! proves what the engine does with it; the pair at the foot of the file wraps
+//! that fixture so `open_file_state` alone comes from
+//! `keeper_sync::platform::probe_open_file_state` and a real
+//! [`std::fs::File`] — so what is under test there is the actual machine's
+//! answer reaching the actual rename, rather than the trait plumbing a second
+//! time.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -391,6 +400,151 @@ async fn a_reader_holding_the_file_open_still_sees_the_content() {
     );
 }
 
+/// A release that gives back nothing reports nothing (Story 56.14).
+///
+/// `rename(2)` replaces ONE directory entry. With a second name on the same
+/// inode the content stays on the disk under that name, so the release is still
+/// correct and still worth doing — the caller asked for THIS name to hold its
+/// pointer, and it now does — and yet not a byte came back.
+///
+/// Without the fix `size_bytes` is the committed pointer's size, so
+/// `keeper-syncd`'s `released 4.0 MB` and Story 56.5's sweep-wide reclaimed
+/// total over-count by the whole file, once per link, while the content is
+/// still sitting on the disk under the other name.
+///
+/// The link count is deliberately **not** a guard, and the first assertion is
+/// what says so: refusing a hard-linked path would be a new refusal for a
+/// request that succeeds. Only the figure changes, to the one that is true.
+///
+/// The sibling name lives in a SECOND temporary directory rather than beside
+/// the file: a link inside the worktree would be an untracked path, and then
+/// `git status` would have an opinion about the fixture instead of about the
+/// release.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_released_hard_linked_file_reports_no_bytes_reclaimed() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let Some((engine, platform)) = engine_for(root, remote.path(), data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let blob = committed_blob(root);
+    let target = root.join("clip.mp4");
+    // Outside the worktree, and on the same filesystem: both directories come
+    // from this machine's one temporary directory, so the link is makeable.
+    let elsewhere = tempfile::tempdir().expect("a directory outside the worktree");
+    let sibling = elsewhere.path().join("clip.mp4.backup");
+    std::fs::hard_link(&target, &sibling)
+        .expect("both temporary directories are on one filesystem, so a hard link is possible");
+
+    let done = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect("a link count is not a guard: the release still happens");
+
+    assert_eq!(done.oid, pointer.oid);
+    assert_eq!(
+        done.size_bytes, 0,
+        "the inode survives under the other name, so this release reclaimed \
+         nothing — and the honest figure is the reclaimed one"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("read the released file"),
+        blob,
+        "the release itself is unchanged: byte for byte the blob git committed"
+    );
+    assert_eq!(
+        std::fs::read(&sibling).expect("read the hard-linked sibling"),
+        content,
+        "and the bytes this release did not reclaim are exactly where they were"
+    );
+    assert!(
+        ledger_paths(&platform).is_empty(),
+        "the ledger no longer claims this machine holds the content under this name"
+    );
+}
+
+/// A filesystem remote whose repository ALSO commits a `.lfsconfig` naming no
+/// addressable LFS server can still release (Story 56.14).
+///
+/// The `.lfsconfig` precedence is unchanged: a file that names a server is
+/// still asked first, and that server's answer still decides. What the fix adds
+/// is the case where there is no server to ask — the remote's own object store
+/// is then asked instead, which is a genuine, size-verified, per-object answer,
+/// and it is fail-closed the same way.
+///
+/// Without the fix the file alone sends this profile past the filesystem-remote
+/// branch, `lfs_access` then refuses to derive an endpoint from a path remote,
+/// and every candidate refuses `UnprovenOnRemote` forever — so such a folder
+/// could never release anything at all, on any pass, having already paid a
+/// whole-file hash to get there.
+///
+/// The file is **committed**, and committed before the fixture's own pointer,
+/// because that is the shape a real checkout has: an owner who set an LFS
+/// option once and replicates it to every peer.
+#[tokio::test]
+async fn a_committed_lfsconfig_naming_no_server_still_releases_from_a_path_remote() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+
+    // A perfectly ordinary transfer setting and NO `lfs.url`: the file is in
+    // force, and there is nothing in it any endpoint can be derived from.
+    std::fs::write(
+        root.join(".lfsconfig"),
+        "[lfs]\n\tconcurrenttransfers = 3\n",
+    )
+    .expect("write a .lfsconfig that names no LFS server");
+    {
+        let repo = git::repo::open(root, false).expect("open the fixture repository");
+        commit(
+            &repo,
+            remote.path(),
+            &git::commit::StagedChange {
+                added: vec![PathBuf::from(".lfsconfig")],
+                ..Default::default()
+            },
+        );
+    }
+
+    let (pointer, _content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let Some((engine, platform)) = engine_for(root, remote.path(), data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let blob = committed_blob(root);
+    let done = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect("no server to ask, so the remote's own store is asked — and it holds the object");
+
+    assert_eq!(done.oid, pointer.oid);
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read the released file"),
+        blob,
+        "byte for byte the blob git committed"
+    );
+    assert!(
+        ledger_paths(&platform).is_empty(),
+        "and the ledger no longer claims this machine holds the content"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The refusals that need the worktree read
 // ---------------------------------------------------------------------------
@@ -505,7 +659,8 @@ async fn a_file_the_machine_says_is_open_is_refused() {
 }
 
 /// The machine cannot tell whether it is open, so the content stays — the answer
-/// every real host gives today, and the one that makes this verb fail-closed.
+/// a platform that cannot see a descriptor table gives, and the one that makes
+/// this verb fail-closed.
 #[tokio::test]
 async fn a_machine_that_cannot_tell_refuses_rather_than_guessing() {
     let work = tempfile::tempdir().expect("tempdir");
@@ -521,8 +676,11 @@ async fn a_machine_that_cannot_tell_refuses_rather_than_guessing() {
         return;
     };
     // What `SyncPlatform::open_file_state`'s own body answers, and therefore
-    // what `LinuxPlatform` and the Tauri shell answer: there is no race-free
-    // primitive available, so the trait says so instead of guessing (AD-125).
+    // what macOS and Windows answer: no descriptor table this crate can read,
+    // so the trait says so instead of guessing (AD-125). Injected here rather
+    // than probed, because the point of this test is the ENGINE's response to
+    // the word — the real probe drives the engine in the two tests at the foot
+    // of this file.
     platform.set_open_file_state(OpenFileState::Unknown);
 
     let err = engine
@@ -777,6 +935,295 @@ async fn a_folder_that_keeps_everything_is_refused_by_name() {
         ledger_paths(&platform),
         vec!["clip.mp4".to_owned()],
         "and the ledger still says what is true"
+    );
+}
+
+/// ...and the same folder **does** release a path its virtualization policy
+/// authorizes (Story 56.10, AD-122, AD-123).
+///
+/// This is the sentence the test above could not have: `release_mode_gate`
+/// returned `Ok` for `LfsMode::PointerOnly` and nothing else, so on a folder in
+/// the mode every profile starts in there was no path at all — pinned, unpinned,
+/// pattern-matched or not — that this verb would let go. Story 56.5's whole TTL
+/// sweep was therefore dead in production, and `dehydrate_entry`'s own doc named
+/// this story as the one that lifts it.
+///
+/// The refusal was never about the folder. It was about the *disagreement*: in
+/// the default mode `materialize_pending` re-materialized any pointer inside the
+/// cone on the next pass, so a release gave back nothing and cost a fetch. Once
+/// the arrival path consults the same policy, the two verbs agree about this
+/// path and the release is real — which the second sync below is what proves.
+///
+/// The policy arrives on the **profile** tier here rather than as a committed
+/// `.keepervirtual`, because that tier overrides the file (AD-122) and because a
+/// file written but not committed would leave `git status` holding an untracked
+/// entry, and the clean-status assertion is the point.
+/// `tests/release_sweep.rs` exercises the committed file.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_folder_that_keeps_everything_releases_what_its_policy_authorizes() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut keeps = profile(root, remote.path());
+    keeps.lfs_mode = LfsMode::Materialize;
+    keeps.virtual_patterns = vec!["*.mp4".to_owned()];
+    let Some((engine, platform)) = engine_with(keeps, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let blob = committed_blob(root);
+    let target = root.join("clip.mp4");
+    assert_eq!(
+        std::fs::read(&target).expect("read"),
+        content,
+        "the fixture starts materialized, or there is nothing to release"
+    );
+
+    let done = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect("the policy authorizes this path, so the mode is no longer the answer");
+
+    assert_eq!(done.oid, pointer.oid);
+    assert_eq!(
+        std::fs::read(&target).expect("read the released file"),
+        blob,
+        "byte for byte the blob git committed"
+    );
+    assert!(
+        ledger_paths(&platform).is_empty(),
+        "and the ledger no longer claims this machine holds the content"
+    );
+    stamp_index_forward(root);
+    assert_eq!(
+        porcelain(root),
+        "",
+        "a released path reads clean in the default mode too"
+    );
+}
+
+/// A folder whose policy says *something* still refuses a path the policy does
+/// not name — with its own sentence (Story 56.10).
+///
+/// The gate lifted for a **path**, not for a folder. A single boolean — "does
+/// this folder have a policy at all" — would have made every path in a folder
+/// with one pattern releasable, which is `git-lfs#3092`'s shape read backwards:
+/// a pattern list deciding something about content it never mentions.
+///
+/// And the sentence is asserted, not just the variant. `AlwaysMaterializes`
+/// tells the reader the *folder* keeps its content and offers `pointerOnly` as
+/// the remedy — false of a folder that already virtualizes a zone, and a remedy
+/// that makes every path in it releasable at once, which is the choice a
+/// per-path policy exists to avoid having to make. So this refusal is
+/// `NotVirtual`, it names the path, and it names the file to add a line to.
+#[tokio::test]
+async fn a_policy_that_does_not_name_the_path_is_still_refused_by_name() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut keeps = profile(root, remote.path());
+    keeps.lfs_mode = LfsMode::Materialize;
+    // A real policy, in force, naming a zone this path is not in.
+    keeps.virtual_patterns = vec!["scans/**".to_owned()];
+    let Some((engine, platform)) = engine_with(keeps, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("nothing authorizes this path's content to stay away");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::NotVirtual { path })
+                if path == "clip.mp4"
+        ),
+        "got: {err}"
+    );
+    let sentence = format!("{err}");
+    assert!(
+        sentence.contains("clip.mp4") && sentence.contains(".keepervirtual"),
+        "the sentence must name the path and the file to edit, not the folder's \
+         mode: {sentence}"
+    );
+    assert!(
+        !sentence.contains("pointers only"),
+        "and it must not offer the profile-wide lever this story exists to \
+         replace: {sentence}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        content,
+        "nothing was written"
+    );
+    assert_eq!(
+        ledger_paths(&platform),
+        vec!["clip.mp4".to_owned()],
+        "and the ledger still says what is true"
+    );
+}
+
+/// A policy cannot lift [`LfsMode::Disabled`] (Story 56.10).
+///
+/// Nothing routes through the clean filter in that mode, so real bytes in the
+/// worktree become an ordinary git blob on the next commit and there are no LFS
+/// pointers for a policy to have an opinion about. The gate is exhaustive over
+/// the mode for exactly this reason: the permissive arm had to be named rather
+/// than inherited.
+#[tokio::test]
+async fn large_file_support_off_refuses_though_the_policy_authorizes() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut off = profile(root, remote.path());
+    off.lfs_mode = LfsMode::Disabled;
+    off.virtual_patterns = vec!["*.mp4".to_owned()];
+    let Some((engine, platform)) = engine_with(off, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("large-file support is off, so there is nothing to release into");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::LfsDisabled { profile })
+                if profile == "media"
+        ),
+        "the refusal must name the mode, not the policy; got: {err}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        content,
+        "nothing was written"
+    );
+}
+
+/// A policy made only of protections authorizes nothing, and the folder is
+/// refused before a path is even resolved (Story 56.10).
+///
+/// Committing `!30-masters/**` before authorizing any zone is an ordinary
+/// defensive thing for a repository owner to write, and it puts a policy *in
+/// force* while leaving its permissive set empty. Gating the folder on which
+/// tier spoke rather than on whether anything is authorized would let such a
+/// folder arm a release window and spend a whole budget of repository opens and
+/// index reads on every sync, forever, to be refused per path — which is
+/// precisely the cheap decline the folder gate exists to keep.
+///
+/// The refusal is the folder's, `AlwaysMaterializes`, because that is what is
+/// true: nothing in this folder may stay away.
+#[tokio::test]
+async fn a_policy_of_only_protections_is_refused_as_a_folder_that_keeps_everything() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut keeps = profile(root, remote.path());
+    keeps.lfs_mode = LfsMode::Materialize;
+    keeps.virtual_patterns = vec!["!30-masters/**".to_owned()];
+    let Some((engine, platform)) = engine_with(keeps, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("a policy with no permissive line authorizes nothing");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::AlwaysMaterializes { profile })
+                if profile == "media"
+        ),
+        "the folder's own refusal, not the path's; got: {err}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        content,
+        "nothing was written"
+    );
+}
+
+/// A fault in `.keepervirtual` does not displace the mode's own answer (Story
+/// 56.10, FR-329).
+///
+/// `.keepervirtual` is entirely inert for a folder with large-file support off:
+/// nothing routes through the clean filter there, so there is no pointer for a
+/// policy to have an opinion about — which is the reason the `Disabled` arm is
+/// named rather than inherited. A caller that compiled the policy before asking
+/// the mode answered a request about such a folder with a configuration error
+/// quoting a pattern line, sending the owner to a file that has no bearing on
+/// their folder at all. The mode is asked first, and no policy is read.
+#[tokio::test]
+async fn a_broken_policy_does_not_displace_the_large_file_support_refusal() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+    std::fs::write(
+        root.join(keeper_sync::lfs::virtual_policy::VIRTUAL_PATTERN_FILE),
+        "[unclosed\n",
+    )
+    .expect("write a policy that cannot compile");
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut off = profile(root, remote.path());
+    off.lfs_mode = LfsMode::Disabled;
+    let Some((engine, platform)) = engine_with(off, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("large-file support is off");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::LfsDisabled { profile })
+                if profile == "media"
+        ),
+        "the mode is the accurate answer here, and no policy was read; got: {err}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        content,
+        "nothing was written"
     );
 }
 
@@ -1551,5 +1998,254 @@ async fn a_pin_that_lands_while_the_proof_is_in_flight_still_stops_the_release()
         ledger_paths(&platform),
         vec!["clip.mp4".to_owned()],
         "and so is the row that carries the pin"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The release, driven by the machine's REAL open-file answer (Story 56.11)
+// ---------------------------------------------------------------------------
+
+/// [`TestPlatform`] in every respect except the one answer under test.
+///
+/// The fixture's injected clock, data directory, secrets and git binary all
+/// stay: this test needs a `sync.db` under a temporary directory and a
+/// deterministic `now_ms` exactly as much as every other test in this file
+/// does. What it must **not** inherit is the injected `open_file_state`, which
+/// is what the other refusal tests here deliberately drive — asserting against
+/// that word proves the engine branches on it, and proves nothing at all about
+/// whether this machine can produce it.
+///
+/// So one method is replaced with `keeper_sync::platform::probe_open_file_state`
+/// and the rest are delegated verbatim. That makes the two tests below the only
+/// place in the tree where the REAL probe drives the REAL engine over a real
+/// repository and a real descriptor — the claim the acceptance criteria for
+/// Story 56.11 are written against.
+///
+/// Every method is spelled out rather than derived: the port's two *provided*
+/// methods (`utc_offset_minutes` and `open_file_state`) would otherwise silently
+/// fall through to the trait's own bodies, and for `utc_offset_minutes` that
+/// means reading the machine's real time zone into a fixture that is UTC
+/// everywhere else.
+///
+/// Gated to `target_os = "linux"` with the two tests it exists for: it is dead
+/// code on a target where the probe answers `Unknown`, and dead code is a
+/// warning the workspace treats as an error.
+#[cfg(target_os = "linux")]
+struct RealOpenPlatform(Arc<TestPlatform>);
+
+#[cfg(target_os = "linux")]
+impl SyncPlatform for RealOpenPlatform {
+    fn data_dir(&self) -> Result<PathBuf, SyncError> {
+        self.0.data_dir()
+    }
+
+    fn secret_get(&self, key: &str) -> Result<Option<String>, SyncError> {
+        self.0.secret_get(key)
+    }
+
+    fn secret_set(&self, key: &str, value: &str) -> Result<(), SyncError> {
+        self.0.secret_set(key, value)
+    }
+
+    fn secret_delete(&self, key: &str) -> Result<(), SyncError> {
+        self.0.secret_delete(key)
+    }
+
+    fn notify(&self, title: &str, body: &str) {
+        self.0.notify(title, body);
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.0.now_ms()
+    }
+
+    fn utc_offset_minutes(&self) -> i32 {
+        self.0.utc_offset_minutes()
+    }
+
+    /// The one method that is not the fixture's: the machine's own answer.
+    fn open_file_state(&self, path: &Path) -> OpenFileState {
+        keeper_sync::platform::probe_open_file_state(path)
+    }
+
+    fn free_space(&self, path: &Path) -> Option<u64> {
+        self.0.free_space(path)
+    }
+
+    fn git_program(&self) -> Result<PathBuf, SyncError> {
+        self.0.git_program()
+    }
+
+    fn host_label(&self) -> String {
+        self.0.host_label()
+    }
+}
+
+/// [`engine_with`], with the platform wrapped so `open_file_state` is real.
+///
+/// Returns the inner [`TestPlatform`], because that is the handle
+/// [`ledger_conn`] and [`remember`] need — the ledger this test inspects lives
+/// under the fixture's data directory, not the wrapper's.
+#[cfg(target_os = "linux")]
+fn engine_with_the_real_open_answer(
+    profile: SyncProfile,
+    data: &Path,
+) -> Option<(Engine, Arc<TestPlatform>)> {
+    let fixture = Arc::new(TestPlatform::new(data));
+    let platform = Arc::new(RealOpenPlatform(Arc::clone(&fixture)));
+    let engine = Engine::open(platform as Arc<dyn SyncPlatform>).ok()?;
+    engine
+        .upsert_profile(&profile)
+        .expect("register the profile");
+    Some((engine, fixture))
+}
+
+/// Whether this host publishes a readable process table at all.
+///
+/// The same capability skip [`init_repo`] is for, and for the same reason: on a
+/// Linux box whose `/proc` is masked or mounted `hidepid=1` the probe correctly
+/// answers `Unknown`, the release correctly refuses `OpenUnknown`, and the two
+/// tests below have nothing falsifiable to say. Phrased as two `read_dir` calls
+/// against the host — never as a question put to the code under test, which
+/// would let a probe that had stopped working skip its own tests.
+#[cfg(target_os = "linux")]
+fn procfs_is_readable() -> bool {
+    std::fs::read_dir("/proc").is_ok() && std::fs::read_dir("/proc/self/fd").is_ok()
+}
+
+/// A real descriptor on the real file makes the real release refuse.
+///
+/// The acceptance criterion of Story 56.11, and the assertion no injected
+/// answer can make: nothing in this test tells the engine the file is open.
+/// `probe_open_file_state` walks this machine's `/proc`, finds this test's own
+/// descriptor on that inode, and the engine refuses on its own — after having
+/// already paid the hash and the remote proof, because the open-file question
+/// is deliberately last.
+///
+/// Fails with the `Open` return removed from the walk, and that mutation is the
+/// proof that it is the probe rather than some other guard doing the refusing.
+///
+/// `target_os = "linux"` rather than `unix`: the probe answers `Unknown` on
+/// every other target today, and there the release would refuse
+/// `OpenUnknown` — a pass for the wrong reason, which is worse than no test.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_real_descriptor_makes_a_real_release_refuse() {
+    if !procfs_is_readable() {
+        return;
+    }
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let Some((engine, platform)) =
+        engine_with_the_real_open_answer(profile(root, remote.path()), data.path())
+    else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let target = root.join("clip.mp4");
+    let reader = std::fs::File::open(&target).expect("a real reader gets there first");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("this very process holds a descriptor on that inode");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::Open { path }) if path == "clip.mp4"
+        ),
+        "`Open`, not `OpenUnknown`: the machine answered rather than shrugged: {err}"
+    );
+
+    assert_eq!(
+        std::fs::read(&target).expect("read"),
+        content,
+        "and the four mebibytes are still here, byte for byte"
+    );
+    assert_eq!(
+        ledger_paths(&platform),
+        vec!["clip.mp4".to_owned()],
+        "the ledger row survives, because nothing was released"
+    );
+
+    // Held across the whole call on purpose — a descriptor dropped early would
+    // let the probe answer `Closed` and the release succeed.
+    drop(reader);
+}
+
+/// With nothing holding it, the real answer lets the release actually happen.
+///
+/// The other half of the acceptance criterion, and the half that would have been
+/// unreachable on every host before this story: end to end through the engine,
+/// with no injected word anywhere, the release publishes the committed blob.
+///
+/// Four assertions for four different bugs, mirroring
+/// `a_release_publishes_the_committed_blob_and_the_tree_stays_clean` — the bytes
+/// (a re-rendered pointer would differ), the inode (a `set_len` would not change
+/// it), the ledger (a stale row invites Story 56.5's sweep to release it again)
+/// and the real `git status` (without the one-path `refresh_index_stat` the
+/// entry's cached stat still describes four mebibytes forever).
+///
+/// `target_os = "linux"` for its sibling's reason: on a target that answers
+/// `Unknown` this test would fail, because the release would correctly refuse.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn with_nothing_holding_it_the_release_actually_happens() {
+    if !procfs_is_readable() {
+        return;
+    }
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, _content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let Some((engine, platform)) =
+        engine_with_the_real_open_answer(profile(root, remote.path()), data.path())
+    else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let target = root.join("clip.mp4");
+    let blob = committed_blob(root);
+    let before = inode(&target);
+
+    engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect("nothing holds it, the remote provably serves it: this must succeed");
+
+    assert_eq!(
+        std::fs::read(&target).expect("read the released file"),
+        blob,
+        "byte for byte the blob git committed — not a re-rendering of it"
+    );
+    assert_ne!(
+        inode(&target),
+        before,
+        "the inode changed, which is what a rename does and a truncation does not"
+    );
+    assert!(
+        ledger_paths(&platform).is_empty(),
+        "the ledger no longer claims this machine holds the content"
+    );
+
+    stamp_index_forward(root);
+    assert_eq!(
+        porcelain(root),
+        "",
+        "and the real git binary agrees the tree is clean"
     );
 }

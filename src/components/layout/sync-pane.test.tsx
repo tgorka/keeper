@@ -16,6 +16,8 @@ vi.mock("@/lib/ipc/client", () => ({
     reclaimableLabel: "256 B",
     scratchLabel: "0 B",
     contentLabel: "4 KB",
+    virtualPaths: 118,
+    materializedPaths: 3,
   })),
   // The shared profile/status mirror.
   syncProfiles: vi.fn(),
@@ -228,6 +230,10 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     removable: false,
     lfsMode: "materialize",
     lfsThresholdBytes: 4 * 1024 * 1024,
+    virtualPatterns: [],
+    virtualOverBytes: 0,
+    releaseTtlMs: 24 * 60 * 60 * 1000,
+    folderOwned: [],
     settleMs: null,
     effectiveSettleMs: 5_000,
     pollIntervalMs: null,
@@ -419,6 +425,10 @@ describe("SyncPane profile header", () => {
     // from the LFS pointers, so it is the same figure whether or not the bytes
     // were ever fetched, and it is what a virtual folder would leave behind.
     expect(line).toHaveTextContent("4 KB of content");
+    // The two counts the same sentence carries since Story 56.12: the only
+    // place a person can see the virtualization policy doing anything.
+    expect(line).toHaveTextContent("118 large files kept away on purpose");
+    expect(line).toHaveTextContent("3 held here");
   });
 
   /**
@@ -441,11 +451,17 @@ describe("SyncPane profile header", () => {
       reclaimableLabel: "0 B",
       scratchLabel: "0 B",
       contentLabel: "1 KB",
+      virtualPaths: 0,
+      materializedPaths: 0,
     });
     render(<SyncPane />);
 
     const line = await screen.findByTestId(SYNC_FOOTPRINT_TESTID);
     expect(line.textContent ?? "").not.toContain("of content");
+    // Zero-suppressed on the same rule as the size parts: a folder that keeps
+    // nothing away says nothing about keeping things away.
+    expect(line.textContent ?? "").not.toContain("kept away");
+    expect(line.textContent ?? "").not.toContain("held here");
   });
 
   /**

@@ -254,22 +254,23 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 }
 
 /// Add the late nullable columns `materialized` has grown, if they are not
-/// there yet (Stories 56.2 and 56.5).
+/// there yet (Stories 56.2, 56.5 and 56.14).
 ///
-/// Six facts the ledger has to hold before anything can decide what to
+/// Seven facts the ledger has to hold before anything can decide what to
 /// release: when the content was last *read* (`last_used_ms`), when the remote
 /// last confirmed it holds the object (`synced_at_ms`), whether the owner has
 /// asked for this path to stay on the machine (`pinned`), the object's
 /// identity and length (`oid`, `size_bytes`) so a row still answers after the
-/// worktree stops holding a pointer to consult, and which way the content
+/// worktree stops holding a pointer to consult, which way the content
 /// travelled (`local_origin`, Story 56.5) so the release sweep knows which of
-/// the two clocks applies to this path.
+/// the two clocks applies to this path, and when the content was released
+/// (`released_at_ms`, Story 56.14) so those facts survive the release.
 ///
 /// Literally [`ensure_activity_columns`]'s shape, including the `drop(stmt)`
 /// before the first `conn.execute` — `rusqlite` holds the connection while a
 /// prepared statement lives, so an `ALTER TABLE` issued with the PRAGMA
 /// statement still alive is a borrow error, not a runtime surprise. The one
-/// difference is that these six columns are not all the same type, so the
+/// difference is that these seven columns are not all the same type, so the
 /// loop carries the type beside the name rather than hard-coding `INTEGER`.
 ///
 /// **Nullable and without a `DEFAULT`, and no `meta` marker.** `NULL` is the
@@ -289,6 +290,12 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 /// `materialize_pending` — both publish content *over a pointer*, so every row
 /// that can already exist was written by an arrival. A row this clone authored
 /// carries a `1`, written by [`note_local_authorship`].
+///
+/// **`NULL` in `released_at_ms` means *the content is here*, which is what
+/// every row written before Story 56.14 meant by existing at all.** A release
+/// used to `DELETE` the row, so the column's absence and its `NULL` say the
+/// same thing about historical data, and [`forget_materialized`] is the only
+/// writer that ever fills it.
 fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
     // Column 1 of `table_info` is the column name.
@@ -303,6 +310,7 @@ fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
         ("oid", "TEXT"),
         ("size_bytes", "INTEGER"),
         ("local_origin", "INTEGER"),
+        ("released_at_ms", "INTEGER"),
     ] {
         if !existing.iter().any(|c| c == column) {
             conn.execute(
@@ -446,6 +454,71 @@ pub fn unit_urgency(conn: &Connection, id: i64) -> Result<Urgency> {
     Ok(Urgency::from_level(level.flatten().unwrap_or(0)))
 }
 
+/// Where one journal unit stands, and why (Story 56.13).
+///
+/// The question a **one-shot** caller has to answer after draining: the drain
+/// swallows a transfer's own error into the row (`Engine::reschedule_after`
+/// writes `last_error` and returns `Ok`), which is right for a supervisor and
+/// useless to a process that is about to tell its caller whether the bytes
+/// arrived. Four answers, and each of them is a different sentence:
+///
+/// * [`UnitStanding::Settled`] — the row is gone, which is the only thing
+///   [`complete`] does, so the work succeeded.
+/// * [`UnitStanding::Waiting`] — `pending` or `deferred`: something will try
+///   again. `reason` is the last recorded failure, which may predate this run.
+/// * [`UnitStanding::InFlight`] — `running`: somebody has claimed it and is
+///   attempting it *now*. For a caller that has just finished its own drain
+///   that somebody is necessarily **another process**, and it is the difference
+///   between "this failed" and "this is happening without you".
+/// * [`UnitStanding::Parked`] — given up on. `claim_ready` never offers a
+///   parked row, so nothing retries it until a human does.
+///
+/// An unreadable `state` is reported as `Waiting`, the answer that claims least:
+/// it neither promises the work is done nor accuses it of having stopped.
+pub fn unit_standing(conn: &Connection, id: i64) -> Result<UnitStanding> {
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT state, last_error FROM journal WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((state, reason)) = row else {
+        return Ok(UnitStanding::Settled);
+    };
+    Ok(match state.as_str() {
+        "running" => UnitStanding::InFlight,
+        "parked" => UnitStanding::Parked { reason },
+        _ => UnitStanding::Waiting { reason },
+    })
+}
+
+/// Where one journal unit stands. See [`unit_standing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitStanding {
+    /// The row is gone: the work succeeded.
+    Settled,
+    /// Something will attempt it again, and this is the last thing that went
+    /// wrong — possibly on an earlier attempt than the caller's own.
+    Waiting { reason: Option<String> },
+    /// Claimed and being attempted right now, by somebody else.
+    InFlight,
+    /// Given up on, and nothing retries it until a human unparks it.
+    Parked { reason: Option<String> },
+}
+
+impl UnitStanding {
+    /// Whether waiting longer could still change the answer.
+    ///
+    /// The drain loop's primary exit: `Settled` is the answer, and `Parked` and
+    /// `InFlight` are answers this process cannot improve on — one because
+    /// nothing will retry it, the other because another process owns the
+    /// attempt and `claim_ready` will not offer a `running` row twice.
+    pub fn worth_waiting_for(&self) -> bool {
+        matches!(self, Self::Waiting { .. })
+    }
+}
+
 /// Every download this profile is still waiting for: its name, object and size.
 ///
 /// Downloads only. An upload is also unfinished work, but the path it carries
@@ -502,6 +575,17 @@ pub fn queued_downloads(
 /// Naming `at_ms` explicitly in the `DO UPDATE` is therefore the whole point:
 /// this function knows exactly one fact, and it is now incapable of touching
 /// any other.
+///
+/// # Why `released_at_ms` is the one other column it clears (Story 56.14)
+///
+/// It is not a second fact. Since Story 56.14 [`forget_materialized`] retains
+/// the row and stamps `released_at_ms` instead of deleting it, so that column
+/// is the *negation* of this function's only fact: a row with it set says
+/// "content for this path is not here". Landing content and the content being
+/// here are the same statement, so leaving the stamp would make the row assert
+/// both at once — and [`materialized_paths`], which filters on exactly that
+/// column, would go on telling `Engine::pending` that the machine holds
+/// nothing at a path it has just materialized.
 pub fn remember_materialized(
     conn: &Connection,
     profile_id: &str,
@@ -510,8 +594,90 @@ pub fn remember_materialized(
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO materialized (profile_id, path, at_ms) VALUES (?1, ?2, ?3)
-         ON CONFLICT(profile_id, path) DO UPDATE SET at_ms = excluded.at_ms",
+         ON CONFLICT(profile_id, path)
+         DO UPDATE SET at_ms = excluded.at_ms, released_at_ms = NULL",
         (profile_id, path, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Record that this machine was *found* holding content for one path, without
+/// claiming to know when it landed (Story 56.14).
+///
+/// The writer for the one arm that had none: `Engine::materialize_held`'s
+/// already-held exit. A human named a path, keeper looked, and the content was
+/// already there — put there by `git lfs pull`, by a keeper that predates this
+/// ledger, by a second profile sharing the store, or by the documented
+/// same-length tie. Before this function that arm wrote nothing at all, so a
+/// path somebody explicitly asked for was invisible to the release clocks
+/// (FR-334): the sweep reads [`materialized_rows`], and a path with no row is
+/// a path with no candidate and no recorded use.
+///
+/// # Why this is not [`remember_materialized`]
+///
+/// `at_ms` means *content for this path landed here*, and this caller does not
+/// know when that was. So the insert sets it to now — the earliest instant
+/// this clone can honestly prove the content was here — and **the conflict arm
+/// leaves it alone**, because a row that already records a landing knows
+/// better than this one does. Using `remember_materialized` here would move an
+/// existing landing clock forward on every read of the file, which is the one
+/// fact the sweep's fallback (`a_row_with_no_recorded_use_falls_back_to_when
+/// _the_content_landed`) depends on.
+///
+/// What it does record on both arms is the *use*: this call happens because
+/// somebody asked for the path, which is precisely what `last_used_ms` means.
+/// It clears `released_at_ms` for [`remember_materialized`]'s reason — the
+/// content is here, and that column says it is not.
+///
+/// # It writes the identity, because the caller is holding the pointer
+///
+/// `oid` and `size_bytes` on both arms, from the committed pointer the
+/// already-held arm looked up to get here — the same fact [`note_arrival`] and
+/// [`note_local_authorship`] record for the same reason, and this is the third
+/// moment the pointer is in hand.
+///
+/// Not optional bookkeeping. `Engine::release_expired` hands
+/// `row.size_bytes.unwrap_or(u64::MAX)` to `release_path_gate`, whose floor is
+/// `size < over_bytes`, so a row with a `NULL` size clears **any**
+/// `virtualOverBytes` floor — a folder that keeps small files materialized on
+/// purpose would release the 2 MB file a person had just explicitly asked for.
+/// A `NULL` size also contributes nothing to `RELEASE_BUDGET_BYTES`, so one
+/// pass could release `RELEASE_BUDGET_OBJECTS` files of any size while holding
+/// the profile's reservation, which is exactly the residual
+/// [`note_arrival`]'s doc says these columns exist to bound. And
+/// `Engine::release_schedules` resolves the same row, so a Files-pane countdown
+/// would be computed against a size nobody measured.
+///
+/// It does not touch `local_origin`, so an inserted row reads `NULL` — *arrived
+/// from the remote*. That is the honest default and the safe one: it selects
+/// the `last_used_ms` clock, which this call has just set to now, and nothing
+/// is ever deleted on a clock alone — `Engine::release_resolved` takes a fresh
+/// remote proof at the moment of deletion. A path this clone actually authored
+/// is corrected the next time its commit runs, by
+/// [`note_local_authorship`]'s upsert.
+pub fn observe_materialized(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    now_ms: i64,
+    oid: &str,
+    size_bytes: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO materialized
+             (profile_id, path, at_ms, last_used_ms, oid, size_bytes)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5)
+         ON CONFLICT(profile_id, path)
+         DO UPDATE SET last_used_ms = excluded.last_used_ms,
+                       oid = excluded.oid, size_bytes = excluded.size_bytes,
+                       released_at_ms = NULL",
+        (
+            profile_id,
+            path,
+            now_ms,
+            oid,
+            i64::try_from(size_bytes).unwrap_or(i64::MAX),
+        ),
     )?;
     Ok(())
 }
@@ -628,6 +794,19 @@ pub fn note_arrival(
 /// written a row. `at_ms` is honest on insert: content for this path does exist
 /// on this machine, that is precisely why there is something to upload. It
 /// never touches `pinned` or `last_used_ms`.
+///
+/// # It clears `released_at_ms`, and that is the one arm that must (Story 56.14)
+///
+/// For [`remember_materialized`]'s reason — the column is the negation of "this
+/// clone holds content for this path", which is exactly what a local authorship
+/// asserts — and because this is the ONLY writer that can reach a released row.
+/// Content the owner puts back at a released path is not pointer text, so
+/// `pending_smudges` skips it and neither `remember_materialized` nor
+/// [`observe_materialized`] is ever called for it; the sweep cannot reach it
+/// either, because its candidates come from [`materialized_rows`]. Without the
+/// clear, the row stays retired forever: bytes the owner just authored would be
+/// invisible to the release sweep at any age, carry no schedule in a listing,
+/// and read to [`materialized_paths`] as content this machine does not have.
 pub fn note_local_authorship(
     conn: &Connection,
     profile_id: &str,
@@ -642,7 +821,8 @@ pub fn note_local_authorship(
          VALUES (?1, ?2, ?3, 1, NULL, ?4, ?5)
          ON CONFLICT(profile_id, path)
            DO UPDATE SET local_origin = 1, synced_at_ms = NULL,
-                         oid = excluded.oid, size_bytes = excluded.size_bytes",
+                         oid = excluded.oid, size_bytes = excluded.size_bytes,
+                         released_at_ms = NULL",
         (
             profile_id,
             path,
@@ -731,15 +911,26 @@ pub fn set_pinned(
     Ok(())
 }
 
-/// Every path this clone has held content for.
+/// Every path this clone holds content for **right now**.
 ///
 /// Read whole rather than asked per row: the caller is deciding a mark for a
 /// list, and one statement beats a query per line.
+///
+/// **`released_at_ms IS NULL` is load-bearing, not tidiness** (Story 56.14).
+/// Since a release retains the row rather than deleting it, the table also
+/// holds paths whose content is gone, and this function's whole contract is
+/// the present tense: `Engine::pending` reads it as the `replacing` flag, so a
+/// released row leaking through would announce a queued download as replacing
+/// content that is not there — the exact false statement
+/// [`forget_materialized`]'s `DELETE` was there to prevent.
 pub fn materialized_paths(
     conn: &Connection,
     profile_id: &str,
 ) -> Result<std::collections::HashSet<String>> {
-    let mut stmt = conn.prepare("SELECT path FROM materialized WHERE profile_id = ?1")?;
+    let mut stmt = conn.prepare(
+        "SELECT path FROM materialized
+          WHERE profile_id = ?1 AND released_at_ms IS NULL",
+    )?;
     let rows = stmt.query_map([profile_id], |r| r.get::<_, String>(0))?;
     let mut out = std::collections::HashSet::new();
     for row in rows {
@@ -800,7 +991,7 @@ pub struct MaterializedRow {
     pub local_origin: bool,
 }
 
-/// Every `materialized` row this profile has, whole.
+/// Every `materialized` row whose content this profile **still holds**, whole.
 ///
 /// Wider than [`materialized_paths`], and beside it rather than replacing it:
 /// that one answers a single yes/no per path, which is all the arrival
@@ -808,11 +999,20 @@ pub struct MaterializedRow {
 /// columns a listing reports. Read in one statement for the same reason it is:
 /// the caller is building a list, and a query per row is how a folder of a
 /// hundred thousand paths becomes a minute of SQLite.
+///
+/// **It carries [`materialized_paths`]' `released_at_ms IS NULL` filter, and
+/// for a sharper reason** (Story 56.14). Its two readers are `Engine::lfs_files`
+/// and the release sweep's candidate list, and both are about content that is
+/// on this disk now: a released row reaching the sweep would be handed to
+/// `Engine::release_resolved`, which would spend an index read and an `lstat`
+/// per pass to refuse `AlreadyPointer` forever — and the sweep's own retraction
+/// arm would then try to retract a row that is already retracted, in a loop
+/// bounded only by the byte budget.
 pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<MaterializedRow>> {
     let mut stmt = conn.prepare(
         "SELECT path, at_ms, last_used_ms, synced_at_ms, oid, size_bytes, pinned, local_origin
            FROM materialized
-          WHERE profile_id = ?1
+          WHERE profile_id = ?1 AND released_at_ms IS NULL
           ORDER BY path",
     )?;
     let rows = stmt.query_map([profile_id], |r| {
@@ -874,23 +1074,60 @@ pub fn is_pinned(conn: &Connection, profile_id: &str, path: &str) -> Result<bool
     Ok(pinned.flatten().unwrap_or(0) != 0)
 }
 
-/// Forget that this machine holds content for one path.
+/// Record that this machine no longer holds content for one path.
 ///
 /// The counterpart to [`remember_materialized`], called once the content has
-/// actually gone. The row's whole meaning is "content for this path exists
-/// here", and it does not: a retained row is a false statement about this
-/// machine, and the consumer it would mislead is [`materialized_paths`], which
-/// feeds `Engine::pending_files`' `replacing` flag — a queued download would be
-/// announced as replacing content that is no longer there.
+/// actually gone.
 ///
 /// It is **not** what makes `lfs::listing` call a path virtual. That comes from
 /// the worktree (`listing::collect` reads `worktree_pointer(..).is_some()`);
 /// the ledger only supplies the timestamps and the pin.
 ///
-/// Deletes exactly `(profile_id, path)` and nothing else. Removing an absent
+/// Touches exactly `(profile_id, path)` and nothing else. Retracting an absent
 /// row succeeds — the same contract [`crate::platform::SyncPlatform::secret_delete`]
 /// states, and for the same reason: the caller wants the fact gone, and it
 /// already being gone is that.
+///
+/// # Why this stamps a column instead of deleting the row (Story 56.14)
+///
+/// It was a `DELETE` until Story 56.14, and the argument for that was sound as
+/// far as it went: the row's headline meaning is "content for this path exists
+/// here", it does not, and a retained row would mislead
+/// [`materialized_paths`] — which feeds `Engine::pending`'s `replacing` flag —
+/// into announcing a queued download as replacing content that is no longer
+/// there.
+///
+/// What that argument missed is the rest of the row. [`ensure_materialized_columns`]
+/// says `oid` and `size_bytes` exist "so a row still answers after the worktree
+/// stops holding a pointer to consult", and calls the five late columns facts
+/// the ledger has to hold *before anything can decide what to release* — and a
+/// `DELETE` discarded `last_used_ms`, `synced_at_ms` and `local_origin` at the
+/// exact instant they were designed to still answer. The recency history a TTL
+/// sweep reasons with was erased by the sweep itself, so a path released and
+/// re-materialized came back looking like a path nobody had ever touched.
+///
+/// Both halves are satisfied by keeping the row and stamping `released_at_ms`:
+/// every present-tense reader ([`materialized_paths`], [`materialized_rows`])
+/// filters `released_at_ms IS NULL`, so nothing can read a released row as
+/// content that is here, while the columns survive. [`remember_materialized`]
+/// and [`observe_materialized`] clear the stamp when content lands again, and
+/// [`note_use`]'s bare `UPDATE` goes on recording a read of a released path,
+/// which is honest — somebody opened it — and is the fact a later
+/// re-materialization wants.
+///
+/// # What it costs
+///
+/// The table now grows with the number of distinct paths this profile has ever
+/// hydrated rather than with the number it currently holds, and **nothing
+/// prunes a released row**: there is no `DELETE FROM materialized` anywhere in
+/// this crate. So the bound is paths-ever-hydrated, which for a folder with
+/// renames, dated exports or a rolling archive grows with time and not with the
+/// cone. Both filtered readers stay correct and index-ranged either way; the
+/// cost is disk, and it is small per row. Bounding it needs a rule about which
+/// released rows are worth keeping — an age relative to the folder's TTL, plus
+/// an index read to know the path is gone upstream — which is a decision rather
+/// than an edit, and it is recorded as deferred work rather than guessed at
+/// here.
 ///
 /// # Why the statement will not touch a pinned row
 ///
@@ -900,15 +1137,20 @@ pub fn is_pinned(conn: &Connection, profile_id: &str, path: &str) -> Result<bool
 /// it is here for the loss class [`remember_materialized`]'s own doc records:
 /// `pinned` is the hard floor a release sweep may not cross, so losing it is
 /// "invisible until content the owner asked to keep was gone". A statement that
-/// is structurally incapable of discarding a pin cannot participate in that,
-/// whatever a future caller does. `COALESCE` because a `NULL` **is** unpinned —
-/// [`MaterializedRow::pinned`]'s documented rule, and every row written before
-/// the column existed reads back that way.
-pub fn forget_materialized(conn: &Connection, profile_id: &str, path: &str) -> Result<()> {
+/// is structurally incapable of retracting a pinned row cannot participate in
+/// that, whatever a future caller does. `COALESCE` because a `NULL` **is**
+/// unpinned — [`MaterializedRow::pinned`]'s documented rule, and every row
+/// written before the column existed reads back that way.
+pub fn forget_materialized(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    now_ms: i64,
+) -> Result<()> {
     conn.execute(
-        "DELETE FROM materialized
+        "UPDATE materialized SET released_at_ms = ?3
           WHERE profile_id = ?1 AND path = ?2 AND COALESCE(pinned, 0) = 0",
-        (profile_id, path),
+        (profile_id, path, now_ms),
     )?;
     Ok(())
 }
@@ -1185,6 +1427,12 @@ impl WorkKind {
     pub const PUSH: &'static str = "push";
     /// The `kind` column spelling for one LFS object upload. Same reason.
     pub const LFS_UPLOAD: &'static str = "lfsUpload";
+    /// The `kind` column spelling for one LFS object download. Same reason —
+    /// [`crate::engine::Engine::materialize_entry_now`] drains until this
+    /// profile owes no more of them, and it has no `WorkKind` value to ask
+    /// with because the object it is waiting for may already be gone from the
+    /// journal.
+    pub const LFS_DOWNLOAD: &'static str = "lfsDownload";
     /// The `kind` column spelling for a pull. Same reason — a rejected push
     /// queues one and has to be able to assert it did (DW-207).
     pub const PULL: &'static str = "pull";
@@ -1215,7 +1463,7 @@ impl WorkKind {
             Self::Pull => Self::PULL,
             Self::Push => Self::PUSH,
             Self::LfsUpload { .. } => Self::LFS_UPLOAD,
-            Self::LfsDownload { .. } => "lfsDownload",
+            Self::LfsDownload { .. } => Self::LFS_DOWNLOAD,
             Self::OpenPullRequest { .. } => "openPullRequest",
             Self::Verify => "verify",
         }
@@ -1432,14 +1680,50 @@ pub fn claim_ready(
     now_ms: i64,
     limit: u32,
 ) -> Result<Vec<WorkItem>> {
+    claim(conn, profile_id, now_ms, limit, None)
+}
+
+/// [`claim_ready`] narrowed to one `kind` (Story 56.13).
+///
+/// For a caller that is draining to satisfy **one request** rather than to move
+/// the folder along: `keeper-syncd materialize` waits for its own transfer, and
+/// a verb documented as "fetch one path's content" must not commit, merge,
+/// publish a branch or open a pull request on the way. `claim_ready` selects on
+/// `profile_id` and `state` alone, so without this the whole ready queue rides
+/// along — and a `Pull` drained that way can move the very pointer the request
+/// is about.
+///
+/// Every other property is `claim_ready`'s, including the background-slot
+/// carve-out: within one kind it still stops a full batch of requested work
+/// from starving the oldest background row.
+pub fn claim_ready_of_kind(
+    conn: &Connection,
+    profile_id: &str,
+    now_ms: i64,
+    limit: u32,
+    kind: &str,
+) -> Result<Vec<WorkItem>> {
+    claim(conn, profile_id, now_ms, limit, Some(kind))
+}
+
+/// The claim both doors above run. `kind` of `None` means every kind.
+fn claim(
+    conn: &Connection,
+    profile_id: &str,
+    now_ms: i64,
+    limit: u32,
+    kind: Option<&str>,
+) -> Result<Vec<WorkItem>> {
     let mut rows = ready_rows(
         conn,
         "SELECT id, payload, attempts, last_error, label, urgency FROM journal
          WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
+           AND (?4 IS NULL OR kind = ?4)
          ORDER BY COALESCE(urgency, 0) DESC, id LIMIT ?3",
         profile_id,
         now_ms,
         limit,
+        kind,
     )?;
     // Only when the batch is full AND holds nothing but requested work: with a
     // spare slot the background row was claimed by the statement above anyway,
@@ -1453,10 +1737,12 @@ pub fn claim_ready(
             "SELECT id, payload, attempts, last_error, label, urgency FROM journal
              WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
                AND COALESCE(urgency, 0) = 0
+               AND (?4 IS NULL OR kind = ?4)
              ORDER BY id LIMIT ?3",
             profile_id,
             now_ms,
             1,
+            kind,
         )?;
         if let Some(oldest) = background.into_iter().next() {
             // The youngest requested row, which is the last one: it keeps its
@@ -1518,9 +1804,13 @@ fn ready_rows(
     profile_id: &str,
     now_ms: i64,
     limit: u32,
+    kind: Option<&str>,
 ) -> Result<Vec<ReadyRow>> {
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map((profile_id, now_ms, limit), |r| {
+    // `?4` is bound whether or not the statement narrows on it: `(?4 IS NULL OR
+    // kind = ?4)` is how one projection serves both doors, and two spellings of
+    // six column indices is what this helper exists to prevent.
+    let rows = stmt.query_map((profile_id, now_ms, limit, kind), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
@@ -3285,7 +3575,7 @@ mod tests {
         remember_materialized(&c, "p", "b.mp4", 1_800).expect("landing");
         remember_materialized(&c, "q", "a.mp4", 1_900).expect("landing");
 
-        forget_materialized(&c, "p", "a.mp4").expect("forget");
+        forget_materialized(&c, "p", "a.mp4", 9_000).expect("forget");
         assert_eq!(
             materialized_rows(&c, "p")
                 .expect("read")
@@ -3301,9 +3591,9 @@ mod tests {
             "and so does the same path in another folder"
         );
 
-        forget_materialized(&c, "p", "a.mp4")
+        forget_materialized(&c, "p", "a.mp4", 9_100)
             .expect("forgetting an absent row must succeed, as deleting an absent secret does");
-        forget_materialized(&c, "p", "never-here.mp4").expect("nor is a path it never knew");
+        forget_materialized(&c, "p", "never-here.mp4", 9_200).expect("nor is a path it never knew");
 
         // And a pinned row is not one it can take, whatever a caller asks. The
         // refusal that keeps a pinned path away from here lives in the engine;
@@ -3314,10 +3604,122 @@ mod tests {
             [],
         )
         .expect("pin it the way 56.5's writer will");
-        forget_materialized(&c, "p", "kept.mp4").expect("the statement succeeds");
+        forget_materialized(&c, "p", "kept.mp4", 9_300).expect("the statement succeeds");
         assert!(
             is_pinned(&c, "p", "kept.mp4").expect("still pinned"),
-            "the row — and with it the owner's pin — survived the delete"
+            "the row — and with it the owner's pin — survived the retraction"
+        );
+        assert!(
+            materialized_paths(&c, "p")
+                .expect("read")
+                .contains("kept.mp4"),
+            "and a row the statement declined to retract still reads as held"
+        );
+    }
+
+    /// Story 56.14. A release used to `DELETE` the row, which discarded
+    /// `last_used_ms`, `synced_at_ms` and `local_origin` at the exact moment
+    /// `ensure_materialized_columns` says they exist to still answer. The row
+    /// now stays and carries a `released_at_ms` stamp instead: absent from every
+    /// present-tense reader, and still holding the history a re-materialization
+    /// wants.
+    ///
+    /// Without the change the two `materialized_rows(..)` reads below return an
+    /// empty vector, and the raw-column assertion cannot even find a row.
+    #[test]
+    fn a_released_row_keeps_its_clocks_and_leaves_every_present_tense_reader() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        note_arrival(&c, "p", "clip.mp4", 5_000, "aaa111", 4_194_304).expect("arrival");
+        note_synced(&c, "p", "clip.mp4", 5_100).expect("confirm");
+
+        forget_materialized(&c, "p", "clip.mp4", 9_000).expect("release");
+
+        assert!(
+            !materialized_paths(&c, "p")
+                .expect("read")
+                .contains("clip.mp4"),
+            "a released path must not read as content this machine holds: it is \
+             `Engine::pending`'s `replacing` flag"
+        );
+        assert!(
+            materialized_rows(&c, "p").expect("read").is_empty(),
+            "nor may it reach the release sweep's candidate list or a listing"
+        );
+
+        let (last_used, synced, origin, released): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = c
+            .query_row(
+                "SELECT last_used_ms, synced_at_ms, local_origin, released_at_ms
+                   FROM materialized WHERE profile_id = 'p' AND path = 'clip.mp4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the row is still there");
+        assert_eq!(
+            (last_used, synced, origin, released),
+            (Some(5_000), Some(5_100), Some(0), Some(9_000)),
+            "every clock the sweep reasons with survived the release"
+        );
+
+        // And landing content again un-retires the row without inventing a new
+        // landing instant for the history it kept.
+        remember_materialized(&c, "p", "clip.mp4", 12_000).expect("re-landing");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(
+            (row.at_ms, row.last_used_ms, row.synced_at_ms),
+            (12_000, Some(5_000), Some(5_100)),
+            "the row is present-tense again and its recency history is intact"
+        );
+    }
+
+    /// Story 56.14. `materialize_held`'s already-held arm wrote nothing at all,
+    /// so a path a human explicitly asked for had no row and could not be a
+    /// release candidate (FR-334). `observe_materialized` is that writer, and it
+    /// must not forge a landing instant for a row that already records one.
+    ///
+    /// Without the function the first assertion has no row to read.
+    #[test]
+    fn observing_content_records_the_use_and_never_moves_the_landing_clock() {
+        let c = conn();
+
+        observe_materialized(&c, "p", "found.mp4", 4_000, "aaa111", 4_096).expect("first sighting");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(
+            (row.at_ms, row.last_used_ms, row.local_origin, row.pinned),
+            (4_000, Some(4_000), false, false),
+            "a path nobody had a row for gets one, dated the earliest instant \
+             this clone can prove the content was here"
+        );
+
+        remember_materialized(&c, "p", "landed.mp4", 1_000).expect("landing");
+        observe_materialized(&c, "p", "landed.mp4", 7_000, "bbb222", 8_192)
+            .expect("second sighting");
+        let row = materialized_rows(&c, "p")
+            .expect("read")
+            .into_iter()
+            .find(|row| row.path == "landed.mp4")
+            .expect("the landed row");
+        assert_eq!(
+            (row.at_ms, row.last_used_ms),
+            (1_000, Some(7_000)),
+            "an existing row's landing clock is left alone; only the use is new"
+        );
+
+        // A sighting of a released path brings it back into the present tense,
+        // because looking at it is how we found out the content is here.
+        forget_materialized(&c, "p", "landed.mp4", 8_000).expect("release");
+        observe_materialized(&c, "p", "landed.mp4", 9_000, "bbb222", 8_192)
+            .expect("third sighting");
+        assert!(
+            materialized_paths(&c, "p")
+                .expect("read")
+                .contains("landed.mp4"),
+            "a sighting un-retires the row it found"
         );
     }
 

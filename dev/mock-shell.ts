@@ -29,6 +29,15 @@
  * and wrong in the app, this file is wrong — it is a viewing aid, never
  * evidence.
  *
+ * **It boots into the shell** (story 56.14). Until then it did not: `App` reads
+ * `encryption_posture` on mount and `session_restore` before that, and neither
+ * was answered here — so every `bun run dev` stopped on the first-run at-rest
+ * encryption card, and the Files pane, the folder settings and every other
+ * surface this file has fixtures for were unreachable without a real install on
+ * a Mac. That is the exact round trip the paragraphs above say this file exists
+ * to end, and it was still there. See the two answers at the head of `ANSWERS`
+ * for what they claim and, deliberately, what they do not.
+ *
  * **Dev only, and structurally so.** The import is behind `import.meta.env.DEV`
  * in `main.tsx`, so Rollup drops the whole module from a production build; there
  * is no runtime flag to get wrong. It also refuses to install when a real shell
@@ -37,6 +46,7 @@
 
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
+  AccountVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
@@ -45,6 +55,10 @@ import type {
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
+  SyncFootprintVm,
+  SyncProfileReq,
+  SyncProfileVm,
+  SyncVerifyVm,
 } from "@/lib/ipc/client";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
@@ -261,6 +275,13 @@ const RELEASE_DUE_SENTENCE =
   "keeper lets this content go on the first sync after the time runs out; the copy stays here until then";
 const RELEASE_PINNED_SENTENCE =
   "This path is pinned, so keeper keeps its content on this computer until the pin is lifted";
+/** `ReleaseSchedule::ModeKeeps` — one of the two causes whose word is `Kept` and
+ *  whose Release `Engine::dehydrate_entry` refuses on the mode gate, which is why
+ *  the pane withholds the button for it (story 56.14). Verbatim, like the two
+ *  above: the whole point of the withheld button is that this sentence is what
+ *  explains it instead. */
+const RELEASE_MODE_KEEPS_SENTENCE =
+  "This folder is set to keep large-file content on this computer, so nothing is released on a clock";
 
 /** A folder tree with the depth and the awkward names a real drive has. */
 const ENTRIES: FilesEntryVm[] = [
@@ -324,6 +345,20 @@ const ENTRIES: FilesEntryVm[] = [
     { status: "materialized", detail: MATERIALIZED_SENTENCE },
     null,
     { releasesAfterMs: null, hold: "Pinned", detail: RELEASE_PINNED_SENTENCE },
+  ),
+  // The row whose Release the pane WITHHOLDS (story 56.14): the folder's mode
+  // keeps large-file content, so `Engine::dehydrate_entry` refuses on the mode
+  // gate before anything else runs. Its word is `Kept`, which is what the pane
+  // reads; a `releaseTtlMs = 0` row would say `Manual` and keep the button,
+  // because that one releases on request. Here so the withheld state can be
+  // LOOKED at — the two rows above it both offer Release, so without this one the
+  // gate has nothing on screen to show.
+  lfsEntry(
+    "raw-2026-08.tiff",
+    { bytes: 268_435_456, label: "268 MB" },
+    { status: "materialized", detail: MATERIALIZED_SENTENCE },
+    null,
+    { releasesAfterMs: null, hold: "Kept", detail: RELEASE_MODE_KEEPS_SENTENCE },
   ),
 ];
 
@@ -980,6 +1015,65 @@ const CSV_ROWS = [
 const ANSWERS: Record<string, unknown> = {
   app_ping: "ok",
   capabilities: { notes: true, recording: true, sync: true, chat: true },
+  // ---------------------------------------------------------------------------
+  // The two answers that decide WHICH screen boots (`src/App.tsx`
+  // `renderContent`). Without them every `bun run dev` stopped at the first-run
+  // at-rest-encryption card and the shell — Files, folder settings, notes,
+  // sessions, every pane below — was unreachable without a real install on a
+  // Mac, which is the exact round trip this file exists to end. Both fell
+  // through to `fallback`, whose `null` is the WORST answer for each of them:
+  // `session_restore` → `null` makes `useSessionRestore`'s `accounts.length`
+  // throw (caught, so zero accounts), and `encryption_posture` → `null` is
+  // spelled "unchosen", which is precisely the card.
+  //
+  // These are harness fixtures, not a signed-in user: nothing here is a real
+  // account, a real homeserver or a real posture, and no Keychain or SDK session
+  // exists behind them. Anything that needs actual Matrix state (the timeline,
+  // room list, crypto) is answered elsewhere in this table or falls through.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * One restored account, so `hasAccount` is true and `App` mounts `<AppShell />`
+   * instead of the encryption card or the login screen. Shape from
+   * `src/lib/ipc/gen/AccountVm.ts`, annotated `satisfies` for the reason
+   * `sync_profiles` states: `dev/` is inside `tsconfig.json`'s `include`, so a
+   * field added in Rust breaks the typecheck here rather than blanking a window
+   * at run time.
+   *
+   * Exactly ONE account. A second would exercise the account switcher and the
+   * per-account hue bar, which is tempting — but it also changes what the
+   * merged inbox and the filter chips render, and a viewing aid should show the
+   * ordinary case unless asked. The `hueIndex` is deliberately not 0 so the
+   * 3 px chat-row edge bar is visible rather than defaulting invisibly.
+   */
+  session_restore: [
+    {
+      accountId: "01J8ACCOUNTMOCKAAAAAAAAAAA",
+      userId: "@harness:example.org",
+      homeserverUrl: "https://matrix.example.org",
+      hueIndex: 3,
+      provider: "password",
+    },
+  ] satisfies AccountVm[],
+
+  /**
+   * Chosen-OFF, i.e. `false` and not `null`.
+   *
+   * `null` means "the user has never answered", which is what raises the
+   * first-run card; `false` means "answered, FileVault only" — the honest
+   * default and the same value `App`'s own read-failure path falls back to
+   * (`App.tsx`: "treat the posture as chosen-off so the user is never trapped
+   * before login"). Off rather than on because a harness that claims at-rest
+   * encryption is enabled would render passphrase state no fixture here can
+   * back.
+   *
+   * Load-bearing even though `session_restore` above already opens the shell:
+   * the posture is read unconditionally on mount, and a hand-driven
+   * `clear()`/sign-out under the mock shell must land on the login screen
+   * rather than back on the card.
+   */
+  encryption_posture: false,
+
   notes_vaults: [
     {
       id: "v1",
@@ -1053,28 +1147,121 @@ const ANSWERS: Record<string, unknown> = {
     })),
     notices: [],
   },
-  // Deliberately NOT annotated `satisfies SyncProfileVm[]`: that type carries
-  // twenty fields and this row answers six. It is under-specified rather than
-  // wrong-shaped, which is the harmless failure — every consumer reads the six
-  // and the rest come back `undefined` — and filling in fourteen invented
-  // values to buy a type annotation would be a fixture that lies. The rule the
-  // Files listing above follows is the one worth keeping: annotate the shapes
-  // a consumer DEREFERENCES, because those are the ones that blank a window.
+  // Annotated `satisfies SyncProfileVm[]` since Story 56.12, which is a change
+  // of policy for this row and worth the sentence. It used to answer six of the
+  // twenty-odd fields on purpose, on the argument that under-specified is the
+  // harmless failure. That stopped being true the moment the folder settings
+  // form became reachable under the mock shell: it calls `profile.excludes
+  // .join`, and `undefined.join` blanks the whole window. The rule the Files
+  // listing follows — annotate the shapes a consumer DEREFERENCES — now applies
+  // here, and `satisfies` is what stops the next field added in Rust from
+  // quietly reintroducing the same white page.
   sync_profiles: [
     {
       id: "p1",
       name: "tgdrive",
       localPath: "/Volumes/merope/tgdrive",
       remoteUrl: "git@electra:tgdrive.git",
+      branch: "main",
+      direction: "bidirectional",
+      lane: "main",
+      subpaths: [],
+      excludes: ["*.tmp", ".DS_Store"],
+      removable: true,
+      lfsMode: "materialize",
+      lfsThresholdBytes: 4 * 1024 * 1024,
+      virtualPatterns: ["scans/**"],
+      virtualOverBytes: 8 * 1024 * 1024,
+      releaseTtlMs: 24 * 60 * 60 * 1000,
+      settleMs: null,
+      effectiveSettleMs: 10_000,
+      pollIntervalMs: null,
+      effectivePollIntervalMs: 15_000,
+      tags: [],
+      commitSubjectTemplate: "",
+      authorOverride: null,
       enabled: true,
+      notes: true,
+      notesSubfolder: "notes",
+      recordings: true,
       recordingsSubfolder: "recordings",
+      sessions: true,
+      sessionsSubfolder: "60-sessions",
+      folderOwned: [],
     },
+    {
+      // The second folder exists to make the owned-elsewhere marker reachable
+      // by hand: its `.keeper/keeper.toml` decides the virtualization policy,
+      // so opening its settings shows those controls disabled with the reason
+      // beside them, and a save from that form omits the keys.
+      id: "p2",
+      name: "neuradrive",
+      localPath: "/Volumes/merope/neuradrive",
+      remoteUrl: "git@electra:neuradrive.git",
+      branch: "main",
+      direction: "bidirectional",
+      lane: "main",
+      subpaths: [],
+      excludes: [],
+      removable: false,
+      lfsMode: "pointerOnly",
+      lfsThresholdBytes: 4 * 1024 * 1024,
+      virtualPatterns: ["raw/**", "!raw/keep-these/**"],
+      virtualOverBytes: 32 * 1024 * 1024,
+      releaseTtlMs: 0,
+      settleMs: null,
+      effectiveSettleMs: 5_000,
+      pollIntervalMs: null,
+      effectivePollIntervalMs: 15_000,
+      tags: [],
+      commitSubjectTemplate: "",
+      authorOverride: null,
+      enabled: true,
+      notes: false,
+      notesSubfolder: null,
+      recordings: false,
+      recordingsSubfolder: "recordings",
+      sessions: false,
+      sessionsSubfolder: "60-sessions",
+      folderOwned: ["releaseTtlMs", "virtualOverBytes", "virtualPatterns"],
+    },
+  ] satisfies SyncProfileVm[],
+  sync_statuses: [
+    { profileId: "p1", state: "idle", pending: 0, lastSyncMs: ago(3) },
+    { profileId: "p2", state: "idle", pending: 0, lastSyncMs: ago(41) },
   ],
-  sync_statuses: [{ profileId: "p1", state: "idle", pending: 0, lastSyncMs: ago(3) }],
   sync_problems: { profiles: [] },
   sync_git_status: { available: true, path: "/usr/bin/git", version: "2.53.0" },
   sync_device: { id: "01DEVICE", label: "hesperia" },
+  // No token stored for either folder. Without this the edit form's keychain
+  // read falls through to `fallback`, which answers `null` — the same answer,
+  // by accident rather than on purpose. Spelled out so the form's opening read
+  // is a fixture rather than a coincidence.
+  sync_get_credential: null,
   config_layers: { overrides: [], faults: [], mainFolder: null },
+  // The folder card's footprint sentence and the Check-files report, both of
+  // which used to fall through to `fallback` and render nothing at all under
+  // the mock shell — so the two surfaces Story 56.12 added counts to could not
+  // be looked at on Linux without a Tauri build.
+  sync_footprint: {
+    onDisk: 218_000_000_000n,
+    lfsCache: 91_000_000_000n,
+    reclaimable: 74_000_000_000n,
+    scratch: 1_400_000_000n,
+    content: 410_000_000_000n,
+    virtualPaths: 118,
+    materializedPaths: 3,
+    onDiskLabel: "218 GB",
+    lfsCacheLabel: "91 GB",
+    reclaimableLabel: "74 GB",
+    scratchLabel: "1.4 GB",
+    contentLabel: "410 GB",
+  } satisfies SyncFootprintVm,
+  sync_verify: {
+    checked: 1_284,
+    virtualPaths: 118,
+    problems: [],
+  } satisfies SyncVerifyVm,
   recording_settings_get: {
     codec: "hevc",
     fps: 60,
@@ -1344,6 +1531,73 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       ? FOLDER_MIGRATION
       : { needed: false, creates: [], rewrites: [], trashes: [] },
   sessions_migrate: () => null,
+  // The folder settings form's one write. Stateful, for the reason the two
+  // space writes below are: the flow being looked at is press Save, watch the
+  // form re-seed, and a shell that accepted the save and re-answered the old
+  // profile would make that flow look broken in exactly the way it is being
+  // looked at for.
+  //
+  // It merges the way `parse_req` does — every `Option` left `null` means "the
+  // caller did not express this", so the stored value stands — which is what
+  // makes the DW-116 property visible here rather than only in a Rust test. It
+  // also strips the keys the fixture's folder file owns, exactly as
+  // `profile::as_stored` does, so the second folder's controls demonstrate the
+  // revert they exist to prevent.
+  sync_profile_save: (payload) => {
+    const req = payload.req as SyncProfileReq;
+    const profiles = ANSWERS.sync_profiles as SyncProfileVm[];
+    // An add sends `id: null` and must APPEND. Falling back to `profiles[0]`
+    // for the shape while keeping a fresh id is what stops "Add folder" from
+    // renaming the first fixture folder, which is half the flow this handler
+    // exists to make inspectable.
+    const existing = profiles.find((candidate) => candidate.id === req.id);
+    const prior = existing ?? { ...profiles[0], id: `p${profiles.length + 1}`, folderOwned: [] };
+    const owned = new Set(prior.folderOwned);
+    const merged: SyncProfileVm = {
+      ...prior,
+      name: req.name,
+      localPath: req.localPath,
+      remoteUrl: req.remoteUrl,
+      branch: req.branch,
+      direction: req.direction,
+      lane: req.lane,
+      subpaths: req.subpaths,
+      excludes: req.excludes,
+      removable: req.removable,
+      lfsMode: req.lfsMode,
+      lfsThresholdBytes: req.lfsThresholdBytes ?? prior.lfsThresholdBytes,
+      virtualPatterns: req.virtualPatterns ?? prior.virtualPatterns,
+      virtualOverBytes: req.virtualOverBytes ?? prior.virtualOverBytes,
+      releaseTtlMs: req.releaseTtlMs ?? prior.releaseTtlMs,
+      settleMs: req.settleMs ?? prior.settleMs,
+      pollIntervalMs: req.pollIntervalMs ?? prior.pollIntervalMs,
+      tags: req.tags,
+      commitSubjectTemplate: req.commitSubjectTemplate ?? prior.commitSubjectTemplate,
+      authorOverride: req.authorOverride ?? prior.authorOverride,
+      notes: req.notes ?? prior.notes,
+      notesSubfolder: req.notesSubfolder ?? prior.notesSubfolder,
+      recordings: req.recordings ?? prior.recordings,
+      recordingsSubfolder: req.recordingsSubfolder ?? prior.recordingsSubfolder,
+      sessions: req.sessions ?? prior.sessions,
+      sessionsSubfolder: req.sessionsSubfolder ?? prior.sessionsSubfolder,
+    };
+    const stored: SyncProfileVm = {
+      ...merged,
+      virtualPatterns: owned.has("virtualPatterns")
+        ? prior.virtualPatterns
+        : merged.virtualPatterns,
+      virtualOverBytes: owned.has("virtualOverBytes")
+        ? prior.virtualOverBytes
+        : merged.virtualOverBytes,
+      releaseTtlMs: owned.has("releaseTtlMs") ? prior.releaseTtlMs : merged.releaseTtlMs,
+      excludes: owned.has("excludes") ? prior.excludes : merged.excludes,
+    };
+    ANSWERS.sync_profiles =
+      existing === undefined
+        ? [...profiles, stored]
+        : profiles.map((candidate) => (candidate.id === stored.id ? stored : candidate));
+    return stored;
+  },
   // The two space writes MUTATE the fixture rather than answering and forgetting.
   // A shell that accepted a save and then re-answered the old five would make
   // the editor look broken in exactly the way it is being looked at for — the

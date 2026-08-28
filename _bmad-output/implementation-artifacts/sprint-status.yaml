@@ -889,6 +889,58 @@ development_status:
   56-7-the-row-says-what-it-is-and-what-a-delete-will-do: review
   56-9-the-button-and-the-time-you-have-left: review
   56-8-a-virtual-files-chapter: review
+  #
+  # THE OWNER COULD NOT SEE ANY OF IT. 2026-08-28: reported "virtual files
+  # developed but I don't see it in the keeper app UI (settings, drive
+  # settings, files)". He was right, and it was not a UI gap:
+  #   VirtualPolicy had exactly ONE production consumer, Engine::verify. The
+  #   arrival path (materialize_pending) still branched only on
+  #   profile.lfs_mode == PointerOnly, so virtualPatterns could not keep a
+  #   single file virtual. Nothing ever became virtual, so the row states, the
+  #   countdown and the verbs had nothing to render. FR-328 says "which paths
+  #   are allowed to stay unmaterialized AFTER A PULL" and no story's
+  #   acceptance criteria owned that path. The epic's fault, not the stories'.
+  # Two more reasons it was invisible: there was no control anywhere for
+  # virtualPatterns / virtualOverBytes / releaseTtlMs (and all three were
+  # PRESERVED, so no form could have saved them), and
+  # SyncPlatform::open_file_state answered Unknown on every host, so AD-125
+  # turned every release into a refusal.
+  #
+  # FIVE FOLLOW-UP STORIES, a second gh-stack on main, bottom to top:
+  #   #284 56.10 feat/56-10-the-policy-decides-what-arrives
+  #   #285 56.11 feat/56-11-is-this-file-open-answered-for-real
+  #   #286 56.12 feat/56-12-drive-settings-for-virtual-files
+  #   #287 56.13 fix/56-13-what-the-end-to-end-run-found
+  #   #288 56.14 fix/56-14-the-deferred-work-sweep
+  #
+  # PROVEN END TO END through the SHIPPED keeper-syncd binary, against a real
+  # bare remote and two real keeper clones (/tmp/vf-e2e.sh, 10/10 checks):
+  # pointer text arrives with the true oid and size, no object is fetched, a
+  # below-floor path arrives whole, the tree stays clean, ls-files reports
+  # 4194304 not ~130 bytes, materialize lands the bytes inline, an OPEN
+  # descriptor REFUSES the release, and closing it releases back to the
+  # pointer. That refusal is 56.11's /proc probe answering for real.
+  #
+  # WHAT A LATER STORY STILL NEEDS TO KNOW:
+  #   1. macOS still answers open_file_state = Unknown, so a release refuses
+  #      there. libproc drags bindgen into every macOS release build; the
+  #      hand-written FFI needs a struct libc does not supply; lsof exists at
+  #      /usr/sbin/lsof on the target and is the cheapest honest option.
+  #      Until then virtual files RELEASE only on Linux.
+  #   2. A profile with an unborn HEAD (new folder, empty remote) commits
+  #      nothing and reports "0 file(s)" forever. Pre-existing, found by the
+  #      e2e, in deferred-work.md with the reproduction.
+  #   3. The deferred ledger is fully triaged for this epic: 28 fixed, 5 stale
+  #      with quoted proof, 23 kept with the condition that would change the
+  #      answer. Five kept entries are blocked on the shell crate and name
+  #      their symbol.
+  #   4. UI evidence is DOM-level plus 26 new frontend cases, not pixels: the
+  #      Mac's GUI session belongs to the owner and was not driven.
+  56-10-the-policy-decides-what-arrives: review
+  56-11-is-this-file-open-answered-for-real: review
+  56-12-drive-settings-for-virtual-files: review
+  56-13-what-the-end-to-end-run-found: review
+  56-14-the-deferred-work-sweep: review
   epic-56-retrospective: optional
 
   # -- EPIC 57, 2026-08-22: scheduled tasks ----------------------------------

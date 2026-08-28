@@ -625,6 +625,27 @@ enum ProfileWatch {
 /// second is 30 files out of 155 000, so the line moves visibly.
 const WALK_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Whether one materialize request may **queue** the object it needs, or is
+/// only **observing** whether it arrived (Story 56.13).
+///
+/// [`Engine::materialize_held`] runs the same checks and the same publish under
+/// both, and the difference is confined to what it does when the local store
+/// does not hold the object. [`Engine::materialize_entry_now`] needs both in one
+/// invocation: it asks once, drains, and then looks again — and looking must
+/// write nothing, because re-asking on the way to *reporting* a failure inserts
+/// a duplicate row for a `parked` unit (`db::enqueue_unique` does not count one
+/// as cover) and pulls a fresh backoff back to now (`db::promote_unit`), so a
+/// cron entry against a dead remote would grow the journal without bound while
+/// hammering the remote at the cron cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhenAbsent {
+    /// Queue the transfer, label it, mark it urgent and wake the supervisor.
+    Queue,
+    /// Write nothing; report [`lfs::hydrate::MaterializeOutcome::Queued`] with
+    /// no unit, and let the caller name the row it already queued.
+    Report,
+}
+
 pub struct Engine {
     platform: Arc<dyn SyncPlatform>,
     /// Single connection behind a mutex. `sync.db` is small and every access is
@@ -717,8 +738,9 @@ pub struct Engine {
     /// and with more at stake. [`RELEASE_BUDGET_OBJECTS`] counts ATTEMPTS, and
     /// the candidate list is re-derived in the same `ORDER BY path` order every
     /// pass — so a prefix that refuses identically every time (32 paths the
-    /// owner edited in place; or, on every real host today, simply the first 32,
-    /// because `open_file_state` defaults to `Unknown`) meant paths 33..n were
+    /// owner edited in place; or, on a platform that cannot answer the
+    /// open-file question — macOS, Windows — simply the first 32, because
+    /// `open_file_state` answers `Unknown` there) meant paths 33..n were
     /// never attempted once, and the promise that a later pass takes the
     /// remainder was false.
     ///
@@ -3179,6 +3201,39 @@ impl Engine {
         scan_when_idle: bool,
         source: SyncSource,
     ) -> Result<()> {
+        self.drain(profile, None, scan_when_idle, source).await
+    }
+
+    /// [`Self::drain_journal`] narrowed to one journal kind (Story 56.13).
+    ///
+    /// For a caller draining to satisfy **one request** rather than to move the
+    /// folder along. `keeper-syncd materialize` waits for its own transfer, and
+    /// a verb sold as "fetch one path's content" must not commit, merge,
+    /// publish a branch or open a pull request on the way there — `execute`
+    /// dispatches every kind it is handed, and a `Pull` drained that way can
+    /// move the very pointer the request is about.
+    ///
+    /// `scan_when_idle` is not offered: a scan is a whole-tree question, and a
+    /// caller narrow enough to want one kind is by definition not asking it.
+    ///
+    /// The caller owns the profile reservation.
+    async fn drain_kind(
+        &self,
+        profile: &SyncProfile,
+        kind: &str,
+        source: SyncSource,
+    ) -> Result<()> {
+        self.drain(profile, Some(kind), false, source).await
+    }
+
+    /// The drain both doors above run. `only` of `None` means every kind.
+    async fn drain(
+        &self,
+        profile: &SyncProfile,
+        only: Option<&str>,
+        scan_when_idle: bool,
+        source: SyncSource,
+    ) -> Result<()> {
         let now = self.platform.now_ms();
         // Before a single unit is claimed, and on every drain: deferred work
         // waits on a condition rather than a clock, so the condition has to be
@@ -3188,7 +3243,10 @@ impl Engine {
         // Before claiming, because a unit claimed without a name reports the
         // folder for the whole transfer — an hour, on a slow link.
         self.backfill_labels(profile);
-        let claimed = self.with_db(|conn| db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT))?;
+        let claimed = self.with_db(|conn| match only {
+            Some(kind) => db::claim_ready_of_kind(conn, &profile.id, now, CLAIM_LIMIT, kind),
+            None => db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT),
+        })?;
         if claimed.is_empty() {
             if scan_when_idle {
                 self.scan_and_enqueue(profile, source)?;
@@ -5594,6 +5652,39 @@ impl Engine {
         if profile.lfs_mode == LfsMode::Disabled {
             return Ok(());
         }
+        // The object is already on this disk, so there is nothing to fetch and
+        // the remaining job is the publish (Story 56.14).
+        //
+        // A pending `LfsDownload` row can outlive the reason it was queued: the
+        // bytes arrive by another route — a pendrive copy, a second profile
+        // sharing this store, a manual `git lfs pull`, or
+        // `Engine::materialize_held`'s inline publish, which publishes straight
+        // from the store and leaves the covering row standing. Before this gate
+        // the row went on to resolve an endpoint, spend a batch round trip and
+        // re-download content that was already here — on a metered or slow link
+        // exactly the transfer the request verb exists to avoid.
+        //
+        // Here rather than in the materialize arms, and by retiring the WORK
+        // rather than the row: "the object is present, so this unit is
+        // satisfied" is a claim about the store, and this is the one function
+        // that reads the store on the transfer's behalf. Deleting the row
+        // instead would strand the object's other paths — one download covers
+        // every path sharing an oid (`enqueue_unique` deduplicates on the
+        // payload), and `materialize_landed` below is what publishes them.
+        //
+        // Downloads only. An upload's job is to put the object on the SERVER,
+        // and the local store says nothing whatever about that.
+        if !upload {
+            let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+            if store.contains(oid, size) {
+                tracing::debug!(
+                    profile = profile.name,
+                    oid,
+                    "the object is already in this folder's store; publishing without a transfer"
+                );
+                return self.materialize_landed(profile, &store, oid, label, unit);
+            }
+        }
         // The direction is in the phase because that is what the tray reads: an
         // upload and a download are different glyphs, so they have to be
         // different phases (see `SyncPhase::direction`).
@@ -6017,6 +6108,34 @@ impl Engine {
         }
 
         let mut landed: Vec<PathBuf> = Vec::new();
+        // The folder's virtualization policy, compiled at most once for this
+        // delivery and only when something here could be refused by it (Story
+        // 56.10, FR-328).
+        //
+        // `materialize_pending` no longer queues a transfer for an authorized
+        // path, but that is not enough on its own, and two ordinary sequences
+        // prove it. A unit queued on an earlier pass is still in the journal
+        // when the owner adds the pattern that was supposed to stop exactly
+        // those gigabytes — `.keepervirtual` is a committed file, so a *pull*
+        // can install it — and this arm would then fetch and publish the very
+        // path the same `sync_once` had just skipped. And every unit queued
+        // before this story shipped delivers under whatever policy is
+        // configured afterwards. Nothing reverses either one: the release sweep
+        // needs a TTL, a window, remote proof and a platform that can say the
+        // file is closed — which Linux now answers and macOS and Windows still
+        // do not, where the `Unknown` answer refuses (AD-125).
+        //
+        // **A requested delivery is exempt for its labelled path only.** That
+        // path is a human's explicit authorization and outranks the policy
+        // (AD-128, FR-330). Its *siblings* are not: a request fans out to every
+        // indexed path carrying the same oid, which this function's own doc calls
+        // ordinary for duplicated content, and nobody asked for those.
+        let mut policy: Option<lfs::virtual_policy::VirtualPolicy> = None;
+        let asks_the_policy = |candidate: &PathBuf| !(requested && *candidate == rela);
+        if profile.lfs_mode == LfsMode::Materialize && wanted.iter().any(asks_the_policy) {
+            policy = Some(lfs::virtual_policy::VirtualPolicy::compile(profile)?);
+        }
+
         for candidate in &wanted {
             let one = std::slice::from_ref(candidate);
             let Some(smudge) = lfs::stage::pending_smudges(&profile.local_path, one)?.pop() else {
@@ -6025,6 +6144,20 @@ impl Engine {
                 // there is nothing here to replace.
                 continue;
             };
+            // Resolved at the pointer's declared size, as every policy decision
+            // is (AD-122), and only for a candidate nobody asked for. A size-0
+            // pointer stands for the empty object, so there is no content for a
+            // policy to keep away — carved out for `materialize_pending`'s
+            // reason.
+            if let Some(policy) = policy.as_ref() {
+                if asks_the_policy(candidate)
+                    && smudge.pointer.size > 0
+                    && policy.resolve(&smudge.path, smudge.pointer.size)
+                        == lfs::virtual_policy::Virtualization::Virtual
+                {
+                    continue;
+                }
+            }
             if !store.contains(&smudge.pointer.oid, smudge.pointer.size) {
                 // The pointer in the worktree names a different object than the
                 // one that landed — the path was edited since the row was
@@ -6032,7 +6165,16 @@ impl Engine {
                 // it now needs.
                 continue;
             }
-            lfs::stage::materialize(store, &profile.local_path, &smudge)?;
+            // Nothing was written because the target stopped holding the
+            // committed pointer while the copy ran — the same discovery the
+            // `store.contains` arm above makes, arriving a moment later, and
+            // the same answer: the sweep owns it and the next pass reconsiders
+            // the path. No ledger row either, because no content landed.
+            if lfs::stage::materialize(store, &profile.local_path, &smudge)?
+                == lfs::stage::Published::TargetMoved
+            {
+                continue;
+            }
             // The one moment this is knowable: content for this path now exists
             // here, so the next object for it is a replacement rather than an
             // arrival.
@@ -6097,6 +6239,26 @@ impl Engine {
     /// modifications and says so ("the following paths are not up to date and
     /// were left despite sparse patterns"). Left unfiltered, that one stale
     /// pointer would pull down the gigabytes the profile exists to avoid.
+    ///
+    /// # The virtualization policy decides what arrives (Story 56.10, FR-328)
+    ///
+    /// The third filter, and the only one that is per path *and* survives a
+    /// pull. Before Story 56.10 this function branched solely on
+    /// `profile.lfs_mode == LfsMode::PointerOnly`, so `virtualPatterns` could
+    /// not keep one single path virtual: the choice on offer was the whole
+    /// profile or nothing, and FR-328's *"which paths are allowed to stay
+    /// unmaterialized after a pull"* did not exist. A `Virtualization::Virtual`
+    /// answer now leaves the committed pointer standing, publishes nothing out
+    /// of the store even when the store holds the object, and queues no
+    /// transfer — so the object is not on this clone either, which is the half
+    /// of the request that is visible from outside keeper.
+    ///
+    /// It authorizes and never instructs (AD-123). Nothing here deletes,
+    /// prunes or rewrites a worktree byte, in either direction: removing a
+    /// pattern makes the next pull materialize the path, and adding one makes
+    /// future arrivals stay away and existing materializations *eligible* for
+    /// Story 56.5's sweep, which then applies every one of 56.4's refusals per
+    /// object.
     fn materialize_pending(
         &self,
         profile: &SyncProfile,
@@ -6105,6 +6267,21 @@ impl Engine {
         if profile.lfs_mode == LfsMode::Disabled {
             return Ok(());
         }
+        // Compiled once for the whole pass, never per path: `VirtualPolicy`'s
+        // own doc forbids building a `GlobSet` inside a walk, and the common
+        // case — no policy configured at all — must not pay for a feature it
+        // does not use.
+        //
+        // A policy keeper cannot read is not a policy, and reading it as
+        // "nothing is virtual" is the one answer unavailable here (FR-329): it
+        // would materialize exactly the content the policy exists to keep away,
+        // on whatever link this machine is on, and there is no undoing the
+        // bytes. So `compile`'s `SyncError::Config` — which quotes the line as
+        // typed and names the file to edit — propagates. `Self::sync_once`
+        // reports it to the person who pressed the button; the supervisor's own
+        // call site already logs it as one `warn!` and carries on with the rest
+        // of the sync. Nothing is fetched and nothing is published either way.
+        let policy = lfs::virtual_policy::VirtualPolicy::compile(profile)?;
         let repo = self.open_repo(profile)?;
         let cone = SparseCone::new(&profile.subpaths);
         // Pointer-sized entries only: see
@@ -6124,15 +6301,68 @@ impl Engine {
         let now = self.platform.now_ms();
         let mut materialized = 0usize;
         for smudge in &pending {
+            // The per-path lever, beside `subpaths[]` above and
+            // `LfsMode::PointerOnly` below (FR-328, AD-122). Ahead of BOTH
+            // branches, because one `Virtual` answer refuses the publish and
+            // the transfer with one sentence — this content may live in the
+            // object store and nowhere else — and a policy consulted separately
+            // in each would be one edit away from leaving the worktree correct
+            // while the bytes arrived anyway, which is the half of the ask a
+            // person can actually see.
+            //
+            // Resolved at the POINTER's declared size, the only place the true
+            // size is known before the content exists (AD-122). The worktree
+            // file here is ~130 bytes of pointer text, so a `virtual_over_bytes`
+            // floor compared against the stat would answer `Materialize` for
+            // every path the floor exists to keep away.
+            //
+            // Pointer text spelling `size 0` stands for the **empty object**, so
+            // there is no content anywhere for a policy to keep away — and a
+            // `virtual_over_bytes` of `0`, the default, would answer `Virtual`
+            // for it, because `0 < 0` is false. Left to the policy, that file
+            // would read as ~90 bytes of pointer text to every application that
+            // opens it, forever, with no bytes elsewhere to justify the
+            // substitution and no verb that recovers it: the release side
+            // refuses one as `AlreadyPointer`, and this sweep would skip it on
+            // every later pass.
+            //
+            // Reachable only from text somebody else wrote, and that is worth
+            // saying rather than leaving as a guess.
+            // [`lfs::pointer::Pointer::render`] encodes the empty pointer as
+            // *nothing at all* — upstream's `Pointer.Encoded()`, so an empty
+            // file stays an empty file — so keeper's own checkout never leaves
+            // one standing, while `Pointer::parse` accepts the text if another
+            // tool or a hand produced it. That is exactly the input
+            // `Self::release_resolved` carves out for, rather than leaving it to
+            // the accident that `lfs::audit::tracked_objects` skips size-0
+            // objects; carved out here too so the two verbs agree about the
+            // empty object, which is the disagreement this whole story exists to
+            // end.
+            if smudge.pointer.size > 0
+                && policy.resolve(&smudge.path, smudge.pointer.size)
+                    == lfs::virtual_policy::Virtualization::Virtual
+            {
+                continue;
+            }
             if store.contains(&smudge.pointer.oid, smudge.pointer.size) {
                 // Pointer-only mode leaves content as a pointer on purpose: it
-                // is the whole-profile lever, where `subpaths[]` above is the
-                // per-path one. Both exist because git-lfs is entirely
-                // sparse-checkout-unaware.
+                // is the whole-profile lever, where `subpaths[]` and the
+                // virtualization policy above are the per-path ones. All three
+                // exist because git-lfs is entirely sparse-checkout-unaware.
                 if profile.lfs_mode == LfsMode::PointerOnly {
                     continue;
                 }
-                lfs::stage::materialize(store, &profile.local_path, smudge)?;
+                // Nothing was written because the target stopped holding the
+                // committed pointer while the copy ran. The loop's own two
+                // earlier `continue`s make the same discovery from the scan; a
+                // third spelling of it belongs on the same rung, and raising
+                // here would fail the whole pass — see
+                // `lfs::stage::Published::TargetMoved` for the measurement.
+                if lfs::stage::materialize(store, &profile.local_path, smudge)?
+                    == lfs::stage::Published::TargetMoved
+                {
+                    continue;
+                }
                 // The one moment this is knowable: content for this path now
                 // exists here, so the next object for it is a replacement
                 // rather than an arrival.
@@ -6340,6 +6570,23 @@ impl Engine {
             outcome.committed = Some(profile.branch.clone());
         }
 
+        // A fault in the arrival leg that must not also cost the person their
+        // push. The only one this leg newly raises is a `.keepervirtual` that
+        // does not compile (FR-329) — a **committed** file, so one typo'd glob
+        // is shared by every clone, and aborting here made every explicit sync
+        // on every clone commit locally, merge the remote in, and then stop:
+        // the uploads that commit had just queued were never drained and the
+        // branch was never pushed, until somebody edited the file. FR-329 asks
+        // for the arrival to refuse loudly; it does not ask for the user's own
+        // commits to be held hostage to it.
+        //
+        // So it is held and raised after the drain and push legs, which is
+        // enough because nothing was fetched and nothing was published: the
+        // commits are exactly as ready to publish as they were. The pass still
+        // ends non-zero with the pattern quoted, and `Self::mark_synced` still
+        // does not fire — a pass with a leg that raised is not a successful
+        // pass, and the release sweep must not ride an edge that did not happen.
+        let mut arrival_fault: Option<SyncError> = None;
         if profile.direction.pulls() {
             let converged = self.do_pull(&profile, source).await?;
             outcome.conflicts = converged.copies;
@@ -6350,7 +6597,9 @@ impl Engine {
             // otherwise the scan would see a pointer-sized file where the index
             // records the full length and call it an edit.
             let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
-            self.materialize_pending(&profile, &store)?;
+            if let Err(err) = self.materialize_pending(&profile, &store) {
+                arrival_fault = Some(err);
+            }
         }
 
         // The commit above may have queued LFS transfers, and `do_push` refuses
@@ -6399,6 +6648,11 @@ impl Engine {
         // `OpenPullRequest` is the whole reason: a one-shot run may have no next
         // tick to pick it up.
         self.drain_journal(&profile, true, source).await?;
+        // The user's commits are published; now say what went wrong. See where
+        // this was captured for why it waited until here and no longer.
+        if let Some(err) = arrival_fault {
+            return Err(err);
+        }
         outcome.bytes = self
             .transferred_bytes(&profile.id)
             .saturating_sub(transferred_before);
@@ -6499,9 +6753,11 @@ impl Engine {
     /// [`Self::release_resolved`] body — the same content-identity hash, the
     /// same per-object remote proof taken at the moment of deletion, the same
     /// fail-closed `open_file_state`, the same double pin read. A stored
-    /// `synced_at_ms` selected the candidate; it authorized nothing. On a real
-    /// host today every one of these therefore refuses `OpenUnknown`, which is
-    /// 56.4's recorded and deliberate consequence.
+    /// `synced_at_ms` selected the candidate; it authorized nothing. On a
+    /// platform that cannot answer the open-file question — macOS, Windows —
+    /// every one of these therefore refuses `OpenUnknown`, which is 56.4's
+    /// recorded and deliberate consequence; on Linux the answer is real since
+    /// Story 56.11 and the sweep reaches the rename.
     ///
     /// # A refusal is not a failure, and neither is it always silent
     ///
@@ -6553,8 +6809,9 @@ impl Engine {
     /// [`Self::release_cursor`] load-bearing rather than a nicety. Re-derived
     /// from the top in the same `ORDER BY path` order every pass, a prefix of
     /// candidates that refuses the same way every time — 32 paths the owner
-    /// edited in place, or on every real host today simply the first 32, since
-    /// `open_file_state` defaults to `Unknown` and `release_resolved` refuses
+    /// edited in place, or on a platform that cannot answer the open-file
+    /// question (macOS, Windows) simply the first 32, since `open_file_state`
+    /// answers `Unknown` there and `release_resolved` refuses
     /// `OpenUnknown` — meant paths 33..n were never attempted once. Both
     /// [`RELEASE_BUDGET_OBJECTS`]' own doc and `docs/sync.md` promise the next
     /// pass takes the remainder; the rotation is what makes that true.
@@ -6585,29 +6842,82 @@ impl Engine {
         let Some(ttl_ms) = profile.effective_release_ttl_ms() else {
             return Ok(());
         };
-        // The same mode gate the request door runs, so a mode that refuses one
-        // refuses the other — but swallowed here rather than propagated. A
-        // folder in the default mode is not a *failure*, it is a folder with
-        // nothing for this sweep to do, and propagating would log a warning on
-        // every successful sync of every ordinary folder. Ahead of the due
-        // gate, so such a folder does not arm a window either.
-        if let Err(err) = release_mode_gate(profile) {
-            tracing::debug!(
-                profile = profile.name,
-                reason = %err,
-                "release sweep has nothing to do in this LFS mode",
-            );
+        // The mode alone, with no I/O at all, for the one mode that can never
+        // release: a folder with large-file support off neither compiles a
+        // policy nor arms a window.
+        if profile.lfs_mode == LfsMode::Disabled {
             return Ok(());
         }
         if !self.release_is_due(profile) {
             return Ok(());
         }
+        // The same gate the request door runs, so a mode that refuses one
+        // refuses the other — but swallowed here rather than propagated. A
+        // folder in the default mode is not a *failure*, it is a folder with
+        // nothing for this sweep to do, and propagating would log a warning on
+        // every successful sync of every ordinary folder.
+        //
+        // Since Story 56.10 that describes a folder in the default mode that
+        // authorizes nothing: no `virtualPatterns` line and no committed
+        // `.keepervirtual` permissive line, so there is nothing here to sweep. A
+        // folder that authorizes something passes this gate and each of its rows
+        // is asked again per path, by `release_path_gate`, at the committed
+        // pointer's size.
+        //
+        // **Behind the due gate**, unlike before Story 56.10, because the gate
+        // now reads `.keepervirtual` for a `Materialize` folder — which is most
+        // of them. Behind it that read is paid once per `RELEASE_LOOK_EVERY_MS`
+        // rather than once per successful sync, and an unparseable policy is
+        // reported at the same hourly cadence instead of on every pass of a
+        // push-only profile that never reaches the arrival path at all. The cost
+        // is that such a folder arms a window before declining, which costs it
+        // nothing: a folder with nothing to sweep wants to be asked less often,
+        // not more.
+        let policy = match release_mode_gate(profile) {
+            Ok(policy) => policy,
+            Err(err) => {
+                tracing::debug!(
+                    profile = profile.name,
+                    reason = %err,
+                    "release sweep has nothing to do in this folder",
+                );
+                return Ok(());
+            }
+        };
 
         let now = self.platform.now_ms();
         let rows = self.with_db(|conn| db::materialized_rows(conn, &profile.id))?;
         let candidates: Vec<&db::MaterializedRow> = rows
             .iter()
             .filter(|row| release_due_at(row, ttl_ms).is_some_and(|due| now >= due))
+            // The policy, as a **pre-filter** on the budget rather than as the
+            // authority. In the default mode the ledger holds a row for every
+            // path this clone ever materialized while the policy typically names
+            // one narrow zone, so without this the pass spends its
+            // `RELEASE_BUDGET_OBJECTS` attempts — each a repository open and an
+            // index read inside `release_resolved` — being refused, and
+            // `RELEASE_BUDGET_BYTES` accumulates for those refusals too, so a
+            // few large unauthorized rows can end a pass before an authorized
+            // one is reached. Rotated cursor and all, an authorized path in a
+            // large folder could take hundreds of syncs to be released while
+            // `Self::release_schedules` showed its deadline long past.
+            //
+            // `unwrap_or(u64::MAX)`, never `0`: this filter may only ever be
+            // wrong in the direction of letting a row through. A row written
+            // before Story 56.5 recorded no size, and treating that as zero
+            // would put it under any `virtualOverBytes` floor and drop it from
+            // the candidate set for good — a filter deciding what
+            // `release_resolved` is allowed to be asked about. The authority
+            // stays where the honest size is, on the committed pointer.
+            .filter(|row| {
+                release_path_gate(
+                    profile,
+                    policy.as_ref(),
+                    Path::new(&row.path),
+                    row.size_bytes.unwrap_or(u64::MAX),
+                )
+                .is_ok()
+            })
             .collect();
         if candidates.is_empty() {
             return Ok(());
@@ -6676,7 +6986,10 @@ impl Engine {
                     continue;
                 }
             };
-            match self.release_resolved(profile, &rela, path).await {
+            match self
+                .release_resolved(profile, policy.as_ref(), &rela, path)
+                .await
+            {
                 Ok(release) => {
                     released += 1;
                     reclaimed = reclaimed.saturating_add(release.size_bytes);
@@ -6695,8 +7008,9 @@ impl Engine {
                         "release sweep retracted a ledger row for a path that holds \
                          pointer text",
                     );
-                    if let Err(err) =
-                        self.with_db(|conn| db::forget_materialized(conn, &profile.id, &row.path))
+                    let now = self.platform.now_ms();
+                    if let Err(err) = self
+                        .with_db(|conn| db::forget_materialized(conn, &profile.id, &row.path, now))
                     {
                         tracing::debug!(
                             profile = profile.name,
@@ -7047,7 +7361,49 @@ impl Engine {
             .await
         {
             Ok(access) => access,
+            // No addressable LFS server. If the remote is a directory, the
+            // objects are in that directory and asking it is the honest answer
+            // (Story 56.14).
+            //
+            // Reachable when a filesystem remote also carries a committed
+            // `.lfsconfig` that does not name a usable `lfs.url` — the file
+            // wins over the shape of the remote URL by design, which sent this
+            // profile past the branch above, and then `endpoint::derive`
+            // refuses a local path outright. The consequence was a folder that
+            // could never release anything at all: every candidate refused
+            // `UnprovenOnRemote` forever, on every pass, having already paid a
+            // whole-file hash to get here.
+            //
+            // The precedence is unchanged — the named server is still asked
+            // first and its answer still decides. This is the fallback for
+            // there being no server to ask, and it is fail-closed the same way:
+            // a store that does not hold the object at this size keeps the
+            // local copy.
+            //
+            // `SyncError::Config` and nothing else, because that is the class
+            // `endpoint::derive` raises for a remote from which no endpoint can
+            // be DERIVED — the dead end this exists for. An `Auth`, a
+            // `Forbidden` or a `Network` means a real server was named and
+            // could not be asked, and answering those from a directory would
+            // let a release proceed on a removable drive's word about a server
+            // that is merely down; AD-48 treats an absent drive as never a
+            // failure, so the content could end up on neither.
             Err(err) => {
+                let no_endpoint_can_exist = matches!(err, SyncError::Config(_));
+                if no_endpoint_can_exist {
+                    if let Some(store) = lfs::local::remote_store(&profile.remote_url) {
+                        let held = store.contains(oid, size);
+                        tracing::warn!(
+                            profile = profile.name,
+                            oid,
+                            error = %err,
+                            held,
+                            "this folder's `.lfsconfig` names no LFS server keeper can address, \
+                             so the filesystem remote's own object store was asked instead"
+                        );
+                        return held;
+                    }
+                }
                 tracing::warn!(
                     profile = profile.name,
                     oid,
@@ -7210,6 +7566,16 @@ impl Engine {
     /// A cross-process lock is a change to every one-shot verb, not to this
     /// one (recorded in `deferred-work.md`).
     ///
+    /// # This one queues and returns; its sibling waits
+    ///
+    /// [`Self::materialize_entry_now`] is the same request followed by the
+    /// drain that satisfies it, and it exists because a process with no
+    /// supervisor behind it cannot be told to come back later. This function
+    /// keeps the queue-and-return shape for the caller that genuinely has a
+    /// supervisor — the app, whose engine IS the one that will drain the row on
+    /// its next tick, and which must not block a UI thread on a four-gigabyte
+    /// transfer.
+    ///
     /// Blocking, like every other repository caller: a `gix::Repository` is
     /// neither `Send` nor cheap to hold, so each open is scoped to a block and
     /// never spans an await point.
@@ -7218,7 +7584,33 @@ impl Engine {
         id: &str,
         subpath: &str,
     ) -> Result<lfs::hydrate::Materialization> {
-        use lfs::hydrate::{ContentRefusal, Materialization, MaterializeOutcome, Plan};
+        let (profile, rela, path) = self.materialize_request(id, subpath)?;
+        let _reservation = self
+            .reserve(&profile.id)
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        // Queueing, always: this door's whole contract is that the supervisor
+        // delivers what it did not find here.
+        self.materialize_held(&profile, &rela, path, WhenAbsent::Queue)
+    }
+
+    /// Everything a materialize request settles **before** it needs the
+    /// folder to itself: which profile, which path, and whether it may be
+    /// asked for at all.
+    ///
+    /// Split out so that [`Self::materialize_entry`] and
+    /// [`Self::materialize_entry_now`] can share one reservation each rather
+    /// than taking two — `reserve` is not re-entrant, so a wrapper that
+    /// reserved and then called the other verb would refuse itself as busy.
+    ///
+    /// Returns the repository-relative path twice over: as the `Path` every
+    /// index and worktree call wants, and as the `/`-joined `String` every
+    /// report and ledger row is keyed by.
+    fn materialize_request(
+        &self,
+        id: &str,
+        subpath: &str,
+    ) -> Result<(SyncProfile, PathBuf, String)> {
+        use lfs::hydrate::ContentRefusal;
 
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
             return Err(SyncError::Config(format!("no such sync profile: {id}")));
@@ -7274,10 +7666,33 @@ impl Engine {
         if !self.volume_ready(&profile)? {
             return Err(SyncError::MediaAbsent);
         }
+        Ok((profile, rela, path))
+    }
 
-        let _reservation = self
-            .reserve(&profile.id)
-            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+    /// The whole of a materialize request that needs the folder to itself.
+    ///
+    /// The caller owns the profile reservation, which is the point of the
+    /// split: [`Self::materialize_entry_now`] runs this, drains, and runs it
+    /// again under one reservation, so the second call re-asks the only
+    /// question a drain can have changed — what the worktree and the store hold
+    /// *now* — through the same publish path rather than a second copy of it.
+    ///
+    /// `absent` is what makes that second call safe. See [`WhenAbsent`]: the
+    /// observing mode writes nothing to the journal, because re-queueing on the
+    /// way to *reporting* a failure duplicates a parked row and cancels the
+    /// backoff the same run just earned.
+    ///
+    /// `rela` and `path` are [`Self::materialize_request`]'s two spellings of
+    /// the same path; `path` is consumed because every answer carries it.
+    fn materialize_held(
+        &self,
+        profile: &SyncProfile,
+        rela: &Path,
+        path: String,
+        absent: WhenAbsent,
+    ) -> Result<lfs::hydrate::Materialization> {
+        use lfs::hydrate::{ContentRefusal, Materialization, MaterializeOutcome, Plan};
+
         // Before the disk, because it needs none. A listing deliberately
         // ignores the mode; a write must not — see
         // [`ContentRefusal::LfsDisabled`].
@@ -7297,7 +7712,7 @@ impl Engine {
             // `open_repo` states (AD-48); the difference is that this opens what
             // is there and never makes one.
             let repo = git::repo::open(&profile.local_path, profile.removable)?;
-            lfs::stage::indexed_pointer(&repo, &rela)
+            lfs::stage::indexed_pointer(&repo, rela)
         };
         let Some(indexed) = indexed else {
             // A plain tracked file and a path git does not track land here
@@ -7306,13 +7721,11 @@ impl Engine {
         };
         // The same cone `materialize_landed` applies, so a request cannot reach
         // content the profile exists to keep away (Story 27.2).
-        if !SparseCone::new(&profile.subpaths).includes(&rela) {
+        if !SparseCone::new(&profile.subpaths).includes(rela) {
             return Err(SyncError::Refused(ContentRefusal::OutsideSubpaths { path }));
         }
 
-        let smudge = match lfs::hydrate::plan(&profile.local_path, &rela, &indexed)
-            .map_err(SyncError::Refused)?
-        {
+        let smudge = match lfs::hydrate::plan(&profile.local_path, rela, &indexed)? {
             Plan::AlreadyHeld => {
                 // The content is here, and this is also the only verb that can
                 // notice its index entry still describing the pointer — after a
@@ -7324,7 +7737,42 @@ impl Engine {
                 // and cannot be repaired by asking for it again.
                 {
                     let repo = git::repo::open(&profile.local_path, profile.removable)?;
-                    git::repo::refresh_index_stat(&repo, std::slice::from_ref(&rela))?;
+                    git::repo::refresh_index_stat(&repo, &[rela.to_path_buf()])?;
+                }
+                // And the ledger learns that this machine holds the content,
+                // which until Story 56.14 this arm never said (FR-334). A path
+                // materialized by `git lfs pull`, by a keeper that predates the
+                // ledger, by a second profile sharing the store, or by the
+                // documented same-length tie had NO row — so the release
+                // clocks could not see the one path a human had explicitly
+                // named, and the sweep had no candidate to put on a clock at
+                // all. `observe_materialized` rather than
+                // `remember_materialized` because this arm does not know when
+                // the content landed and must not claim it landed now: see its
+                // doc for which column each arm of that statement writes.
+                //
+                // Best-effort, exactly as the release side's retraction is: the
+                // content is here whatever SQLite says, and refusing a request
+                // that has already succeeded because a memo failed would be the
+                // worse answer.
+                let now = self.platform.now_ms();
+                if let Err(err) = self.with_db(|conn| {
+                    db::observe_materialized(
+                        conn,
+                        &profile.id,
+                        &path,
+                        now,
+                        &indexed.oid,
+                        indexed.size,
+                    )
+                }) {
+                    tracing::warn!(
+                        profile = profile.name,
+                        path = path,
+                        error = %err,
+                        "the content is here, but could not record that this folder holds it: \
+                         the release clocks will not see this path until it is asked for again"
+                    );
                 }
                 return Ok(Materialization {
                     path,
@@ -7342,6 +7790,23 @@ impl Engine {
         // writing to answer a question.
         let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
         if !store.contains(&indexed.oid, indexed.size) {
+            if absent == WhenAbsent::Report {
+                // Observing, not asking. A second request on the way to
+                // *reporting* that the first one did not land would insert a
+                // duplicate row (`enqueue_unique` does not count a `parked` row
+                // as cover) and would pull a fresh backoff back to now
+                // (`promote_unit`), so a cron entry against a dead remote would
+                // both grow the journal without bound and hammer the remote at
+                // the cron cadence. The caller already holds the unit it queued
+                // and reports that one.
+                return Ok(Materialization {
+                    path,
+                    oid: indexed.oid,
+                    size_bytes: indexed.size,
+                    outcome: MaterializeOutcome::Queued,
+                    unit_id: None,
+                });
+            }
             // The object is not here. The journal is the queue, and
             // `enqueue_unique` returns whatever unit already covers this work —
             // so a repeat request is one row and one download, and a request for
@@ -7365,11 +7830,10 @@ impl Engine {
                 db::promote_unit(conn, unit_id, now)?;
                 Ok(unit_id)
             })?;
-            // The supervisor claims it, not this call: `keeper-syncd` has no
-            // event loop to wait on and draining inline would make urgency
-            // pointless. In this process that collapses the wait to the next
-            // tick; from the CLI, whose engine is its own, the running daemon
-            // picks the row up on its own next pass instead.
+            // Nothing here claims the row. Who does depends on the door: the
+            // app's engine IS the supervisor, so this collapses the wait to its
+            // next tick, and [`Self::materialize_entry_now`] drains it before
+            // returning for the one-shot CLI that has no supervisor at all.
             self.wake_now(&profile.id);
             tracing::info!(
                 profile = profile.name,
@@ -7389,11 +7853,20 @@ impl Engine {
         // One frame of the phase the queued branch already publishes, so a
         // local copy of a four-gigabyte object is not silent. No new phase, no
         // new field, no new channel.
-        let mut event = self.progress(&profile, SyncPhase::DownloadingLfs);
+        let mut event = self.progress(profile, SyncPhase::DownloadingLfs);
         event.current = Some(path.clone());
         self.publish(event);
 
-        lfs::stage::materialize(&store, &profile.local_path, &smudge)?;
+        // The request door's answer is the opposite of the sweeps' (see
+        // `lfs::stage::Published::TargetMoved`): a person asked for ONE file,
+        // and the honest reply is the one `lfs::hydrate::plan` would have given
+        // had it looked an instant later — the path does not hold the pointer
+        // this folder committed, so keeper will not overwrite what is there.
+        if lfs::stage::materialize(&store, &profile.local_path, &smudge)?
+            == lfs::stage::Published::TargetMoved
+        {
+            return Err(SyncError::Refused(ContentRefusal::LocallyModified { path }));
+        }
         // The one moment this is knowable: content for this path now exists
         // here, so the next object for it is a replacement rather than an
         // arrival.
@@ -7431,6 +7904,217 @@ impl Engine {
         })
     }
 
+    /// Ask for one path's content **and wait for it** (Story 56.13).
+    ///
+    /// [`Self::materialize_entry`] with the drain that satisfies it, for the
+    /// caller that has no supervisor behind it. An end-to-end run of the
+    /// shipped `keeper-syncd` binary is what earned this: the verb printed
+    /// `queued  4.0 MB  scans/big.bin`, exited `0`, and left ~130 bytes of
+    /// pointer text on disk, because a one-shot process is not the daemon its
+    /// own output was telling the operator to rely on. For the cron entry this
+    /// verb exists for that is a no-op wearing a success message.
+    ///
+    /// # `Ok` is a report, not a promise
+    ///
+    /// [`lfs::hydrate::MaterializeOutcome::Queued`] still comes back when the
+    /// transfer did not land, and it is still `Ok`: the request was legitimate,
+    /// the row is in the journal, and a later pass may well deliver it. What
+    /// changed is that it now means "this call did **not** put the bytes here",
+    /// which is a fact the caller must be able to act on — `keeper-syncd`
+    /// turns it into a non-zero exit, and the app never sees it because the app
+    /// calls the queueing verb.
+    ///
+    /// # The drain waits for the requested unit, and nothing else
+    ///
+    /// The primary exit is [`db::UnitStanding`] on the very row this request
+    /// queued: `Settled` means [`db::complete`] deleted it, which is the only
+    /// thing that deletes one, so the bytes arrived. `Parked` and `InFlight`
+    /// are answers this process cannot improve on — nothing retries a parked
+    /// row until a human unparks it, and `claim_ready` never offers a `running`
+    /// row, so a second pass would claim nothing.
+    ///
+    /// It must **not** be the profile's outstanding-download count. That count
+    /// is the whole folder's, `materialize_pending` queues one row per
+    /// unfetched pointer after every pull, and `CLAIM_LIMIT` is 16 — so the
+    /// requested row completes on the first pass while the count merely falls
+    /// by sixteen, and a strictly-decreasing loop then keeps going until the
+    /// entire backlog is fetched. `keeper-syncd materialize photos one.jpg`
+    /// would download the folder, holding the reservation throughout.
+    /// [`Self::sync_once`]'s identical loop is bounded that way for the
+    /// opposite reason: that verb IS supposed to do the folder's work.
+    ///
+    /// The strictly-decreasing count survives as the **anti-spin guard**, for
+    /// the one case that needs it: `claim_ready` keeps a slot back for the
+    /// oldest background row, which can bump the youngest requested row out of
+    /// a full batch, so a pass that did not attempt this row is possible and
+    /// waiting one more pass is right — while a queue making no progress at all
+    /// stops the loop rather than spinning on it.
+    ///
+    /// # Downloads only
+    ///
+    /// [`Self::drain_kind`], not [`Self::drain_journal`]: `execute` dispatches
+    /// every kind it is handed, so an unnarrowed drain would let a verb sold as
+    /// "fetch one path's content" commit, merge, publish the branch and open a
+    /// pull request — and a `Pull` drained here can move the committed pointer
+    /// the request is about, under the observation below.
+    ///
+    /// # One reservation, and one honest limit
+    ///
+    /// The request and its drain run under a single [`Self::reserve`], so no
+    /// second `Busy` window is opened between queueing and draining, and
+    /// `drain_kind`'s requirement that the caller own the reservation is met.
+    /// In-process — the app, or any future supervisor sharing this engine — a
+    /// pass already holding the folder answers [`SyncError::Busy`] before
+    /// anything is queued.
+    ///
+    /// Across processes it cannot, for the reason [`Self::materialize_entry`]
+    /// states out loud: the reservation is an in-process map, so this never
+    /// sees a running `keeper-syncd watch`. Draining anyway is safe rather than
+    /// merely tolerated. `db::claim_ready` flips a row to `running`, so the
+    /// worst case is the same immutable, content-addressed bytes fetched twice
+    /// — [`lfs::store::LfsStore`] publishes by rename once the digest and the
+    /// length match, and [`lfs::stage::materialize`] publishes the worktree
+    /// file the same way. The cost of losing that race is bandwidth, and it
+    /// cannot corrupt. The *other* half of that race — the daemon claimed the
+    /// row first, so this process can do nothing but watch — is what
+    /// `InFlight` exists to report honestly instead of calling a healthy
+    /// transfer a failure.
+    ///
+    /// # The second pass observes; it never asks again
+    ///
+    /// [`Self::materialize_held`] is called a second time with
+    /// [`WhenAbsent::Report`], so it is the same publish path rather than a
+    /// second copy of it and it re-asks the only question the drain can have
+    /// changed — what the worktree and the store hold *now* — while writing
+    /// nothing to the journal. Normally [`Self::materialize_landed`] has
+    /// already published the labelled path (it is the arm that outranks the
+    /// virtualization policy for a requested unit and re-stats the index), so
+    /// the second call answers `AlreadyMaterialized`; if the object reached the
+    /// store without being published, the second call publishes it.
+    ///
+    /// Either way **this** invocation delivered the content, so the outcome is
+    /// `Materialized` — `AlreadyMaterialized` means "the worktree already held
+    /// it before you asked", which a consumer would read as a cache hit. Its
+    /// `unit_id` is `None`, honouring
+    /// [`lfs::hydrate::Materialization::unit_id`]'s own contract: the field
+    /// names the row that *will* deliver the content, and after a successful
+    /// drain there is no such row — `db::complete` deleted it, and a consumer
+    /// that polls on the field's presence would wait forever.
+    ///
+    /// `volume_ready` is re-asked before that pass. It is
+    /// [`Self::materialize_request`]'s guard and it runs once, while the
+    /// `.git`-existence test it exists to precede runs twice; a removable drive
+    /// unplugged mid-transfer would otherwise be reported as
+    /// `ContentRefusal::NotTracked` — "your file is not tracked by git" —
+    /// rather than as the absence AD-48 requires.
+    pub async fn materialize_entry_now(
+        &self,
+        id: &str,
+        subpath: &str,
+        source: SyncSource,
+    ) -> Result<lfs::hydrate::Materialization> {
+        use lfs::hydrate::MaterializeOutcome;
+
+        let (profile, rela, path) = self.materialize_request(id, subpath)?;
+        let _reservation = self
+            .reserve(&profile.id)
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+
+        let queued = self.materialize_held(&profile, &rela, path.clone(), WhenAbsent::Queue)?;
+        let (MaterializeOutcome::Queued, Some(unit)) = (queued.outcome, queued.unit_id) else {
+            return Ok(queued);
+        };
+
+        let mut previous = u32::MAX;
+        loop {
+            // A bookkeeping failure inside the drain must not discard a
+            // delivery that already happened: `db::complete` runs *after*
+            // `materialize_landed` published the worktree file, so a
+            // `SQLITE_BUSY` there — most likely precisely when a `watch` daemon
+            // is writing the same file, which this verb tolerates running
+            // alongside — would otherwise report a failed run over content that
+            // is on disk. Stop draining and let the observation below decide.
+            if let Err(err) = self
+                .drain_kind(&profile, WorkKind::LFS_DOWNLOAD, source)
+                .await
+            {
+                tracing::warn!(
+                    profile = profile.name,
+                    unit,
+                    error = %err,
+                    "the drain could not finish; reporting what is on disk"
+                );
+                break;
+            }
+            if !self
+                .with_db(|conn| db::unit_standing(conn, unit))?
+                .worth_waiting_for()
+            {
+                break;
+            }
+            let outstanding = self.lfs_downloads_outstanding(&profile)?;
+            if outstanding == 0 || outstanding >= previous {
+                break;
+            }
+            previous = outstanding;
+        }
+
+        // See this function's doc: the guard that precedes the `.git` test runs
+        // in `materialize_request`, and the `.git` test is about to run again.
+        if !self.volume_ready(&profile)? {
+            return Err(SyncError::MediaAbsent);
+        }
+        let settled = self.materialize_held(&profile, &rela, path, WhenAbsent::Report)?;
+        if settled.outcome == MaterializeOutcome::Queued {
+            tracing::warn!(
+                profile = profile.name,
+                path = settled.path,
+                unit,
+                "the requested transfer did not land in this run"
+            );
+            // The unit this invocation queued, not one the observation minted:
+            // `WhenAbsent::Report` mints none, and the row that recorded the
+            // failure is the row the caller has to be told about.
+            return Ok(lfs::hydrate::Materialization {
+                unit_id: Some(unit),
+                ..settled
+            });
+        }
+        Ok(lfs::hydrate::Materialization {
+            outcome: MaterializeOutcome::Materialized,
+            unit_id: None,
+            ..settled
+        })
+    }
+
+    /// Of the downloads this profile owes, how many are still outstanding?
+    ///
+    /// [`Self::lfs_uploads_outstanding`]'s mirror and it counts the same way —
+    /// parked rows included — for a different reason. There it answers whether
+    /// publishing is safe; here it is only the anti-spin guard for
+    /// [`Self::materialize_entry_now`]'s loop, and a parked download that
+    /// stopped being retried is exactly the row whose count must not fall, so
+    /// the loop stops instead of spinning on it.
+    fn lfs_downloads_outstanding(&self, profile: &SyncProfile) -> Result<u32> {
+        self.with_db(|conn| db::outstanding_count(conn, &profile.id, WorkKind::LFS_DOWNLOAD))
+    }
+
+    /// Where one journal unit stands, best effort (Story 56.13).
+    ///
+    /// [`db::unit_standing`] for a caller outside this crate — `keeper-syncd`
+    /// phrases its failure from it, because "nothing will retry this",
+    /// "something is transferring it right now" and "it will be tried again"
+    /// are three different sentences and only one of them should send an
+    /// operator to start a daemon.
+    ///
+    /// A journal that cannot be read reads `Waiting` with no reason: the caller
+    /// is already reporting a failure and must not lose that report to a second
+    /// one.
+    pub fn unit_standing(&self, unit: i64) -> db::UnitStanding {
+        self.with_db(|conn| db::unit_standing(conn, unit))
+            .unwrap_or(db::UnitStanding::Waiting { reason: None })
+    }
+
     /// Release one path's content back to the pointer this folder committed
     /// (Story 56.4, FR-332, FR-333).
     ///
@@ -7449,25 +8133,34 @@ impl Engine {
     /// an outcome enum whose "nothing happened" arm a caller can forget to
     /// check.
     ///
-    /// # Only a folder that is meant to hold pointers
+    /// # Only a folder, and a path, that is meant to hold pointers
     ///
-    /// [`lfs::hydrate::ContentRefusal::AlwaysMaterializes`] refuses every mode
-    /// but [`LfsMode::PointerOnly`], and it is a **mode gate rather than a
-    /// permanent limit**. In the default mode [`Self::materialize_pending`]
-    /// re-materializes any tracked path inside the cone whose worktree holds a
-    /// pointer — copying it back out of this machine's object store, or
-    /// queueing a download of it — so a release there gives back nothing and
-    /// costs a fetch, and a sweep driving this verb would fight the scan loop
-    /// forever. The gate lifts when the virtualization policy reaches the
-    /// arrival sweep and the two verbs stop disagreeing about what a folder
-    /// holds, which is a later story's work and not a limitation of this one.
+    /// The gate is now two (Story 56.10). [`release_mode_gate`] asks whether
+    /// this folder authorizes anything at all to stay away, and
+    /// [`release_path_gate`] asks whether it authorizes **this path**, at the
+    /// committed pointer's size, inside [`Self::release_resolved`].
+    ///
+    /// [`lfs::hydrate::ContentRefusal::AlwaysMaterializes`] is what either one
+    /// refuses with, and the reason it ever existed was never the mode: in the
+    /// default mode [`Self::materialize_pending`] re-materializes any tracked
+    /// path inside the cone whose worktree holds a pointer — copying it back out
+    /// of this machine's object store, or queueing a download of it — so a
+    /// release there gave back nothing and cost a fetch, and a sweep driving
+    /// this verb would fight the scan loop forever. So
+    /// [`LfsMode::Materialize`] with **no** virtualization policy still refuses
+    /// by name and for exactly that reason, while `LfsMode::Materialize` with a
+    /// policy that names this path no longer does: Story 56.10 taught
+    /// [`Self::materialize_pending`] the same policy, the two verbs now agree
+    /// about this path, and the release is not undone on the next pass.
     ///
     /// # The order of the guards is the contract
     ///
     /// The free checks first, exactly as [`Self::materialize_entry`] has them:
     /// containment ([`release_target`]), the pause, the volume, the
-    /// reservation, then the mode ([`release_mode_gate`]) — and then every
-    /// release-specific guard, in [`Self::release_resolved`], which is where
+    /// reservation, then the folder's mode and whether it has a policy at all
+    /// ([`release_mode_gate`]) — and then, in [`Self::release_resolved`], the
+    /// index, the cone, that folder's policy for **this path**
+    /// ([`release_path_gate`]) and every release-specific guard, which is where
     /// they are listed and where they run.
     ///
     /// The split is Story 56.5's and it is what lets the release sweep run
@@ -7504,8 +8197,13 @@ impl Engine {
         let _reservation = self
             .reserve(&profile.id)
             .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
-        release_mode_gate(&profile)?;
-        self.release_resolved(&profile, &rela, path).await
+        // The gate compiles the folder's virtualization policy on the one mode
+        // that needs it and hands it back, so the mode's own answer — a folder
+        // with large-file support off — is never displaced by a fault in a file
+        // that is inert for it, and `PointerOnly` reads nothing at all.
+        let policy = release_mode_gate(&profile)?;
+        self.release_resolved(&profile, policy.as_ref(), &rela, path)
+            .await
     }
 
     /// Every release-specific guard, and the release itself, for one path whose
@@ -7521,7 +8219,10 @@ impl Engine {
     ///
     /// # The order of the guards is the contract
     ///
-    /// After the index and the cone, the release-specific ones, cheapest first:
+    /// After the index and the cone, the folder's mode and its policy for this
+    /// path ([`release_path_gate`]) — free, and the last question that is about
+    /// the path rather than about the file. Then the release-specific guards,
+    /// cheapest first:
     ///
     /// 1. **`Missing` / `Modified`** from one `lstat`.
     /// 2. **`AlreadyPointer`**, at most a kilobyte of read, so the common
@@ -7541,12 +8242,23 @@ impl Engine {
     ///    memo Story 56.5's sweep selects candidates by — authorizes
     ///    *eligibility* and never a deletion; NFR-40 rests on this line.
     /// 6. **`Open` / `OpenUnknown`**, last, because it is the answer most
-    ///    likely to have changed while the steps above ran.
+    ///    likely to have changed while the steps above ran. Real on Linux since
+    ///    Story 56.11 — [`crate::platform::probe_open_file_state`] reads
+    ///    `/proc/<pid>/fd` by inode identity — and still `Unknown`, and so
+    ///    still a refusal, on a platform that cannot look.
     /// 7. **`Pinned`, again**, immediately before the deletion. NFR-40 puts the
     ///    authorization at the moment of the deletion, and step 3 happened
     ///    before a whole-file hash and a round trip — the two slowest things
     ///    here. One indexed `SELECT` on a two-column primary key is what "at
     ///    the moment of the deletion" costs.
+    ///
+    /// One consequence of placing the path gate there, stated rather than
+    /// discovered: under [`LfsMode::Materialize`], a stale ledger row for a path
+    /// no pattern names is no longer retracted by [`Self::release_expired`]'s
+    /// `AlreadyPointer` arm, because the path is refused before that arm can be
+    /// reached. Not a regression — before Story 56.10 no folder in that mode
+    /// reached this function at all — and the row is overwritten by the next
+    /// materialization of that path.
     ///
     /// The local store is deliberately **not** a precondition, which is the one
     /// place this does not mirror [`Self::materialize_entry`]: that verb copies
@@ -7581,6 +8293,7 @@ impl Engine {
     async fn release_resolved(
         &self,
         profile: &SyncProfile,
+        policy: Option<&lfs::virtual_policy::VirtualPolicy>,
         rela: &Path,
         path: String,
     ) -> Result<lfs::hydrate::Release> {
@@ -7605,6 +8318,14 @@ impl Engine {
         if !SparseCone::new(&profile.subpaths).includes(rela) {
             return Err(SyncError::Refused(ContentRefusal::OutsideSubpaths { path }));
         }
+        // The folder's mode and its policy, for THIS path, at the committed
+        // pointer's size — the first point at which the honest size is in hand,
+        // and free, because the blob has just been read. It sits with the cone
+        // rather than among the guards below because it asks the same class of
+        // question — is this path in scope for this verb at all — and because
+        // its refusal is the useful one: telling the owner of a path no pattern
+        // names that his file is `Modified` would send him looking for an edit.
+        release_path_gate(profile, policy, rela, pointer.size)?;
 
         let absolute = profile.local_path.join(rela);
         let metadata = match std::fs::symlink_metadata(&absolute) {
@@ -7679,7 +8400,36 @@ impl Engine {
         if metadata.len() != pointer.size {
             return Err(SyncError::Refused(ContentRefusal::Modified { path }));
         }
-        let (found_oid, read) = lfs::stage::content_oid(&absolute)?;
+        // On the blocking pool, because this is a whole-file SHA-256 inside an
+        // `async fn` (Story 56.14).
+        //
+        // A multi-gigabyte read with no yield point pins one tokio worker for
+        // as long as the disk takes. The sweep has always paid it on the
+        // engine's own runtime, but story 56.9 added the first INTERACTIVE
+        // caller: `sync_release_entry` must `.await` this method directly,
+        // because `spawn_blocking` cannot host a future — so a person pressing
+        // Release on a large file starved a worker the whole desktop's IPC
+        // shares. `sync_materialize_entry` beside it does not have the problem
+        // precisely because `materialize_entry` is synchronous and IS wrapped.
+        //
+        // This is the one call worth moving and not a general repair: the rest
+        // of this method is still blocking-in-async — the index open and parse,
+        // the `lstat`, and since story 56.11 the `/proc` walk — but each of
+        // those is bounded by a small amount of work, where this one is bounded
+        // only by the size of the user's file.
+        let hashed = {
+            let absolute = absolute.clone();
+            tokio::task::spawn_blocking(move || lfs::stage::content_oid(&absolute))
+                .await
+                // A panic in a `spawn_blocking` body: the digest never ran, so
+                // nothing about the content is established and the release must
+                // not proceed. Reported rather than swallowed, for the same
+                // reason every other guard here raises instead of declining.
+                .map_err(|err| {
+                    SyncError::Git(format!("could not hash the content to release: {err}"))
+                })?
+        };
+        let (found_oid, read) = hashed?;
         if found_oid != pointer.oid || read != pointer.size {
             return Err(SyncError::Refused(ContentRefusal::Modified { path }));
         }
@@ -7697,8 +8447,10 @@ impl Engine {
             OpenFileState::Open => {
                 return Err(SyncError::Refused(ContentRefusal::Open { path }));
             }
-            // The trait default, and therefore the answer on every real host
-            // today. Fail-closed is the whole point (AD-125).
+            // Answered for real on Linux since Story 56.11
+            // ([`crate::platform::probe_open_file_state`]), so this arm is now
+            // reached on macOS and Windows — and by any platform that has not
+            // opted in. Fail-closed is still the whole point (AD-125).
             OpenFileState::Unknown => {
                 return Err(SyncError::Refused(ContentRefusal::OpenUnknown { path }));
             }
@@ -7708,6 +8460,54 @@ impl Engine {
         if self.with_db(|conn| db::is_pinned(conn, &profile.id, &path))? {
             return Err(SyncError::Refused(ContentRefusal::Pinned { path }));
         }
+
+        // How many bytes this release actually gives back to the disk, taken
+        // from the very `lstat` the content proof was taken against (Story
+        // 56.14).
+        //
+        // `rename(2)` replaces ONE directory entry. With `nlink > 1` the inode
+        // survives under the other name and not a byte is reclaimed, so
+        // reporting the pointer's size — which `Release::size_bytes` documents
+        // as "the bytes this machine no longer holds", and which
+        // `keeper-syncd`'s `dehydrate_line` renders as `released 4.0 MB` —
+        // over-counts by the whole file, once per hard link. The release itself
+        // is still correct and still worth doing: the caller asked for THIS
+        // name to hold its pointer, and it now does.
+        //
+        // Not a guard: refusing a hard-linked path would be a new refusal for a
+        // request that succeeds, and nothing in the guard chain has ever read
+        // the link count. Only the figure changes, to the one that is true.
+        // Re-stated here rather than read off the `lstat` above, which was
+        // taken before a whole-file hash, a network round trip and the `/proc`
+        // walk: a link created or removed in those seconds would make the figure
+        // wrong in either direction. Beside the second pin read, for its reason
+        // — nothing between this and the deletion. A failure to re-stat falls
+        // back to the earlier answer rather than refusing a release that every
+        // guard has already permitted.
+        #[cfg(unix)]
+        let reclaimed = {
+            use std::os::unix::fs::MetadataExt as _;
+            let fresh = std::fs::symlink_metadata(&absolute);
+            let links = fresh.as_ref().unwrap_or(&metadata).nlink();
+            if links > 1 {
+                tracing::info!(
+                    profile = profile.name,
+                    path = path,
+                    links = metadata.nlink(),
+                    size = pointer.size,
+                    "releasing a hard-linked file: the pointer replaces this name, and the \
+                     content stays on the disk under the others, so no bytes are reclaimed"
+                );
+                0
+            } else {
+                pointer.size
+            }
+        };
+        // No portable link count, and inventing one would be worse than the
+        // over-count: every platform keeper ships to today either answers this
+        // or has no hard links to answer about.
+        #[cfg(not(unix))]
+        let reclaimed = pointer.size;
 
         lfs::stage::dehydrate(
             &profile.local_path,
@@ -7722,7 +8522,10 @@ impl Engine {
         )?;
         // The content is gone. From here the deletion is the fact and the
         // bookkeeping is best-effort — see this method's doc.
-        if let Err(err) = self.with_db(|conn| db::forget_materialized(conn, &profile.id, &path)) {
+        let now = self.platform.now_ms();
+        if let Err(err) =
+            self.with_db(|conn| db::forget_materialized(conn, &profile.id, &path, now))
+        {
             tracing::warn!(
                 profile = profile.name,
                 path = path,
@@ -7753,12 +8556,13 @@ impl Engine {
             path = path,
             oid = pointer.oid,
             size = pointer.size,
+            reclaimed,
             "released LFS content on request"
         );
         Ok(Release {
             path,
             oid: pointer.oid,
-            size_bytes: pointer.size,
+            size_bytes: reclaimed,
         })
     }
 
@@ -8098,24 +8902,48 @@ impl Engine {
             let mut report = VerifyReport::default();
             let store = lfs::store::LfsStore::in_git_dir(root.join(".git"));
             // Whether ANY path in this folder could be excused, settled once
-            // because both halves are facts about the folder rather than about
-            // a path. No source said what may stay away, so nothing may; or
-            // LFS is off entirely, in which case nothing will ever materialize
-            // a pointer and calling the path's absent content normal would be
-            // dishonest. Settling it here is also what keeps the ordinary
-            // folder — the overwhelming majority, carrying no policy at all —
-            // from paying an index parse plus one object-header lookup per
-            // tracked path on every verify, the scheduled ones included.
-            let excusable = policy.tier() != lfs::virtual_policy::VirtualPolicyTier::Unset
-                && walked.lfs_mode != LfsMode::Disabled;
+            // because every half is a fact about the folder rather than about
+            // a path. No source said what may stay away and the mode does not
+            // say it either, so nothing may; or LFS is off entirely, in which
+            // case nothing will ever materialize a pointer and calling the
+            // path's absent content normal would be dishonest. Settling it here
+            // is also what keeps the ordinary folder — the overwhelming
+            // majority, carrying no policy at all — from paying an index parse
+            // plus one object-header lookup per tracked path on every verify,
+            // the scheduled ones included.
+            //
+            // `LfsMode::PointerOnly` is the third way a folder can say it (Story
+            // 56.14). It is the whole-profile lever for exactly this — its own
+            // doc calls it leaving content as a pointer on purpose, and both
+            // arrival arms `continue` past the publish for it — so a committed
+            // pointer with no local object is the DESIGNED state of every path
+            // in such a folder. Before this it was the one configuration where
+            // the checks called the normal state a fault: a PointerOnly folder
+            // with no `.keepervirtual` and no `virtualPatterns` produced the
+            // same wall of `LFS object … is missing locally` rows story 56.6
+            // existed to end, and the only spelling of "yes, I meant it" was to
+            // restate the whole folder as a per-path policy.
+            let mode_excuses = walked.lfs_mode == LfsMode::PointerOnly;
+            let excusable = walked.lfs_mode != LfsMode::Disabled
+                && (mode_excuses || policy.tier() != lfs::virtual_policy::VirtualPolicyTier::Unset);
             // One index read for the whole walk. A folder with no repository,
             // or one whose index cannot be read, answers with an empty map and
             // therefore excuses NOTHING: the index is the only thing that can
             // tell a checkout's committed pointer from a pointer-shaped file
             // somebody saved by hand, and `VirtualPolicy::resolve` does no I/O
             // by design (FR-328) so it cannot.
+            //
+            // `open_read_only` rather than `git::repo::open` (Story 56.14):
+            // verify is the one pass that takes no reservation, so it is the
+            // most likely of all of them to run beside a keeper commit or a
+            // person's own `git`, and the ordinary door deliberately does
+            // housekeeping — it deletes an `index.lock` older than 60 s,
+            // polls and clears abandoned ref locks, and rewrites `.git/config`
+            // to drop a foreign LFS driver. None of that is needed to read an
+            // index, and a check that repairs what it is checking is not a
+            // check.
             let indexed = if excusable {
-                git::repo::open(&root, walked.removable)
+                git::repo::open_read_only(&root, walked.removable)
                     .ok()
                     .map(|repo| lfs::stage::indexed_pointers(&repo))
                     .unwrap_or_default()
@@ -8176,8 +9004,17 @@ impl Engine {
                                         .is_some_and(|entry| {
                                             entry.oid == pointer.oid && entry.size == pointer.size
                                         });
-                                    let authorized = policy.resolve(rela, pointer.size)
-                                        == lfs::virtual_policy::Virtualization::Virtual;
+                                    // `mode_excuses` is the folder-wide
+                                    // authorization (Story 56.14): a
+                                    // `LfsMode::PointerOnly` folder authorizes
+                                    // every tracked path to stay away, which is
+                                    // what the mode means, so the per-path
+                                    // policy has nothing left to add. The other
+                                    // three facts are unchanged and still have
+                                    // to be earned.
+                                    let authorized = mode_excuses
+                                        || policy.resolve(rela, pointer.size)
+                                            == lfs::virtual_policy::Virtualization::Virtual;
                                     // `contains` is length-verified, so an
                                     // object sitting here at the WRONG length
                                     // answered `false` above — a truncated
@@ -8655,9 +9492,12 @@ impl Engine {
     /// matches marks against a listing matches these the same way, on every
     /// platform.
     ///
-    /// The TTL and the mode are read once for the folder rather than per row,
-    /// because they are facts about the folder; [`release_schedule`] is then a
-    /// pure classification of each row against them. The mode is handed over as
+    /// The TTL, the mode and — since Story 56.10 — the compiled virtualization
+    /// policy are read once for the folder rather than per row, because all
+    /// three are facts about the folder; [`release_schedule`] is then a pure
+    /// classification of each row against them. The only per-row work the
+    /// policy adds is one [`lfs::virtual_policy::VirtualPolicy::resolve`], which
+    /// does no I/O of any kind. The mode is handed over as
     /// a mode rather than as [`release_mode_gate`]'s verdict, because the gate
     /// refuses two opposite configurations with one `Err` and a row's cell has
     /// to tell them apart — see [`release_schedule`]'s own doc.
@@ -8675,10 +9515,31 @@ impl Engine {
             Ok((profile, rows))
         })?;
         let ttl_ms = profile.effective_release_ttl_ms();
+        // Compiled once for the listing, never per row.
+        //
+        // Each row is resolved at the size the ledger recorded when the content
+        // landed, which is the pointer's own number — `db::note_arrival` writes
+        // it from the pointer in hand.
+        //
+        // `unwrap_or(u64::MAX)` for a row that recorded none, which is every row
+        // written before Story 56.5, and the direction is the whole reason. Read
+        // as `0`, such a row falls under any `virtualOverBytes` floor and draws
+        // `ModeKeeps` — *this folder is set to keep large-file content* — while
+        // `Self::release_expired`, which asks the committed pointer, releases
+        // that very path with no countdown ever shown. A surface that promises a
+        // release the deleting chain refuses only disappoints; one that promises
+        // the content is kept and then loses it from the worktree surprises, and
+        // that is the direction this must not be wrong in. So an absent size
+        // means *unknown*, not *nothing*: it clears any floor, the row draws the
+        // clock the sweep will honour, and the honest size arrives with the next
+        // materialization of that path.
+        let policy = lfs::virtual_policy::VirtualPolicy::compile(&profile)?;
         Ok(rows
             .into_iter()
             .map(|row| {
-                let schedule = release_schedule(&row, ttl_ms, profile.lfs_mode);
+                let virtualization =
+                    policy.resolve(Path::new(&row.path), row.size_bytes.unwrap_or(u64::MAX));
+                let schedule = release_schedule(&row, ttl_ms, profile.lfs_mode, virtualization);
                 (row.path, schedule)
             })
             .collect())
@@ -9131,27 +9992,136 @@ fn release_target(profile: &SyncProfile, subpath: &str) -> Result<(PathBuf, Stri
     Ok((rela, path))
 }
 
-/// May this folder let content go at all? (Story 56.4, extracted in Story
-/// 56.5.)
+/// May this folder let **any** content go — and, when the answer depends on its
+/// virtualization policy, the compiled policy the per-path gate will use? (Story
+/// 56.4, extracted in Story 56.5, widened in Story 56.10.)
 ///
-/// Exhaustive, so a fourth mode has to decide rather than inherit. Shared by
-/// the request door and the sweep so that a mode which refuses one refuses the
-/// other — see [`Engine::dehydrate_entry`]'s doc for why
-/// [`LfsMode::Materialize`] is a mode gate and not a permanent limit.
-fn release_mode_gate(profile: &SyncProfile) -> Result<()> {
+/// A question about the *folder*, asked before a path is named, and kept in that
+/// position deliberately: [`Engine::release_expired`] runs on every successful
+/// sync of every folder and every arrival writes a `materialized` row, so an
+/// ordinary folder has to be able to decline without opening its repository and
+/// resolving a target for each candidate row.
+///
+/// [`LfsMode::Materialize`] used to be a flat refusal, and that is what left
+/// Story 56.5's retention sweep dead in production: a folder in the mode every
+/// profile starts in declined before it read a clock, so a `releaseTtlMs` set by
+/// hand did nothing whatever. The refusal was never really about the mode — it
+/// was about the disagreement [`Engine::dehydrate_entry`]'s doc names, that in
+/// this mode [`Engine::materialize_pending`] copied any pointer's object
+/// straight back out of the store on the next pass. Story 56.10 taught the
+/// arrival path the same policy, so the two verbs agree, and this gate now asks
+/// the cheap half of the policy question: **is any path authorized at all?**
+/// The per-path half is [`release_path_gate`]'s, taken at the committed
+/// pointer's size inside [`Engine::release_resolved`] — and it is the check here
+/// that keeps a folder with no policy behaving exactly as it did.
+///
+/// **[`lfs::virtual_policy::VirtualPolicy::authorizes_anything`], never
+/// [`lfs::virtual_policy::VirtualPolicy::tier`].** A source consisting of
+/// nothing but `!` protections says something, so its tier is
+/// [`lfs::virtual_policy::VirtualPolicyTier::PatternFile`] while its permissive
+/// set is empty — a natural thing for a repository owner to commit, and one that
+/// authorizes no path whatever. Gating on the tier would let such a folder arm a
+/// release window and spend a whole budget of repository opens and index reads
+/// per sync, forever, to be refused per path. That is precisely the cheap
+/// decline this gate exists to preserve.
+///
+/// **The policy is compiled here, on the one arm that needs it, and handed
+/// back.** `Ok(None)` means the mode answered alone and no file was read:
+/// [`LfsMode::PointerOnly`] authorizes every path by configuration, so
+/// [`release_path_gate`] never asks a policy there and compiling one would be a
+/// filesystem read taken to answer a question nobody puts. It also means a fault
+/// in `.keepervirtual` — a file that is entirely inert for a folder with
+/// large-file support off — cannot displace [`LfsMode::Disabled`]'s own accurate
+/// sentence, which is what happened when the caller compiled first.
+///
+/// Exhaustive, so a fourth mode has to decide rather than inherit.
+fn release_mode_gate(profile: &SyncProfile) -> Result<Option<lfs::virtual_policy::VirtualPolicy>> {
     use lfs::hydrate::ContentRefusal;
 
     match profile.lfs_mode {
+        LfsMode::PointerOnly => Ok(None),
+        LfsMode::Disabled => Err(SyncError::Refused(ContentRefusal::LfsDisabled {
+            profile: profile.name.clone(),
+        })),
+        LfsMode::Materialize => {
+            // FR-329: a policy keeper cannot read is not a policy, and for a
+            // verb that deletes the direction is not a choice.
+            let policy = lfs::virtual_policy::VirtualPolicy::compile(profile)?;
+            if policy.authorizes_anything() {
+                Ok(Some(policy))
+            } else {
+                // Nothing in this folder may stay away, so nothing may leave it.
+                Err(SyncError::Refused(ContentRefusal::AlwaysMaterializes {
+                    profile: profile.name.clone(),
+                }))
+            }
+        }
+    }
+}
+
+/// May **this path's** content go, in a folder that has already passed
+/// [`release_mode_gate`]? (Story 56.10, AD-122, AD-123.)
+///
+/// `size` is the **committed pointer's** declared size, never the worktree's.
+/// The file standing here holds the content, so its stat is the content's
+/// length — but after a release it is ~130 bytes, and a gate that answered
+/// differently before and after would make this verb non-idempotent and would
+/// read a `virtual_over_bytes` floor backwards. The pointer is the one number
+/// that is the same either way, and it is the number
+/// [`lfs::virtual_policy::VirtualPolicy::resolve`]'s floor is written against.
+///
+/// **This makes a path eligible and authorizes nothing** (AD-123, NFR-40). It
+/// runs *before* every one of Story 56.4's refusals and replaces none of them:
+/// the pattern file says what may leave, per-object proof taken at the moment of
+/// the deletion says what may be deleted, and collapsing those two is precisely
+/// git-lfs#3092.
+///
+/// **Only the permissive half of the policy is a release authority, and only in
+/// [`LfsMode::Materialize`].** A `!` protection is not consulted here at all:
+/// under `PointerOnly` no policy is asked, and under `Materialize` a protection
+/// reaches this gate only as the absence of an authorization. That is AD-126's
+/// split, deliberately — *the pattern file is advisory about hydration; the pin
+/// is what is enforced against release* — so an owner who wants bytes kept
+/// against the sweep pins the path, and `!` lines keep meaning what they mean on
+/// the arrival side. Stated here because
+/// [`lfs::virtual_policy::VirtualPolicy::resolve`] calls a protection
+/// unconditional, and it is unconditional over the question that function
+/// answers, not over this one.
+///
+/// [`LfsMode::Disabled`] is refused here as well as in the folder gate. It
+/// cannot be reached, because the folder gate runs first — but the arm has to be
+/// *named* rather than inherited: nothing routes through the clean filter in
+/// that mode, so a policy has no LFS pointer there to have an opinion about and
+/// must never read as permission.
+fn release_path_gate(
+    profile: &SyncProfile,
+    policy: Option<&lfs::virtual_policy::VirtualPolicy>,
+    rela: &Path,
+    size: u64,
+) -> Result<()> {
+    use lfs::hydrate::ContentRefusal;
+    use lfs::virtual_policy::Virtualization;
+
+    match profile.lfs_mode {
+        // The whole-profile lever, and deliberately not narrowed by the
+        // per-path one: in this mode every path is virtual by configuration, so
+        // asking the policy could only take away a release that already worked.
         LfsMode::PointerOnly => Ok(()),
         LfsMode::Disabled => Err(SyncError::Refused(ContentRefusal::LfsDisabled {
             profile: profile.name.clone(),
         })),
-        // A folder that keeps everything it holds would have this back on
-        // the next pass; see `dehydrate_entry`'s own doc for why that is a
-        // mode gate and not a limit.
-        LfsMode::Materialize => Err(SyncError::Refused(ContentRefusal::AlwaysMaterializes {
-            profile: profile.name.clone(),
-        })),
+        LfsMode::Materialize => match policy.map(|policy| policy.resolve(rela, size)) {
+            Some(Virtualization::Virtual) => Ok(()),
+            // `None` cannot arrive here: `release_mode_gate` answers this mode
+            // with `Some` or refuses. It is answered conservatively rather than
+            // left to an `unwrap`, because a missing policy is an absent
+            // authorization and never a permission.
+            Some(Virtualization::Materialize) | None => {
+                Err(SyncError::Refused(ContentRefusal::NotVirtual {
+                    path: lfs::stage::index_key(rela),
+                }))
+            }
+        },
     }
 }
 
@@ -9226,8 +10196,10 @@ pub fn release_due_at(row: &db::MaterializedRow, ttl_ms: u64) -> Option<i64> {
 /// support OFF that it "is set to keep large-file content" is false of the
 /// folder and points them at a setting that reads the other way, so
 /// [`ReleaseSchedule::ModeKeeps`] and [`ReleaseSchedule::LfsOff`] are separate
-/// variants with separate sentences. They still draw the same word, because
-/// from the row's side "kept" is the one fact either way.
+/// variants with separate sentences. They draw the same word, because from the
+/// row's side "kept" is the one fact either way — and because, as
+/// [`ReleaseSchedule::Indefinite`] records, that word now carries a second
+/// meaning a surface acts on: a request will be refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseSchedule {
     /// Releases no earlier than this absolute epoch-ms instant.
@@ -9241,26 +10213,44 @@ pub enum ReleaseSchedule {
     /// no clock at any age. The only variant whose word is "Not sent".
     Unconfirmed,
     /// The folder's release TTL is switched off (`releaseTtlMs = 0`), so its
-    /// content stays until a person releases it by hand. Shares its word with
-    /// [`Self::ModeKeeps`] and [`Self::LfsOff`]; what tells it apart is that
-    /// its sentence points at the folder's *release interval*, which is the
-    /// setting that would put these rows on a clock.
+    /// content stays until a person releases it by hand. What tells it apart
+    /// from [`Self::ModeKeeps`] and [`Self::LfsOff`] is that its sentence
+    /// points at the folder's *release interval*, which is the setting that
+    /// would put these rows on a clock.
+    ///
+    /// # Its word is its own, and that is load-bearing (Story 56.14)
+    ///
+    /// It used to draw "Kept" alongside the two mode causes, and the three are
+    /// not the same thing at all: [`Engine::release_resolved`] has **no TTL
+    /// guard anywhere in its chain**, so a `releaseTtlMs = 0` row releases on
+    /// request — by hand is precisely how its own sentence says its content
+    /// leaves — while both mode causes are refused, by
+    /// [`release_mode_gate`]'s `AlwaysMaterializes` and `LfsDisabled` arms.
+    /// One word over a releasable row and a guaranteed refusal left the Files
+    /// pane with nothing to gate its Release control on but a prose sentence,
+    /// so it offered the button on rows where the press could only produce a
+    /// red alert.
+    ///
+    /// "Manual" rather than "On request" or "Until asked" because the cell it
+    /// shares with "Pinned" and "23 hr" is six characters wide. It leaves
+    /// "Kept" meaning exactly *keeper keeps this and you cannot release it*,
+    /// which is what the two mode causes are — and that is the word the Files
+    /// pane branches on.
     Indefinite,
     /// The folder is in [`LfsMode::Materialize`], which re-materializes what
     /// it holds, so a release would be undone on the next pass and a countdown
     /// would promise something that never comes. Shares its word with
-    /// [`Self::Indefinite`] and [`Self::LfsOff`]; what tells it apart is that
-    /// its sentence names the folder deliberately *keeping* large-file
-    /// content.
+    /// [`Self::LfsOff`], and shares with it the fact behind that word — a
+    /// request is refused; what tells the two apart is that this one's
+    /// sentence names the folder deliberately *keeping* large-file content.
     ModeKeeps,
     /// The folder has large-file support off ([`LfsMode::Disabled`]) and still
     /// holds `materialized` rows — reachable, because a folder switched away
     /// from [`LfsMode::PointerOnly`] keeps the ledger rows it already had, and
     /// `browse::classify` goes on marking them materialized. Shares its word
-    /// with [`Self::Indefinite`] and [`Self::ModeKeeps`]; what tells it apart
-    /// is that its sentence names large-file support being OFF, which is the
-    /// opposite configuration to [`Self::ModeKeeps`] and would be a lie in its
-    /// sentence.
+    /// with [`Self::ModeKeeps`]; what tells it apart is that its sentence
+    /// names large-file support being OFF, which is the opposite configuration
+    /// to [`Self::ModeKeeps`] and would be a lie in its sentence.
     LfsOff,
 }
 
@@ -9279,9 +10269,13 @@ impl ReleaseSchedule {
             Self::Due { at_ms } => Ok(*at_ms),
             Self::Pinned => Err("Pinned"),
             Self::Unconfirmed => Err("Not sent"),
-            // Three reasons, one word: see [`Self::hold`] for why, and
-            // [`Self::sentence`] for what actually separates them.
-            Self::Indefinite | Self::ModeKeeps | Self::LfsOff => Err("Kept"),
+            // "Manual" is a releasable row and "Kept" is a refused one; the
+            // Files pane's Release control branches on exactly that
+            // distinction, so the two must not be re-merged. See
+            // [`Self::Indefinite`] for why, [`Self::hold`] for the wire, and
+            // [`Self::sentence`] for what separates the two "Kept" reasons.
+            Self::Indefinite => Err("Manual"),
+            Self::ModeKeeps | Self::LfsOff => Err("Kept"),
         }
     }
 
@@ -9311,11 +10305,23 @@ impl ReleaseSchedule {
     /// Short because it stands where a figure would stand, in a cell sized for
     /// `23 hr`; the whole reason is [`Self::sentence`]'s job. "Not sent" rather
     /// than "Unconfirmed" because the person is being told something about
-    /// their own file, not about keeper's bookkeeping, and the switched-off
-    /// TTL, the mode that keeps large-file content and the folder with
-    /// large-file support off all say "Kept" because from the row's side they
-    /// are the same fact — the difference between the three is a sentence, not
-    /// a word.
+    /// their own file, not about keeper's bookkeeping.
+    ///
+    /// # A surface reads these words as a claim about whether Release works
+    ///
+    /// "Kept" means *keeper keeps this and a request will be refused*: both the
+    /// mode that keeps large-file content and the folder with large-file
+    /// support off are refused by [`release_mode_gate`], and the difference
+    /// between those two is a sentence rather than a word. "Pinned" is the
+    /// third refused word — [`Engine::release_resolved`] reads
+    /// [`db::is_pinned`] twice and declines.
+    ///
+    /// "Manual" and "Not sent" are **not** refused: neither a switched-off TTL
+    /// nor an absent `synced_at_ms` is a guard anywhere in
+    /// [`Engine::release_resolved`]'s chain, so both of those rows release on
+    /// request. Story 56.14 split "Manual" out of "Kept" for exactly this
+    /// reason; re-merging them would put a control back on rows whose press can
+    /// only produce a refusal.
     pub fn hold(&self) -> Option<&'static str> {
         self.instant_or_words().err()
     }
@@ -9392,6 +10398,15 @@ impl ReleaseSchedule {
 /// the gate's refusal vocabulary is about the request door. Exhaustive, so a
 /// fourth mode has to decide which sentence it draws rather than inherit one.
 ///
+/// Since Story 56.10 the mode is no longer the whole of that fact: it is joined
+/// by the virtualization policy's per-path answer, because a folder in
+/// [`LfsMode::Materialize`] may name paths whose content is authorized to stay
+/// away and those rows are on the sweep's clock. The answer is handed in
+/// **already resolved** rather than compiled here, which is what keeps this
+/// function what it is — no I/O, no compile, every variant reachable from a
+/// hand-built row — and what guarantees the listing and the sweep read one
+/// compiled policy rather than two.
+///
 /// Pure — no `self`, no I/O, no clock — like [`release_due_at`] and for its
 /// reason: every variant is then reachable from a hand-built row, and the
 /// precedence the shell's cells rest on is provable where a compiler runs.
@@ -9399,13 +10414,24 @@ pub fn release_schedule(
     row: &db::MaterializedRow,
     ttl_ms: Option<u64>,
     mode: LfsMode,
+    virtualization: lfs::virtual_policy::Virtualization,
 ) -> ReleaseSchedule {
     if row.pinned {
         return ReleaseSchedule::Pinned;
     }
     match mode {
         LfsMode::PointerOnly => {}
-        LfsMode::Materialize => return ReleaseSchedule::ModeKeeps,
+        // Story 56.10: the mode is no longer the whole answer. A folder that
+        // keeps everything by default may still name paths whose content is
+        // authorized to stay away, and those rows are on the sweep's clock — so
+        // `ModeKeeps`' sentence, which tells the owner this folder is set to
+        // keep large-file content, would be false over a row that will be
+        // released within the hour. The per-path answer arrives from the caller,
+        // resolved against the same compiled policy the sweep asks.
+        LfsMode::Materialize => match virtualization {
+            lfs::virtual_policy::Virtualization::Virtual => {}
+            lfs::virtual_policy::Virtualization::Materialize => return ReleaseSchedule::ModeKeeps,
+        },
         LfsMode::Disabled => return ReleaseSchedule::LfsOff,
     }
     let Some(ttl_ms) = ttl_ms else {
@@ -9989,6 +11015,8 @@ mod tests {
     /// sentence shown to somebody about their own file.
     #[test]
     fn release_schedule_asks_the_pin_then_the_mode_then_the_ttl() {
+        use lfs::virtual_policy::Virtualization;
+
         const TTL: u64 = 24 * 60 * 60 * 1000;
 
         // The pin is the first question, so it wins over a clock that ran out
@@ -10004,13 +11032,16 @@ mod tests {
             row.pinned = true;
             row.last_used_ms = Some(1);
             assert_eq!(
-                release_schedule(&row, Some(TTL), mode),
+                release_schedule(&row, Some(TTL), mode, Virtualization::Materialize),
                 ReleaseSchedule::Pinned,
                 "the pin is asked before anything else, whatever the mode says"
             );
             // And with the sweep switched off entirely, the pin is still the
             // more specific truth.
-            assert_eq!(release_schedule(&row, None, mode), ReleaseSchedule::Pinned);
+            assert_eq!(
+                release_schedule(&row, None, mode, Virtualization::Materialize),
+                ReleaseSchedule::Pinned
+            );
         }
 
         // The mode beats a due clock: in a folder that re-materializes what it
@@ -10018,14 +11049,47 @@ mod tests {
         let mut row = ledger_row("clip.mp4", 1_000);
         row.last_used_ms = Some(5_000);
         assert_eq!(
-            release_schedule(&row, Some(TTL), LfsMode::Materialize),
+            release_schedule(
+                &row,
+                Some(TTL),
+                LfsMode::Materialize,
+                Virtualization::Materialize
+            ),
             ReleaseSchedule::ModeKeeps
         );
         // And it beats an absent TTL, because the mode is the more specific
         // reason of the two and both would draw the same word.
         assert_eq!(
-            release_schedule(&row, None, LfsMode::Materialize),
+            release_schedule(
+                &row,
+                None,
+                LfsMode::Materialize,
+                Virtualization::Materialize
+            ),
             ReleaseSchedule::ModeKeeps
+        );
+        // Story 56.10: and it does NOT beat a policy that authorizes this path.
+        // Such a row is on the sweep's clock, so a cell reading "this folder
+        // keeps large-file content" would be lying about this story's own
+        // change — it would tell the owner nothing is released on a clock while
+        // the sweep releases this very path within the hour.
+        assert_eq!(
+            release_schedule(
+                &row,
+                Some(TTL),
+                LfsMode::Materialize,
+                Virtualization::Virtual
+            ),
+            ReleaseSchedule::Due {
+                at_ms: 5_000 + TTL as i64
+            },
+            "an authorized path in the default mode falls through to the clock"
+        );
+        // And with the sweep switched off it draws the folder's own word rather
+        // than the mode's: nothing is holding this path but the absent TTL.
+        assert_eq!(
+            release_schedule(&row, None, LfsMode::Materialize, Virtualization::Virtual),
+            ReleaseSchedule::Indefinite
         );
 
         // The OTHER mode `release_mode_gate` refuses, and the reason this is
@@ -10034,12 +11098,17 @@ mod tests {
         // it reaches here — and "set to keep large-file content" would be the
         // opposite of what its own settings say.
         assert_eq!(
-            release_schedule(&row, Some(TTL), LfsMode::Disabled),
+            release_schedule(
+                &row,
+                Some(TTL),
+                LfsMode::Disabled,
+                Virtualization::Materialize
+            ),
             ReleaseSchedule::LfsOff,
             "a folder with large-file support off is told that, not that it keeps content"
         );
         assert_eq!(
-            release_schedule(&row, None, LfsMode::Disabled),
+            release_schedule(&row, None, LfsMode::Disabled, Virtualization::Materialize),
             ReleaseSchedule::LfsOff
         );
 
@@ -10047,7 +11116,12 @@ mod tests {
         // and is the operator's documented way to say "never release from this
         // folder" — not a very short TTL.
         assert_eq!(
-            release_schedule(&row, None, LfsMode::PointerOnly),
+            release_schedule(
+                &row,
+                None,
+                LfsMode::PointerOnly,
+                Virtualization::Materialize
+            ),
             ReleaseSchedule::Indefinite
         );
 
@@ -10058,7 +11132,12 @@ mod tests {
         row.local_origin = true;
         row.last_used_ms = Some(i64::MAX / 2);
         assert_eq!(
-            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
+            release_schedule(
+                &row,
+                Some(TTL),
+                LfsMode::PointerOnly,
+                Virtualization::Materialize
+            ),
             ReleaseSchedule::Unconfirmed,
             "content that exists on this machine alone is never put on a clock"
         );
@@ -10073,7 +11152,12 @@ mod tests {
         row.synced_at_ms = Some(7_000);
         row.last_used_ms = Some(i64::MAX / 2);
         assert_eq!(
-            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
+            release_schedule(
+                &row,
+                Some(TTL),
+                LfsMode::PointerOnly,
+                Virtualization::Materialize
+            ),
             ReleaseSchedule::Due {
                 at_ms: 7_000 + TTL as i64
             },
@@ -10086,7 +11170,12 @@ mod tests {
         let mut row = ledger_row("clip.mp4", 1_000);
         row.last_used_ms = Some(5_000);
         assert_eq!(
-            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
+            release_schedule(
+                &row,
+                Some(TTL),
+                LfsMode::PointerOnly,
+                Virtualization::Materialize
+            ),
             ReleaseSchedule::Due {
                 at_ms: 5_000 + TTL as i64
             }
@@ -10094,10 +11183,53 @@ mod tests {
         // …and `at_ms` when it has not been used since it landed.
         let row = ledger_row("clip.mp4", 1_000);
         assert_eq!(
-            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
+            release_schedule(
+                &row,
+                Some(TTL),
+                LfsMode::PointerOnly,
+                Virtualization::Materialize
+            ),
             ReleaseSchedule::Due {
                 at_ms: 1_000 + TTL as i64
             }
+        );
+    }
+
+    /// A `Virtual` answer widens the mode's arm and nothing else (Story 56.10).
+    ///
+    /// The precedence every one of this epic's safety claims rests on. The pin
+    /// is a hard floor asked before any mode, and [`LfsMode::Disabled`] means
+    /// nothing routes through the clean filter at all — so an authorizing policy
+    /// must not be able to draw a countdown over either. A classifier that asked
+    /// the policy first would promise a release the chain that deletes refuses,
+    /// which is the one direction a surface may not be wrong in.
+    #[test]
+    fn a_virtual_answer_overrides_neither_the_pin_nor_large_file_support_being_off() {
+        use lfs::virtual_policy::Virtualization;
+
+        const TTL: u64 = 24 * 60 * 60 * 1000;
+
+        let mut pinned = ledger_row("clip.mp4", 1_000);
+        pinned.pinned = true;
+        pinned.last_used_ms = Some(1);
+        assert_eq!(
+            release_schedule(
+                &pinned,
+                Some(TTL),
+                LfsMode::Materialize,
+                Virtualization::Virtual
+            ),
+            ReleaseSchedule::Pinned,
+            "the pin is a floor: a policy authorizes eligibility, never a deletion"
+        );
+
+        let mut off = ledger_row("clip.mp4", 1_000);
+        off.last_used_ms = Some(5_000);
+        assert_eq!(
+            release_schedule(&off, Some(TTL), LfsMode::Disabled, Virtualization::Virtual),
+            ReleaseSchedule::LfsOff,
+            "with large-file support off there is no pointer for a policy to have an \
+             opinion about"
         );
     }
 
@@ -10138,9 +11270,9 @@ mod tests {
         }
 
         // Pairwise distinct, because the sentence is the only thing carrying the
-        // difference between rows that draw the same word: `Indefinite`,
-        // `ModeKeeps` and `LfsOff` all say "Kept", and they send the owner to
-        // three different settings — one of them the opposite of another.
+        // difference between rows that draw the same word: `ModeKeeps` and
+        // `LfsOff` both say "Kept", and they send the owner to two different
+        // settings that are the opposite of one another.
         let mut sentences: Vec<&str> = all.iter().map(ReleaseSchedule::sentence).collect();
         sentences.sort_unstable();
         let distinct = sentences.len();
@@ -10150,6 +11282,32 @@ mod tests {
             distinct,
             "six reasons, six sentences — a shared one would tell somebody the wrong \
              thing about their own file"
+        );
+
+        // Story 56.14. The Files pane's Release control is withheld on exactly
+        // the words that mean the request is CERTAIN to be refused — "Kept"
+        // (`release_mode_gate`'s two arms) and "Pinned" (`release_resolved`
+        // reads `db::is_pinned` twice) — and offered otherwise. So a word shared
+        // between a refused row and a releasable one silently re-enables a
+        // button whose press can only produce a red alert, which is why
+        // `Indefinite` has its own: `release_resolved` has no TTL guard at all,
+        // and a `releaseTtlMs = 0` row releases on request.
+        assert_eq!(
+            ReleaseSchedule::Indefinite.hold(),
+            Some("Manual"),
+            "a row whose Release works must not draw a refused row's word"
+        );
+        for refused in [ReleaseSchedule::ModeKeeps, ReleaseSchedule::LfsOff] {
+            assert_eq!(
+                refused.hold(),
+                Some("Kept"),
+                "the two mode causes are refused and share the one word for it: {refused:?}"
+            );
+        }
+        assert_eq!(
+            ReleaseSchedule::Unconfirmed.hold(),
+            Some("Not sent"),
+            "and an unconfirmed row releases on request too, so it keeps its own word"
         );
     }
 
