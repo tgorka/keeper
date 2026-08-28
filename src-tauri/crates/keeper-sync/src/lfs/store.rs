@@ -19,8 +19,10 @@
 //! them is not async at all, and an async duplicate would be a second
 //! implementation of the same hash loop.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
 
@@ -30,13 +32,90 @@ use crate::error::{Result, SyncError};
 ///
 /// Bounded on purpose: an LFS object is routinely larger than RAM, so nothing
 /// in this module may size a buffer from the object (NFR-23).
-const HASH_CHUNK_BYTES: usize = 128 * 1024;
+///
+/// `pub(crate)` because a second LFS hashing loop arrived that is not in this
+/// module and must read at the same granularity:
+/// [`crate::lfs::stage::content_oid`], which hashes a materialized worktree
+/// file to prove it still holds the object this store would have handed out. A
+/// third copy of the literal would be a third thing to keep in step.
+pub(crate) const HASH_CHUNK_BYTES: usize = 128 * 1024;
 
 /// A repository's local LFS object store.
 #[derive(Debug, Clone)]
 pub struct LfsStore {
     /// The `lfs` directory itself, i.e. `<git-dir>/lfs`.
     root: PathBuf,
+}
+
+/// Hasher state for partial downloads, for the life of the process.
+///
+/// # What this removes
+///
+/// [`LfsStore::resume_offset`] re-reads and re-hashes the entire `.part` file,
+/// because a resumed download must still produce a digest over every byte —
+/// including the ones it did not fetch this time. That is correct and it is
+/// not cheap: a 970 MB partial on an external drive is fourteen seconds of
+/// reading before a single new byte is asked for.
+///
+/// On a link that interrupts often, that cost is paid again on every retry and
+/// it *grows with progress*, so the further an object gets the slower it goes.
+/// Measured on a folder pulling 44 GB over a 240 kB/s tunnel: three partials
+/// above 600 MB, all being resumed repeatedly, and an effective rate that
+/// decayed from the link's own 300 kB/s to a fifth of it over an afternoon.
+///
+/// # Why a cache is safe here
+///
+/// The state is handed back **only** when the `.part` is exactly as long as it
+/// was when the state was taken. Nothing in this crate rewrites a partial in
+/// place — a download appends and nothing else — so equal length means equal
+/// bytes. And the guarantee does not rest on that reasoning alone: the digest
+/// of the finished object is still checked against its oid before the file is
+/// committed, so a wrong prefix cannot pass, it can only fail late and cost a
+/// re-download.
+///
+/// In-memory on purpose. `Sha256`'s intermediate state has no serialized form,
+/// and a restart is exactly the case where re-reading is the honest answer.
+static STAGED_PREFIXES: OnceLock<Mutex<HashMap<String, (u64, Sha256)>>> = OnceLock::new();
+
+fn staged_prefixes() -> &'static Mutex<HashMap<String, (u64, Sha256)>> {
+    STAGED_PREFIXES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Keep the hasher for a partial this process wrote, so the next attempt does
+/// not read those bytes again.
+pub fn remember_prefix(oid: &str, offset: u64, hasher: &Sha256) {
+    let mut cache = staged_prefixes().lock().expect("staged prefix lock");
+    cache.insert(oid.to_owned(), (offset, hasher.clone()));
+}
+
+/// The remembered hasher, if it covers exactly `staged` bytes.
+fn recall_prefix(oid: &str, staged: u64) -> Option<Sha256> {
+    let cache = staged_prefixes().lock().expect("staged prefix lock");
+    cache
+        .get(oid)
+        .filter(|(offset, _)| *offset == staged)
+        .map(|(_, hasher)| hasher.clone())
+}
+
+/// Drop what is no longer partial — a committed object, or one whose staged
+/// bytes were discarded.
+pub fn forget_prefix(oid: &str) {
+    staged_prefixes()
+        .lock()
+        .expect("staged prefix lock")
+        .remove(oid);
+}
+
+/// What one sweep found and what it took.
+///
+/// Both halves, because "removed 863" alone cannot say whether the sweep was
+/// thorough or whether 900 more are still there being written.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScratchSweep {
+    pub found: u64,
+    pub found_bytes: u64,
+    pub removed: u64,
+    pub removed_bytes: u64,
 }
 
 impl LfsStore {
@@ -83,6 +162,75 @@ impl LfsStore {
         self.root.join("tmp")
     }
 
+    /// How old scratch has to be before a sweep is willing to call it debris.
+    ///
+    /// A live transfer's temp file is seconds old. An hour is far beyond any
+    /// honest write and far short of the days this scratch has been observed to
+    /// survive, so the sweep can run at startup — beside a transfer that is
+    /// genuinely in flight — without ever taking a file somebody is using.
+    const SCRATCH_DEBRIS_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// Delete transfer scratch that no live transfer can still be using, and
+    /// report what was there.
+    ///
+    /// # Why this is needed at all
+    ///
+    /// `tempfile` deletes its file when the handle drops — and a process that
+    /// is killed drops nothing. Every crash therefore leaks one file per
+    /// transfer in flight, and nothing has ever removed them. Measured on one
+    /// machine after four days of a crash loop: **100 GB in 863 files**, beside
+    /// 4 GB of abandoned resumable downloads, on a volume with 153 GB free.
+    ///
+    /// # Why by age rather than by name
+    ///
+    /// The names are random by construction, so there is nothing in a name to
+    /// tell a leaked file from a live one. Age can: see
+    /// [`Self::SCRATCH_DEBRIS_AGE`].
+    ///
+    /// Never fails the caller. A sweep is housekeeping, and a folder that
+    /// refused to sync because it could not delete a temp file would have traded
+    /// a disk-space problem for a sync problem.
+    pub fn sweep_scratch(&self, profile: &str) -> ScratchSweep {
+        let mut swept = ScratchSweep::default();
+        for dir in [self.tmp_dir(), self.root.join("incomplete")] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                swept.found += 1;
+                swept.found_bytes += meta.len();
+                let old_enough = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age >= Self::SCRATCH_DEBRIS_AGE);
+                if old_enough && std::fs::remove_file(entry.path()).is_ok() {
+                    swept.removed += 1;
+                    swept.removed_bytes += meta.len();
+                }
+            }
+        }
+        if swept.removed > 0 {
+            crate::anomaly::Anomaly {
+                what: "transfer scratch left by an interrupted run",
+                measured: format!(
+                    "found={} found_bytes={} removed={} removed_bytes={}",
+                    swept.found, swept.found_bytes, swept.removed, swept.removed_bytes
+                ),
+                expected: "near zero; scratch is deleted when a transfer ends, and only a \
+                           killed process leaves any",
+                consequence: "disk nothing would have reclaimed; removed now, and the space \
+                              is back",
+            }
+            .report(profile);
+        }
+        swept
+    }
+
     /// Create the directory skeleton. Idempotent.
     pub fn ensure_layout(&self) -> Result<()> {
         for dir in [
@@ -106,6 +254,36 @@ impl LfsStore {
         std::fs::metadata(self.object_path(oid))
             .map(|meta| meta.is_file() && meta.len() == expected_size)
             .unwrap_or(false)
+    }
+
+    /// The OID and size a stream would have, without keeping a byte of it.
+    ///
+    /// The clean direction asks two questions of a file — "what is its pointer"
+    /// and "is its object stored" — and only the second one needs the bytes.
+    /// [`LfsStore::insert_streaming`] cannot tell them apart: the OID is the
+    /// *result* of writing, so it writes a full copy into `tmp/` first and
+    /// learns afterwards that the object was already there.
+    ///
+    /// On a folder whose objects are almost all stored already, that copy is
+    /// the dominant cost of a status walk. Measured on the field folder over a
+    /// quiet volume: `tmp/` grew at 9.6 MB/s and stood at 5.4 GB mid-walk, so
+    /// the 24.2 GB of pointer content a walk re-reads costs about 42 minutes of
+    /// writing — every walk, for content that never changed.
+    pub fn digest_of(mut reader: impl Read) -> Result<(String, u64)> {
+        let mut hasher = Sha256::new();
+        let mut size: u64 = 0;
+        let mut buf = vec![0u8; HASH_CHUNK_BYTES];
+        loop {
+            let read = reader.read(&mut buf).map_err(|err| {
+                SyncError::io("read lfs source", std::path::Path::new("<stream>"), err)
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+            size += read as u64;
+        }
+        Ok((hex::encode(hasher.finalize()), size))
     }
 
     /// Hash `reader` into the store and publish it under the digest it turns
@@ -245,6 +423,17 @@ impl LfsStore {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, hasher)),
             Err(err) => return Err(SyncError::io("open lfs partial", path, err)),
         };
+
+        // The prefix this process hashed on its way to being interrupted, if it
+        // is still exactly what is on disk. See `remember_prefix` for why that
+        // check is the whole of the safety argument.
+        let staged = file
+            .metadata()
+            .map_err(|err| SyncError::io("stat lfs partial", &path, err))?
+            .len();
+        if let Some(recalled) = recall_prefix(oid, staged) {
+            return Ok((staged, recalled));
+        }
 
         let mut offset: u64 = 0;
         let mut buf = vec![0u8; HASH_CHUNK_BYTES];
@@ -493,5 +682,86 @@ mod tests {
         store
             .remove_partial(&oid)
             .expect("second removal is a no-op");
+    }
+
+    /// The whole point: a resume does not read again what this process already
+    /// hashed. Proven by making the file's bytes DISAGREE with the remembered
+    /// state — if `resume_offset` read the file, it could not return the digest
+    /// the cache holds.
+    #[test]
+    fn a_remembered_prefix_is_handed_back_without_reading_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        let oid = "a".repeat(64);
+        std::fs::write(store.incomplete_path(&oid), vec![0u8; 1_000]).expect("part");
+
+        // State that could only have come from the cache: it covers the same
+        // number of bytes, and different ones.
+        let mut primed = Sha256::new();
+        primed.update(vec![7u8; 1_000]);
+        remember_prefix(&oid, 1_000, &primed);
+
+        let (offset, hasher) = store.resume_offset(&oid).expect("resume");
+        assert_eq!(offset, 1_000);
+        assert_eq!(
+            hex::encode(hasher.finalize()),
+            hex::encode(primed.finalize()),
+            "the remembered hasher came back, so the file was not re-read"
+        );
+        forget_prefix(&oid);
+    }
+
+    /// The safety check, and the whole of the argument for keeping state at
+    /// all: it is handed back only while the partial is exactly as long as it
+    /// was. A file that grew or shrank under us falls back to reading, which is
+    /// always correct and merely slower.
+    #[test]
+    fn a_prefix_whose_file_has_moved_on_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        let oid = "b".repeat(64);
+        std::fs::write(store.incomplete_path(&oid), vec![0u8; 1_000]).expect("part");
+
+        let mut stale = Sha256::new();
+        stale.update(vec![7u8; 900]);
+        remember_prefix(&oid, 900, &stale);
+
+        let (offset, hasher) = store.resume_offset(&oid).expect("resume");
+        assert_eq!(offset, 1_000, "the file is what it is, not what we recall");
+        let mut honest = Sha256::new();
+        honest.update(vec![0u8; 1_000]);
+        assert_eq!(
+            hex::encode(hasher.finalize()),
+            hex::encode(honest.finalize()),
+            "and the digest is over the bytes actually on disk"
+        );
+        forget_prefix(&oid);
+    }
+
+    /// Nothing is kept for an object that is no longer partial.
+    #[test]
+    fn a_committed_object_leaves_no_state_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        let oid = "c".repeat(64);
+        std::fs::write(store.incomplete_path(&oid), vec![0u8; 10]).expect("part");
+        let mut primed = Sha256::new();
+        primed.update(vec![7u8; 10]);
+        remember_prefix(&oid, 10, &primed);
+
+        forget_prefix(&oid);
+
+        let (offset, hasher) = store.resume_offset(&oid).expect("resume");
+        let mut honest = Sha256::new();
+        honest.update(vec![0u8; 10]);
+        assert_eq!(offset, 10);
+        assert_eq!(
+            hex::encode(hasher.finalize()),
+            hex::encode(honest.finalize()),
+            "forgotten state means the file is read, as it is after a restart"
+        );
     }
 }

@@ -1,12 +1,17 @@
 /**
  * The note list's empty states (Epic 37, UX-DR35/UX-DR37).
  *
- * Four states, and telling them apart is the whole job. "Nothing here" and
+ * Five states, and telling them apart is the whole job. "Nothing here" and
  * "nothing matches" look identical on screen and mean opposite things: the first
  * is an invitation to write, the second is an invitation to widen. Wording them
  * the same would leave someone staring at an empty vault wondering which of
  * their chips to remove, or at an over-filtered list wondering where their notes
  * went.
+ *
+ * A lens with nothing in it is a third thing again, and gets its own sentence
+ * for the same reason: told "no notes match these filters", someone who clicked
+ * Recordings goes looking for the filter they did not set. What is true is that
+ * the vault has no recording notes yet, and that says who writes them.
  *
  * Every state carries exactly one action, so the surface never dead-ends. None
  * of them is a toast: each is true for as long as it is true, and each is
@@ -14,8 +19,13 @@
  */
 import { Button } from "@/components/ui/button";
 
-/** Which of the four states the list is in. */
-export type NotesEmptyKind = "no-vault" | "empty-vault" | "no-matches" | "no-search-matches";
+/** Which of the five states the list is in. */
+export type NotesEmptyKind =
+  | "no-vault"
+  | "empty-vault"
+  | "no-recordings"
+  | "no-matches"
+  | "no-search-matches";
 
 /** The exact copy, kept verbatim from the experience spine. */
 const COPY: Record<NotesEmptyKind, { message: string; action: string }> = {
@@ -26,6 +36,10 @@ const COPY: Record<NotesEmptyKind, { message: string; action: string }> = {
   "empty-vault": {
     message: "This vault is empty. Write the first note.",
     action: "New Note",
+  },
+  "no-recordings": {
+    message: "No recording notes yet. keeper writes one each time a recording stops.",
+    action: "Show all notes",
   },
   "no-matches": {
     message: "No notes match these filters.",
@@ -43,18 +57,32 @@ const COPY: Record<NotesEmptyKind, { message: string; action: string }> = {
  * The chips stay on screen above this — they are not cleared to make room for
  * it — because the fastest way out of "nothing matches" is removing the one chip
  * that went too far, and that is only possible if the chips are still there.
+ *
+ * `detail` names the terms that are narrowing the list (Story 43.3). It is a
+ * second line rather than a longer message because it is the *changing* part:
+ * the sentence above it is a fixed fact about the state, and folding a live list
+ * of terms into it would make the copy unreadable at four chips. An exclusion is
+ * the term that needs it most — an inclusion that went too far leaves a list you
+ * can see is wrong, while an exclusion leaves the same empty pane whether it
+ * removed one note or nine hundred.
  */
 export function NotesEmptyState({
   kind,
+  detail,
   onAction,
 }: {
   kind: NotesEmptyKind;
+  /** The active terms, said in words; `null` when nothing is narrowing. */
+  detail?: string | null;
   onAction: () => void;
 }) {
   const { message, action } = COPY[kind];
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6">
       <p className="max-w-[36ch] text-center text-muted-foreground text-sm">{message}</p>
+      {detail !== null && detail !== undefined && (
+        <p className="max-w-[36ch] text-center text-muted-foreground text-xs">{detail}</p>
+      )}
       <Button type="button" variant="outline" size="sm" onClick={onAction}>
         {action}
       </Button>

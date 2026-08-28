@@ -17,12 +17,24 @@
  * because the trigger requires a tag character immediately after the `#`.
  * Escape closes the popup and leaves the literal `#` behind — a completion that
  * eats what you typed when you dismiss it is worse than no completion.
+ *
+ * Story 44.13: **which of those tags match what has been typed is no longer
+ * CodeMirror's opinion.** It used to be — this source handed over the whole
+ * vocabulary and let the library's fuzzy matcher narrow it, which meant `#ent`
+ * offered `client` on a substring hit in the middle of a segment, and it meant
+ * the editor and the tag chooser answered the same question two different ways.
+ * Both now ask `components/tags/tag-match.ts`, which matches the way the tag
+ * tree is shaped: at segment boundaries. `filter: false` is what hands the
+ * decision over, and it is why `validFor` is gone with it — a result that
+ * survives the next keystroke without re-querying is a result that never
+ * narrows once keeper is the one narrowing it.
  */
 import type {
   CompletionContext,
   CompletionResult,
   CompletionSource,
 } from "@codemirror/autocomplete";
+import { matchTags } from "@/components/tags/tag-match";
 import type { NoteTagNodeVm } from "@/lib/ipc/client";
 
 /** A `#` followed by tag characters, with the caret at the end. */
@@ -57,8 +69,8 @@ export function tagCompleteSource(tags: TagSource): CompletionSource {
     const all = await tags();
     return {
       from: opened.from + 1,
-      options: all.map((tag) => ({ label: tag, type: "keyword" })),
-      validFor: /^[\w/-]*$/,
+      options: matchTags(opened.text.slice(1), all).map((tag) => ({ label: tag, type: "keyword" })),
+      filter: false,
     };
   };
 }

@@ -13,10 +13,10 @@ import { createStore } from "zustand/vanilla";
  * Which primary window the shell renders: the Unified Inbox, the Archive, the
  * Bridges surface (Story 6.1), the Approval Pane (Story 7.3), the Recording
  * view (Story 16.3), the Recordings browser (Story 42.3), the Sync view (Story
- * 32.5), the Notes view (Story 37.1), or Settings. "inbox"/"archive" pick which
- * window the chat-list pane shows; "bridges", "approval", "recording",
- * "recordings", "sync", "notes" and "settings" each replace the chat-list +
- * conversation cluster entirely.
+ * 32.5), the Files tab (Story 43.8), the Notes view (Story 37.1), or Settings.
+ * "inbox"/"archive" pick which window the chat-list pane shows; "bridges",
+ * "approval", "recording", "recordings", "sync", "files", "notes" and
+ * "settings" each replace the chat-list + conversation cluster entirely.
  *
  * Settings joined this list rather than staying a dialog because it is a place
  * you go and stay, not a question you answer and dismiss — and a modal covers the
@@ -28,6 +28,12 @@ import { createStore } from "zustand/vanilla";
  * it a browser, and a browser buried under the capture settings is a browser
  * nobody opens. Both are gated on the same `recording` capability — a browser
  * for recordings you cannot make is a puzzle, not a surface.
+ *
+ * "files" is a sibling of "sync" for the same reason and rides the same `sync`
+ * capability: Sync answers "is this folder working", Files answers "what is in
+ * it", and folding the second into the first would bury a browser under a
+ * diagnostics pane. Where folder sync cannot run there is no synced folder to
+ * browse, so the entry is absent rather than empty.
  */
 export type PrimaryView =
   | "inbox"
@@ -37,7 +43,9 @@ export type PrimaryView =
   | "recording"
   | "recordings"
   | "sync"
+  | "files"
   | "notes"
+  | "sessions"
   | "settings";
 
 export interface PrimaryViewState {

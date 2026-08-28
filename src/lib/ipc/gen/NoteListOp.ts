@@ -8,8 +8,4 @@ import type { NoteRowVm } from "./NoteRowVm";
  * this is the same index-diff shape those three already established, and the
  * frontend applies it to a plain array by index without re-sorting.
  */
-export type NoteListOp = { "op": "reset", rows: Array<NoteRowVm>, 
-/**
- * Total matching notes behind the window.
- */
-total: number, } | { "op": "upsert", index: number, row: NoteRowVm, } | { "op": "remove", id: string, };
+export type NoteListOp = { "op": "reset", rows: Array<NoteRowVm>, } | { "op": "upsert", index: number, row: NoteRowVm, } | { "op": "remove", id: string, };

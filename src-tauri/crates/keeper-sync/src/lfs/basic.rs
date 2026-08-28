@@ -28,7 +28,7 @@
 
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -45,7 +45,7 @@ use crate::lfs::batch::{
     auth_challenge, bounded_body, header_string, json_headers, sensitive_auth, transport_reason,
     Action, AuthRefresh, Disposition, ObjectId, ObjectSpec, Operation, MAX_ERROR_BODY_BYTES,
 };
-use crate::lfs::store::LfsStore;
+use crate::lfs::store::{self, LfsStore};
 
 /// `lfs.concurrenttransfers` default (research §5.10).
 ///
@@ -573,20 +573,25 @@ impl BasicTransfer {
         // `chunk()` rather than `bytes_stream()`: consuming a `Stream` needs
         // `futures_util::StreamExt`, which this crate deliberately does not
         // depend on. Both poll one body frame at a time; neither buffers.
-        loop {
-            let chunk = response
-                .chunk()
-                .await
-                .map_err(|err| network(host, transport_reason(&err)))?;
+        // The loop BREAKS with its outcome rather than returning through `?`,
+        // because an interrupted transfer has something worth keeping: the
+        // hasher, primed with every byte that did reach the disk. Returning
+        // early drops it, and the next attempt then re-reads the whole partial
+        // to rebuild what this process already had — fourteen seconds, on a
+        // 970 MB partial, before it asks for a single new byte.
+        let interrupted: Option<SyncError> = loop {
+            let chunk = match response.chunk().await {
+                Ok(chunk) => chunk,
+                Err(err) => break Some(network(host, transport_reason(&err))),
+            };
             let Some(chunk) = chunk else {
-                break;
+                break None;
             };
             let bytes: &[u8] = &chunk;
             hasher.update(bytes);
-            writer
-                .write_all(bytes)
-                .await
-                .map_err(|err| SyncError::io("write lfs partial", &part, err))?;
+            if let Err(err) = writer.write_all(bytes).await {
+                break Some(SyncError::io("write lfs partial", &part, err));
+            }
             written += bytes.len() as u64;
             if coalescer.should_emit(Instant::now()) {
                 self.reporter.emit(TransferEvent::Progress {
@@ -594,12 +599,21 @@ impl BasicTransfer {
                     bytes_done: written,
                 });
             }
-        }
+        };
+
         writer
             .flush()
             .await
             .map_err(|err| SyncError::io("flush lfs partial", &part, err))?;
         drop(writer);
+
+        if let Some(err) = interrupted {
+            // Flushed first, deliberately: the remembered offset is only usable
+            // while it equals the file's length, so state saved ahead of the
+            // flush would be discarded by the very check that makes it safe.
+            store::remember_prefix(&spec.oid, written, &hasher);
+            return Err(err);
+        }
 
         let digest = hex::encode(hasher.finalize());
         if digest != spec.oid || written != spec.size {
@@ -607,6 +621,7 @@ impl BasicTransfer {
             // prefix we already know is poisoned would reproduce the same
             // mismatch on every subsequent attempt, forever.
             self.store.remove_partial(&spec.oid)?;
+            store::forget_prefix(&spec.oid);
             return Err(SyncError::Integrity {
                 subject: format!("lfs object {}", spec.oid),
                 expected: format!("{}/{}B", spec.oid, spec.size),
@@ -615,6 +630,7 @@ impl BasicTransfer {
         }
 
         // A rename; microseconds, so it stays on the reactor.
+        store::forget_prefix(&spec.oid);
         self.store.commit_partial(&spec.oid)
     }
 
@@ -663,20 +679,49 @@ impl BasicTransfer {
             // survives a future change of body type.
             headers.insert(CONTENT_LENGTH, HeaderValue::from(spec.size));
 
+            // What the watchdog below reads. The body is inside `reqwest` by
+            // the time anybody wants to ask it how far it has got.
+            let moved = Arc::new(AtomicU64::new(0));
             let body = reqwest::Body::wrap(SizedFileBody::new(
                 file,
                 spec.size,
                 spec.oid.clone(),
                 Arc::clone(&self.reporter),
+                Arc::clone(&moved),
             ));
-            let response = self
+            let sending = self
                 .client
                 .put(&action.href)
                 .headers(headers)
                 .body(body)
-                .send()
-                .await
-                .map_err(|err| network(host, transport_reason(&err)))?;
+                .send();
+            // The upload is guarded by PROGRESS, not by silence.
+            //
+            // While a body is being sent the server says nothing, because that
+            // is correct — so a read timeout is a duration cap wearing a
+            // silence costume, and an object that needs longer than the cap can
+            // never finish however good the link is. Eight objects on a real
+            // folder retried every 61 seconds for eighteen hours against a
+            // 60-second read timeout, and the sizes never mattered.
+            //
+            // This asks the only question that distinguishes a slow upload from
+            // a dead one: did any byte move in the last window?
+            tokio::pin!(sending);
+            let mut last_seen = 0u64;
+            let response = loop {
+                tokio::select! {
+                    finished = &mut sending => {
+                        break finished.map_err(|err| network(host, transport_reason(&err)))?;
+                    }
+                    () = tokio::time::sleep(UPLOAD_STALL_WINDOW) => {
+                        let now = moved.load(Ordering::Relaxed);
+                        if now == last_seen {
+                            return Err(network(host, "the upload stopped moving"));
+                        }
+                        last_seen = now;
+                    }
+                }
+            };
 
             let status = response.status().as_u16();
             let retry_after = header_string(response.headers(), "retry-after");
@@ -971,6 +1016,19 @@ pub fn parse_content_range_start(value: &str) -> Option<u64> {
 ///
 /// Reads go through `tokio::fs`, so a multi-gigabyte upload never blocks the
 /// reactor inside `poll_frame`.
+/// How long an upload may make no progress at all before it is a failure.
+///
+/// The guard on an upload is that BYTES ARE MOVING, not that the socket is
+/// talking: while the client sends a body the server is silent because that is
+/// correct, so silence says nothing. A read timeout asked the wrong question and
+/// answered it every sixty seconds — see `http::TRANSFER_READ_TIMEOUT`.
+///
+/// Ninety seconds rather than something tighter because a file on a slow or
+/// sleeping external disk can genuinely take a while to yield its next chunk,
+/// and turning that into a failure would trade a rare hang for a retry storm on
+/// exactly the folders this matters for.
+pub const UPLOAD_STALL_WINDOW: Duration = Duration::from_secs(90);
+
 struct SizedFileBody {
     file: tokio::fs::File,
     /// Bytes still to send. Also the `size_hint`, which is what the trait's
@@ -978,19 +1036,29 @@ struct SizedFileBody {
     remaining: u64,
     buf: bytes::BytesMut,
     sent: u64,
+    /// The same figure the watchdog reads. Shared rather than returned, because
+    /// the body is inside `reqwest` by the time anybody wants to ask.
+    moved: Arc<AtomicU64>,
     oid: String,
     reporter: Arc<Reporter>,
     coalescer: ProgressCoalescer,
 }
 
 impl SizedFileBody {
-    fn new(file: tokio::fs::File, size: u64, oid: String, reporter: Arc<Reporter>) -> Self {
+    fn new(
+        file: tokio::fs::File,
+        size: u64,
+        oid: String,
+        reporter: Arc<Reporter>,
+        moved: Arc<AtomicU64>,
+    ) -> Self {
         let coalescer = reporter.coalescer();
         Self {
             file,
             remaining: size,
             buf: bytes::BytesMut::with_capacity(CHUNK_BYTES),
             sent: 0,
+            moved,
             oid,
             reporter,
             coalescer,
@@ -1040,6 +1108,9 @@ impl http_body::Body for SizedFileBody {
 
         this.remaining -= filled as u64;
         this.sent += filled as u64;
+        // Every chunk, not every progress event: the coalescer exists to keep
+        // the UI quiet and the watchdog needs the truth.
+        this.moved.store(this.sent, Ordering::Relaxed);
         if this.coalescer.should_emit(Instant::now()) {
             this.reporter.emit(TransferEvent::Progress {
                 oid: this.oid.clone(),
@@ -1445,6 +1516,7 @@ mod tests {
                 detached: AtomicBool::new(false),
                 interval: DEFAULT_PROGRESS_INTERVAL,
             }),
+            Arc::new(AtomicU64::new(0)),
         );
 
         // This is what reqwest reads to set `Content-Length`; without it hyper
@@ -1492,6 +1564,7 @@ mod tests {
                 detached: AtomicBool::new(false),
                 interval: DEFAULT_PROGRESS_INTERVAL,
             }),
+            Arc::new(AtomicU64::new(0)),
         );
 
         let mut last = None;

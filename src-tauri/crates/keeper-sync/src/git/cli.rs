@@ -436,6 +436,14 @@ fn capture(
     args: &[String],
     credential: Option<&Credential>,
 ) -> Result<Output> {
+    // Prepended rather than passed through: `-c` only counts before the
+    // subcommand, and hardening a call site can forget is not hardening.
+    let args: Vec<String> = repository_config_args(cwd)
+        .into_iter()
+        .chain(args.iter().cloned())
+        .collect();
+    let args = args.as_slice();
+
     let mut command = Command::new(program);
     if let Some(credential) = credential {
         // Read back only by `CREDENTIAL_HELPER`, which git spawns as a child of
@@ -498,6 +506,57 @@ fn capture(
 /// Leaving those in place is what lets a push authenticate as an unrelated
 /// account that happens to be stored for the same host, which fails per
 /// repository depending on that account's access and never says why.
+/// A `core.hooksPath` that can never be a directory, so git finds no hook to
+/// run and says nothing about it.
+///
+/// `/dev/null` is a character device, so every lookup below it fails with
+/// `ENOTDIR` rather than merely being absent — which matters, because an
+/// *absent* path is one a user or another process could later create, and this
+/// value ends up on the command line of a process that writes to their
+/// repository. The Windows spelling of the same trick is the `NUL` device.
+#[cfg(not(windows))]
+const NO_HOOKS_PATH: &str = "/dev/null/keeper-runs-no-repository-hooks";
+#[cfg(windows)]
+const NO_HOOKS_PATH: &str = r"NUL\keeper-runs-no-repository-hooks";
+
+/// The `-c` settings every invocation *inside a repository* carries.
+///
+/// # Repository hooks are never run
+///
+/// keeper commits, merges and checks out through gitoxide, which has no hook
+/// support at all — so for the whole write half of the engine the user's hooks
+/// have never run. The four things the shim exists for (AD-41) are the only
+/// operations that could still fire one, and firing one there would make the
+/// engine's behaviour depend on which half of itself did the work.
+///
+/// The failure that made this load-bearing is not hypothetical. A `git lfs
+/// install` run by hand inside a synced folder writes stock `pre-push`,
+/// `post-checkout`, `post-commit` and `post-merge` hooks, and every one of them
+/// begins by refusing to run unless `git-lfs` is on `PATH`. keeper *is* the LFS
+/// implementation for a folder it manages — it registers its own
+/// `filter.lfs.clean`/`smudge`, uploads through its own journal and prunes
+/// local objects it has already replicated — so those hooks are wrong even when
+/// git-lfs is installed: `git lfs pre-push` walks a store keeper has
+/// deliberately emptied. On a desktop launch, where `PATH` is Finder's rather
+/// than a shell's, they simply made every push fail with a message about a
+/// binary keeper never needed.
+///
+/// A user's own hooks are silenced too, and that is the intended reading: an
+/// unattended engine converging a folder in the background is not the event a
+/// `pre-push` was written to gate. Nothing keeper does depends on a hook, so
+/// there is no case in which running one is required and every case in which
+/// running one is a surprise.
+///
+/// `cwd` gates this because it is exactly the "are we in a repository" question:
+/// [`version_detail`] probes a binary with no repository in sight, and a `-c`
+/// on that call would only make the diagnostic vector harder to read.
+fn repository_config_args(cwd: Option<&Path>) -> Vec<String> {
+    if cwd.is_none() {
+        return Vec::new();
+    }
+    vec!["-c".to_owned(), format!("core.hooksPath={NO_HOOKS_PATH}")]
+}
+
 fn credential_config_args(credential: Option<&Credential>) -> Vec<String> {
     let mut args = vec!["-c".to_owned(), "credential.helper=".to_owned()];
     if credential.is_some() {
@@ -614,10 +673,29 @@ fn merge_ff_only_args(reference: &str) -> Result<Vec<String>> {
     ])
 }
 
-/// `git merge -X theirs <ref>` argument vector.
+/// `git merge -X theirs -X no-renames <ref>` argument vector.
 ///
 /// `--no-edit` and an explicit `-m` keep git from opening an editor, which
 /// would hang a headless daemon forever.
+///
+/// # Rename detection is off, and that is what keeps the folder syncing
+///
+/// A rename is a delete plus an add of the same bytes, and keeper reconciles
+/// machine-generated trees where nobody is going to read a rename as such: the
+/// content is identical either way, and `-X theirs` already decides every
+/// content conflict. What detection does add is a failure mode. Above
+/// `merge.renameLimit` git gives up on it — "exhaustive rename detection was
+/// skipped due to too many files" — and the fallback turns one side's
+/// reorganization into rename/delete conflicts, one per path. Measured on the
+/// folder that reported it, a housekeeping pass that moved 128,483 files out of
+/// an inbox produced **138,311 unmerged paths** and `fatal: Exiting because of
+/// an unresolved conflict`: an unattended engine cannot resolve that, so the
+/// profile stopped syncing entirely and sat at "Idle · N waiting to sync" while
+/// the queue behind it never moved.
+///
+/// With detection off the same pass merges cleanly — our deletion of the old
+/// path and their addition of the new one are independent edits — and it is
+/// also markedly faster, because the O(n²) similarity search never runs.
 fn merge_theirs_args(reference: &str, message: &str) -> Result<Vec<String>> {
     Ok(vec![
         "merge".to_owned(),
@@ -632,6 +710,8 @@ fn merge_theirs_args(reference: &str, message: &str) -> Result<Vec<String>> {
         "ort".to_owned(),
         "-X".to_owned(),
         "theirs".to_owned(),
+        "-X".to_owned(),
+        "no-renames".to_owned(),
         "-m".to_owned(),
         // Passed verbatim, newlines and all. The message is a single argv
         // element handed to git without a shell, so a newline cannot start
@@ -880,7 +960,16 @@ pub(crate) fn classify_message(
     if DIVERGED.iter().any(|needle| lower.contains(needle)) {
         return Some(SyncError::Diverged {
             profile: label.to_owned(),
-            reason: first_line(text),
+            // Every line, not the first one. `git push` leads with "error:
+            // failed to push some refs to '<url>'" — a summary naming the
+            // remote and nothing else — and puts the reason underneath, or on
+            // stdout under `--porcelain`. Reporting only the summary made every
+            // rejected push in the field read identically whatever had
+            // happened, telling the reader the one thing they already knew
+            // (DW-207). This is the case [`one_line`] was written for: line one
+            // is the symptom, line two is the cause, and a settings row shows
+            // one line — so they are joined rather than chosen between.
+            reason: one_line(text),
         });
     }
 
@@ -1025,6 +1114,73 @@ mod tests {
         );
     }
 
+    /// One side moving a file while the other deletes it must MERGE, not stop.
+    ///
+    /// This is the shape a housekeeping pass takes: a script moves files out of
+    /// an inbox and publishes the moves through a branch, while the local clone
+    /// records only the removals. With rename detection on, git calls every one
+    /// of those a rename/delete conflict — 138,311 of them on the folder that
+    /// reported this — and an unattended engine has nothing to resolve them
+    /// with, so the profile stops syncing. Driven through the real `git`, not
+    /// asserted on the argument vector: the vector proves the flag is passed,
+    /// and only git proves the flag is the right one.
+    #[test]
+    fn a_file_the_remote_moved_and_we_deleted_merges_instead_of_conflicting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(root.join("inbox")).expect("mkdir");
+        std::fs::write(root.join("inbox/report.pdf"), b"the same bytes either way").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+
+        // Their side: the housekeeping move, on a branch standing in for the
+        // remote.
+        git(&["checkout", "-q", "-b", "remote"]);
+        std::fs::create_dir_all(root.join("records")).expect("mkdir");
+        std::fs::rename(
+            root.join("inbox/report.pdf"),
+            root.join("records/report.pdf"),
+        )
+        .expect("move");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "move it out of the inbox"]);
+
+        // Our side: the same removal, and nothing else.
+        git(&["checkout", "-q", "main"]);
+        std::fs::remove_file(root.join("inbox/report.pdf")).expect("delete");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "the drop is empty"]);
+
+        GitCli::new(PathBuf::from("git"))
+            .merge_theirs(root, "refs/heads/remote", "sync: merge remote changes\n")
+            .expect("a move on one side and a delete on the other is not a conflict");
+        assert!(
+            root.join("records/report.pdf").is_file(),
+            "the destination the remote published has to land here"
+        );
+        assert!(
+            !root.join("inbox/report.pdf").exists(),
+            "and the emptied inbox stays empty"
+        );
+    }
+
     #[test]
     fn the_inherited_credential_helper_chain_is_always_cleared() {
         // Without the reset, git falls through to the user's own helpers and a
@@ -1049,6 +1205,29 @@ mod tests {
         );
         assert_eq!(args.len(), 4);
         assert!(args[3].starts_with("credential.helper=!"));
+    }
+
+    #[test]
+    fn a_repository_invocation_always_disables_hooks() {
+        // A `git lfs install` run by hand in a synced folder leaves hooks that
+        // refuse to run without git-lfs on PATH, which is how a desktop launch
+        // lost every push. Nothing keeper does needs a hook, so none run.
+        let args = repository_config_args(Some(Path::new("/w/folder")));
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-c");
+        assert!(
+            args[1].starts_with("core.hooksPath="),
+            "the hook path must be overridden, got {}",
+            args[1]
+        );
+        assert!(
+            !Path::new(args[1].trim_start_matches("core.hooksPath=")).is_dir(),
+            "the sentinel must not be a directory anything could put a hook in"
+        );
+
+        // Probing a binary is not repository work, and a `-c` there would only
+        // clutter the one diagnostic that gets read by a human.
+        assert!(repository_config_args(None).is_empty());
     }
 
     #[test]
@@ -1247,6 +1426,40 @@ mod tests {
         .expect("classified");
         match err {
             SyncError::Diverged { profile, .. } => assert_eq!(profile, "tgdrive"),
+            other => panic!("expected Diverged, got {other:?}"),
+        }
+    }
+
+    /// What the field actually shows, and why it showed nothing useful.
+    ///
+    /// `git push --porcelain` puts its rejection on stdout and leads stderr
+    /// with a summary naming only the remote. keeper concatenates the two, so
+    /// the *first* line is that summary — and reporting it meant every rejected
+    /// push read "error: failed to push some refs to '<url>'" whatever had
+    /// happened, which is the one thing the reader already knew (DW-207).
+    #[test]
+    fn a_rejection_is_reported_by_the_line_that_says_why() {
+        let err = classify_message(
+            "error: failed to push some refs to 'https://forge.example.com/o/r.git'\n\
+             To https://forge.example.com/o/r.git\n\
+             !\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\n\
+             Done",
+            "neuradrive",
+            None,
+            &[],
+        )
+        .expect("classified");
+        match err {
+            SyncError::Diverged { reason, .. } => {
+                assert!(
+                    reason.contains("fetch first"),
+                    "the line that diagnoses it has to reach the reader: {reason}"
+                );
+                assert!(
+                    reason.contains("failed to push some refs"),
+                    "and so does git's own account of what was refused: {reason}"
+                );
+            }
             other => panic!("expected Diverged, got {other:?}"),
         }
     }

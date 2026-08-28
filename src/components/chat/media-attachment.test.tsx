@@ -53,7 +53,13 @@ describe("MediaAttachment", () => {
           thumbnailUrl: null,
           filename: "report.pdf",
           mimetype: "application/pdf",
-          size: 1048576,
+          // 1 500 000 bytes rather than 1 048 576, because the old value could
+          // not tell the two bases apart: this component divided by 1024 and
+          // printed "MB", so a mebibyte came out as "1.0 MB" — the right string
+          // by coincidence. 1 500 000 is "1.5 MB" decimal and "1.4 MB" binary,
+          // so the assertion below now fails if the divisor ever goes back
+          // (Story 45.5, FR-178).
+          size: 1_500_000,
           width: null,
           height: null,
         })}
@@ -61,8 +67,8 @@ describe("MediaAttachment", () => {
       />,
     );
     expect(screen.getByText("report.pdf")).toBeInTheDocument();
-    // 1 MiB rendered as a human size.
-    expect(screen.getByText(/1\.0 MB/)).toBeInTheDocument();
+    // Decimal, from the one formatter: keeper's number equals Finder's number.
+    expect(screen.getByText(/1\.5 MB/)).toBeInTheDocument();
   });
 
   it("renders an inline audio element from the full protocol url", () => {

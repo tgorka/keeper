@@ -59,9 +59,14 @@ function CommandInput({
   className,
   ...props
 }: React.ComponentProps<typeof CommandPrimitive.Input>) {
+  // No bespoke surface on this one. It carried `border-input/30 bg-input/30` — a
+  // faded copy of the field chrome every other InputGroup wears, painted at an
+  // opacity that matched no token in either theme. The palette's quiet is
+  // supplied by its tokens; a second, dimmer version of a field is just a field
+  // that looks slightly wrong. Size and radius only.
   return (
     <div data-slot="command-input-wrapper" className="p-1 pb-0">
-      <InputGroup className="h-8! rounded-lg! border-input/30 bg-input/30 shadow-none! *:data-[slot=input-group-addon]:pl-2!">
+      <InputGroup className="h-8! rounded-lg! *:data-[slot=input-group-addon]:pl-2!">
         <CommandPrimitive.Input
           data-slot="command-input"
           className={cn(
@@ -158,7 +163,7 @@ function CommandShortcut({ className, ...props }: React.ComponentProps<"span">) 
     <span
       data-slot="command-shortcut"
       className={cn(
-        "ml-auto text-xs tracking-widest text-muted-foreground group-data-selected/command-item:text-foreground",
+        "ml-auto text-xs text-muted-foreground group-data-selected/command-item:text-foreground",
         className,
       )}
       {...props}

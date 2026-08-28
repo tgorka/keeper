@@ -74,3 +74,38 @@ describe("recording palette handlers (Story 20.4)", () => {
     await expect(dispatchPaletteAction("recording-open-folder", null)).resolves.toBeUndefined();
   });
 });
+
+describe("the Recordings archive entry (Story 45.20, FR-198)", () => {
+  it("opens the archive, and not the capture surface", () => {
+    // Two ids, two views, and the second assertion is the one that matters: the
+    // reported gap was that the menu could open capture and not the archive, so
+    // a handler that quietly resolved to "recording" would look wired and fix
+    // nothing.
+    expect(paletteActionHandlers["open-recordings"], "handler").toBeTypeOf("function");
+
+    void dispatchPaletteAction("open-recordings", null);
+    expect(primaryViewStore.getState().view).toBe("recordings");
+
+    void dispatchPaletteAction("open-recording", null);
+    expect(primaryViewStore.getState().view).toBe("recording");
+
+    void dispatchPaletteAction("open-recordings", null);
+    expect(primaryViewStore.getState().view).toBe("recordings");
+  });
+
+  it("registers a handler for every navigation id the Rust registry ships", () => {
+    // The registry is in Rust and this map is in TypeScript; nothing but this
+    // list joins them, and an id with no handler is a menu item that logs a
+    // warning and does nothing. Every Navigation id, spelled out.
+    for (const id of [
+      "open-inbox",
+      "open-archive",
+      "open-approval",
+      "open-bridges",
+      "open-recording",
+      "open-recordings",
+    ]) {
+      expect(paletteActionHandlers[id], `handler for ${id}`).toBeTypeOf("function");
+    }
+  });
+});

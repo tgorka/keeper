@@ -22,6 +22,17 @@ export type NoteBodyBatch = { "kind": "reset",
  */
 rev: string, 
 /**
+ * The note's vault-relative path.
+ *
+ * **Added by Story 45.18, and the absence it replaces was load-bearing.**
+ * `path` reached the editor only through `Renamed` or a completed save,
+ * so a note that was merely OPENED had none until its first autosave —
+ * which left the header's path caption blank on open, and would have
+ * left 45.18's "Show in Files" absent for exactly the case it exists
+ * for. The value is in hand here anyway; not sending it was the gap.
+ */
+path: string, 
+/**
  * The `---` block verbatim — fences and trailing newline included — or
  * empty when the note has none.
  */

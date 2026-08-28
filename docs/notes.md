@@ -113,6 +113,71 @@ A query that does not parse **matches nothing** and says why, with the offending
 underlined. It never falls back to matching everything — a space is a surface people run bulk
 actions from.
 
+The chip editor above the results is the query, not a picture of it: every predicate above
+round-trips through it, including `field:status=open`, which for a while parsed but could
+only be edited as text. A chip that cannot represent a term truthfully — an ordered
+comparison like `field:priority>=3` — says so and leaves you the text field, because a chip
+that silently widened `>=` to `=` would be worse than no chip.
+
+## Widgets in a note
+
+Three blocks turn a note into a small application over its own vault:
+
+```markdown
+> [!board] tag:project/keeper
+> [!log] tag:project/keeper
+> [!refs]
+```
+
+`board` is four columns — in preparation, to do, done, deferred — over the notes the query
+selects; dragging a card writes `status:` and a fractional `order:` into that one note and
+touches nothing else. `log` folds the matching notes newest-first. `refs` lists what the
+note points at, with the same six kinds and the same missing-first ordering the sessions
+surface uses.
+
+They are **callouts, not fenced blocks**. A note carrying one opens in Obsidian, on GitHub
+or in `cat` as a labelled quote — degraded, but still readable prose. A fence would have
+made it a wall of grey source everywhere but here, and a note that only makes sense inside
+keeper is a note keeper has taken hostage.
+
+Sessions use all three, but nothing about them is session-specific: a board is a widget
+that happens to be useful in a session, not a session feature that leaked.
+
+## The writing tools
+
+Three affordances sit over the note body: the **format toolbar** above it, the `/`
+**command menu** at the start of an empty line, and `:shortcode:` **emoji** — either
+picked from the menu or typed straight through, where the closing colon turns `:tada:`
+into 🎉.
+
+Since Story 50.3 those three are not the note editor's private property. They live in one
+module, and keeper's file editor imports the same one — so a markdown file opened from
+Files or from a session has the same toolbar, the same `/` commands and the same emoji, to
+the byte. A second copy would have been a second set of behaviours nobody noticed drifting
+apart.
+
+What stayed here is what needs a **vault**: wikilink and tag completion, `![[…]]` embeds
+and the CSV table are all addressed by a vault plus a vault-relative path, and a file
+outside a vault has neither.
+
+**Live preview did not stay.** This paragraph used to say it had, because a note autosaves
+against a subscription and a file is saved by hand — but that is a fact about *saving*,
+not about *rendering*. Since Story 51.5 a markdown file has a third tab, **Note**, and it
+is this same live-preview layer over the file's own buffer: rendered as you type, in Files
+and in a session exactly as in a note. The distinction the old sentence was protecting is
+intact, because it was never about the renderer — a note saves itself, and Note mode over
+a file writes when you press `⌘S` or Save and at no other moment. One renderer, two save
+contracts, and neither surface borrowed the other's.
+
+## Finding text
+
+`⌘F` finds inside the note you have open — the editor's own find, so it reaches text below
+the fold that the rendered view has not drawn yet, and `Enter`/`⇧Enter` walk the hits.
+
+`⌘⇧F` searches everything at once: messages, notes and session files. It was the chat
+search shortcut and is now the search shortcut; a person who wants to find a sentence
+rarely remembers which surface they wrote it on.
+
 ## Capture
 
 The point of the feature. A global hotkey raises a panel, you type, you press Escape, and the

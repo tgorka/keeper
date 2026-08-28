@@ -35,15 +35,24 @@
 //!   copies, never a modal ([`git::conflict`]).
 //! * **An absent volume is never a deletion** ([`volume`]).
 
+pub mod anomaly;
 pub mod backoff;
+pub mod browse;
 pub mod copy;
 pub mod credential;
 pub mod db;
 pub mod engine;
 pub mod error;
 pub mod exclude;
+pub mod export;
+pub mod file_serve;
+pub mod files_write;
+pub mod footprint;
 pub mod git;
+pub mod http;
 pub mod lfs;
+pub mod names;
+pub mod openfiles;
 pub mod platform;
 pub mod profile;
 pub mod progress;
@@ -54,7 +63,8 @@ pub mod volume;
 pub mod watch;
 
 pub use copy::{
-    copy_verified, CopyEntry, CopyOptions, CopyOutcome, CopyProgress, CopyReport, CopySink,
+    copy_verified, ContentSource, CopyEntry, CopyOptions, CopyOutcome, CopyProgress, CopyReport,
+    CopySink,
 };
 pub use credential::AccessToken;
 pub use db::{ActivityEntry, ActivityKind, ActivityRow, DeliveryState};
@@ -64,6 +74,7 @@ pub use engine::{
 };
 pub use error::{Result, SyncError};
 pub use git::resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};
+pub use names::{ForDisplay, UnspellableName};
 pub use platform::SyncPlatform;
 pub use profile::{ProfileState, SyncDirection, SyncLane, SyncProfile};
 pub use progress::{SyncPhase, SyncProgress, SyncStatus};

@@ -10,7 +10,7 @@
 # ─────────────────────────────────────────────────────────────────
 
 [core]
-user_name = "Dev"
+user_name = "Tomasz Gorka"
 communication_language = "English"
 
 [modules.bmm]

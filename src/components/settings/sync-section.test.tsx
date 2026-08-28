@@ -25,7 +25,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncActivity: vi.fn(() => Promise.resolve([])),
   syncPending: vi.fn(() => Promise.resolve([])),
   syncProblems: vi.fn(() =>
-    Promise.resolve({ warning: null, error: null, parked: [], conflicts: [] }),
+    Promise.resolve({ warning: null, error: null, parked: [], conflicts: [], unspellable: [] }),
   ),
 }));
 
@@ -134,6 +134,10 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     commitSubjectTemplate: "",
     notes: false,
     notesSubfolder: null,
+    recordings: false,
+    recordingsSubfolder: "recordings",
+    sessions: false,
+    sessionsSubfolder: "60-sessions",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -147,6 +151,8 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     state: "watching",
     phase: "idle",
     line: RUST_LINE,
+    queuedFiles: 0,
+    queuedBytes: 0,
     filesDone: 0,
     filesTotal: null,
     bytesDone: 0,
@@ -236,6 +242,7 @@ describe("SyncSection profile rows", () => {
       pulled: true,
       filesChanged: 0,
       conflicts: [],
+      stale: [],
       bytes: 0,
       line: "Nothing to sync — this folder already matches the remote.",
       ...over,
@@ -572,6 +579,13 @@ describe("SyncSection add-profile form", () => {
         commitSubjectTemplate: "",
         notes: false,
         notesSubfolder: null,
+        // The recordings switch is off and untouched, so the save says "this
+        // folder holds none" and names no subfolder at all (Story 41.7). The
+        // sessions switch follows the same rule (FR-222).
+        recordings: false,
+        recordingsSubfolder: null,
+        sessions: false,
+        sessionsSubfolder: null,
       }),
     );
     // Nothing was typed into the token field, so the keychain was left alone.
@@ -757,7 +771,11 @@ describe("DeviceSection (Story 34.5)", () => {
     const field = await screen.findByLabelText(SYNC_DEVICE_NAME_LABEL);
     expect(field).toHaveValue("hesperia");
     // The id is in every trailer, so someone reading `git log` can find it here.
-    expect(screen.getByText(`${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`)).toBeInTheDocument();
+    // Asserted through the line rather than as one text node: the id is its own
+    // element (it is set in the mono face and the label beside it is not).
+    expect(screen.getByText("01JDEVICE").closest("p")).toHaveTextContent(
+      `${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`,
+    );
   });
 
   it("renames on request, keeps the id, and says the change is for later commits", async () => {
@@ -778,7 +796,9 @@ describe("DeviceSection (Story 34.5)", () => {
       expect(screen.getByLabelText(SYNC_DEVICE_NAME_LABEL)).toHaveValue("Studio Mac"),
     );
     expect(screen.getByText(SYNC_DEVICE_SAVED_SENTENCE)).toBeInTheDocument();
-    expect(screen.getByText(`${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`)).toBeInTheDocument();
+    expect(screen.getByText("01JDEVICE").closest("p")).toHaveTextContent(
+      `${SYNC_DEVICE_ID_LABEL}: 01JDEVICE`,
+    );
   });
 
   it("reports a refused rename instead of showing a name nothing will use", async () => {

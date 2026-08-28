@@ -26,12 +26,35 @@
  *     another vault and the note is still open when you come back. A vault
  *     switch is a filter that happens to be wide.
  *
- * The one row in the column that is NOT a filter is Today: it opens or creates
- * today's journal entry (FR-99), which is an action on one note.
+ * **Every row in the column is a space, a tag or a folder** (Story 44.3,
+ * AD-79). There is no fixed rail above them: Inbox, Journal, Pinned and
+ * Recordings are seeded notes under `spaces/`, listed by {@link SpaceList} with
+ * every other space, editable and deleteable like every other space. Today is
+ * gone (AD-80) — it never filtered anything, and opening today's journal entry
+ * is still `⌘⌥J`, the tray and the palette.
+ *
+ * **A note can be created from the column** (Story 44.6, FR-160). Two places,
+ * and they mean different things: the button at the head of the column makes a
+ * note in the vault, and the `+` on a space row makes a note *that space will
+ * list* — which is a promise about where it turns up, so Rust reads the
+ * space's query and gives the note the tags, folder and flags it needs. When it
+ * cannot, the create still happens and the sentence Rust composed is shown
+ * above the list. Nothing here parses a query; the surface sends a space id.
  */
-import { CalendarDays, Inbox, NotebookPen, Pin } from "lucide-react";
+import {
+  FilePlus,
+  FilterX,
+  Folder,
+  Layers,
+  NotebookPen,
+  NotebookText,
+  Search,
+  Tags,
+} from "lucide-react";
 import { type KeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
-import { NoteEditor } from "@/components/notes/note-editor";
+import { PanelStrip } from "@/components/layout/panel-strip";
+import { type SurfaceRail, useSurfaceColumn } from "@/components/layout/surface-column";
+import { NoteDeleteDialog } from "@/components/notes/note-delete-dialog";
 import { NoteFilterBar } from "@/components/notes/note-filter-bar";
 import { NoteList } from "@/components/notes/note-list";
 import { type NotesEmptyKind, NotesEmptyState } from "@/components/notes/notes-empty-state";
@@ -39,67 +62,131 @@ import { PhysicalTree } from "@/components/notes/physical-tree";
 import { SpaceList } from "@/components/notes/space-list";
 import { TagTree } from "@/components/notes/tag-tree";
 import { VaultSwitcher } from "@/components/notes/vault-switcher";
-import { Button } from "@/components/ui/button";
-import {
-  createNote,
-  openJournalToday,
-  saveFilterAsSpace,
-  useNotesActions,
-} from "@/hooks/use-notes-actions";
+import { createNote, saveFilterAsSpace, useNotesActions } from "@/hooks/use-notes-actions";
 import { useNotesChanges } from "@/hooks/use-notes-changes";
+import { countLabel, NOTES } from "@/lib/count-label";
 import type { NoteRowVm } from "@/lib/ipc/client";
+import { columnFoldStore } from "@/lib/stores/column-fold";
 import {
+  emptyFilterReason,
   isFiltered,
-  type NoteScope,
+  isScopeOnly,
   notesFiltersStore,
   scopeLabel,
   useNotesFiltersStore,
 } from "@/lib/stores/notes-filters";
 import { notesListStore, useNotesListStore } from "@/lib/stores/notes-list";
 import {
+  hydrateNotesRailFold,
+  type NotesRailGroup,
+  notesRailFoldStore,
+  useNotesRailFold,
+} from "@/lib/stores/notes-rail-fold";
+import {
   ensureNotesVaultsHydrated,
   useActiveVault,
   useNotesVaultsStore,
 } from "@/lib/stores/notes-vaults";
+import { activePanel, panelsStore, usePanelsStore } from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
-/** The scope rows above the data-driven groups, in the order the spine fixes. */
-const SCOPE_ROWS: { scope: NoteScope; label: string; icon: typeof Inbox }[] = [
-  { scope: { kind: "inbox" }, label: "Inbox", icon: Inbox },
-  { scope: { kind: "journal" }, label: "Journal", icon: CalendarDays },
-  { scope: { kind: "pinned" }, label: "Pinned", icon: Pin },
-];
-
 /** What a failed verb reads as when the rejection carries no message. */
 const NOTES_ACTION_FAILED = "keeper could not do that to this note.";
 
+/**
+ * What the folded list column's way into the notes reads as, and the carrier of
+ * the count while the list itself is unmounted. Not the column's own name —
+ * "Expand note list" is the fold; this is the notes.
+ */
+export const NOTES_RAIL_LIST_LABEL = "Note list";
+
 /** The name a saved space gets when it is promoted from the chip bar. */
 export const UNTITLED_SPACE_NAME = "Saved filter";
+
+/** The rail's create control, kept verbatim so a test names what a user reads. */
+export const NEW_NOTE_LABEL = "New note";
+
+/**
+ * Test id for the line that says how many notes this lens holds (Story 44.11).
+ * A slot rather than a text match, so a test asserts the NUMBER rather than
+ * re-deriving the sentence the label module composes.
+ */
+export const NOTES_COUNT_SLOT = "notes-count";
+
+/**
+ * Test id for a sentence Rust composed about a create it could not fully
+ * honour (Story 44.6). A slot rather than a text match, because the wording is
+ * Rust's and asserting it here would put a second copy of the sentence in the
+ * language that cannot produce it.
+ */
+export const NOTES_NOTICE_SLOT = "notes-create-notice";
+
+/**
+ * What an empty panel says on the Notes surface (Story 46.12).
+ *
+ * `PanelStrip`'s own default names the gesture that fills a panel in Files —
+ * "Click a file to open it" — and beside a list of notes that is an instruction
+ * to do something this surface does not offer. The sentence is the first thing
+ * a fresh keeper shows on this tab, so it is the one place where naming the
+ * wrong noun is most expensive.
+ */
+export const NOTES_PANEL_EMPTY_SENTENCE = "Nothing is open here yet. Click a note to open it.";
 
 export function NotesPane() {
   const vaults = useNotesVaultsStore((s) => s.vaults);
   const activeVaultId = useNotesVaultsStore((s) => s.activeVaultId);
   const activeVault = useActiveVault();
   const scope = useNotesFiltersStore((s) => s.scope);
-  const tags = useNotesFiltersStore((s) => s.tags);
+  const tagTerms = useNotesFiltersStore((s) => s.tagTerms);
   const searchText = useNotesFiltersStore((s) => s.text);
   const agentOnly = useNotesFiltersStore((s) => s.agentOnly);
   const filtered = useNotesFiltersStore(isFiltered);
+  // A string, so subscribing to it re-renders on value rather than on identity.
+  const filterReason = useNotesFiltersStore(emptyFilterReason);
+  const scopeOnly = useNotesFiltersStore(isScopeOnly);
   const searchNonce = useNotesFiltersStore((s) => s.searchNonce);
   const rows = useNotesListStore((s) => s.rows);
   const total = useNotesListStore((s) => s.total);
+  const matched = useNotesListStore((s) => s.matched);
   const loaded = useNotesListStore((s) => s.loaded);
-  const selected = useNotesListStore((s) => s.selected);
+  // Which rail sections are folded (Story 47.3). Read here so the folded
+  // COLUMN's rail can open the section it names: unfolding the column into a
+  // section the user left folded would be a control that lands you nowhere.
+  const railGroups = useNotesRailFold((s) => s.groups);
+  // The note this pane is showing: the active panel's target, when it is a note.
+  const activeNote = usePanelsStore((s) => {
+    const active = activePanel(s);
+    return active.target?.kind === "note" ? active.target : null;
+  });
   const actions = useNotesActions(activeVaultId);
   const searchRef = useRef<HTMLInputElement | null>(null);
   // A verb's failure belongs to the surface that asked for it, so it is shown
   // here rather than swallowed or pushed into the read mirror.
   const [actionError, setActionError] = useState<string | null>(null);
+  // What Rust had to say about a create that succeeded and still did not do
+  // what was asked — a note in a space whose query no new note can satisfy.
+  // Separate from `actionError` because it is not a failure: the note exists,
+  // and rendering it as an error would send someone looking for a broken write.
+  const [notices, setNotices] = useState<string[]>([]);
+  // The row a confirmation is open for. The id alone, not the row: the list
+  // re-streams constantly, and a held row object would keep a stale title on
+  // screen while the dialog names what it is about to delete.
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   useEffect(() => {
     void ensureNotesVaultsHydrated();
+  }, []);
+
+  // Restore which rail sections were folded (Story 47.3). Here and not in
+  // `AppShell`, unlike the chat sidebar's fold: Spaces, Tags and Files render
+  // nowhere but this pane, and this pane is unmounted whenever another primary
+  // view is showing. Idempotent, so the double-invoked development effect and
+  // every later remount restore exactly once and never overwrite a fold the
+  // user has changed since.
+  useEffect(() => {
+    hydrateNotesRailFold(document.cookie);
   }, []);
 
   // The list mirror follows the active vault and the chip set; this is the only
@@ -120,6 +207,27 @@ export function NotesPane() {
   }, []);
 
   /**
+   * Make a note and open it (FR-160, Story 44.6).
+   *
+   * `spaceId` is `null` from the rail's own button — a note in the vault, which
+   * the default list shows — and a space's id from that space's `+`. The
+   * difference is Rust's to act on; this only says which.
+   *
+   * Rust's notices are adopted whatever they are, including the empty list, so
+   * a second create clears the first one's sentence rather than leaving a
+   * stale explanation over a note it is not about.
+   */
+  const onCreate = useCallback(
+    (spaceId: string | null) => {
+      setActionError(null);
+      void createNote(spaceId)
+        .then((created) => setNotices(created?.notices ?? []))
+        .catch(report);
+    },
+    [report],
+  );
+
+  /**
    * Promote the chip set to a space note (`⌘⇧S`, FR-105, UX-DR37).
    *
    * It is named from the chips rather than from a prompt, because nothing in
@@ -131,13 +239,13 @@ export function NotesPane() {
   const onSaveAsSpace = useCallback(() => {
     const parts = [
       scope.kind === "all" ? null : scopeLabel(scope),
-      ...tags,
+      ...tagTerms.map((chip) => (chip.term === "exclude" ? `not ${chip.tag}` : chip.tag)),
       agentOnly ? "Changed by agent" : null,
       searchText.trim() === "" ? null : `"${searchText.trim()}"`,
     ].filter((part): part is string => part !== null && part !== "");
     const name = parts.length === 0 ? UNTITLED_SPACE_NAME : parts.join(" · ");
     void saveFilterAsSpace(name).catch(report);
-  }, [scope, tags, agentOnly, searchText, report]);
+  }, [scope, tagTerms, agentOnly, searchText, report]);
 
   // Two chords are scoped to this view by being mounted with it — nothing else
   // mounts this listener, so neither can fire from another surface.
@@ -145,6 +253,13 @@ export function NotesPane() {
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
       const mod = event.metaKey || event.ctrlKey;
       if (!mod || event.altKey) {
+        return;
+      }
+      // Something closer to the keystroke already answered it — an open editor
+      // taking `⌘F` for its own find (FR-267). This listener is on `window` and
+      // so is always last; standing down is how a pane-wide chord yields to the
+      // focused document without either side knowing the other exists.
+      if (event.defaultPrevented) {
         return;
       }
       if (!event.shiftKey && event.key === "f") {
@@ -161,17 +276,52 @@ export function NotesPane() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onSaveAsSpace]);
 
+  /**
+   * A row's own click: the active panel now shows this note (Story 45.1).
+   *
+   * Single click replaces, double click opens beside — AD-90's gesture pair,
+   * the same one the Files tree uses, and deliberately not a second contract of
+   * this pane's own. Before Story 46.12 there was no twin here at all, because
+   * the model refused a second note panel; the store handles the interleaving
+   * (a double click is always preceded by a real single click, and `openPanel`
+   * puts back what that click displaced).
+   */
   const openRow = useCallback(
     (row: NoteRowVm) => {
       if (activeVaultId !== null) {
-        notesListStore.getState().select(activeVaultId, row.id);
+        panelsStore.getState().setActiveTarget({
+          kind: "note",
+          vaultId: activeVaultId,
+          noteId: row.id,
+        });
+      }
+    },
+    [activeVaultId],
+  );
+
+  /** Double click: open this note BESIDE what is already open (Story 46.12). */
+  const openRowBeside = useCallback(
+    (row: NoteRowVm) => {
+      if (activeVaultId !== null) {
+        panelsStore.getState().openPanel({
+          kind: "note",
+          vaultId: activeVaultId,
+          noteId: row.id,
+        });
       }
     },
     [activeVaultId],
   );
 
   const runVerb = useCallback(
-    (row: NoteRowVm, verb: "e" | "p" | "u" | "r") => {
+    (row: NoteRowVm, verb: "e" | "p" | "u" | "r" | "d") => {
+      // `d` is the one verb that does not act. It asks, and the confirmation
+      // is what acts — so it is handled here rather than joining the chain of
+      // actions below, where every other entry runs on the keystroke.
+      if (verb === "d") {
+        setDeletingId(row.id);
+        return;
+      }
       const run =
         verb === "e"
           ? actions.archive
@@ -196,10 +346,13 @@ export function NotesPane() {
   };
 
   const noVault = vaults !== null && vaults.length === 0;
-  // The open note is shown only while its own vault is the active one. It is not
-  // forgotten in the meantime — that is the whole of "a vault switch is a filter".
+  // The open note is the active panel's target, and it is shown only while its
+  // own vault is the active one. It is not forgotten in the meantime — that is
+  // the whole of "a vault switch is a filter" — and it is the panel list rather
+  // than a cursor of this pane's own, so the Files surface and this one cannot
+  // disagree about what is open (Story 45.1).
   const openNoteId =
-    selected !== null && selected.vaultId === activeVaultId ? selected.noteId : null;
+    activeNote !== null && activeNote.vaultId === activeVaultId ? activeNote.noteId : null;
 
   // A cold scan in progress is why the list can be empty and the vault not be.
   const scanning = activeVault !== null && !activeVault.indexed;
@@ -210,13 +363,31 @@ export function NotesPane() {
   } else if (loaded && rows.length === 0 && !scanning) {
     // "Nothing here" and "nothing matches" are different facts and get different
     // sentences; a search that matched nothing gets a third, because the way out
-    // of it is the field rather than the chips. None of them may be shown while
-    // the vault is still being read — "this vault is empty" said over a scan in
-    // flight is simply false, and it is false for exactly as long as the user is
-    // waiting to find out otherwise.
+    // of it is the field rather than the chips, and an empty lens a fourth,
+    // because nothing the user can clear will fill it. None of them may be shown
+    // while the vault is still being read — "this vault is empty" said over a
+    // scan in flight is simply false, and it is false for exactly as long as the
+    // user is waiting to find out otherwise.
+    // The Recordings sentence follows the *space*, not a scope kind that no
+    // longer exists: `defaultKey` is the identity keeper wrote into the note, so
+    // renaming the seeded Recordings space to anything at all keeps it, and a
+    // space of the user's own that happens to be called Recordings does not
+    // borrow it.
     emptyKind =
-      searchText.trim() !== "" ? "no-search-matches" : filtered ? "no-matches" : "empty-vault";
+      searchText.trim() !== ""
+        ? "no-search-matches"
+        : scope.kind === "space" && scope.defaultKey === "recordings" && scopeOnly
+          ? "no-recordings"
+          : filtered
+            ? "no-matches"
+            : "empty-vault";
   }
+
+  // Which terms are narrowing, for the two states a filter can cause. The empty
+  // vault and the empty lens are facts about the vault, not about the bar, so
+  // naming terms under them would answer a question nobody asked.
+  const emptyDetail =
+    emptyKind === "no-matches" || emptyKind === "no-search-matches" ? filterReason : null;
 
   const onEmptyAction = () => {
     switch (emptyKind) {
@@ -224,7 +395,7 @@ export function NotesPane() {
         primaryViewStore.getState().setView("sync");
         return;
       case "empty-vault":
-        void createNote().catch(report);
+        onCreate(null);
         return;
       case "no-search-matches":
         notesFiltersStore.getState().setText("");
@@ -236,117 +407,295 @@ export function NotesPane() {
     }
   };
 
+  /**
+   * What the scope column still offers with its body unmounted (Story 48.1,
+   * second cut). The order is the column's own, read top to bottom.
+   *
+   * The vault entry and the three sections are "unfold, and put me at the thing
+   * I named" — the honest behaviour for a switcher and three trees at 48px, and
+   * the section entries do the second half of it by opening a section the user
+   * had folded. New note is not: it makes a note in the active vault and opens
+   * it in the strip beside, which is exactly as true folded as unfolded.
+   *
+   * The three sections are DECLARED, not discovered. `TagTree` renders nothing
+   * for a vault with no tags and `PhysicalTree` nothing for a vault it cannot
+   * read, and the rail is not going to run a second tag read to find that out
+   * before offering the way in. Unfolding then shows what is actually there,
+   * which is the same answer the unfolded column gives — and the alternative,
+   * a rail whose controls appear and disappear as trees load, is a strip that
+   * changes shape under the cursor.
+   */
+  const openSection = (group: NotesRailGroup) => {
+    columnFoldStore.getState().toggleColumn("notes-rail");
+    if (railGroups[group]) {
+      notesRailFoldStore.getState().toggleGroup(group);
+    }
+  };
+  const railRail: SurfaceRail = [
+    {
+      id: "vault",
+      icon: NotebookPen,
+      label: "Vaults",
+      // Which vault is active is the first thing the strip hid. It rides the
+      // control that leads to the switcher rather than a caption of its own.
+      detail: activeVault?.name ?? null,
+      onSelect: () => columnFoldStore.getState().toggleColumn("notes-rail"),
+    },
+    {
+      id: "new-note",
+      icon: FilePlus,
+      label: NEW_NOTE_LABEL,
+      disabled: activeVaultId === null,
+      onSelect: () => onCreate(null),
+    },
+    { id: "spaces", icon: Layers, label: "Spaces", onSelect: () => openSection("spaces") },
+    { id: "tags", icon: Tags, label: "Tags", onSelect: () => openSection("tags") },
+    { id: "files", icon: Folder, label: "Files", onSelect: () => openSection("files") },
+  ];
+
+  /**
+   * What the list column still offers folded.
+   *
+   * The count is the fact a strip destroys most completely — folded, there is
+   * nothing on screen to say the lens holds forty notes or none — so it rides
+   * the entry into the list, as digits for the eye and as words in the name.
+   * Clear filters is on the rail because a filter you cannot see and cannot
+   * clear is worse than one you can: the chips are unmounted, and until this
+   * the only way back to an unfiltered list was to unfold first.
+   */
+  const listRail: SurfaceRail = [
+    {
+      id: "search",
+      icon: Search,
+      label: "Search notes",
+      // The pane already focuses the field on this nonce, for the palette's
+      // Search Notes. Unfolding and bumping it in one click lands the caret in
+      // the field the same render the field comes back.
+      onSelect: () => {
+        columnFoldStore.getState().toggleColumn("notes-list");
+        notesFiltersStore.getState().requestSearchFocus();
+      },
+    },
+    {
+      id: "notes",
+      icon: NotebookText,
+      label: NOTES_RAIL_LIST_LABEL,
+      detail: loaded && !noVault ? countLabel(total, NOTES, { of: matched }) : null,
+      count: total,
+      onSelect: () => columnFoldStore.getState().toggleColumn("notes-list"),
+    },
+    ...(filtered
+      ? [
+          {
+            id: "clear-filters",
+            icon: FilterX,
+            label: "Clear filters",
+            detail: filterReason === "" ? null : filterReason,
+            onSelect: () => notesFiltersStore.getState().clearAll(),
+          },
+        ]
+      : []),
+  ];
+
+  // Both of this surface's fixed columns fold and resize (Story 48.1). The
+  // panel strip does not: it is the flexible one, and a surface where every
+  // column has a width is a surface with a gap in it. Called here rather than
+  // at the top of the component because a column's rail is made of the same
+  // state its body is.
+  const rail = useSurfaceColumn("notes-rail", { rail: railRail });
+  const list = useSurfaceColumn("notes-list", { rail: listRail });
+
   return (
-    <div className="flex min-h-0 flex-1">
-      {/* Pane 1 — the scope column. */}
+    // `min-w-0` is the whole of this surface fitting its window, and it is not
+    // defensive: measured in Chromium against this exact chain at a 1000px
+    // viewport, this row came out **1235px** without it and 1000px with it.
+    //
+    // Notes is the only surface that puts a row of its own between the shell and
+    // its columns — Files and Sessions hand their columns straight to the shell
+    // row (`app-shell.tsx`), so their columns are flex items of a box the window
+    // already sized. This row is a flex ITEM of that box, and a flex item's
+    // `min-width` defaults to `auto`, which means its content-based minimum:
+    // the two column bases plus a panel wide enough for its toolbar. Flexbox
+    // then refuses to shrink the row below that floor, the row overflows the
+    // window, and every box inside it is laid out at the wider width and
+    // clipped by the window — the open note's toolbar cut mid-row, and prose
+    // wrapped somewhere off screen so each line ended mid-word.
+    //
+    // Two earlier fixes went to the wrong element: `min-w-0` on the note column
+    // (`NOTE_COLUMN_CLASS`, whose parent is a block box, so it changed nothing)
+    // and a `ResizeObserver` re-measure (which cannot help a box that was never
+    // given a smaller width). The floor belongs on the item that has the
+    // content-based minimum, and that is this row.
+    <div className="flex min-h-0 min-w-0 flex-1">
+      {/* Pane 1 — the scope column (Story 48.1: it folds, and it resizes). */}
       <nav
-        aria-label="Notes"
-        className="flex h-full min-h-0 w-[240px] shrink-0 flex-col border-border border-r bg-sidebar"
+        // No `aria-label` here: the column's own chrome draws the visible name
+        // and `rootProps` points this region's `aria-labelledby` at it, so the
+        // region and the heading a reader hears are one string (Story 48.3).
+        {...rail.rootProps}
+        className="flex h-full min-h-0 flex-col overflow-hidden border-border border-r bg-sidebar last:border-r-0"
       >
-        <div className="shrink-0 p-2">
-          <VaultSwitcher />
-        </div>
-        <ul className="flex shrink-0 flex-col gap-0.5 px-2">
-          <li>
-            {/* Not a filter: Today opens or creates one note (FR-99). */}
-            <Button
-              type="button"
-              variant="ghost"
-              className="w-full justify-start gap-2"
-              onClick={() => {
-                void openJournalToday().catch(report);
-              }}
-            >
-              <NotebookPen aria-hidden="true" />
-              Today
-            </Button>
-          </li>
-          {SCOPE_ROWS.map((row) => {
-            const Icon = row.icon;
-            const active = scope.kind === row.scope.kind;
-            return (
-              <li key={row.label}>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  aria-current={active ? "true" : undefined}
-                  aria-pressed={active}
-                  className={cn(
-                    "w-full justify-start gap-2",
-                    active && "bg-accent text-accent-foreground",
-                  )}
-                  onClick={() => notesFiltersStore.getState().setScope(row.scope)}
-                >
-                  <Icon aria-hidden="true" />
-                  {row.label}
-                </Button>
-              </li>
-            );
-          })}
-        </ul>
-        {/* Both trees are unbounded, so each owns its own scroll container and
-            everything below them stays reachable at every tree size (AD-34-4). */}
-        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-1">
-          <SpaceList vaultId={activeVaultId} />
-          <TagTree vaultId={activeVaultId} />
-          <PhysicalTree vaultId={activeVaultId} />
-        </div>
+        {rail.chrome}
+        {!rail.folded && (
+          <>
+            <div className="shrink-0 p-2">
+              <VaultSwitcher />
+            </div>
+            {/* The rail's own create (Story 44.6). At the head of the column and
+                not inside the Spaces group: this one makes a note in the vault,
+                which the default list shows, while the `+` on a space row makes a
+                note that space will list. Two different promises need two
+                different controls. */}
+            <div className="shrink-0 px-2 pb-2">
+              <button
+                type="button"
+                disabled={activeVaultId === null}
+                onClick={() => onCreate(null)}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-md border border-border px-2 py-1.5 text-left text-sm outline-none",
+                  "hover:bg-accent/50 focus-visible:ring-2 focus-visible:ring-ring",
+                  "disabled:pointer-events-none disabled:opacity-50",
+                )}
+              >
+                <FilePlus aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+                {NEW_NOTE_LABEL}
+              </button>
+            </div>
+            {/* Every group below is unbounded — spaces as much as tags, now that
+                the four fixed rows are spaces too — so they share one scroll
+                container and everything in it stays reachable at every size
+                (AD-34-4). */}
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pt-1">
+              <SpaceList vaultId={activeVaultId} onNewNote={(space) => onCreate(space.id)} />
+              <TagTree vaultId={activeVaultId} />
+              <PhysicalTree vaultId={activeVaultId} />
+            </div>
+          </>
+        )}
       </nav>
+      {rail.seam}
 
       {/* Pane 2 — the list. The primary surface (UX-DR37). */}
       {/* biome-ignore lint/a11y/noStaticElementInteractions: the column hosts the Esc chip-walk so it works from a row as well as from the bar; every control inside stays independently operable. */}
       <div
         onKeyDown={onColumnKeyDown}
-        className="flex h-full min-h-0 w-[320px] shrink-0 flex-col border-border border-r bg-background"
+        {...list.rootProps}
+        className="flex h-full min-h-0 flex-col overflow-hidden border-border border-r bg-background last:border-r-0"
       >
-        {!noVault && <NoteFilterBar onSaveAsSpace={onSaveAsSpace} searchRef={searchRef} />}
-        {/* A cold scan in flight, under the chip bar (FR-96, AD-57). The list
-            stays interactive throughout — you can open the first note before the
-            last one is found — so this is a thin bar and not a blocking state.
-            A corrupt cache takes the same branch as an absent one: a rescan,
-            never an error message. */}
-        {scanning && (
-          <div
-            role="status"
-            aria-label="Reading this vault"
-            data-slot="notes-index-progress"
-            className="h-0.5 w-full shrink-0 overflow-hidden bg-muted"
-          >
-            <div className="h-full w-1/3 bg-primary/60 motion-safe:animate-pulse" />
-          </div>
-        )}
-        {actionError !== null && (
-          <p role="alert" className="shrink-0 px-3 py-2 text-destructive text-xs">
-            {actionError}
-          </p>
-        )}
-        {emptyKind !== null ? (
-          <NotesEmptyState kind={emptyKind} onAction={onEmptyAction} />
-        ) : (
-          <NoteList
-            rows={rows}
-            total={total}
-            selectedId={openNoteId}
-            onSelect={openRow}
-            onToggleTag={(tag) => notesFiltersStore.getState().toggleTag(tag)}
-            onVerb={runVerb}
-            onGrow={() => notesListStore.getState().growWindow()}
-          />
-        )}
-      </div>
+        {list.chrome}
+        {!list.folded && (
+          <>
+            {!noVault && <NoteFilterBar onSaveAsSpace={onSaveAsSpace} searchRef={searchRef} />}
+            {/* A cold scan in flight, under the chip bar (FR-96, AD-57). The list
+                stays interactive throughout — you can open the first note before the
+                last one is found — so this is a thin bar and not a blocking state.
+                A corrupt cache takes the same branch as an absent one: a rescan,
+                never an error message. */}
+            {scanning && (
+              <div
+                role="status"
+                aria-label="Reading this vault"
+                data-slot="notes-index-progress"
+                className="h-0.5 w-full shrink-0 overflow-hidden bg-muted"
+              >
+                <div className="h-full w-1/3 bg-primary/60 motion-safe:animate-pulse" />
+              </div>
+            )}
+            {actionError !== null && (
+              <p role="alert" className="shrink-0 px-3 py-2 text-destructive text-xs">
+                {actionError}
+              </p>
+            )}
+            {/* What Rust said about a create that could not be what the space asked
+                for. `status` and not `alert`: the note was written, and the only
+                thing wrong is where it is not. Each sentence is composed in Rust,
+                because the reason names query terms and this surface does not read
+                queries. */}
+            {notices.map((notice) => (
+              <p
+                key={notice}
+                role="status"
+                data-slot={NOTES_NOTICE_SLOT}
+                className="shrink-0 border-border border-b px-3 py-2 text-muted-foreground text-xs"
+              >
+                {notice}
+              </p>
+            ))}
+            {/* How many notes this lens selects (Story 44.11, FR-166).
 
-      {/* Pane 3 — the editor. It owns everything about the open document; this
-          view only tells it which note, and `null` means "nothing on screen"
-          rather than "close and forget". */}
-      <div className="flex h-full min-h-0 flex-1 flex-col bg-background">
-        {activeVaultId !== null && (
-          <NoteEditor
-            vaultId={activeVaultId}
-            noteId={openNoteId}
-            onOpenNote={(noteId) => notesListStore.getState().select(activeVaultId, noteId)}
-          />
+                Above the list rather than inside it, and a sibling of the empty
+                state rather than a child of `NoteList`, because an empty set has to
+                say zero. `NoteList` is not rendered at all when the vault or the
+                filter comes up empty, and a count that vanishes exactly when the
+                answer is "none" is a count that never answers the question anyone
+                asks it.
+
+                `total` and never `rows.length`: the list is windowed and the page
+                is 200, so the array on screen is a screenful of a vault. */}
+            {!noVault && loaded && (
+              <p
+                role="status"
+                data-slot={NOTES_COUNT_SLOT}
+                className="shrink-0 border-border border-b px-3 py-1 text-muted-foreground text-xs"
+              >
+                {countLabel(total, NOTES, { of: matched })}
+              </p>
+            )}
+            {emptyKind !== null ? (
+              <NotesEmptyState kind={emptyKind} detail={emptyDetail} onAction={onEmptyAction} />
+            ) : (
+              <NoteList
+                rows={rows}
+                total={total}
+                selectedId={openNoteId}
+                onSelect={openRow}
+                onSelectBeside={openRowBeside}
+                onToggleTag={(tag) => notesFiltersStore.getState().cycleTag(tag)}
+                onVerb={runVerb}
+                onGrow={() => notesListStore.getState().growWindow()}
+              />
+            )}
+          </>
         )}
       </div>
+      {list.seam}
+
+      {/* Pane 3 — the panels (Story 46.12).
+
+          It used to be one `NoteEditor` and a note id, which is the shape that
+          could hold exactly one note. It is the same strip the Files surface
+          hosts, because "N targets side by side" is a solved problem in this
+          codebase and a second strip would be a second answer to it — with its
+          own gesture contract, its own focus rule and its own cookie, all of
+          which would drift.
+
+          The panel list is global and singular, and that is the point rather
+          than a compromise: a note opened here is still open when you go to
+          Files, and the file its `Show in Files` opened is still open when you
+          come back. Switching surfaces changes the browser beside the panels,
+          never the panels — and a vault switch is the same act one level down,
+          so a note panel is NOT hidden when its vault stops being the active
+          one. Before this story it was, because a single editor slot had to be
+          told which note; now the panel holds the note and the rail filters the
+          list. `NotePanelBody` says so out loud if the vault is actually gone. */}
+      <PanelStrip emptySentence={NOTES_PANEL_EMPTY_SENTENCE} />
+
+      {/* The list's `Delete` key, confirmed. The same dialog and the same
+          command the editor's actions menu and the sidebar's space rows use:
+          three doors, one removal (Story 45.17). Keyed on the id so pressing
+          Delete on a second row after cancelling the first asks about the
+          second rather than re-rendering the first's plan. */}
+      {activeVaultId !== null && deletingId !== null && (
+        <NoteDeleteDialog
+          key={deletingId}
+          vaultId={activeVaultId}
+          noteId={deletingId}
+          onClose={() => setDeletingId(null)}
+          // Nothing else to do: `deleteNote` closes any panel showing it, and
+          // the list mirror is driven by the index, which the trash announced.
+          onDeleted={() => setDeletingId(null)}
+        />
+      )}
     </div>
   );
 }

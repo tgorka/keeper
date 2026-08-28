@@ -15,6 +15,7 @@
  */
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Lamp } from "@/components/ui/lamp";
 import type { ScreenRecordingAccess } from "@/lib/ipc/client";
 
 /** The Screen Recording permission's System Settings name. */
@@ -99,7 +100,8 @@ export function RecordingPermissionRow({
           <span className="truncate font-medium text-sm">{name}</span>
           {access === "granted" ? (
             <Badge variant="secondary">
-              <span aria-hidden="true" className="size-1.5 rounded-full bg-bridge-healthy" />
+              {/* Silent: "Granted" is spelled out immediately to its right. */}
+              <Lamp state="live" label={null} />
               {ACCESS_LABEL.granted}
             </Badge>
           ) : access === "denied" ? (

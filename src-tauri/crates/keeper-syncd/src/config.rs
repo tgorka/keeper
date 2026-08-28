@@ -202,83 +202,36 @@ fn parse_profile(
         .map(|name| format!(" ({name})"))
         .unwrap_or_default();
 
-    let mut canonical = serde_json::Map::with_capacity(fields.len());
-    for (key, field) in fields {
-        let name = canonical_key(&key);
-        if !accepted.contains(&name) {
-            return Err(SyncError::Config(format!(
-                "[[profile]] #{}{label}: unknown key `{key}`; accepted keys are {}",
-                index + 1,
-                accepted.iter().cloned().collect::<Vec<_>>().join(", ")
-            )));
-        }
-        if canonical.insert(name.clone(), field).is_some() {
-            // `local_path` and `localPath` in one table: the survivor would
-            // depend on map ordering, so refuse rather than pick.
-            return Err(SyncError::Config(format!(
-                "[[profile]] #{}{label}: key `{name}` is given twice \
-                 (camelCase and snake_case spellings are the same key)",
-                index + 1
-            )));
-        }
-    }
+    // The engine's own key folding, not a second copy of it: a folder's
+    // `.keeper/keeper.toml` is canonicalized by these very functions (Story
+    // 46.8), and a `[[profile]]` table that meant something different from a
+    // `[folder]` table would be exactly the drift this module's 1:1 promise
+    // rules out. Only the sentence is ours — the daemon names the table and its
+    // index, which no other caller wants.
+    let prefix = |message: String| {
+        SyncError::Config(format!("[[profile]] #{}{label}: {message}", index + 1))
+    };
+    let unwrap_config = |err: SyncError| match err {
+        SyncError::Config(message) => prefix(message),
+        other => other,
+    };
+    let canonical =
+        keeper_sync::profile::canonical_profile_fields(fields, accepted).map_err(unwrap_config)?;
 
     let profile: SyncProfile = serde_json::from_value(serde_json::Value::Object(canonical))
-        .map_err(|err| SyncError::Config(format!("[[profile]] #{}{label}: {err}", index + 1)))?;
+        .map_err(|err| prefix(err.to_string()))?;
     // The engine's own validator, not a second copy of the rules: a config-file
     // profile must clear exactly the bar an app-created one clears.
-    profile.validate().map_err(|err| match err {
-        SyncError::Config(message) => {
-            SyncError::Config(format!("[[profile]] #{}{label}: {message}", index + 1))
-        }
-        other => other,
-    })?;
+    profile.validate().map_err(unwrap_config)?;
     Ok(profile)
 }
 
 /// Every key a `[[profile]]` table may carry, derived from [`SyncProfile`].
 ///
-/// Derived, not listed. A hand-maintained list is a list that goes stale the
-/// first time the engine gains a field, and the failure mode is the worst one
-/// available: the daemon rejects a profile the app just wrote.
+/// Derived, not listed, and derived in `keeper-sync` beside the type rather
+/// than here — the folder tier asks the same question of the same type.
 fn accepted_profile_keys() -> Result<BTreeSet<String>> {
-    let probe = SyncProfile::new("id", "name", "/", "remote");
-    let value = serde_json::to_value(&probe).map_err(|err| {
-        SyncError::Config(format!("cannot enumerate the accepted profile keys: {err}"))
-    })?;
-    match value {
-        serde_json::Value::Object(map) => Ok(map.into_iter().map(|(key, _)| key).collect()),
-        _ => Err(SyncError::Config(
-            "cannot enumerate the accepted profile keys: a profile is not an object".to_owned(),
-        )),
-    }
-}
-
-/// Fold a snake_case key onto the camelCase spelling `SyncProfile` uses.
-///
-/// TOML convention is snake_case and the profile schema is camelCase (it is the
-/// app's JSON schema). Accepting both keeps the 1:1 copy-a-table promise while
-/// not making an operator write `localPath` in a `.toml` file.
-fn canonical_key(key: &str) -> String {
-    if !key.contains('_') {
-        return key.to_owned();
-    }
-    let mut out = String::with_capacity(key.len());
-    for (index, part) in key.split('_').filter(|part| !part.is_empty()).enumerate() {
-        let mut chars = part.chars();
-        match chars.next() {
-            None => {}
-            Some(first) if index == 0 => {
-                out.push(first);
-                out.push_str(chars.as_str());
-            }
-            Some(first) => {
-                out.extend(first.to_uppercase());
-                out.push_str(chars.as_str());
-            }
-        }
-    }
-    out
+    keeper_sync::profile::accepted_profile_keys()
 }
 
 /// A documented starter configuration, written by `keeper-syncd init`.
@@ -350,15 +303,30 @@ logLevel = "info"
 # repository root. The trade-off is real: a matched file stays an ordinary git
 # blob however large it grows, and gitoxide has no streaming object read.
 # lfsNever = ["*.md", "*.txt"]
-# Release local LFS objects once the remote holds them. On the machine where
-# content originates every LFS file exists twice -- worktree and object store --
-# because the clean path must read the bytes to compute the pointer. This
-# reclaims the second copy. The worktree keeps every file; an object is released
-# only when its content is still in the worktree AND the journal owes no
-# transfer for it, so rebuilding costs one local read. The honest trade: the
-# drive stops being self-sufficient, because restoring a file the worktree later
-# loses then needs the network.
-# lfsPruneLocal = false
+# Release local LFS objects once the remote holds them. ON BY DEFAULT. On the
+# machine where content originates every LFS file exists twice -- worktree and
+# object store -- because the clean path must read the bytes to compute the
+# pointer. This reclaims the second copy. The worktree keeps every file; an
+# object is released only when its content is still in the worktree AND the
+# journal owes no transfer for it AND the remote has confirmed it holds the
+# content, so rebuilding costs one local read. Set it to false for a folder
+# that must be restorable with no network: the object store then stays a
+# complete local copy of everything the worktree holds, at roughly twice the
+# disk.
+# lfsPruneLocal = true
+# Which paths' CONTENT may stay unmaterialized after a pull -- the file stays
+# tracked, committed and listed, and only its bytes live in the LFS object
+# store. NOT the opposite of lfsNever above: that one says "never route this
+# through LFS at all", this one says "route it, then keep it as a pointer".
+# Same gitignore dialect, plus `!` to protect something the zone would
+# otherwise cover; `!` on a folder protects everything inside it, and a
+# protection stated anywhere is honoured everywhere -- a machine can widen what
+# may leave, never narrow what is kept. Editing this list never deletes a byte.
+# The canonical home for it is the folder's own .keeper/keeper.toml, so this
+# daemon and the desktop app honour one answer.
+# virtualPatterns = ["40-media/**", "!40-media/scans/"]
+# Smallest size that may stay away, in bytes. 0 (the default) means no floor.
+# virtualOverBytes = 0
 # How long a file must stop changing before it is considered complete.
 # settleMs = 5000
 # pollIntervalMs = 15000
@@ -665,6 +633,56 @@ lfsMode = "materialize"
         assert!(err.to_string().contains("pushOnly"), "{err}");
     }
 
+    /// A `releaseTtlMs` that is not a number is refused at startup, with the
+    /// profile named (Story 56.5).
+    ///
+    /// The daemon deletes content on this number's say-so, so "the value did
+    /// not parse, carry on with the default" is not an available answer: an
+    /// operator who typed `"soon"` meant something, and a folder running the
+    /// 24 h default while its config says otherwise is the silent version of
+    /// getting it wrong.
+    #[test]
+    fn a_non_numeric_release_ttl_is_refused_at_startup_with_the_profile_named() {
+        let text = format!("{MINIMAL}release_ttl_ms = \"soon\"\n");
+
+        let err = parse(&text).expect_err("a TTL that is not a duration must not load");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("[[profile]] #1"),
+            "the refusal must say which table: {message}"
+        );
+        assert!(
+            message.contains("docs"),
+            "and name the folder an operator recognises: {message}"
+        );
+    }
+
+    /// The floor and the ceiling reach the operator through the config file,
+    /// and `0` is accepted as the documented way to disable (Story 56.5).
+    ///
+    /// `SyncProfile::validate` owns the rule; this is the assertion that the
+    /// config path actually runs it rather than reimplementing a subset.
+    #[test]
+    fn a_release_ttl_out_of_range_is_refused_and_zero_is_accepted() {
+        let err = parse(&format!("{MINIMAL}releaseTtlMs = 500\n"))
+            .expect_err("half a second is not a retention window");
+        assert!(
+            err.to_string().contains("release TTL"),
+            "the refusal must name the field in words: {err}"
+        );
+
+        let config = parse(&format!("{MINIMAL}releaseTtlMs = 0\n")).expect("zero disables");
+        assert_eq!(config.profiles[0].release_ttl_ms, 0);
+        assert_eq!(config.profiles[0].effective_release_ttl_ms(), None);
+
+        let config = parse(&format!("{MINIMAL}releaseTtlMs = 3600000\n")).expect("an hour");
+        assert_eq!(
+            config.profiles[0].effective_release_ttl_ms(),
+            Some(3_600_000)
+        );
+    }
+
     #[test]
     fn a_later_bad_profile_prevents_every_earlier_one_from_loading() {
         // "Never partially applied": one broken table must not leave the good
@@ -803,14 +821,6 @@ lfsMode = "materialize"
         // TOML has no null; emitting one would make the file unparseable.
         assert!(!text.contains("authorOverride"), "{text}");
         assert_eq!(parse(&text).expect("parse").profiles, vec![profile]);
-    }
-
-    #[test]
-    fn canonical_key_folds_snake_case_onto_the_profile_schema() {
-        assert_eq!(canonical_key("lfs_threshold_bytes"), "lfsThresholdBytes");
-        assert_eq!(canonical_key("localPath"), "localPath");
-        assert_eq!(canonical_key("id"), "id");
-        assert_eq!(canonical_key("subpaths"), "subpaths");
     }
 
     #[test]

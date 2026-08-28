@@ -49,11 +49,12 @@ use keeper_core::notes::index::{
     link_key, IndexBuilder, IndexCache, IndexEntry, IndexSnapshot, NoteDelta, RecordingTagDelta,
     FIELD_DEVICE, FIELD_ORIGIN, INDEX_SCHEMA,
 };
+use keeper_core::notes::order;
 use keeper_core::notes::vm::{
     NoteAttachmentVm, NoteCadenceVm, NoteDiffVm, NoteHunkVm, NoteIndexProgressVm, NoteRevisionVm,
     NoteVaultVm,
 };
-use keeper_core::notes::{links, naming, tags, NotesError};
+use keeper_core::notes::{links, naming, recording_note, tags, templates, NotesError};
 use keeper_core::platform::Platform;
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::profile::{NotesCadence, NotesConfig, SyncProfile};
@@ -70,7 +71,12 @@ pub const KEEPER_DIR: &str = ".keeper";
 pub const OBSIDIAN_DIR: &str = ".obsidian";
 
 /// The vault-relative directory pasted and dropped assets land in (FR-110).
-const ATTACHMENTS_DIR: &str = "attachments";
+///
+/// Crate-visible because a `![[data.csv]]` embed resolves against it too
+/// (Story 44.16): a second string spelling `attachments` in `notes_ipc` is a
+/// rename waiting to half-land, and the two halves would then disagree about
+/// where the file the user just dropped went.
+pub(crate) const ATTACHMENTS_DIR: &str = "attachments";
 
 /// The coalescing window notes applies on top of the sync watcher's own 500 ms
 /// debounce (AD-56). A sliding window, reset by each new path: a burst of writes
@@ -225,6 +231,7 @@ fn tap_flag() -> MutexGuard<'static, bool> {
 /// no vaults, and this returns quietly — `CapabilitiesVm.notes` is already
 /// `false` there.
 pub fn start(app: &AppHandle) {
+    tracing::info!("notes: starting the vault registry");
     refresh(app);
     start_tap();
 }
@@ -235,7 +242,15 @@ pub fn start(app: &AppHandle) {
 /// vault list *is* a filter over the profile list" (AD-54): flagging a folder
 /// adds a vault, unflagging removes one and deletes nothing.
 pub fn refresh(app: &AppHandle) {
+    // Every early return below says so, at a level the app can actually print.
+    // Two field reports in a row on Story 44.3 turned on "did this even run",
+    // and the answer was unreadable because this function could return three
+    // different ways in silence: no engine, an unreadable profile set, and — the
+    // one that is easiest to miss — a profile set with no flagged vault in it,
+    // which leaves the loops below nothing to iterate and produces exactly the
+    // same blank log as never being called at all.
     let Some(engine) = crate::sync::engine_if_open() else {
+        tracing::info!("notes: no sync engine yet, so no vaults; the next refresh re-enters here");
         return;
     };
     let profiles = match engine.list_profiles() {
@@ -246,6 +261,11 @@ pub fn refresh(app: &AppHandle) {
         }
     };
     let wanted: Vec<Vault> = profiles.iter().filter_map(register_one).collect();
+    tracing::info!(
+        profiles = profiles.len(),
+        vaults = wanted.len(),
+        "notes: refreshing the vault registry"
+    );
     let keep: HashSet<&str> = wanted.iter().map(|vault| vault.id.as_str()).collect();
 
     let mut guard = registry();
@@ -270,7 +290,45 @@ pub fn refresh(app: &AppHandle) {
             }
         }
     }
+    let registered: Vec<Vault> = guard.values().map(|slot| slot.vault.clone()).collect();
     drop(guard);
+    // Seed the default spaces (Story 44.3, FR-156, AD-79), after the lock is
+    // dropped: a command arriving mid-seed must not queue behind it.
+    //
+    // **Every registered vault, not only a newly registered one.** The run plans
+    // against what is on `spaces/` and refuses to write when it cannot read, so
+    // repeating it is free and a run that declined once gets another chance the
+    // next time anything refreshes. Restricting it to first registration bought
+    // one directory listing per refresh and cost exactly that second chance —
+    // which is the difference between a vault that heals itself and one that
+    // needs the user to find a menu item they have no reason to press.
+    //
+    // It deliberately does NOT wait for the first scan: seeding asks the
+    // directory, not an index that has not been built yet, so a cold vault
+    // converges on its first registration instead of on the second.
+    //
+    // **Off this thread, because asking the directory can block forever.**
+    // Measured on the owner's machine: `refresh` sat inside
+    // `default_spaces::seed -> read_dir -> opendir -> __open_nocancel` for the
+    // whole life of the process. A vault on a removable volume can stall an
+    // `open` indefinitely — the drive is asleep, it was pulled mid-call, or
+    // macOS is holding the call while it decides whether this build may read
+    // the volume at all, which a fresh ad-hoc signature makes it do again every
+    // install. `refresh` runs on startup and after every profile write, so a
+    // blocking seed there does not merely delay itself: `start_tap` below never
+    // arms, no later refresh ever retries, and the app comes up with a notes
+    // subsystem that is silent and will not recover. Spawned, the same stall
+    // costs exactly the seeding it was in, and the next refresh tries again.
+    for vault in registered {
+        tauri::async_runtime::spawn_blocking(move || {
+            crate::notes_ipc::seed_default_spaces(&vault);
+            // The templates go in beside the spaces, on the same terms:
+            // idempotent by construction, planned against the directory rather
+            // than the index, and never on a vault that has already been
+            // offered them (Story 44.7).
+            crate::notes_ipc::seed_default_templates(&vault);
+        });
+    }
     // A `git` repoint tears the engine down and closes the tap; re-arming here
     // means the first profile write after a repair puts notes back too.
     start_tap();
@@ -436,8 +494,14 @@ pub fn set_recording_tags(session_id: &str, tags: &[String]) {
 
 /// Drop the cache and cold-scan (`notes_index_rebuild`).
 ///
-/// Deleting `.keeper/` by hand is the same repair, which is why this is not the
-/// only way to get it.
+/// **Selective, and it has to be.** Until Story 46.8 `.keeper/` held nothing but
+/// a cache and a trash, so deleting the whole directory by hand was the same
+/// repair and was documented as one. AD-100 put the folder's own configuration
+/// in there — `keeper.toml` and `keeper.<host>.toml`, which sync — so the whole
+/// directory is no longer safe to delete and this must never grow into a
+/// `remove_dir_all`. It removes `index.json` and nothing else: the trash is the
+/// user's recoverable deletions (NFR-30) and the `*.toml` files are their
+/// settings, and neither is a cache a rescan can regenerate.
 pub fn rebuild(id: &str) -> Result<(), NotesError> {
     let guard = registry();
     let slot = guard
@@ -466,6 +530,8 @@ pub fn vault_vm(vault: &Vault, unread: u32) -> NoteVaultVm {
             u32::try_from(snapshot.len()).unwrap_or(u32::MAX)
         }),
         unread_count: unread,
+        capture_template: vault.config.capture_template.clone(),
+        capture_tag: vault.config.capture_tag.clone(),
         cadence: cadence_vm(&vault.config.cadence),
     }
 }
@@ -570,7 +636,7 @@ fn vault_relative(vault: &Vault, path: &Path) -> Option<String> {
 ///
 /// `.obsidian/` is refused here as well as skipped by the walk, because "we
 /// never generate that path" is not the same as "that path cannot be requested".
-fn is_internal(rel: &str) -> bool {
+pub(crate) fn is_internal(rel: &str) -> bool {
     rel.split('/')
         .any(|part| part == KEEPER_DIR || part == OBSIDIAN_DIR || part == ".git")
 }
@@ -1044,10 +1110,15 @@ impl VaultWalk for DiskWalk {
 /// Walk the vault, returning every markdown note with its `lstat`.
 ///
 /// `.obsidian/` is skipped **by name, before descent** — the directory is never
-/// listed, so nothing inside it is opened or stat'd. So are `.keeper/`, which is
-/// keeper's own cache rather than vault content, and `.git/`. Everything else
-/// goes through keeper's own [`ExcludeSet`], so an exclusion rule means the same
-/// thing to notes as it does to sync.
+/// listed, so nothing inside it is opened or stat'd. So are `.keeper/` and
+/// `.git/`. Everything else goes through keeper's own [`ExcludeSet`], so an
+/// exclusion rule means the same thing to notes as it does to sync.
+///
+/// `.keeper/` stays skipped even though AD-100 made the `*.toml` in it sync:
+/// the tier-0 carve-out is about what reaches a *commit*, and a folder's
+/// configuration is no more a note than the index cache beside it is. The
+/// refusal is by name rather than through the [`ExcludeSet`] precisely so this
+/// walk does not have to care which of the two answers tier 0 gives.
 fn walk(fs: &mut dyn VaultWalk, excludes: &ExcludeSet) -> Vec<Seen> {
     let mut out = Vec::new();
     let mut queue = vec![String::new()];
@@ -1137,7 +1208,9 @@ fn load_cache(vault: &Vault) -> Vec<IndexEntry> {
     adopt_cache(&bytes, &vault.id).unwrap_or_else(|| {
         tracing::info!(
             vault = %vault.id,
-            "notes: index cache discarded; rescanning (deleting .keeper/ is a supported repair)"
+            "notes: index cache discarded; rescanning (deleting .keeper/index.json is a \
+             supported repair — never the directory, which now holds the folder's own \
+             keeper.toml as well as the trash)"
         );
         Vec::new()
     })
@@ -1286,6 +1359,35 @@ fn read_bounded(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(capped).into_owned())
 }
 
+/// Index a note keeper has just written, without waiting for the reconciler
+/// (Story 44.6).
+///
+/// The create path has to answer one question about the file it is writing —
+/// will the space it was created in list it? — and the reconciler will not have
+/// seen the file yet: it coalesces, so a write and the index knowing about it
+/// are separated by up to one coalescing window.
+///
+/// It goes through [`parse_note`], the reconciler's own parser, rather than
+/// through a second reading of the same bytes. That is the whole point: the
+/// answer given at creation time is produced by the rule that will produce the
+/// answer a second later, so "keeper said it would appear here and it did not"
+/// is unrepresentable.
+///
+/// The revalidation triple is synthesised — the file is on disk but has not
+/// been `lstat`ed, and this entry is never cached — so `size` is the text's own
+/// length and `ino` is zero. Nothing downstream of this call reads either; the
+/// timestamps a query compares against come from the frontmatter keeper just
+/// wrote.
+pub fn index_written(rel: &str, text: &str) -> IndexEntry {
+    let now = now_ms();
+    let stat = FileStat {
+        size: u64::try_from(text.len()).unwrap_or(u64::MAX),
+        mtime_ns: i128::from(now) * 1_000_000,
+        ino: 0,
+    };
+    parse_note(rel, &stat, text, now)
+}
+
 /// Turn bytes into an [`IndexEntry`] through the pure core. No IO here.
 fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry {
     let (fm, body_offset) = Frontmatter::parse(text);
@@ -1307,17 +1409,46 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     if conflict_origin(rel).is_some() {
         flags.push("conflict".to_owned());
     }
-    if rel.starts_with("templates/") {
+    // **A template is a note tagged `template`** (AD-82, Story 44.7). This used
+    // to be `rel.starts_with("templates/")` — a directory keeper owns, which is
+    // the exact thing AD-82 rejects, and the reason the tag had never mattered
+    // to anything. The predicate now lives in `keeper-core` beside the code that
+    // strips the marker on copy, so "what is a template" has one answer.
+    //
+    // The folder still counts, and that is compatibility rather than a second
+    // rule: a vault seeded by an earlier build has untagged notes under
+    // `templates/` that the template list has always shown, and silently
+    // un-templating them on upgrade would be keeper taking a feature away from
+    // a file it did not change. A tagged template anywhere else now counts too,
+    // which is the half AD-82 was actually asking for.
+    if templates::is_template(&fm) || rel.starts_with(&format!("{}/", templates::TEMPLATES_DIR)) {
         flags.push("template".to_owned());
     }
-    if rel.starts_with("spaces/") {
+    // The folder decides, EXCEPT for the two files OKF reserves. `index.md` is
+    // generated from the documents around it and `log.md` is a hand-kept
+    // ledger; neither carries frontmatter, so neither can carry a query. Left
+    // in, a generated listing under `spaces/` becomes a space that selects
+    // nothing and says its query cannot be read — which is what the vault that
+    // prompted this was showing. That is not a broken space; it is not a space.
+    if rel.starts_with("spaces/") && !keeper_core::notes::is_okf_reserved(rel) {
         flags.push("space".to_owned());
+    }
+    if keeper_core::notes::is_okf_reserved(rel) {
+        flags.push("generated".to_owned());
     }
     if rel.starts_with("journal/") {
         flags.push("journal".to_owned());
     }
     if is_capture(&fm) {
         flags.push("capture".to_owned());
+    }
+    // A note keeper wrote about a recording (Story 42.4). Read through the
+    // composer's own predicate rather than the key, so the surface that lists
+    // these notes and the code that writes them can never disagree about what
+    // one is — and note that the test is frontmatter, never the folder a stub
+    // happens to sit in: a stub can be filed anywhere and stays one.
+    if recording_note::is_recording_note(&fm) {
+        flags.push("recording".to_owned());
     }
     if usize::try_from(stat.size).unwrap_or(usize::MAX) > MAX_INDEXED_BODY {
         flags.push("oversize".to_owned());
@@ -1328,7 +1459,7 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
     // path-derived identity instead, flagged so the UI can say that its pins and
     // unread marks will not survive a rename.
     let id = match fm.as_string("id") {
-        Some(id) if is_ulid(id) => id.to_owned(),
+        Some(id) if naming::is_ulid(id) => id.to_owned(),
         _ => {
             flags.push("unstable_identity".to_owned());
             format!("path:{rel}")
@@ -1350,6 +1481,11 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
         .and_then(|raw| parse_timestamp_ms(raw))
         .unwrap_or_else(|| mtime_ms(stat, now_ms));
 
+    // One pass. This used to call `links::extract(body)` twice — once for the
+    // targets and once for the attributes — which parses every link in every
+    // note of the vault a second time for a projection of the same result.
+    let parsed = links::extract(body);
+
     IndexEntry {
         id,
         path: rel.to_owned(),
@@ -1361,12 +1497,27 @@ fn parse_note(rel: &str, stat: &FileStat, text: &str, now_ms: i64) -> IndexEntry
         updated_ms,
         tags: tags::note_tags(&fm, body),
         fields,
-        links: links::extract(body)
-            .into_iter()
-            .map(|link| link.target)
-            .collect(),
+        links: parsed.iter().map(|link| link.target.clone()).collect(),
+        // Every predicate the author wrote on a link, per target, keyed the way
+        // both link panels look it up — and computed in `keeper-core`, never
+        // here.
+        //
+        // The shell deliberately holds no token rules at all. This map used to
+        // be folded inline against the RAW target the author typed while the
+        // readers looked it up through `link_key`, so an attribute written on
+        // `[x](B.md)` — or on any title carrying a capital letter — matched
+        // nothing in either direction and the whole feature rendered blank. One
+        // half of it never met the other. With the producer and its two
+        // consumers naming the key in one place, they cannot drift apart again,
+        // and a new predicate spelling is understood everywhere the moment
+        // `link_predicate_map` understands it.
+        link_predicates: keeper_core::notes::index::link_predicate_map(&parsed),
         flags,
         snippet: snippet(body),
+        // Read once, here, so the list's comparator never re-parses a string
+        // (Story 44.5). The raw text stays in `fields` so `field:order=…` — an
+        // ordinary space predicate over the note's own frontmatter — keeps working.
+        order: order::read_order(&fm),
     }
 }
 
@@ -1382,21 +1533,14 @@ fn is_capture(fm: &Frontmatter) -> bool {
     }
 }
 
-/// A note's title: an explicit frontmatter `title`, else the first heading or
-/// line of the body, else the filename stem — which is what Obsidian shows.
+/// A note's title, through the one rule in `keeper-core::notes::naming`.
+///
+/// The rule moved out of this file when the default-space seeder needed it on a
+/// vault that has no index yet (Story 44.3). Two copies of a three-branch
+/// fallback is the kind of drift nobody notices until a seeded space stands down
+/// against a name only one of them can see.
 fn note_title(fm: &Frontmatter, body: &str, rel: &str) -> String {
-    if let Some(title) = fm.as_string("title") {
-        let trimmed = title.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
-    }
-    let from_body = naming::title_from_body(body);
-    if from_body.trim().is_empty() {
-        stem(rel).to_owned()
-    } else {
-        from_body
-    }
+    naming::note_title(fm.as_string("title"), body, stem(rel))
 }
 
 /// The first [`SNIPPET_CHARS`] characters of body, whitespace folded.
@@ -1413,18 +1557,6 @@ fn snippet(body: &str) -> String {
 fn stem(rel: &str) -> &str {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     name.strip_suffix(".md").unwrap_or(name)
-}
-
-/// Whether a string is a ULID: 26 Crockford base32 characters.
-///
-/// Checked rather than assumed, because `id` is a top-level frontmatter key that
-/// an agent or another tool may already be using for something else entirely.
-fn is_ulid(value: &str) -> bool {
-    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-    value.len() == 26
-        && value
-            .bytes()
-            .all(|byte| ALPHABET.contains(&byte.to_ascii_uppercase()))
 }
 
 /// An RFC-3339 timestamp as epoch milliseconds, or a bare `YYYY-MM-DD` at local
@@ -1590,6 +1722,20 @@ pub fn read_note(vault: &Vault, rel: &str) -> Result<String, NotesError> {
 /// muting a path, because a real external write that lands inside the muting
 /// window is not swallowed by it.
 pub fn write_note(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError> {
+    write_vault_file(vault, rel, text)?;
+    touch(&vault.id, vec![rel.to_owned()]);
+    mark_dirty(&vault.id);
+    Ok(())
+}
+
+/// Write a vault file that is not a note, atomically.
+///
+/// [`write_note`] minus the two announcements, for keeper's own bookkeeping —
+/// today the default-space ledger (Story 44.3). Telling the reconciler about a
+/// `.json` would ask the index to re-read a path the walk never collects, and
+/// marking the vault dirty for it would put a commit cadence behind a file the
+/// user never touched.
+pub fn write_vault_file(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError> {
     let path = contained(vault, rel)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -1597,8 +1743,6 @@ pub fn write_note(vault: &Vault, rel: &str, text: &str) -> Result<(), NotesError
     }
     atomic_write(&path, text.as_bytes())
         .map_err(|error| NotesError::Name(format!("{rel}: {error}")))?;
-    touch(&vault.id, vec![rel.to_owned()]);
-    mark_dirty(&vault.id);
     Ok(())
 }
 
@@ -1702,11 +1846,15 @@ pub fn contained(vault: &Vault, rel: &str) -> Result<PathBuf, NotesError> {
     Ok(vault.root.join(relative))
 }
 
-/// Import a file into `attachments/`, returning what the editor should insert.
+/// Copy a file into `attachments/`, returning where it landed.
 ///
-/// The bytes never cross IPC in either direction (AD-58): the webview hands over
-/// a path Tauri's own drag-drop event gave it, or nothing at all for a clipboard
-/// paste, and Rust does the reading.
+/// The bytes never cross IPC in either direction (AD-58): the webview hands
+/// over a path Tauri's own drag-drop event or the file picker gave it, and Rust
+/// does the reading.
+///
+/// **Returns a location, never markdown.** It used to compose the embed too,
+/// in a spelling nothing in this app renders; Story 45.13 made
+/// `src/lib/notes/attach.ts` the one place an attachment embed is spelled.
 pub fn import_attachment(vault: &Vault, source: &Path) -> Result<NoteAttachmentVm, NotesError> {
     let name = source
         .file_name()
@@ -1721,7 +1869,6 @@ pub fn import_attachment(vault: &Vault, source: &Path) -> Result<NoteAttachmentV
     std::fs::copy(source, &target).map_err(|error| NotesError::Name(format!("{rel}: {error}")))?;
     mark_dirty(&vault.id);
     Ok(NoteAttachmentVm {
-        markdown: attachment_markdown(&rel, &chosen),
         url: asset_url(&vault.id, &rel),
         rel_path: rel,
     })
@@ -1753,23 +1900,6 @@ fn unique_name(name: &str, taken: &[String]) -> String {
     // Ten thousand files of one name is not a real vault, but a name is still
     // owed; a ULID cannot collide with the counters above.
     format!("{stem}-{}{extension}", crate::sync_ipc::new_ulid())
-}
-
-/// The markdown an imported attachment inserts: an embed for an image, an
-/// ordinary link otherwise.
-fn attachment_markdown(rel: &str, name: &str) -> String {
-    if is_image(rel) {
-        format!("![{name}]({rel})")
-    } else {
-        format!("[{name}]({rel})")
-    }
-}
-
-fn is_image(rel: &str) -> bool {
-    matches!(
-        extension(rel).as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "svg" | "bmp")
-    )
 }
 
 /// A path's lowercased extension.
@@ -2232,6 +2362,101 @@ fn git_out(app: &AppHandle, repo: &Path, args: &[String]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// The newest commit touching one note, or `None` when git has never seen it.
+///
+/// This is the revision Story 44.8 hands back as the undo of a template update:
+/// the same string [`revisions`] lists, so "undo" and "the history panel" are
+/// looking at one object rather than two that have to agree.
+pub fn head_rev_of(app: &AppHandle, vault: &Vault, rel: &str) -> Option<String> {
+    let out = git_out(
+        app,
+        &vault.local_path,
+        &[
+            "log".to_owned(),
+            "--no-color".to_owned(),
+            "-n1".to_owned(),
+            "--format=%H".to_owned(),
+            "--".to_owned(),
+            format!("{}/{rel}", vault.config.subfolder),
+        ],
+    )?;
+    let rev = out.trim();
+    (!rev.is_empty()).then(|| rev.to_owned())
+}
+
+/// One note's text as of `rev`, or `None` when that revision does not hold it.
+///
+/// `git show <rev>:<path>` — a read, like [`revisions`] and [`diff`], so it needs
+/// no engine API. Binary-safe by omission: a note is UTF-8 by construction and a
+/// file that is not is not a note keeper will restore.
+pub fn revision_text(app: &AppHandle, vault: &Vault, rel: &str, rev: &str) -> Option<String> {
+    git_out(
+        app,
+        &vault.local_path,
+        &[
+            "show".to_owned(),
+            format!("{rev}:{}/{rel}", vault.config.subfolder),
+        ],
+    )
+}
+
+/// Every vault-relative note path whose bytes on disk are NOT what git holds:
+/// modified, staged, renamed or never tracked at all.
+///
+/// **One** `git status` for the whole vault, not one call per note — the same
+/// arithmetic [`read_heads`] does, and for the same reason: a per-note process
+/// spawn over a ten-thousand-note vault is not a feature, it is a stall.
+///
+/// `None` means the question could not be asked (no git, no repository). Callers
+/// that gate a destructive action on recoverability must treat that as "nothing
+/// is recoverable", never as "everything is" — which is why this is an `Option`
+/// and not an empty set.
+pub fn uncommitted_paths(app: &AppHandle, vault: &Vault) -> Option<HashSet<String>> {
+    let prefix = format!("{}/", vault.config.subfolder);
+    let out = git_out(
+        app,
+        &vault.local_path,
+        &[
+            "status".to_owned(),
+            "--porcelain".to_owned(),
+            // NUL-delimited: a path with a space, a quote or a newline in it is
+            // reported verbatim instead of being quoted and escaped, so there is
+            // no unquoting rule here to get wrong.
+            "-z".to_owned(),
+            "--untracked-files=all".to_owned(),
+            "--".to_owned(),
+            vault.config.subfolder.clone(),
+        ],
+    )?;
+
+    let mut dirty = HashSet::new();
+    let mut records = out.split('\0');
+    // `while let` rather than a `for`, because a rename record consumes the field
+    // AFTER it and a `for` would have already taken it.
+    while let Some(record) = records.next() {
+        // `XY <path>`. `get` rather than indexing: a truncated or malformed
+        // record must not panic a read that only ever informs a refusal.
+        let (Some(status), Some(path)) = (record.get(..2), record.get(3..)) else {
+            continue;
+        };
+        // A rename or copy record is followed by its origin path in the next
+        // field; both sides are "not what git holds", and consuming the second
+        // one here is what stops it being read as the next status code.
+        if status.starts_with('R') || status.starts_with('C') {
+            if let Some(rel) = records
+                .next()
+                .and_then(|origin| origin.strip_prefix(&prefix))
+            {
+                dirty.insert(rel.to_owned());
+            }
+        }
+        if let Some(rel) = path.strip_prefix(&prefix) {
+            dirty.insert(rel.to_owned());
+        }
+    }
+    Some(dirty)
+}
+
 // ---------------------------------------------------------------------------
 // The cadence (AD-62)
 // ---------------------------------------------------------------------------
@@ -2408,13 +2633,21 @@ async fn run_cadence_action(vault_id: &str, action: Action) -> bool {
     };
     match action {
         Action::Commit => {
-            // `rescan` is how the engine is asked to notice *now*: its own next
-            // pass walks the tree, applies the stability gate and commits what
-            // settled. No second committer, and no second scheduler.
-            if let Err(error) = engine.rescan(vault_id) {
-                tracing::debug!(%error, "notes: could not request a rescan for the cadence");
-                return false;
-            }
+            // `wake_now`, never `rescan`: the cadence is asking the engine to
+            // notice *now*, and its own next pass walks the tree, applies the
+            // stability gate and commits what settled. No second committer, and
+            // no second scheduler.
+            //
+            // It used to call `rescan`, which is the "Recheck all files" button
+            // — it drops the gate for the WHOLE profile. On a folder that is
+            // both a notes vault and a recordings destination that ran about
+            // once a second, and nothing but a note could ever finish settling:
+            // a recording would stop, write its note stub, the stub would make
+            // the vault dirty, the cadence would fire, and the segments the
+            // recording had just closed lost the episode they needed. The
+            // recording could not sync because it had written a note about
+            // itself.
+            engine.wake_now(vault_id);
             true
         }
         Action::Push => {
@@ -2597,9 +2830,101 @@ mod tests {
             tags: Vec::new(),
             fields: BTreeMap::new(),
             links: Vec::new(),
+            link_predicates: Default::default(),
             flags: Vec::new(),
             snippet: String::new(),
+            order: keeper_core::notes::order::NoteOrder::default(),
         }
+    }
+
+    /// Every predicate spelling reaches the panel, and each reaches it under
+    /// the key the reader looks it up with.
+    ///
+    /// This is the whole of the reported defect, in one test. keeper carried one
+    /// attribute, `reference="x"`, keyed by the RAW target the author typed,
+    /// and read it back with `link_key`-folded keys — so nothing ever matched
+    /// unless the target was already lowercase and extensionless. And the word
+    /// it looked for is not the word the owner's drives write: their registry
+    /// declares `rel=`, and there are 45 of those against zero `reference=`.
+    /// Either bug alone renders nothing.
+    ///
+    /// The spellings the owner's notes actually carry — kramdown's `:local`, a
+    /// bare property name, a colon-keyed pair holding a literal, and any of
+    /// them behind the emphasis markers that close the link — are asserted
+    /// through that same folded key here. A parser that learns a new token and
+    /// an index that keys it differently is the identical bug a second time.
+    #[test]
+    fn every_predicate_spelling_lands_under_the_folded_key() {
+        let entry = index_written(
+            "10-notes/a.md",
+            "---\ntype: Note\n---\n\
+             The drive's own spelling: [B](B.md){rel=\"cites\"}\n\
+             keeper's older one: [C](C.md){reference=\"supports\"}\n\
+             A CURIE beside a legacy word: [D](D.md){rel=\"index\", schema:about}\n\
+             Nothing at all: [E](E.md)\n\
+             The default vocabulary: [F](F.md){ :cites }\n\
+             A bare property name: [G](G.md){ cites }\n\
+             A pair holding a literal: [H](H.md){ :type=\"Metric\" }\n\
+             Behind the emphasis: **[I](I.md)**{ :depends_on }\n",
+        );
+
+        let at = |target: &str| {
+            entry
+                .link_predicates
+                .get(&keeper_core::notes::index::link_key(target))
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        // `B.md` is exactly the target that never matched before: the raw
+        // spelling has an extension and a capital.
+        assert_eq!(at("B.md"), ["cites"], "the drive's own rel= must land");
+        assert_eq!(at("C.md"), ["supports"], "and keeper's older reference=");
+        // Modern tokens keep the order the author wrote; a legacy `rel=` name
+        // is appended after them, even when the author wrote it first. It is a
+        // stated limitation of the compatibility shim rather than a precedence
+        // keeper invented: `RawLink` keeps pairs and tokens in two vectors, so
+        // the interleaving of `{rel="index", schema:about}` is not recoverable,
+        // and inverting that shape to serve a rare mixed block would cost every
+        // ordinary link. Pinned here so a reordering shows up as this test
+        // failing rather than as chips silently swapping in the panel.
+        assert_eq!(
+            at("D.md"),
+            ["schema:about", "index"],
+            "tokens in written order, the legacy value appended"
+        );
+        assert!(
+            !entry
+                .link_predicates
+                .contains_key(&keeper_core::notes::index::link_key("E.md")),
+            "a link with nothing on it must not appear in the map at all"
+        );
+        // The colon is stripped rather than carried, so the empty prefix, the
+        // bare property and `rel="cites"` arrive as ONE spelling. Keeping it
+        // would let the panel show `cites` and `:cites` as two relationships
+        // and a graph query match only one of them.
+        assert_eq!(
+            at("F.md"),
+            ["cites"],
+            "kramdown's `:local` names a predicate"
+        );
+        assert_eq!(at("G.md"), ["cites"], "and so does a bare property name");
+        // What annotates the edge is the KEY; `Metric` is the object and stays
+        // in `attrs`. Projecting the value here would put a datum where a
+        // relationship goes — `Metric` is not something one note does to another.
+        assert_eq!(
+            at("H.md"),
+            ["type"],
+            "a colon-keyed pair predicates by its key"
+        );
+        // The owner's own line is `**[x](y)**{ :depends_on }`. Demanding that
+        // the block touch the closing `)` is what made their common case — the
+        // bolded link — read as unsupported.
+        assert_eq!(
+            at("I.md"),
+            ["depends_on"],
+            "an attribute block after the emphasis that closes the link"
+        );
     }
 
     /// A directory tree in memory that records every directory the walk listed.
@@ -3022,15 +3347,6 @@ mod tests {
         // A bare `-10` is a one-line span.
         assert_eq!((hunks[1].old_start, hunks[1].old_lines), (10, 1));
         assert_eq!((hunks[1].new_start, hunks[1].new_lines), (11, 2));
-    }
-
-    #[test]
-    fn only_a_real_ulid_gives_a_note_a_stable_identity() {
-        assert!(is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGH"));
-        assert!(!is_ulid("not-a-ulid"));
-        assert!(!is_ulid(""));
-        // `U`, `I`, `L` and `O` are not in Crockford base32.
-        assert!(!is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGU"));
     }
 
     #[test]

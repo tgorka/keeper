@@ -50,7 +50,10 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::ArchiveError;
 use crate::recording::SessionMetaField;
-use crate::vm::{RecordingFilterVm, RecordingHitVm};
+use crate::vm::{
+    RecordingFilterVm, RecordingHitVm, RecordingNoteTargetKind, RecordingNoteTargetVm,
+    RecordingSearchVm,
+};
 
 use super::recordings::{in_transaction, RecordingRow};
 
@@ -87,7 +90,7 @@ const INDEX_JOIN: &str = " JOIN recordings_fts_docs \
 /// or `client/other`. A plain `LIKE 'client/acme%'` matches `client/acmecorp`
 /// and silently widens every tag filter to its lexical neighbours, so the test
 /// is two arms: equal to the prefix, or the prefix followed by `/`. This is the
-/// identical rule `crate::notes::query::tag_descends` applies to note tags, and
+/// identical rule `crate::notes::index::tag_covers` applies to note tags, and
 /// it is still spelled out again here rather than shared. Story 42.5 unified
 /// what a TAG is, which is the thing that was actually broken; how a hierarchy
 /// descends is a two-arm prefix test that has been fixed since FR-104 and
@@ -580,77 +583,21 @@ pub fn search_recordings(
         .limit
         .unwrap_or(DEFAULT_LIMIT)
         .clamp(1, DEFAULT_LIMIT);
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    let mut clauses: Vec<String> = Vec::new();
-
-    let index_join = if filter.query.is_empty() {
-        ""
-    } else {
-        if filter.query.chars().count() >= TRIGRAM_MIN_CHARS {
-            let quoted = filter.query.replace('"', "\"\"");
-            clauses.push("recordings_fts MATCH ?".to_owned());
-            params.push(Box::new(format!("\"{quoted}\"")));
-        } else {
-            clauses.push(
-                "LOWER(recordings_fts.text) LIKE '%' || LOWER(?) || '%' ESCAPE '\\'".to_owned(),
-            );
-            params.push(Box::new(escape_like(&filter.query)));
-        }
-        INDEX_JOIN
-    };
-
-    // Story 42.5: a filter tag joins the one vocabulary here, at the boundary
-    // where it becomes SQL. `crate::notes::query` normalises a `tag:` term the
-    // same way for the same reason — a person typing `Client/Acme ` into a chip
-    // means the tag the rows actually carry. A term that normalises to nothing
-    // narrows nothing and is dropped, which is also what the old
-    // `!tag.is_empty()` guard was for.
-    for tag in crate::notes::tags::normalise_all(filter.tags.iter().map(String::as_str)) {
-        clauses.push(TAG_PREDICATE_SQL.to_owned());
-        // The equality arm takes the canonical tag; the descendant arm is a LIKE
-        // and takes it escaped.
-        params.push(Box::new(tag.clone()));
-        params.push(Box::new(escape_like(&tag)));
-    }
-    if let Some(participant) = filter.participant.as_deref().filter(|p| !p.is_empty()) {
-        clauses.push(PARTICIPANT_PREDICATE_SQL.to_owned());
-        params.push(Box::new(escape_like(participant)));
-    }
-    if let Some(start_ts) = filter.start_ts {
-        clauses.push("recordings.started_ts >= ?".to_owned());
-        params.push(Box::new(start_ts));
-    }
-    if let Some(end_ts) = filter.end_ts {
-        clauses.push("recordings.started_ts <= ?".to_owned());
-        params.push(Box::new(end_ts));
-    }
-    if let Some(durability) = &filter.durability {
-        clauses.push("recordings.durability = ?".to_owned());
-        params.push(Box::new(durability.clone()));
-    }
-    if let Some(profile_id) = &filter.profile_id {
-        clauses.push("recordings.profile_id = ?".to_owned());
-        params.push(Box::new(profile_id.clone()));
-    }
-
-    let where_sql = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!(" WHERE {}", clauses.join(" AND "))
-    };
+    let predicates = Predicates::of(filter);
     // `limit` is an i64 this function clamped, never caller text.
     let sql = format!(
-        "SELECT {HIT_COLUMNS} FROM recordings{index_join}{where_sql} \
+        "SELECT {HIT_COLUMNS} FROM recordings{join}{where_sql} \
          ORDER BY recordings.started_ts DESC, recordings.session_id ASC \
-         LIMIT {limit}"
+         LIMIT {limit}",
+        join = predicates.join,
+        where_sql = predicates.where_sql,
     );
 
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| ArchiveError::Sqlite(format!("could not prepare recording search: {e}")))?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let rows = stmt
-        .query_map(param_refs.as_slice(), |r| {
+        .query_map(predicates.params().as_slice(), |r| {
             Ok(RecordingHit {
                 session_id: r.get(0)?,
                 relative_path: r.get(1)?,
@@ -675,6 +622,123 @@ pub fn search_recordings(
     Ok(hits)
 }
 
+/// How many sessions this filter matches — every one of them, not the page
+/// [`search_recordings`] hands back (Story 44.11, FR-166).
+///
+/// **This is the whole reason the story needed a backend change here.**
+/// `search_recordings` stops at [`DEFAULT_LIMIT`], so `hits.len()` is 200 for an
+/// archive of two hundred sessions and 200 for an archive of nine thousand. A
+/// surface counting the vector it was handed would show the same number for
+/// both, and Story 44.10 removed the one thing that used to make the difference
+/// visible: with every row rendered, a list that stopped at 200 rows looked like
+/// a list that stopped; windowed, it looks exactly like a complete archive.
+///
+/// A `COUNT(*)` over the same predicates, built by the same [`Predicates`] the
+/// search uses, so the count and the rows can never disagree about what "this
+/// filter" means. `COUNT` needs neither the ordering nor the hit columns, and
+/// the free-text join is present only when there is text to match — so an
+/// unfiltered count is a single covering scan of the `recordings` table rather
+/// than a walk through the index.
+pub fn count_recordings(conn: &Connection, filter: &RecordingFilter) -> Result<u32, ArchiveError> {
+    let predicates = Predicates::of(filter);
+    let sql = format!(
+        "SELECT COUNT(*) FROM recordings{join}{where_sql}",
+        join = predicates.join,
+        where_sql = predicates.where_sql,
+    );
+    let total: i64 = conn
+        .prepare(&sql)
+        .and_then(|mut stmt| stmt.query_row(predicates.params().as_slice(), |r| r.get(0)))
+        .map_err(|e| ArchiveError::Sqlite(format!("could not count recording hits: {e}")))?;
+    Ok(u32::try_from(total).unwrap_or(u32::MAX))
+}
+
+/// One filter, compiled to SQL once and used by both the page and the count.
+///
+/// Extracted for Story 44.11 rather than copied: a count that applied a
+/// different set of predicates from the list beneath it is a count that is
+/// wrong in exactly the way nobody checks, because both numbers look plausible
+/// and only one of them is being read.
+struct Predicates {
+    /// [`INDEX_JOIN`] when there is free text to match, empty otherwise.
+    join: &'static str,
+    /// `" WHERE …"`, or empty when nothing narrows.
+    where_sql: String,
+    values: Vec<Box<dyn rusqlite::ToSql>>,
+}
+
+impl Predicates {
+    fn of(filter: &RecordingFilter) -> Self {
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+
+        let join = if filter.query.is_empty() {
+            ""
+        } else {
+            if filter.query.chars().count() >= TRIGRAM_MIN_CHARS {
+                let quoted = filter.query.replace('"', "\"\"");
+                clauses.push("recordings_fts MATCH ?".to_owned());
+                values.push(Box::new(format!("\"{quoted}\"")));
+            } else {
+                clauses.push(
+                    "LOWER(recordings_fts.text) LIKE '%' || LOWER(?) || '%' ESCAPE '\\'".to_owned(),
+                );
+                values.push(Box::new(escape_like(&filter.query)));
+            }
+            INDEX_JOIN
+        };
+
+        // Story 42.5: a filter tag joins the one vocabulary here, at the boundary
+        // where it becomes SQL. `crate::notes::query` normalises a `tag:` term the
+        // same way for the same reason — a person typing `Client/Acme ` into a chip
+        // means the tag the rows actually carry. A term that normalises to nothing
+        // narrows nothing and is dropped, which is also what the old
+        // `!tag.is_empty()` guard was for.
+        for tag in crate::notes::tags::normalise_all(filter.tags.iter().map(String::as_str)) {
+            clauses.push(TAG_PREDICATE_SQL.to_owned());
+            // The equality arm takes the canonical tag; the descendant arm is a LIKE
+            // and takes it escaped.
+            values.push(Box::new(tag.clone()));
+            values.push(Box::new(escape_like(&tag)));
+        }
+        if let Some(participant) = filter.participant.as_deref().filter(|p| !p.is_empty()) {
+            clauses.push(PARTICIPANT_PREDICATE_SQL.to_owned());
+            values.push(Box::new(escape_like(participant)));
+        }
+        if let Some(start_ts) = filter.start_ts {
+            clauses.push("recordings.started_ts >= ?".to_owned());
+            values.push(Box::new(start_ts));
+        }
+        if let Some(end_ts) = filter.end_ts {
+            clauses.push("recordings.started_ts <= ?".to_owned());
+            values.push(Box::new(end_ts));
+        }
+        if let Some(durability) = &filter.durability {
+            clauses.push("recordings.durability = ?".to_owned());
+            values.push(Box::new(durability.clone()));
+        }
+        if let Some(profile_id) = &filter.profile_id {
+            clauses.push("recordings.profile_id = ?".to_owned());
+            values.push(Box::new(profile_id.clone()));
+        }
+
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        Predicates {
+            join,
+            where_sql,
+            values,
+        }
+    }
+
+    fn params(&self) -> Vec<&dyn rusqlite::ToSql> {
+        self.values.iter().map(|p| p.as_ref()).collect()
+    }
+}
+
 /// Search the recordings archive and project the hits into the rows Story 42.3
 /// renders (FR-141, UX-DR50).
 ///
@@ -697,32 +761,27 @@ pub fn search_recordings(
 /// `session_id`, so each of the at most [`DEFAULT_LIMIT`] lookups is a keyed
 /// b-tree probe, where a `GROUP BY` over every segment ever recorded is a full
 /// scan whose cost grows with the archive instead of with the answer.
+///
+/// The `total` beside the rows is [`count_recordings`]' — the whole matched
+/// set, not this page and not what a viewport rendered (Story 44.11). It costs
+/// one extra `COUNT(*)` per query, which is the price of a surface that can say
+/// how many sessions it found.
 pub fn search_recording_vms(
     conn: &Connection,
     filter: &RecordingFilter,
     destination_root: &Path,
-) -> Result<Vec<RecordingHitVm>, ArchiveError> {
-    // An `archive.db` written before Story 42.1 has no `recordings` table at
-    // all, and a machine that has not re-opened the WRITER since upgrading
-    // still has one — nothing ensures the schema on a read-only connection, and
-    // nothing can. The browser must read that as "nothing recorded", exactly as
-    // it reads an absent database, rather than as `no such table: recordings`:
-    // it is the same fact for the same user, and the writer heals it the next
-    // time anything records. One `sqlite_master` probe per query, against a
-    // b-tree the connection has already opened.
-    let indexed: Option<bool> = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recordings'",
-            [],
-            |_| Ok(true),
-        )
-        .optional()
-        .map_err(|e| {
-            ArchiveError::Sqlite(format!("could not probe for the recordings table: {e}"))
-        })?;
-    if indexed.is_none() {
-        return Ok(Vec::new());
+) -> Result<RecordingSearchVm, ArchiveError> {
+    if !recordings_indexed(conn)? {
+        // A pre-42.1 `archive.db` has nothing to count and nothing to list.
+        // Zero, and zero is a number the surface shows: an archive that holds
+        // nothing says so, rather than hiding the count and leaving the reader
+        // to guess whether it is empty or still loading.
+        return Ok(RecordingSearchVm {
+            rows: Vec::new(),
+            total: 0,
+        });
     }
+    let total = count_recordings(conn, filter)?;
     let hits = search_recordings(conn, filter)?;
     let mut total_bytes_stmt = conn
         .prepare("SELECT COALESCE(SUM(bytes), 0) FROM recording_segments WHERE session_id = ?1")
@@ -758,7 +817,7 @@ pub fn search_recording_vms(
             playable_relative.as_deref(),
         ));
     }
-    Ok(vms)
+    Ok(RecordingSearchVm { rows: vms, total })
 }
 
 /// One hit, plus what only the database could add, as the row Story 42.3
@@ -810,6 +869,194 @@ fn recording_hit_vm(
         total_bytes,
         durability: hit.durability,
         tags,
+    }
+}
+
+/// Whether this `archive.db` has a `recordings` table to read at all.
+///
+/// A database written before Story 42.1 has none, and a machine that has not
+/// re-opened the WRITER since upgrading still has one — nothing ensures the
+/// schema on a read-only connection, and nothing can. Every read path must
+/// report that as "nothing recorded", exactly as it reports an absent
+/// database, rather than as `no such table: recordings`: it is the same fact
+/// for the same user, and the writer heals it the next time anything records.
+/// One `sqlite_master` probe per query, against a b-tree the connection has
+/// already opened.
+fn recordings_indexed(conn: &Connection) -> Result<bool, ArchiveError> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recordings'",
+        [],
+        |_| Ok(true),
+    )
+    .optional()
+    .map(|found| found.unwrap_or(false))
+    .map_err(|e| ArchiveError::Sqlite(format!("could not probe for the recordings table: {e}")))
+}
+
+/// Everything the reader of a recording note can act on, for the session that
+/// note names by id (Story 42.4, FR-142, FR-145, AD-65): the session folder
+/// first, then every file in it, in name order.
+///
+/// **Resolved by session id, not by trusting the note's own paths.** A note
+/// carries the relative path the recording had the minute the stub was
+/// written, and Story 40.4 renames folders afterwards. Story 42.1's row
+/// follows the session, so the index is right about where the folder is NOW
+/// and the note is only right until the first retitle.
+///
+/// **The files are read off the disk, not out of `recording_segments`.** A
+/// note's `files:` list includes `manifest.json`, which is not a segment and
+/// never will be, so a segments-only answer would leave the one file every
+/// session has without an action. Reading the folder also makes the guarantee
+/// the surface leans on true by construction: every target handed back was
+/// there a moment ago, so an action offered for one is an action that opens
+/// something.
+///
+/// **`None`, never an error, in all three ways this can come up empty**: a
+/// session this archive does not know, a session whose folder is not on this
+/// machine, and a pre-42.1 `archive.db` with no `recordings` table. To the
+/// person holding the note those are one fact — keeper cannot say where this
+/// recording is — and the surface answers all three the same way: the note's
+/// own text, and no action that would open nothing.
+///
+/// `destination_root` is the EFFECTIVE recordings destination, resolved by the
+/// shell and passed in for [`search_recording_vms`]' reason: this crate reads
+/// no registry and knows no platform, and the join happens exactly once
+/// (AD-65).
+pub fn session_note_targets(
+    conn: &Connection,
+    session_id: &str,
+    destination_root: &Path,
+) -> Result<Option<Vec<RecordingNoteTargetVm>>, ArchiveError> {
+    if !recordings_indexed(conn)? {
+        return Ok(None);
+    }
+    let indexed_folder: Option<String> = conn
+        .query_row(
+            "SELECT relative_path FROM recordings WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| ArchiveError::Sqlite(format!("could not look up a session's folder: {e}")))?;
+    let Some(relative_folder) = indexed_folder else {
+        return Ok(None);
+    };
+    let folder = join_relative(destination_root, &relative_folder);
+    // A folder that cannot be listed is a folder nothing can be opened inside
+    // of — moved outside keeper, on a volume that is not mounted, or behind a
+    // permission this process does not have. All of those are "keeper cannot
+    // reach this recording", which is the same answer as an unknown session.
+    let Ok(entries) = std::fs::read_dir(&folder) else {
+        return Ok(None);
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        // Files only: nothing the recorder writes nests, and a note's `files:`
+        // never names a directory.
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        // A name that is not UTF-8 is a name no note can carry either — the
+        // stub is composed from the same bytes — so it is skipped rather than
+        // lossily spelled into a target that would match nothing and open
+        // nothing.
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        names.push(name);
+    }
+    // `read_dir` yields the filesystem's order, which differs between machines
+    // and between two calls on one machine. The surface looks a target up by
+    // name and does not care, but an unordered list makes a test assert
+    // whatever the last run happened to produce.
+    names.sort();
+
+    let mut targets = Vec::with_capacity(names.len() + 1);
+    targets.push(RecordingNoteTargetVm {
+        relative_path: relative_folder.clone(),
+        absolute_path: path_string(&folder),
+        kind: RecordingNoteTargetKind::Folder,
+    });
+    for name in names {
+        targets.push(RecordingNoteTargetVm {
+            // A session filed directly at the destination root has the empty
+            // relative path, and `"/" + name` there would be a relative path
+            // that reads as an absolute one — the exact shape FR-145 exists to
+            // keep out of a note.
+            relative_path: if relative_folder.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative_folder}/{name}")
+            },
+            absolute_path: path_string(&folder.join(&name)),
+            kind: kind_for_file_name(&name),
+        });
+    }
+    Ok(Some(targets))
+}
+
+/// The extensions a `<video>` is offered for: what the recorder writes video
+/// into (`.mov`, Story 20.1) and the containers a synced recordings folder
+/// plausibly already holds beside it.
+///
+/// Public because the shell serves exactly these over `keeper-recording://`
+/// and the files tab types its listing with the same vocabulary (Story 43.5,
+/// Story 43.8). A second table anywhere is a table that drifts.
+pub const VIDEO_EXTENSIONS: [&str; 4] = ["mov", "mp4", "m4v", "webm"];
+
+/// The extensions an `<img>` is offered for (Story 43.5).
+///
+/// SVG is here rather than under [`RecordingNoteTargetKind::File`] because
+/// an inline `<img src>` cannot run script from one, and the shell serves it
+/// with `nosniff` under the app's CSP — the same reading `keeper-note://`
+/// already takes of a vault's own SVG.
+pub const IMAGE_EXTENSIONS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "svg"];
+
+/// The extensions an `<audio>` is offered for (Story 43.5).
+pub const AUDIO_EXTENSIONS: [&str; 6] = ["mp3", "m4a", "wav", "ogg", "oga", "flac"];
+
+/// What a file of this name is, decided by its extension alone (Story 43.5,
+/// FR-150, AD-73).
+///
+/// **By extension, and deliberately not by reading the file.** Targets are
+/// composed for every file in a session folder at once, so sniffing each one's
+/// header would turn opening a note into a burst of reads on what may be a
+/// network share — and the cost of being wrong is an element that shows
+/// nothing, not a lost byte.
+///
+/// **Case-insensitively**, because a file copied in from another machine may be
+/// `.MOV`, and a player that is absent for the same video under a different
+/// spelling reads as a bug.
+///
+/// **The last extension decides**, which is what `Path::extension` means:
+/// `clip.mov.bak` is a backup and not a video, and a note that put a `<video>`
+/// on it would show a broken player for a file nothing can play.
+///
+/// A name with no extension at all — `Makefile`, `manifest`, a dotfile — is a
+/// [`RecordingNoteTargetKind::File`], never a guess. So is every extension
+/// not named above: the catch-all is what makes an unanticipated file an
+/// attachment with working actions instead of a dead player.
+///
+/// Never returns [`RecordingNoteTargetKind::Folder`]. A directory is known from
+/// the dirent that listed it, not from its name — `2026.08` is a folder and
+/// `notes.zip` is not, and no extension table can tell them apart.
+pub fn kind_for_file_name(name: &str) -> RecordingNoteTargetKind {
+    let Some(extension) = Path::new(name).extension().and_then(|ext| ext.to_str()) else {
+        return RecordingNoteTargetKind::File;
+    };
+    let listed = |table: &[&str]| {
+        table
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    };
+    if listed(&VIDEO_EXTENSIONS) {
+        RecordingNoteTargetKind::Video
+    } else if listed(&IMAGE_EXTENSIONS) {
+        RecordingNoteTargetKind::Image
+    } else if listed(&AUDIO_EXTENSIONS) {
+        RecordingNoteTargetKind::Audio
+    } else {
+        RecordingNoteTargetKind::File
     }
 }
 
@@ -1851,6 +2098,182 @@ mod tests {
         assert_eq!(limited(None), 5, "no cap is the default cap");
     }
 
+    /// Story 44.11: the count is of the archive, and the page is the page.
+    ///
+    /// This is the trap the story exists for. `search_recordings` stops at
+    /// [`DEFAULT_LIMIT`], so a surface counting the vector it was handed shows
+    /// the cap and calls it the archive. The fixture is deliberately larger
+    /// than the cap: at 200 rows returned out of 250 stored, `rows.len()` and
+    /// `total` are different numbers, and only one of them is the answer to
+    /// "how many sessions do I have".
+    #[test]
+    fn the_count_is_the_whole_archive_and_not_the_page_the_search_returned() {
+        let conn = memory_db();
+        let stored = usize::try_from(DEFAULT_LIMIT).expect("a positive cap") + 50;
+        for n in 0..stored {
+            upsert_recording(
+                &conn,
+                &row_with_meta(
+                    &format!("01DEVICE-{n:04}SESSION"),
+                    100 + n as i64,
+                    "Call",
+                    "Ada",
+                    "a note",
+                    &["internal"],
+                ),
+            )
+            .expect("index a session");
+        }
+
+        let filter = RecordingFilter::default();
+        let page = search_recordings(&conn, &filter).expect("search");
+        assert_eq!(
+            page.len(),
+            usize::try_from(DEFAULT_LIMIT).expect("a positive cap"),
+            "the page still stops at the cap; nothing about that changed"
+        );
+        assert_eq!(
+            count_recordings(&conn, &filter).expect("count"),
+            u32::try_from(stored).expect("a small fixture"),
+            "and the count reports every session, not the page"
+        );
+
+        // And the VM the surface actually receives carries that number, not its
+        // own `rows.len()`. Asserted here rather than left to the projection's
+        // other tests, all of whose fixtures are under the cap and would pass
+        // just as happily on a `total` derived from the vector.
+        let vm = search_recording_vms(&conn, &filter, Path::new("/recordings")).expect("browse");
+        assert_eq!(
+            vm.rows.len(),
+            usize::try_from(DEFAULT_LIMIT).expect("a positive cap")
+        );
+        assert_eq!(vm.total, u32::try_from(stored).expect("a small fixture"));
+        assert_ne!(
+            usize::try_from(vm.total).expect("a small fixture"),
+            vm.rows.len(),
+            "if these were ever equal at this fixture size the assertion above \
+             would be satisfied by a total taken from the page"
+        );
+    }
+
+    /// Story 44.11: a filtered list counts the filtered set, through the same
+    /// predicates that chose the rows. A count built from a second, separately
+    /// written `WHERE` is a count that disagrees with the list beneath it in
+    /// exactly the cases nobody checks.
+    #[test]
+    fn the_count_narrows_with_every_predicate_the_search_narrows_with() {
+        let conn = memory_db();
+        upsert_recording(
+            &conn,
+            &row_with_meta("01DEVICE-01A", 1_000, "Standup", "Ada", "n", &["internal"]),
+        )
+        .expect("index");
+        upsert_recording(
+            &conn,
+            &row_with_meta(
+                "01DEVICE-02B",
+                2_000,
+                "Standup",
+                "Grace",
+                "n",
+                &["client/acme"],
+            ),
+        )
+        .expect("index");
+        upsert_recording(
+            &conn,
+            &row_with_meta("01DEVICE-03C", 3_000, "Retro", "Ada", "n", &["internal"]),
+        )
+        .expect("index");
+
+        let counted = |filter: RecordingFilter| {
+            let total = count_recordings(&conn, &filter).expect("count");
+            let rows = search_recordings(&conn, &filter).expect("search").len();
+            assert_eq!(
+                usize::try_from(total).expect("small"),
+                rows,
+                "under the cap the two must agree exactly; if they ever do not, \
+                 the count and the list are answering different questions"
+            );
+            total
+        };
+
+        assert_eq!(counted(RecordingFilter::default()), 3);
+        assert_eq!(
+            counted(RecordingFilter {
+                query: "standup".to_owned(),
+                ..RecordingFilter::default()
+            }),
+            2
+        );
+        assert_eq!(
+            counted(RecordingFilter {
+                tags: vec!["internal".to_owned()],
+                ..RecordingFilter::default()
+            }),
+            2
+        );
+        assert_eq!(
+            counted(RecordingFilter {
+                participant: Some("grace".to_owned()),
+                ..RecordingFilter::default()
+            }),
+            1
+        );
+        assert_eq!(
+            counted(RecordingFilter {
+                start_ts: Some(2_000),
+                ..RecordingFilter::default()
+            }),
+            2
+        );
+        assert_eq!(
+            counted(RecordingFilter {
+                query: "nothing here".to_owned(),
+                ..RecordingFilter::default()
+            }),
+            0,
+            "an empty set counts zero rather than declining to answer"
+        );
+    }
+
+    /// Story 44.11: the caller's page size is not the archive's size. A count
+    /// that moved with `limit` would be the rendered-window defect wearing the
+    /// filter's clothes.
+    #[test]
+    fn the_page_size_a_caller_asks_for_does_not_move_the_count() {
+        let conn = memory_db();
+        for n in 0..5i64 {
+            upsert_recording(
+                &conn,
+                &row_with_meta(
+                    &format!("01DEVICE-{n:02}SESSION"),
+                    100 + n,
+                    "Call",
+                    "Ada",
+                    "a note",
+                    &["internal"],
+                ),
+            )
+            .expect("index a session");
+        }
+
+        for limit in [Some(1), Some(2), Some(DEFAULT_LIMIT), None] {
+            assert_eq!(
+                count_recordings(
+                    &conn,
+                    &RecordingFilter {
+                        limit,
+                        ..RecordingFilter::default()
+                    }
+                )
+                .expect("count"),
+                5,
+                "the count is of the archive, whatever page size was asked for"
+            );
+        }
+    }
+
     /// Story 42.3: the input seam is a total field move. Every optional is
     /// carried, because a filter that silently dropped one would narrow by less
     /// than the user asked and look like a search bug rather than a mapping bug.
@@ -1917,7 +2340,9 @@ mod tests {
 
     /// The rows the browser would render for an unrestricted filter.
     fn browsed(conn: &Connection, root: &Path) -> Vec<RecordingHitVm> {
-        search_recording_vms(conn, &RecordingFilter::default(), root).expect("browse")
+        search_recording_vms(conn, &RecordingFilter::default(), root)
+            .expect("browse")
+            .rows
     }
 
     /// Story 42.3: the row's two derived figures. Duration is the span between
@@ -2088,9 +2513,17 @@ mod tests {
         )
         .expect("search");
 
-        assert_eq!(matching.len(), 1);
-        assert_eq!(matching[0].title.as_deref(), Some("Standup"));
-        assert!(missing.is_empty());
+        assert_eq!(matching.rows.len(), 1);
+        assert_eq!(matching.rows[0].title.as_deref(), Some("Standup"));
+        assert_eq!(
+            matching.total, 1,
+            "the count is of the filtered set, not of the archive"
+        );
+        assert!(missing.rows.is_empty());
+        assert_eq!(
+            missing.total, 0,
+            "an empty result says zero rather than leaving the count behind"
+        );
     }
 
     /// Story 42.3: a stored path can never compose out of the destination root.
@@ -2121,11 +2554,12 @@ mod tests {
     fn browsing_an_archive_that_predates_the_recordings_tables_yields_no_rows() {
         let conn = Connection::open_in_memory().expect("open in-memory archive");
 
-        let rows =
+        let found =
             search_recording_vms(&conn, &RecordingFilter::default(), Path::new("/recordings"))
                 .expect("an archive with no recordings tables is an empty answer, never an error");
 
-        assert!(rows.is_empty());
+        assert!(found.rows.is_empty());
+        assert_eq!(found.total, 0);
     }
 
     #[test]
@@ -2174,5 +2608,239 @@ mod tests {
         );
         // And the boundary still holds: `client/acmecorp` is not under it.
         assert!(found_tag(&conn, "Client/AcmeCorp").is_empty());
+    }
+
+    /// A session folder on disk holding exactly what a finished session holds,
+    /// plus one subfolder, which is not a target.
+    fn session_folder(root: &Path, relative: &str, files: &[&str]) {
+        let folder = root.join(relative);
+        std::fs::create_dir_all(folder.join("nested")).expect("session folder");
+        for name in files {
+            std::fs::write(folder.join(name), b"bytes").expect("a file in the session folder");
+        }
+    }
+
+    /// The relative path and kind of each target, which is what the note
+    /// surface matches on and renders by.
+    fn target_shapes(targets: &[RecordingNoteTargetVm]) -> Vec<(&str, RecordingNoteTargetKind)> {
+        targets
+            .iter()
+            .map(|target| (target.relative_path.as_str(), target.kind))
+            .collect()
+    }
+
+    /// Story 42.4, widened by Story 43.5: the note's reader gets the folder and
+    /// every file in it, each typed with the vocabulary the note body, the
+    /// panel and `keeper-recording://` all branch on. Asserted through the real
+    /// directory read rather than over [`kind_for_file_name`] alone, because
+    /// the classification only matters where the name comes off a disk.
+    #[test]
+    fn a_session_types_every_file_it_holds_with_the_one_attachment_vocabulary() {
+        let root = temp_dir();
+        session_folder(
+            &root,
+            "2026/2026-08-08 15.52 test",
+            &[
+                "camera-0000.MOV",
+                "clip.mov.bak",
+                "manifest.json",
+                "notes",
+                "room-tone.WAV",
+                "screen-0000.mov",
+                "whiteboard.png",
+            ],
+        );
+        let conn = memory_db();
+        let mut row = bare_row("01DEVICE-01SESSION", Some(1_000));
+        row.relative_path = "2026/2026-08-08 15.52 test".to_owned();
+        upsert_recording(&conn, &row).expect("index the session");
+
+        let targets = session_note_targets(&conn, "01DEVICE-01SESSION", &root)
+            .expect("a known session resolves")
+            .expect("a session on disk has targets");
+
+        assert_eq!(
+            target_shapes(&targets),
+            vec![
+                (
+                    "2026/2026-08-08 15.52 test",
+                    RecordingNoteTargetKind::Folder
+                ),
+                // Uppercase: a file copied in from another machine is the same
+                // video, and a player that vanished with the spelling is a bug.
+                (
+                    "2026/2026-08-08 15.52 test/camera-0000.MOV",
+                    RecordingNoteTargetKind::Video
+                ),
+                // Double extension: the LAST one decides, so a backup of a
+                // video is not a video and gets no player to break.
+                (
+                    "2026/2026-08-08 15.52 test/clip.mov.bak",
+                    RecordingNoteTargetKind::File
+                ),
+                (
+                    "2026/2026-08-08 15.52 test/manifest.json",
+                    RecordingNoteTargetKind::File
+                ),
+                // No extension at all: a plain file, never a guess.
+                (
+                    "2026/2026-08-08 15.52 test/notes",
+                    RecordingNoteTargetKind::File
+                ),
+                (
+                    "2026/2026-08-08 15.52 test/room-tone.WAV",
+                    RecordingNoteTargetKind::Audio
+                ),
+                (
+                    "2026/2026-08-08 15.52 test/screen-0000.mov",
+                    RecordingNoteTargetKind::Video
+                ),
+                (
+                    "2026/2026-08-08 15.52 test/whiteboard.png",
+                    RecordingNoteTargetKind::Image
+                ),
+            ],
+            "the folder leads, its files follow in name order, and `nested` is not a target"
+        );
+        assert_eq!(
+            targets[1].absolute_path,
+            path_string(&root.join("2026/2026-08-08 15.52 test/camera-0000.MOV")),
+            "the absolute path is composed here, once, from the destination root"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Story 43.5: the whole vocabulary, pinned. Every extension the three
+    /// tables name resolves to its kind, no name is on two tables, and the
+    /// catch-all catches the shapes that get misread as "probably a video".
+    #[test]
+    fn every_extension_resolves_to_exactly_one_kind_and_the_rest_are_plain_files() {
+        for extension in VIDEO_EXTENSIONS {
+            assert_eq!(
+                kind_for_file_name(&format!("a.{extension}")),
+                RecordingNoteTargetKind::Video,
+                "{extension} is on the video table"
+            );
+            assert_eq!(
+                kind_for_file_name(&format!("a.{}", extension.to_uppercase())),
+                RecordingNoteTargetKind::Video,
+                "{extension} uppercase is the same video"
+            );
+        }
+        for extension in IMAGE_EXTENSIONS {
+            assert_eq!(
+                kind_for_file_name(&format!("a.{extension}")),
+                RecordingNoteTargetKind::Image,
+                "{extension} is on the image table"
+            );
+        }
+        for extension in AUDIO_EXTENSIONS {
+            assert_eq!(
+                kind_for_file_name(&format!("a.{extension}")),
+                RecordingNoteTargetKind::Audio,
+                "{extension} is on the audio table"
+            );
+        }
+        // No table may claim a name another one already claims: an overlap
+        // would make the kind depend on the order of the branches.
+        for extension in VIDEO_EXTENSIONS {
+            assert!(
+                !IMAGE_EXTENSIONS.contains(&extension) && !AUDIO_EXTENSIONS.contains(&extension),
+                "{extension} is on two tables"
+            );
+        }
+        for extension in IMAGE_EXTENSIONS {
+            assert!(
+                !AUDIO_EXTENSIONS.contains(&extension),
+                "{extension} is on two tables"
+            );
+        }
+
+        for name in [
+            "manifest.json",
+            "transcript.txt",
+            "paper.pdf",
+            "notes",
+            "Makefile",
+            ".gitignore",
+            "clip.mov.bak",
+            "archive.mov.zip",
+            "a.mov.",
+            "",
+        ] {
+            assert_eq!(
+                kind_for_file_name(name),
+                RecordingNoteTargetKind::File,
+                "{name:?} is not something keeper can render inline"
+            );
+        }
+
+        // A path, not just a bare name: only the last component's extension
+        // may decide, or a session folder called `2026.mov` would type its
+        // whole contents as video.
+        assert_eq!(
+            kind_for_file_name("2026/a.mov/notes.txt"),
+            RecordingNoteTargetKind::File
+        );
+        assert_eq!(
+            kind_for_file_name("2026/notes.txt/a.mov"),
+            RecordingNoteTargetKind::Video
+        );
+    }
+
+    /// Story 42.4 × Story 40.4: the note keeps saying where the recording was
+    /// when it was written; the index says where it is now, and the actions
+    /// follow the index.
+    #[test]
+    fn the_targets_follow_a_session_whose_folder_was_retitled() {
+        let root = temp_dir();
+        session_folder(&root, "2026/2026-08-08 1552 standup", &["screen-0000.mov"]);
+        let conn = memory_db();
+        let mut row = bare_row("01DEVICE-01MOVED", Some(1_000));
+        row.relative_path = "2026/2026-08-08 1552".to_owned();
+        upsert_recording(&conn, &row).expect("index the session");
+        move_session(&conn, "01DEVICE-01MOVED", "2026/2026-08-08 1552 standup")
+            .expect("retitle the session");
+
+        let targets = session_note_targets(&conn, "01DEVICE-01MOVED", &root)
+            .expect("a retitled session resolves")
+            .expect("its folder is on disk under the new name");
+
+        assert_eq!(
+            targets[0].absolute_path,
+            path_string(&root.join("2026/2026-08-08 1552 standup")),
+            "the old folder is gone; a target pointing at it would open nothing"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Story 42.4: the three ways this comes up empty are one answer, and none
+    /// of them is an error — the note still renders its own text, and the
+    /// surface offers nothing that would open nothing.
+    #[test]
+    fn an_unknown_session_a_vanished_folder_and_a_pre_42_1_archive_all_have_no_targets() {
+        let root = temp_dir();
+        let conn = memory_db();
+        let mut row = bare_row("01DEVICE-01GONE", Some(1_000));
+        row.relative_path = "2026/2026-08-08 1552".to_owned();
+        upsert_recording(&conn, &row).expect("index the session");
+
+        assert_eq!(
+            session_note_targets(&conn, "01DEVICE-01UNKNOWN", &root).expect("no error"),
+            None,
+            "a session this archive has never seen"
+        );
+        assert_eq!(
+            session_note_targets(&conn, "01DEVICE-01GONE", &root).expect("no error"),
+            None,
+            "a session whose folder is not on this machine"
+        );
+
+        let bare = Connection::open_in_memory().expect("open in-memory archive");
+        assert_eq!(
+            session_note_targets(&bare, "01DEVICE-01GONE", &root).expect("no error"),
+            None,
+            "an archive that predates the recordings table"
+        );
     }
 }

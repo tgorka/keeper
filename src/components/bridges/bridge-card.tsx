@@ -40,7 +40,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { BRIDGE_HEALTH_DOT_CLASS, BRIDGE_HEALTH_LABEL, BRIDGE_STATUS_LABEL } from "@/lib/bridges";
+import { Lamp, type LampState } from "@/components/ui/lamp";
+import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP, BRIDGE_STATUS_LABEL } from "@/lib/bridges";
 import { formatRoomTimestamp } from "@/lib/format-time";
 import type { BadgeStyle, BridgeHealth, BridgeNetworkVm, BridgeStatus } from "@/lib/ipc/client";
 import { bridgeBotRoom } from "@/lib/ipc/client";
@@ -63,11 +64,18 @@ const BADGE_STYLE: Record<BadgeStyle, { variant: "secondary" | "outline"; classN
   outline: { variant: "outline" },
 };
 
-/** The discovery status dot tint for each {@link BridgeStatus}. */
-const STATUS_DOT_CLASS: Record<BridgeStatus, string> = {
-  loggedIn: "bg-bridge-healthy",
-  notLoggedIn: "bg-bridge-disconnected",
-  configured: "bg-muted-foreground/50",
+/**
+ * The discovery-status lamp for each {@link BridgeStatus} — the setup/login
+ * state, distinct from the live health lamp on the right of the card.
+ *
+ * A configured-but-unused bridge is `idle` (hollow: nothing is wrong, nothing
+ * is running) and one that needs a login is `fault`, so the three states differ
+ * in shape before they differ in tint.
+ */
+const STATUS_LAMP: Record<BridgeStatus, LampState> = {
+  loggedIn: "live",
+  notLoggedIn: "fault",
+  configured: "idle",
 };
 
 interface BridgeCardProps {
@@ -197,13 +205,11 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
           <span className="truncate font-medium">{network.name}</span>
           {tierBadge}
         </div>
-        {/* Discovery status word + dot (Story 6.2) — the setup/login state, distinct
-            from the placeholder live-health dot on the right (Story 6.5). */}
+        {/* Discovery status word + lamp (Story 6.2) — the setup/login state, distinct
+            from the live-health lamp on the right (Story 6.5). The lamp is silent to
+            a screen reader because the word beside it already says the state. */}
         <div className="flex items-center gap-1.5" data-slot="bridge-status">
-          <span
-            aria-hidden="true"
-            className={cn("size-1.5 shrink-0 rounded-full", STATUS_DOT_CLASS[status])}
-          />
+          <Lamp state={STATUS_LAMP[status]} label={null} />
           <span className="text-muted-foreground text-xs">{BRIDGE_STATUS_LABEL[status]}</span>
         </div>
       </div>
@@ -221,18 +227,18 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
             >
               {BRIDGE_HEALTH_LABEL[health.health]}
             </span>
-            <span
-              aria-hidden="true"
+            <Lamp
+              state={BRIDGE_HEALTH_LAMP[health.health]}
+              label={null}
               data-slot="bridge-health-dot"
-              className={cn(
-                "size-2 rounded-full",
-                BRIDGE_HEALTH_DOT_CLASS[health.health],
-                pulsing && "animate-pulse",
-              )}
+              className={cn(pulsing && "animate-pulse")}
             />
           </div>
+          {/* When the health was last measured. It is a fact, not decoration, so
+              it sits at the 4.5:1 metadata tone rather than being faded through
+              it — a timestamp nobody can read is a timestamp nobody can act on. */}
           <span
-            className="text-[10px] text-muted-foreground/70"
+            className="figures text-meta text-muted-foreground"
             data-slot="bridge-health-checked"
             data-testid="bridge-health-checked"
           >
@@ -240,11 +246,11 @@ export function BridgeCard({ network, accountId, status }: BridgeCardProps) {
           </span>
         </div>
       ) : (
-        <span
-          aria-hidden="true"
-          data-slot="bridge-health-dot"
-          className="size-2 shrink-0 rounded-full bg-muted-foreground/30"
-        />
+        /* Nothing is monitored here, so the lamp is unlit rather than absent: a
+           missing indicator and a healthy one look the same, and only one of
+           those is true. Named for a screen reader because no visible word
+           accompanies it. */
+        <Lamp state="idle" label="Not monitored" data-slot="bridge-health-dot" />
       )}
       {offersAction && (
         <Button

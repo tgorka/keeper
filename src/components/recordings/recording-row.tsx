@@ -119,10 +119,13 @@ export function RecordingRow({ hit, canReveal, onReveal, onPlay }: RecordingRowP
   const glyph = DURABILITY_GLYPH[hit.durability];
 
   return (
-    <li className="flex items-start justify-between gap-3 rounded-md border border-border px-3 py-2">
+    // A `div`, not an `li`: the windowed list (Story 44.10) owns the positioned
+    // `li` this sits inside, because the row's box has to be measured
+    // independently of the row's own padding.
+    <div className="flex items-start justify-between gap-3 rounded-md border border-border px-3 py-2">
       <div className="flex min-w-0 flex-col gap-1">
         <span className="truncate font-medium text-foreground text-sm">{headline}</span>
-        <span className="text-muted-foreground text-xs">{meta}</span>
+        <span className="figures text-muted-foreground text-xs">{meta}</span>
         {hit.tags.length > 0 && (
           <div className="flex flex-wrap items-center gap-1">
             {hit.tags.map((tag) => (
@@ -203,6 +206,6 @@ export function RecordingRow({ hit, canReveal, onReveal, onPlay }: RecordingRowP
           {copied ? RECORDINGS_COPIED_LABEL : RECORDINGS_COPY_ID_LABEL}
         </Button>
       </div>
-    </li>
+    </div>
   );
 }

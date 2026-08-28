@@ -15,8 +15,32 @@
 //! Only facts keeper already holds. No transcription, no summarisation, no
 //! inference of any kind — named here because "a note about a recording" invites
 //! exactly that, and a machine-written paragraph in the one field a human was
-//! about to write in is worse than a blank one. No tag normalisation against the
-//! notes tag tree either (that is 42.5); tags are carried as stored.
+//! about to write in is worse than a blank one. The session's own tags are
+//! carried **as stored**, because normalising them would rewrite the user's own
+//! text in one of the two places Story 42.5 promises it survives. The single
+//! tag keeper adds of its own accord is [`RECORDINGS_TAG`], and that one is
+//! resolved through 42.5's vocabulary rather than written as a literal (Story
+//! 43.2).
+//!
+//! # Why the body embeds the videos while the frontmatter lists the files
+//!
+//! `files:` is a machine's list and an embed is what a person sees; both name
+//! the same strings, and neither is derived from the other by joining anything
+//! (AD-65 — the embed is the `files:` entry verbatim, in the same
+//! relative-to-the-destination-root frame, so FR-145 holds in the body for the
+//! same reason it holds in the block).
+//!
+//! The embeds go **below the heading**, never above it.
+//! `notes_vault::note_title` falls back to the body's first line, so an embed
+//! written at offset zero becomes the note's displayed title. That is not a
+//! hypothetical: Story 43.7's panel inserts at the caret, a caret at zero put
+//! an embed above `# Title`, and the owner's vault has a note called
+//! `![[recordings/…/screen-0000.mov]]` because of it.
+//!
+//! Videos only, decided by [`kind_for_file_name`] rather than by a second
+//! extension table here. `manifest.json` and `events.log` are reachable through
+//! `files:` and Story 43.7's panel already, and embedding either would put a
+//! chip that shows nothing where the recording is supposed to be.
 //!
 //! # Two rules the shape of this module is built around
 //!
@@ -48,9 +72,49 @@
 //! Both are derived by the shell from the same two stamps, so they cannot
 //! disagree about which session they describe.
 
+use crate::archive::recordings_fts::kind_for_file_name;
 use crate::notes::frontmatter::{FieldValue, Frontmatter};
 use crate::notes::naming;
+use crate::notes::tags;
 use crate::notes::templates::Stamp;
+use crate::vm::RecordingNoteTargetKind;
+
+/// The frontmatter key whose presence makes a note a recording note.
+///
+/// Not a folder name, not a tag, not a filename convention. `session:` is the
+/// only marker because it is the only one keeper mints and nobody can move: a
+/// Story 40.4 retitle renames the session folder and rewrites nothing here, and
+/// a user is free to rename the note file itself. Keying the predicate on
+/// anything else would let a note quietly stop being a recording note because
+/// somebody tidied a folder.
+pub const SESSION_KEY: &str = "session";
+
+/// Whether a note's frontmatter says keeper wrote it about a recording.
+///
+/// A blank value does not count. [`Frontmatter::parse`] keeps a key whose value
+/// is empty, so a bare `session:` line would otherwise mark a note as a
+/// recording whose session can never be resolved — the one state no caller can
+/// do anything with, and the one that would put a dead Reveal button on a note.
+pub fn is_recording_note(fm: &Frontmatter) -> bool {
+    fm.as_string(SESSION_KEY)
+        .is_some_and(|id| !id.trim().is_empty())
+}
+
+/// The tag every recording note carries so a *human* can find one (Story 43.2,
+/// FR-147).
+///
+/// [`SESSION_KEY`] is the machine's predicate and it is invisible in the vault:
+/// browsing the tag tree shows a note's own tags and nothing saying what KIND
+/// of note it is, so the notes keeper writes are the only ones a person cannot
+/// reach without already knowing they exist.
+///
+/// Spelled here in the canonical form [`tags::normalise`] produces, and put
+/// through that function anyway before it is emitted: the vocabulary is the
+/// authority on what this tag is, not this constant. The test
+/// `the_kind_tag_is_already_what_the_vocabulary_makes_of_it` pins the two
+/// together, so a future normalisation rule cannot leave this file emitting a
+/// tag the tree files under a different name.
+pub const RECORDINGS_TAG: &str = "recordings";
 
 /// Everything about a session that the stub is allowed to state, as the shell
 /// reads it off `manifest.json`.
@@ -86,6 +150,15 @@ pub struct SessionFacts<'a> {
     /// The session folder **relative to the destination root**, `/`-separated.
     /// Not a `Path`, and not absolute: FR-145.
     pub relative_folder: Option<&'a str>,
+    /// The session's files — every segment, and the manifest that describes
+    /// them — each **relative to the destination root**, `/`-separated. The
+    /// same frame [`Self::relative_folder`] is in, so a reader resolves any one
+    /// of them on its own rather than by joining it to the folder above it.
+    ///
+    /// Not a `Path`, and not absolute, for the reason `relative_folder` is not:
+    /// FR-145 is enforced by this signature rather than by a filter, because a
+    /// filter is a thing that can be forgotten on the next field added here.
+    pub files: &'a [&'a str],
 }
 
 /// A composed stub: what to call the file, and what to put in it.
@@ -97,12 +170,24 @@ pub struct NoteStub {
     /// The whole file — frontmatter block, a blank separator line, then the
     /// body.
     pub contents: String,
-    /// Byte offset of the **body's first byte** in [`Self::contents`].
+    /// Byte offset of the **body's first byte** in [`Self::contents`] — the
+    /// heading, which is also the first byte the writer is allowed to edit.
     ///
     /// One past what [`Frontmatter::parse`] calls the body offset, for the
     /// reason `create_note` adds `+ 1` to its caret hint: the parser's offset
     /// lands on the blank line that separates the block from the prose, and the
     /// prose is what the user was invited to write in.
+    ///
+    /// **It stays the heading even now that the body carries embeds**, and the
+    /// stop surface's caret — placed at the END of the body it slices off here
+    /// — is what lands below them. Moving this offset past the embeds would
+    /// look like a better caret hint and would instead move the embeds into the
+    /// read-only head that surface renders, making the one thing keeper just
+    /// wrote into someone's note the one thing they cannot delete. It would
+    /// also disagree with `RecordingNoteStubVm::body_offset`, which the shell
+    /// recomputes from [`Frontmatter::parse`] against the file on disk: two
+    /// same-named offsets meaning two different positions is a split that goes
+    /// wrong silently.
     pub body_offset: usize,
 }
 
@@ -130,7 +215,7 @@ pub fn compose(facts: &SessionFacts<'_>, taken: &[String]) -> NoteStub {
     let date = start.or(end).map(iso_date).unwrap_or_default();
     let title = title_of(facts, &date);
 
-    let mut pairs: Vec<(String, FieldValue)> = Vec::with_capacity(9);
+    let mut pairs: Vec<(String, FieldValue)> = Vec::with_capacity(10);
     pairs.push(("title".to_owned(), FieldValue::Str(title.clone())));
     push_text(&mut pairs, "date", &date);
     if let Some(stamp) = start {
@@ -147,22 +232,32 @@ pub fn compose(facts: &SessionFacts<'_>, taken: &[String]) -> NoteStub {
     // Blank entries dropped rather than emitted: `meta.tags` is a UI split of a
     // comma-separated field, so a trailing comma leaves an empty string behind,
     // and `tags: ["work", ""]` would put a nameless tag in the vault's tag tree.
-    let tags: Vec<FieldValue> = facts
+    let mut tags: Vec<FieldValue> = facts
         .tags
         .iter()
         .map(|tag| tag.trim())
         .filter(|tag| !tag.is_empty())
         .map(|tag| FieldValue::Str(tag.to_owned()))
         .collect();
+
+    // Keeper's kind tag goes **after** the session's own, for the reason the
+    // three bookkeeping keys below come last: what the writer typed leads, and
+    // what keeper added trails it. Prepending would also displace the user's
+    // first tag from the one position a truncated property row is sure to show,
+    // and would make keeper's addition look like something they chose first.
+    if let Some(kind) = kind_tag(facts.tags) {
+        tags.push(FieldValue::Str(kind));
+    }
     if !tags.is_empty() {
         pairs.push(("tags".to_owned(), FieldValue::List(tags)));
     }
 
-    // Last, and in this order, because these two are keeper's own bookkeeping
+    // Last, and in this order, because these three are keeper's own bookkeeping
     // rather than anything the writer typed: the identity that outlives the
-    // folder name, then where the folder was relative to its root.
+    // folder name, then where the folder was relative to its root, then what is
+    // inside it — in that same frame, so the reader never has to join the two.
     pairs.push((
-        "session".to_owned(),
+        SESSION_KEY.to_owned(),
         FieldValue::Str(facts.session_id.to_owned()),
     ));
     push_text(
@@ -171,12 +266,39 @@ pub fn compose(facts: &SessionFacts<'_>, taken: &[String]) -> NoteStub {
         facts.relative_folder.unwrap_or_default(),
     );
 
+    // Blank entries dropped and the key omitted when nothing survives, exactly
+    // as `tags` above and for the same reason: `- ` under `files:` is a
+    // nameless entry, which is worse than no key at all — nobody can act on it,
+    // and nobody can tell from the note what it was supposed to have been.
+    //
+    // Trimmed once and kept, because the body's embeds must name the same
+    // strings the block does. Two independent passes over `facts.files` would
+    // be two places for the next filter to be added to and one for it to be
+    // forgotten.
+    let files: Vec<&str> = facts
+        .files
+        .iter()
+        .map(|file| file.trim())
+        .filter(|file| !file.is_empty())
+        .collect();
+    if !files.is_empty() {
+        pairs.push((
+            "files".to_owned(),
+            FieldValue::List(
+                files
+                    .iter()
+                    .map(|file| FieldValue::Str((*file).to_owned()))
+                    .collect(),
+            ),
+        ));
+    }
+
     let front = Frontmatter::serialise_new(&pairs);
-    // A heading and then room. Composed the way `create_note` composes a note —
-    // `format!("{front}\n{body}")` — because a stub that assembled its own
-    // frontmatter differently from every other note keeper writes would be the
-    // one note the vault's parser had a special case for.
-    let body = format!("# {title}\n\n");
+    // A heading, then the recording, then room. Composed the way `create_note`
+    // composes a note — `format!("{front}\n{body}")` — because a stub that
+    // assembled its own frontmatter differently from every other note keeper
+    // writes would be the one note the vault's parser had a special case for.
+    let body = format!("# {title}\n\n{}", video_embeds(&files));
     let body_offset = front.len() + 1;
     let contents = format!("{front}\n{body}");
 
@@ -211,6 +333,80 @@ fn title_of(facts: &SessionFacts<'_>, date: &str) -> String {
         return date.to_owned();
     }
     facts.session_id.to_owned()
+}
+
+/// [`RECORDINGS_TAG`] in canonical form, or `None` when the session already
+/// carries it under some spelling of its own.
+///
+/// **The question is asked of [`tags::normalise`], never of the strings.**
+/// `Recordings`, `recordings ` and `#recordings` are all already this tag, and
+/// emitting a second spelling beside one of them is precisely the twin node
+/// Story 42.5 exists to prevent — the tree would show `recordings` counted
+/// twice off one note, or worse, the writer would see keeper disagree with them
+/// about their own vocabulary. What the user typed is left byte-identical;
+/// keeper only declines to say it again.
+///
+/// Returning `None` for an unnormalisable constant rather than panicking keeps
+/// [`compose`] total, which is the promise this whole module makes: there is no
+/// session for which the one minute in which a note would have been written is
+/// lost to a composer that refused.
+fn kind_tag(own: &[String]) -> Option<String> {
+    let kind = tags::normalise(RECORDINGS_TAG)?;
+    let already = own
+        .iter()
+        .any(|tag| tags::normalise(tag).as_deref() == Some(kind.as_str()));
+    (!already).then_some(kind)
+}
+
+/// The session's videos as Obsidian embeds, one per line, with a blank line
+/// after them — or an empty string when the session has none.
+///
+/// **Empty, not blank.** A session that recorded only audio, or whose segments
+/// all failed to express themselves relative to the root, gets the body it got
+/// before this story: `# Title` and one blank line. An embed block that
+/// collapsed to nothing must not leave the separator it would have needed
+/// behind, because a stub is the one note nobody proofreads before saving.
+///
+/// **Ledger order, never a sort**, for the reason `files:` is in ledger order:
+/// sorting would lift `camera-0000.mov` above the screen segment it was
+/// recorded beside, and the pair reads as one player (Story 44.1).
+///
+/// **The `files:` string verbatim.** Nothing is joined onto it and nothing is
+/// re-derived from `recording:`; the note is written in one frame and every
+/// path in it stays in that frame, which is what makes it still true after the
+/// tree is cloned (FR-145).
+fn video_embeds(files: &[&str]) -> String {
+    let mut out = String::new();
+    for file in files
+        .iter()
+        .filter(|file| matches!(kind_for_file_name(file), RecordingNoteTargetKind::Video))
+        .filter(|file| wikilink_can_name(file))
+    {
+        out.push_str("![[");
+        out.push_str(file);
+        out.push_str("]]\n");
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether `![[file]]` would still mean *this* file.
+///
+/// Obsidian's wikilink grammar consumes each of these characters: `]` closes
+/// the link, `|` starts an alias, `#` starts a heading reference, `^` a block
+/// reference, and a newline ends it outright. A file name containing one is
+/// legal on APFS and would produce an embed pointing at some shorter path that
+/// does not exist — a broken player in place of the recording, which is worse
+/// than no embed. A newline is the sharper case: it would put a second body
+/// line into the note that keeper did not write.
+///
+/// Such a file is still listed under `files:` and still one press away in Story
+/// 43.7's panel, so nothing about it becomes unreachable — keeper only declines
+/// to write a link it knows is wrong.
+fn wikilink_can_name(file: &str) -> bool {
+    !file.contains(['\n', '\r', '[', ']', '|', '#', '^'])
 }
 
 /// Push `key: value`, or nothing at all when the value is blank.
@@ -258,6 +454,7 @@ fn duration_text(started_ms: Option<i64>, ended_ms: Option<i64>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notes::links;
 
     const ID: &str = "01K0DEVICE0000000000000000-01K0SESSION00000000000000";
 
@@ -274,6 +471,7 @@ mod tests {
             participants: Some("Jane Doe, Sam"),
             tags: &[],
             relative_folder: Some("2026/keeper-rec 2026-08-08 14.23.45"),
+            files: &[],
         }
     }
 
@@ -308,7 +506,11 @@ mod tests {
         assert_eq!(fm.as_string("participants"), Some("Jane Doe, Sam"));
         assert_eq!(
             fm.as_list("tags"),
-            Some(vec!["work".to_owned(), "quarterly".to_owned()])
+            Some(vec![
+                "work".to_owned(),
+                "quarterly".to_owned(),
+                RECORDINGS_TAG.to_owned()
+            ])
         );
         assert_eq!(
             fm.as_string("session"),
@@ -352,6 +554,459 @@ mod tests {
             stub.contents
                 .contains("recording: 2026/keeper-rec 2026-08-08 14.23.45"),
             "the location is recorded, but relative to the destination root"
+        );
+    }
+
+    /// The files are the session's own ledger order — the screen track, then
+    /// the camera track beside it, then the manifest that describes them — and
+    /// never a sort. Sorting would lift `camera-0000.mov` above the screen
+    /// segment it accompanies, and the note would read like a directory
+    /// listing rather than like a recording.
+    #[test]
+    fn every_file_of_a_session_is_listed_under_its_folder_in_ledger_order() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/camera-0000.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let (fm, _) = Frontmatter::parse(&stub.contents);
+
+        assert_eq!(
+            fm.as_list("files"),
+            Some(
+                files
+                    .iter()
+                    .map(|file| (*file).to_owned())
+                    .collect::<Vec<_>>()
+            ),
+            "every file reads back through the parser, in the order it arrived"
+        );
+        assert!(
+            stub.contents.contains(concat!(
+                "recording: 2026/keeper-rec 2026-08-08 14.23.45\n",
+                "files:\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/camera-0000.mov\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/manifest.json\n",
+            )),
+            "the list follows `recording:` immediately, one file per line: {}",
+            stub.contents
+        );
+    }
+
+    /// The two tracks and the manifest, exactly as a two-camera session hands
+    /// them over.
+    const TWO_TRACKS: [&str; 3] = [
+        "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+        "2026/keeper-rec 2026-08-08 14.23.45/camera-0000.mov",
+        "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+    ];
+
+    /// Story 44.2's whole claim, as the exact body: the heading, a blank line,
+    /// both tracks in the ledger's order, and the line the writer's caret lands
+    /// on. `manifest.json` is in `files:` and is deliberately not here — it is
+    /// already reachable through the attachment panel, and an embed of it is a
+    /// chip that shows nothing where the recording should be.
+    ///
+    /// Asserted as the whole body rather than with `contains`, because "an
+    /// extra blank line crept in" and "the embeds ended up in the wrong half of
+    /// the note" both pass a `contains`.
+    #[test]
+    fn a_two_track_session_embeds_both_videos_under_the_heading_in_ledger_order() {
+        let stub = compose(
+            &SessionFacts {
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+
+        assert_eq!(
+            &stub.contents[stub.body_offset..],
+            concat!(
+                "# Quarterly review\n",
+                "\n",
+                "![[2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov]]\n",
+                "![[2026/keeper-rec 2026-08-08 14.23.45/camera-0000.mov]]\n",
+                "\n",
+            )
+        );
+    }
+
+    /// Read back with the vault's own link parser rather than with `contains`,
+    /// because the promise is that Obsidian renders these: a string that merely
+    /// occurs in the body is not an embed, and `links::extract` is the reader
+    /// that decides. Each target is compared against the `files:` entry itself,
+    /// so a composer that ever joined a root onto a subpath (AD-65) or
+    /// re-derived the path from `recording:` fails here rather than on the
+    /// second machine the vault is cloned onto.
+    #[test]
+    fn the_embeds_read_back_as_embeds_naming_the_files_key_byte_for_byte() {
+        let stub = compose(
+            &SessionFacts {
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+        let listed = Frontmatter::parse(&stub.contents)
+            .0
+            .as_list("files")
+            .expect("this session has files");
+        let links = links::extract(&stub.contents[stub.body_offset..]);
+
+        assert_eq!(links.len(), 2, "the manifest is listed, never embedded");
+        assert!(
+            links.iter().all(|link| link.embed),
+            "`![[…]]`, not `[[…]]` — a mention renders nothing"
+        );
+        assert!(
+            links.iter().all(|link| link.alias.is_none()),
+            "no alias: an embed with one names a different target"
+        );
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.target.clone())
+                .collect::<Vec<_>>(),
+            vec![listed[0].clone(), listed[1].clone()],
+            "each embed names the note's own `files:` entry, in the ledger's order"
+        );
+    }
+
+    /// The failure this story is not allowed to reproduce. Story 43.7's panel
+    /// inserts at the caret, a caret at zero put an embed above `# Title`, and
+    /// `notes_vault::note_title` falls back to the body's first line — so the
+    /// owner's vault has a note called `![[recordings/…/screen-0000.mov]]`.
+    ///
+    /// Asserted through [`naming::title_from_body`], which IS that fallback,
+    /// rather than through a `starts_with('#')` of our own: a rule the test
+    /// restates is a rule the test can be wrong about.
+    #[test]
+    fn the_heading_is_still_the_title_under_the_rule_the_vault_falls_back_to() {
+        let stub = compose(
+            &SessionFacts {
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+
+        assert_eq!(
+            naming::title_from_body(&stub.contents[stub.body_offset..]),
+            "Quarterly review"
+        );
+        // And over the body the indexer actually slices — the parser's offset,
+        // separator line included — so the stub's own offset is not what is
+        // holding the heading up.
+        let (_, at) = Frontmatter::parse(&stub.contents);
+        assert_eq!(
+            naming::title_from_body(&stub.contents[at..]),
+            "Quarterly review"
+        );
+
+        // An untitled session is the same claim with nothing to hide behind:
+        // its heading is a date, and a date is still not an embed.
+        let untitled = compose(
+            &SessionFacts {
+                title: None,
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+        assert_eq!(
+            naming::title_from_body(&untitled.contents[untitled.body_offset..]),
+            "2026-08-08"
+        );
+    }
+
+    /// A session that recorded no video gets the body it got before this story,
+    /// byte for byte. An embed block that collapsed to nothing must not leave
+    /// the blank line it would have needed behind — a stub is the one note
+    /// nobody proofreads before saving, and a trailing blank is the kind of
+    /// thing that survives into every note a person owns.
+    #[test]
+    fn a_session_with_no_video_embeds_nothing_and_gains_no_blank_line() {
+        let bare = compose(&facts(), &[]);
+        let untouched = bare.contents[bare.body_offset..].to_owned();
+        assert_eq!(untouched, "# Quarterly review\n\n");
+
+        let audio_only = [
+            "2026/keeper-rec 2026-08-08 14.23.45/mix-0000.m4a",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+        ];
+        let metadata_only = [
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+            "2026/keeper-rec 2026-08-08 14.23.45/events.log",
+        ];
+        for files in [&audio_only, &metadata_only] {
+            let stub = compose(&SessionFacts { files, ..facts() }, &[]);
+            assert_eq!(
+                &stub.contents[stub.body_offset..],
+                untouched,
+                "no video means the 42.4 body, unchanged: {files:?}"
+            );
+            assert_eq!(
+                Frontmatter::parse(&stub.contents).0.as_list("files"),
+                Some(files.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>()),
+                "the files are still listed — only the body is empty of them"
+            );
+        }
+    }
+
+    /// Every kind Story 43.5 names, in one session. What reaches the body is
+    /// cross-checked against [`kind_for_file_name`] itself rather than against a
+    /// list written out here, so a second extension table can never be added to
+    /// this module and diverge from the attachment panel's answer.
+    #[test]
+    fn only_the_files_43_5_calls_video_are_embedded() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/whiteboard.png",
+            "2026/keeper-rec 2026-08-08 14.23.45/mix-0000.m4a",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+            "2026/keeper-rec 2026-08-08 14.23.45/events.log",
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov.bak",
+            "2026/keeper-rec 2026-08-08 14.23.45/camera-0000.MOV",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let embedded: Vec<String> = links::extract(&stub.contents[stub.body_offset..])
+            .into_iter()
+            .map(|link| link.target)
+            .collect();
+
+        assert_eq!(
+            embedded,
+            vec![
+                "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov".to_owned(),
+                // A file copied in from another machine is the same video; a
+                // backup of one is not, because the LAST extension decides.
+                "2026/keeper-rec 2026-08-08 14.23.45/camera-0000.MOV".to_owned(),
+            ]
+        );
+        for file in files {
+            assert_eq!(
+                embedded.iter().any(|target| target == file),
+                matches!(kind_for_file_name(file), RecordingNoteTargetKind::Video),
+                "the body embeds exactly 43.5's videos, and {file} disagrees"
+            );
+        }
+    }
+
+    /// A file name Obsidian's wikilink grammar would eat. `]` closes the link,
+    /// `|` starts an alias, `#` starts a heading reference, and a newline ends
+    /// the link and puts a line into the note keeper did not write. Each is
+    /// legal on APFS, and an embed built from one points at a shorter path that
+    /// does not exist — a broken player in place of the recording.
+    ///
+    /// It stays in `files:`, so it stays one press away in Story 43.7's panel.
+    /// Keeper only declines to write a link it already knows is wrong.
+    #[test]
+    fn a_name_a_wikilink_cannot_express_is_listed_but_never_embedded() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/take [2].mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/a|b.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/take #3.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/one\n# Not the title.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let body = &stub.contents[stub.body_offset..];
+
+        assert_eq!(
+            links::extract(body)
+                .into_iter()
+                .map(|link| link.target)
+                .collect::<Vec<_>>(),
+            vec!["2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov".to_owned()],
+            "only the name a wikilink can carry is embedded: {body:?}"
+        );
+        assert!(
+            !body.contains("Not the title"),
+            "and no name put a line of its own into the body: {body:?}"
+        );
+        assert_eq!(
+            naming::title_from_body(body),
+            "Quarterly review",
+            "the heading is still the first line the vault reads"
+        );
+        assert_eq!(
+            stub.contents.matches("![[").count(),
+            1,
+            "the skipped names left no half-written embed behind"
+        );
+    }
+
+    /// Where the caret hint points, said out loud so moving it fails here.
+    ///
+    /// `body_offset` is the head/body split, and it stays on the heading. The
+    /// caret a person actually gets is the END of the slice taken from it — the
+    /// stop surface's `setSelectionRange(value.length, …)` — so it lands on the
+    /// blank line BELOW the embeds. Below and not above: keeper's prefill is
+    /// context and the sentence goes after it, and a caret above the embeds
+    /// would push them down the page on the first keystroke, which is the note
+    /// no longer opening as the recording.
+    ///
+    /// Moving `body_offset` past the embeds would look like a better caret hint
+    /// and would instead move them into the head that surface renders read-only,
+    /// making the one thing keeper just wrote the one thing nobody can delete.
+    #[test]
+    fn the_body_offset_is_the_heading_and_the_writers_line_is_below_the_embeds() {
+        let stub = compose(
+            &SessionFacts {
+                files: &TWO_TRACKS,
+                ..facts()
+            },
+            &[],
+        );
+
+        assert!(
+            stub.contents[..stub.body_offset].ends_with("---\n\n"),
+            "everything before the offset is keeper's block and its separator"
+        );
+        assert!(
+            stub.contents[stub.body_offset..].starts_with("# Quarterly review\n"),
+            "the offset lands on the heading, which therefore stays editable"
+        );
+
+        let editable = &stub.contents[stub.body_offset..];
+        assert!(
+            editable.contains("![[2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov]]"),
+            "the embeds are inside the editable half, not in the read-only head"
+        );
+        assert!(
+            editable.ends_with("camera-0000.mov]]\n\n"),
+            "the caret at the end of that half sits under the last embed: {editable:?}"
+        );
+    }
+
+    /// Omitted, never labelled: a session that closed no segment must not leave
+    /// `files:` standing over nothing. Asserted against the rendered text and
+    /// not against a length, because an empty list and a bare key both measure
+    /// zero and both are exactly what this forbids.
+    #[test]
+    fn a_session_with_no_files_carries_no_files_key_at_all() {
+        let stub = compose(
+            &SessionFacts {
+                files: &[],
+                ..facts()
+            },
+            &[],
+        );
+
+        assert!(
+            !stub.contents.contains("files"),
+            "the key is absent from the block entirely, not present and empty: {}",
+            stub.contents
+        );
+        assert_eq!(Frontmatter::parse(&stub.contents).0.as_list("files"), None);
+    }
+
+    /// The same rule the tags list obeys, for the same reason: a nameless entry
+    /// in a note is worse than no key, because nothing can be done with it and
+    /// the note does not even say what went missing.
+    #[test]
+    fn a_blank_file_entry_is_dropped_rather_than_listed_nameless() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+            "   ",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let (fm, _) = Frontmatter::parse(&stub.contents);
+
+        assert_eq!(
+            fm.as_list("files"),
+            Some(vec![files[0].to_owned(), files[2].to_owned()])
+        );
+        assert!(
+            stub.contents.contains(concat!(
+                "files:\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov\n",
+                "  - 2026/keeper-rec 2026-08-08 14.23.45/manifest.json\n",
+            )),
+            "the two real files are adjacent, so the blank produced no line at all: {}",
+            stub.contents
+        );
+
+        // Nothing but blanks is nothing: the key goes with them.
+        let all_blank = compose(
+            &SessionFacts {
+                files: &["", "  "],
+                ..facts()
+            },
+            &[],
+        );
+        assert!(
+            !all_blank.contents.contains("files"),
+            "a list that emptied out takes its key with it: {}",
+            all_blank.contents
+        );
+    }
+
+    /// FR-145 for the new key, asserted the way
+    /// `no_line_of_the_stub_carries_an_absolute_path` asserts it for the rest of
+    /// the block: over every value the list actually holds, so a file that
+    /// arrived absolute is caught here whichever one it is.
+    #[test]
+    fn no_file_in_the_list_is_written_as_an_absolute_path() {
+        let files = [
+            "2026/keeper-rec 2026-08-08 14.23.45/screen-0000.mov",
+            "2026/keeper-rec 2026-08-08 14.23.45/manifest.json",
+        ];
+        let stub = compose(
+            &SessionFacts {
+                files: &files,
+                ..facts()
+            },
+            &[],
+        );
+        let listed = Frontmatter::parse(&stub.contents)
+            .0
+            .as_list("files")
+            .expect("this session has files");
+
+        assert_eq!(listed.len(), 2);
+        for path in &listed {
+            assert!(
+                !path.starts_with('/'),
+                "a note never carries an absolute path, got {path}"
+            );
+            assert!(
+                path.starts_with("2026/keeper-rec 2026-08-08 14.23.45/"),
+                "each file is in the same frame as `recording:` — relative to the destination \
+                 root — got {path}"
+            );
+        }
+        assert!(
+            !stub.contents.contains("/Users/"),
+            "and no absolute prefix reaches any other line either"
         );
     }
 
@@ -426,8 +1081,11 @@ mod tests {
         );
     }
 
+    /// `participants:` is still an omit-do-not-label field. `tags:` no longer
+    /// can be: Story 43.2 gives every stub the kind tag, so a session carrying
+    /// none of its own has a tag list of exactly one.
     #[test]
-    fn a_session_with_no_participants_and_no_tags_omits_those_lines_entirely() {
+    fn a_session_with_no_participants_omits_that_line_and_still_carries_its_kind_tag() {
         let stub = compose(
             &SessionFacts {
                 participants: None,
@@ -439,12 +1097,15 @@ mod tests {
         let (fm, _) = Frontmatter::parse(&stub.contents);
 
         assert_eq!(fm.get("participants"), None);
-        assert_eq!(fm.get("tags"), None);
         assert!(
             !stub.contents.contains("participants:"),
             "an absent fact is omitted, not emitted as an empty label"
         );
-        assert!(!stub.contents.contains("tags:"));
+        assert!(
+            stub.contents.contains("tags:"),
+            "a session with no tags of its own is still findable as a recording"
+        );
+        assert_eq!(fm.as_list("tags"), Some(vec![RECORDINGS_TAG.to_owned()]));
         // What it does still say, so the omission is not mistaken for the
         // composer having given up.
         assert_eq!(fm.as_string("title"), Some("Quarterly review"));
@@ -466,7 +1127,7 @@ mod tests {
     /// `meta.tags` is a UI split of a comma-separated field, so a trailing comma
     /// really does arrive as an empty element.
     #[test]
-    fn empty_tags_are_dropped_and_an_all_blank_tag_list_omits_the_line() {
+    fn empty_tags_are_dropped_and_an_all_blank_tag_list_leaves_only_the_kind_tag() {
         let mixed = ["work".to_owned(), "  ".to_owned(), " late ".to_owned()];
         let stub = compose(
             &SessionFacts {
@@ -477,7 +1138,11 @@ mod tests {
         );
         assert_eq!(
             Frontmatter::parse(&stub.contents).0.as_list("tags"),
-            Some(vec!["work".to_owned(), "late".to_owned()])
+            Some(vec![
+                "work".to_owned(),
+                "late".to_owned(),
+                RECORDINGS_TAG.to_owned()
+            ])
         );
 
         let blank = ["".to_owned(), "   ".to_owned()];
@@ -488,10 +1153,95 @@ mod tests {
             },
             &[],
         );
-        assert!(
-            !stub.contents.contains("tags:"),
-            "a list with nothing in it is no list"
+        assert_eq!(
+            Frontmatter::parse(&stub.contents).0.as_list("tags"),
+            Some(vec![RECORDINGS_TAG.to_owned()]),
+            "a list with nothing in it is the kind tag alone, never a nameless entry"
         );
+    }
+
+    /// The constant is only allowed to be a literal because it is *also* what
+    /// the vocabulary makes of it. If a future normalisation rule ever changed
+    /// that, this file would emit a tag the tag tree files under a different
+    /// name — the exact twin-node failure Story 42.5 closed — and it would show
+    /// up here rather than in somebody's sidebar.
+    #[test]
+    fn the_kind_tag_is_already_what_the_vocabulary_makes_of_it() {
+        assert_eq!(
+            tags::normalise(RECORDINGS_TAG).as_deref(),
+            Some(RECORDINGS_TAG)
+        );
+    }
+
+    /// AC, first half (Story 43.2, FR-147): the stub says what KIND of note it
+    /// is, and it says so *after* the session's own tags, which arrive
+    /// untouched and in the order the user typed them.
+    #[test]
+    fn the_kind_tag_follows_the_sessions_own_tags_and_changes_none_of_them() {
+        let own = [
+            "Zeta".to_owned(),
+            "client/Acme ".to_owned(),
+            "alpha".to_owned(),
+        ];
+        let stub = compose(
+            &SessionFacts {
+                tags: &own,
+                ..facts()
+            },
+            &[],
+        );
+        assert_eq!(
+            Frontmatter::parse(&stub.contents).0.as_list("tags"),
+            Some(vec![
+                "Zeta".to_owned(),
+                "client/Acme".to_owned(),
+                "alpha".to_owned(),
+                RECORDINGS_TAG.to_owned()
+            ]),
+            "the user's own text and their own order survive; keeper's tag trails it"
+        );
+    }
+
+    /// AC, second half: the tag is the vocabulary's, not a literal. Every one
+    /// of these spellings already *is* `recordings` to the tag tree, so
+    /// appending keeper's own would put two chips on one note that resolve to
+    /// one node — and the writer would see keeper disagree with them about
+    /// their own vocabulary.
+    #[test]
+    fn a_session_that_already_says_recordings_in_any_spelling_gets_exactly_one() {
+        for spelling in [
+            "recordings",
+            "Recordings",
+            "RECORDINGS",
+            "recordings ",
+            "  Recordings",
+            "#recordings",
+        ] {
+            let own = ["work".to_owned(), spelling.to_owned()];
+            let stub = compose(
+                &SessionFacts {
+                    tags: &own,
+                    ..facts()
+                },
+                &[],
+            );
+            let written = Frontmatter::parse(&stub.contents)
+                .0
+                .as_list("tags")
+                .expect("a stub always carries a tag list");
+
+            assert_eq!(
+                written,
+                vec!["work".to_owned(), spelling.trim().to_owned()],
+                "{spelling:?}: keeper adds nothing beside a tag that is already this one"
+            );
+            let canonical = tags::normalise_all(written.iter().map(String::as_str));
+            assert_eq!(
+                canonical.iter().filter(|t| *t == RECORDINGS_TAG).count(),
+                1,
+                "{spelling:?}: exactly one node in the tag tree, not a near-identical pair"
+            );
+        }
     }
 
     /// A manifest that predates Story 21.5 has no stamps at all. The stub must
@@ -625,5 +1375,33 @@ mod tests {
         );
         assert_eq!(&stub.contents[stub.body_offset..], "# Café résumé\n\n");
         assert!(stub.contents[..stub.body_offset].ends_with("---\n\n"));
+    }
+
+    /// The predicate the Recordings lens and the properties panel both key on,
+    /// asserted against a stub this module composed rather than against a
+    /// hand-written block — so the writer and the reader cannot drift apart.
+    #[test]
+    fn a_composed_stub_is_recognised_as_a_recording_note() {
+        let stub = compose(&facts(), &[]);
+        let (fm, _) = Frontmatter::parse(&stub.contents);
+        assert!(is_recording_note(&fm));
+    }
+
+    /// A note that merely mentions files is somebody's own note. Keeper does not
+    /// claim it, list it under Recordings, or put a recording's buttons in it.
+    #[test]
+    fn a_note_without_a_session_is_not_a_recording_note() {
+        let (fm, _) = Frontmatter::parse(
+            "---\ntitle: Groceries\nfiles:\n  - list.txt\nrecording: 2026/whatever\n---\n\nbody\n",
+        );
+        assert!(!is_recording_note(&fm));
+    }
+
+    /// A bare `session:` parses to a key with an empty value, and a recording
+    /// whose identity is blank can never be resolved — so it is not one.
+    #[test]
+    fn a_blank_session_value_is_not_an_identity() {
+        let (fm, _) = Frontmatter::parse("---\ntitle: Half a stub\nsession:   \n---\n\nbody\n");
+        assert!(!is_recording_note(&fm));
     }
 }

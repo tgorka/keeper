@@ -29,7 +29,10 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use keeper_sync::engine::Engine;
+use keeper_sync::engine::{Engine, VerifyReport};
+use keeper_sync::lfs::audit::RemoteAudit;
+use keeper_sync::lfs::hydrate::{ContentRefusal, Materialization, Pin, Release};
+use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
 use keeper_sync::provenance::SyncSource;
@@ -130,6 +133,16 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         // A cancelled operation is not a failure — the type's own contract says
         // so, and a graceful SIGTERM must not make systemd log a failed unit.
         SyncError::Cancelled => EXIT_OK,
+        // Neither is an overlapping run. The work is being done by whoever got
+        // the folder first, so a one-shot that lands here did nothing wrong and
+        // must not earn a `Restart=on-failure` for losing a race.
+        SyncError::Busy(_) => EXIT_OK,
+        // A refusal ends the command without doing what was asked, which for a
+        // one-shot verb is a failed run: an agent or a script that asked for a
+        // file and did not get it must be able to see that in `$?`. Never
+        // `EXIT_CONFIG` — nothing about the configuration is wrong when keeper
+        // declines to overwrite a file the user edited.
+        SyncError::Refused(_) => EXIT_FAILURE,
         SyncError::GitCommand { .. }
         | SyncError::Network { .. }
         | SyncError::Auth { .. }
@@ -149,6 +162,13 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         | SyncError::Integrity { .. }
         | SyncError::Quota { .. }
         | SyncError::Diverged { .. }
+        // Beside `Diverged`, and for a one-shot run only. In the supervisor
+        // being overtaken is a race the next reconcile settles (DW-207), but a
+        // `sync --once` that ends here published nothing this pass — and a pass
+        // that did not publish is a failed pass, which is exactly what
+        // `Restart=on-failure` should see. The restart meets a fetch first, so
+        // it converges rather than looping.
+        | SyncError::RemoteMoved { .. }
         | SyncError::Journal(_)
         | SyncError::Git(_)
         | SyncError::Io { .. } => EXIT_FAILURE,
@@ -238,6 +258,105 @@ pub enum Command {
     Verify {
         /// Profile id or name. Omit for all profiles.
         profile: Option<String>,
+        /// Re-publish anything the server is missing that this machine can
+        /// still supply, instead of only reporting it (DW-208). Moves bytes.
+        #[arg(long, requires = "remote")]
+        repair: bool,
+        /// Also ask the server whether it holds every object the pointers name.
+        ///
+        /// The half that finds permanent loss: a pointer whose object never
+        /// reached the server is a valid blob, a clean status and content only
+        /// one machine still has. Costs one batch round trip per few hundred
+        /// objects and transfers nothing.
+        #[arg(long)]
+        remote: bool,
+    },
+    /// List the LFS paths in a folder and whether this machine holds them.
+    ///
+    /// The honest size of every row is the one the pointer names, never the
+    /// ~130 bytes of pointer text a virtual path holds on disk (FR-336). Reads
+    /// the index, the worktree and the materialization ledger; transfers
+    /// nothing and writes nothing.
+    LsFiles {
+        /// Profile id or name. Omit for all profiles.
+        profile: Option<String>,
+        /// Also ask the server whether it holds every object the pointers
+        /// name, and splice the answer in under `remote`.
+        ///
+        /// Costs one batch round trip per few hundred objects, which is why it
+        /// is opt-in: without it the key is ABSENT from the document rather
+        /// than null, so a consumer can tell "nobody asked" from "the server
+        /// answered" (FR-337).
+        #[arg(long)]
+        remote: bool,
+    },
+    /// Ask for one virtual path's content (FR-338).
+    ///
+    /// Publishes the file inline when this machine already holds the object,
+    /// and otherwise queues the transfer and says so — the running daemon
+    /// delivers it, because this verb has no event loop to wait on. A path
+    /// whose worktree bytes are neither the committed pointer nor the content
+    /// it names is **refused by name** and left exactly as it is: keeper does
+    /// not overwrite a local modification.
+    Materialize {
+        /// Profile id or name. Required: materializing is a write, and "all
+        /// folders" is not a thing anybody means by it.
+        profile: String,
+        /// The path inside the folder, as `ls-files` spells it.
+        subpath: String,
+    },
+    /// Release one path's content, leaving the pointer this folder committed
+    /// (FR-332, FR-333).
+    ///
+    /// `materialize`'s inverse, and the verb where a mistake destroys the only
+    /// copy — so it refuses before it writes anything: the folder keeps every
+    /// object it holds (so a release there would be undone), the file is not
+    /// the content this folder committed, something has it open (or this
+    /// machine cannot tell), nothing has confirmed the server can serve the
+    /// object, the path is pinned, or there was no content here to begin with.
+    /// The last of those is a no-op and exits 0; every other refusal exits 1
+    /// and changes nothing on disk.
+    ///
+    /// A release whose **bookkeeping** failed afterwards still exits 0 and
+    /// still reports the release: by then the content is gone, and calling a
+    /// completed deletion a failure would be the one lie this contract cannot
+    /// afford. `Engine::dehydrate_entry` logs what it could not record.
+    Dehydrate {
+        /// Profile id or name. Required: releasing is a deletion, and "all
+        /// folders" is not a thing anybody means by it.
+        profile: String,
+        /// The path inside the folder, as `ls-files` spells it.
+        subpath: String,
+    },
+    /// Keep one path's content on this machine, whatever the release sweep
+    /// thinks (FR-334).
+    ///
+    /// A standing instruction about a path, not an operation on content: it
+    /// writes one column and touches no file, so a path may be pinned before it
+    /// has ever been materialized. It is the absolute floor `dehydrate` and the
+    /// automatic release sweep both read — a pinned path is never released, at
+    /// any age, by either.
+    ///
+    /// Refused for a path this folder does not track as an LFS path: a pin
+    /// recorded against something no release will ever consider would be a
+    /// promise nothing keeps.
+    Pin {
+        /// Profile id or name. Required: a pin is about one folder's path.
+        profile: String,
+        /// The path inside the folder, as `ls-files` spells it.
+        subpath: String,
+    },
+    /// Withdraw a pin, making the path an ordinary release candidate again
+    /// (FR-334).
+    ///
+    /// `pin`'s inverse and nothing more: it clears one column and leaves both
+    /// release clocks exactly as they were, so the path is due whenever it
+    /// would have been due had it never been pinned.
+    Unpin {
+        /// Profile id or name. Required: a pin is about one folder's path.
+        profile: String,
+        /// The path inside the folder, as `ls-files` spells it.
+        subpath: String,
     },
     /// Check every prerequisite and report what is broken.
     Doctor,
@@ -289,6 +408,15 @@ pub enum LfsDirection {
         #[arg(long, value_name = "DIR")]
         repo: PathBuf,
     },
+    /// Serve git's long-running filter protocol until the pipe closes.
+    ///
+    /// The shape `filter.lfs.process` is registered as, and the one git
+    /// actually uses when it is set — see `keeper_sync::lfs::filter` for why
+    /// registering only clean/smudge left the filter unreachable.
+    FilterProcess {
+        #[arg(long, value_name = "DIR")]
+        repo: PathBuf,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -325,14 +453,25 @@ pub struct AddArgs {
     pub removable: bool,
     #[arg(long, value_name = "BYTES")]
     pub lfs_threshold_bytes: Option<u64>,
-    /// Release local LFS objects once the remote holds them.
+    /// Release local LFS objects once the remote holds them. Now the default.
     ///
     /// Reclaims the second copy every LFS file has on the machine where it
     /// originated. The worktree keeps every file; only the redundant object in
     /// `.git/lfs/objects` goes, and only when the journal owes no transfer for
-    /// it. Trades a self-sufficient local copy for a smaller one.
+    /// it and the remote has confirmed it holds the content.
+    ///
+    /// Kept as a flag after the default flipped so existing scripts keep
+    /// working and keep saying what they mean; it now asks for what a profile
+    /// does anyway.
     #[arg(long)]
     pub lfs_prune_local: bool,
+    /// Keep the second local copy of every LFS object — the opt-out.
+    ///
+    /// For a folder that has to be restorable with no network: the object
+    /// store stays a complete local copy, so a file the worktree loses can be
+    /// recovered offline. It costs roughly twice the disk.
+    #[arg(long, conflicts_with = "lfs_prune_local")]
+    pub no_lfs_prune_local: bool,
     /// Glob that must never go through LFS, whatever its size. Repeatable.
     ///
     /// The recorded `.gitattributes` rule is per-extension, so one oversized
@@ -489,9 +628,33 @@ pub async fn run(
             let engine = engine_for(&platform, config)?;
             cmd_set_enabled(&printer, &engine, &profile, true)
         }
-        Command::Verify { profile } => {
+        Command::Verify {
+            profile,
+            remote,
+            repair,
+        } => {
             let engine = engine_for(&platform, config)?;
-            cmd_verify(&printer, &engine, profile.as_deref()).await
+            cmd_verify(&printer, &engine, profile.as_deref(), remote, repair).await
+        }
+        Command::LsFiles { profile, remote } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_ls_files(&printer, &engine, profile.as_deref(), remote).await
+        }
+        Command::Materialize { profile, subpath } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_materialize(&printer, &engine, &profile, &subpath)
+        }
+        Command::Dehydrate { profile, subpath } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_dehydrate(&printer, &engine, &profile, &subpath).await
+        }
+        Command::Pin { profile, subpath } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_pin(&printer, &engine, &profile, &subpath, true)
+        }
+        Command::Unpin { profile, subpath } => {
+            let engine = engine_for(&platform, config)?;
+            cmd_pin(&printer, &engine, &profile, &subpath, false)
         }
         Command::Sync { profile, once } => {
             let engine = engine_for(&platform, config)?;
@@ -663,7 +826,12 @@ fn cmd_add(
     profile.subpaths = args.subpath.clone();
     profile.excludes = args.exclude.clone();
     profile.lfs_never = args.lfs_never.clone();
-    profile.lfs_prune_local = args.lfs_prune_local;
+    // Only the opt-out is applied. Assigning the flag itself would make every
+    // `add` that does not pass it an opt-out, which is how a changed default
+    // gets quietly undone by the tool that is supposed to honour it.
+    if args.no_lfs_prune_local {
+        profile.lfs_prune_local = false;
+    }
     profile.tags = args.tag.clone();
     profile.removable = args.removable;
     profile.author_override = args.author.clone();
@@ -1004,39 +1172,164 @@ fn join_outcome(
 // verify
 // ---------------------------------------------------------------------------
 
+/// One profile's verification as a human reads it (Story 25.6, Story 56.6).
+///
+/// **Pure, and returning lines rather than printing them**, for the reason
+/// [`ls_files_lines`] is: [`Printer`] writes to process stdout, so an assertion
+/// about what this verb *says* would otherwise need the binary spawned — and
+/// the claim worth asserting is a claim about a string.
+///
+/// The `virtual` count is the whole anti-quietness argument in one word. Since
+/// Story 56.6 `verify` excuses an authorized virtual path instead of calling it
+/// a fault, and a row that is suppressed and reported *nowhere* is
+/// indistinguishable from a check that stopped running. So the count is
+/// rendered unconditionally, in both forms, beside the two numbers that were
+/// always there.
+///
+/// `Err` is a folder whose verify could not run at all — a `.keepervirtual`
+/// that will not compile (FR-329) is the ordinary way — and it is one folder's
+/// line rather than the end of the verb. See [`cmd_verify`].
+fn verify_lines(profile: &SyncProfile, report: Result<&VerifyReport, &str>) -> Vec<String> {
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => return vec![format!("{}: could not be checked: {error}", profile.name)],
+    };
+    let mut lines = vec![format!(
+        "{}: {} checked, {} bad, {} virtual",
+        profile.name,
+        report.checked,
+        report.bad.len(),
+        report.virtual_paths
+    )];
+    lines.extend(
+        report
+            .bad
+            .iter()
+            .map(|(path, reason)| format!("  {path}: {reason}")),
+    );
+    lines
+}
+
+/// One profile's verification as the `--json` document carries it.
+///
+/// The key set is the contract, and `virtual` joins it for the reason
+/// [`verify_lines`] renders the count: suppressed and nowhere reported is not a
+/// state this document may describe. `profileId` and `profile` are the same two
+/// keys [`ls_files_entry`] carries, so an operator with three folders reads
+/// both documents the same way.
+///
+/// An `Err` entry carries `error` and **no** `bad` array. A consumer must be
+/// able to tell "this folder was checked and nothing was wrong" from "this
+/// folder was never checked", and an empty array cannot say the second.
+fn verify_entry(profile: &SyncProfile, report: Result<&VerifyReport, &str>) -> serde_json::Value {
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            return serde_json::json!({
+                "profileId": profile.id,
+                "profile": profile.name,
+                "error": error,
+            })
+        }
+    };
+    serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "checked": report.checked,
+        "virtual": report.virtual_paths,
+        "bad": report.bad
+            .iter()
+            .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Check every selected folder, and let one folder's failure be one folder's.
+///
+/// A `?` on the per-profile `verify` used to discard every report already
+/// computed, skip every folder still to come, and emit no `--json` document at
+/// all — so a typo in one folder's `.keepervirtual` blinded the operator to the
+/// other two. Contained instead: the failure is that folder's own entry, it
+/// counts against the exit code, and the loop carries on.
 async fn cmd_verify(
     printer: &Printer,
     engine: &Engine,
     wanted: Option<&str>,
+    remote: bool,
+    repair: bool,
 ) -> std::result::Result<(), CliError> {
     let profiles = engine.list_profiles()?;
     let selected: Vec<SyncProfile> = select(&profiles, wanted)?.into_iter().cloned().collect();
 
     let mut reports = Vec::with_capacity(selected.len());
     let mut bad_total = 0usize;
+    let mut missing_total = 0usize;
+    let mut refused_total = 0usize;
     for profile in &selected {
-        let report = engine.verify(&profile.id).await?;
-        bad_total += report.bad.len();
-        printer.line(format!(
-            "{}: {} checked, {} bad",
-            profile.name,
-            report.checked,
-            report.bad.len()
-        ));
-        for (path, reason) in &report.bad {
-            printer.line(format!("  {path}: {reason}"));
+        let checked = match engine.verify(&profile.id).await {
+            Ok(report) => report,
+            Err(err) => {
+                let reason = err.to_string();
+                refused_total += 1;
+                for line in verify_lines(profile, Err(reason.as_str())) {
+                    printer.line(line);
+                }
+                reports.push(verify_entry(profile, Err(reason.as_str())));
+                // The remote half of a folder whose local half never ran would
+                // be an audit of an unknown, and `--repair` over it would be a
+                // write decided from one.
+                continue;
+            }
+        };
+        bad_total += checked.bad.len();
+        for line in verify_lines(profile, Ok(&checked)) {
+            printer.line(line);
         }
-        reports.push(serde_json::json!({
-            "profileId": profile.id,
-            "profile": profile.name,
-            "checked": report.checked,
-            "bad": report.bad
-                .iter()
-                .map(|(path, reason)| serde_json::json!({ "path": path, "reason": reason }))
-                .collect::<Vec<_>>(),
-        }));
+        let mut entry = verify_entry(profile, Ok(&checked));
+
+        if remote {
+            let audit = engine.audit_remote_objects(&profile.id).await?;
+            missing_total += audit.missing.len();
+            printer.line(format!(
+                "{}: {} pointer(s) on the server, {} missing ({:.2} GB)",
+                profile.name,
+                audit.checked,
+                audit.missing.len(),
+                audit.missing_bytes() as f64 / 1_073_741_824.0
+            ));
+            for object in &audit.missing {
+                printer.line(format!(
+                    "  {} ({} bytes): {}",
+                    object.path, object.size, object.reason
+                ));
+            }
+            entry["remote"] = serde_json::to_value(&audit).unwrap_or(serde_json::Value::Null);
+
+            if repair && !audit.is_intact() {
+                let fixed = engine.republish_missing_objects(&profile.id).await?;
+                printer.line(format!(
+                    "{}: queued {} object(s) for re-upload ({:.2} GB); {} beyond this machine",
+                    profile.name,
+                    fixed.queued,
+                    fixed.queued_bytes as f64 / 1_073_741_824.0,
+                    fixed.unrecoverable.len()
+                ));
+                for object in &fixed.unrecoverable {
+                    printer.line(format!("  {} ({} bytes)", object.path, object.size));
+                }
+                // Only what nobody here can put back still counts against the
+                // exit code: an upload that is queued is a problem being fixed.
+                missing_total -= audit.missing.len() - fixed.unrecoverable.len();
+                entry["repair"] = serde_json::to_value(&fixed).unwrap_or(serde_json::Value::Null);
+            }
+        }
+        reports.push(entry);
     }
-    printer.json(&serde_json::json!({ "verified": reports, "bad": bad_total }));
+    printer.json(&serde_json::json!({
+        "verified": reports,
+        "bad": bad_total,
+        "missingOnRemote": missing_total,
+    }));
 
     if bad_total > 0 {
         // Corrupt content is a real failure, and a cron wrapper must see it.
@@ -1044,6 +1337,505 @@ async fn cmd_verify(
             "{bad_total} object(s) failed verification"
         )));
     }
+    if missing_total > 0 {
+        // Louder than a warning on purpose: content that exists on exactly one
+        // machine is one disk failure from gone, and the only thing that can
+        // still save it is somebody noticing today.
+        return Err(CliError::Operational(format!(
+            "{missing_total} pointer(s) name content the server does not have"
+        )));
+    }
+    if refused_total > 0 {
+        // Last, so neither gate above is weakened or reworded, and non-zero
+        // regardless: a check that could not run is not a check that passed.
+        return Err(CliError::Operational(format!(
+            "{refused_total} folder(s) could not be checked"
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ls-files
+// ---------------------------------------------------------------------------
+
+/// One profile's listing as a human reads it (Story 56.2, FR-336, FR-337).
+///
+/// **Pure, and returning lines rather than printing them.** [`Printer`] writes
+/// to process stdout, so an assertion about what this verb *says* would
+/// otherwise need the binary spawned — and the claim worth asserting is a claim
+/// about a string: that the size named is the four megabytes the pointer stands
+/// for and never the ~130 bytes of pointer text the worktree actually holds.
+///
+/// The state word comes from [`LfsFileState`]'s own [`std::fmt::Display`],
+/// which is the same string the `--json` form carries, so the two renderings
+/// cannot come to call one row two different things.
+///
+/// The oid is printed in full rather than abbreviated. It is the handle
+/// `verify`, the store and every later verb take, and a prefix somebody has to
+/// expand by hand is not a handle.
+fn ls_files_lines(profile_name: &str, files: &[LfsFile]) -> Vec<String> {
+    if files.is_empty() {
+        // An honest empty answer, not an error: a folder with no LFS paths —
+        // or one whose `lfs_mode` is `disabled` — has nothing to list, and
+        // saying so beats a failure about a feature nobody asked for.
+        return vec![format!("{profile_name}: no LFS paths")];
+    }
+    let counted = |wanted: LfsFileState| files.iter().filter(|f| f.state == wanted).count();
+    let mut lines = vec![format!(
+        "{profile_name}: {total} LFS path(s) — {virtual_count} virtual, \
+         {materialized} materialized, {absent} absent",
+        total = files.len(),
+        virtual_count = counted(LfsFileState::Virtual),
+        materialized = counted(LfsFileState::Materialized),
+        absent = counted(LfsFileState::Absent),
+    )];
+    lines.extend(files.iter().map(|file| {
+        format!(
+            "  {state:<12}  {size:>9}  {path}  {oid}{pinned}",
+            state = file.state,
+            size = format_bytes(file.size_bytes),
+            path = file.path,
+            oid = file.oid,
+            pinned = if file.pinned { "  [pinned]" } else { "" },
+        )
+    }));
+    lines
+}
+
+/// One profile's listing as the `--json` document carries it.
+///
+/// The key set is the contract (FR-337): `files` is [`LfsFile`]'s own
+/// serialization, unmodified, and `total` is beside it so a consumer that only
+/// wants the count does not have to parse the array. `profileId` and `profile`
+/// mirror what `verify` puts on its per-profile entry, because an operator with
+/// three folders configured reads both documents the same way.
+///
+/// `remote` is a **parameter**, and `None` is what makes the key absent rather
+/// than `null`. Absent means "nobody asked the server"; `null` cannot say that,
+/// and a consumer has to be able to tell it from "the server answered and holds
+/// nothing". Taking it here rather than splicing it in afterwards is what lets
+/// the contract be asserted: the branch that decides absence is in a function a
+/// test can call, not in an `if` around an `await`.
+///
+/// Note that `total` counts **paths** while `remote.checked` counts
+/// path-to-object usages over the objects the batch API was asked about, so the
+/// two are not the same number and are not meant to reconcile.
+fn ls_files_entry(
+    profile: &SyncProfile,
+    files: &[LfsFile],
+    remote: Option<&RemoteAudit>,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "total": files.len(),
+        "files": files,
+    });
+    if let Some(audit) = remote {
+        entry["remote"] = serde_json::to_value(audit).unwrap_or(serde_json::Value::Null);
+    }
+    entry
+}
+
+/// The whole `--json` document, envelope included.
+///
+/// The envelope is as much of the contract as the rows are — renaming
+/// `listings` breaks every consumer — so it is built here where a test can
+/// assert it, rather than inline in [`cmd_ls_files`] where nothing could.
+fn ls_files_document(listings: Vec<serde_json::Value>) -> serde_json::Value {
+    let total: usize = listings
+        .iter()
+        .map(|entry| entry["total"].as_u64().unwrap_or(0) as usize)
+        .sum();
+    serde_json::json!({ "listings": listings, "total": total })
+}
+
+/// List every LFS path in the selected profiles, and whether this machine holds
+/// its content.
+///
+/// [`Engine::lfs_files`] reads the index, the worktree and the ledger and
+/// creates nothing; `--remote` adds one batch round trip per few hundred
+/// objects and still transfers nothing. Objects the server is missing are
+/// *reported* and do not change the exit code — this is a listing, and
+/// `verify --remote` is the command whose job is to fail on them.
+async fn cmd_ls_files(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: Option<&str>,
+    remote: bool,
+) -> std::result::Result<(), CliError> {
+    let profiles = engine.list_profiles()?;
+    let selected: Vec<SyncProfile> = select(&profiles, wanted)?.into_iter().cloned().collect();
+
+    let mut listings = Vec::with_capacity(selected.len());
+    for profile in &selected {
+        let files = engine.lfs_files(&profile.id)?;
+        for line in ls_files_lines(&profile.name, &files) {
+            printer.line(line);
+        }
+        // The one place the flag is read. `None` past this point is the whole
+        // absent-versus-answered contract, and it is carried as a value rather
+        // than as a later mutation.
+        let audit = if remote {
+            Some(engine.audit_remote_objects(&profile.id).await?)
+        } else {
+            None
+        };
+        if let Some(audit) = &audit {
+            printer.line(format!(
+                "{}: {} pointer(s) on the server, {} missing ({})",
+                profile.name,
+                audit.checked,
+                audit.missing.len(),
+                format_bytes(audit.missing_bytes()),
+            ));
+            for object in &audit.missing {
+                printer.line(format!(
+                    "  {} ({}): {}",
+                    object.path,
+                    format_bytes(object.size),
+                    object.reason
+                ));
+            }
+        }
+        listings.push(ls_files_entry(profile, &files, audit.as_ref()));
+    }
+    printer.json(&ls_files_document(listings));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// materialize
+// ---------------------------------------------------------------------------
+
+/// One materialization as a human reads it.
+///
+/// Pure, and taking the profile's name rather than the profile, so the sentence
+/// a person reads is asserted by a test that owns no engine. One line: this
+/// verb settles exactly one path, and a header over a single row would be
+/// noise.
+///
+/// The size is the **pointer's**, never the ~130 bytes of pointer text a
+/// virtual path holds on disk (FR-336) — the same discipline `ls-files` states,
+/// and the number is the one a person was asking about when they asked for the
+/// file.
+///
+/// The outcome word is [`MaterializeOutcome`]'s own [`std::fmt::Display`],
+/// which is prose; the `--json` form carries serde's camelCase spelling of the
+/// same variant, so one enum still decides what happened and each surface
+/// spells it the way its reader expects.
+fn materialize_lines(profile_name: &str, done: &Materialization) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{profile_name}: {outcome}  {size}  {path}",
+        outcome = done.outcome,
+        size = format_bytes(done.size_bytes),
+        path = done.path,
+    )];
+    if let Some(unit) = done.unit_id {
+        // Said out loud because this verb does NOT wait: `keeper-syncd` has no
+        // event subscription, so the object is delivered by the supervisor —
+        // and by the supervisor's own next pass, since this process's `wake_now`
+        // reaches only its own engine. An operator with no daemon running would
+        // otherwise wait for something that is never going to happen.
+        lines.push(format!(
+            "  queued as unit {unit}; a running `keeper-syncd watch` fetches it \
+             on its next pass"
+        ));
+    }
+    lines
+}
+
+/// One materialization as the `--json` document carries it.
+///
+/// The key set is the contract: `profileId`, `profile`, `path`, `oid`,
+/// `sizeBytes`, `outcome` — plus `unitId` **only** when something was queued.
+///
+/// Absent rather than null, and built by naming the keys here rather than by
+/// serializing [`Materialization`], for the reason `ls_files_entry` states:
+/// `null` cannot distinguish "nothing was queued" from "a unit whose id we
+/// lost", and a derived serialization would emit exactly that `null`. The
+/// branch that decides absence is therefore in a function a test can call.
+fn materialize_json(profile: &SyncProfile, done: &Materialization) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "path": done.path,
+        "oid": done.oid,
+        "sizeBytes": done.size_bytes,
+        "outcome": done.outcome,
+    });
+    if let Some(unit) = done.unit_id {
+        entry["unitId"] = serde_json::json!(unit);
+    }
+    entry
+}
+
+/// Ask for one path's content in one folder.
+///
+/// [`Engine::materialize_entry`] holds every decision — containment, the mode,
+/// the index, the cone, whether the bytes on disk may be replaced, and whether
+/// the object is here or has to be fetched. This function selects the profile
+/// and prints; adding any policy here would be the second implementation AD-52
+/// exists to prevent.
+///
+/// A required profile, resolved through [`select`] so a mistyped name is
+/// refused with the alternatives named rather than silently addressing a
+/// different folder. `select` returns a list because its other callers accept
+/// `None` for "every profile"; this verb writes to one worktree, so it takes
+/// the one match and prints its document exactly once.
+fn cmd_materialize(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: &str,
+    subpath: &str,
+) -> std::result::Result<(), CliError> {
+    let profiles = engine.list_profiles()?;
+    let matched = select(&profiles, Some(wanted))?;
+    let [profile] = matched[..] else {
+        // `select` refuses a selector nothing matches and names the
+        // alternatives; what it cannot refuse is a selector matching two
+        // folders, because nothing makes a profile's NAME unique. For a read
+        // verb the answer is both listings; for a write there is no defensible
+        // arbitrary choice, so this asks for the id.
+        return Err(SyncError::Config(format!(
+            "`{wanted}` matches {} folders; name the one you mean by its id",
+            matched.len()
+        ))
+        .into());
+    };
+
+    let done = engine
+        .materialize_entry(&profile.id, subpath)
+        .map_err(|err| {
+            // `Busy` is `EXIT_OK` for `sync --once`, where losing a race did no
+            // wrong and a `Restart=on-failure` unit must not fire for it. This verb
+            // promises one path now holds content, so a run that did not deliver it
+            // has to be visible in `$?` — the same reasoning the `Refused` arm of
+            // `sync_exit_code` carries.
+            match err {
+                SyncError::Busy(name) => CliError::Operational(format!(
+                    "{name} is busy syncing right now; ask again in a moment"
+                )),
+                other => other.into(),
+            }
+        })?;
+    for line in materialize_lines(&profile.name, &done) {
+        printer.line(line);
+    }
+    printer.json(&materialize_json(profile, &done));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// dehydrate
+// ---------------------------------------------------------------------------
+
+/// One release as a human reads it.
+///
+/// Pure, taking the profile's *name*, for [`materialize_lines`]'s reason. One
+/// line, because this verb settles exactly one path and it either released it
+/// or refused.
+///
+/// The size is the **pointer's**: the bytes this machine no longer holds, which
+/// is the number a person asking for space back was asking about. The word is
+/// prose — `released` — and it is not the `--json` document's `outcome` token
+/// by coincidence rather than by sharing a function; see
+/// [`already_pointer_line`], where the two genuinely differ.
+fn dehydrate_line(profile_name: &str, done: &Release) -> String {
+    format!(
+        "{profile_name}: released  {size}  {path}",
+        size = format_bytes(done.size_bytes),
+        path = done.path,
+    )
+}
+
+/// One release as the `--json` document carries it.
+///
+/// The key set is the contract: `profileId`, `profile`, `path`, `oid`,
+/// `sizeBytes`, `outcome`. Built by naming the keys rather than by serializing
+/// [`Release`], for the reason [`materialize_json`] states and because the
+/// sibling document below has a deliberately *narrower* key set that no single
+/// derived serialization could produce.
+fn dehydrate_json(profile: &SyncProfile, done: &Release) -> serde_json::Value {
+    serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "path": done.path,
+        "oid": done.oid,
+        "sizeBytes": done.size_bytes,
+        "outcome": "released",
+    })
+}
+
+/// The no-op line: there was no content here to release.
+///
+/// Prose, not the wire word. `alreadyPointer` in a sentence a person reads is a
+/// token that escaped from a JSON document — [`MaterializeOutcome`]'s own
+/// `Display` doc makes the same distinction for the same reason.
+fn already_pointer_line(profile_name: &str, path: &str) -> String {
+    format!("{profile_name}: already a pointer  {path}")
+}
+
+/// The no-op document: `profileId`, `profile`, `path`, `outcome` — and
+/// **no** `oid`, **no** `sizeBytes`.
+///
+/// Absent rather than null, and this is the sharper case of the rule
+/// [`materialize_json`] follows: nothing was released, so there is no size to
+/// report, and `sizeBytes: 0` would read as "released, nothing in it" while
+/// `sizeBytes: null` would read as "released something and lost the number". A
+/// consumer totalling reclaimed bytes must be able to skip this document
+/// without arithmetic.
+fn already_pointer_json(profile: &SyncProfile, path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "path": path,
+        "outcome": "alreadyPointer",
+    })
+}
+
+/// The one refusal that is not a failure, and the path it is about.
+///
+/// [`Engine::dehydrate_entry`] returns `Ok` only when it actually released
+/// something, so "there was nothing here to release" arrives as
+/// [`ContentRefusal::AlreadyPointer`] — a typed error a caller can branch on,
+/// which is what makes every refusal one uniform contract. Both halves of
+/// that are literal: it has to be distinguishable *by type*, and it must not be
+/// something a caller has to handle as a failure.
+///
+/// This is where the two meet, and it is a pure function with its own test
+/// precisely because "the refusals really are distinguishable" is the claim
+/// being made. Matching on the message would have been the other reading, and
+/// it is the one that stops working the first time a sentence is reworded.
+fn nothing_to_release(err: &SyncError) -> Option<&str> {
+    match err {
+        SyncError::Refused(ContentRefusal::AlreadyPointer { path }) => Some(path),
+        _ => None,
+    }
+}
+
+/// Let one path's content go in one folder.
+///
+/// [`Engine::dehydrate_entry`] holds every decision — containment, the mode,
+/// the index, the cone, whether these are the committed bytes, whether the path
+/// is pinned, whether the server can serve the object, and whether anything has
+/// the file open. This function selects the profile, branches on the one
+/// refusal that is a no-op, and prints.
+///
+/// A required profile resolved through [`select`], and a two-folder name match
+/// refused by asking for the id — [`cmd_materialize`]'s rule, and it matters
+/// more here: there is no defensible arbitrary choice about which folder to
+/// delete from.
+async fn cmd_dehydrate(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: &str,
+    subpath: &str,
+) -> std::result::Result<(), CliError> {
+    let profiles = engine.list_profiles()?;
+    let matched = select(&profiles, Some(wanted))?;
+    let [profile] = matched[..] else {
+        return Err(SyncError::Config(format!(
+            "`{wanted}` matches {} folders; name the one you mean by its id",
+            matched.len()
+        ))
+        .into());
+    };
+
+    let done = match engine.dehydrate_entry(&profile.id, subpath).await {
+        Ok(done) => done,
+        Err(err) => {
+            // Nothing to do is not a failed run: the caller asked for this path
+            // to hold nothing but its pointer, and it does.
+            if let Some(path) = nothing_to_release(&err) {
+                printer.line(already_pointer_line(&profile.name, path));
+                printer.json(&already_pointer_json(profile, path));
+                return Ok(());
+            }
+            // Every other refusal exits 1 through `sync_exit_code`. `Busy` is
+            // `EXIT_OK` for `sync --once`, where losing a race did no wrong;
+            // this verb promises the content is gone, so a run that did not do
+            // it has to be visible in `$?` — `cmd_materialize`'s reasoning.
+            return Err(match err {
+                SyncError::Busy(name) => CliError::Operational(format!(
+                    "{name} is busy syncing right now; ask again in a moment"
+                )),
+                other => other.into(),
+            });
+        }
+    };
+    printer.line(dehydrate_line(&profile.name, &done));
+    printer.json(&dehydrate_json(profile, &done));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// pin / unpin
+// ---------------------------------------------------------------------------
+
+/// One pin instruction as a human reads it.
+///
+/// Pure, taking the profile's *name*, for [`dehydrate_line`]'s reason. Prose
+/// rather than the wire word: `pinned: true` in a sentence a person reads is a
+/// field that escaped from a JSON document.
+fn pin_line(profile_name: &str, done: &Pin) -> String {
+    format!(
+        "{profile_name}: {state}  {path}",
+        state = if done.pinned { "pinned" } else { "unpinned" },
+        path = done.path,
+    )
+}
+
+/// One pin instruction as the `--json` document carries it.
+///
+/// The key set is the contract: `profileId`, `profile`, `path`, `pinned` — and
+/// nothing else. No `oid` and no `sizeBytes`, because a pin says nothing about
+/// content and may be recorded for a path whose bytes are not here; a size of
+/// `0` or a null oid would both be answers to a question nobody asked.
+/// Built by naming the keys rather than by serializing [`Pin`], for
+/// [`dehydrate_json`]'s reason.
+fn pin_json(profile: &SyncProfile, done: &Pin) -> serde_json::Value {
+    serde_json::json!({
+        "profileId": profile.id,
+        "profile": profile.name,
+        "path": done.path,
+        "pinned": done.pinned,
+    })
+}
+
+/// Set or clear one path's pin in one folder.
+///
+/// [`Engine::pin_entry`] holds every decision — containment, whether this
+/// folder tracks the path at all, and the write. This function selects the
+/// profile and prints, exactly as [`cmd_dehydrate`] does.
+///
+/// A required profile resolved through [`select`], and a two-folder name match
+/// refused by asking for the id: [`cmd_materialize`]'s rule.
+///
+/// Synchronous, unlike [`cmd_dehydrate`], because a pin takes no reservation
+/// and makes no round trip — there is nothing here to await, and so no `Busy`
+/// to remap either.
+fn cmd_pin(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: &str,
+    subpath: &str,
+    pinned: bool,
+) -> std::result::Result<(), CliError> {
+    let profiles = engine.list_profiles()?;
+    let matched = select(&profiles, Some(wanted))?;
+    let [profile] = matched[..] else {
+        return Err(SyncError::Config(format!(
+            "`{wanted}` matches {} folders; name the one you mean by its id",
+            matched.len()
+        ))
+        .into());
+    };
+
+    let done = engine.pin_entry(&profile.id, subpath, pinned)?;
+    printer.line(pin_line(&profile.name, &done));
+    printer.json(&pin_json(profile, &done));
     Ok(())
 }
 
@@ -1649,12 +2441,16 @@ fn cmd_update(printer: &Printer, check_only: bool) -> Result<(), CliError> {
 fn cmd_lfs_filter(direction: LfsDirection) -> Result<(), CliError> {
     use keeper_sync::lfs::filter;
 
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
     let (repo, which) = match &direction {
         LfsDirection::Clean { repo, .. } => (repo.clone(), filter::Direction::Clean),
         LfsDirection::Smudge { repo, .. } => (repo.clone(), filter::Direction::Smudge),
+        LfsDirection::FilterProcess { repo } => {
+            filter::run_process(repo, &mut stdin.lock(), &mut stdout.lock())?;
+            return Ok(());
+        }
     };
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
     filter::run(&repo, which, &mut stdin.lock(), &mut stdout.lock())?;
     Ok(())
 }
@@ -1664,6 +2460,7 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
     use clap::CommandFactory as _;
+    use keeper_sync::lfs::hydrate::MaterializeOutcome;
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
@@ -1699,10 +2496,18 @@ mod tests {
             &["keeper-syncd", "sync", "--once"],
             &["keeper-syncd", "sync", "docs", "--once"],
             &["keeper-syncd", "watch"],
+            &["keeper-syncd", "materialize", "docs", "40-media/clip.mp4"],
+            &["keeper-syncd", "dehydrate", "docs", "40-media/clip.mp4"],
+            &["keeper-syncd", "pin", "docs", "40-media/clip.mp4"],
+            &["keeper-syncd", "unpin", "docs", "40-media/clip.mp4"],
             &["keeper-syncd", "pause", "docs"],
             &["keeper-syncd", "resume", "docs"],
             &["keeper-syncd", "verify"],
             &["keeper-syncd", "verify", "docs"],
+            &["keeper-syncd", "ls-files"],
+            &["keeper-syncd", "ls-files", "docs"],
+            &["keeper-syncd", "ls-files", "--remote"],
+            &["keeper-syncd", "ls-files", "docs", "--remote"],
             &["keeper-syncd", "doctor"],
             &["keeper-syncd", "logs"],
             &["keeper-syncd", "logs", "-n", "20"],
@@ -1735,8 +2540,26 @@ mod tests {
                 .expect_err("a profile is required to pause or resume one");
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
         }
+        // `materialize`, `dehydrate`, `pin` and `unpin` each need two: a folder
+        // and a path inside it. One argument is the shape a person trying
+        // `materialize clip.mp4` produces, and it must be told what is missing
+        // rather than have `clip.mp4` read as a profile name.
+        for args in [
+            vec!["keeper-syncd", "materialize"],
+            vec!["keeper-syncd", "materialize", "docs"],
+            vec!["keeper-syncd", "dehydrate"],
+            vec!["keeper-syncd", "dehydrate", "docs"],
+            vec!["keeper-syncd", "pin"],
+            vec!["keeper-syncd", "pin", "docs"],
+            vec!["keeper-syncd", "unpin"],
+            vec!["keeper-syncd", "unpin", "docs"],
+        ] {
+            let err = parse(&args).expect_err("a profile AND a subpath are required");
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{args:?}");
+        }
         // ...and the optional ones really are optional.
         assert!(parse(&["keeper-syncd", "verify"]).is_ok());
+        assert!(parse(&["keeper-syncd", "ls-files"]).is_ok());
     }
 
     #[test]
@@ -1935,6 +2758,16 @@ mod tests {
                 ),
                 EXIT_FAILURE,
             ),
+            // Story 56.3's one new variant. `EXIT_FAILURE` and not
+            // `EXIT_CONFIG`: an agent that asked for a file and was told keeper
+            // will not overwrite the edit there has to see a non-zero `$?`,
+            // and nothing about the configuration is wrong.
+            (
+                SyncError::Refused(keeper_sync::lfs::hydrate::ContentRefusal::LocallyModified {
+                    path: "40-media/clip.mp4".to_owned(),
+                }),
+                EXIT_FAILURE,
+            ),
         ];
 
         for (err, expected) in cases {
@@ -2082,5 +2915,719 @@ mod tests {
         assert_eq!(CheckStatus::Warn.label(), "warn");
         assert_eq!(CheckStatus::Fail.label(), "FAIL");
         assert_ne!(CheckStatus::Warn, CheckStatus::Fail);
+    }
+
+    // --- ls-files: the two renderings are the contract -------------------
+
+    fn lfs_file(path: &str, state: LfsFileState, size_bytes: u64) -> LfsFile {
+        LfsFile {
+            path: path.to_owned(),
+            oid: "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea".to_owned(),
+            size_bytes,
+            state,
+            mtime_ms: Some(1_700_000_000_123),
+            materialized_at_ms: None,
+            last_used_ms: None,
+            synced_at_ms: None,
+            pinned: false,
+        }
+    }
+
+    /// The human line names the honest size, and never the pointer's own byte
+    /// count (FR-336).
+    ///
+    /// The 4 MiB virtual path is the whole story in one row: the file on disk is
+    /// about 130 bytes, and an implementation that reported `metadata().len()`
+    /// would put `130 B` here. Asserted on the rendered string because that
+    /// string is what an operator reads and what an agent greps.
+    #[test]
+    fn the_human_line_carries_the_state_the_pointers_size_and_the_oid() {
+        let files = [
+            lfs_file("media/away.mp4", LfsFileState::Virtual, 4 * 1024 * 1024),
+            lfs_file("media/held.mp4", LfsFileState::Materialized, 2_048),
+            lfs_file("media/gone.mp4", LfsFileState::Absent, 99),
+        ];
+        let lines = ls_files_lines("Field", &files);
+
+        assert_eq!(lines.len(), 4, "a header and one line per path: {lines:?}");
+        assert!(
+            lines[0].contains("3 LFS path(s)")
+                && lines[0].contains("1 virtual")
+                && lines[0].contains("1 materialized")
+                && lines[0].contains("1 absent"),
+            "the header counts every state: {}",
+            lines[0]
+        );
+
+        let virtual_line = &lines[1];
+        assert!(virtual_line.contains("virtual"), "{virtual_line}");
+        assert!(
+            virtual_line.contains("4.0 MB"),
+            "the size is the one the pointer names: {virtual_line}"
+        );
+        assert!(
+            virtual_line.contains(&files[0].oid),
+            "the full oid is the handle every later verb takes: {virtual_line}"
+        );
+        assert!(
+            !virtual_line.contains("130"),
+            "the pointer's own byte count must never appear: {virtual_line}"
+        );
+        assert!(lines[2].contains("materialized") && lines[2].contains("2.0 KB"));
+        assert!(lines[3].contains("absent") && lines[3].contains("99 B"));
+    }
+
+    /// A folder with no LFS paths says so instead of failing — the `disabled`
+    /// and the no-LFS-at-all cases both arrive here as an empty slice.
+    #[test]
+    fn an_empty_listing_is_one_honest_line() {
+        assert_eq!(ls_files_lines("Field", &[]), vec!["Field: no LFS paths"]);
+    }
+
+    /// A pinned row says so, because 56.5's release sweep treats `pinned` as a
+    /// floor it may not cross and an operator has to be able to see which paths
+    /// are behind it.
+    #[test]
+    fn a_pinned_row_is_marked_in_the_human_form() {
+        let mut file = lfs_file("keep.bin", LfsFileState::Materialized, 10);
+        file.pinned = true;
+        let lines = ls_files_lines("Field", std::slice::from_ref(&file));
+        assert!(lines[1].contains("[pinned]"), "{}", lines[1]);
+        assert!(
+            !ls_files_lines("Field", &[lfs_file("x.bin", LfsFileState::Absent, 1)])[1]
+                .contains("[pinned]"),
+            "and an unpinned row is not marked"
+        );
+    }
+
+    /// FR-337 calls the JSON form stable, so the assertion is on the KEY SET
+    /// rather than on a substring: a renamed or dropped field is the breakage
+    /// that matters to a consumer, and a `contains` check would miss both. The
+    /// envelope is asserted for the same reason — renaming `listings` breaks
+    /// every consumer and would otherwise break no gate.
+    #[test]
+    fn the_json_documents_key_set_is_exactly_the_contract() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let files = [lfs_file("a.bin", LfsFileState::Virtual, 4 * 1024 * 1024)];
+        let entry = ls_files_entry(&profile, &files, None);
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["files", "profile", "profileId", "total"]);
+        assert_eq!(object["total"], serde_json::json!(1));
+        assert_eq!(object["profileId"], serde_json::json!("01DOCS"));
+
+        let row = object["files"][0].as_object().expect("one file object");
+        let mut row_keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        row_keys.sort_unstable();
+        assert_eq!(
+            row_keys,
+            vec![
+                "lastUsedMs",
+                "materializedAtMs",
+                "mtimeMs",
+                "oid",
+                "path",
+                "pinned",
+                "sizeBytes",
+                "state",
+                "syncedAtMs",
+            ]
+        );
+        assert_eq!(row["state"], serde_json::json!("virtual"));
+        assert_eq!(
+            row["sizeBytes"],
+            serde_json::json!(4 * 1024 * 1024),
+            "the pointer's number, not the ~130 bytes on disk"
+        );
+
+        let document = ls_files_document(vec![entry.clone(), entry]);
+        let envelope = document.as_object().expect("an object");
+        let mut envelope_keys: Vec<&str> = envelope.keys().map(String::as_str).collect();
+        envelope_keys.sort_unstable();
+        assert_eq!(envelope_keys, vec!["listings", "total"]);
+        assert_eq!(
+            envelope["total"],
+            serde_json::json!(2),
+            "the envelope's total is every profile's paths added up"
+        );
+        assert_eq!(envelope["listings"].as_array().expect("array").len(), 2);
+    }
+
+    /// Without `--remote` the key is ABSENT, not null (FR-337).
+    ///
+    /// The distinction is the whole point of making the round trip opt-in: a
+    /// consumer must be able to tell "nobody asked the server" from "the server
+    /// answered and holds nothing", and `null` cannot say the first. Asserted
+    /// through the renderer's own parameter rather than by re-enacting a splice:
+    /// `None` is what `cmd_ls_files` passes when the flag is absent, so the
+    /// branch under test is the branch that ships.
+    #[test]
+    fn the_remote_key_is_absent_unless_remote_was_asked_for() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let files = [lfs_file("a.bin", LfsFileState::Virtual, 10)];
+
+        let plain = ls_files_entry(&profile, &files, None);
+        assert!(
+            !plain.as_object().expect("object").contains_key("remote"),
+            "no round trip was made, so there is no key to carry: {plain}"
+        );
+
+        let audit = RemoteAudit::default();
+        let asked = ls_files_entry(&profile, &files, Some(&audit));
+        assert!(
+            asked.as_object().expect("object").contains_key("remote"),
+            "and when it was asked for, the audit document is there: {asked}"
+        );
+        assert!(
+            !asked["remote"].is_null(),
+            "present-and-null is the one value the contract says cannot occur: {asked}"
+        );
+
+        // ...and the flag really is optional and really does parse.
+        assert!(matches!(
+            parse(&["keeper-syncd", "ls-files"]).expect("parse").command,
+            Command::LsFiles { remote: false, .. }
+        ));
+        assert!(matches!(
+            parse(&["keeper-syncd", "ls-files", "--remote"])
+                .expect("parse")
+                .command,
+            Command::LsFiles { remote: true, .. }
+        ));
+    }
+
+    // --- verify: the two renderings are the contract (Story 56.6) ----------
+
+    fn verified(checked: u64, virtual_paths: u64, bad: &[(&str, &str)]) -> VerifyReport {
+        VerifyReport {
+            checked,
+            virtual_paths,
+            bad: bad
+                .iter()
+                .map(|(path, reason)| ((*path).to_owned(), (*reason).to_owned()))
+                .collect(),
+        }
+    }
+
+    /// The whole anti-quietness argument is this string, and until now nothing
+    /// asserted it.
+    ///
+    /// `verify` no longer reports an authorized virtual path as a fault, so the
+    /// only thing standing between "excused correctly" and "stopped looking" is
+    /// a count on the line an operator reads. A thousand quiet paths with no
+    /// number beside them is the failure this story could have shipped.
+    #[test]
+    fn the_human_line_counts_what_was_excused_beside_what_was_wrong() {
+        let profile = SyncProfile::new("01DOCS", "Field", "/srv/docs", "https://x/d.git");
+        let lines = verify_lines(
+            &profile,
+            Ok(&verified(
+                1_001,
+                1_000,
+                &[("30-docs/report.bin", "LFS object abc is missing locally")],
+            )),
+        );
+
+        assert_eq!(
+            lines.len(),
+            2,
+            "a header and one line per bad path: {lines:?}"
+        );
+        assert_eq!(lines[0], "Field: 1001 checked, 1 bad, 1000 virtual");
+        assert_eq!(
+            lines[1],
+            "  30-docs/report.bin: LFS object abc is missing locally"
+        );
+    }
+
+    /// A clean folder still says how many paths are deliberately away, because
+    /// zero bad and a thousand virtual is the normal state Epic 56 created and
+    /// an operator has to be able to see it.
+    #[test]
+    fn a_clean_folder_still_names_its_virtual_count() {
+        let profile = SyncProfile::new("01DOCS", "Field", "/srv/docs", "https://x/d.git");
+        assert_eq!(
+            verify_lines(&profile, Ok(&verified(1_000, 1_000, &[]))),
+            vec!["Field: 1000 checked, 0 bad, 1000 virtual"]
+        );
+    }
+
+    /// The JSON form's key set is what a consumer parses, so `virtual` is
+    /// asserted as a KEY and not as a substring: a renamed or dropped field is
+    /// the breakage that matters, and a `contains` check would miss both.
+    #[test]
+    fn the_verify_entrys_key_set_carries_the_virtual_count() {
+        let profile = SyncProfile::new("01DOCS", "Field", "/srv/docs", "https://x/d.git");
+        let entry = verify_entry(
+            &profile,
+            Ok(&verified(
+                7,
+                4,
+                &[("a.bin", "LFS object abc is missing locally")],
+            )),
+        );
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["bad", "checked", "profile", "profileId", "virtual"]
+        );
+        assert_eq!(object["virtual"], serde_json::json!(4));
+        assert_eq!(object["checked"], serde_json::json!(7));
+        assert_eq!(
+            object["bad"],
+            serde_json::json!([{ "path": "a.bin", "reason": "LFS object abc is missing locally" }])
+        );
+    }
+
+    /// A folder whose verify could not run is its own entry, and it carries
+    /// `error` with **no** `bad` array.
+    ///
+    /// Both halves matter. The entry exists because a `?` used to discard every
+    /// report already computed and emit no document at all, so one folder's
+    /// `.keepervirtual` typo blinded the operator to the folders beside it. The
+    /// absent `bad` matters because an empty array cannot distinguish "checked,
+    /// nothing wrong" from "never checked", and those are the two answers a
+    /// consumer must never confuse.
+    #[test]
+    fn a_folder_that_could_not_be_checked_is_its_own_entry_and_not_a_clean_one() {
+        let profile = SyncProfile::new("01DOCS", "Field", "/srv/docs", "https://x/d.git");
+        let reason = "40-media/[unclosed in .keepervirtual is not a valid pattern";
+
+        assert_eq!(
+            verify_lines(&profile, Err(reason)),
+            vec![format!("Field: could not be checked: {reason}")]
+        );
+
+        let entry = verify_entry(&profile, Err(reason));
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["error", "profile", "profileId"]);
+        assert_eq!(object["error"], serde_json::json!(reason));
+        assert!(
+            !object.contains_key("bad"),
+            "an empty `bad` would read as a folder that was checked: {entry}"
+        );
+        assert!(!object.contains_key("virtual"));
+    }
+
+    // --- materialize: the two renderings are the contract (Story 56.3) ------
+
+    fn materialization(outcome: MaterializeOutcome, unit_id: Option<i64>) -> Materialization {
+        Materialization {
+            path: "40-media/clip.mp4".to_owned(),
+            oid: "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea".to_owned(),
+            size_bytes: 4 * 1024 * 1024,
+            outcome,
+            unit_id,
+        }
+    }
+
+    /// The human line names the outcome, the honest size and the path.
+    ///
+    /// The size assertion is the load-bearing one: it is derived from the
+    /// `size_bytes` the pointer named — 4 MiB — where the file on disk before
+    /// the call is about 130 bytes, so a renderer reading the worktree's own
+    /// length could not produce this string (FR-336). Asserted by moving the
+    /// field rather than by looking for the absence of `130`, which no possible
+    /// body of a function with no filesystem access could have printed.
+    #[test]
+    fn the_human_line_carries_the_outcome_the_honest_size_and_the_path() {
+        let lines = materialize_lines(
+            "Field",
+            &materialization(MaterializeOutcome::Materialized, None),
+        );
+        assert_eq!(lines.len(), 1, "one path, one line: {lines:?}");
+        assert!(lines[0].contains("materialized"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("4.0 MB"),
+            "the size is the one the pointer names: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("40-media/clip.mp4"), "{}", lines[0]);
+
+        // The same renderer over a pointer-text-sized number, so the field the
+        // line reads is pinned rather than assumed: 4 MiB above and 130 B here
+        // can only both hold if `size_bytes` is what is rendered.
+        let mut small = materialization(MaterializeOutcome::Materialized, None);
+        small.size_bytes = 130;
+        assert!(
+            materialize_lines("Field", &small)[0].contains("130 B"),
+            "the line renders `size_bytes`, whatever it says"
+        );
+
+        // Prose in the sentence, camelCase on the wire: one enum, two
+        // spellings, each where its reader expects it.
+        let already = materialize_lines(
+            "Field",
+            &materialization(MaterializeOutcome::AlreadyMaterialized, None),
+        );
+        assert!(
+            already[0].contains("already materialized"),
+            "a person reads a sentence, not a JSON token: {}",
+            already[0]
+        );
+
+        // A queued outcome says who will deliver it, because this verb does not
+        // wait and an operator with no daemon running would otherwise wait for
+        // something that cannot happen.
+        let queued = materialize_lines(
+            "Field",
+            &materialization(MaterializeOutcome::Queued, Some(42)),
+        );
+        assert_eq!(queued.len(), 2, "{queued:?}");
+        assert!(queued[0].contains("queued"), "{}", queued[0]);
+        assert!(
+            queued[1].contains("unit 42") && queued[1].contains("watch"),
+            "{}",
+            queued[1]
+        );
+    }
+
+    /// The JSON key set is the promise, so the assertion is on the KEY SET.
+    ///
+    /// A renamed or dropped field is the breakage that matters to a consumer
+    /// and a `contains` check would miss both — the same reasoning
+    /// `the_json_documents_key_set_is_exactly_the_contract` states for
+    /// `ls-files`.
+    #[test]
+    fn the_materialize_json_key_set_is_exactly_the_contract() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let done = materialization(MaterializeOutcome::Queued, Some(42));
+        let entry = materialize_json(&profile, &done);
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "oid",
+                "outcome",
+                "path",
+                "profile",
+                "profileId",
+                "sizeBytes",
+                "unitId",
+            ]
+        );
+        assert_eq!(object["profileId"], serde_json::json!("01DOCS"));
+        assert_eq!(object["outcome"], serde_json::json!("queued"));
+        assert_eq!(object["unitId"], serde_json::json!(42));
+        assert_eq!(
+            object["sizeBytes"],
+            serde_json::json!(4 * 1024 * 1024),
+            "the pointer's number, not the ~130 bytes on disk"
+        );
+    }
+
+    /// `unitId` is ABSENT for an outcome that queued nothing, not null.
+    ///
+    /// `null` would say "there is a unit and I do not know its id", which is a
+    /// thing that cannot happen — and a consumer polling for delivery has to be
+    /// able to tell "nothing to wait for" from "wait for this". Asserted
+    /// through the renderer's own parameter, so the branch under test is the
+    /// branch that ships.
+    #[test]
+    fn the_unit_id_is_absent_unless_something_was_queued() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        for outcome in [
+            MaterializeOutcome::Materialized,
+            MaterializeOutcome::AlreadyMaterialized,
+        ] {
+            let entry = materialize_json(&profile, &materialization(outcome, None));
+            assert!(
+                !entry.as_object().expect("object").contains_key("unitId"),
+                "nothing was queued, so there is no key to carry: {entry}"
+            );
+        }
+        // The wire spelling is serde's, and it is camelCase where the prose is
+        // a sentence: pinned here because a consumer branches on this string.
+        assert_eq!(
+            materialize_json(
+                &profile,
+                &materialization(MaterializeOutcome::AlreadyMaterialized, None)
+            )["outcome"],
+            serde_json::json!("alreadyMaterialized")
+        );
+    }
+
+    /// Two positionals, in that order, and neither optional.
+    #[test]
+    fn materialize_takes_a_folder_and_a_path_inside_it() {
+        let cli =
+            parse(&["keeper-syncd", "materialize", "docs", "40-media/clip.mp4"]).expect("parse");
+        let Command::Materialize { profile, subpath } = cli.command else {
+            panic!("expected materialize");
+        };
+        assert_eq!(profile, "docs");
+        assert_eq!(subpath, "40-media/clip.mp4");
+    }
+
+    // --- dehydrate: the two documents and the exit-0 branch (Story 56.4) ----
+
+    fn release() -> Release {
+        Release {
+            path: "40-media/clip.mp4".to_owned(),
+            oid: "3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea".to_owned(),
+            size_bytes: 4 * 1024 * 1024,
+        }
+    }
+
+    /// Two positionals, in that order, and neither optional.
+    #[test]
+    fn dehydrate_takes_a_folder_and_a_path_inside_it() {
+        let cli =
+            parse(&["keeper-syncd", "dehydrate", "docs", "40-media/clip.mp4"]).expect("parse");
+        let Command::Dehydrate { profile, subpath } = cli.command else {
+            panic!("expected dehydrate");
+        };
+        assert_eq!(profile, "docs");
+        assert_eq!(subpath, "40-media/clip.mp4");
+    }
+
+    /// The released line carries the honest size and the path, in prose.
+    ///
+    /// The size assertion is the load-bearing one and it is pinned by moving
+    /// the field: 4 MiB and 130 B can only both hold if `size_bytes` is what is
+    /// rendered — and after a release the file on disk is the ~130 bytes, so a
+    /// renderer reading the worktree would have printed the wrong number.
+    #[test]
+    fn the_released_line_carries_the_honest_size_and_the_path() {
+        let line = dehydrate_line("Field", &release());
+        assert!(line.contains("released"), "{line}");
+        assert!(
+            line.contains("4.0 MB"),
+            "the bytes given back are the pointer's number: {line}"
+        );
+        assert!(line.contains("40-media/clip.mp4"), "{line}");
+
+        let mut small = release();
+        small.size_bytes = 130;
+        assert!(
+            dehydrate_line("Field", &small).contains("130 B"),
+            "the line renders `size_bytes`, whatever it says"
+        );
+    }
+
+    /// The no-op line says so in prose, never in the wire word.
+    ///
+    /// `alreadyPointer` in a sentence a person reads is a token that escaped
+    /// from a JSON document — `MaterializeOutcome`'s `Display` doc makes the
+    /// same distinction for the same reason.
+    #[test]
+    fn the_already_pointer_line_is_prose_and_not_the_wire_word() {
+        let line = already_pointer_line("Field", "40-media/clip.mp4");
+        assert!(line.contains("already a pointer"), "{line}");
+        assert!(line.contains("40-media/clip.mp4"), "{line}");
+        assert!(
+            !line.contains("alreadyPointer"),
+            "the camelCase spelling belongs to the document, not the sentence: {line}"
+        );
+    }
+
+    /// The released document's key set is exactly the contract.
+    #[test]
+    fn the_dehydrate_json_key_set_is_exactly_the_contract() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let entry = dehydrate_json(&profile, &release());
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "oid",
+                "outcome",
+                "path",
+                "profile",
+                "profileId",
+                "sizeBytes"
+            ]
+        );
+        assert_eq!(object["profileId"], serde_json::json!("01DOCS"));
+        assert_eq!(object["outcome"], serde_json::json!("released"));
+        assert_eq!(
+            object["sizeBytes"],
+            serde_json::json!(4 * 1024 * 1024),
+            "the pointer's number, not the ~130 bytes now on disk"
+        );
+    }
+
+    /// The no-op document says `alreadyPointer` and carries **no** `oid` and
+    /// **no** `sizeBytes`.
+    ///
+    /// Absent, not null and not zero: nothing was released, so a consumer
+    /// totalling reclaimed bytes has to be able to skip this document without
+    /// arithmetic. Asserted on the key set, because a renamed or added field is
+    /// exactly the breakage a `contains` check would miss.
+    #[test]
+    fn the_already_pointer_json_carries_no_oid_and_no_size() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let entry = already_pointer_json(&profile, "40-media/clip.mp4");
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["outcome", "path", "profile", "profileId"]);
+        assert_eq!(object["outcome"], serde_json::json!("alreadyPointer"));
+        assert_eq!(object["path"], serde_json::json!("40-media/clip.mp4"));
+    }
+
+    /// Exactly one refusal is a no-op; every other one is a failed run.
+    ///
+    /// The branch that gives `dehydrate` its exit-0 case, asserted over the
+    /// whole vocabulary rather than over the one variant it matches — because
+    /// the claim is that the refusals are distinguishable *by type*, and a
+    /// second variant leaking through here would silently turn a refused
+    /// deletion into a reported success.
+    #[test]
+    fn only_already_pointer_is_nothing_to_release() {
+        assert_eq!(
+            nothing_to_release(&SyncError::Refused(ContentRefusal::AlreadyPointer {
+                path: "40-media/clip.mp4".to_owned(),
+            })),
+            Some("40-media/clip.mp4"),
+            "and it hands back the path, so the no-op line can name it"
+        );
+
+        let path = "40-media/clip.mp4".to_owned();
+        let others = [
+            ContentRefusal::Modified { path: path.clone() },
+            ContentRefusal::Open { path: path.clone() },
+            ContentRefusal::OpenUnknown { path: path.clone() },
+            ContentRefusal::UnprovenOnRemote { path: path.clone() },
+            ContentRefusal::Pinned { path: path.clone() },
+            ContentRefusal::Missing { path: path.clone() },
+            ContentRefusal::NotTracked { path: path.clone() },
+            ContentRefusal::OutsideSubpaths { path: path.clone() },
+            ContentRefusal::LocallyModified { path: path.clone() },
+            ContentRefusal::ContentNotHere { path },
+            ContentRefusal::Paused {
+                profile: "docs".to_owned(),
+            },
+            ContentRefusal::LfsDisabled {
+                profile: "docs".to_owned(),
+            },
+            ContentRefusal::AlwaysMaterializes {
+                profile: "docs".to_owned(),
+            },
+        ];
+        for refusal in others {
+            let err = SyncError::Refused(refusal.clone());
+            assert_eq!(
+                nothing_to_release(&err),
+                None,
+                "{refusal:?} is a refused release, so the command must fail"
+            );
+            assert_eq!(
+                sync_exit_code(&err),
+                EXIT_FAILURE,
+                "...and exit 1: {refusal:?}"
+            );
+        }
+
+        // Nor is anything that is not a refusal at all.
+        assert_eq!(nothing_to_release(&SyncError::MediaAbsent), None);
+        assert_eq!(
+            nothing_to_release(&SyncError::Busy("docs".to_owned())),
+            None
+        );
+    }
+
+    // --- pin / unpin: the verb that makes 56.4's floor reachable (56.5) -----
+
+    /// Two positionals, in that order, and neither optional — for both verbs.
+    #[test]
+    fn pin_and_unpin_each_take_a_folder_and_a_path_inside_it() {
+        let cli = parse(&["keeper-syncd", "pin", "docs", "40-media/clip.mp4"]).expect("parse");
+        let Command::Pin { profile, subpath } = cli.command else {
+            panic!("expected pin");
+        };
+        assert_eq!(profile, "docs");
+        assert_eq!(subpath, "40-media/clip.mp4");
+
+        let cli = parse(&["keeper-syncd", "unpin", "docs", "40-media/clip.mp4"]).expect("parse");
+        let Command::Unpin { profile, subpath } = cli.command else {
+            panic!("expected unpin");
+        };
+        assert_eq!(profile, "docs");
+        assert_eq!(subpath, "40-media/clip.mp4");
+    }
+
+    /// The human line says which way the instruction went, in prose.
+    #[test]
+    fn the_pin_line_says_pinned_or_unpinned_in_prose() {
+        let pinned = pin_line(
+            "Field",
+            &Pin {
+                path: "40-media/clip.mp4".to_owned(),
+                pinned: true,
+            },
+        );
+        assert!(pinned.contains("pinned"), "{pinned}");
+        assert!(pinned.contains("40-media/clip.mp4"), "{pinned}");
+        assert!(
+            !pinned.contains("true"),
+            "the boolean belongs to the document, not the sentence: {pinned}"
+        );
+
+        let unpinned = pin_line(
+            "Field",
+            &Pin {
+                path: "40-media/clip.mp4".to_owned(),
+                pinned: false,
+            },
+        );
+        assert!(unpinned.contains("unpinned"), "{unpinned}");
+        assert!(
+            !unpinned.contains("false"),
+            "same rule the other way round: {unpinned}"
+        );
+    }
+
+    /// The pin document's key set is exactly the contract.
+    ///
+    /// No `oid` and no `sizeBytes`, and that is the sharp part: a pin says
+    /// nothing about content and may be recorded for a path whose bytes are not
+    /// here, so either key would be an answer to a question nobody asked.
+    #[test]
+    fn the_pin_json_key_set_is_exactly_the_contract() {
+        let profile = SyncProfile::new("01DOCS", "docs", "/srv/docs", "https://x/d.git");
+        let entry = pin_json(
+            &profile,
+            &Pin {
+                path: "40-media/clip.mp4".to_owned(),
+                pinned: true,
+            },
+        );
+
+        let object = entry.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["path", "pinned", "profile", "profileId"]);
+        assert_eq!(object["profileId"], serde_json::json!("01DOCS"));
+        assert_eq!(object["profile"], serde_json::json!("docs"));
+        assert_eq!(object["path"], serde_json::json!("40-media/clip.mp4"));
+        assert_eq!(
+            object["pinned"],
+            serde_json::json!(true),
+            "a boolean, so a consumer branches on a type rather than on a word"
+        );
+
+        let cleared = pin_json(
+            &profile,
+            &Pin {
+                path: "40-media/clip.mp4".to_owned(),
+                pinned: false,
+            },
+        );
+        assert_eq!(cleared["pinned"], serde_json::json!(false));
     }
 }

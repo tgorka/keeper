@@ -34,7 +34,7 @@
 use std::fmt;
 use std::fmt::Write as _;
 
-use crate::notes::{line_bounds, line_number};
+use crate::notes::{bom_len, line_bounds, line_number};
 
 /// A frontmatter value in the Obsidian property subset.
 #[derive(Debug, Clone, PartialEq)]
@@ -892,14 +892,6 @@ fn complain(slot: &mut Option<Unparsed>, source: &str, at: usize, reason: &str) 
             reason: reason.to_owned(),
             line: line_number(source, at),
         });
-    }
-}
-
-fn bom_len(source: &str) -> usize {
-    if source.starts_with('\u{feff}') {
-        '\u{feff}'.len_utf8()
-    } else {
-        0
     }
 }
 

@@ -1,19 +1,67 @@
-//! Note template expansion (FR-100).
+//! What a template is, and what applying one does (FR-100, FR-161, FR-162, AD-82).
 //!
-//! A **closed** placeholder set — `{{date:FMT}}`, `{{time:FMT}}`, `{{title}}`,
-//! `{{cursor}}`, `{{id}}` — and everything else is left exactly as written. That
-//! is not laziness: templates are ordinary notes under `templates/`, they sync,
-//! and an agent may write one. A template engine that evaluates arbitrary
-//! expressions in a file an agent can author is a code-execution surface, and a
-//! template engine that *guesses* at unknown braces silently eats a user's
-//! literal `{{TODO}}`. Leaving the unknown alone is the only option that is both
-//! safe and honest.
+//! **A template is a note tagged `template`.** Not a file type, not a directory
+//! keeper owns. That is AD-82, and it is what makes a template searchable,
+//! syncable, and editable with the tools that already exist — the same editor,
+//! the same tag tree, the same sync engine. [`is_template`] is the one predicate
+//! that decides, so the surface that lists templates and the code that strips
+//! the marker cannot disagree about what one is.
+//!
+//! **Applying a template copies its BODY and drops that one tag.** The copy is
+//! not a template; leaving the tag on would make every note a template of
+//! itself, and the next note made from the copy would inherit the marker again.
+//! Every *other* tag rides along, because a journal template tagged
+//! `journal, daily` exists precisely so the notes it makes are tagged
+//! `journal, daily`.
+//!
+//! ## Two spellings, one renderer
+//!
+//! Placeholders come in two shapes, and this is the only file that resolves
+//! either:
+//!
+//! | Shape | Set | Where it came from |
+//! |-------|-----|--------------------|
+//! | `{{date:FMT}}`, `{{time:FMT}}`, `{{title}}`, `{{cursor}}`, `{{id}}` | moment tokens | Obsidian's own Templates plugin — a template authored in Obsidian must keep working here |
+//! | `{yyyy}`, `{yy}`, `{mm}`, `{dd}`, `{HH}`, `{MM}`, `{SS}` | fixed | the recording path template and the journal path template already publish it |
+//!
+//! The second row is the reason this module grew rather than a second one being
+//! written. A user who has learned `{yyyy}/{mm}/{dd}` from the recording
+//! destination field has learned the vocabulary of this app, and a body that
+//! refused it would be teaching them the app has two. The path renderers
+//! ([`crate::notes::naming::journal_path`] and
+//! [`crate::recording::path_template`]) could not be called here: both sanitise
+//! their output into a *path* — dropping `..`, folding separators, appending
+//! `.md`, collapsing empty folder components — which is correct for a filename
+//! and destroys a document. So the vocabulary is shared and the renderer is
+//! this one.
+//!
+//! **`{mm}` is the month and `{MM}` is the minute; inside `{{date:…}}` it is the
+//! other way round**, because moment defines `MM` as the month and `mm` as the
+//! minute. That collision is not invented here — it is the existing state of
+//! both vocabularies, documented at [`crate::recording::path_template`] — but
+//! this is the one file where both are in scope at once, so it is worth reading
+//! twice.
+//!
+//! ## Why the set is closed
+//!
+//! Everything unrecognised is left exactly as written. That is not laziness:
+//! templates are ordinary notes, they sync, and an agent may write one. A
+//! template engine that evaluates arbitrary expressions in a file an agent can
+//! author is a code-execution surface, and one that *guesses* at unknown braces
+//! silently eats a user's literal `{{TODO}}` or the `{n}` in their maths.
+//! Leaving the unknown alone is the only option that is both safe and honest.
 //!
 //! Dates come from `ctx.now_local`, an RFC 3339 string the shell already has —
 //! keeper-core carries no clock, and a pure function that reads the wall clock
 //! could not be tested.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
+
+use crate::notes::default_spaces;
+use crate::notes::frontmatter::{FieldValue, Frontmatter};
+use crate::notes::naming;
+use crate::notes::tags;
 
 /// What a template is allowed to know about the note being created.
 #[derive(Debug, Clone, Default)]
@@ -28,24 +76,34 @@ pub struct TemplateCtx {
     pub now_local: String,
 }
 
-/// Expand `template`, returning the text and the byte offset the editor should
+/// Expand a template's text, returning it and the byte offset the editor should
 /// place the caret at.
+///
+/// **Text, not a note**: this is the string-level renderer, and it neither knows
+/// nor cares whether what it was handed had a frontmatter block. [`expand`] is
+/// the note-level entry point and the one a create path should call; this stays
+/// public because Story 44.8 re-renders a template to work out what a note would
+/// have said, and a second renderer there would be a second grammar.
 ///
 /// The cursor offset is `None` when the template has no `{{cursor}}`; the first
 /// occurrence wins and any further ones are simply removed, because two carets
 /// is not a thing an editor can honour.
-pub fn expand(template: &str, ctx: &TemplateCtx) -> (String, Option<usize>) {
+pub fn expand_body(template: &str, ctx: &TemplateCtx) -> (String, Option<usize>) {
     let stamp = Stamp::parse(&ctx.now_local);
     let mut out = String::with_capacity(template.len());
     let mut cursor: Option<usize> = None;
     let mut rest = template;
 
     while let Some(open) = rest.find("{{") {
-        out.push_str(&rest[..open]);
+        push_literal(&mut out, &rest[..open], stamp.as_ref());
         let after = &rest[open + 2..];
 
         let Some(close) = after.find("}}") else {
-            // An unterminated `{{` is literal text, not a broken template.
+            // An unterminated `{{` is literal text, not a broken template — and
+            // verbatim, without the single-brace pass. Everything from here on
+            // is inside a construct the author did not finish, and quietly
+            // rewriting part of it would make the failure harder to see than
+            // leaving the whole tail exactly as typed.
             out.push_str(&rest[open..]);
             return (out, cursor);
         };
@@ -58,7 +116,11 @@ pub fn expand(template: &str, ctx: &TemplateCtx) -> (String, Option<usize>) {
                     cursor = Some(out.len());
                 }
             }
-            // Re-emit the original bytes, spacing and all.
+            // Re-emit the original bytes, spacing and all — and NOT through
+            // `push_literal`, or `{{yyyy}}` would come back as `{2026}`: an
+            // unknown double-brace token would have its inside silently
+            // rewritten by the other vocabulary, which is the opposite of
+            // "unknown is left alone".
             Resolved::Unknown => {
                 out.push_str("{{");
                 out.push_str(token);
@@ -69,9 +131,970 @@ pub fn expand(template: &str, ctx: &TemplateCtx) -> (String, Option<usize>) {
         rest = &after[close + 2..];
     }
 
-    out.push_str(rest);
+    push_literal(&mut out, rest, stamp.as_ref());
     (out, cursor)
 }
+
+/// Copy a run of ordinary text into `out`, resolving the single-brace date
+/// vocabulary on the way.
+///
+/// Applied only to the literal runs BETWEEN `{{…}}` constructs, never inside
+/// one. A `{` with no closing `}`, or a `{word}` outside the closed set, is
+/// copied through untouched — a note is full of braces that are not
+/// placeholders, and `{n}` in someone's maths must survive being written down.
+fn push_literal(out: &mut String, chunk: &str, stamp: Option<&Stamp>) {
+    let Some(stamp) = stamp else {
+        // No usable timestamp: every date placeholder stays visible, exactly as
+        // `{{date}}` does. A visible `{yyyy}` in a new note is a bug report; a
+        // silent 1970 is not.
+        out.push_str(chunk);
+        return;
+    };
+
+    let mut rest = chunk;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('}') else {
+            out.push_str(&rest[open..]);
+            return;
+        };
+        match date_token(&after[..close], stamp) {
+            Some(text) => {
+                out.push_str(&text);
+                rest = &after[close + 1..];
+            }
+            // Not ours. Emit the brace and resume *after* it rather than after
+            // the `}`, so the closing brace of `{a}` is still available to open
+            // nothing and the `{yyyy}` in `{a{yyyy}` is still found.
+            None => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+}
+
+/// The closed single-brace set, spelled exactly as the recording path template
+/// and the journal path template spell it.
+///
+/// Date and time only. `{slug}`, `{title}` and `{seq}` are deliberately absent:
+/// the first two already have a body spelling in `{{title}}`, and two spellings
+/// of one value inside one document is the divergence this module exists to
+/// avoid, while `{seq}` is a *path* concept — it disambiguates a colliding
+/// folder and means nothing in a paragraph.
+fn date_token(token: &str, stamp: &Stamp) -> Option<String> {
+    let mut out = String::with_capacity(4);
+    // `let _`, not `?`: writing into a `String` is infallible, and mapping a
+    // formatting error onto `None` would spell "this is not a date token" for a
+    // condition that has nothing to do with the token.
+    let _ = match token {
+        "yyyy" => write!(out, "{:04}", stamp.year),
+        "yy" => write!(out, "{:02}", stamp.year.rem_euclid(100)),
+        "mm" => write!(out, "{:02}", stamp.month),
+        "dd" => write!(out, "{:02}", stamp.day),
+        "HH" => write!(out, "{:02}", stamp.hour),
+        "MM" => write!(out, "{:02}", stamp.minute),
+        "SS" => write!(out, "{:02}", stamp.second),
+        _ => return None,
+    };
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// A template is a note
+// ---------------------------------------------------------------------------
+
+/// The tag that marks a note as a template (AD-82).
+///
+/// Normalised form, because that is the only form a tag exists in once
+/// [`crate::notes::tags::normalise`] has seen it: `#Template`, `template` and
+/// ` TEMPLATE ` are one tag, and comparing against anything else here would
+/// make the marker case-sensitive in exactly one place.
+pub const TEMPLATE_TAG: &str = "template";
+
+/// The key inside a **space** note's reserved `keeper:` map naming the template
+/// notes created in that space start from (FR-162).
+///
+/// `template` bare, because on a space the word is unambiguous: a space is a
+/// lens, it is not made from anything, so the only thing `keeper.template` can
+/// mean there is "the template this space hands out".
+pub const SPACE_TEMPLATE_KEY: &str = "template";
+
+/// The key inside a **new note's** reserved `keeper:` map recording which
+/// template made it, as a vault-relative path (FR-161).
+///
+/// `from_template` rather than `template`, and the difference is load-bearing:
+/// [`SPACE_TEMPLATE_KEY`] is the same word in the same map on a note that is
+/// also a note, and one spelling meaning "hands this out" on a space and "was
+/// made from this" on a note is a trap for whoever reads a vault next.
+pub const FROM_TEMPLATE_KEY: &str = "from_template";
+
+/// The template note's own `id`, recorded beside [`FROM_TEMPLATE_KEY`].
+///
+/// Both, and the id is the one that matters. A path breaks the moment the
+/// template is renamed or moved, which in a synced vault is not hypothetical —
+/// and Story 44.8's finder would then return zero notes and report success.
+/// A silent nothing is the failure this epic has already shipped twice; one
+/// extra line of frontmatter turns it into a hit.
+pub const FROM_TEMPLATE_ID_KEY: &str = "from_template_id";
+
+/// Which template a note was made from, as recorded in its frontmatter.
+///
+/// Both fields are optional and independently so: a note written before this
+/// landed, or by hand, may carry the path and no id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Provenance {
+    /// Vault-relative path of the template, as resolved when the note was made.
+    pub path: Option<String>,
+    /// The template note's `id`. Survives a rename; match on this first.
+    pub id: Option<String>,
+}
+
+impl Provenance {
+    /// Whether the note claims no template at all.
+    pub fn is_empty(&self) -> bool {
+        self.path.is_none() && self.id.is_none()
+    }
+}
+
+/// Everything applying a template produces, for a caller that will write the
+/// note (Story 44.6 owns the write; this owns what goes into it).
+// No `Eq`: `FieldValue` carries an `f64`, so the properties a template hands
+// over are only ever partially comparable.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Expanded {
+    /// The template's **body**, placeholders resolved. Never its frontmatter:
+    /// see [`expand`].
+    pub body: String,
+    /// Byte offset into `body` where the template asked for the caret.
+    pub caret: Option<usize>,
+    /// The template's own tags, normalised, with [`TEMPLATE_TAG`] removed.
+    pub tags: Vec<String>,
+    /// The template's other frontmatter properties, in its own key order, ready
+    /// to merge into the new note's block *underneath* the keys keeper writes
+    /// itself. See [`expand`] for the five that never cross.
+    pub properties: Vec<(String, FieldValue)>,
+    /// The template note's `id`, for [`provenance_pairs`].
+    pub source_id: Option<String>,
+}
+
+/// Is this note a template? (AD-82.)
+///
+/// The **frontmatter** tag, not an inline `#template` in the body. Deliberate:
+/// the body is copied verbatim into every note made from the template, so an
+/// inline marker would ride along and make each copy a template of itself —
+/// which is the exact failure AD-82 names. Keeping the marker in frontmatter is
+/// what lets [`expand`] drop it by not copying a property, instead of editing
+/// somebody's prose on the way past.
+///
+/// A note *about* templates that mentions `#template` in a sentence is therefore
+/// a note, which is also the right answer.
+pub fn is_template(fm: &Frontmatter) -> bool {
+    frontmatter_tags(fm).iter().any(|tag| tag == TEMPLATE_TAG)
+}
+
+/// Apply a template note to a new note.
+///
+/// `source` is the template note's whole file. What crosses over is the body,
+/// the tags, and the template's other frontmatter **properties** — a template
+/// that declares `status: draft` and `project:` exists so the notes it makes
+/// declare them too, and that properties block is what the note renders as a
+/// header in keeper and in Obsidian alike.
+///
+/// Five keys never cross, and each for its own reason:
+///
+/// - `id`, `created`, `updated` are the TEMPLATE's identity and history. A copy
+///   carrying them would claim to be the template, and two notes sharing an
+///   `id` is how a pin, an unread mark and a sync conflict land on the wrong
+///   file.
+/// - `title` would name every note after the template. `Daily Template` is the
+///   scaffold's name, never the name of Tuesday.
+/// - `keeper` is the reserved bookkeeping map. Copying it would carry
+///   [`SPACE_TEMPLATE_KEY`] onto an ordinary note, and it is also where the
+///   caller writes [`provenance_pairs`] — a copied one would be overwritten or,
+///   worse, kept, leaving a note claiming the template's provenance instead of
+///   its own.
+///
+/// This is the fix for a defect that made the feature unusable: the create path
+/// used to hand the whole file to [`expand_body`], so a templated note was
+/// written with a literal `---\nid: …\ntags: [template]\n---` block pasted into
+/// its body, underneath the real frontmatter. Nobody could have used templates
+/// and not noticed, which is why nobody had.
+///
+/// Total. A template with no frontmatter, an empty template, and a template
+/// whose frontmatter keeper cannot parse all expand to something writable —
+/// losing a thought over a malformed scaffold is the wrong trade.
+pub fn expand(source: &str, ctx: &TemplateCtx) -> Expanded {
+    let (fm, body_offset) = Frontmatter::parse(source);
+    let (body, caret) = expand_body(source.get(body_offset..).unwrap_or(""), ctx);
+    Expanded {
+        body,
+        caret,
+        tags: copied_tags(&fm),
+        properties: copied_properties(&fm),
+        source_id: fm.as_string("id").map(str::to_owned),
+    }
+}
+
+/// Frontmatter keys that never cross into a copy as a *property*.
+/// See [`expand`] for what each of the first five would break.
+///
+/// `tags` is here for a different reason and it is the sharpest of the six: the
+/// tags cross over, but through [`Expanded::tags`], where [`TEMPLATE_TAG`] is
+/// stripped. Leaving `tags` in the properties as well would hand the caller the
+/// raw list a second time — marker included — and the copy would be a template
+/// after all, which is the single thing AD-82 says must not happen. A test
+/// caught exactly that.
+const PRIVATE_KEYS: [&str; 6] = ["id", "created", "updated", "title", "keeper", "tags"];
+
+/// The tags a copy inherits: every one the template carries except the marker.
+///
+/// Only the exact `template` tag leaves. A `template/daily` is left alone —
+/// it is somebody's own filing under a word keeper happens to reserve at the
+/// root, and [`is_template`] does not treat it as a marker either, so removing
+/// it would be this module deleting a tag that was never doing anything.
+fn copied_tags(fm: &Frontmatter) -> Vec<String> {
+    let mut tags = frontmatter_tags(fm);
+    tags.retain(|tag| tag != TEMPLATE_TAG);
+    tags
+}
+
+/// The properties a copy inherits, in the template's own key order.
+///
+/// Source order, not sorted: Obsidian renders properties in the order the file
+/// lists them, so a template author who put `project` above `status` arranged
+/// that on purpose.
+///
+/// A key whose value the parser could not model is skipped rather than guessed
+/// at — [`Frontmatter::get`] returns `None` for it, and inventing a value for a
+/// construct keeper does not understand would put something in the copy that
+/// was never in the template.
+fn copied_properties(fm: &Frontmatter) -> Vec<(String, FieldValue)> {
+    fm.keys()
+        .filter(|key| !PRIVATE_KEYS.contains(key))
+        .filter_map(|key| Some((key.to_owned(), fm.get(key)?.clone())))
+        .collect()
+}
+
+/// A note's frontmatter tags, through the one normalisation rule (Story 42.5).
+///
+/// Frontmatter only — [`crate::notes::tags::note_tags`] unions in the body's
+/// inline tags, which is right for the index and wrong here: the body is
+/// already being copied, so an inline tag arrives in the copy by itself and
+/// adding it to the copy's `tags:` property would file it twice.
+fn frontmatter_tags(fm: &Frontmatter) -> Vec<String> {
+    let raw = fm.as_list("tags").unwrap_or_default();
+    tags::normalise_all(raw.iter().map(String::as_str))
+}
+
+/// The frontmatter pairs recording which template made a note, ready to merge
+/// into the note's reserved `keeper:` map.
+///
+/// A `Vec` rather than two `Option`s so the caller merges one thing and decides
+/// nothing; empty when there is no template, which is the ordinary case.
+pub fn provenance_pairs(rel: &str, source_id: Option<&str>) -> Vec<(String, FieldValue)> {
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return Vec::new();
+    }
+    let mut pairs = vec![(
+        FROM_TEMPLATE_KEY.to_owned(),
+        FieldValue::Str(rel.to_owned()),
+    )];
+    if let Some(id) = source_id.map(str::trim).filter(|id| !id.is_empty()) {
+        pairs.push((
+            FROM_TEMPLATE_ID_KEY.to_owned(),
+            FieldValue::Str(id.to_owned()),
+        ));
+    }
+    pairs
+}
+
+/// Read a note's template provenance back out (Story 44.8).
+///
+/// Total: a note with no frontmatter, no `keeper:` map, or a `keeper:` value
+/// that is not a map has no provenance rather than an error. 44.8 runs this over
+/// every note in a vault, and a vault where one malformed note aborts the scan
+/// is a vault where the feature never runs.
+pub fn provenance(source: &str) -> Provenance {
+    let (fm, _) = Frontmatter::parse(source);
+    let Some(FieldValue::Map(pairs)) = fm.get("keeper") else {
+        return Provenance::default();
+    };
+    let mut found = Provenance::default();
+    for (key, value) in pairs {
+        let FieldValue::Str(text) = value else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            FROM_TEMPLATE_KEY => found.path = Some(text.to_owned()),
+            FROM_TEMPLATE_ID_KEY => found.id = Some(text.to_owned()),
+            _ => {}
+        }
+    }
+    found
+}
+
+/// The template a space hands to notes created in it, or `None` (FR-162).
+///
+/// Pure, over the space note's frontmatter, so the shell reads the file and this
+/// decides what it says. Empty and absent are one state: a user who cleared the
+/// field means "no template", not "a template whose path is nothing".
+pub fn space_default_template(fm: &Frontmatter) -> Option<String> {
+    let FieldValue::Map(pairs) = fm.get("keeper")? else {
+        return None;
+    };
+    pairs.iter().find_map(|(key, value)| {
+        if key != SPACE_TEMPLATE_KEY {
+            return None;
+        }
+        let FieldValue::Str(path) = value else {
+            return None;
+        };
+        let path = path.trim();
+        (!path.is_empty()).then(|| path.to_owned())
+    })
+}
+
+/// What the user is told when the template a create asked for is not there.
+///
+/// Composed here, as a finished sentence, because this crate is where the fact
+/// is known — and because the note IS still created: the sentence has to say
+/// both halves or it reads as a failure. A code for TypeScript to turn into
+/// words could not name the path, and naming the path is the whole value.
+pub fn missing_template_notice(named: &str) -> String {
+    format!(
+        "The template \"{}\" is not in this vault, so this note was created without it. \
+Check the space's template setting, or restore the template and create the note again.",
+        named.trim()
+    )
+}
+
+/// The four places a create can be told which template to apply, most specific
+/// first (FR-161, FR-162, FR-193).
+///
+/// A struct rather than four positional `Option<&str>` arguments, because four
+/// same-typed parameters is a call site where two can be swapped and nothing
+/// says so — and the failure that produces is a note templated from the wrong
+/// rung, which looks like a user mistake.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TemplateRungs<'a> {
+    /// The template the caller named on this one create.
+    pub named: Option<&'a str>,
+    /// The space's `keeper.template`.
+    pub space: Option<&'a str>,
+    /// The vault's quick-capture template. Only ever set for a capture
+    /// (Story 45.16) — an ordinary note must not silently acquire the scaffold
+    /// somebody chose for two-second thoughts.
+    pub capture: Option<&'a str>,
+    /// The vault's `default_template`.
+    pub vault_default: Option<&'a str>,
+}
+
+/// Which rung a create actually takes.
+///
+/// The ordering is the whole content: a caller naming one is answering a
+/// question the space only implied, a space naming one is answering a question
+/// the vault only implied, and the capture template sits between them because
+/// it is chosen for a *surface* — narrower than the vault, wider than one note.
+///
+/// **A blank rung is an absent rung, at every level.** "Cleared" and "never
+/// set" are one state ([`space_default_template`] already says so for the
+/// space), and treating `Some("  ")` as a value would make a create go looking
+/// for a template whose path is nothing and then report it missing. Trimming in
+/// one place rather than at each call site is the point of this function
+/// existing at all: the shell used to filter one rung and not the next.
+pub fn rung<'a>(rungs: TemplateRungs<'a>) -> Option<&'a str> {
+    [rungs.named, rungs.space, rungs.capture, rungs.vault_default]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|path| !path.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// The templates keeper ships
+// ---------------------------------------------------------------------------
+
+/// The vault-relative directory keeper writes its own templates into.
+///
+/// A **default**, not a rule. AD-82 puts the marker in the tag precisely so a
+/// template can live anywhere the user likes; this is only where keeper puts the
+/// three it ships, so they land somewhere findable instead of in the vault root.
+/// Moving one out of here does not stop it being a template.
+pub const TEMPLATES_DIR: &str = "templates";
+
+/// Where the template seed ledger lives, vault-relative.
+///
+/// Its own file rather than a key inside `.keeper-spaces.json`: the two seeds
+/// answer different questions ("has this vault been offered the default spaces"
+/// and "…the default templates"), they were added in different releases, and a
+/// vault seeded by the older build has the spaces ledger and no templates
+/// ledger — which is exactly the state that must read as "offer the templates",
+/// and could not if one absent file had to mean two things.
+///
+/// Same reasoning as [`crate::notes::default_spaces::LEDGER_REL`] for the rest:
+/// in the vault so it syncs, dot-prefixed so Obsidian hides it, not a `.md` so
+/// the note walk never collects it.
+pub const TEMPLATE_LEDGER_REL: &str = ".keeper-templates.json";
+
+/// One template keeper ships.
+///
+/// `key` is the identity and the only field the user cannot change: the moment
+/// the note exists its name, its tags and every byte of its body are theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultTemplate {
+    /// The stable identity, recorded in the ledger.
+    pub key: &'static str,
+    /// The note's title, which is also its filename stem.
+    pub name: &'static str,
+    /// The body, before expansion.
+    pub body: &'static str,
+}
+
+/// The three keeper ships, for the three spaces that most want one.
+///
+/// **None of them tags the notes it makes**, and that is a decision rather than
+/// an omission. Each of the three spaces selects on something that is not a tag:
+/// Inbox is `is:untagged`, Journal is the `journal/` path, and Recordings is the
+/// `session:` frontmatter key. An Inbox template that helpfully tagged its notes
+/// `inbox` would file every one of them straight OUT of the Inbox — the space
+/// that offered the template would be the one space the note could not appear
+/// in. So the shipped templates carry `template` and nothing else, and the tags
+/// a note gets come from the space it was created in (Story 44.6).
+///
+/// **What the bodies use is what both renderers draw**: ATX headings, an aligned
+/// GFM table, task lists and paragraphs. No callouts. keeper's live preview
+/// (`src/components/notes/editor/live-preview.ts`) styles `Blockquote` and knows
+/// nothing of `> [!note]`, so a callout would render in Obsidian and show a
+/// literal `[!note]` in the app that wrote it — and a shipped template that
+/// looks broken in keeper is worse than a plain one.
+///
+/// The tables are aligned to the same rule the toolbar's builder uses (every
+/// cell padded to its column's widest), because this vault is also read in
+/// `git diff` and in Obsidian's source mode.
+///
+/// **No placeholder goes inside a table cell**, and that rule was learned here:
+/// the journal's Log table first read `| {HH}:{MM} |`, which is nine source
+/// characters padded to a nine-wide column and five characters once expanded.
+/// The template file looked aligned and every note made from it did not. A
+/// placeholder's rendered width is not its source width, so a cell holding one
+/// can be aligned in the scaffold or in the note but never in both — and the
+/// note is the artefact somebody reads. `a_shipped_templates_tables_are_aligned_after_expansion`
+/// is the assertion that keeps it true.
+pub const DEFAULT_TEMPLATES: [DefaultTemplate; 3] = [
+    DefaultTemplate {
+        key: "inbox",
+        name: "Inbox note",
+        // Deliberately the shortest of the three. An inbox exists to catch a
+        // thought before it is gone; a scaffold with six sections to delete is
+        // friction at the one moment friction costs the thought.
+        body: "# {{title}}\n\n{{cursor}}\n\n## Next\n\n- [ ]\n",
+    },
+    DefaultTemplate {
+        key: "journal",
+        name: "Journal entry",
+        // The heading is the date in the single-brace vocabulary, so a journal
+        // entry opens with the day it is about even before anyone types.
+        body: "# {yyyy}-{mm}-{dd}\n\
+\n\
+## Focus\n\
+\n\
+{{cursor}}\n\
+\n\
+## Log\n\
+\n\
+| Time | What |\n\
+| ---- | ---- |\n\
+|      |      |\n\
+\n\
+## Carried forward\n\
+\n\
+- [ ]\n",
+    },
+    DefaultTemplate {
+        key: "recording",
+        name: "Recording notes",
+        // For a note *about* a recording. It does not pretend to be a recording
+        // note: that is the `session:` key keeper writes when a capture stops
+        // (Story 42.4), and a template cannot forge one — nor should it, or the
+        // Recordings space would fill with notes that have no recording.
+        body: "# {{title}}\n\
+\n\
+Recorded {yyyy}-{mm}-{dd} at {HH}:{MM}.\n\
+\n\
+## Summary\n\
+\n\
+{{cursor}}\n\
+\n\
+## Chapters\n\
+\n\
+| Time  | Topic |\n\
+| ----- | ----- |\n\
+| 00:00 |       |\n\
+\n\
+## Actions\n\
+\n\
+- [ ]\n",
+    },
+];
+
+/// The file keeper writes for one shipped template.
+///
+/// Tagged [`TEMPLATE_TAG`] and nothing else — that tag is what makes it a
+/// template (AD-82), and [`expand`] is what takes it back off again on the way
+/// into a copy.
+pub fn render_template_note(template: &DefaultTemplate, id: &str, now: &str) -> String {
+    let front = Frontmatter::serialise_new(&[
+        ("id".to_owned(), FieldValue::Str(id.to_owned())),
+        (
+            "title".to_owned(),
+            FieldValue::Str(template.name.to_owned()),
+        ),
+        ("created".to_owned(), FieldValue::Str(now.to_owned())),
+        ("updated".to_owned(), FieldValue::Str(now.to_owned())),
+        (
+            "tags".to_owned(),
+            FieldValue::List(vec![FieldValue::Str(TEMPLATE_TAG.to_owned())]),
+        ),
+    ]);
+    format!("{front}\n{}", template.body)
+}
+
+/// Where one shipped template lands, vault-relative.
+///
+/// A named function rather than a `format!` at the call site, because it now
+/// has two callers pointing in opposite directions: [`seed_templates`] uses it
+/// to WRITE the file and [`journal_template`] uses it to FIND the same file
+/// again. Two independent compositions that must agree about a directory and a
+/// slug is the shape that shipped a media URL which resolved at a vault root
+/// and 404'd in every subfolder — the composer had no test because only the
+/// table beneath it did. One function, one test, both directions.
+pub fn template_rel(template: &DefaultTemplate) -> String {
+    format!("{TEMPLATES_DIR}/{}.md", naming::slug(template.name))
+}
+
+/// The shipped template whose key is `key`, if any.
+pub fn template_by_key(key: &str) -> Option<&'static DefaultTemplate> {
+    DEFAULT_TEMPLATES.iter().find(|t| t.key == key)
+}
+
+/// The key of the template today's journal entry is made from.
+///
+/// A constant rather than the literal repeated at the one call site, so
+/// `a_shipped_template_answers_to_the_journal_key` fails loudly if the shipped
+/// set is ever reorganised out from under it — a lookup that silently returns
+/// `None` is how this path came to have no template in the first place.
+pub const JOURNAL_TEMPLATE_KEY: &str = "journal";
+
+/// The template today's journal entry names, if the vault still has it
+/// (Story 45.20, FR-198).
+///
+/// **This is a wiring fix, and the wire was the missing part.** 44.7 shipped a
+/// `Journal entry` template and seeded it into every vault; `notes_journal_today`
+/// filled its create request from `vault.config.default_template`, which is
+/// `None` unless the user went and set one, and *nothing anywhere named the
+/// journal template*. So the one note keeper creates on a schedule was the one
+/// note the shipped scaffolding never reached — green everywhere, because every
+/// test of the template engine handed it a template to begin with.
+///
+/// **A rung, not a second ladder.** [`rung`] already decides precedence for
+/// every create, and the journal is a caller answering "which template" for
+/// this one note — [`TemplateRungs::named`], by that struct's own definition.
+/// So this returns only the journal's own answer and returns `None` when it has
+/// none; the fall-through to the vault's `default_template` is the ladder's
+/// job, not this function's. Writing the fall-through here as well would put
+/// two orderings in the crate and make the day they disagree a silent one.
+///
+/// `present` answers "is there a note at this vault-relative path". A closure
+/// rather than a read, so the decision — and what an absent file means — is
+/// provable on a host where the shell crate does not build (AD-56), and the
+/// shell contributes one existence check.
+///
+/// **An absent template is `None`, deliberately.** Deleting the shipped journal
+/// scaffold has to stick, exactly as deleting a seeded space does (AD-79): a
+/// template that keeps coming back is keeper editing somebody's vault behind
+/// their back. Returning its path unconditionally would also cost the user
+/// their own `default_template`, because a named-and-missing rung stops the
+/// ladder and reports missing rather than falling through.
+pub fn journal_template(present: &dyn Fn(&str) -> bool) -> Option<String> {
+    let shipped = template_by_key(JOURNAL_TEMPLATE_KEY)?;
+    let rel = template_rel(shipped);
+    present(&rel).then_some(rel)
+}
+
+/// Today's journal entry, as bytes.
+///
+/// The composition lives here rather than in the shell for one reason worth
+/// stating: **"the body came from the template" is the acceptance, and it could
+/// not be asserted anywhere the shell crate does not build.** Before this, the
+/// frontmatter, the tag list, the properties and the provenance map were
+/// assembled inline in `create_journal`, so a test could prove that [`expand`]
+/// expands and that a path resolves, and nothing could prove the expanded body
+/// reached the file. That gap is the whole defect this story fixes; leaving the
+/// composition unreachable would have left the next one unprovable too.
+///
+/// `template` is the template's `(vault-relative path, source)`, or `None` for
+/// a plain entry. `now` is one instant used for `created` and `updated` and for
+/// the template's own date tokens — one read, so a note written across a second
+/// boundary cannot claim two.
+pub fn render_journal_note(
+    template: Option<(&str, &str)>,
+    title: &str,
+    id: &str,
+    now: &str,
+) -> JournalNote {
+    let applied = template.map(|(rel, source)| {
+        let expanded = expand(
+            source,
+            &TemplateCtx {
+                title: title.to_owned(),
+                id: id.to_owned(),
+                now_local: now.to_owned(),
+            },
+        );
+        (rel, expanded)
+    });
+    let mut pairs = vec![
+        ("id".to_owned(), FieldValue::Str(id.to_owned())),
+        ("created".to_owned(), FieldValue::Str(now.to_owned())),
+        ("updated".to_owned(), FieldValue::Str(now.to_owned())),
+    ];
+    // The journal template's tags and properties reach the entry too. Without
+    // this the one note keeper creates on a schedule would be the one note a
+    // template could not shape.
+    if let Some((_, expanded)) = &applied {
+        if !expanded.tags.is_empty() {
+            pairs.push((
+                "tags".to_owned(),
+                FieldValue::List(
+                    expanded
+                        .tags
+                        .iter()
+                        .map(|tag| FieldValue::Str(tag.clone()))
+                        .collect(),
+                ),
+            ));
+        }
+        pairs.extend(expanded.properties.iter().cloned());
+    }
+    let provenance = applied.as_ref().map_or_else(Vec::new, |(rel, expanded)| {
+        provenance_pairs(rel, expanded.source_id.as_deref())
+    });
+    if !provenance.is_empty() {
+        pairs.push(("keeper".to_owned(), FieldValue::Map(provenance)));
+    }
+    let (body, caret) = match &applied {
+        Some((_, expanded)) => (expanded.body.clone(), expanded.caret),
+        None => (format!("# {title}\n"), None),
+    };
+    let front = Frontmatter::serialise_new(&pairs);
+    JournalNote {
+        text: format!("{front}\n{body}"),
+        caret,
+        from: applied.map(|(rel, _)| rel.to_owned()),
+    }
+}
+
+/// What [`render_journal_note`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalNote {
+    /// The whole file: frontmatter, a blank line, then the body.
+    pub text: String,
+    /// Where `{{cursor}}` was, as a byte offset **into the body** — not into
+    /// [`Self::text`]. The caller adds whatever its own editor coordinates need;
+    /// this is the same number [`Expanded::caret`] carries, unmoved, because a
+    /// renderer that silently rebased it would break the one caller that already
+    /// adjusts it.
+    pub caret: Option<usize>,
+    /// The template it came from, vault-relative, when one applied.
+    pub from: Option<String>,
+}
+
+/// Which shipped templates to write, in [`DEFAULT_TEMPLATES`] order.
+///
+/// The same three-way rule the space seeder uses, for the same reasons
+/// ([`crate::notes::default_spaces::plan`]): the ledger says what names this
+/// vault has already had claimed, `existing` says what is on disk right now, and
+/// an unreadable ledger on an automatic run means keeper writes nothing.
+///
+/// `existing` is the file names already inside [`TEMPLATES_DIR`]; presence is
+/// [`claimed_templates`].
+pub fn plan_templates(
+    mode: default_spaces::SeedMode,
+    existing: &[String],
+    offered: Option<&BTreeSet<String>>,
+) -> Vec<&'static DefaultTemplate> {
+    let ledger = match (mode, offered) {
+        (default_spaces::SeedMode::Restore, _) => None,
+        (default_spaces::SeedMode::FirstRun, Some(keys)) => Some(keys),
+        // Unreadable ledger, automatic run: keeper stays out of the vault.
+        (default_spaces::SeedMode::FirstRun, None) => return Vec::new(),
+    };
+    let present = claimed_templates(existing);
+    DEFAULT_TEMPLATES
+        .iter()
+        .filter(|template| !ledger.is_some_and(|keys| keys.contains(template.key)))
+        .filter(|template| !present.contains(template.key))
+        .collect()
+}
+
+/// The shipped-template keys this vault has taken, whoever wrote the file
+/// (Story 47.4, DW-191).
+///
+/// A template is present when a file is already called what it would be called,
+/// folded through [`naming::slug`] — the same fold that decides two notes cannot
+/// share a filename, so `Journal entry.md` and `journal-entry.md` are one
+/// template and the seed does not write a second.
+///
+/// **Not [`crate::notes::default_spaces::claimed`], and this is the one sentence
+/// that stops the next reader merging them.** A space is claimed by its
+/// `keeper.default` marker OR its name, because a space note carries an identity
+/// that survives a rename. A template carries no marker at all — AD-82 makes a
+/// template an ordinary note with an ordinary tag, so there is nothing on it
+/// that says "this is keeper's Journal entry" — and its only identity is its
+/// filename. One rule reads two fields, the other reads one; the file FORMAT is
+/// shared (`default_spaces::parse_ledger`) because parsing genuinely is one rule,
+/// and the presence rule is not.
+pub fn claimed_templates(existing: &[String]) -> BTreeSet<String> {
+    let taken: BTreeSet<String> = existing
+        .iter()
+        .map(|file| naming::slug(file.strip_suffix(".md").unwrap_or(file)))
+        .collect();
+    DEFAULT_TEMPLATES
+        .iter()
+        .filter(|template| taken.contains(&naming::slug(template.name)))
+        .map(|template| template.key.to_owned())
+        .collect()
+}
+
+/// Run the template seed against a vault.
+///
+/// Reuses [`default_spaces::SeedVault`], [`default_spaces::SeedMode`] and
+/// [`default_spaces::SeedOutcome`] rather than declaring a second port and a
+/// second outcome enum: the two seeds do the same dangerous thing — write notes
+/// into somebody's real vault, on removable media, through the sync engine — and
+/// they must agree about what "absent" and "could not tell" mean. Only the
+/// ledger, the contents and the wording differ.
+///
+/// Order is forced: read the ledger, list the directory, plan, write, record.
+/// A read that fails is never an empty answer — an unlistable `templates/` is a
+/// directory keeper cannot see, and writing three notes on that basis is how a
+/// vault gets two of each.
+///
+/// **The ledger records the names keeper CLAIMED, not the notes it wrote**
+/// (Story 47.4, DW-191). This is the same defect the space seeder had, one file
+/// over, and the same fix: a shipped template keeper stood down for — because
+/// the vault already held a `journal-entry.md` the user wrote — is recorded
+/// exactly like one it created. Recording only what it wrote left the user's own
+/// file unprotected by the mechanism that protects keeper's: delete your own
+/// journal entry and the next run saw a name absent from `templates/` and absent
+/// from the ledger and wrote keeper's scaffold in its place. You delete your file
+/// and a different one comes back — which is the exact surprise 44.7 refused for
+/// templates in prose while this went on doing it.
+///
+/// The cost is the same and so is the escape hatch: a name freed deliberately is
+/// not re-offered, and "Restore default templates" ignores the ledger.
+pub fn seed_templates(
+    vault: &mut dyn default_spaces::SeedVault,
+    mode: default_spaces::SeedMode,
+) -> default_spaces::SeedOutcome {
+    let offered = match read_template_ledger(vault) {
+        Ok(offered) => offered,
+        Err(reason) => {
+            // Restore is the user asking. An unreadable ledger must not stop
+            // them repairing what they can see is missing.
+            if mode == default_spaces::SeedMode::FirstRun {
+                return default_spaces::SeedOutcome::Blocked(reason);
+            }
+            None
+        }
+    };
+    let existing = match vault.list(TEMPLATES_DIR) {
+        Ok(files) => files,
+        // An absent directory is no templates; anything else is keeper being
+        // unable to see, and it declines.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return default_spaces::SeedOutcome::Blocked(format!(
+                "could not list \"{TEMPLATES_DIR}\" in this vault, so keeper cannot tell which \
+default templates are already there: {error}"
+            ));
+        }
+    };
+
+    // Whether the ledger was READABLE, kept before `offered` is consumed. An
+    // automatic run with an unreadable one has already returned `Blocked`; a
+    // Restore may not invent a ledger over a file it could not parse, which may
+    // be a newer build's and whose defaults this one would then re-offer.
+    let readable = offered.is_some();
+    let plan = plan_templates(mode, &existing, offered.as_ref());
+
+    let mut written = Vec::new();
+    // What the ledger already held, plus every shipped template that is present
+    // — whether keeper wrote it or the user did.
+    let mut seeded: BTreeSet<String> = offered.unwrap_or_default();
+    let known = seeded.len();
+    seeded.extend(claimed_templates(&existing));
+    // `extend` only adds, so a changed length is a new claim.
+    let newly_claimed = seeded.len() != known;
+
+    if plan.is_empty() {
+        // The upgrade write, and the only run that touches the ledger without
+        // writing a note: a vault whose ledger predates DW-191 holds the keys
+        // keeper WROTE, and the names it stood down for are missing from it.
+        // Gated on an actual change so a settled vault does not rewrite this
+        // file on every refresh — it is synced content, and a rewrite per launch
+        // is a commit per launch.
+        if newly_claimed && readable {
+            record_template_ledger(vault, &seeded);
+        }
+        return default_spaces::SeedOutcome::AlreadySatisfied;
+    }
+
+    for template in plan {
+        let id = vault.new_id();
+        let now = vault.now_local();
+        // Through [`template_rel`], not a second `format!`: the journal path
+        // now LOOKS UP what this line WRITES, and two compositions that must
+        // agree is the failure shape one of them is always missing a test for.
+        let rel = template_rel(template);
+        if let Err(error) = vault.write(&rel, &render_template_note(template, &id, &now)) {
+            let reason = format!("could not write \"{rel}\": {error}");
+            // Record what landed before giving up, or the next run writes the
+            // ones that already exist a second time.
+            record_template_ledger(vault, &seeded);
+            return default_spaces::SeedOutcome::Stopped { written, reason };
+        }
+        seeded.insert(template.key.to_owned());
+        written.push(rel);
+    }
+    record_template_ledger(vault, &seeded);
+    default_spaces::SeedOutcome::Wrote(written)
+}
+
+/// The sentence and level one template-seed run deserves in the log.
+///
+/// Its own wording rather than [`default_spaces::SeedOutcome::report`]'s, which
+/// says "default spaces" in every arm — but the same floor, and for the same
+/// reason: nothing sets `RUST_LOG` in the packaged app, so `tracing::debug!` is
+/// dead code there (DW-162). **Every arm reports at
+/// [`default_spaces::REPORT_FLOOR`] or above**, asserted below, so a run that
+/// declined to act can never be invisible on the machine it declined on.
+pub fn report_template_seed(outcome: &default_spaces::SeedOutcome) -> (tracing::Level, String) {
+    let floor = default_spaces::REPORT_FLOOR;
+    match outcome {
+        default_spaces::SeedOutcome::Wrote(written) if written.is_empty() => (
+            floor,
+            "seeded no default templates; the plan was empty".to_owned(),
+        ),
+        default_spaces::SeedOutcome::Wrote(written) => (
+            floor,
+            format!(
+                "seeded {} default templates: {}",
+                written.len(),
+                written.join(", ")
+            ),
+        ),
+        default_spaces::SeedOutcome::AlreadySatisfied => (
+            floor,
+            "default templates already settled for this vault; wrote nothing".to_owned(),
+        ),
+        default_spaces::SeedOutcome::Blocked(why) => (
+            tracing::Level::WARN,
+            format!("did not seed the default templates; will try again next refresh. {why}"),
+        ),
+        default_spaces::SeedOutcome::Stopped { written, reason } => (
+            tracing::Level::WARN,
+            format!(
+                "stopped after seeding {} default templates; recorded what landed. {reason}",
+                written.len()
+            ),
+        ),
+    }
+}
+
+/// The sentence written into the template ledger, so the file explains itself to
+/// whoever finds it in their vault rather than looking like debris.
+const TEMPLATE_LEDGER_NOTE: &str = "keeper has already offered this vault its default \
+templates, and will not add them again on its own. Delete a template you do not want and it \
+stays deleted. Use Restore default templates to get the missing ones back, or delete this file \
+to be offered all of them again.";
+
+/// The keys this vault has already been offered, or the sentence explaining why
+/// keeper cannot tell.
+///
+/// **`Ok(None)` is impossible on purpose**, exactly as in
+/// [`crate::notes::default_spaces`]: an absent ledger is `Ok(Some(empty))`,
+/// which is the fact "this vault has been offered nothing", while `None` at the
+/// [`plan_templates`] boundary means "keeper could not tell" and stops an
+/// automatic run dead. Returning `Ok(None)` for a missing file — which the first
+/// draft did — collapses those two into one and makes a fresh vault report
+/// `AlreadySatisfied` while writing nothing: a feature green on every test and
+/// silent on the owner's machine, which is the failure this epic keeps shipping.
+fn read_template_ledger(
+    vault: &dyn default_spaces::SeedVault,
+) -> Result<Option<BTreeSet<String>>, String> {
+    match vault.read(TEMPLATE_LEDGER_REL) {
+        Ok(text) => default_spaces::parse_ledger(&text)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                "\"{TEMPLATE_LEDGER_REL}\" is there and is not a seed ledger, so keeper cannot \
+tell which default templates this vault has already been offered; leaving them alone"
+            )
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(BTreeSet::new())),
+        Err(error) => Err(format!(
+            "\"{TEMPLATE_LEDGER_REL}\" could not be read ({error}); leaving this vault's \
+templates alone"
+        )),
+    }
+}
+
+/// Record what this vault has been offered. A failure here is deliberately not
+/// fatal: the templates are on disk and the user can see them, and the cost of
+/// an unrecorded seed is that the next run finds them by name and declines.
+fn record_template_ledger(vault: &mut dyn default_spaces::SeedVault, keys: &BTreeSet<String>) {
+    let text = render_template_ledger(keys);
+    if let Err(error) = vault.write(TEMPLATE_LEDGER_REL, &text) {
+        tracing::warn!(
+            %error,
+            "notes: wrote the default templates but could not record them in the ledger; \
+        the next run will find them by name"
+        );
+    }
+}
+
+/// The ledger file's bytes.
+///
+/// Written here rather than through [`default_spaces::render_ledger`] — the two
+/// files share a *format* but not a sentence, and reaching for the spaces
+/// renderer and then string-replacing its note out would leave this file
+/// silently wrong the day that sentence is reworded. The reader is shared,
+/// because parsing genuinely is one rule.
+fn render_template_ledger(keys: &BTreeSet<String>) -> String {
+    let value = serde_json::json!({
+        "version": TEMPLATE_LEDGER_VERSION,
+        "note": TEMPLATE_LEDGER_NOTE,
+        "seeded": keys.iter().collect::<Vec<_>>(),
+    });
+    // Pretty, with a trailing newline: this lands in a folder a person browses
+    // and a line-based sync diffs.
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_owned())
+    )
+}
+
+/// The ledger format this build writes and understands.
+const TEMPLATE_LEDGER_VERSION: u64 = 1;
 
 enum Resolved {
     Text(String),
@@ -231,7 +1254,7 @@ mod tests {
 
     #[test]
     fn expansion_reports_the_cursor_offset_and_removes_the_marker() {
-        let (text, cursor) = expand("# {{title}}\n\n{{cursor}}\n", &ctx());
+        let (text, cursor) = expand_body("# {{title}}\n\n{{cursor}}\n", &ctx());
         assert_eq!(text, "# Weekly review\n\n\n");
         assert_eq!(cursor, Some("# Weekly review\n\n".len()));
         // The offset is a real byte index into the expanded text.
@@ -243,40 +1266,40 @@ mod tests {
     fn cursor_offset_is_a_byte_index_after_multibyte_expansion() {
         let mut c = ctx();
         c.title = "Café ☕".to_owned();
-        let (text, cursor) = expand("{{title}}{{cursor}}!", &c);
+        let (text, cursor) = expand_body("{{title}}{{cursor}}!", &c);
         assert_eq!(text, "Café ☕!");
         assert_eq!(cursor, Some("Café ☕".len()));
     }
 
     #[test]
     fn only_the_first_cursor_survives_and_the_rest_vanish() {
-        let (text, cursor) = expand("a{{cursor}}b{{cursor}}c", &ctx());
+        let (text, cursor) = expand_body("a{{cursor}}b{{cursor}}c", &ctx());
         assert_eq!(text, "abc");
         assert_eq!(cursor, Some(1));
     }
 
     #[test]
     fn no_cursor_placeholder_means_no_offset() {
-        let (text, cursor) = expand("plain body", &ctx());
+        let (text, cursor) = expand_body("plain body", &ctx());
         assert_eq!(text, "plain body");
         assert_eq!(cursor, None);
     }
 
     #[test]
     fn an_unknown_placeholder_is_left_literal_byte_for_byte() {
-        let (text, _) = expand("{{TODO}} and {{ weather:oslo }} and {{}}", &ctx());
+        let (text, _) = expand_body("{{TODO}} and {{ weather:oslo }} and {{}}", &ctx());
         assert_eq!(text, "{{TODO}} and {{ weather:oslo }} and {{}}");
     }
 
     #[test]
     fn an_unterminated_brace_pair_is_literal_text() {
-        let (text, _) = expand("half open {{title", &ctx());
+        let (text, _) = expand_body("half open {{title", &ctx());
         assert_eq!(text, "half open {{title");
     }
 
     #[test]
     fn dates_and_times_use_the_moment_token_subset() {
-        let (text, _) = expand(
+        let (text, _) = expand_body(
             "{{date}} {{time}} | {{date:YYYY/MM/DD}} {{time:HH:mm:ss}} {{date:YY}}",
             &ctx(),
         );
@@ -285,19 +1308,19 @@ mod tests {
 
     #[test]
     fn month_and_minute_tokens_do_not_collide() {
-        let (text, _) = expand("{{date:MM-mm}}", &ctx());
+        let (text, _) = expand_body("{{date:MM-mm}}", &ctx());
         assert_eq!(text, "08-35");
     }
 
     #[test]
     fn literal_text_inside_a_format_survives() {
-        let (text, _) = expand("{{date:[week of] YYYY-MM-DD}}", &ctx());
+        let (text, _) = expand_body("{{date:[week of] YYYY-MM-DD}}", &ctx());
         assert_eq!(text, "[week of] 2026-08-02");
     }
 
     #[test]
     fn whitespace_inside_the_braces_is_tolerated_for_known_tokens() {
-        let (text, _) = expand("{{ title }}", &ctx());
+        let (text, _) = expand_body("{{ title }}", &ctx());
         assert_eq!(text, "Weekly review");
     }
 
@@ -308,7 +1331,7 @@ mod tests {
             id: "I".to_owned(),
             now_local: "not a timestamp".to_owned(),
         };
-        let (text, _) = expand("{{date}} {{date:YYYY}} {{title}}", &broken);
+        let (text, _) = expand_body("{{date}} {{date:YYYY}} {{title}}", &broken);
         assert_eq!(text, "{{date}} {{date:YYYY}} T");
     }
 
@@ -318,12 +1341,1242 @@ mod tests {
             now_local: "2026-08-02".to_owned(),
             ..ctx()
         };
-        let (text, _) = expand("{{date}} {{time}}", &c);
+        let (text, _) = expand_body("{{date}} {{time}}", &c);
         assert_eq!(text, "2026-08-02 00:00");
     }
 
     #[test]
     fn an_empty_template_expands_to_nothing() {
-        assert_eq!(expand("", &ctx()), (String::new(), None));
+        assert_eq!(expand_body("", &ctx()), (String::new(), None));
+    }
+
+    // -----------------------------------------------------------------------
+    // The single-brace vocabulary (Story 44.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_recording_path_vocabulary_resolves_in_a_body() {
+        // Exactly the spellings `crate::recording::path_template` publishes, so
+        // a user who learned them in the destination field has learned them
+        // here. `{mm}` is the MONTH and `{MM}` is the MINUTE.
+        let (text, _) = expand_body("{yyyy}-{mm}-{dd} {HH}:{MM}:{SS} {yy}", &ctx());
+        assert_eq!(text, "2026-08-02 14:35:09 26");
+    }
+
+    #[test]
+    fn the_two_vocabularies_disagree_about_mm_and_both_are_honoured() {
+        // The collision worth reading twice, asserted rather than described:
+        // single-brace `{mm}` is moment's `MM`, and moment's `mm` is the minute.
+        let (text, _) = expand_body("{mm} {MM} | {{date:MM}} {{date:mm}}", &ctx());
+        assert_eq!(text, "08 35 | 08 35");
+    }
+
+    #[test]
+    fn an_unknown_single_brace_word_is_left_alone() {
+        // A body is full of braces that are not placeholders. `{n}` in someone's
+        // maths, a literal `{}`, and a `{seq}` that belongs to paths and not
+        // here all survive being written down.
+        let (text, _) = expand_body("{n} {} {seq} {slug} {title} {YYYY}", &ctx());
+        assert_eq!(text, "{n} {} {seq} {slug} {title} {YYYY}");
+    }
+
+    #[test]
+    fn an_unclosed_single_brace_is_literal_and_a_later_token_still_resolves() {
+        // The scan resumes after the `{`, not after the `}`, so one stray brace
+        // cannot swallow the placeholder behind it.
+        let (text, _) = expand_body("{ {yyyy}", &ctx());
+        assert_eq!(text, "{ 2026");
+        let (tail, _) = expand_body("a { b", &ctx());
+        assert_eq!(tail, "a { b");
+    }
+
+    #[test]
+    fn a_double_brace_unknown_is_not_rewritten_by_the_single_brace_pass() {
+        // The trap this ordering exists to avoid: `{{yyyy}}` is an unknown
+        // double-brace token, and running the other vocabulary over the bytes
+        // re-emitted for it would produce `{2026}` — an unknown silently
+        // rewritten, which is the opposite of the promise.
+        let (text, _) = expand_body("{{yyyy}} {{ dd }}", &ctx());
+        assert_eq!(text, "{{yyyy}} {{ dd }}");
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_leaves_single_brace_placeholders_visible() {
+        let broken = TemplateCtx {
+            now_local: "not a timestamp".to_owned(),
+            ..ctx()
+        };
+        let (text, _) = expand_body("{yyyy}-{mm}-{dd}", &broken);
+        assert_eq!(text, "{yyyy}-{mm}-{dd}");
+    }
+
+    #[test]
+    fn a_cursor_offset_survives_a_single_brace_expansion_before_it() {
+        // The offset is a byte index into the EXPANDED text, and the expansion
+        // that runs before the marker changes the text's length.
+        let (text, cursor) = expand_body("{yyyy}-{mm}{{cursor}}!", &ctx());
+        assert_eq!(text, "2026-08!");
+        assert_eq!(cursor, Some("2026-08".len()));
+    }
+
+    // -----------------------------------------------------------------------
+    // A template is a note (Story 44.7)
+    // -----------------------------------------------------------------------
+
+    /// A template note as it actually sits in a vault.
+    fn template_note(tags: &str, body: &str) -> String {
+        format!("---\nid: 01TEMPLATE0000000000000000\ncreated: 2026-01-01T00:00:00+01:00\ntags: {tags}\n---\n{body}")
+    }
+
+    #[test]
+    fn the_copy_carries_every_tag_except_the_marker() {
+        let out = expand(
+            &template_note("[journal, Daily, template, work/notes]", "# Hi\n"),
+            &ctx(),
+        );
+        assert_eq!(out.tags, vec!["journal", "daily", "work/notes"]);
+        // The whole point: the copy is not a template, or every note made from
+        // it would be a template of itself.
+        assert!(!out.tags.iter().any(|tag| tag == TEMPLATE_TAG));
+    }
+
+    #[test]
+    fn the_marker_is_matched_after_normalisation_not_as_typed() {
+        // `#Template` and ` TEMPLATE ` are the same tag; a case-sensitive
+        // comparison here would let a capitalised marker through into the copy.
+        let out = expand(
+            &template_note("[\"#Template\", \" TEMPLATE \"]", "x"),
+            &ctx(),
+        );
+        assert!(out.tags.is_empty(), "{:?}", out.tags);
+    }
+
+    #[test]
+    fn a_tag_merely_filed_under_template_is_kept() {
+        // Only the exact marker leaves. `template/daily` is somebody's own
+        // filing, `is_template` does not read it as a marker, and dropping it
+        // would be deleting a tag that was never doing anything.
+        let out = expand(&template_note("[template, template/daily]", "x"), &ctx());
+        assert_eq!(out.tags, vec!["template/daily"]);
+    }
+
+    #[test]
+    fn the_templates_own_frontmatter_never_reaches_the_body() {
+        // The defect this function exists to fix. The create path used to hand
+        // the whole FILE to the expander, so a templated note was written with a
+        // literal `---` block pasted into its body under the real one.
+        let out = expand(
+            &template_note("[template]", "# Standup\n\nNotes.\n"),
+            &ctx(),
+        );
+        assert_eq!(out.body, "# Standup\n\nNotes.\n");
+        assert!(!out.body.contains("---"), "{:?}", out.body);
+        assert!(!out.body.contains("id:"), "{:?}", out.body);
+    }
+
+    #[test]
+    fn a_template_without_placeholders_copies_byte_identically() {
+        // The body is a document, not a format string: every byte that is not a
+        // placeholder is the author's, including the braces that are not ours.
+        let body = "# Meeting\n\n| Who | What |\n| --- | ---- |\n|     |      |\n\n- [ ] item {n}\n> quote\n";
+        let out = expand(&template_note("[template]", body), &ctx());
+        assert_eq!(out.body, body);
+        assert_eq!(out.caret, None);
+    }
+
+    #[test]
+    fn a_template_with_no_frontmatter_at_all_is_still_a_body() {
+        // A note somebody wrote in a plain editor. No tags to carry, no id to
+        // record, and the whole file is the body.
+        let out = expand("# Bare\n\n{yyyy}\n", &ctx());
+        assert_eq!(out.body, "# Bare\n\n2026\n");
+        assert!(out.tags.is_empty());
+        assert_eq!(out.source_id, None);
+        // And with no id, provenance records the path alone rather than a pair
+        // with a hole in it.
+        let pairs = provenance_pairs("templates/bare.md", out.source_id.as_deref());
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, FROM_TEMPLATE_KEY);
+    }
+
+    #[test]
+    fn expansion_reports_the_templates_own_id_for_provenance() {
+        let out = expand(&template_note("[template]", "x"), &ctx());
+        assert_eq!(out.source_id.as_deref(), Some("01TEMPLATE0000000000000000"));
+
+        let pairs = provenance_pairs("templates/journal.md", out.source_id.as_deref());
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    FROM_TEMPLATE_KEY.to_owned(),
+                    FieldValue::Str("templates/journal.md".to_owned())
+                ),
+                (
+                    FROM_TEMPLATE_ID_KEY.to_owned(),
+                    FieldValue::Str("01TEMPLATE0000000000000000".to_owned())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn provenance_round_trips_through_a_written_note() {
+        // Written the way the create path writes it — inside the reserved map —
+        // and read back by the one reader Story 44.8 uses.
+        let pairs = provenance_pairs("templates/journal.md", Some("01TEMPLATE"));
+        let note = Frontmatter::serialise_new(&[
+            ("id".to_owned(), FieldValue::Str("01NOTE".to_owned())),
+            ("keeper".to_owned(), FieldValue::Map(pairs)),
+        ]);
+        let found = provenance(&note);
+        assert_eq!(found.path.as_deref(), Some("templates/journal.md"));
+        assert_eq!(found.id.as_deref(), Some("01TEMPLATE"));
+        assert!(!found.is_empty());
+    }
+
+    #[test]
+    fn a_note_from_no_template_has_no_provenance_and_does_not_error() {
+        // Every shape 44.8's scan will meet on a real vault. None is an error:
+        // one malformed note must not abort a ten-thousand-note walk.
+        for source in [
+            "",
+            "# just a body\n",
+            "---\nid: 01NOTE\n---\nbody\n",
+            "---\nkeeper: not-a-map\n---\n",
+            "---\nkeeper:\n  capture: true\n---\n",
+            "---\nkeeper:\n  from_template: \"   \"\n---\n",
+        ] {
+            assert!(provenance(source).is_empty(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn provenance_survives_a_note_that_also_carries_other_keeper_keys() {
+        // The map is shared with `capture`, `default` and the space keys, and a
+        // reader that stopped at the first unrecognised entry would miss ours.
+        let note = "---\nkeeper:\n  capture: true\n  from_template: templates/x.md\n  from_template_id: 01T\n---\n";
+        let found = provenance(note);
+        assert_eq!(found.path.as_deref(), Some("templates/x.md"));
+        assert_eq!(found.id.as_deref(), Some("01T"));
+    }
+
+    #[test]
+    fn a_template_is_marked_by_its_frontmatter_tag_and_not_by_its_body() {
+        let tagged = template_note("[template]", "x");
+        assert!(is_template(&Frontmatter::parse(&tagged).0));
+
+        // An inline `#template` is a word in a sentence. It must NOT make the
+        // note a template, because the body is copied verbatim into every note
+        // made from one — an inline marker would ride along and make each copy a
+        // template of itself.
+        let mentions = template_note("[notes]", "How I use #template notes\n");
+        assert!(!is_template(&Frontmatter::parse(&mentions).0));
+
+        // And a bare scalar `tags: template` counts, because Obsidian writes it.
+        let scalar = "---\ntags: template\n---\nx";
+        assert!(is_template(&Frontmatter::parse(scalar).0));
+
+        // A note with no tags at all is not one, whatever folder it sits in.
+        assert!(!is_template(&Frontmatter::parse("---\nid: x\n---\n").0));
+    }
+
+    #[test]
+    fn a_space_names_its_default_template() {
+        let space =
+            "---\nkeeper:\n  space: \"is:journal\"\n  template: templates/journal.md\n---\n";
+        let (fm, _) = Frontmatter::parse(space);
+        assert_eq!(
+            space_default_template(&fm).as_deref(),
+            Some("templates/journal.md")
+        );
+    }
+
+    #[test]
+    fn a_space_with_no_usable_template_setting_names_none() {
+        // Cleared and never set are one state: a user who emptied the field
+        // means "no template", not "a template whose path is nothing".
+        for space in [
+            "---\nkeeper:\n  space: \"is:journal\"\n---\n",
+            "---\nkeeper:\n  template: \"\"\n---\n",
+            "---\nkeeper:\n  template: \"   \"\n---\n",
+            "---\nkeeper:\n  template: 7\n---\n",
+            "---\nkeeper: nonsense\n---\n",
+            "---\nid: x\n---\n",
+            "",
+        ] {
+            let (fm, _) = Frontmatter::parse(space);
+            assert_eq!(space_default_template(&fm), None, "{space:?}");
+        }
+    }
+
+    #[test]
+    fn the_missing_template_sentence_names_the_path_and_says_the_note_was_made() {
+        let notice = missing_template_notice("templates/journal.md");
+        assert!(notice.contains("templates/journal.md"), "{notice}");
+        // Both halves, or it reads as a failure when the note is right there.
+        assert!(notice.contains("was created without it"), "{notice}");
+        // A finished sentence, composed here, not a code for TypeScript to word.
+        assert!(notice.ends_with('.'), "{notice}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The templates keeper ships, and the seed that writes them
+    // -----------------------------------------------------------------------
+
+    /// A vault in memory, driven through the real port the shell implements.
+    #[derive(Default)]
+    struct FakeVault {
+        files: std::collections::BTreeMap<String, String>,
+        /// Directories whose listing fails, and the error kind it fails with.
+        unlistable: BTreeSet<String>,
+        /// Paths whose write fails, so a half-finished seed can be driven.
+        unwritable: BTreeSet<String>,
+        /// Every `write` the run attempted, in order, whether or not it landed.
+        ///
+        /// The ledger's bytes cannot answer "did this run touch the file": a
+        /// rewrite with identical content is invisible in the map and very
+        /// visible to the sync engine, which stages an mtime.
+        attempted: Vec<String>,
+        next_id: usize,
+    }
+
+    impl default_spaces::SeedVault for FakeVault {
+        fn read(&self, rel: &str) -> std::io::Result<String> {
+            self.files
+                .get(rel)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))
+        }
+
+        fn list(&self, rel_dir: &str) -> std::io::Result<Vec<String>> {
+            if self.unlistable.contains(rel_dir) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ));
+            }
+            let prefix = format!("{rel_dir}/");
+            let files: Vec<String> = self
+                .files
+                .keys()
+                .filter_map(|rel| rel.strip_prefix(&prefix))
+                .filter(|rest| !rest.contains('/'))
+                .map(str::to_owned)
+                .collect();
+            if files.is_empty() {
+                // An absent directory, which the seeder must tell apart from an
+                // unlistable one.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such directory",
+                ));
+            }
+            Ok(files)
+        }
+
+        fn write(&mut self, rel: &str, text: &str) -> std::io::Result<()> {
+            self.attempted.push(rel.to_owned());
+            if self.unwritable.contains(rel) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ));
+            }
+            self.files.insert(rel.to_owned(), text.to_owned());
+            Ok(())
+        }
+
+        fn new_id(&mut self) -> String {
+            self.next_id += 1;
+            format!("01SEEDEDTEMPLATE{:010}", self.next_id)
+        }
+
+        fn now_local(&self) -> String {
+            "2026-08-09T09:00:00+02:00".to_owned()
+        }
+
+        fn today(&self) -> String {
+            "2026-08-09".to_owned()
+        }
+    }
+
+    #[test]
+    fn a_first_run_on_a_fresh_vault_writes_all_three_and_records_them() {
+        let mut vault = FakeVault::default();
+        let outcome = seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        assert_eq!(
+            outcome,
+            default_spaces::SeedOutcome::Wrote(vec![
+                "templates/inbox-note.md".to_owned(),
+                "templates/journal-entry.md".to_owned(),
+                "templates/recording-notes.md".to_owned(),
+            ])
+        );
+        // The ledger is what stops the second run happening at all.
+        let ledger = default_spaces::parse_ledger(&vault.files[TEMPLATE_LEDGER_REL])
+            .expect("the ledger keeper just wrote must parse");
+        assert_eq!(ledger.len(), 3);
+        assert!(ledger.contains("journal"));
+    }
+
+    #[test]
+    fn a_second_run_writes_nothing_and_says_so_out_loud() {
+        let mut vault = FakeVault::default();
+        seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        let again = seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        assert_eq!(again, default_spaces::SeedOutcome::AlreadySatisfied);
+
+        // And a deleted template STAYS deleted: the ledger, not the directory,
+        // is what keeper remembers, so it does not put back what was thrown away.
+        vault.files.remove("templates/journal-entry.md");
+        let third = seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        assert_eq!(third, default_spaces::SeedOutcome::AlreadySatisfied);
+        assert!(!vault.files.contains_key("templates/journal-entry.md"));
+    }
+
+    #[test]
+    fn restore_ignores_the_ledger_and_replaces_only_what_is_missing() {
+        let mut vault = FakeVault::default();
+        seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        vault.files.remove("templates/journal-entry.md");
+        // The user asking is the whole point of Restore, so the ledger does not
+        // get a vote — but the two templates still on disk are left alone.
+        let outcome = seed_templates(&mut vault, default_spaces::SeedMode::Restore);
+        assert_eq!(
+            outcome,
+            default_spaces::SeedOutcome::Wrote(vec!["templates/journal-entry.md".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_template_already_there_under_the_same_name_is_never_doubled() {
+        // Whatever the user's file says inside, the NAME is taken — folded the
+        // way `naming::slug` folds it, so `Journal Entry.md` blocks the seed too.
+        let mut vault = FakeVault::default();
+        vault
+            .files
+            .insert("templates/Journal Entry.md".to_owned(), "mine".to_owned());
+        let outcome = seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        assert_eq!(
+            outcome,
+            default_spaces::SeedOutcome::Wrote(vec![
+                "templates/inbox-note.md".to_owned(),
+                "templates/recording-notes.md".to_owned(),
+            ])
+        );
+        assert_eq!(vault.files["templates/Journal Entry.md"], "mine");
+    }
+
+    #[test]
+    fn an_unreadable_ledger_stops_an_automatic_run_and_never_a_restore() {
+        let mut vault = FakeVault::default();
+        vault
+            .files
+            .insert(TEMPLATE_LEDGER_REL.to_owned(), "{ not json".to_owned());
+
+        // A ledger that is THERE and does not parse is not an absent one: keeper
+        // does not know what this vault has been offered, and writing three
+        // notes on that basis is the AD-79 failure.
+        let blocked = seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        let default_spaces::SeedOutcome::Blocked(why) = &blocked else {
+            panic!("expected Blocked, got {blocked:?}");
+        };
+        assert!(why.contains(TEMPLATE_LEDGER_REL), "{why}");
+        assert!(!vault.files.contains_key("templates/inbox-note.md"));
+
+        // The user pressing Restore is looking at the gap and asking for it back.
+        let restored = seed_templates(&mut vault, default_spaces::SeedMode::Restore);
+        assert!(matches!(
+            &restored,
+            default_spaces::SeedOutcome::Wrote(written) if written.len() == 3
+        ));
+    }
+
+    #[test]
+    fn a_directory_keeper_cannot_list_blocks_the_seed_rather_than_reading_as_empty() {
+        // A sleeping USB volume. Swallowing the listing error and calling it "no
+        // templates" is how a vault ends up with two of each.
+        let mut vault = FakeVault::default();
+        vault.unlistable.insert(TEMPLATES_DIR.to_owned());
+        let outcome = seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        let default_spaces::SeedOutcome::Blocked(why) = &outcome else {
+            panic!("expected Blocked, got {outcome:?}");
+        };
+        assert!(why.contains(TEMPLATES_DIR), "{why}");
+        assert!(vault.files.is_empty(), "nothing may be written");
+    }
+
+    #[test]
+    fn a_write_that_fails_partway_records_what_landed() {
+        let mut vault = FakeVault::default();
+        vault
+            .unwritable
+            .insert("templates/journal-entry.md".to_owned());
+        let outcome = seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        let default_spaces::SeedOutcome::Stopped { written, .. } = &outcome else {
+            panic!("expected Stopped, got {outcome:?}");
+        };
+        assert_eq!(written, &vec!["templates/inbox-note.md".to_owned()]);
+        // What landed is in the ledger, so the next run does not write it twice.
+        let ledger =
+            default_spaces::parse_ledger(&vault.files[TEMPLATE_LEDGER_REL]).expect("ledger parses");
+        assert_eq!(ledger.iter().collect::<Vec<_>>(), vec!["inbox"]);
+    }
+
+    #[test]
+    fn every_seed_outcome_is_reported_at_a_level_the_app_can_actually_print() {
+        // DW-162, one layer out: nothing sets `RUST_LOG` in the packaged app, so
+        // a `debug!` here is a run that did something invisible on the machine it
+        // ran on. This is the assertion, not the promise.
+        for outcome in [
+            default_spaces::SeedOutcome::Wrote(vec!["templates/x.md".to_owned()]),
+            default_spaces::SeedOutcome::Wrote(Vec::new()),
+            default_spaces::SeedOutcome::AlreadySatisfied,
+            default_spaces::SeedOutcome::Blocked("why".to_owned()),
+            default_spaces::SeedOutcome::Stopped {
+                written: Vec::new(),
+                reason: "why".to_owned(),
+            },
+        ] {
+            let (level, sentence) = report_template_seed(&outcome);
+            assert!(
+                level <= default_spaces::REPORT_FLOOR,
+                "{outcome:?} reports at {level}, below the floor the app prints"
+            );
+            assert!(
+                sentence.contains("template"),
+                "the sentence must say what it is about: {sentence}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_shipped_template_is_a_template_and_makes_notes_that_are_not() {
+        // The round trip that matters: what the seeder writes, read back through
+        // the predicate that finds it and the function that copies it.
+        for shipped in &DEFAULT_TEMPLATES {
+            let note = render_template_note(shipped, "01T", "2026-08-09T09:00:00+02:00");
+            let (fm, _) = Frontmatter::parse(&note);
+            assert!(is_template(&fm), "{} must be a template", shipped.key);
+
+            let made = expand(&note, &ctx());
+            assert!(
+                made.tags.is_empty(),
+                "{} hands its copy {:?}; a shipped template must add no tag, or the \
+space that offered it (Inbox is `is:untagged`) may be the one space the note cannot appear in",
+                shipped.key,
+                made.tags
+            );
+            // `title` is the template's name and must not become the note's.
+            assert!(
+                !made.properties.iter().any(|(key, _)| key == "title"),
+                "{} would name every note after itself",
+                shipped.key
+            );
+            // No frontmatter fence smuggled into the body. A bare `---` LINE,
+            // not the substring: a GFM delimiter row (`| ---- | ---- |`) also
+            // contains three dashes, and the first version of this assertion
+            // failed the journal template for having a table in it.
+            assert!(
+                !made.body.lines().any(|line| line.trim_end() == "---"),
+                "{} smuggles a frontmatter fence into its body",
+                shipped.key
+            );
+            // Each one puts the caret somewhere deliberate.
+            assert!(made.caret.is_some(), "{} places no caret", shipped.key);
+        }
+    }
+
+    #[test]
+    fn a_shipped_templates_tables_are_aligned_after_expansion() {
+        // The defect this catches was in the first draft of the journal
+        // template: `| {HH}:{MM} |` is nine source characters and five rendered
+        // ones, so the scaffold looked aligned and every note made from it did
+        // not. The assertion is on the EXPANDED text, because that is what a
+        // person reads.
+        for shipped in &DEFAULT_TEMPLATES {
+            let note = render_template_note(shipped, "01T", "2026-08-09T09:00:00+02:00");
+            let body = expand(&note, &ctx()).body;
+            let rows: Vec<&str> = body
+                .lines()
+                .filter(|line| line.trim_start().starts_with('|'))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let pipes: Vec<Vec<usize>> = rows
+                .iter()
+                .map(|row| {
+                    row.char_indices()
+                        .filter_map(|(at, c)| (c == '|').then_some(at))
+                        .collect()
+                })
+                .collect();
+            assert!(
+                pipes.windows(2).all(|pair| pair[0] == pair[1]),
+                "{}'s table pipes do not line up once expanded:\n{}",
+                shipped.key,
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn no_shipped_template_uses_syntax_the_apps_own_renderer_cannot_draw() {
+        // A callout renders in Obsidian and shows a literal `[!note]` in keeper:
+        // `live-preview.ts` styles `Blockquote` and knows nothing of them. A
+        // shipped template that looks broken in the app that wrote it is worse
+        // than a plain one, so this is a gate rather than a note in a doc.
+        for shipped in &DEFAULT_TEMPLATES {
+            assert!(
+                !shipped.body.contains("[!"),
+                "{} uses a callout",
+                shipped.key
+            );
+            // No trailing whitespace either: two spaces at end of line is a hard
+            // break in markdown, and nobody means one in an empty scaffold.
+            for line in shipped.body.lines() {
+                assert_eq!(line, line.trim_end(), "{} has a padded line", shipped.key);
+            }
+        }
+    }
+
+    #[test]
+    fn a_template_hands_its_own_properties_to_the_copy_but_never_its_identity() {
+        let template = "---\nid: 01T\ntitle: Weekly Template\ncreated: 2026-01-01T00:00:00+01:00\nupdated: 2026-02-02T00:00:00+01:00\ntags: [template, work]\nstatus: draft\nproject: Acme\nkeeper:\n  template: templates/other.md\n---\n# x\n";
+        let out = expand(template, &ctx());
+        assert_eq!(
+            out.properties,
+            vec![
+                ("status".to_owned(), FieldValue::Str("draft".to_owned())),
+                ("project".to_owned(), FieldValue::Str("Acme".to_owned())),
+            ],
+            "source order, and only the author's own keys"
+        );
+        // Each exclusion is its own failure: a shared `id` puts a pin on the
+        // wrong file, a copied `title` names every note after the scaffold, and a
+        // copied `keeper` map would carry the template's provenance onto a note
+        // that has its own.
+        for private in PRIVATE_KEYS {
+            assert!(
+                !out.properties.iter().any(|(key, _)| key == private),
+                "{private} crossed over"
+            );
+        }
+        assert_eq!(out.tags, vec!["work"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 45.16 — which rung a create takes
+    // -----------------------------------------------------------------------
+
+    /// Every rung filled, then peeled one at a time. Asserted as a sequence
+    /// rather than four independent cases, because the content of this function
+    /// is the ORDER and a test that checks one rung in isolation cannot see it.
+    #[test]
+    fn a_create_takes_the_most_specific_template_it_has_been_given() {
+        let all = TemplateRungs {
+            named: Some("named.md"),
+            space: Some("space.md"),
+            capture: Some("capture.md"),
+            vault_default: Some("vault.md"),
+        };
+        assert_eq!(rung(all), Some("named.md"));
+        assert_eq!(rung(TemplateRungs { named: None, ..all }), Some("space.md"));
+        assert_eq!(
+            rung(TemplateRungs {
+                named: None,
+                space: None,
+                ..all
+            }),
+            Some("capture.md")
+        );
+        assert_eq!(
+            rung(TemplateRungs {
+                named: None,
+                space: None,
+                capture: None,
+                ..all
+            }),
+            Some("vault.md")
+        );
+        assert_eq!(rung(TemplateRungs::default()), None);
+    }
+
+    /// The capture rung sits between the space and the vault: a capture has no
+    /// space, so this is what makes a quick capture's scaffold *its own* rather
+    /// than the one every note in the vault gets (Story 45.16, FR-193).
+    #[test]
+    fn a_capture_template_beats_the_vault_default_and_loses_to_a_space() {
+        assert_eq!(
+            rung(TemplateRungs {
+                capture: Some("capture.md"),
+                vault_default: Some("vault.md"),
+                ..TemplateRungs::default()
+            }),
+            Some("capture.md")
+        );
+        assert_eq!(
+            rung(TemplateRungs {
+                space: Some("space.md"),
+                capture: Some("capture.md"),
+                ..TemplateRungs::default()
+            }),
+            Some("space.md")
+        );
+        // Nothing configured for capture falls through to exactly what an
+        // ordinary note would get, which is the behaviour every existing vault
+        // keeps.
+        assert_eq!(
+            rung(TemplateRungs {
+                vault_default: Some("vault.md"),
+                ..TemplateRungs::default()
+            }),
+            Some("vault.md")
+        );
+    }
+
+    /// A blank rung must not shadow the one below it. Before this function the
+    /// shell filtered the caller's rung and not the space's, so the two spellings
+    /// of "no template" behaved differently depending on which rung held them.
+    #[test]
+    fn a_blank_rung_is_an_absent_rung_and_never_hides_the_rung_beneath() {
+        assert_eq!(
+            rung(TemplateRungs {
+                named: Some("   "),
+                space: Some("space.md"),
+                ..TemplateRungs::default()
+            }),
+            Some("space.md")
+        );
+        assert_eq!(
+            rung(TemplateRungs {
+                space: Some(""),
+                capture: Some("\t\n"),
+                vault_default: Some("vault.md"),
+                ..TemplateRungs::default()
+            }),
+            Some("vault.md")
+        );
+        assert_eq!(
+            rung(TemplateRungs {
+                named: Some(""),
+                space: Some("  "),
+                capture: Some("\n"),
+                vault_default: Some(" "),
+            }),
+            None,
+            "four blanks are four absences, not a template whose path is nothing"
+        );
+    }
+
+    /// The path is trimmed before it is handed on, so a value pasted with a
+    /// trailing newline resolves instead of being reported missing.
+    #[test]
+    fn a_rung_is_trimmed_so_a_pasted_path_still_finds_its_template() {
+        assert_eq!(
+            rung(TemplateRungs {
+                capture: Some(" templates/capture.md\n"),
+                ..TemplateRungs::default()
+            }),
+            Some("templates/capture.md")
+        );
+    }
+
+    /// Story 45.16's headline, in the pure core: a capture applies 44.7's
+    /// template through 44.7's `expand`, and what comes out is not a template.
+    #[test]
+    fn the_capture_template_is_applied_through_expand_and_its_copy_is_not_a_template() {
+        let source = "---\nid: 01TPL\ntags: [template, Journal, work/notes]\nstatus: draft\n---\n# {{title}}\n\nCaptured {yyyy}-{mm}-{dd}.\n";
+        let chosen = rung(TemplateRungs {
+            capture: Some("templates/capture.md"),
+            vault_default: Some("templates/everything-else.md"),
+            ..TemplateRungs::default()
+        })
+        .expect("the capture rung is filled");
+        assert_eq!(chosen, "templates/capture.md");
+
+        let out = expand(source, &ctx());
+        assert_eq!(
+            out.tags,
+            vec!["journal", "work/notes"],
+            "the marker is dropped and the rest cross over"
+        );
+        assert!(
+            !out.body.contains("---"),
+            "the template's own frontmatter never reaches the body: {:?}",
+            out.body
+        );
+        assert!(out.body.contains("# Weekly review"));
+        assert!(out.body.contains("Captured 2026-08-02."));
+        assert_eq!(
+            provenance_pairs(chosen, out.source_id.as_deref()).len(),
+            2,
+            "a capture records which template made it, path and id"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Today's journal, and the template it never asked for (Story 45.20)
+    // -----------------------------------------------------------------------
+
+    /// The vault-relative path the shipped journal template lands at.
+    ///
+    /// Spelled out as a literal here, ONCE, rather than computed from
+    /// `template_rel` in every assertion below: computing the expected value
+    /// with the function under test is how a composer that agrees with itself
+    /// and with nothing on disk passes. `2026-08-09` vaults have this file.
+    const JOURNAL_REL: &str = "templates/journal-entry.md";
+
+    /// A `present` closure over a fixed set of paths.
+    ///
+    /// Two entries in the "everything" case on purpose: a probe that keeps only
+    /// the first element of a collection passes every single-item fixture.
+    fn present_in(paths: &'static [&'static str]) -> impl Fn(&str) -> bool {
+        move |rel: &str| paths.contains(&rel)
+    }
+
+    #[test]
+    fn a_shipped_template_answers_to_the_journal_key_and_lands_where_the_seeder_puts_it() {
+        let shipped = template_by_key(JOURNAL_TEMPLATE_KEY).expect("a journal template ships");
+        assert_eq!(shipped.name, "Journal entry");
+        // The composer and the literal agree, in both directions: this is the
+        // path `seed_templates` writes and the path `journal_template` looks up.
+        assert_eq!(template_rel(shipped), JOURNAL_REL);
+        // And a key that ships nothing is `None` rather than the first template
+        // in the array — a lookup that quietly returns the wrong scaffold would
+        // template every journal entry from the Inbox note.
+        assert_eq!(template_by_key("nothing-ships-this"), None);
+    }
+
+    #[test]
+    fn template_rel_is_the_slug_and_not_the_name() {
+        // "Journal entry" has a space and a capital; the file has neither. The
+        // two directions must fold identically or the seeder writes a file the
+        // lookup cannot find, which is a feature that is silent rather than
+        // broken.
+        for shipped in &DEFAULT_TEMPLATES {
+            let rel = template_rel(shipped);
+            assert!(rel.starts_with("templates/"), "{rel}");
+            assert!(rel.ends_with(".md"), "{rel}");
+            let stem = rel
+                .trim_start_matches("templates/")
+                .trim_end_matches(".md")
+                .to_owned();
+            assert_eq!(stem, naming::slug(shipped.name), "{rel}");
+            assert_eq!(stem, stem.to_lowercase(), "{rel} is not folded");
+            assert!(!stem.contains(' '), "{rel} kept a space");
+        }
+    }
+
+    #[test]
+    fn todays_journal_names_the_shipped_template_when_the_vault_still_has_it() {
+        let vault = present_in(&[JOURNAL_REL, "templates/inbox-note.md"]);
+        assert_eq!(journal_template(&vault).as_deref(), Some(JOURNAL_REL));
+    }
+
+    #[test]
+    fn a_deleted_journal_template_names_nothing_so_the_ladder_falls_through() {
+        // The user threw the scaffold away. keeper must not name it — a named
+        // rung that is not there stops `rung` and reports missing, which would
+        // cost this user the `default_template` they DID set. `None` here is
+        // what lets the vault default win, and AD-79 is what makes the deletion
+        // stick.
+        let without = present_in(&["templates/inbox-note.md", "templates/mine.md"]);
+        assert_eq!(journal_template(&without), None);
+
+        // Which is exactly the rung the ladder then takes.
+        assert_eq!(
+            rung(TemplateRungs {
+                named: journal_template(&without).as_deref(),
+                vault_default: Some("templates/mine.md"),
+                ..TemplateRungs::default()
+            }),
+            Some("templates/mine.md")
+        );
+        // And with the scaffold present, the journal's own answer wins over the
+        // vault-wide one — the specific beats the general, as it does for a
+        // space and for a capture.
+        let with = present_in(&[JOURNAL_REL, "templates/mine.md"]);
+        assert_eq!(
+            rung(TemplateRungs {
+                named: journal_template(&with).as_deref(),
+                vault_default: Some("templates/mine.md"),
+                ..TemplateRungs::default()
+            }),
+            Some(JOURNAL_REL)
+        );
+    }
+
+    #[test]
+    fn journal_template_asks_about_exactly_the_path_it_would_return() {
+        // The probe that would have caught a composer aimed at the wrong string
+        // — the shape that shipped a media URL resolving at a vault root and
+        // 404ing everywhere else. Record what was asked, not only what came
+        // back.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let spy = |rel: &str| {
+            asked.borrow_mut().push(rel.to_owned());
+            false
+        };
+        assert_eq!(journal_template(&spy), None);
+        assert_eq!(asked.into_inner(), vec![JOURNAL_REL.to_owned()]);
+    }
+
+    /// **The acceptance, asserted on the body.**
+    ///
+    /// Not "a template was chosen" and not "`expand` expands" — both of those
+    /// were already true while the feature did nothing. What was never asserted
+    /// is that the expanded body is what lands in the file, so that is what this
+    /// reads: the bytes, from the top.
+    #[test]
+    fn todays_journal_entry_is_written_from_the_shipped_templates_body() {
+        let shipped = template_by_key(JOURNAL_TEMPLATE_KEY).expect("a journal template ships");
+        let source = render_template_note(shipped, "01TPL", "2026-08-09T09:00:00+02:00");
+        let note = render_journal_note(
+            Some((JOURNAL_REL, &source)),
+            "2026-08-09",
+            "01ENTRY",
+            "2026-08-09T10:00:00+02:00",
+        );
+
+        // What `expand` produced for this template, computed independently.
+        // The assertion below is that THIS is what landed in the file — the one
+        // link in the chain nothing checked before, and the reason the feature
+        // could be green while doing nothing.
+        let expanded = expand(
+            &source,
+            &TemplateCtx {
+                title: "2026-08-09".to_owned(),
+                id: "01ENTRY".to_owned(),
+                now_local: "2026-08-09T10:00:00+02:00".to_owned(),
+            },
+        );
+        assert!(
+            note.text.ends_with(&expanded.body),
+            "the expanded body is not what the file ends with:\n{}",
+            note.text
+        );
+        let body = expanded.body.as_str();
+
+        // The template's own structure, expanded. A plain entry is `# 2026-08-09`
+        // and nothing else, so every one of these is a byte the template put there.
+        assert!(body.contains("# 2026-08-09"), "{body}");
+        assert!(body.contains("## Focus"), "{body}");
+        assert!(body.contains("## Log"), "{body}");
+        assert!(body.contains("| Time | What |"), "{body}");
+        assert!(body.contains("## Carried forward"), "{body}");
+        // The date came from the single-brace vocabulary against `now`, not from
+        // the title: a template heading of `{yyyy}-{mm}-{dd}` is the point.
+        assert!(!body.contains("{yyyy}"), "unexpanded token: {body}");
+        assert!(!body.contains("{{cursor}}"), "marker left behind: {body}");
+        // And the template's frontmatter never becomes prose — the defect that
+        // made templates unusable before 44.7 fixed `expand`.
+        //
+        // A TEXTUAL absence of a serialisation key, so it is only a witness if
+        // something else in this test proves the key still spells itself that
+        // way — otherwise a rename in `Frontmatter::serialise_new` makes this
+        // pass for the wrong reason while the structural assertions beside it
+        // cannot see the rename at all (W3Recording's finding, Story 45.19).
+        // The witness has to be built rather than found here.
+        // The shipped journal template carries only the `template` marker, which
+        // `expand` strips, so this entry has no `tags:` key anywhere — which
+        // means the witness has to be built rather than found. A template with a
+        // tag that DOES cross proves the key still spells itself `tags:`.
+        let tagged = render_journal_note(
+            Some((
+                "templates/mine.md",
+                "---\nid: 01T\ntags: [template, daily]\n---\n# x\n",
+            )),
+            "2026-08-09",
+            "01OTHER",
+            "2026-08-09T10:00:00+02:00",
+        );
+        assert!(tagged.text.contains("tags:"), "{}", tagged.text);
+        assert!(!body.contains("tags:"), "{body}");
+
+        // The entry is a note, not a template: the marker does not cross.
+        let (fm, _) = Frontmatter::parse(&note.text);
+        assert!(!is_template(&fm), "the copy must not be a template");
+        assert_eq!(fm.as_string("id"), Some("01ENTRY"));
+        assert_eq!(fm.as_string("created"), Some("2026-08-09T10:00:00+02:00"));
+        assert_eq!(fm.as_string("updated"), Some("2026-08-09T10:00:00+02:00"));
+
+        // Provenance: which template made it, by path AND by id, so a renamed
+        // template does not orphan the record (44.8 reads both).
+        assert_eq!(
+            provenance(&note.text),
+            Provenance {
+                path: Some(JOURNAL_REL.to_owned()),
+                id: Some("01TPL".to_owned()),
+            }
+        );
+        assert_eq!(note.from.as_deref(), Some(JOURNAL_REL));
+        // The caret is an offset into the BODY — the same number `expand`
+        // reported, unmoved — and it lands where `{{cursor}}` was, under
+        // `## Focus`.
+        assert_eq!(note.caret, expanded.caret);
+        let at = note.caret.expect("the journal template places a caret");
+        assert!(body[..at].ends_with("## Focus\n\n"), "{:?}", &body[..at]);
+    }
+
+    #[test]
+    fn a_journal_entry_with_no_template_is_still_a_journal_entry() {
+        // The whole point of the shortcut is that today's page is always there.
+        // A vault with no scaffold gets the bare heading, no `keeper:` map, and
+        // no caret to restore.
+        let note = render_journal_note(None, "2026-08-09", "01ENTRY", "2026-08-09T10:00:00+02:00");
+        assert!(note.text.ends_with("\n# 2026-08-09\n"), "{}", note.text);
+        assert_eq!(note.caret, None);
+        assert_eq!(note.from, None);
+        assert_eq!(provenance(&note.text), Provenance::default());
+        // Same pairing as the `tags:` absence above: this literal is only a
+        // witness because the templated entry in
+        // `todays_journal_entry_is_written_from_the_shipped_templates_body`
+        // proves the reserved map still spells itself `keeper:`. Asserted here
+        // too, in one test, so a rename fails the presence half rather than
+        // silently satisfying the absence half.
+        let templated = render_journal_note(
+            Some((
+                "templates/mine.md",
+                "---\nid: 01T\ntags: [template]\n---\n# x\n",
+            )),
+            "2026-08-09",
+            "01OTHER",
+            "2026-08-09T10:00:00+02:00",
+        );
+        assert!(templated.text.contains("keeper:"), "{}", templated.text);
+        assert!(!note.text.contains("keeper:"), "{}", note.text);
+    }
+
+    #[test]
+    fn a_journal_template_that_carries_tags_and_properties_hands_them_to_the_entry() {
+        // A user's own journal template, tagged and with properties. The entry
+        // inherits both, and loses only the marker — otherwise the one note
+        // keeper creates on a schedule is the one note a template cannot shape.
+        let source = concat!(
+            "---\n",
+            "id: 01MINE\n",
+            "title: My journal scaffold\n",
+            "tags: [template, journal, daily]\n",
+            "mood: \n",
+            "---\n",
+            "# {yyyy}-{mm}-{dd}\n\nSlept: \n",
+        );
+        let note = render_journal_note(
+            Some(("templates/mine.md", source)),
+            "2026-08-09",
+            "01ENTRY",
+            "2026-08-09T10:00:00+02:00",
+        );
+        let (fm, _) = Frontmatter::parse(&note.text);
+        // Two tags survive, not one: a fixture with a single inheritable tag
+        // cannot tell "every tag but the marker" from "the first tag".
+        assert_eq!(
+            frontmatter_tags(&fm),
+            vec!["journal".to_owned(), "daily".to_owned()]
+        );
+        assert!(!is_template(&fm), "the entry is not a template");
+        // The template's title never becomes the entry's.
+        assert_eq!(fm.as_string("title"), None);
+        assert!(note.text.contains("# 2026-08-09"), "{}", note.text);
+        assert!(note.text.contains("Slept:"), "{}", note.text);
+    }
+
+    // -----------------------------------------------------------------------
+    // The names keeper claims (Story 47.4, DW-191, one file over)
+    // -----------------------------------------------------------------------
+
+    /// The presence rule on its own. Read by [`plan_templates`] to decide what
+    /// to skip and by [`seed_templates`] to decide what to record, so "stood
+    /// down for" and "claimed" cannot become two answers.
+    #[test]
+    fn a_shipped_template_is_claimed_by_its_filename_and_by_nothing_else() {
+        assert!(claimed_templates(&[]).is_empty());
+
+        // Folded through `naming::slug`, so the three spellings of one name are
+        // one claim: the same fold that already decided the seed does not write
+        // a second `Journal entry.md` beside a `journal-entry.md`.
+        for spelling in ["Journal entry.md", "journal-entry.md", "JOURNAL ENTRY.md"] {
+            assert_eq!(
+                claimed_templates(&[spelling.to_owned()]),
+                ["journal"].iter().map(|k| (*k).to_owned()).collect(),
+                "{spelling:?} is the journal template's name"
+            );
+        }
+
+        // A file that is nobody's shipped template claims nothing.
+        assert!(claimed_templates(&["Meeting notes.md".to_owned()]).is_empty());
+
+        // The set, not the first hit.
+        assert_eq!(
+            claimed_templates(&[
+                "journal-entry.md".to_owned(),
+                "Inbox note.md".to_owned(),
+                "whatever.md".to_owned(),
+            ]),
+            ["inbox", "journal"]
+                .iter()
+                .map(|k| (*k).to_owned())
+                .collect()
+        );
+    }
+
+    /// **DW-191, in `templates.rs`.** The user wrote their own journal-entry
+    /// scaffold before keeper shipped one. keeper stands down for the name — and
+    /// now records it. They delete their file. Nothing arrives in its place.
+    ///
+    /// This is the surprise 44.7 refused for templates in prose while
+    /// `plan_templates` went on producing it: you delete your own file and
+    /// keeper's version comes back wearing its name.
+    #[test]
+    fn a_template_stood_down_for_a_name_the_user_took_is_claimed_and_their_file_stays_gone() {
+        let mut vault = FakeVault::default();
+        vault.files.insert(
+            "templates/journal-entry.md".to_owned(),
+            "# my own scaffold\n".to_owned(),
+        );
+
+        let outcome = seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+        assert_eq!(
+            outcome,
+            default_spaces::SeedOutcome::Wrote(vec![
+                "templates/inbox-note.md".to_owned(),
+                "templates/recording-notes.md".to_owned(),
+            ]),
+            "keeper still stands down rather than writing over their scaffold"
+        );
+        assert_eq!(
+            vault.files["templates/journal-entry.md"], "# my own scaffold\n",
+            "and it did not touch the file it stood down for"
+        );
+        let ledger = default_spaces::parse_ledger(&vault.files[TEMPLATE_LEDGER_REL])
+            .expect("the ledger parses");
+        assert!(
+            ledger.contains("journal"),
+            "the name keeper stood down for is claimed: {ledger:?}"
+        );
+
+        // They throw their own scaffold away.
+        vault.files.remove("templates/journal-entry.md");
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::FirstRun),
+            default_spaces::SeedOutcome::AlreadySatisfied
+        );
+        assert!(
+            !vault.files.contains_key("templates/journal-entry.md"),
+            "the user deleted their scaffold and keeper's must not arrive instead"
+        );
+
+        // …until they ask. Restore ignores the ledger, so the claim is escapable.
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::Restore),
+            default_spaces::SeedOutcome::Wrote(vec!["templates/journal-entry.md".to_owned()])
+        );
+    }
+
+    /// **The upgrade path.** A vault seeded by a build before this change holds
+    /// a ledger of what keeper WROTE, with the names it stood down for missing.
+    /// The first run after the change reconciles: no template note is written —
+    /// nothing is missing — and the claim is recorded.
+    ///
+    /// Built by hand rather than by running the old code, because the old code
+    /// is gone.
+    #[test]
+    fn a_template_ledger_written_under_the_old_meaning_is_reconciled_by_the_next_run() {
+        let mut vault = FakeVault::default();
+        vault.files.insert(
+            "templates/journal-entry.md".to_owned(),
+            "# my own scaffold\n".to_owned(),
+        );
+        for shipped in DEFAULT_TEMPLATES.iter().filter(|t| t.key != "journal") {
+            vault.files.insert(
+                template_rel(shipped),
+                render_template_note(shipped, "01OLD", "2026-08-08T09:00:00+02:00"),
+            );
+        }
+        let old: BTreeSet<String> = ["inbox", "recording"]
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect();
+        vault
+            .files
+            .insert(TEMPLATE_LEDGER_REL.to_owned(), render_template_ledger(&old));
+
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::FirstRun),
+            default_spaces::SeedOutcome::AlreadySatisfied,
+            "nothing is missing, so no template note is written"
+        );
+        let ledger = default_spaces::parse_ledger(&vault.files[TEMPLATE_LEDGER_REL])
+            .expect("the ledger parses");
+        assert!(
+            ledger.contains("journal"),
+            "…and the name keeper stood down for is claimed now: {ledger:?}"
+        );
+
+        // Which is what makes the deletion stick.
+        vault.files.remove("templates/journal-entry.md");
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::FirstRun),
+            default_spaces::SeedOutcome::AlreadySatisfied
+        );
+        assert!(!vault.files.contains_key("templates/journal-entry.md"));
+    }
+
+    /// The reconciliation writes ONCE. `.keeper-templates.json` is synced
+    /// content, and a rewrite on every launch is a commit per launch in
+    /// somebody's vault history.
+    #[test]
+    fn a_settled_template_vault_touches_nothing_on_the_runs_after_the_upgrade() {
+        let mut vault = FakeVault::default();
+        vault.files.insert(
+            "templates/journal-entry.md".to_owned(),
+            "# my own scaffold\n".to_owned(),
+        );
+        seed_templates(&mut vault, default_spaces::SeedMode::FirstRun);
+
+        for run in 0..3 {
+            vault.attempted.clear();
+            assert_eq!(
+                seed_templates(&mut vault, default_spaces::SeedMode::FirstRun),
+                default_spaces::SeedOutcome::AlreadySatisfied
+            );
+            assert!(
+                vault.attempted.is_empty(),
+                "run {run} after the claim rewrote {:?}",
+                vault.attempted
+            );
+        }
+    }
+
+    /// A Restore with nothing to restore must not invent a ledger over one
+    /// keeper could not read: it may be a newer build's, and replacing it
+    /// re-offers that build's templates. The only path where the claim write
+    /// could reach an unreadable ledger — an automatic run has already returned
+    /// `Blocked`.
+    #[test]
+    fn a_template_restore_with_nothing_to_restore_leaves_an_unreadable_ledger_alone() {
+        let mut vault = FakeVault::default();
+        for shipped in &DEFAULT_TEMPLATES {
+            vault.files.insert(
+                template_rel(shipped),
+                render_template_note(shipped, "01OLD", "2026-08-08T09:00:00+02:00"),
+            );
+        }
+        let theirs = "{\"version\":99,\"written-by\":\"a keeper from the future\"}\n";
+        vault
+            .files
+            .insert(TEMPLATE_LEDGER_REL.to_owned(), theirs.to_owned());
+
+        assert_eq!(
+            seed_templates(&mut vault, default_spaces::SeedMode::Restore),
+            default_spaces::SeedOutcome::AlreadySatisfied
+        );
+        assert_eq!(
+            vault.files[TEMPLATE_LEDGER_REL], theirs,
+            "keeper must not replace a ledger it could not read"
+        );
     }
 }

@@ -10,12 +10,24 @@
 //! in the engine; this layer only translates types and maps errors into the one
 //! `IpcError` envelope the frontend already understands.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use keeper_core::vm::{IpcError, IpcErrorCode};
-use keeper_sync::engine::{PendingReason, SyncOutcome};
+use keeper_core::vm::{
+    ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
+    FilesDeleteRefusalVm, FilesEntryFacts, FilesEntrySyncVm, FilesEntryVm, FilesListingState,
+    FilesListingVm, FilesReleaseVm, FilesSyncStatusVm, FilesWriteVm, IpcError, IpcErrorCode,
+};
+use keeper_sync::browse;
+use keeper_sync::engine::{PendingReason, ReleaseSchedule, SyncOutcome};
+use keeper_sync::exclude::ExcludeSet;
+use keeper_sync::export::{self, ExportRefusal};
+use keeper_sync::files_write::{self, WriteRefusal, WriteRoute, WriteScope};
+use keeper_sync::lfs::hydrate::ContentRefusal;
 use keeper_sync::profile::{
-    LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS, DEFAULT_SETTLE_MS,
+    LfsMode, ProfileState, SyncDirection, SyncLane, DEFAULT_POLL_INTERVAL_MS,
+    DEFAULT_RECORDINGS_SUBFOLDER, DEFAULT_SESSIONS_SUBFOLDER, DEFAULT_SETTLE_MS,
 };
 use keeper_sync::progress::{format_bytes, SyncPhase, SyncStatus};
 use keeper_sync::provenance::SyncSource;
@@ -121,6 +133,40 @@ pub struct SyncProfileVm {
     /// box, so what it displays is the value that would actually be in force
     /// (AD-34-8).
     pub notes_subfolder: Option<String>,
+    /// Whether this folder holds recordings (Story 41.1, AD-66).
+    ///
+    /// Beside the notes flag above and meaning the same kind of thing: a
+    /// recordings root is not a configured object with a life of its own, it is
+    /// this flag plus a subfolder on a profile that already exists. Story 41.7
+    /// is what made it reachable — the block existed and nothing in the app
+    /// could write one, so the destination picker 41.2 built never had a profile
+    /// to offer.
+    pub recordings: bool,
+    /// The recordings subfolder that would be **in force**: the stored one when
+    /// this folder holds recordings, and `RecordingsConfig`'s own default when it
+    /// does not.
+    ///
+    /// Never `None`, which is the one place this deliberately does not mirror
+    /// `notes_subfolder` directly above. That field is `None` for a folder that
+    /// is not a vault, so the form has to prefill its box from a copy of the
+    /// default it keeps in TypeScript (`SYNC_NOTES_DEFAULT_SUBFOLDER`) — a second
+    /// spelling of a Rust constant, which is exactly the drift
+    /// `keeper_sync::profile` spells its defaults once to prevent. Resolving it
+    /// here instead means the form prefills from the value that would actually be
+    /// used (AD-34-8) and never spells `recordings` at all.
+    pub recordings_subfolder: String,
+    /// Whether this folder contains a sessions zone (FR-222, AD-107).
+    ///
+    /// Beside the notes and recordings flags above and meaning the same kind of
+    /// thing: a sessions root is not a configured object with a life of its
+    /// own, it is this flag plus a subfolder on a profile that already exists.
+    pub sessions: bool,
+    /// The sessions subfolder that would be **in force**: the stored one when
+    /// this folder holds sessions, and `SessionsConfig`'s own default when it
+    /// does not. Never `None`, following `recordings_subfolder` directly above
+    /// rather than `notes_subfolder` — the form prefills from the value that
+    /// would actually be used, and `60-sessions` is spelled once, in Rust.
+    pub sessions_subfolder: String,
 }
 
 impl From<&SyncProfile> for SyncProfileVm {
@@ -149,8 +195,115 @@ impl From<&SyncProfile> for SyncProfileVm {
             enabled: p.enabled,
             notes: p.notes.is_some(),
             notes_subfolder: p.notes.as_ref().map(|notes| notes.subfolder.clone()),
+            recordings: p.recordings.is_some(),
+            // The stored value, or the default that would be used if this folder
+            // were flagged right now. Resolved here rather than in the form, so
+            // `DEFAULT_RECORDINGS_SUBFOLDER` is spelled once in the whole product.
+            recordings_subfolder: p.recordings.as_ref().map_or_else(
+                || DEFAULT_RECORDINGS_SUBFOLDER.to_owned(),
+                |recordings| recordings.subfolder.clone(),
+            ),
+            sessions: p.sessions.is_some(),
+            sessions_subfolder: p.sessions.as_ref().map_or_else(
+                || DEFAULT_SESSIONS_SUBFOLDER.to_owned(),
+                |sessions| sessions.subfolder.clone(),
+            ),
         }
     }
+}
+
+/// What a synced folder costs on this disk, decomposed (Story 55.9).
+///
+/// **There is no server total here, and its absence is deliberate.** No generic
+/// git request asks a remote how large it is; a host's own API can answer, and
+/// keeper syncs to plain git, so a figure that appeared for one host and not
+/// another would be worse than none. What is knowable without asking anyone is
+/// the half that explains the gap a person actually notices — the bytes held
+/// here that the remote already has.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncFootprintVm {
+    /// Everything under the folder, working tree and `.git` together.
+    ///
+    /// `number` rather than ts-rs's `bigint` for `u64`, the same reading every
+    /// other byte count in this file takes: JSON loses precision above 2^53, and
+    /// 2^53 bytes is nine petabytes.
+    pub on_disk: u64,
+    /// The local LFS object cache — the second copy of large content. Inside
+    /// `on_disk`, never beside it.
+    pub lfs_cache: u64,
+    /// Cache the remote already holds, which keeper may release at any time.
+    /// This is the number that explains "why is it bigger here than there".
+    pub reclaimable: u64,
+    /// Transfer scratch left by interrupted runs. Swept by "Recheck all files".
+    pub scratch: u64,
+    /// Everything this folder tracks at full size, whether or not the bytes are
+    /// on this machine — which is what the server holds, worked out without
+    /// asking it.
+    ///
+    /// There is no request in the git protocol for "how big are you", and a
+    /// number that only appeared for one host would be worse than none. But an
+    /// LFS pointer states the size of the object it stands for, so a folder can
+    /// weigh its own contents whether or not it has fetched them. That is the
+    /// number a virtual folder needs: `content` minus `on_disk` is what would
+    /// still be out there.
+    pub content: u64,
+    /// The same five numbers as people read them.
+    ///
+    /// Formatted here, by the one formatter, because a second one in TypeScript
+    /// is how this row and the Files pane's size column end up disagreeing about
+    /// the same folder.
+    pub on_disk_label: String,
+    pub lfs_cache_label: String,
+    pub reclaimable_label: String,
+    pub scratch_label: String,
+    pub content_label: String,
+}
+
+/// Measure one folder's footprint.
+///
+/// Blocking: it walks and stats a tree that may be on a slow external volume,
+/// and doing that on the async runtime would stall every other command sharing
+/// the thread — the same reason `notes_embed_paths` spawns.
+#[tauri::command]
+pub async fn sync_footprint(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<SyncFootprintVm, IpcError> {
+    let engine = engine_of(&state)?;
+    // `list_profiles` because that is the accessor the engine offers; a folder
+    // that has been removed between the click and this call is a missing id,
+    // not an error worth a dialog.
+    let profile = engine
+        .list_profiles()
+        .map_err(|e| sync_ipc_error(&e))?
+        .into_iter()
+        .find(|candidate| candidate.id == id)
+        .ok_or_else(|| {
+            sync_ipc_error(&keeper_sync::SyncError::Config(format!(
+                "no such sync profile: {id}"
+            )))
+        })?;
+    let root = profile.local_path.clone();
+    let measured = tokio::task::spawn_blocking(move || keeper_sync::footprint::measure(&root))
+        .await
+        .map_err(|err| {
+            sync_ipc_error(&keeper_sync::SyncError::Config(format!("footprint: {err}")))
+        })?
+        .map_err(|e| sync_ipc_error(&e))?;
+    Ok(SyncFootprintVm {
+        on_disk: measured.on_disk,
+        lfs_cache: measured.lfs_cache,
+        reclaimable: measured.reclaimable,
+        scratch: measured.scratch,
+        content: measured.content,
+        on_disk_label: keeper_core::size::format_file_size(measured.on_disk),
+        lfs_cache_label: keeper_core::size::format_file_size(measured.lfs_cache),
+        reclaimable_label: keeper_core::size::format_file_size(measured.reclaimable),
+        scratch_label: keeper_core::size::format_file_size(measured.scratch),
+        content_label: keeper_core::size::format_file_size(measured.content),
+    })
 }
 
 /// What a profile is doing right now — the polled snapshot the tray reads.
@@ -186,6 +339,13 @@ pub struct SyncStatusVm {
     /// words; the number is here so a surface can show it without parsing prose.
     #[ts(type = "number")]
     pub settling: u32,
+    /// Transfers still to be delivered, and their bytes. `line` says both in
+    /// words; the numbers are here so a surface can show them without parsing
+    /// prose, the same reason `settling` is.
+    #[ts(type = "number")]
+    pub queued_files: u32,
+    #[ts(type = "number")]
+    pub queued_bytes: u64,
     /// Sticky, last-write-wins, cleared only by a clean run — the same shape as
     /// `RecordingStatusVm::warning` so the banner behaves identically.
     pub warning: Option<String>,
@@ -211,6 +371,8 @@ impl From<&SyncStatus> for SyncStatusVm {
             bytes_total: s.bytes_total,
             pending: s.pending,
             settling: s.settling,
+            queued_files: s.queued_files,
+            queued_bytes: s.queued_bytes,
             warning: s.warning.clone(),
             error: s.error.clone(),
             last_sync_ms: s.last_sync_ms,
@@ -236,6 +398,10 @@ pub struct SyncOutcomeVm {
     #[ts(type = "number")]
     pub files_changed: u64,
     pub conflicts: Vec<String>,
+    /// Paths that took the remote's version with no copy kept, because the
+    /// profile declares them regenerable. Nothing is on disk to clean up —
+    /// these want the tool that writes them to run again.
+    pub stale: Vec<String>,
     /// Bytes this run moved over the network — the received pack plus every
     /// LFS object transferred. Zero for a pass that found nothing to do, which
     /// is the common and correct answer, never an error.
@@ -302,8 +468,19 @@ pub struct SyncActivityVm {
 #[serde(rename_all = "camelCase")]
 pub struct SyncPendingVm {
     pub path: String,
-    /// `settling` | `untracked` | `modified` | `added` | `deleted`.
+    /// `settling` | `untracked` | `modified` | `added` | `deleted` | `incoming`
+    /// | `incomingUpdate`.
+    ///
+    /// The first five are what this machine changed; `incoming` is an LFS
+    /// object queued to arrive, which `git status` cannot see and which used to
+    /// leave a folder pulling 53 GB reporting nothing as pending at all.
     pub reason: String,
+    /// How big the thing waiting is: announced, for an object that has not
+    /// arrived; measured off the worktree for one that has not left. `null`
+    /// only where there is nothing to measure — a deletion has no file, and a
+    /// path that vanished between the walk and the stat has no size to report.
+    #[ts(type = "number | null")]
+    pub size_bytes: Option<u64>,
     /// When the quiescence episode began, for `settling` only. The UI renders
     /// it as "waiting for writes to stop", not as a countdown: the window
     /// restarts on every write, so a promised finish time would be a guess.
@@ -324,6 +501,31 @@ pub struct SyncParkedVm {
     pub last_error: Option<String>,
 }
 
+/// A file whose name is not text, as the Problems pane shows it (Story 47.2,
+/// DW-200).
+///
+/// The shell-side shape of `keeper_sync::UnspellableName`, for the same reason
+/// [`SyncParkedVm`] is the shell-side shape of a parked unit: the engine type
+/// is not a view model and does not derive [`TS`].
+///
+/// **Both renderings, and neither alone is enough.** `display` is what a person
+/// reads and it is LOSSY and non-injective — two different files can produce
+/// one `display`, which is the whole defect story 47.2 closed. `escaped` is
+/// byte-exact ASCII, and it is what makes the row actionable: a person can
+/// paste it into a shell and find the file. A row carrying only the lossy
+/// rendering names a file the reader cannot then locate; one carrying only the
+/// escaped form is unreadable.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncUnspellableVm {
+    /// `U+FFFD`-substituted rendering: what the row reads as.
+    pub display: String,
+    /// Byte-exact ASCII, `\xNN` per byte outside printable ASCII: what the row
+    /// can be acted on with.
+    pub escaped: String,
+}
+
 /// Everything currently wrong with one profile.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -335,6 +537,14 @@ pub struct SyncProblemsVm {
     /// Conflict copies still on disk. A copy the user has already dealt with
     /// and deleted is resolved, so it leaves this list on its own.
     pub conflicts: Vec<String>,
+    /// Files in this folder whose names are not text (Story 47.2, DW-200).
+    ///
+    /// Reported rather than silent. Before this, keeper rendered such a name
+    /// lossily and said nothing, and the rendering could be joined back to a
+    /// *different real file* — so a delete confirmed against one row removed
+    /// another. `browse::plain_segments` now refuses the rendering; this list is
+    /// how the person finds out the file exists at all.
+    pub unspellable: Vec<SyncUnspellableVm>,
 }
 
 /// Fields a caller may set when creating or updating a profile.
@@ -402,6 +612,37 @@ pub struct SyncProfileReq {
     /// user changed.
     #[serde(default)]
     pub notes_subfolder: Option<String>,
+    /// Flag or unflag this folder as holding recordings (Story 41.7, AD-66).
+    /// `None` leaves the flag alone under exactly the rule `notes` follows above:
+    /// a caller with no control for it must not be able to clear it, and clearing
+    /// it would take a folder out of the Recording destination picker while every
+    /// file stayed where it was.
+    #[serde(default)]
+    pub recordings: Option<bool>,
+    /// The recordings subfolder to pin. `None` keeps whatever is stored — or,
+    /// when this flags the folder for the first time, lets `RecordingsConfig`'s
+    /// own default stand, which is how a form that shows an untouched box says
+    /// "keeper picks".
+    ///
+    /// Unlike `notes_subfolder`, an explicit empty string is a value and NOT an
+    /// omission: see [`recordings_subfolder`] for why nothing here is tidied up
+    /// on the caller's behalf.
+    #[serde(default)]
+    pub recordings_subfolder: Option<String>,
+    /// Flag or unflag this folder as holding a sessions zone (FR-222, AD-107).
+    /// `None` leaves the flag alone under exactly the rule `notes` and
+    /// `recordings` follow above: a caller with no control for it must not be
+    /// able to clear it, and clearing it would take a whole zone off the
+    /// Sessions surface while every file stayed where it was.
+    #[serde(default)]
+    pub sessions: Option<bool>,
+    /// The sessions subfolder to pin. `None` keeps whatever is stored — or,
+    /// when this flags the folder for the first time, lets `SessionsConfig`'s
+    /// own default (`60-sessions`) stand. Follows `recordings_subfolder`'s
+    /// verbatim rule, not `notes_subfolder`'s tidying: the validator refuses by
+    /// name, and a silent correction would save against a folder nobody named.
+    #[serde(default)]
+    pub sessions_subfolder: Option<String>,
 }
 
 /// Mint an opaque, sortable, collision-free id.
@@ -539,6 +780,29 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
         // `false` on its own account — the wait is on the uploads, not on a
         // clock, and pressing "Sync now" again cannot shorten it.
         SyncError::LfsUploadPending { .. } => IpcErrorCode::SyncUnavailable,
+        // The same shape one line up: a wait rather than a fault. Another
+        // machine reached the shared branch first, so this pass published
+        // nothing and the reconcile it queued is what makes the next one land
+        // (DW-207). `syncUnavailable` says "sync cannot continue right now",
+        // which is the truth for the moment it lasts — and `internal` would
+        // dress a routine race as a defect in front of the user.
+        SyncError::RemoteMoved { .. } => IpcErrorCode::SyncUnavailable,
+        // The third of the same shape, and the one the user is most likely to
+        // cause themselves: a scheduled run and a "Sync now" click overlapping.
+        // The folder is being synced — by the run that got there first — so this
+        // is a wait, not a fault. It used to arrive as `Config`, which the app
+        // renders as "invalid sync configuration", sending somebody to look for
+        // a broken setting that does not exist.
+        SyncError::Busy(_) => IpcErrorCode::SyncUnavailable,
+        // A typed refusal about ONE path (Story 56.3): keeper will not change
+        // the bytes there, and the reason is the refusal's own sentence.
+        // `internal` rather than a new code, on the same reasoning
+        // `write_refused` uses for `WriteRefusal`: the frontend has no
+        // affordance to build from a distinct code here — 56.7 owns the row
+        // states and 56.9 the button — and the message is written to be shown
+        // verbatim. `retriable` is `false` from `Retriability::Permanent`,
+        // which is correct: asking again unchanged gets the same answer.
+        SyncError::Refused(_) => IpcErrorCode::Internal,
         // Everything else keeps the `internal` this funnel has always given it.
         // Spelled out rather than defaulted so that growing the taxonomy asks
         // the question here instead of answering it.
@@ -695,6 +959,60 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
             }
         }
     }
+    // The recordings flag (Story 41.7, AD-66) — the notes block directly above,
+    // applied a second time and deliberately not reinvented. `RecordingsConfig`
+    // and its validation shipped in Story 41.1 and the destination picker in
+    // 41.2, and neither was reachable, because no request could express this
+    // field: the app could read a recordings block written by `keeper-syncd` and
+    // could never write one. Unflagging REMOVES the block rather than storing an
+    // empty one, because `None` is "holds no recordings" and a default-filled
+    // block would nominate the folder as a destination nobody chose.
+    match req.recordings {
+        Some(true) => {
+            let mut config = profile.recordings.clone().unwrap_or_default();
+            if let Some(subfolder) = recordings_subfolder(req) {
+                config.subfolder = subfolder;
+            }
+            profile.recordings = Some(config);
+        }
+        Some(false) => profile.recordings = None,
+        // Not expressed: as for notes, a subfolder edit on its own still lands on
+        // a folder that already holds recordings, and says nothing about one that
+        // does not.
+        None => {
+            if let (Some(config), Some(subfolder)) =
+                (profile.recordings.as_mut(), recordings_subfolder(req))
+            {
+                config.subfolder = subfolder;
+            }
+        }
+    }
+    // The sessions flag (FR-222, AD-107) — the recordings block directly above,
+    // applied a third time and deliberately not reinvented. Unflagging REMOVES
+    // the block rather than storing an empty one, because `None` is "holds no
+    // sessions zone" and a default-filled block would put a Sessions surface
+    // over a folder nobody flagged. Unflagging removes no files — it is a flag
+    // write and nothing else.
+    match req.sessions {
+        Some(true) => {
+            let mut config = profile.sessions.clone().unwrap_or_default();
+            if let Some(subfolder) = sessions_subfolder(req) {
+                config.subfolder = subfolder;
+            }
+            profile.sessions = Some(config);
+        }
+        Some(false) => profile.sessions = None,
+        // Not expressed: as above, a subfolder edit on its own still lands on a
+        // folder that already holds a zone, and says nothing about one that
+        // does not.
+        None => {
+            if let (Some(config), Some(subfolder)) =
+                (profile.sessions.as_mut(), sessions_subfolder(req))
+            {
+                config.subfolder = subfolder;
+            }
+        }
+    }
     // Validate here so a bad profile is rejected at the edge with an actionable
     // message rather than deep inside the engine.
     profile.validate().map_err(|err| sync_ipc_error(&err))?;
@@ -711,6 +1029,36 @@ fn parse_req(req: &SyncProfileReq, prior: Option<&SyncProfile>) -> Result<SyncPr
 fn notes_subfolder(req: &SyncProfileReq) -> Option<String> {
     let trimmed = req.notes_subfolder.as_ref()?.trim().trim_matches('/');
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// The recordings subfolder a request expresses, or `None` when it expresses
+/// none.
+///
+/// Whitespace-trimmed and otherwise **verbatim**, which is the one way this does
+/// not copy [`notes_subfolder`] above (Story 41.7). Stripping slashes there is a
+/// convenience; here it would be a silent correction of the exact inputs
+/// `RecordingsConfig::validate` exists to refuse by name — `/tmp` would become
+/// `tmp`, and a save the owner should have been told about would succeed against
+/// a folder they did not name. An empty string is passed through for the same
+/// reason, so the validator gets to say "recordings subfolder must not be empty"
+/// itself rather than have the answer guessed at here.
+///
+/// `None` — the key absent from the request altogether — is still the AD-34-9
+/// omission that leaves whatever is stored alone.
+fn recordings_subfolder(req: &SyncProfileReq) -> Option<String> {
+    req.recordings_subfolder
+        .as_ref()
+        .map(|raw| raw.trim().to_owned())
+}
+
+/// The sessions subfolder a request expresses, or `None` when it expresses
+/// none. Verbatim after a whitespace trim, for the reason
+/// [`recordings_subfolder`] is: `SessionsConfig::validate` refuses bad shapes
+/// by name, and correcting them here would hide the refusal.
+fn sessions_subfolder(req: &SyncProfileReq) -> Option<String> {
+    req.sessions_subfolder
+        .as_ref()
+        .map(|raw| raw.trim().to_owned())
 }
 
 fn engine_of(state: &AppState) -> Result<Arc<keeper_sync::engine::Engine>, IpcError> {
@@ -740,6 +1088,7 @@ pub async fn sync_statuses(
 /// Create or update a profile, returning the stored result.
 #[tauri::command]
 pub async fn sync_profile_save(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     req: SyncProfileReq,
 ) -> Result<SyncProfileVm, IpcError> {
@@ -758,6 +1107,11 @@ pub async fn sync_profile_save(
     engine
         .upsert_profile(&profile)
         .map_err(|e| sync_ipc_error(&e))?;
+    // The sessions flag rides this save (FR-222), and the root registry is a
+    // filter over the profile list (AD-107) — so the registry re-reads here,
+    // the same move `notes_vault_flag` makes for vaults. Idempotent and cheap
+    // when nothing sessions-shaped changed.
+    crate::sessions_root::refresh(&app);
     Ok(SyncProfileVm::from(&profile))
 }
 
@@ -847,6 +1201,16 @@ fn outcome_line(outcome: &SyncOutcome) -> String {
             plural(count)
         ));
     }
+    if !outcome.stale.is_empty() {
+        // Deliberately not phrased as a conflict: nothing was kept, nothing has
+        // to be deleted, and the only action is to run whatever writes the file.
+        let count = outcome.stale.len() as u64;
+        clauses.push(format!(
+            "took the remote's version of {count} generated file{} — regenerate {}",
+            plural(count),
+            if count == 1 { "it" } else { "them" }
+        ));
+    }
     if clauses.is_empty() {
         return NOTHING_TO_SYNC.to_owned();
     }
@@ -883,6 +1247,7 @@ pub async fn sync_folder_now(
         files_changed: outcome.files_changed,
         bytes: outcome.bytes,
         line: outcome_line(&outcome),
+        stale: outcome.stale.clone(),
         conflicts: outcome.conflicts,
     })
 }
@@ -932,6 +1297,18 @@ pub async fn sync_pending(
         .map(|file| {
             let (reason, since_ms) = match file.reason {
                 PendingReason::Settling { since_ms } => ("settling", Some(since_ms)),
+                // Two words for one direction: an object that replaces content
+                // this machine holds is a different thing to look at from one
+                // that is simply arriving, and only keeper's own record of what
+                // it has materialized can tell them apart.
+                PendingReason::Incoming { replacing, .. } => (
+                    if replacing {
+                        "incomingUpdate"
+                    } else {
+                        "incoming"
+                    },
+                    None,
+                ),
                 PendingReason::Untracked => ("untracked", None),
                 PendingReason::Modified => ("modified", None),
                 PendingReason::Added => ("added", None),
@@ -941,6 +1318,10 @@ pub async fn sync_pending(
                 path: file.path,
                 reason: reason.to_owned(),
                 since_ms,
+                // Off the row, not out of the reason: every row that has a size
+                // carries one now, so a list holding both directions reads as
+                // one list instead of two half-filled columns.
+                size_bytes: file.size_bytes,
             }
         })
         .collect())
@@ -968,6 +1349,17 @@ pub async fn sync_problems(
             })
             .collect(),
         conflicts: report.conflicts,
+        // Hand-projected like every field above it, so a field added to
+        // `ProblemReport` reaches the pane by someone deciding it should rather
+        // than by inheriting a derive (Story 47.2, DW-200).
+        unspellable: report
+            .unspellable
+            .into_iter()
+            .map(|name| SyncUnspellableVm {
+                display: name.display,
+                escaped: name.escaped,
+            })
+            .collect(),
     })
 }
 
@@ -1175,8 +1567,18 @@ fn profile_by_id(state: &AppState, id: &str) -> Result<keeper_sync::SyncProfile,
 /// NOT a digest comparison — keeper records no per-file hash (`file_state` has
 /// no digest column). Each file is read and fails only if it changed under the
 /// read (a torn read), and each LFS pointer's object must be present at its
-/// recorded size. Worth having, but the earlier "against its recorded digests"
-/// wording described a check that does not exist.
+/// recorded size — **except** where the folder's virtual-file policy authorizes
+/// that content to stay away, which `verify` counts as virtual rather than
+/// reporting as a fault (Story 56.6). That policy is read from the
+/// `.keepervirtual` standing in the **worktree**, never from `HEAD`, and a
+/// `virtualPatterns` list on the profile or in a folder TOML layer above it
+/// replaces the file's list wholesale — so what is in force may be neither
+/// committed nor in that file at all. The excuse also needs the index to
+/// confirm the bytes on disk are the pointer this repository committed, the
+/// object to be genuinely absent rather than truncated, and — for a folder
+/// whose remote is a directory this machine can see — that store to hold the
+/// object. Worth having, but the earlier "against its recorded digests" wording
+/// described a check that does not exist.
 #[tauri::command]
 pub async fn sync_verify(
     state: tauri::State<'_, AppState>,
@@ -1201,10 +1603,38 @@ pub async fn sync_verify(
 ///
 /// Returns nothing: the effect shows up as the folder's own Pending list on the
 /// next walk, which is the thing the user was looking at when they pressed it.
+/// The remote half rides along (DW-208). "Recheck all files" is the one action
+/// whose plain meaning is *look at everything again*, and until now it looked
+/// only at the worktree — which cannot see the failure that actually loses
+/// content, a pointer whose object never reached the server. Nothing else in
+/// the engine ever retries one: uploads are queued only for files being freshly
+/// staged, so an obligation dropped once is dropped for good.
+///
+/// It runs after the rescan and its failure is not the button's failure: the
+/// local half has already taken effect, and a folder whose remote is
+/// unreachable must still be able to forget what it remembers. The repair is
+/// reported through the profile's own warnings, where the paths it could not
+/// recover are the part a human has to act on.
 #[tauri::command]
 pub async fn sync_rescan(state: tauri::State<'_, AppState>, id: String) -> Result<(), IpcError> {
     let engine = engine_of(&state)?;
-    engine.rescan(&id).map_err(|e| sync_ipc_error(&e))
+    engine.rescan(&id).map_err(|e| sync_ipc_error(&e))?;
+    match engine.republish_missing_objects(&id).await {
+        Ok(report) if report.missing > 0 => tracing::info!(
+            profile = id,
+            missing = report.missing,
+            queued = report.queued,
+            unrecoverable = report.unrecoverable.len(),
+            "recheck: re-publishing what the server was missing"
+        ),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            profile = id,
+            error = %err,
+            "recheck: could not ask the server what it is missing"
+        ),
+    }
+    Ok(())
 }
 
 /// An `IpcError` carrying a message written for the person who will read it.
@@ -1352,6 +1782,1955 @@ pub async fn sync_unsubscribe_progress(
     Ok(())
 }
 
+/// One directory of one synced folder, for the Files tab (Story 43.8, FR-153,
+/// AD-74, AD-75, AD-65).
+///
+/// **Listing is the shell's job, and this is the only place it is done.** The
+/// frontend hands back a `subpath` this command previously produced and never
+/// composes one; `keeper_sync::browse` resolves it against the profile's own
+/// root, refuses anything that is not a plain descendant of it — lexically and
+/// again after symlinks are followed — and applies the profile's tier-0
+/// exclusions. A webview that asked for `../../.ssh` would have to have
+/// persuaded the engine to store a profile pointing there first.
+///
+/// **Lazy, one directory per call.** These trees hold a hundred thousand files.
+/// Nothing here descends, and the cap is reported rather than hidden.
+///
+/// **Read-only about the engine, not only about the disk.** `browse` takes a
+/// `&SyncProfile` and not the engine, so looking at a folder cannot spend the
+/// stability gate's verdict, clear `file_state`, move the scan clock or wake
+/// the watcher. The listing runs on the blocking pool because a directory on a
+/// pendrive can take hundreds of milliseconds to stat, and stalling the async
+/// runtime would freeze every other profile's poll behind a click.
+///
+/// **The sync mark is read, not recomputed** (Story 44.17, FR-173).
+/// [`keeper_sync::engine::Engine::pending`] is already the one derived answer
+/// to "what has this folder not synced yet, and why", and [`sync_pending`]
+/// renders the same list as the Pending card. Calling it here rather than
+/// asking git a second question is what keeps the two surfaces from ever
+/// wording the same file differently — and it is the reason a mark cannot
+/// become a second source of sync truth.
+///
+/// An engine that cannot produce that list does not fail the listing. A folder
+/// whose repository is unreadable is exactly the folder somebody most needs to
+/// look inside, so the entries still come back, marked
+/// [`FilesSyncStatusVm::Unknown`] with the engine's own words attached.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a malformed
+/// profile exclude pattern, a subpath that escapes the root, an unreadable
+/// directory).
+/// How long a listing waits for the sync marks before showing the folder without
+/// them.
+///
+/// [`Engine::pending`] is a `git status` over the whole worktree plus an
+/// untracked expansion that `lstat`s every candidate. On a folder of tens of
+/// thousands of files, on a drive already saturated by its own transfers, that
+/// is minutes — and every one of them was spent with the Files pane showing
+/// nothing at all, because the listing waited for marks it does not need in
+/// order to name a directory's entries.
+const BROWSE_MARKS_BUDGET: Duration = Duration::from_secs(3);
+
+/// How long one answer is reused by later listings.
+///
+/// Short, because it decorates rows a person is looking at. Long enough to
+/// cover the burst that matters: the Files pane's refresh re-reads EVERY open
+/// directory, so ten expanded folders used to mean ten whole-repository walks
+/// of the same tree at the same moment.
+const BROWSE_MARKS_TTL: Duration = Duration::from_secs(3);
+
+/// What the row's `unavailable` reason says when the walk outran its budget.
+const BROWSE_MARKS_SLOW_SENTENCE: &str =
+    "This folder is busy, so the sync marks are not ready yet. They appear on the next listing.";
+
+/// The last pending view per profile, and whether one is being computed.
+///
+/// A process-wide memo rather than a field on `AppState`: it is a cache of an
+/// answer the engine already owns, it must be shared by every window, and
+/// nothing outside this one command reads it. `Instant` is stamped when the
+/// answer arrives, not when it was asked for, so a walk that took two minutes
+/// does not hand back a view that is two minutes stale the moment it lands.
+static BROWSE_MARKS: OnceLock<Mutex<HashMap<String, MarkSlot>>> = OnceLock::new();
+
+#[derive(Default)]
+struct MarkSlot {
+    answered: Option<(Instant, browse::PendingView)>,
+    walking: bool,
+}
+
+/// What a listing should do about one profile's marks.
+#[derive(Debug, PartialEq, Eq)]
+enum MarkPlan {
+    /// Use this answer as it stands.
+    Serve(browse::PendingView),
+    /// A walk is already running and this is the best answer there is. `None`
+    /// means there has never been one, and the row says so rather than
+    /// claiming every entry is clean.
+    ServeWhileWalking(Option<browse::PendingView>),
+    /// Nothing usable and nobody walking: start one.
+    Walk,
+}
+
+impl MarkSlot {
+    /// The policy, separated from the plumbing so it can be read and tested
+    /// without an engine, a disk or a clock.
+    fn plan(&self, ttl: Duration) -> MarkPlan {
+        if let Some((at, view)) = self.answered.as_ref() {
+            if at.elapsed() < ttl {
+                return MarkPlan::Serve(view.clone());
+            }
+        }
+        if self.walking {
+            return MarkPlan::ServeWhileWalking(self.answered.as_ref().map(|(_, v)| v.clone()));
+        }
+        MarkPlan::Walk
+    }
+}
+
+fn browse_marks() -> &'static Mutex<HashMap<String, MarkSlot>> {
+    BROWSE_MARKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The sync marks for one profile: cached, or computed within a budget.
+///
+/// The walk is spawned rather than awaited in place, and the task stores its
+/// own result — so a walk that outruns [`BROWSE_MARKS_BUDGET`] is not wasted.
+/// Dropping the `JoinHandle` (which is what the timeout does) does not cancel a
+/// tokio task, so it runs to completion and the NEXT listing finds the answer
+/// waiting. Without that, a folder slow enough to time out once would never
+/// show a mark at all.
+async fn browse_marks_for(
+    engine: &Arc<keeper_sync::engine::Engine>,
+    id: &str,
+) -> (browse::PendingView, Option<String>) {
+    {
+        let mut marks = browse_marks().lock().expect("browse marks lock");
+        let slot = marks.entry(id.to_owned()).or_default();
+        match slot.plan(BROWSE_MARKS_TTL) {
+            MarkPlan::Serve(view) => return (view, None),
+            // One walk at a time per folder. A second would read the same tree
+            // off the same disk for the same answer, and on this hardware that
+            // is the difference the transfers feel.
+            MarkPlan::ServeWhileWalking(Some(view)) => return (view, None),
+            MarkPlan::ServeWhileWalking(None) => {
+                return (
+                    browse::PendingView::Unavailable,
+                    Some(BROWSE_MARKS_SLOW_SENTENCE.to_owned()),
+                )
+            }
+            MarkPlan::Walk => slot.walking = true,
+        }
+    }
+
+    let walker = {
+        let engine = Arc::clone(engine);
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            let answered = engine.pending(&id).await;
+            let mut marks = browse_marks().lock().expect("browse marks lock");
+            let slot = marks.entry(id).or_default();
+            slot.walking = false;
+            match &answered {
+                Ok(files) => {
+                    slot.answered = Some((
+                        Instant::now(),
+                        browse::PendingView::from_pending(files.clone()),
+                    ));
+                }
+                Err(_) => slot.answered = None,
+            }
+            answered.map(browse::PendingView::from_pending)
+        })
+    };
+
+    match tokio::time::timeout(BROWSE_MARKS_BUDGET, walker).await {
+        Ok(Ok(Ok(view))) => (view, None),
+        Ok(Ok(Err(error))) => (browse::PendingView::Unavailable, Some(error.to_string())),
+        // The task panicked. The slot stays flagged as walking, which is the
+        // safe way round: it stops a panicking walk being re-entered on every
+        // keystroke, and a restart clears it.
+        Ok(Err(join)) => (browse::PendingView::Unavailable, Some(join.to_string())),
+        Err(_) => (
+            browse::PendingView::Unavailable,
+            Some(BROWSE_MARKS_SLOW_SENTENCE.to_owned()),
+        ),
+    }
+}
+
+#[tauri::command]
+pub async fn sync_browse(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<FilesListingVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, &id)?.clone();
+    let excludes = ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&e))?;
+
+    // Before the walk, so one answer covers every entry in the directory and a
+    // thousand-row folder asks the engine once — and bounded, so a folder whose
+    // walk takes minutes still lists its entries now. See `browse_marks_for`.
+    let (pending, unavailable) = browse_marks_for(&engine, &id).await;
+
+    // One indexed SELECT, deliberately not part of `browse_marks_for`'s cached
+    // walk (Story 56.7): that cache exists to stop a repeated tree walk, and a
+    // cached materialized set would call a path keeper has already released
+    // materialized — offering to free space that is already free.
+    //
+    // `Engine::pending` is this table's other reader: it consults the same rows
+    // for `PendingReason::Incoming`'s `replacing` flag, and that answer reaches
+    // us through the marks cache above, so it can be up to `BROWSE_MARKS_TTL`
+    // older than this one and the two can disagree about a row inside one
+    // listing. They are deliberately not made one read: sharing the set would
+    // mean serving the mark from whichever copy the cache happened to hold,
+    // which is the stale offer to free already-free space again.
+    //
+    // Skipped outright when the marks walk could not answer, which is the case
+    // `notes_ipc` documents for its own `PendingView::Unavailable`: `classify`
+    // returns `Unknown` before the ledger is ever consulted then, so the read
+    // cannot change a row — and it is an unfiltered scan of everything this
+    // profile has ever hydrated, paid on every folder expansion.
+    //
+    // A read that fails is not a listing failure either. An empty view reads as
+    // `Synced`, which is true and merely less specific, where an empty
+    // `PendingView` would be a lie. That is also why the log is not optional:
+    // the degradation is BY DESIGN invisible on screen, so the `warn` is the
+    // only trace anywhere that a row lost its state.
+    let materialized = if unavailable.is_some() {
+        browse::MaterializedView::none()
+    } else {
+        engine
+            .materialized_paths(&id)
+            .map(browse::MaterializedView::from_paths)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    profile = id,
+                    error = %error,
+                    "files: could not read which paths keeper has materialized"
+                );
+                browse::MaterializedView::none()
+            })
+    };
+
+    // When each materialized path becomes releasable, as one absolute instant
+    // per path (Story 56.9, FR-343). Two statements — the in-force profile and
+    // the ledger — resolved in the engine, because the choice between 56.5's
+    // two clocks needs `materialized.local_origin`, which nothing on the wire
+    // carries and nothing in this crate may re-derive.
+    //
+    // Beside the ledger read above rather than folded into it, and NOT cached,
+    // for the reason that read gives: a stale deadline keeps counting down
+    // after the sweep has already let the content go. Skipped under the same
+    // condition too — a row that answers `Unknown` two rungs earlier is never
+    // `Materialized`, and `FilesEntryVm::new` drops a deadline for every other
+    // state, so the read could not change a row.
+    //
+    // A read that fails costs the rows their countdown and nothing else, so it
+    // degrades to an empty map with a `warn!` — the only trace anywhere, since
+    // a row with no deadline renders exactly as a row that has none.
+    let schedules = if unavailable.is_some() {
+        HashMap::new()
+    } else {
+        engine.release_schedules(&id).unwrap_or_else(|error| {
+            tracing::warn!(
+                profile = id,
+                error = %error,
+                "files: could not read when this folder's content is released"
+            );
+            HashMap::new()
+        })
+    };
+
+    let listing = {
+        let profile = profile.clone();
+        let subpath = subpath.clone();
+        tokio::task::spawn_blocking(move || {
+            browse::browse(&profile, &subpath, &excludes, &pending, &materialized)
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not read the folder: {err}")))?
+    }
+    .map_err(|refusal| open_failure(refusal.to_string()))?;
+
+    // Built from the vault keeper can actually REACH, not from the profile's
+    // stored configuration (Story 45.3). A profile whose `notes` block names a
+    // vault the registry has no slot for is a profile whose write commands will
+    // refuse, and a listing that said "writable" from the config would put a
+    // Delete button over exactly that case.
+    let (_vault, scope) = vault_and_scope(&profile);
+    Ok(files_listing_vm(
+        &profile,
+        subpath,
+        listing,
+        unavailable.as_deref(),
+        &scope,
+        &schedules,
+    ))
+}
+
+/// Project one [`BrowseListing`] into the VM the Files tab renders.
+///
+/// The `entries`/`state` pairing is the contract the surface depends on:
+/// `Some` only under [`FilesListingState::Listed`], so a pane cannot render
+/// "this folder is empty" for a drive that is out without first unwrapping and
+/// meeting the state that says otherwise.
+///
+/// `engine_failure` is the engine's own words for why it could not produce a
+/// pending list, threaded through so an `unknown` mark carries a reason
+/// instead of a shrug.
+///
+/// The folder roles come off the profile that is already in hand (Story 45.5):
+/// `notes.subfolder` and `recordings.subfolder` are the only evidence that a
+/// folder is the vault or the recordings root, and reading them here — rather
+/// than letting a surface match a name — is why a vault called `Second Brain`
+/// is marked and an ordinary folder called `10-notes` is not. Borrowed for the
+/// whole listing, so a thousand rows resolve against two `&str`.
+///
+/// `schedules` is when each materialized path becomes releasable, keyed by the
+/// ledger's own `/`-joined spelling — which is the spelling
+/// `BrowseEntry::relative_path` already carries. Borrowed for the whole
+/// listing, and looked up rather than computed: the classification is
+/// `keeper_sync::engine::release_schedule`'s, and the pairing of an instant
+/// with a hold is proven in that crate's tests, so all this layer does is read
+/// three accessors. An absent key is a path with no ledger row, which is every
+/// ordinary file.
+fn files_listing_vm(
+    profile: &SyncProfile,
+    subpath: String,
+    listing: browse::BrowseListing,
+    engine_failure: Option<&str>,
+    scope: &files_write::WriteScope<'_>,
+    schedules: &HashMap<String, ReleaseSchedule>,
+) -> FilesListingVm {
+    let roles = keeper_core::vm::FilesFolderRoles {
+        notes_subfolder: profile.notes.as_ref().map(|notes| notes.subfolder.as_str()),
+        recordings_subfolder: profile
+            .recordings
+            .as_ref()
+            .map(|recordings| recordings.subfolder.as_str()),
+    };
+    let (state, entries, detail, truncated) = match listing {
+        browse::BrowseListing::Listed(dir) => {
+            let entries = dir
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    let sync = sync_mark(&entry.sync, engine_failure);
+                    // AD-102: three answers, not two. `owner` is the lexical
+                    // half of the same classifier `sync_write_entry` routes
+                    // through, so the flag a row renders and the writer the
+                    // command picks cannot come apart — and it is lexical
+                    // precisely so a thousand rows do not cost a thousand
+                    // `canonicalize` calls to re-learn the `is_dir` the dirent
+                    // just supplied.
+                    let write = match scope.owner(&entry.relative_path, entry.is_dir) {
+                        Ok(files_write::WriteOwner::Vault) => FilesWriteVm::allowed(),
+                        Ok(files_write::WriteOwner::Unmanaged) => FilesWriteVm::unmanaged(
+                            scope.unmanaged_caveat(&entry.name),
+                            // Story 53.3: the same fact in one line, for the
+                            // surface that folds the caveat away. Composed here
+                            // beside the whole sentence, because a webview that
+                            // clipped one to make the other would be
+                            // paraphrasing the clause that names what is
+                            // missing.
+                            scope.unmanaged_caveat_short(&entry.name),
+                        ),
+                        Err(refusal) => FilesWriteVm::refused(refusal.to_string()),
+                    };
+                    // Looked up BEFORE the facts literal, because
+                    // `relative_path` is moved into it.
+                    let release =
+                        schedules
+                            .get(&entry.relative_path)
+                            .map(|schedule| FilesReleaseVm {
+                                releases_after_ms: schedule.releases_after_ms(),
+                                hold: schedule.hold().map(str::to_owned),
+                                detail: schedule.sentence().to_owned(),
+                            });
+                    FilesEntryVm::new(FilesEntryFacts {
+                        name: entry.name,
+                        relative_path: entry.relative_path,
+                        absolute_path: entry.absolute_path.to_string_lossy().into_owned(),
+                        is_dir: entry.is_dir,
+                        sync,
+                        size_bytes: entry.size_bytes,
+                        lfs_oid: entry.lfs_oid,
+                        mtime_ms: entry.mtime_ms,
+                        release,
+                        roles,
+                        write,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let detail = dir.truncated.then(|| {
+                format!(
+                    "This folder holds more than {cap} items — showing the first \
+                     {cap}. Open it in Finder to see the rest.",
+                    cap = browse::LISTING_CAP,
+                )
+            });
+            (
+                FilesListingState::Listed,
+                Some(entries),
+                detail,
+                dir.truncated,
+            )
+        }
+        // The same sentence `sync_open_path` refuses with, because it is the
+        // same fact: this folder is not reachable right now, and the next step
+        // depends only on whether it lives on removable media.
+        browse::BrowseListing::MediaAbsent => (
+            FilesListingState::MediaAbsent,
+            None,
+            Some(unavailable_sentence(profile)),
+            false,
+        ),
+        browse::BrowseListing::MediaUnexpected { found_id } => (
+            FilesListingState::MediaUnexpected,
+            None,
+            Some(format!(
+                "A different volume ({found_id}) is mounted where {} lives. \
+                 keeper will not list a folder it cannot prove is yours — \
+                 eject it and reattach the right drive.",
+                profile.name
+            )),
+            false,
+        ),
+        browse::BrowseListing::Missing => (
+            FilesListingState::Missing,
+            None,
+            Some(missing_sentence(profile, &subpath)),
+            false,
+        ),
+    };
+    // The directory's OWN verdict — "can a file be created in here" — which is
+    // a different question from any entry's. Refused outright for every state
+    // that produced no entries: a folder keeper could not read is not a folder
+    // keeper will write into, and offering New file over an unplugged drive is
+    // the "action that will fail" this field exists to remove.
+    let write = if state == FilesListingState::Listed {
+        FilesWriteVm::from_verdict(&scope.directory(&subpath))
+    } else {
+        FilesWriteVm::refused(detail.clone().unwrap_or_else(|| {
+            "keeper could not read this folder, so it will not write in it.".to_owned()
+        }))
+    };
+    FilesListingVm {
+        profile_id: profile.id.clone(),
+        subpath,
+        state,
+        entries,
+        detail,
+        truncated,
+        write,
+    }
+}
+
+/// Word one entry's sync state (Story 44.17, FR-173).
+///
+/// **The sentence is composed here and not in TypeScript** — the same rule the
+/// listing's own `detail` follows. The reason is not tidiness: the browser and
+/// the Pending card describe the same engine state, and a second copy of these
+/// words in the frontend is a second copy that will be edited once.
+///
+/// A folder's roll-up carries no [`PendingReason`] of its own, and it is worded
+/// as a folder rather than borrowing whichever descendant's word came first
+/// alphabetically. "This folder is untracked" about a folder holding one new
+/// file would be a small, confident lie.
+///
+/// # Where the bytes are, on the wire (Story 56.7, FR-345)
+///
+/// [`browse::EntrySyncStatus::Virtual`], `Materializing` and `Materialized`
+/// each reach the surface as a [`FilesSyncStatusVm`] of their own. Story 56.2
+/// routed the one state it had onto `Synced` and said so; the states are real,
+/// a person acts on each of them differently, and this is the arm that names
+/// them.
+///
+/// **`FilesDeletePlanVm::compose`'s `travels` filter names every one of them
+/// explicitly, and that had to be done by hand.** It is a `matches!` and not
+/// an exhaustive `match`, so a wire variant left out of it is not a compile
+/// error anywhere — it lands silently in the "stays on this machine" bucket,
+/// and the delete confirmation tells someone a deletion is local while it
+/// removes tracked content that only the remote holds (AD-134). A pointer is
+/// not a copy of the content, but it *is* the content as far as the repository
+/// is concerned.
+///
+/// **A variant added after this story inherits the same obligations.** It
+/// needs a label, a shape and a tone in each of the
+/// `Record<FilesSyncStatusVm, …>` maps in
+/// `src/components/layout/sync-status-mark.tsx` — those are total, so the
+/// TypeScript build is the checklist for them — and its own arm in `travels`,
+/// which fails nothing and must be visited deliberately.
+///
+/// **None of the sentences below claims the remote holds anything.** The
+/// evidence is the bytes on this disk and this machine's own journal;
+/// `docs/sync.md` documents the state where a pointer's object never reached
+/// the server, and `verify --remote` is the check that earns the other claim.
+/// The materializing sentence names a queued STATE rather than an activity in
+/// flight, and names no percentage and no finish time, for the same reason the
+/// mark carries no spinner: what keeper has is a journal row, and a row whose
+/// state is `deferred` — waiting on a volume nobody has re-attached — reaches
+/// this mark exactly as a running one does. Keeper knows what is queued, not
+/// whether anything is moving, and not when it lands.
+fn sync_mark(status: &browse::EntrySyncStatus, engine_failure: Option<&str>) -> FilesEntrySyncVm {
+    match status {
+        browse::EntrySyncStatus::Synced => FilesEntrySyncVm::plain(FilesSyncStatusVm::Synced),
+        browse::EntrySyncStatus::Waiting { reason } => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Waiting,
+            match reason {
+                Some(PendingReason::Settling { .. }) => {
+                    "keeper is waiting for this file to finish being written."
+                }
+                Some(PendingReason::Untracked) => {
+                    "This file is new and has not been committed yet."
+                }
+                Some(PendingReason::Modified) => {
+                    "This file has changed and has not been committed yet."
+                }
+                Some(PendingReason::Added) => "This file is staged and has not been committed yet.",
+                Some(PendingReason::Deleted) => {
+                    "This file has been deleted and the deletion has not been committed yet."
+                }
+                Some(PendingReason::Incoming { .. }) => {
+                    "This file's content is still on the remote and has not been downloaded yet."
+                }
+                None => "Something in this folder is waiting to sync.",
+            },
+        ),
+        browse::EntrySyncStatus::Excluded => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Excluded,
+            "A pattern in this folder's sync settings excludes it, so keeper will never \
+             copy it.",
+        ),
+        // A sentence about THIS machine, for the reason the doc above gives:
+        // the evidence is only that the worktree bytes are the pointer. What
+        // the sentence has to account for beyond the state is the size, which
+        // is the content's rather than the placeholder's.
+        browse::EntrySyncStatus::Virtual => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Virtual,
+            "This file's content is not stored on this computer — only a placeholder is, \
+             so it takes up almost no space. The size shown is the content's.",
+        ),
+        // Words a STATE, not an activity, and that is the whole point:
+        // `db::queued_downloads` takes every `lfsDownload` journal row whose
+        // state is not `parked`, so `deferred` reaches `PendingReason::Incoming`
+        // too — the canonical one being a download whose removable remote was
+        // absent, which waits for a volume re-attach and may wait indefinitely.
+        // "keeper is downloading this" would be a present-progressive claim
+        // about a path nothing is transferring; "has it queued" is true of
+        // queued, running and deferred alike. No duration, no percentage, no
+        // denominator either — see the doc above. The queue is what keeper
+        // knows; a number here would be one it invented.
+        browse::EntrySyncStatus::Materializing => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Materializing,
+            "keeper has this file's content queued to download to this computer.",
+        ),
+        // Says the space is recoverable without promising when, because 56.5's
+        // sweep decides that and this row does not know its answer. "can fetch
+        // it back" is the half that keeps a release from reading as a loss.
+        browse::EntrySyncStatus::Materialized => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Materialized,
+            "This file's content is on this computer. keeper may release it again \
+             later to free the space, and can fetch it back.",
+        ),
+        browse::EntrySyncStatus::NotInRepository => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::NotInRepository,
+            "This folder is not a repository yet. The first sync sets one up and takes \
+             everything in it.",
+        ),
+        // The engine's own words, verbatim, for the same reason an unreadable
+        // directory shows the OS's: a reason someone can act on beats a
+        // sentence that only says something went wrong.
+        browse::EntrySyncStatus::Unknown => FilesEntrySyncVm::explained(
+            FilesSyncStatusVm::Unknown,
+            match engine_failure {
+                Some(reason) => {
+                    format!("keeper could not read this folder's sync state: {reason}")
+                }
+                None => "keeper could not read this folder's sync state.".to_owned(),
+            },
+        ),
+    }
+}
+
+/// Why a directory that should be there is not.
+///
+/// The profile root and a folder inside it are different sentences: the root
+/// being gone is a profile problem with a profile remedy, which
+/// [`unavailable_sentence`] already words. A subfolder that vanished is not —
+/// re-pointing the profile would be the wrong advice — so it is named by its
+/// own relative path, and by the profile's NAME rather than its absolute path,
+/// which keeps a home-directory name out of a surface people screenshot.
+fn missing_sentence(profile: &SyncProfile, subpath: &str) -> String {
+    if subpath.is_empty() {
+        return unavailable_sentence(profile);
+    }
+    format!(
+        "{subpath} is no longer in {}. It was moved, renamed or deleted outside keeper.",
+        profile.name
+    )
+}
+
+/// Hand one file inside a synced folder to the system's default handler
+/// (Story 43.8, FR-153, AD-65).
+///
+/// **Why this is not `recording_open_path`.** That command's containment root
+/// is the *recordings destination*, deliberately and permanently: it is the one
+/// place keeper serves recordings from, and AD-74 says the Files tab must not
+/// reach for it to browse folders that are not recordings roots. Pointed at a
+/// note in a vault it would refuse, correctly, and a browser whose Open works
+/// for one folder in five is worse than one with no Open at all.
+///
+/// So the root here is the profile's own, and the containment rule is not a
+/// second one: it is [`browse::resolve`], the same function the listing uses,
+/// which refuses `..` lexically and refuses a symlink out of the tree after
+/// canonicalisation.
+///
+/// Takes a profile id and a profile-relative subpath, never a path: a webview
+/// that asked for `/etc/passwd` would have to have persuaded the engine to
+/// store a profile pointing there first. This opens; it does not stream, and it
+/// has no counterpart that writes.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+/// escapes the root, a file that is no longer on disk, an opener failure).
+#[tauri::command]
+pub async fn sync_open_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, &id)?;
+    let resolved = browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| open_failure(refusal.to_string()))?
+        .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    // A use keeper can observe, so the release clock for this path moves
+    // (Story 56.5, AD-126). Best-effort by signature and no policy here: the
+    // engine owns every rule, because a rule in this crate is one nobody can
+    // exercise on Linux.
+    engine.note_use(&id, &subpath);
+    tauri_plugin_opener::open_path(&resolved, None::<&str>).map_err(|error| {
+        open_failure(format!(
+            "could not open {subpath} with the system's default application: {error}"
+        ))
+    })
+}
+
+/// Ask for one virtual path's content (Story 56.3, FR-338).
+///
+/// **The app's door onto `Engine::materialize_entry`**, and the CLI's
+/// `keeper-syncd materialize` is the other. Every decision is the engine's:
+/// containment, the LFS mode, the index, the sparse cone, whether the worktree
+/// bytes may be replaced, and whether the object is already here or has to be
+/// fetched. Nothing is decided in this crate, which does not build on Linux, so
+/// a rule written here would be one nobody could exercise until macOS (AD-55,
+/// AD-56).
+///
+/// **Returns nothing, on purpose.** The CLI needs the outcome because it prints
+/// it; the app does not, yet — 56.7 owns the row states and 56.9 the button —
+/// and every fact a row needs already has a surface: `sync_browse` and
+/// `Engine::lfs_files` report whether a path is virtual or materialized, and
+/// `sync_subscribe_progress` reports `DownloadingLfs` with the path in
+/// `current`. A view model nothing renders would mean a new `keeper-core` type,
+/// a new generated binding and two uncast TypeScript fixtures, all so the
+/// frontend could ignore it. `Result<(), IpcError>` is the shape
+/// `sync_open_entry` and `sync_write_entry` already have.
+///
+/// **A refusal is a rejection carrying the refusal's own sentence.** A path
+/// whose bytes are neither the committed pointer nor the content it names is
+/// `ContentRefusal::LocallyModified`, and it arrives through
+/// [`sync_ipc_error`]'s `Refused` arm as `internal` with that sentence — logged
+/// `warn!` here for the reason [`write_refused`] logs one: `GatedMakeWriter`
+/// only puts `INFO` on disk in debug mode, and a refusal is the thing a person
+/// asks about later (DW-162).
+///
+/// Runs on the blocking pool. Copying a four-gigabyte object out of the local
+/// store is a filesystem copy that hashes nothing but moves everything, and
+/// holding the IPC thread for it would freeze every other profile's poll behind
+/// one click. The engine's own reservation means only one operation runs per
+/// folder *in this process*, so two clicks cannot race the index — the daemon
+/// is a separate process and its own reservation, which is stated on
+/// `Engine::materialize_entry`.
+///
+/// Rejects with: `syncUnavailable` (the folder is already syncing), `internal`
+/// (no such profile, an unplugged removable volume, a subpath that escapes the
+/// root — including through a symlinked parent, a path that is not a tracked
+/// large file, a path outside the folder's subpaths, a file that is gone, a
+/// file keeper will not overwrite, LFS turned off for the folder, the folder
+/// paused).
+#[tauri::command]
+pub async fn sync_materialize_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<(), IpcError> {
+    // The owned `Arc` `engine_of` hands back is moved into the blocking task
+    // rather than borrowed: `Engine` lives behind an `Arc` precisely so a call
+    // that may copy gigabytes can hold it without holding `state`.
+    let engine = engine_of(&state)?;
+    let asked = subpath.clone();
+    let done = tokio::task::spawn_blocking(move || engine.materialize_entry(&id, &subpath))
+        .await
+        .map_err(|err| open_failure(format!("could not materialize {asked}: {err}")))?;
+    match done {
+        Ok(outcome) => {
+            tracing::info!(
+                path = %outcome.path,
+                outcome = %outcome.outcome,
+                unit = ?outcome.unit_id,
+                "files: materialize"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            if let SyncError::Refused(refusal) = &err {
+                tracing::warn!(%refusal, "files: materialize refused");
+            }
+            Err(sync_ipc_error(&err))
+        }
+    }
+}
+
+/// Let one materialized path go back to being its pointer, on request (Story
+/// 56.9, FR-343, FR-332).
+///
+/// **The app's door onto `Engine::dehydrate_entry`**, and `keeper-syncd
+/// dehydrate` is the other. Every one of 56.4's five refusals applies
+/// unchanged, taken fresh at the moment of deletion: this command is not a
+/// privileged caller and adds no gate of its own, because a rule written in
+/// this crate is a rule nobody can exercise until macOS (AD-55, AD-56).
+///
+/// **Not on the blocking pool, unlike [`sync_materialize_entry`].**
+/// `dehydrate_entry` is `async fn` — the per-object proof that the remote can
+/// still serve these bytes is a batch round trip — so it is awaited directly.
+/// `spawn_blocking` cannot host a future, and wrapping one would mean a runtime
+/// inside a runtime.
+///
+/// **[`ContentRefusal::AlreadyPointer`] is answered `Ok`, deliberately.** The
+/// CLI door reports it as `nothing_to_release` rather than a failure, because
+/// the worktree already holds what the caller asked for; surfacing it as a
+/// rejection would paint a red alert over a no-op. Every other refusal is a
+/// rejection carrying its own sentence, through [`sync_ipc_error`]'s existing
+/// `Refused` arm, and is logged `warn!` for the reason
+/// [`sync_materialize_entry`] logs one (DW-162).
+///
+/// On a host whose platform cannot answer "is this file open" race-free — which
+/// is every host today — the honest answer is `ContentRefusal::OpenUnknown`,
+/// and that sentence is what a person sees. That is 56.4's recorded and
+/// deliberate consequence, not a defect in this command.
+///
+/// Rejects with: `syncUnavailable` (the folder is already syncing), `internal`
+/// (no such profile, an unplugged removable volume, a subpath that escapes the
+/// root, a path that is not a tracked large file, a path outside the folder's
+/// subpaths, a path whose bytes are not what this folder committed, a path some
+/// process may be reading, a path nothing has confirmed the server holds, a
+/// pinned path, a folder that always materializes, LFS turned off for the
+/// folder, the folder paused).
+#[tauri::command]
+pub async fn sync_release_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    match engine.dehydrate_entry(&id, &subpath).await {
+        Ok(released) => {
+            tracing::info!(
+                path = %released.path,
+                oid = %released.oid,
+                bytes = released.size_bytes,
+                "files: release"
+            );
+            Ok(())
+        }
+        Err(SyncError::Refused(ContentRefusal::AlreadyPointer { path })) => {
+            tracing::info!(%path, "files: nothing to release");
+            Ok(())
+        }
+        Err(err) => {
+            if let SyncError::Refused(refusal) = &err {
+                tracing::warn!(%refusal, "files: release refused");
+            }
+            Err(sync_ipc_error(&err))
+        }
+    }
+}
+
+/// Hold one path against release, or stop holding it (Story 56.9, FR-334).
+///
+/// **The app's door onto `Engine::pin_entry`**, and `keeper-syncd pin` /
+/// `unpin` are the others. A pin is a standing instruction about a path rather
+/// than an operation on its content: it takes no reservation, writes nothing
+/// into the worktree, is idempotent, and does not require the content to be
+/// here — 56.4's `Pinned` refusal is what enforces it when a release later
+/// asks.
+///
+/// On the blocking pool, [`sync_materialize_entry`]'s shape exactly: one index
+/// read and one `UPDATE` is cheap, but `pin_entry` is a synchronous engine call
+/// and the IPC thread is not the place to make one.
+///
+/// **`pinned` is an argument rather than a toggle**, so two clicks in a row
+/// cannot leave the ledger in a state neither the caller nor the row expected.
+/// The Files row only ever sends `true` today: nothing on the wire says whether
+/// a path is pinned — the row learns it as Rust's own word in
+/// `FilesReleaseVm::hold` — so an unpin control could not say which way it
+/// would go. `keeper-syncd unpin` is that door until a story adds the bit.
+///
+/// Rejects with: `internal` (no such profile, an unplugged removable volume, a
+/// subpath that escapes the root, a path that is not a tracked large file, a
+/// path outside the folder's subpaths).
+#[tauri::command]
+pub async fn sync_pin_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    pinned: bool,
+) -> Result<(), IpcError> {
+    let engine = engine_of(&state)?;
+    let asked = subpath.clone();
+    let done = tokio::task::spawn_blocking(move || engine.pin_entry(&id, &subpath, pinned))
+        .await
+        .map_err(|err| open_failure(format!("could not pin {asked}: {err}")))?;
+    match done {
+        Ok(pin) => {
+            tracing::info!(path = %pin.path, pinned = pin.pinned, "files: pin");
+            Ok(())
+        }
+        Err(err) => {
+            if let SyncError::Refused(refusal) = &err {
+                tracing::warn!(%refusal, "files: pin refused");
+            }
+            Err(sync_ipc_error(&err))
+        }
+    }
+}
+
+/// Read one file inside a synced folder as editable text (Story 45.6, FR-179,
+/// AD-65).
+///
+/// **The counterpart of `sync_write_entry`, and deliberately not part of it.**
+/// Story 45.3 reversed AD-75 and gave the Files surface a write path; this is
+/// the read half, and it is a separate command because reading is a separate
+/// capability: a file outside a vault can be listed and viewed but not written
+/// (the epic's own rule), so a single read-write command would have to refuse
+/// half of itself.
+///
+/// **Containment is not restated here.** The subpath is one the listing already
+/// produced, and [`browse::resolve`] is the same function `sync_browse` and
+/// `sync_open_entry` use: it refuses `..` lexically and refuses a symlink out
+/// of the tree after canonicalisation. This command composes no path of its
+/// own, so there is no second rule to keep in step with the first.
+///
+/// **Every decision is in `keeper-core`.** Whether the bytes are text, whether
+/// the file is too large to edit, how big it is in words a person reads — all
+/// of it is [`keeper_core::text_file::open_text_file`], which compiles and is
+/// tested on any machine. This crate does not build on Linux, so a threshold
+/// or a sentence written here would be one nobody could exercise until macOS
+/// (AD-55, AD-56).
+///
+/// Runs on the blocking pool: a file on a pendrive or a network share can take
+/// hundreds of milliseconds to open, and stalling the async runtime would
+/// freeze every other profile's poll behind one click.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+/// escapes the root, a file that is no longer on disk, an unreadable file).
+#[tauri::command]
+pub async fn sync_read_text(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<keeper_core::text_file::TextFileVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, &id)?;
+    let resolved = browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| open_failure(refusal.to_string()))?
+        .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    // A use keeper can observe (Story 56.5, AD-126); see `sync_open_entry`.
+    engine.note_use(&id, &subpath);
+    let named = subpath.clone();
+    tokio::task::spawn_blocking(move || keeper_core::text_file::open_text_file(&resolved))
+        .await
+        .map_err(|err| open_failure(format!("could not read {named}: {err}")))?
+        .map_err(|err| open_failure(format!("could not read {subpath}: {err}")))
+}
+
+/// Write `subpath`'s rendered page beside it as a PDF (Story 56, macOS).
+///
+/// The renderer is the webview, because there is no Rust crate that lays out
+/// HTML and CSS to a standard somebody comparing the two files would accept —
+/// and a PDF that does not look like the page defeats the button, whose whole
+/// point is that the two stay the same document. See `pdf_export`.
+///
+/// Returns the subpath of the file written, so the caller can say what it made
+/// rather than guessing at the name.
+#[tauri::command]
+pub async fn sync_export_pdf(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<String, IpcError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Stated rather than silently absent: the renderer is the webview, and
+        // asking one for a PDF is `createPDF`, which is a WebKit method. A
+        // platform where that does not exist needs a different renderer, not a
+        // different call — so the honest answer here is that this is not built
+        // yet, named as such.
+        let _ = (&app, &state, &id, &subpath);
+        return Err(open_failure(
+            "exporting a PDF is macOS-only for now: it renders through the webview".to_owned(),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::{Listener, Manager, WebviewUrl, WebviewWindowBuilder};
+
+        let engine = engine_of(&state)?;
+        let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+        let profile = find_profile(&profiles, &id)?;
+        let source = browse::resolve(&profile.local_path, &subpath)
+            .map_err(|refusal| open_failure(refusal.to_string()))?
+            .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+        let out = crate::pdf_export::pdf_beside(&source);
+
+        // A label per export, so two of them cannot collide and a leaked window from
+        // a previous failure cannot be mistaken for this one's.
+        let label = format!("print-{}", uuid_like(&subpath));
+        if let Some(stale) = app.get_webview_window(&label) {
+            let _ = stale.destroy();
+        }
+        let url = format!(
+            "print.html?profile={}&subpath={}",
+            keeper_core::capture::query_encode(&id),
+            keeper_core::capture::query_encode(&subpath)
+        );
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        let ready = tx.clone();
+        let failed = tx;
+        let window = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+            .title("keeper — printing")
+            .inner_size(
+                crate::pdf_export::PAGE_SIZE.0,
+                crate::pdf_export::PAGE_SIZE.1,
+            )
+            .position(
+                crate::pdf_export::OFFSCREEN.0,
+                crate::pdf_export::OFFSCREEN.1,
+            )
+            .visible(true)
+            .decorations(false)
+            .skip_taskbar(true)
+            .build()
+            .map_err(|err| open_failure(format!("could not open a window to render in: {err}")))?;
+
+        tracing::info!(
+            profile = %id,
+            subpath = %subpath,
+            label = %label,
+            out = %out.display(),
+            "pdf export: window opened"
+        );
+        window.listen(crate::pdf_export::READY_EVENT, move |_| {
+            tracing::info!("pdf export: the page reported it is laid out");
+            let _ = ready.try_send(Ok(()));
+        });
+        window.listen(crate::pdf_export::FAILED_EVENT, move |event| {
+            let said = event.payload().trim_matches('"').to_owned();
+            tracing::warn!(said = %said, "pdf export: the page refused");
+            let _ = failed.try_send(Err(said));
+        });
+
+        let rendered = tokio::task::spawn_blocking(move || {
+            match rx.recv_timeout(crate::pdf_export::RENDER_LIMIT) {
+                Ok(answer) => answer,
+                Err(_) => Err("the page never reported that it was ready".to_owned()),
+            }
+        })
+        .await
+        .map_err(|err| open_failure(format!("waiting for the page failed: {err}")))?;
+
+        let captured = match rendered {
+            Ok(()) => {
+                let window = window.clone();
+                tokio::task::spawn_blocking(move || crate::pdf_export::capture(&window))
+                    .await
+                    .map_err(|err| open_failure(format!("rendering failed: {err}")))?
+            }
+            Err(said) => Err(said),
+        };
+
+        // Always, and before the answer is read: a window left off-screen is a
+        // window nobody can find to close.
+        let _ = window.destroy();
+
+        let bytes = match captured {
+            Ok(bytes) => {
+                tracing::info!(bytes = bytes.len(), "pdf export: rendered");
+                bytes
+            }
+            Err(said) => {
+                tracing::error!(said = %said, "pdf export: failed");
+                return Err(open_failure(said));
+            }
+        };
+        std::fs::write(&out, &bytes)
+            .map_err(|err| open_failure(format!("could not write {}: {err}", out.display())))?;
+        Ok(out
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| subpath.clone()))
+    }
+}
+
+/// A label-safe token for one subpath. Not an identifier anybody stores — it
+/// only has to be stable within a run and free of characters a window label
+/// refuses.
+#[cfg(target_os = "macos")]
+fn uuid_like(subpath: &str) -> String {
+    subpath
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Read one file inside a synced folder as a document (Story 45.8, FR-181,
+/// FR-182, AD-65).
+///
+/// **The third reader beside `sync_read_text` and `sync_browse`, and separate
+/// for the same reason they are separate from each other.** A document is not
+/// text: it cannot be edited, its bytes never cross this boundary, and what the
+/// webview receives is a bounded projection rather than a file. Folding it into
+/// `sync_read_text` would have meant a `TextFileVm` with four document-shaped
+/// fields that are `None` for every text file, and a viewer deciding which half
+/// of one command's answer it was looking at.
+///
+/// **Containment is not restated here.** The subpath is one the listing already
+/// produced, and [`browse::resolve`] is the same function `sync_browse`,
+/// `sync_open_entry` and `sync_read_text` use. This command composes no path of
+/// its own (AD-65).
+///
+/// **Every decision is in `keeper-core`.** Which format the bytes are, every
+/// cap, every refusal sentence and the whole of the parsing is
+/// [`keeper_core::document::open_document`], which compiles and is tested on
+/// any machine. This crate does not build on Linux, so a cap written here would
+/// be one nobody could exercise until macOS (AD-55, AD-56).
+///
+/// **This does not serve the PDF's pages.** Those come from Story 45.7's
+/// `keeper-file://` protocol, Range-served straight into the webview's own PDF
+/// renderer, so a 400-page document costs one element and no marshalling. What
+/// this command adds for a PDF is the header facts — version, page count,
+/// whether it is encrypted — that the chrome around the embed shows.
+///
+/// Runs on the blocking pool: inflating a container can take hundreds of
+/// milliseconds, and stalling the async runtime would freeze every other
+/// profile's poll behind one click.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+/// escapes the root, a file that is no longer on disk, an unreadable file). A
+/// file that is readable but is not a document keeper knows is NOT a rejection
+/// — it is a `DocumentVm` carrying a sentence, because the viewer draws that.
+#[tauri::command]
+pub async fn sync_read_document(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<keeper_core::document::DocumentVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, &id)?;
+    let resolved = browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| open_failure(refusal.to_string()))?
+        .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    // A use keeper can observe (Story 56.5, AD-126); see `sync_open_entry`.
+    engine.note_use(&id, &subpath);
+    let named = subpath.clone();
+    tokio::task::spawn_blocking(move || keeper_core::document::open_document(&resolved))
+        .await
+        .map_err(|err| open_failure(format!("could not read {named}: {err}")))?
+        .map_err(|err| open_failure(format!("could not read {subpath}: {err}")))
+}
+
+// ---------------------------------------------------------------------------
+// Export (Story 45.21, FR-199)
+// ---------------------------------------------------------------------------
+
+/// An export refusal, as the frontend receives it and as the log records it.
+///
+/// One function for both export commands — `notes_ipc::notes_export` calls this
+/// one rather than wording its own, because a refusal the user reads must not
+/// depend on which surface they pressed the button from.
+///
+/// `warn!` rather than `info!`, on the same reasoning as [`write_refused`]:
+/// `GatedMakeWriter` only writes `INFO` to the file when debug mode is on, and
+/// a refusal is exactly the thing somebody asks about an hour later (DW-162).
+pub(crate) fn export_refused(refusal: &ExportRefusal) -> IpcError {
+    tracing::warn!(%refusal, "export: refused");
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: refusal.to_string(),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// Copy one file out of a synced folder to a location the user picked
+/// (Story 45.21, FR-199, AD-65).
+///
+/// **Not a write command, and deliberately not beside the four below.** Export
+/// reads inside the profile and writes outside it, so it needs no vault and
+/// refuses nothing for being outside one: a PDF in a synced folder that keeper
+/// will not edit is still a PDF the owner can take a copy of. `writable_profile`
+/// is not used here for exactly that reason.
+///
+/// **The destination is the one path the webview supplies**, and it is the one
+/// path AD-65 permits it to: the user picked it from the OS folder chooser, it
+/// is not composed from anything keeper holds, and nothing under it is read.
+/// The source is still an id plus a relative path, re-resolved through
+/// `browse::resolve` like every other reader on this surface.
+///
+/// Every decision — is the destination there, is the name taken, does a partial
+/// copy get cleaned up — is [`keeper_sync::export`], which compiles and is
+/// tested on any machine. This crate does not build on Linux (AD-55, AD-56).
+///
+/// Runs on the blocking pool: copying a 2 GB video off a pendrive is not
+/// something to do on the async runtime.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+/// escapes the root, a file that is gone, a folder, a destination that is
+/// missing / is a file / is inside the profile / already holds the name, or a
+/// copy the disk refused).
+#[tauri::command]
+pub async fn sync_export_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    destination: String,
+) -> Result<ExportReceiptVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    // The root is cloned out immediately: nothing about the profile is needed
+    // after this point, and a borrow held across the await below would be a
+    // borrow of a local `Vec` in a future that has to be `Send`.
+    let root = find_profile(&profiles, &id)?.local_path.clone();
+    let named = subpath.clone();
+    let target = std::path::PathBuf::from(&destination);
+    // A use keeper can observe (Story 56.5, AD-126); see `sync_open_entry`.
+    // Before the `subpath` moves into the blocking closure below.
+    engine.note_use(&id, &subpath);
+
+    let done = tokio::task::spawn_blocking(move || export::export_entry(&root, &subpath, &target))
+        .await
+        .map_err(|err| open_failure(format!("could not export {named}: {err}")))?
+        .map_err(|refusal| export_refused(&refusal))?;
+
+    tracing::info!(rel = %named, "files: exported a file out of keeper");
+    Ok(ExportReceiptVm::file(
+        &destination,
+        done.path.display().to_string(),
+        export::file_name_of(&named),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// The Files surface writes (Story 45.3, FR-175, FR-176, AD-89)
+// ---------------------------------------------------------------------------
+//
+// AD-75 said the Files surface never writes. AD-89 retired it, deliberately and
+// by the owner, and the four commands below are the whole of what replaced it.
+// The reasoning lives in `keeper_sync::files_write`'s module doc; what matters
+// at this call site is the shape it imposes:
+//
+//   * every byte goes through `notes_vault::write_vault_file` + `mark_dirty`,
+//     the same path notes and Story 44.16's CSV editor use — never a second
+//     writer, never a reach into the sync engine;
+//   * every removal goes through `notes_vault::trash_note`, which the
+//     reconciler already understands, so a deletion is announced rather than
+//     discovered on the next scan;
+//   * every decision — is this inside a vault, is it a folder, is the name a
+//     name, is it already taken — is made in `keeper_sync::files_write`, which
+//     compiles and is tested on any machine. This crate does not build on Linux
+//     (AD-55, AD-56), so a rule written here would be a rule guarding a write
+//     that nobody could exercise until macOS.
+
+/// The vault this profile holds and the write scope over it.
+///
+/// **From the LIVE vault, never from `profile.notes`.** The listing's
+/// `writable` flag and the write command's answer have to be the same question
+/// asked twice, and a profile configured with a vault the registry has no slot
+/// for — unflagged, root moved, still starting — is exactly where those two
+/// would diverge. A pane told "writable" by configuration and refused by the
+/// registry is a pane offering an action that will fail, which is the one thing
+/// this story's own rule forbids.
+fn vault_and_scope(profile: &SyncProfile) -> (Option<crate::notes_vault::Vault>, WriteScope<'_>) {
+    let vault = crate::notes_vault::vault(&profile.id);
+    let scope = WriteScope::new(
+        &profile.name,
+        vault.as_ref().map(|vault| vault.config.subfolder.as_str()),
+    )
+    // The workspace fence (Phase 7, AD-113): with the sessions zone named,
+    // the scope refuses every write under a session's `workspace/` — scratch
+    // keeper reads and never touches. From the stored profile rather than the
+    // registry, because the fence must hold even while the sessions registry
+    // is still starting: an unregistered zone widens nothing.
+    .with_sessions(
+        profile
+            .sessions
+            .as_ref()
+            .map(|sessions| sessions.subfolder.as_str()),
+    );
+    (vault, scope)
+}
+
+/// A write refusal, as the frontend receives it — and as the log records it.
+///
+/// `warn!` rather than `info!`, on 44.16's reasoning: `GatedMakeWriter` only
+/// writes `INFO` to the file when debug mode is on and lets `WARN` and above
+/// through always. A refusal is the thing the user asks about later, so it has
+/// to already be on disk (DW-162).
+fn write_refused(refusal: &WriteRefusal) -> IpcError {
+    tracing::warn!(%refusal, "files: write refused");
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: refusal.to_string(),
+        account_id: None,
+        retriable: false,
+    }
+}
+
+/// The profile and its live vault, or the refusal that ends the call.
+///
+/// **The CREATE path's opener, and after Story 46.14 only that.** Creating is
+/// still vault-only (AD-102 widened editing and deleting, not creating), so
+/// this is the one command that may still decline a whole profile for holding
+/// no vault. Everything that changes an existing file starts at
+/// [`routable_profile`] instead.
+fn writable_profile(
+    state: &tauri::State<'_, AppState>,
+    id: &str,
+) -> Result<(SyncProfile, crate::notes_vault::Vault), IpcError> {
+    let engine = engine_of(state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    let profile = find_profile(&profiles, id)?.clone();
+    // The refusal is `WriteRefusal`'s own sentence rather than one worded here,
+    // so the reason a person reads when a command declines is the same reason
+    // the listing already showed them where the control should have been.
+    let Some(vault) = crate::notes_vault::vault(&profile.id) else {
+        return Err(write_refused(&WriteRefusal::NoVault {
+            profile_name: profile.name.clone(),
+        }));
+    };
+    Ok((profile, vault))
+}
+
+/// The profile a command may change a file in, whether or not it holds a vault
+/// (Story 46.14, AD-102).
+///
+/// **The vault question no longer ends the call, and that is the whole
+/// shell-side change.** [`writable_profile`] refused a whole profile for
+/// holding no reachable vault before `WriteScope` was ever consulted, which is
+/// what made the owner's `AGENTS.md` unreachable: it is inside a sync profile,
+/// outside the vault. Editing and deleting now start here and let
+/// [`WriteScope::route`] decide the fork, in `keeper-sync`, where it is
+/// asserted on every machine.
+///
+/// Deliberately does NOT return a vault. The vault a command writes through
+/// must be the same one its scope was built from, and the only way to make
+/// that structural is for both to come out of [`vault_and_scope`]'s single
+/// registry lookup — a second lookup here is exactly the "writable by config,
+/// refused by the registry" divergence that function exists to prevent.
+fn routable_profile(state: &tauri::State<'_, AppState>, id: &str) -> Result<SyncProfile, IpcError> {
+    let engine = engine_of(state)?;
+    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+    Ok(find_profile(&profiles, id)?.clone())
+}
+
+// ---------------------------------------------------------------------------
+// What the sessions tree borrows (Phase 7, FR-254, AD-117)
+// ---------------------------------------------------------------------------
+//
+// A sessions root IS a sync profile (AD-107), so the session tree needs the
+// same three facts a listing needs: the profile, its write scope, and one
+// `pending` answer. These three re-export the machinery above rather than
+// letting `sessions_ipc` build its own — the whole point of the tree's sync
+// mark is that it is not a second opinion, and it stops being one the moment
+// the sessions surface starts asking git its own questions.
+//
+// Nothing new is computed here. Each is one line over a private helper,
+// visible to the crate and to nobody else.
+
+/// The profile behind one sessions root.
+pub(crate) fn sessions_profile(
+    state: &tauri::State<'_, AppState>,
+    root_id: &str,
+) -> Result<SyncProfile, IpcError> {
+    routable_profile(state, root_id)
+}
+
+/// The live vault and the write scope over it — including the AD-113 fence,
+/// which is what the tree renders its read-only lock from.
+pub(crate) fn sessions_scope(
+    profile: &SyncProfile,
+) -> (Option<crate::notes_vault::Vault>, WriteScope<'_>) {
+    vault_and_scope(profile)
+}
+
+/// One `Engine::pending` answer for the whole tree, the engine's own words on
+/// failure.
+pub(crate) async fn sessions_pending(
+    state: &tauri::State<'_, AppState>,
+    root_id: &str,
+) -> Result<Vec<keeper_sync::engine::PendingFile>, String> {
+    let engine = engine_of(state).map_err(|error| error.message)?;
+    engine
+        .pending(root_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The Files pane's own sentences, verbatim — [`sync_mark`], for the sessions
+/// tree.
+///
+/// Deliberately not a count. This doc said "the five sentences" until Story
+/// 56.2 added a sixth arm, and a number in a doc comment is a fact that goes
+/// stale silently: nothing compiles against it and nothing tests it. What
+/// matters is that there is exactly one function wording these states, so a
+/// session file the Files pane calls excluded is called excluded here in the
+/// same words.
+pub(crate) fn sessions_sync_mark(
+    status: &browse::EntrySyncStatus,
+    engine_failure: Option<&str>,
+) -> FilesEntrySyncVm {
+    sync_mark(status, engine_failure)
+}
+
+/// Save one file inside a synced folder (Story 45.3, FR-175, AD-89, AD-65;
+/// Story 46.14, AD-102).
+///
+/// **Two writers, and `WriteScope::route` picks.** Which one is not decided
+/// here — it is decided in `keeper-sync`, where it is asserted on Linux, and it
+/// arrives as a `WriteRoute` whose vault arm already carries the vault. This
+/// command's job is to spend the verdict, not to reach it.
+///
+/// *In the vault:* `write_vault_file` is the same temp-and-rename `write_note`
+/// uses, under the `.keeper.<ulid>.tmp` name that is already a tier-0 sync
+/// exclusion, so a `kill -9` between write and rename leaves no torn file.
+/// `mark_dirty` is the announcement `import_attachment` already makes: the
+/// commit cadence runs and the change is committed and synced. `touch` is
+/// included, where Story 44.16 deliberately left it out — 44.16's target is an
+/// embedded `.csv` the notes walk never collects, whereas this surface can save
+/// a `.md` *inside the vault*, which is a note, so the index has to be told.
+///
+/// *Outside every vault:* `write_unmanaged`, a plain atomic write with no
+/// `mark_dirty` and no `touch` — because there is no vault to mark and no index
+/// this file belongs in. Neither call is reachable from that arm: the route
+/// hands over no vault, and `write_unmanaged`'s signature has nowhere to put
+/// one. The surface said so before the first keystroke
+/// (`FilesWriteVm::caveat`); an edit that quietly does less than the vault path
+/// does would be strictly worse than the refusal it replaces.
+///
+/// **A path that is not on disk is refused rather than created**, by either
+/// writer. Saving is not creating: `sync_create_entry` is, it is still
+/// vault-only, and it is the one with the collision rule. A stale editor whose
+/// file was deleted elsewhere must not put it back.
+///
+/// Content is written as exact bytes — no trailing-newline normalisation, no
+/// re-encoding — for the reason 44.16's parser records spans instead of
+/// re-serialising: a file the user did not change must not change.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a folder, a path
+/// that escapes the profile root, a path that is gone, a vault that is
+/// configured but not yet live, a disk failure).
+#[tauri::command]
+pub async fn sync_write_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    content: String,
+) -> Result<(), IpcError> {
+    let profile = routable_profile(&state, &id)?;
+    let (vault, scope) = vault_and_scope(&profile);
+    let route = scope
+        .route(vault, &profile.local_path, &subpath)
+        .map_err(|refusal| write_refused(&refusal))?;
+
+    // On the blocking pool for the same reason the listing is: a folder on a
+    // pendrive or a network share can take hundreds of milliseconds to write,
+    // and stalling the async runtime would freeze every other profile's poll
+    // behind one save.
+    let written = {
+        let route = route.clone();
+        // `subpath` is not captured by the blocking closure — the route
+        // already holds every path either writer needs — so it is still here
+        // to name the file if the task itself panics.
+        tokio::task::spawn_blocking(move || match &route {
+            WriteRoute::Vault { vault, path } => {
+                crate::notes_vault::write_vault_file(vault, path.as_str(), &content)
+                    .map_err(WriteOutcome::Vault)
+            }
+            WriteRoute::Unmanaged(target) => {
+                files_write::write_unmanaged(target, &content).map_err(WriteOutcome::Plain)
+            }
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not save {subpath}: {err}")))?
+    };
+    written.map_err(|outcome| match outcome {
+        WriteOutcome::Vault(error) => notes_write_error(error),
+        WriteOutcome::Plain(refusal) => write_refused(&refusal),
+    })?;
+
+    match route {
+        WriteRoute::Vault { vault, path } => {
+            crate::notes_vault::touch(&vault.id, vec![path.as_str().to_owned()]);
+            crate::notes_vault::mark_dirty(&vault.id);
+            tracing::info!(rel = %path.as_str(), "files: wrote a vault file from the Files surface");
+        }
+        // Logged at `info!` and not `debug!` for DW-162's reason, and worth a
+        // line of its own: "keeper wrote this and told nothing about it" is
+        // exactly what a person asks about later.
+        WriteRoute::Unmanaged(target) => tracing::info!(
+            rel = %target.profile_relative(),
+            "files: wrote a file no vault manages — no mark_dirty, no touch (AD-102)"
+        ),
+    }
+    Ok(())
+}
+
+/// Which writer failed, so the sentence a person reads comes from the right
+/// vocabulary.
+///
+/// The two errors are genuinely different types — `NotesError` names a
+/// vault-relative path and `WriteRefusal` names the one the surface shows —
+/// and flattening them to a `String` inside the blocking task would throw away
+/// the `warn!` each of them already logs on the way out.
+enum WriteOutcome {
+    Vault(keeper_core::notes::NotesError),
+    Plain(WriteRefusal),
+}
+
+// ---------------------------------------------------------------------------
+// A file's own properties (Story 50.4, FR-283, AD-120)
+// ---------------------------------------------------------------------------
+//
+// Here rather than in `notes_ipc` because the address decides ownership: this
+// pair is `(profile id, profile-relative subpath)`, which is what every command
+// in this file speaks and what no command in `notes_ipc` does — a note is a
+// vault id and a note id. The file these serve most often has no vault behind
+// it at all (a session's `README.md` under a sessions zone, AD-107), and
+// reaching it through `notes_ipc` would mean inventing a vault for a file that
+// is not in one.
+//
+// What they do NOT own is a second frontmatter parser or a second frontmatter
+// writer. Both are `keeper_core::file_properties`, over
+// `keeper_core::notes::frontmatter` — the same span-recording scanner the notes
+// side splices through — so the two surfaces cannot come to disagree about
+// where one file's block ends.
+
+/// The bytes a properties edit may be applied to, or Rust's own reason it may
+/// not be.
+///
+/// One helper for both commands, so the read cannot offer a panel over a file
+/// the write would then decline. A prefix is refused rather than edited: with
+/// `oversize` the string is the first megabyte and writing it back would delete
+/// the rest of the file (`text_file`'s module note).
+fn editable_source(
+    file: keeper_core::text_file::TextFileVm,
+    subpath: &str,
+) -> Result<String, IpcError> {
+    match file.text {
+        Some(text) if !file.oversize => Ok(text),
+        _ => Err(open_failure(file.detail.unwrap_or_else(|| {
+            format!("keeper cannot read {subpath} as text, so it has no properties to show")
+        }))),
+    }
+}
+
+/// Read one file's frontmatter block (Story 50.4, FR-283).
+///
+/// **Routed, not merely resolved, and with the same call the write makes.**
+/// `WriteScope::route` is what refuses a `workspace/` path (AD-113), a
+/// directory, and a subpath that leaves the profile — in `keeper-sync`, where
+/// it is asserted on Linux. Asking it here as well is what makes matrix row 8
+/// true: a file whose properties keeper would refuse to write gets no panel at
+/// all, rather than a panel that refuses on the first keystroke. Story 45.3's
+/// rule, applied to a second pair of commands.
+///
+/// It routes AND resolves because those are two questions: `route` answers
+/// "may keeper write here", and `browse::resolve` — the same call
+/// `sync_read_text` makes — answers "where is it". The route's own path is
+/// deliberately opaque (`UnmanagedPath` keeps its absolute form private so a
+/// `PathBuf` cannot reach a writer from anywhere else), so the second `stat` is
+/// the price of that, and it is one `stat` per panel open.
+///
+/// Returns the block **verbatim**, `""` for a file that has none — the same
+/// shape `NoteBodyBatch.frontmatter` and `NoteWriteVm.frontmatter` carry, so
+/// the properties panel consumes one thing from two addresses and does not
+/// fork. A view-model wrapping one string would be a `gen/` type whose only
+/// field is the string.
+///
+/// Runs on the blocking pool for `sync_read_text`'s reason: a file on a
+/// pendrive can take hundreds of milliseconds to open.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a path that
+/// escapes the root or sits in `workspace/`, a directory, a file that is gone,
+/// a file that is not editable text).
+#[tauri::command]
+pub async fn sync_read_frontmatter(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+) -> Result<String, IpcError> {
+    let profile = routable_profile(&state, &id)?;
+    let (vault, scope) = vault_and_scope(&profile);
+    scope
+        .route(vault, &profile.local_path, &subpath)
+        .map_err(|refusal| write_refused(&refusal))?;
+    let resolved = browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| open_failure(refusal.to_string()))?
+        .ok_or_else(|| open_failure(missing_sentence(&profile, &subpath)))?;
+
+    let named = subpath.clone();
+    tokio::task::spawn_blocking(move || {
+        let file = keeper_core::text_file::open_text_file(&resolved)
+            .map_err(|err| open_failure(format!("could not read {subpath}: {err}")))?;
+        let source = editable_source(file, &subpath)?;
+        Ok(keeper_core::file_properties::block_of(&source).to_owned())
+    })
+    .await
+    .map_err(|err| open_failure(format!("could not read {named}: {err}")))?
+}
+
+/// Write one file's frontmatter block, and nothing else in the file
+/// (Story 50.4, FR-283, FR-233, AD-120).
+///
+/// **`expect` is the block the surface read, and the write refuses if the block
+/// on disk is no longer it.** The guard is the block rather than the file
+/// because the body written is the body just read: a person or an agent typing
+/// in the body loses nothing and is refused nothing, and the only edit this
+/// command could drop is a concurrent edit to the properties themselves. The
+/// reasoning, and why that is a better precondition than `GuardedWrite`'s
+/// length or the notes side's whole-file fingerprint, is in
+/// `keeper_core::file_properties` — with the byte tests, which this crate could
+/// not carry (AD-55, AD-56).
+///
+/// A refusal rather than a conflict copy. `notes_save` writes one because it is
+/// saving a document somebody typed; a property is a field they can set again,
+/// and a second file on disk would be a worse answer than a sentence.
+///
+/// **Nothing is stamped.** `notes_save` puts `updated` into the block on every
+/// write and `notes_create` puts an `id` in; neither happens here, because this
+/// is a file keeper did not author and the sessions contract is explicit about
+/// it (`docs/sessions.md`). What lands is exactly the block the person edited.
+///
+/// The two writers, and `WriteScope::route` picking between them, are
+/// `sync_write_entry`'s — including `touch` and `mark_dirty` for a file that
+/// turns out to be inside a vault, and neither for one that is not (AD-102).
+///
+/// Returns the block as it now stands on disk, for the panel to render.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, a path that
+/// escapes the root or sits in `workspace/`, a directory, a file that is gone,
+/// a file that is not editable text, a block that changed underneath, a block
+/// that is not well formed, a disk failure).
+#[tauri::command]
+pub async fn sync_write_frontmatter(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    expect: String,
+    frontmatter: String,
+) -> Result<String, IpcError> {
+    // Scoped to this function: nothing else in this module emits, and the
+    // module deliberately spells every other `tauri::` name in full.
+    use tauri::Emitter as _;
+
+    let profile = routable_profile(&state, &id)?;
+    let (vault, scope) = vault_and_scope(&profile);
+    let route = scope
+        .route(vault, &profile.local_path, &subpath)
+        .map_err(|refusal| write_refused(&refusal))?;
+    let resolved = browse::resolve(&profile.local_path, &subpath)
+        .map_err(|refusal| open_failure(refusal.to_string()))?
+        .ok_or_else(|| open_failure(missing_sentence(&profile, &subpath)))?;
+
+    let named = subpath.clone();
+    let landed = {
+        let route = route.clone();
+        let subpath = subpath.clone();
+        // Read, splice and write in ONE blocking task. Reading on the async
+        // side and writing here would open a window between the guard and the
+        // write that is wider than the one the guard exists to close.
+        tokio::task::spawn_blocking(move || {
+            let file = keeper_core::text_file::open_text_file(&resolved)
+                .map_err(|err| open_failure(format!("could not read {subpath}: {err}")))?;
+            let source = editable_source(file, &subpath)?;
+            let next = keeper_core::file_properties::replace_block(
+                &source,
+                &expect,
+                &frontmatter,
+                &subpath,
+            )
+            .map_err(|refusal| {
+                // `warn!` on `write_refused`'s reasoning (DW-162): a refusal is
+                // exactly what somebody asks about an hour later.
+                tracing::warn!(%refusal, "files: a properties write was refused");
+                IpcError {
+                    code: IpcErrorCode::Internal,
+                    message: refusal.to_string(),
+                    account_id: None,
+                    retriable: false,
+                }
+            })?;
+            match &route {
+                WriteRoute::Vault { vault, path } => {
+                    crate::notes_vault::write_vault_file(vault, path.as_str(), &next)
+                        .map_err(notes_write_error)?;
+                }
+                WriteRoute::Unmanaged(target) => {
+                    files_write::write_unmanaged(target, &next)
+                        .map_err(|refusal| write_refused(&refusal))?;
+                }
+            }
+            Ok::<String, IpcError>(keeper_core::file_properties::block_of(&next).to_owned())
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not save {named}: {err}")))??
+    };
+
+    match route {
+        WriteRoute::Vault { vault, path } => {
+            crate::notes_vault::touch(&vault.id, vec![path.as_str().to_owned()]);
+            crate::notes_vault::mark_dirty(&vault.id);
+            tracing::info!(rel = %path.as_str(), "files: wrote a vault file's properties");
+        }
+        WriteRoute::Unmanaged(target) => tracing::info!(
+            rel = %target.profile_relative(),
+            "files: wrote the properties of a file no vault manages (AD-102)"
+        ),
+    }
+
+    // The re-read, and the narrowest hook there is: the sessions surfaces
+    // already listen for this event and re-issue both space reads on it
+    // (`session-detail.tsx`), so a file that just became `tag:ref` appears in
+    // References without a manual refresh and without one line of new frontend
+    // plumbing. The zone watcher would have said the same thing a debounce
+    // later; saying it now is what turns that race into a guarantee, which is
+    // the reason the detail surface already keeps an explicit re-read beside
+    // the event.
+    //
+    // Only for a profile that holds a sessions zone. A tag written in an
+    // ordinary synced folder changes no space, and an event nobody is listening
+    // for is still a re-read for every open board.
+    if profile.sessions.is_some() {
+        let _ = app.emit(crate::sessions_root::SESSIONS_CHANGED_EVENT, id);
+    }
+    Ok(landed)
+}
+
+/// Word what deleting this selection would do, before it is done (Story 45.3,
+/// FR-175, UX-DR66).
+///
+/// **A separate call, and that is what makes the confirmation honest.** The
+/// plan is built by the same code the delete runs — the same scope, the same
+/// resolution, the same sync answer — so the dialog cannot promise something
+/// the command will then refuse, and a file that vanished between the click and
+/// the confirmation is named as a refusal rather than silently dropped.
+///
+/// The sentences are composed by [`FilesDeletePlanVm::compose`], in
+/// `keeper-core`, which is pure and therefore asserted on every machine. This
+/// command's whole job is gathering the facts it needs per path: may keeper
+/// delete it, does it sync, and — since Story 46.14 — which trash it is bound
+/// for. That third fact is per file rather than per call because one drag over
+/// a vault and the folder beside it selects both.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile).
+#[tauri::command]
+pub async fn sync_delete_plan(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpaths: Vec<String>,
+) -> Result<FilesDeletePlanVm, IpcError> {
+    let profile = routable_profile(&state, &id)?;
+    let (vault, scope) = vault_and_scope(&profile);
+    let excludes = ExcludeSet::new(&profile.excludes).map_err(|e| sync_ipc_error(&e))?;
+    let engine = engine_of(&state)?;
+    // Once for the whole selection, exactly as the listing asks once for a
+    // whole directory.
+    let (pending, unavailable) = match engine.pending(&id).await {
+        Ok(files) => (browse::PendingView::from_pending(files), None),
+        Err(error) => (browse::PendingView::Unavailable, Some(error.to_string())),
+    };
+    // The same single SELECT the listing takes, and for the same reason: the
+    // confirmation must word a materialized path exactly as the row it was
+    // opened from does (Story 56.7). A failed read degrades to `Synced`, which
+    // still counts as travelling in `FilesDeletePlanVm::compose`, so it cannot
+    // turn this sentence into the quiet guess.
+    let materialized = engine
+        .materialized_paths(&id)
+        .map(browse::MaterializedView::from_paths)
+        .unwrap_or_else(|error| {
+            // The log is the only trace this degradation leaves. The dialog
+            // goes on to word a truth rather than an error — a less specific
+            // one — so nothing on screen, and nothing in the plan that crosses
+            // the wire, says the state was ever read for.
+            tracing::warn!(
+                profile = id,
+                error = %error,
+                "files: could not read which paths keeper has materialized"
+            );
+            browse::MaterializedView::none()
+        });
+
+    let mut files = Vec::new();
+    let mut refusals = Vec::new();
+    for subpath in subpaths {
+        match scope.route(vault.clone(), &profile.local_path, &subpath) {
+            Ok(route) => {
+                // `false` and not a re-`stat`: `route` refuses every directory,
+                // so anything that got this far is a file. The old
+                // `DeleteTarget.is_dir` could only ever be `false` here too —
+                // it was a fact carried past the check that made it constant.
+                let status = browse::status_of(
+                    &profile.local_path,
+                    &subpath,
+                    false,
+                    &excludes,
+                    &pending,
+                    &materialized,
+                );
+                files.push((
+                    subpath,
+                    sync_mark(&status, unavailable.as_deref()).status,
+                    destination_of(&route),
+                ));
+            }
+            Err(refusal) => refusals.push(FilesDeleteRefusalVm {
+                relative_path: subpath,
+                reason: refusal.to_string(),
+            }),
+        }
+    }
+    Ok(FilesDeletePlanVm::compose(&profile.name, files, refusals))
+}
+
+/// Where one routed path's bytes are about to go, for the confirmation's
+/// recovery sentence (Story 46.14, AD-102).
+///
+/// A projection of the route rather than a second reading of the scope: the
+/// dialog and the command have to name the same trash, and the only way to
+/// guarantee that is for both to read the same verdict.
+fn destination_of<V>(route: &WriteRoute<V>) -> FilesDeleteDestinationVm {
+    match route {
+        WriteRoute::Vault { .. } => FilesDeleteDestinationVm::VaultTrash,
+        WriteRoute::Unmanaged(_) => FilesDeleteDestinationVm::SystemTrash,
+    }
+}
+
+/// Move a selection of files into a trash — the vault's or the operating
+/// system's (Story 45.3, FR-175, AD-89, NFR-30; Story 46.14, AD-102).
+///
+/// **Never an `unlink`, whichever trash it is**, and that is the promise AD-102
+/// relocated rather than weakened.
+///
+/// *In the vault:* `trash_note` is the removal path the reconciler already
+/// understands. It renames the file into `<vault>/.keeper/trash/<ulid>/<rel>` —
+/// `.keeper` is a tier-0 sync exclusion, so git sees a deletion — then
+/// `touch`es the path so the index drops the note, and `mark_dirty`s the vault
+/// so the commit cadence carries the removal. The bytes stay recoverable
+/// locally *and* from history, and the commit that deletes the file is preceded
+/// by one that still holds it.
+///
+/// *Outside every vault:* `trash_unmanaged`, which is `NSFileManager
+/// trashItem` on macOS and the freedesktop.org home trash elsewhere. There is
+/// no vault trash to reach and no note history to record in, and the
+/// confirmation said exactly that before the click
+/// (`FilesDeletePlanVm::recovery`).
+///
+/// **Every path is re-checked here, not trusted from the plan.** The plan is
+/// advice a person read; this is the authority. A path that became a folder, a
+/// path that moved into or out of the vault, a path that was already deleted —
+/// each answers for itself, and the receipt reports the split rather than
+/// failing the batch. Failing the whole call would leave four files trashed and
+/// an error on screen saying nothing happened.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile).
+#[tauri::command]
+pub async fn sync_delete_entries(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpaths: Vec<String>,
+) -> Result<FilesDeleteReceiptVm, IpcError> {
+    let profile = routable_profile(&state, &id)?;
+
+    let (outcome, dirty) = {
+        let profile = profile.clone();
+        tokio::task::spawn_blocking(move || {
+            // One registry lookup for the vault AND the scope, so the vault a
+            // path is trashed into and the vault the scope measured it against
+            // cannot be two different vaults.
+            let (vault, scope) = vault_and_scope(&profile);
+            // Resolved once for the batch and never per file: `os_trash` reads
+            // the environment, and on a machine with no home directory it is
+            // the same refusal every time.
+            let trash = files_write::os_trash();
+            let stamp = files_write::local_now_ms();
+            let mut deleted = Vec::new();
+            let mut refusals = Vec::new();
+            let mut dirty: Option<String> = None;
+            for subpath in subpaths {
+                let outcome = scope
+                    .route(vault.clone(), &profile.local_path, &subpath)
+                    .and_then(|route| match route {
+                        WriteRoute::Vault { vault, path } => {
+                            crate::notes_vault::trash_note(&vault, path.as_str())
+                                .map(|grave| (grave, Some(vault.id.clone())))
+                                .map_err(|error| WriteRefusal::DeleteFailed {
+                                    // The path the SURFACE shows, not the
+                                    // vault-relative one: the sentence lands
+                                    // beside the row the person selected, and
+                                    // naming it differently there would read as
+                                    // a different file.
+                                    relative_path: subpath.clone(),
+                                    reason: error.to_string(),
+                                })
+                        }
+                        WriteRoute::Unmanaged(target) => match &trash {
+                            // No vault to mark: there is none to reach, and
+                            // marking one anyway would ask a reconciler to
+                            // reconcile a path it has never indexed.
+                            Ok(trash) => files_write::trash_unmanaged(&target, trash, stamp)
+                                .map(|grave| (grave, None)),
+                            // A machine with no trash keeps its file. The
+                            // alternative is the `unlink` NFR-30 forbids.
+                            Err(refusal) => Err(refusal.clone()),
+                        },
+                    });
+                match outcome {
+                    Ok((grave, marked)) => {
+                        tracing::info!(
+                            %subpath,
+                            grave = %grave.display(),
+                            "files: moved a file to the trash"
+                        );
+                        dirty = dirty.or(marked);
+                        deleted.push(subpath);
+                    }
+                    Err(refusal) => {
+                        tracing::warn!(%subpath, %refusal, "files: delete refused");
+                        refusals.push(FilesDeleteRefusalVm {
+                            relative_path: subpath,
+                            reason: refusal.to_string(),
+                        });
+                    }
+                }
+            }
+            (FilesDeleteReceiptVm { deleted, refusals }, dirty)
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not delete: {err}")))?
+    };
+
+    // Only a removal that actually happened, and only a vault one, moves a
+    // vault's cadence.
+    if let Some(vault_id) = dirty {
+        crate::notes_vault::mark_dirty(&vault_id);
+    } else if outcome.deleted.is_empty() {
+        // DW-162: a path that declines to act says so where a person can find
+        // it later, and `debug!` never reaches the packaged app's log.
+        tracing::info!(profile = %profile.name, "files: delete removed nothing");
+    }
+    Ok(outcome)
+}
+
+/// Create an empty text file inside a synced folder's notes vault (Story 45.3,
+/// FR-176, AD-89).
+///
+/// Takes the directory as a profile-relative subpath the listing produced, and
+/// the name as its own argument — never a joined path (AD-65). Rust joins them,
+/// once, in `WriteScope::create`, which is also where the name is checked.
+///
+/// **The collision refusal is the point.** `write_vault_file` renames over its
+/// target, so a create that did not check would replace an existing file with
+/// an empty one. The check is case-insensitive because APFS and NTFS are: an
+/// exact-match check passes on the Linux box this is written on and destroys a
+/// file on the Mac it ships to. A directory that cannot be read is a refusal,
+/// never a cleared check — the shape of the epic-44 defect where `notes_create`
+/// could overwrite a note through an unreadable directory.
+///
+/// Returns the new file's profile-relative path, so the surface can re-read the
+/// folder and put the cursor on the row it just made without composing a path.
+///
+/// Rejects with: `unsupported`, `internal` (no such profile, no vault, a
+/// directory outside the vault, a name that is not a name, a name already
+/// taken, an unreadable directory, a disk failure).
+#[tauri::command]
+pub async fn sync_create_entry(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    subpath: String,
+    name: String,
+) -> Result<String, IpcError> {
+    let (profile, vault) = writable_profile(&state, &id)?;
+    let (_, scope) = vault_and_scope(&profile);
+    let target = scope
+        .create(&subpath, &name)
+        .map_err(|refusal| write_refused(&refusal))?;
+
+    let created = {
+        let root = profile.local_path.clone();
+        let vault = vault.clone();
+        let target = target.clone();
+        let wanted = name.clone();
+        tokio::task::spawn_blocking(move || {
+            let directory = files_write::resolve_existing(&root, &subpath)?;
+            if files_write::collides(&directory, &wanted)? {
+                return Err(WriteRefusal::NameTaken { name: wanted });
+            }
+            // Empty, and empty on purpose: a new text file with keeper's
+            // boilerplate in it is a file the user has to delete something out
+            // of before typing.
+            crate::notes_vault::write_vault_file(&vault, &target.vault_relative, "").map_err(
+                |error| WriteRefusal::WriteFailed {
+                    relative_path: target.profile_relative.clone(),
+                    reason: error.to_string(),
+                },
+            )?;
+            Ok(target)
+        })
+        .await
+        .map_err(|err| open_failure(format!("could not create {name}: {err}")))?
+    };
+    let target = created.map_err(|refusal| write_refused(&refusal))?;
+
+    crate::notes_vault::touch(&vault.id, vec![target.vault_relative.clone()]);
+    crate::notes_vault::mark_dirty(&vault.id);
+    tracing::info!(
+        rel = %target.profile_relative,
+        "files: created a file from the Files surface"
+    );
+    Ok(target.profile_relative)
+}
+
+/// A `NotesError` from the one writer, as the frontend receives it.
+///
+/// Its `Display` already names the vault-relative path and the OS's own words,
+/// which is what a person needs; wrapping it in a second sentence would bury
+/// the only actionable part.
+fn notes_write_error(error: keeper_core::notes::NotesError) -> IpcError {
+    tracing::warn!(%error, "files: a vault write failed");
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message: error.to_string(),
+        account_id: None,
+        retriable: false,
+    }
+}
+
 /// The tray's view of folder sync: one composed state and one line.
 ///
 /// Called by the ~1 Hz tray tick, so it is deliberately cheap and total:
@@ -1428,6 +3807,10 @@ mod tests {
             commit_subject_template: None,
             notes: None,
             notes_subfolder: None,
+            recordings: None,
+            recordings_subfolder: None,
+            sessions: None,
+            sessions_subfolder: None,
         }
     }
 
@@ -1437,7 +3820,7 @@ mod tests {
     /// struct: the bug is a lost KEY, and serde is what decides what a key is.
     ///
     /// A field the request has a slot for.
-    const EXPRESSED: [&str; 17] = [
+    const EXPRESSED: [&str; 19] = [
         "name",
         "localPath",
         "remoteUrl",
@@ -1455,22 +3838,53 @@ mod tests {
         "authorOverride",
         "commitSubjectTemplate",
         "notes",
+        // Moved out of PRESERVED by Story 41.7. It was preserved because the app
+        // had no control for it and `parse_req` must not touch what no form
+        // shows; it is expressed now because the Sync form has the switch, and
+        // that switch is the whole of what makes a folder a recording
+        // destination.
+        "recordings",
+        // Expressed from birth (FR-222): the Sync form shipped its switch in the
+        // same change that added the field, so it never had a PRESERVED phase.
+        "sessions",
     ];
 
     /// A field no request can express, which `parse_req` must therefore never
     /// touch. `enabled` moves only through pause/resume, `volumeId` is minted by
     /// the engine on first sight of the media, `id` names the row, and the two
-    /// LFS knobs (`lfsNever`, `lfsPruneLocal`) plus the recordings block
-    /// (`recordings`, Story 41.1) are configured through `keeper-syncd`'s profile
-    /// file with no slot in the app's form — `parse_req` keeps them because it
-    /// starts from `prior.clone()`, not because it copies them by name.
-    const PRESERVED: [&str; 6] = [
+    /// LFS knobs (`lfsNever`, `lfsPruneLocal`) are configured through
+    /// `keeper-syncd`'s profile file with no slot in the app's form — `parse_req`
+    /// keeps them because it starts from `prior.clone()`, not because it copies
+    /// them by name. `lfsPruneLocal` needs no slot on purpose: releasing the
+    /// redundant object copy is what a profile does by default, and the opt-out
+    /// is for a machine that is configured, not clicked.
+    /// `regenerable` joins them for the same reason and one of its own: which
+    /// paths a repository generates is a fact about that repository, so it is
+    /// configured where the repository can say it — `.keeper/keeper.toml`, which
+    /// travels with the folder — rather than clicked per machine. A save from a
+    /// form that has never shown the list must not be able to empty it.
+    /// `virtualPatterns` and `virtualOverBytes` (Story 56.1) are here for
+    /// exactly the `regenerable` reason, and AD-132 states it: which paths may
+    /// stay unmaterialized is a fact the repository declares, so its home is the
+    /// committed pattern file and the folder's `.keeper/keeper.toml` tier, which
+    /// both the daemon and this app read. The profile is only the last
+    /// precedence layer. Until a form actually renders these — Story 56.9 — a
+    /// save that cannot express them must leave a daemon-set policy alone, which
+    /// is the DW-116 rule this whole list exists to enforce.
+    /// `releaseTtlMs` (Story 56.5) joins them on the same AD-132 reasoning: how
+    /// long this repository's content may stay is a fact about the repository,
+    /// this story ships no form control for it, and a save that cannot express
+    /// it must not reset a daemon-set retention window to the 24 h default.
+    const PRESERVED: [&str; 9] = [
         "id",
         "volumeId",
         "enabled",
         "lfsNever",
         "lfsPruneLocal",
-        "recordings",
+        "regenerable",
+        "virtualPatterns",
+        "virtualOverBytes",
+        "releaseTtlMs",
     ];
 
     fn json_fields(profile: &SyncProfile) -> serde_json::Map<String, serde_json::Value> {
@@ -1478,6 +3892,56 @@ mod tests {
             serde_json::Value::Object(map) => map,
             other => panic!("a profile is a JSON object, got {other}"),
         }
+    }
+
+    /// The Files pane used to wait for `Engine::pending` before it would name a
+    /// single entry — a whole-worktree `git status` plus an untracked
+    /// expansion. On a folder of tens of thousands of files on a busy drive
+    /// that is minutes of an empty pane, and the pane's own refresh asked for
+    /// it once per open directory.
+    #[test]
+    fn a_fresh_answer_is_served_and_a_stale_one_starts_a_walk() {
+        let view = browse::PendingView::Unavailable;
+        let fresh = MarkSlot {
+            answered: Some((Instant::now(), view.clone())),
+            walking: false,
+        };
+        assert_eq!(fresh.plan(Duration::from_secs(3)), MarkPlan::Serve(view));
+
+        // The same answer, now older than the window it is good for.
+        assert_eq!(fresh.plan(Duration::from_nanos(1)), MarkPlan::Walk);
+
+        assert_eq!(
+            MarkSlot::default().plan(Duration::from_secs(3)),
+            MarkPlan::Walk
+        );
+    }
+
+    /// One walk at a time per folder: a second reads the same tree off the same
+    /// disk for the same answer, which is exactly what made ten open
+    /// directories ten whole-repository walks at once.
+    #[test]
+    fn a_walk_in_progress_serves_what_there_is_rather_than_starting_another() {
+        let stale = browse::PendingView::Known(Default::default());
+        let walking_with_answer = MarkSlot {
+            answered: Some((Instant::now(), stale.clone())),
+            walking: true,
+        };
+        // Stale but usable: a mark a few seconds old beats no mark at all.
+        assert_eq!(
+            walking_with_answer.plan(Duration::from_nanos(1)),
+            MarkPlan::ServeWhileWalking(Some(stale))
+        );
+
+        let walking_first_time = MarkSlot {
+            answered: None,
+            walking: true,
+        };
+        assert_eq!(
+            walking_first_time.plan(Duration::from_secs(3)),
+            MarkPlan::ServeWhileWalking(None),
+            "and with nothing to serve it says so, rather than calling every entry clean"
+        );
     }
 
     /// AD-34-9, mechanized. The old `parse_req` rebuilt the profile from
@@ -1505,9 +3969,23 @@ mod tests {
         prior.enabled = false;
         prior.volume_id = Some("01VOLUME".into());
         prior.lfs_never = vec!["*.psd".into()];
-        prior.lfs_prune_local = true;
-        // Story 41.1's block, set to something a fresh profile never has, so the
-        // "nothing preserved moved" assertion below genuinely bites for it too.
+        prior.regenerable = vec!["index.md".into()];
+        // The opt-out, because a fresh profile now releases the redundant copy.
+        prior.lfs_prune_local = false;
+        // Story 56.1's virtualization policy. A fresh profile virtualizes
+        // nothing and has no size floor, so both need a value a fresh profile
+        // never has, or the preservation assertion below would pass however
+        // `parse_req` behaved.
+        prior.virtual_patterns = vec!["scans/**".into()];
+        prior.virtual_over_bytes = 32 * 1024 * 1024;
+        // Story 56.5's retention window. A fresh profile carries the 24 h
+        // default, so it needs a value a fresh profile never has or the
+        // preservation assertion below would pass however `parse_req` behaved.
+        prior.release_ttl_ms = 7 * 24 * 60 * 60 * 1000;
+        // Story 41.1's block, set to something a fresh profile never has. It was
+        // a PRESERVED field until Story 41.7 gave the form a switch for it; the
+        // distinctive value stays, because it is now what makes the EXPRESSED
+        // assertion below bite — an edit has to move it OFF this value.
         prior.recordings = Some(keeper_sync::profile::RecordingsConfig {
             subfolder: "sessions/raw".into(),
             media: keeper_sync::profile::MediaPolicy::PointerOnly,
@@ -1539,6 +4017,14 @@ mod tests {
         // Flagging the folder as a vault moves `notes` from `None` to `Some`.
         edit.notes = Some(true);
         edit.notes_subfolder = Some("second-brain".into());
+        // And flagging it as a recordings root moves `recordings` to a subfolder
+        // that does not overlap the vault just configured above.
+        edit.recordings = Some(true);
+        edit.recordings_subfolder = Some("media/sessions".into());
+        // And flagging it as a sessions zone moves `sessions` from `None`,
+        // overlapping neither of the two subfolders above.
+        edit.sessions = Some(true);
+        edit.sessions_subfolder = Some("60-sessions".into());
         let merged = parse_req(&edit, Some(&prior)).expect("valid");
 
         let before = json_fields(&prior);
@@ -1650,6 +4136,192 @@ mod tests {
                 .expect("now a vault")
                 .subfolder,
             keeper_sync::profile::NotesConfig::default().subfolder
+        );
+    }
+
+    /// Story 41.7's whole point, at the layer that carries it: the switch writes
+    /// a real `recordings` block, and turning it off REMOVES the block rather
+    /// than storing an empty one. Before this, `RecordingsConfig` and the
+    /// destination picker both existed and neither was reachable, because no
+    /// request could express the field.
+    #[test]
+    fn flagging_a_folder_writes_a_recordings_block_and_unflagging_removes_it() {
+        // Flagging a folder that has never held recordings, with the subfolder
+        // box untouched: the block is written with the default that lives in
+        // Rust, and nowhere else.
+        let mut flag = req();
+        flag.recordings = Some(true);
+        let flagged = parse_req(&flag, None).expect("valid");
+        assert_eq!(
+            flagged
+                .recordings
+                .as_ref()
+                .expect("the folder now holds recordings")
+                .subfolder,
+            keeper_sync::profile::RecordingsConfig::default().subfolder
+        );
+        assert_eq!(
+            flagged.recordings_root(),
+            Some(std::path::PathBuf::from("/home/u/tgdrive/recordings")),
+            "which is what makes it offerable as a recording destination"
+        );
+
+        // A subfolder the owner chose is stored as given.
+        let mut custom = req();
+        custom.recordings = Some(true);
+        custom.recordings_subfolder = Some("media/screen-recordings".into());
+        assert_eq!(
+            parse_req(&custom, None)
+                .expect("valid")
+                .recordings
+                .expect("flagged")
+                .subfolder,
+            "media/screen-recordings"
+        );
+
+        // Unflagging clears the block. `None` is "holds no recordings", so a
+        // default-filled block left behind would keep the folder in the picker
+        // after the owner took it out.
+        let mut unflag = req();
+        unflag.recordings = Some(false);
+        let cleared = parse_req(&unflag, Some(&flagged)).expect("valid");
+        assert_eq!(cleared.recordings, None);
+        assert_eq!(cleared.recordings_root(), None);
+
+        // And a request that says nothing leaves the block exactly as it is —
+        // AD-34-9, the rule that kept `recordings` alive while it was unreachable
+        // and keeps a `keeper-syncd`-configured media/push policy alive now.
+        let mut daemon_configured = flagged.clone();
+        daemon_configured.recordings = Some(keeper_sync::profile::RecordingsConfig {
+            subfolder: "sessions/raw".into(),
+            media: keeper_sync::profile::MediaPolicy::PointerOnly,
+            push: keeper_sync::profile::PushPolicy::Immediate,
+        });
+        assert_eq!(
+            parse_req(&req(), Some(&daemon_configured))
+                .expect("valid")
+                .recordings,
+            daemon_configured.recordings,
+            "a form that does not show the flag cannot move it"
+        );
+
+        // Re-flagging an already-flagged folder keeps the policy fields the app
+        // has no control for; only the subfolder the form showed moves.
+        let mut refit = req();
+        refit.recordings = Some(true);
+        refit.recordings_subfolder = Some("sessions/final".into());
+        let refitted = parse_req(&refit, Some(&daemon_configured))
+            .expect("valid")
+            .recordings
+            .expect("still flagged");
+        assert_eq!(refitted.subfolder, "sessions/final");
+        assert_eq!(
+            refitted.media,
+            keeper_sync::profile::MediaPolicy::PointerOnly
+        );
+        assert_eq!(refitted.push, keeper_sync::profile::PushPolicy::Immediate);
+    }
+
+    /// Each refusal `RecordingsConfig::validate` owns, reaching the caller as its
+    /// own sentence rather than as a corrected save.
+    ///
+    /// The correction is the failure mode worth a test: `notes_subfolder` trims
+    /// slashes, so had this been written by copying it, `/tmp` would have been
+    /// quietly stored as `tmp` and the owner's recordings would land in a folder
+    /// they never named — a save that "worked" and put the files somewhere else.
+    #[test]
+    fn a_recordings_subfolder_the_validator_refuses_is_refused_in_its_own_words() {
+        let mut vault = parse_req(&req(), None).expect("valid");
+        vault.notes = Some(keeper_sync::profile::NotesConfig {
+            subfolder: "10-notes".into(),
+            ..Default::default()
+        });
+
+        for (subfolder, expected) in [
+            (
+                "",
+                "recordings subfolder must not be empty: recordings live in a folder inside the \
+                 profile, never at the profile root",
+            ),
+            (
+                "   ",
+                "recordings subfolder must not be empty: recordings live in a folder inside the \
+                 profile, never at the profile root",
+            ),
+            (
+                "/tmp",
+                "recordings subfolder must be relative to the profile folder, got /tmp",
+            ),
+            (
+                "../x",
+                "recordings subfolder must not escape the profile folder: ../x",
+            ),
+            (
+                "10-notes/rec",
+                "recordings subfolder 10-notes/rec overlaps notes subfolder 10-notes: one folder \
+                 cannot be both a vault and a recordings root",
+            ),
+        ] {
+            let mut bad = req();
+            bad.recordings = Some(true);
+            bad.recordings_subfolder = Some(subfolder.into());
+            let err = parse_req(&bad, Some(&vault))
+                .expect_err("a subfolder the validator refuses must not be stored");
+            assert_eq!(
+                // `SyncError::Config` prints as `invalid sync configuration: {0}`,
+                // and that envelope is the whole of what the boundary adds — the
+                // sentence inside it is the validator's, word for word, which is
+                // what the form puts on screen.
+                err.message,
+                format!("invalid sync configuration: {expected}"),
+                "the validator's own sentence has to reach the form unaltered, since it is the \
+                 only thing that says WHICH rule was broken"
+            );
+        }
+
+        // The control: the same folder, the same vault, a subfolder that breaks
+        // no rule. Without this the loop above would pass just as well if
+        // flagging were refused outright.
+        let mut fine = req();
+        fine.recordings = Some(true);
+        fine.recordings_subfolder = Some("20-recordings".into());
+        assert_eq!(
+            parse_req(&fine, Some(&vault))
+                .expect("a subfolder beside the vault is not an overlap")
+                .recordings
+                .expect("flagged")
+                .subfolder,
+            "20-recordings"
+        );
+    }
+
+    /// The VM answers "where would recordings go" for a folder that does not hold
+    /// any yet, which is what lets the form prefill its subfolder box without
+    /// keeping a TypeScript copy of `DEFAULT_RECORDINGS_SUBFOLDER`.
+    ///
+    /// The notes pair is the cautionary tale sitting right beside it:
+    /// `notes_subfolder` is `None` for a folder that is not a vault, so
+    /// `add-folder-form.tsx` spells `"notes"` itself, and the two copies are one
+    /// rename apart from disagreeing about where a vault lives.
+    #[test]
+    fn the_profile_vm_answers_where_recordings_would_go_before_a_folder_holds_any() {
+        let mut profile = parse_req(&req(), None).expect("valid");
+        let vm = SyncProfileVm::from(&profile);
+        assert!(!vm.recordings, "an unflagged folder holds no recordings");
+        assert_eq!(
+            vm.recordings_subfolder, DEFAULT_RECORDINGS_SUBFOLDER,
+            "and the form still learns the subfolder flagging it would use"
+        );
+
+        profile.recordings = Some(keeper_sync::profile::RecordingsConfig {
+            subfolder: "media/screen-recordings".into(),
+            ..Default::default()
+        });
+        let vm = SyncProfileVm::from(&profile);
+        assert!(vm.recordings);
+        assert_eq!(
+            vm.recordings_subfolder, "media/screen-recordings",
+            "once it holds them, the stored answer is the one in force"
         );
     }
 
@@ -2014,6 +4686,45 @@ mod tests {
             line,
             "Kept your version of 1 file that changed in both places, alongside the remote's."
         );
+    }
+
+    /// A regenerable path that took the remote's version is neither a conflict
+    /// nor silence. Nothing was kept and nothing has to be deleted, so the
+    /// sentence must not send anybody looking for a `.sync-conflict-` file that
+    /// does not exist — the only action is to run whatever writes the file.
+    #[test]
+    fn a_regenerable_path_reads_as_regenerate_not_as_conflict() {
+        let one = outcome_line(&SyncOutcome {
+            pulled: true,
+            stale: vec!["10-notes/index.md".to_owned()],
+            ..SyncOutcome::default()
+        });
+        assert_eq!(
+            one,
+            "Took the remote's version of 1 generated file — regenerate it."
+        );
+        assert!(!one.contains("Kept your version"));
+
+        let many = outcome_line(&SyncOutcome {
+            pulled: true,
+            stale: vec!["a/index.md".to_owned(), "b/index.md".to_owned()],
+            ..SyncOutcome::default()
+        });
+        assert_eq!(
+            many,
+            "Took the remote's version of 2 generated files — regenerate them."
+        );
+
+        // Both can happen in one convergence, and the sentence has to carry
+        // both without conflating them.
+        let both = outcome_line(&SyncOutcome {
+            pulled: true,
+            conflicts: vec!["notes.sync-conflict-20250725-120000-host.md".to_owned()],
+            stale: vec!["index.md".to_owned()],
+            ..SyncOutcome::default()
+        });
+        assert!(both.contains("Kept your version of 1 file"), "{both}");
+        assert!(both.contains("1 generated file"), "{both}");
     }
 
     /// A pass whose legs all ran and moved nothing is the single most common

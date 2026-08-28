@@ -56,7 +56,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { useWindowedRows } from "@/components/ui/window-list";
+import { countLabel, SESSIONS } from "@/lib/count-label";
 import type { IpcError, RecordingFilterVm, RecordingHitVm } from "@/lib/ipc/client";
 import { recordingOpenPath, revealPath, searchRecordings } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -64,6 +65,18 @@ import { primaryViewStore } from "@/lib/stores/primary-view";
 
 /** Debounce (ms) before a filter change fires `searchRecordings`. */
 const DEBOUNCE_MS = 200;
+
+/**
+ * The height a recordings row is assumed to be until it has been mounted once,
+ * and the space between two of them.
+ *
+ * An assumption, not a fact, and that is the point: a row grows a third line
+ * when it has enough tags to wrap the badges, and a fourth where the platform
+ * has no Finder and the path renders as text instead. The window measures what
+ * a row really is on first mount; this is only what it starts from.
+ */
+const RECORDING_ROW_ESTIMATE = 60;
+const RECORDING_ROW_GAP = 8;
 
 /** The pane's heading, and the accessible name of the surface itself. */
 export const RECORDINGS_PANE_TITLE = "Recordings";
@@ -77,6 +90,12 @@ export const RECORDINGS_LIST_LABEL = "Recording sessions";
 
 /** The header control that re-runs the current query against the archive. */
 export const RECORDINGS_REFRESH_LABEL = "Refresh";
+
+/**
+ * Test id for the line that says how many sessions the filter found (Story
+ * 44.11). A slot, so a test asserts the number rather than the sentence.
+ */
+export const RECORDINGS_COUNT_SLOT = "recordings-count";
 
 /**
  * The durability words the archive column can hold, and how the filter names
@@ -113,6 +132,11 @@ export function RecordingsPane() {
   const [endDate, setEndDate] = useState<string | null>(null);
   const [durability, setDurability] = useState<string | null>(null);
   const [hits, setHits] = useState<RecordingHitVm[]>([]);
+  // How many sessions the filter matches in the whole archive, which is NOT
+  // `hits.length` (Story 44.11): the engine's page stops at 200, so an archive
+  // of nine thousand and one of exactly two hundred both hand back two hundred
+  // rows. Zero until a query lands, and shown only once one has.
+  const [total, setTotal] = useState(0);
   const [error, setError] = useState<IpcError | null>(null);
   // Whether a query has actually landed. An empty list is not yet "empty" while
   // the first answer is in flight, and neither empty-state sentence is true of
@@ -156,7 +180,8 @@ export function RecordingsPane() {
         if (seq !== seqRef.current) {
           return;
         }
-        setHits(result);
+        setHits(result.rows);
+        setTotal(result.total);
         setError(null);
         setLoaded(true);
       })
@@ -165,6 +190,7 @@ export function RecordingsPane() {
           return;
         }
         setHits([]);
+        setTotal(0);
         setError(
           isIpcError(e)
             ? e
@@ -212,15 +238,44 @@ export function RecordingsPane() {
     emptyKind = filtered ? "no-matches" : "no-recordings";
   }
 
+  // Keyed by session id, so a re-query that re-orders the archive carries each
+  // row's measured height with the row rather than leaving the previous
+  // occupant's height at that position.
+  const getKey = useCallback((index: number) => hits[index]?.sessionId ?? String(index), [hits]);
+  const list = useWindowedRows({
+    count: hits.length,
+    getKey,
+    rowHeight: RECORDING_ROW_ESTIMATE,
+    gap: RECORDING_ROW_GAP,
+  });
+
   return (
     <section
       aria-label={RECORDINGS_PANE_TITLE}
-      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
+      // Last child of the shell row, so the trailing edge cancels; see
+      // DESIGN.md → Elevation & Depth.
+      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0"
     >
       <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
         <div className="min-w-0">
-          <h1 className="font-heading font-medium text-lg">{RECORDINGS_PANE_TITLE}</h1>
+          <h1 className="font-heading text-title">{RECORDINGS_PANE_TITLE}</h1>
           <p className="text-muted-foreground text-sm">{RECORDINGS_PANE_SUBTITLE}</p>
+          {/* How many sessions the filter found (Story 44.11, FR-166).
+
+              In the header, which is rendered in every state, so an archive
+              that matches nothing says `0 sessions` instead of dropping the
+              count exactly when the reader most wants to know it was asked.
+              Suppressed only before the first answer lands: `0` before a query
+              has run is a claim nobody has checked yet. */}
+          {loaded && (
+            <p
+              role="status"
+              data-slot={RECORDINGS_COUNT_SLOT}
+              className="figures text-muted-foreground text-xs"
+            >
+              {countLabel(total, SESSIONS)}
+            </p>
+          )}
         </div>
         <Button
           type="button"
@@ -355,7 +410,7 @@ export function RecordingsPane() {
         )}
       </div>
 
-      <ScrollArea className="min-h-0 flex-1">
+      <div {...list.viewportProps} className="min-h-0 flex-1 overflow-y-auto">
         <div className="flex min-h-0 flex-col gap-2 p-6">
           {error !== null ? (
             <div role="alert" className="rounded-md bg-destructive/10 p-3 text-destructive text-sm">
@@ -376,31 +431,43 @@ export function RecordingsPane() {
               }
             />
           ) : (
-            <ul aria-label={RECORDINGS_LIST_LABEL} className="flex flex-col gap-2">
-              {hits.map((hit) => (
-                <RecordingRow
-                  key={hit.sessionId}
-                  hit={hit}
-                  canReveal={canReveal}
-                  onReveal={(h) => {
-                    // The absolute path Rust resolved for this session as it is
-                    // stored RIGHT NOW: story 40.4 moves folders on a retitle and
-                    // 42.1's row follows the session, so the row's path is the
-                    // current one and Reveal never points at where it used to be.
-                    void revealPath(h.absolutePath).catch(() => {});
-                  }}
-                  onPlay={(h) => {
-                    if (h.playablePath === null) {
-                      return;
-                    }
-                    void recordingOpenPath(h.playablePath).catch(() => {});
-                  }}
-                />
-              ))}
+            <ul
+              aria-label={RECORDINGS_LIST_LABEL}
+              className="relative w-full"
+              style={{ height: `${list.totalSize}px` }}
+            >
+              {list.rows.map((row) => {
+                const hit = hits[row.index];
+                if (hit === undefined) {
+                  return null;
+                }
+                return (
+                  <li key={hit.sessionId} {...list.rowProps(row)}>
+                    <RecordingRow
+                      hit={hit}
+                      canReveal={canReveal}
+                      onReveal={(h) => {
+                        // The absolute path Rust resolved for this session as it
+                        // is stored RIGHT NOW: story 40.4 moves folders on a
+                        // retitle and 42.1's row follows the session, so the
+                        // row's path is the current one and Reveal never points
+                        // at where it used to be.
+                        void revealPath(h.absolutePath).catch(() => {});
+                      }}
+                      onPlay={(h) => {
+                        if (h.playablePath === null) {
+                          return;
+                        }
+                        void recordingOpenPath(h.playablePath).catch(() => {});
+                      }}
+                    />
+                  </li>
+                );
+              })}
             </ul>
           )}
         </div>
-      </ScrollArea>
+      </div>
     </section>
   );
 }

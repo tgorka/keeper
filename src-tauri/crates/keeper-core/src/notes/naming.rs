@@ -37,6 +37,24 @@ pub(crate) const RESERVED_DEVICE_NAMES: [&str; 22] = [
     "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
 ];
 
+/// Whether a string is a ULID: 26 Crockford base32 characters.
+///
+/// Checked rather than assumed, because `id` is a top-level frontmatter key
+/// that an agent or another tool may already be using for something else
+/// entirely — and what keeper does with a foreign `id` (keep it, index by path,
+/// flag the identity as unstable) depends entirely on this answer.
+///
+/// Lives in the domain because three readers now need the same rule: the notes
+/// index, the sessions board, and the session markdown pool. A second spelling
+/// of "is this one of ours" is how the 22-character regression happened.
+pub fn is_ulid(value: &str) -> bool {
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    value.len() == 26
+        && value
+            .bytes()
+            .all(|byte| ALPHABET.contains(&byte.to_ascii_uppercase()))
+}
+
 /// Fold a title into a slug, with **no** fallback and **no** device-name
 /// escape: an emoji-only title folds to the empty string, and `"NUL"` folds to
 /// `"nul"`.
@@ -170,6 +188,61 @@ pub fn title_from_body(body: &str) -> String {
     String::new()
 }
 
+/// A note's title as every surface shows it: an explicit frontmatter `title`,
+/// else the first heading or line of the body, else the filename stem — which is
+/// what Obsidian shows.
+///
+/// The rule lives here rather than in the shell because two callers need it and
+/// one of them cannot use the other's. The index computes it while building an
+/// `IndexEntry`; the default-space seeder needs it for a note it has just read
+/// off the disk, on a vault that has no index yet (Story 44.3). Two copies of a
+/// three-branch fallback is exactly the kind of drift nobody notices until a
+/// seeded space stands down against a name only one of them can see.
+pub fn note_title(frontmatter_title: Option<&str>, body: &str, stem: &str) -> String {
+    if let Some(title) = frontmatter_title {
+        let trimmed = title.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    let from_body = title_from_body(body);
+    if from_body.trim().is_empty() {
+        stem.to_owned()
+    } else {
+        from_body
+    }
+}
+
+/// Follow a retitle into the body's opening heading — but only into the heading
+/// keeper itself wrote. `None` means the caller must leave the body alone.
+///
+/// The inverse of [`title_from_body`] and deliberately much narrower than it. A
+/// note keeper created carries `# <title>` as its whole body, so a retitle that
+/// did not follow would leave a file called "Archive triage" whose first line
+/// reads "Active work" — and the body is what Obsidian renders. But the body
+/// belongs to whoever last edited it: a first line that no longer says
+/// `# <old_title>` is something a person or an agent wrote, and rewriting it
+/// would be keeper editing prose it does not own. So the match is exact,
+/// against the line [`title_from_body`] would have read, and every other shape
+/// of body — prose, a different heading, no body at all — declines.
+pub fn retitle_heading(body: &str, old_title: &str, new_title: &str) -> Option<String> {
+    let wanted = format!("# {old_title}");
+    let mut at = 0;
+    for line in body.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            at += line.len();
+            continue;
+        }
+        if line.trim() != wanted {
+            return None;
+        }
+        // `\r` counted as part of the ending, so a CRLF body keeps its endings.
+        let end = at + line.trim_end_matches(['\r', '\n']).len();
+        return Some(format!("{}# {new_title}{}", &body[..at], &body[end..]));
+    }
+    None
+}
+
 /// Expand a journal path template for one date (FR-99).
 ///
 /// Closed placeholder set: `{yyyy}`, `{yy}`, `{mm}`, `{dd}`. Anything else is
@@ -208,6 +281,27 @@ pub fn journal_path(template: &str, y: i32, m: u32, d: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three readers now depend on this one rule — the notes index, the
+    /// sessions board and the session markdown pool — and a file that fails it
+    /// is indexed by path instead. It travelled here from `notes_vault` with
+    /// its test, because a rule and the thing that guards it should not live in
+    /// different crates.
+    #[test]
+    fn only_a_real_ulid_gives_a_note_a_stable_identity() {
+        assert!(is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGH"));
+        assert!(!is_ulid("not-a-ulid"));
+        assert!(!is_ulid(""));
+        // `U`, `I`, `L` and `O` are not in Crockford base32.
+        assert!(!is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGU"));
+        // 26 characters exactly. The 22-character regression that broke every
+        // note is the reason this is a function rather than an assumption.
+        assert!(!is_ulid("01J8ZQ4M7T5R9V3XK2B6C0"));
+        assert!(!is_ulid("01J8ZQ4M7T5R9V3XK2B6C0DFGHX"));
+        // Case-insensitive: Crockford's alphabet is, and a hand-typed id is
+        // more likely lowercase than not.
+        assert!(is_ulid("01j8zq4m7t5r9v3xk2b6c0dfgh"));
+    }
 
     #[test]
     fn slugs_an_ordinary_title() {
@@ -348,5 +442,69 @@ mod tests {
         assert_eq!(journal_path("/abs/{yyyy}.md", 2026, 8, 2), "abs/2026.md");
         assert_eq!(journal_path(r"win\path\{dd}", 2026, 8, 2), "win/path/02.md");
         assert_eq!(journal_path("..", 2026, 8, 2), "2026-08-02.md");
+    }
+
+    /// keeper wrote `# <name>` into a new space's body, so keeper may follow a
+    /// retitle into it — and only there.
+    #[test]
+    fn a_retitle_follows_the_heading_keeper_wrote() {
+        assert_eq!(
+            retitle_heading(
+                "\n# Active work\n\nSome body.\n",
+                "Active work",
+                "Archive triage"
+            )
+            .as_deref(),
+            Some("\n# Archive triage\n\nSome body.\n")
+        );
+        // A body that is nothing but the heading, which is what a new space has.
+        assert_eq!(
+            retitle_heading("\n# Active work\n", "Active work", "Archive triage").as_deref(),
+            Some("\n# Archive triage\n")
+        );
+        // No trailing newline is still a heading.
+        assert_eq!(
+            retitle_heading("# Active work", "Active work", "Archive triage").as_deref(),
+            Some("# Archive triage")
+        );
+        // CRLF keeps its line endings rather than being silently normalised.
+        assert_eq!(
+            retitle_heading("\r\n# Active work\r\n", "Active work", "Archive triage").as_deref(),
+            Some("\r\n# Archive triage\r\n")
+        );
+        // Trailing spaces belonged to the heading being replaced, so they go
+        // with it rather than dangling after the new one.
+        assert_eq!(
+            retitle_heading("# Active work   \n", "Active work", "Archive triage").as_deref(),
+            Some("# Archive triage\n")
+        );
+    }
+
+    /// The half that would rot. A heading someone changed is a thing they said,
+    /// and keeper following a rename into it would be keeper editing prose it
+    /// did not write.
+    #[test]
+    fn a_retitle_leaves_a_body_keeper_did_not_write_untouched() {
+        // Retitled by hand: the heading no longer names the old title.
+        assert!(retitle_heading(
+            "\n# What I am actually tracking\n",
+            "Active work",
+            "Archive triage"
+        )
+        .is_none());
+        // Prose, not a heading — even when it says the old title.
+        assert!(retitle_heading("\nActive work\n", "Active work", "Archive triage").is_none());
+        // A deeper heading is not the one keeper writes.
+        assert!(retitle_heading("\n## Active work\n", "Active work", "Archive triage").is_none());
+        // A body that opens with prose and carries the heading later.
+        assert!(retitle_heading(
+            "\nNotes.\n\n# Active work\n",
+            "Active work",
+            "Archive triage"
+        )
+        .is_none());
+        // An empty body has no heading to follow and must not grow one.
+        assert!(retitle_heading("", "Active work", "Archive triage").is_none());
+        assert!(retitle_heading("\n\n", "Active work", "Archive triage").is_none());
     }
 }

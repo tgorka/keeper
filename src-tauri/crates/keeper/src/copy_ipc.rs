@@ -260,6 +260,32 @@ pub async fn copy_start(
         ));
     }
 
+    // The hydration capability, supplied because a person pressed a button:
+    // `copy.rs` refuses a path that holds only its LFS pointer unless a caller
+    // hands it a `ContentSource`, and handing the user 130-byte stubs on the
+    // pendrive that was meant to be their second copy is the failure that seam
+    // exists to stop (Story 56.6, AD-128).
+    //
+    // **Optional, and resolved before the job is registered.** A copy of
+    // `~/Pictures` has nothing to do with sync, so a sync database that is
+    // locked or a data directory that cannot be written must not be able to
+    // fail it: without an engine every ordinary file still copies and every
+    // pointer path refuses by name, which is the graceful answer the seam was
+    // designed around. Resolved ahead of `register` because an early return
+    // after it would leave a `Copying` job with no `settled_ms` that the
+    // retention sweep keeps for the life of the process.
+    let content = match crate::sync::engine(Arc::clone(&state.platform)) {
+        Ok(engine) => Some(engine),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "no sync engine for this copy, so any path holding only its LFS pointer will be \
+                 refused by name rather than hydrated"
+            );
+            None
+        }
+    };
+
     let registry = Arc::clone(&state.copies);
     let (id, cancel) = registry.register(source.clone(), destination.clone());
     let options = CopyOptions {
@@ -274,8 +300,16 @@ pub async fn copy_start(
             sink_registry.advance(&sink_id, progress);
             true
         });
-        let outcome =
-            keeper_sync::copy::copy_verified(&source, &destination, &options, Some(&sink), &cancel);
+        let outcome = keeper_sync::copy::copy_verified(
+            &source,
+            &destination,
+            &options,
+            Some(&sink),
+            &cancel,
+            content
+                .as_deref()
+                .map(|engine| engine as &dyn keeper_sync::copy::ContentSource),
+        );
         match outcome {
             Ok(report) => {
                 let state = if cancel.load(Ordering::Relaxed) {

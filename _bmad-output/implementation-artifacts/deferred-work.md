@@ -281,6 +281,122 @@ origin: migrated from legacy ledger (spec-4-3-pins.md), 2026-07-06
 location: src/components/.../pins-strip.tsx
 reason: `pins-strip.tsx` avatars are `draggable` buttons reordered via `onDragStart`/`onDragOver`/`onDrop`; there is no arrow-key move or move-up/down menu affordance, so keyboard/assistive-tech users cannot reorder (Pin/Unpin themselves remain keyboard-operable via the context menu). The epic's accessibility floor mentions keyboard operability but the spec specified only drag reorder. Deferred as an a11y enhancement (e.g. a keyboard reorder affordance or the Epic 9 single-key verbs) rather than expanding this story's scope.
 status: open
+note: 2026-08-17 (story 52.7) — the entry stays OPEN, and the reason it stays open is
+  now narrower and the premise it rested on was wrong. It said reordering is "native
+  HTML5 pointer drag only"; on macOS it was neither. `pins-strip.tsx` never wrote
+  anything to the drag data store, and WebKit — the engine keeper ships — fires no
+  `drop` for a drag that set no data, so the pointer path this entry treated as the
+  working one had also been dead in the real app since story 4.3, under the four green
+  desktop-drag tests that could not see a store jsdom does not implement. 52.7 fixed the
+  pointer path on both surfaces that had the hole: `pins-strip.tsx` `onDragStart`
+  now names the pin (`text/plain`, `account:room`) and declares
+  `effectAllowed = "move"`, `onDragOver` answers `dropEffect = "move"`, and `onDrop`
+  calls `preventDefault` now that the drag carries text WebKit would otherwise act
+  on itself; `notes/task-board.tsx` got the identical three lines. Both are asserted
+  against a fake `DataTransfer` (`pins-strip.test.tsx`,
+  `notes/task-board.test.tsx`, `sessions/session-board.test.tsx`), each mutation-
+  proven to fail with the fix removed. What this entry actually asks for — a
+  non-gesture reorder for pins — is still absent on desktop: story 13.6 added
+  "Move up" / "Move down" to the pin context menu on the PHONE tier only
+  (`pins-strip.tsx`, `phone &&`), so a desktop keyboard user still cannot reorder.
+  The obvious close is to stop gating those two menu items on `phone` — the strip's
+  context menu is already keyboard-reachable and the items are already written,
+  guarded and tested — but that is a UX decision about the desktop menu's contents
+  and belongs to whoever owns the strip, not to a story about a drag defect.
+  52.7 does NOT extend this entry to the task board: the board ships a per-card
+  column menu as its keyboard path, which 52.7 demoted to hover/`focus-within`
+  visibility with `opacity-0` (not `hidden`), so it stays in the DOM, in the tab
+  order and in the accessibility tree — asserted at both the widget and the session
+  mount point.
+note: 2026-08-17 (story 53.1) — the entry stays OPEN, and what it asks for is now the
+  ONLY thing still missing: a non-gesture reorder for pins on the desktop. 52.7's note
+  above is superseded in one respect — the `dataTransfer` lines it added were correct
+  and still did not work, because the defect was below the page. Tauri installs a wry
+  drag-drop handler whose closure always returns `true`
+  (`tauri-runtime-wry-2.11.4/src/lib.rs:4862-4896`); wry implements
+  `NSDraggingDestination` on the macOS WKWebView subclass itself
+  (`wry-0.55.1/src/wkwebview/class/wry_web_view.rs:77-112`) and forwards
+  `performDragOperation:` to `super` only when that closure answers `false`
+  (`wry-0.55.1/src/wkwebview/drag_drop.rs:88-95`). So the drop is claimed in Rust
+  before WebKit performs it and the page's `drop` cannot fire at all — for ANY HTML5
+  drag in this app, on any surface, whatever it writes to the store. `dragDropEnabled`
+  is per-window and config-time; turning it off would take Story 3.7's
+  drop-an-OS-file-to-attach with it (`layout/conversation-pane.tsx:814-848`, the app's
+  only `onDragDropEvent` consumer), so it was not touched.
+  53.1 therefore replaced the gesture rather than the data it carried. HTML5 drag is
+  GONE from both surfaces — no `draggable`, `onDragStart`, `onDragOver`, `onDrop` or
+  `dataTransfer` remains in `layout/pins-strip.tsx` or `notes/task-board.tsx`, and each
+  suite asserts the rendered DOM carries no `[draggable]` at all, because two
+  mechanisms for one verb is how the dead one survived two epics. Both now press,
+  move and release through one state machine, `hooks/use-pointer-drag.ts`
+  (`pointerdown` → slop → `setPointerCapture` → `pointermove` → `pointerup`), which
+  starts no OS drag session and so cannot be claimed by the native layer.
+  What is now TRUE on which surface:
+  - pins strip, desktop: reorder works by pointer for the first time since story 4.3.
+    A press needs no hold, becomes a drag past 10 px, previews the reordered strip
+    while carried (there is no HTML5 ghost left to lean on, so the preview IS the cue)
+    and persists the full order on release. A press that does not travel is still the
+    click that selects the room; the click after a drag is swallowed.
+  - pins strip, phone: unchanged in behaviour. The long-press lift (story 13.6) was
+    always pointer-only and always worked; it now enters the same hook, so the
+    stale-index guards and the release arithmetic exist once instead of twice. A
+    stationary lift still opens the pin's menu.
+  - pins strip, keyboard: STILL NOTHING on the desktop, which is this entry's actual
+    subject. "Move up" / "Move down" remain gated on `phone &&`. The close is still to
+    ungate them — a UX decision about the desktop menu's contents, and 53.1 had no
+    more licence to make it than 52.7 did.
+  - task board (`notes/task-board.tsx`, both the session and the widget mount): the
+    gesture works AND the dead drop zone is fixed. The whole column box is the target
+    now — its padding, its header and the empty space below the last card — where the
+    `<ul>` used to take the drop, not fill the box, and the box drew the highlight; the
+    cue is drawn on the element that accepts the release. This entry is still NOT
+    extended to the board: its per-card column menu remains the keyboard path,
+    hover/`focus-within` revealed with `opacity-0` (not `hidden`), untouched by 53.1.
+  Every claim above is mutation-proven: removing the slop, the click suppression, the
+  vacated-slot arithmetic, the card-midpoint tally, the column bounds, the cue's
+  source, the pins stale-index guard, or re-cutting the target at the old `<ul>`'s
+  edges each fails a named test in `notes/task-board.test.tsx`,
+  `sessions/session-board.test.tsx` or `layout/pins-strip.test.tsx`.
+note: 2026-08-17 (story 53.1, review) — one correction to the note above and one
+  limit it did not state.
+  THE CORRECTION. "Both now press, move and release through one state machine" was
+  true and the machine had a defect that made the pins strip's desktop reorder dead
+  again, for the third time: the move that crosses the slop takes the pointer
+  capture, and it is the SAME move that paints the reorder preview. A preview that
+  reorders a keyed list makes React move the pressed node, `insertBefore` removes
+  that node from its parent before putting it back, and the removing steps are what
+  Pointer Events hooks for the *implicit release* of pointer capture. So the strip
+  released its own capture on the drag's first step, the following moves and the
+  release were discarded by the `pressRef === null` guard, and the strip snapped
+  back. No test could see it: `src/test/setup.ts` stubs `setPointerCapture` /
+  `releasePointerCapture` / `hasPointerCapture` as no-ops and nothing in the repo
+  dispatched `lostpointercapture`, so the headline reorder test passed over a dead
+  drag. `hooks/use-pointer-drag.ts` now listens for the release natively on the
+  captured element — React delegates at the root container, so an element removed
+  for good never reaches a delegated `onLostPointerCapture` at all — and tells the
+  two causes apart by `isConnected`: MOVED takes the capture back (the node is still
+  mounted and its handlers are intact), UNMOUNTED ends the gesture and clears the
+  swallowed-click flag with it. Both surfaces are covered by the one fix; the board
+  was safe only by accident, since an external `order:` edit from Obsidian, an agent
+  or the watcher moves a pressed card mid-drag exactly as a preview does.
+  THE LIMIT, which the story's title and the note above did not qualify. On the task
+  board a finger lifts a card only where the gesture does not race a scroll
+  container. `notes/task-board.tsx` deliberately leaves `touch-action` alone (claiming
+  it would stop a phone scrolling the board by starting on a card, which is
+  the commoner gesture), so where an ancestor can pan in the direction the finger
+  travels, the browser claims the gesture at about the 6 px slop and the board gets
+  `pointercancel`, which returns the card. At phone width the four columns stack
+  (`grid-cols-1`), so EVERY cross-column move travels along the page's own pan axis
+  and the touch lift does not survive there. Above the phone tier the columns sit
+  side by side, cross-column travel is horizontal, nothing pans that way, and a
+  finger does move a card. The non-gesture path on that tier is the per-card column
+  menu, which is in the DOM, in the tab order and in the accessibility tree at all
+  times. The pins strip has no such limit: its phone entry is a long-press lift and
+  its avatars are `touch-none`. The cure for the board is the same route — gate the
+  touch press behind `hooks/use-long-press` and pass `captureNow`, which
+  `use-pointer-drag` already supports — and it is a UX decision about what a press on
+  a card should mean on a phone (a hold, with the scroll it costs), not a defect fix,
+  so 53.1's review did not make it.
 
 ### DW-38: A favourited chat has no unread/mention affordance anywhere in the inbox view — the Favorites section renders compact rows as avatar + name only, and favourited rooms are removed from the Inbox window, so an unread favourited conversation shows no bold-name/dot/mention badge on any surface.
 
@@ -2204,6 +2320,374 @@ reason: F4 was that `SyncPhase::is_transferring` claimed `Pushing` carries a rat
   someone chose is fine; an exception nobody recorded becomes the precedent for the next one.
 status: open
 
+### DW-162: `tracing::debug!` cannot print in the shipped desktop app, so 127 diagnostic call sites across all three crates are dead code — and the Settings "debug mode" toggle does not turn them on.
+
+origin: found while diagnosing the third field report on story 44.3 (default spaces seeded nothing and logged nothing), 2026-08-09
+location: src-tauri/crates/keeper/src/debug_log.rs:122-129 (`init`, the only place the process-wide subscriber is built) + the 127 `tracing::debug!` call sites outside test modules, principally keeper-core/src/account.rs (24), keeper-sync/src/engine.rs (19), keeper/src/ipc.rs (18)
+reason: `init` installs
+  `EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))`, and nothing sets
+  `RUST_LOG` for the macOS desktop app — the only occurrences in the tree are `info` in
+  `gen/apple/project.yml` and the iOS Xcode scheme, plus `keeper-syncd`, which resolves its own
+  filter from `--verbose` and its config. A GUI process launched from Finder inherits no shell
+  environment. So the effective floor is `info` on every machine a user runs, and `tracing::debug!`
+  reaches neither stderr nor `keeper.log`, whatever the user does.
+  The count is 127 across `keeper` (42), `keeper-core` (55) and `keeper-sync` (30), and the content
+  is what makes this worth an entry rather than a shrug: they are overwhelmingly the line that
+  explains a refusal or a fallback — `keeper-note: refused a path outside the vault`,
+  `recordings sync: the push policy says not now, so the commits stay local until it does`,
+  `recording note: this stub is no longer what keeper composed, so it is kept`,
+  `notes: cadence push deferred`, `no synced folders to default to; recording into the plain
+  folder`. Every one answers "why did keeper not do the thing I expected", and every one is
+  invisible at exactly the moment somebody asks. `GatedMakeWriter` already makes the right call for
+  the file leg — `WARN`/`ERROR` are always recorded, `INFO` joins them while debug mode is on — but
+  `DEBUG` is filtered out one layer above it, by the subscriber, before the writer is consulted. The
+  consequence a user meets is that the Settings toggle called "debug mode" does not enable debug
+  logging.
+  Cost of the absence, measured rather than asserted: story 44.3 took three field reports and three
+  rounds to diagnose. Round 1 was a silent code path; round 2 replaced it with a `tracing::debug!`
+  that could not print, which looked like a fix and reproduced the same defect one layer out; round
+  3 found this. Any future silent-behaviour bug in any subsystem starts from the same place.
+  Not fixed in 44.3 because the fix is a judgement about the whole app and there are at least three
+  defensible shapes: (1) `EnvFilter::new("debug")` when `debug.mode` is on — cheapest, matches what
+  the toggle's name promises, needs a volume review because 127 sites include hot paths in
+  `engine.rs` and `account.rs` and the file leg is unrotated; (2) promote the diagnostic sites to
+  `INFO` and leave the floor — precise, no volume surprise, but 127 individual judgements that will
+  drift straight back; (3) per-target filtering (`info,keeper_lib::notes_vault=debug`) driven by a
+  setting — most control, most machinery. Story 44.3 did (2) for its own module only, with a test
+  that pins the floor to the literal `Level::INFO` and names `EnvFilter::new("info")` as its source
+  (`keeper-core::notes::default_spaces::no_seed_outcome_reports_below_the_level_the_app_can_print`),
+  which is the smallest honest thing one story can do and is not a fix for the other 126.
+  Whoever takes this: the test above is the pattern worth copying, and the reason it works is worth
+  copying too. Its first version compared each outcome's level against the `REPORT_FLOOR` constant
+  alone, and a mutation that *lowered the constant* passed it — a self-consistent floor accommodates
+  whatever level someone reaches for. Pinning the literal is what closed it.
+status: open
+
+### DW-163: A space's `keeper.limit` is read, shipped to the frontend and written back on save, and nothing has ever applied it — the list window is sized entirely by the request.
+
+origin: found while implementing story 44.4, which applied `keeper.sort` and left its neighbour where it was, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_ipc.rs (`SpaceDef.limit`, `project_list`)
+reason: `space_def` parses `limit` and clamps it, `notes_spaces` puts it on `NoteSpaceVm`, and
+  `notes_space_save` writes it back — but `project_list` sizes its window from `req.limit`
+  (`DEFAULT_LIMIT` when zero) and never looks at the space's. So a space that says `limit: 42`
+  yields whatever the caller asked for, and the value is a round-tripped decoration.
+  This is the identical defect story 44.4 fixed for `sort`, one key over, and it was left alone on
+  purpose: 44.4's scope is the icon, the order and the sort, and applying `limit` is a change to how
+  many rows every space returns — which interacts with 44.10's virtualisation and 44.11's counts
+  (a space capped at 42 makes "how many notes does this select" ambiguous in a way the counts story
+  has to answer, not this one). Whoever takes it must decide that first: whether `limit` caps what
+  the space *selects* or only what it *renders*, because 44.11's count means different things under
+  each reading.
+status: done 2026-08-09, story 44.11 (see spec-44-11-counts.md)
+resolution: `keeper.limit` caps SELECTION. A rendering cap is incoherent after 44.10 — the viewport
+  already bounds rendering for every list, so a second render cap would bound only what can be
+  scrolled to, and the transport window already has an owner in `NoteQueryReq.limit`. A selection
+  cap is a thing a person can mean and cannot otherwise say ("this space holds the twenty most
+  recent"), and it composes with 44.4's sort: the cap is applied AFTER the ordering, so the space
+  keeps the twenty the sort put first. The count shows the CAPPED number, because that is what a
+  person can reach — and never silently: `NoteListVm.matched` travels beside `total` so the surface
+  reads `20 of 347 notes`, and `counts::Selection::report` words the decline at INFO (DW-162's
+  floor, pinned to the literal level). The rule lives in `keeper-core::notes::counts` so it is
+  provable on Linux; the shell only wires it.
+  Two repairs fell out. (1) Unset stopped meaning `MAX_LIMIT`: the old reader mapped an absent,
+  zero or negative `limit` onto 500, so "sets no cap" and "caps at 500" were the same value — and
+  because the editor round-trips a `limit` it does not render and `notes_space_save` wrote it
+  unconditionally, every space saved once grew a `limit: 500` it never had. Zero is now no cap and
+  no cap writes no key, the rule `icon` and `order` already followed. (2) The space's cap is no
+  longer clamped to the page size, so `limit: 2000` means 2 000 rather than silently dropping 1 500.
+
+### DW-164: The `recorded` sort reads a session's instant out of the stub's `date` and `start` keys, so a recording note whose stamps a person edited by hand sorts by what they typed rather than by the session.
+
+origin: found while implementing story 44.4, 2026-08-09
+location: src-tauri/crates/keeper-core/src/notes/sort.rs (`recorded_ms`)
+reason: `recording_note::compose` writes the session's local calendar day into `date` and its clock
+  into `start`, and there is no single stored instant to read — so `recorded_ms` composes those two.
+  That is the honest reading of what is on disk, and it is also the user's own text: a note is the
+  user's, and FR-121 says keeper does not overwrite what they wrote. The consequence is that
+  `recorded` is only as true as those two keys, and a note whose `date` was retyped sorts by the
+  retyped day even though `manifest.json` still knows the real one.
+  Not fixed here because the fix is a schema decision rather than a sort decision: it would mean the
+  stub writing a machine key (`keeper.recorded`, an RFC 3339 instant beside `session:`) that keeper
+  owns and a person is not invited to edit, which changes what `compose` emits for every recording
+  note and wants its own story beside 44.2. The sort would then prefer that key and fall back to
+  `date`/`start` for every note written before it.
+status: open
+
+### DW-165: A note containing a ```mermaid fence CRASHES the editor — `live-preview` supplies a block decoration from a `ViewPlugin`, which CodeMirror refuses, so the `EditorView` throws on construction.
+
+origin: found while wiring story 44.16's `![[….csv]]` table widget into the same decoration set,
+  2026-08-09
+location: src/components/notes/editor/live-preview.ts (`buildDecorations` mermaid branch, and the
+  `ViewPlugin.fromClass` at the bottom of the file that provides the whole set)
+severity: **crash, not a quiet no-op.** The three sibling defects this epic found — a scrub bar
+  whose `max` was `"0"`, a `/` menu that had never opened, a seed whose log line the app cannot
+  print — all shipped green while doing nothing. This one does something: a note with a mermaid
+  diagram in it cannot be opened at all. Rank it above the other three.
+reason: `livePreview` provides its decorations from a `ViewPlugin`
+  (`ViewPlugin.fromClass(…, { decorations: (value) => value.decorations })`). CodeMirror does not
+  allow a plugin to contribute a block decoration, and the mermaid branch pushes exactly one:
+  `Decoration.replace({ widget: new MermaidWidget(source), block: true })`. So the first time the
+  decoration set contains a rendered fence, CodeMirror throws and the view does not build.
+
+  **Reproduction, verbatim, run 2026-08-09 under `bun run vitest`.** Build an `EditorView`
+  with a parent in `document.body` and these two extensions, in this order:
+
+  ```ts
+  extensions: [
+    markdown({ base: markdownLanguage }),                    // @codemirror/lang-markdown
+    livePreview({ vaultId: "v", assetUrl: (r) => r, onOpenLink: () => {}, recordingSession: () => null }),
+  ]
+  ```
+
+  over exactly this document:
+
+  ```
+  intro\n\n```mermaid\ngraph TD;\nA-->B;\n```\n\nafter\n
+  ```
+
+  The `new EditorView({...})` call throws:
+
+  ```
+  RangeError: Block decorations may not be specified via plugins
+      at Object.point (@codemirror/view/dist/index.js:2747)
+      at RangeSet.spans (@codemirror/state/dist/index.js:3374)
+      at new DocView (@codemirror/view/dist/index.js:2922)
+      at new EditorView (@codemirror/view/dist/index.js:7915)
+  ```
+
+  Dropping `block: true` does **not** fix it: a fence spans several lines, and an inline replace
+  over a range containing a line break trades the error for
+  `RangeError: Decorations that replace line breaks may not be specified via plugins`. So the fence
+  genuinely needs a block decoration and the plugin genuinely cannot give it one.
+
+  **The fix shape.** Move the decoration source off the plugin and onto a `StateField`, which is
+  allowed block decorations:
+  `StateField.define<DecorationSet>({ create, update, provide: (f) => EditorView.decorations.from(f) })`.
+  Not a one-liner, and that is why it is here rather than in 44.16: `buildDecorations` takes an
+  `EditorView` and reads `view.visibleRanges`, which a `StateField` does not have — a field sees
+  only `EditorState`, so the viewport windowing has to be re-expressed (or the field has to hold the
+  whole document's decorations and the viewport optimisation dropped). The plugin also carries the
+  wikilink `mousedown` handler, which stays a plugin concern and has to be split out. Three agents
+  were editing this file when it was found, mid-wave; a decoration-source migration there is how a
+  green tree stops being green.
+
+  **Why the suite is green, and this is the transferable part.** `mermaid-widget.test.ts` drives
+  `renderMermaidInto` and constructs `MermaidWidget` directly — thorough about the widget, and it
+  never asks the renderer to place one. The one test in the suite that does build a real
+  `EditorView` around `livePreview` (`recording-embed.test.ts`, "livePreview, over a recording
+  note") loads `livePreview` **without** `@codemirror/lang-markdown`, so `syntaxTree` yields no
+  `FencedCode` node, the mermaid branch is never entered, and the decoration is never constructed.
+  A suite can be exhaustive about a widget and still never once assemble the thing the user
+  assembles. Shipped this way since story 37.8.
+
+  **The test it needs is the reproduction above**, and nothing in the suite currently does it: build
+  an `EditorView` with the markdown language AND `livePreview` over a document containing a fence.
+status: open
+
+### DW-166: `is:journal` is spelled twice — the index derives the flag from a literal `"journal/"` prefix and story 44.6's creation seed inverts it from its own constant.
+
+origin: found while implementing story 44.6, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_vault.rs (`parse_note`, the three
+  `rel.starts_with(…)` flag branches) and src-tauri/crates/keeper-core/src/notes/seed.rs
+  (`JOURNAL_DIR`)
+reason: `parse_note` decides `is:journal`, `is:space` and — until story 44.7 moved it — `is:template`
+  from a path prefix written as a bare literal. Story 44.6 needs the INVERSE of that rule: given
+  `is:journal`, which folder must a new note be created in for the flag to be true. So the seed
+  carries `JOURNAL_DIR`, with a doc comment naming the function it inverts, and `"journal"` is now
+  in the source twice. The two cannot drift silently in a way a test catches: the seed's own round
+  trip asserts against a hand-built entry, not against `parse_note`, because the `keeper` crate does
+  not build on Linux (AD-56).
+  Not fixed here because the obvious fix — hoist the constants into `keeper-core` beside
+  `default_spaces::SPACES_DIR` and have `parse_note` call one `index::path_flags(rel)` — lands three
+  lines away from story 44.7's in-flight change to the `is:template` predicate, which moves that one
+  flag off the folder and onto the note's own tag (AD-82). Doing both at once in one wave would have
+  been two agents rewriting the same nine lines. It is one constant, one `starts_with` and one
+  import once wave 3 has settled.
+status: open
+
+### DW-167: A space filtered `is:template` creates a note that says it will not appear, because story 44.6's seed deliberately declines a predicate story 44.7 was moving at the same time.
+
+origin: found while implementing story 44.6, 2026-08-09
+location: src-tauri/crates/keeper-core/src/notes/seed.rs (`seed_flag`)
+reason: The creation seed makes a new note satisfy `is:pinned`, `is:archived`, `is:capture` and
+  `is:journal`, and declines every other `is:` flag with a stated reason. `is:template` is the one
+  entry in that table whose reason is temporal rather than principled: while 44.6 was being written,
+  44.7 was moving the predicate from the `templates/` folder prefix onto the note's own `template`
+  tag. Seeding a folder would have been seeding against a rule that no longer exists, and seeding
+  the tag would have been seeding against a rule that did not exist yet.
+  The consequence today: New Note in a space filtered `is:template` writes a plain note at the vault
+  root and reports "A new note can't satisfy is:template, so this note is in the vault but won't
+  appear in <space>." That is honest and it is not right — creation CAN satisfy it now, by adding
+  the `template` tag, which is exactly what `seed_term`'s `tag:` arm already does for every other
+  tag.
+  The fix is one arm in `seed_flag`: `template` sets the `template` tag. `seed::verdict` needs no
+  change at all — it re-runs the real query over the real bytes, so it will simply stop declining.
+  A test exists to flip: `a_space_of_spaces_does_not_manufacture_a_broken_space` is its sibling and
+  shows the shape.
+resolution: **Closed 2026-08-09, in story 44.6, before its spec shipped.** The deferral was
+  temporal, and the reason expired inside the same wave: 44.7 landed while 44.6 was in its
+  verification pass, and `notes_vault::parse_note` now reads the predicate through
+  `templates::is_template` off the note's frontmatter tags (with `templates/` grandfathered). So
+  `seed_flag` gained the arm it was always going to get — `is:template` seeds the tag
+  `templates::TEMPLATE_TAG`, never a folder — and a space filtered `is:template` now makes a new
+  template, which is the only thing that ask can mean.
+  `seed::verdict` needed no change whatsoever, which is worth recording because it is the design
+  paying out: the verdict re-runs the real query over the real bytes through the reconciler's own
+  parser, so adding a seed arm made it stop declining without anybody teaching it a new rule. A
+  per-flag "can we satisfy this?" table would have needed editing in two places and could have
+  disagreed with itself.
+  Two tests (`a_template_space_creates_a_template`,
+  `a_template_space_that_also_names_the_tag_adds_it_once`) and two mutants: M9 removes the arm and
+  kills the first; M10 removes `add_tag`'s de-duplication and kills the second, because two
+  producers now reach the seed's tag list and a duplicate there is a duplicate in the note's
+  frontmatter.
+status: closed
+
+### DW-168: `IndexEntry.fields` flattens a nested frontmatter map into one string, so the space DSL's `field:` predicate cannot address `keeper.from_template` — or any other sub-key.
+
+origin: found while implementing story 44.8, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_vault.rs:1379-1384 (`parse_note`'s field loop),
+  src-tauri/crates/keeper-core/src/notes/frontmatter.rs (`FieldValue::index_string`),
+  src-tauri/crates/keeper-core/src/notes/index.rs (`RESERVED_FIELD_PREFIX`)
+reason: The reconciler stores every frontmatter key through `FieldValue::index_string()`, and a
+  one-level map renders as its pairs joined by `FIELD_LIST_SEPARATOR`. So story 44.7's
+  `keeper: { from_template, from_template_id }` lands in the index as ONE entry —
+  `fields["keeper"] = "from_template: templates/journal.md\nfrom_template_id: 01J…"` — and there is
+  no `fields["keeper.from_template"]` for `field:` to match. Two consequences. First, nobody can
+  write a space for "every note made from the journal template", which is the obvious next thing to
+  want and is one index change away. Second, `RESERVED_FIELD_PREFIX`'s own doc — "a user's top-level
+  `keeper:` map indexes under the bare key `keeper`, so this prefix can never shadow something they
+  wrote" — was written when the reserved namespace held only keeper-computed values
+  (`keeper.origin`, `keeper.device`, `keeper.touched`); now that keeper WRITES a `keeper:` map into
+  the note file, the reserved namespace and the user's own possible `keeper:` key are
+  indistinguishable at the index layer.
+  Story 44.8 works around it rather than changing the reconciler: `template_update::provenance_from_index`
+  inverts that one flattening for its own two keys, with a round-trip test against the real renderer.
+  That keeps the finder at zero file reads on a ten-thousand-note vault and touches nothing else.
+  The general fix — index a one-level map as `parent.child` entries alongside (or instead of) the
+  bare key — changes what `field:` means for every existing query in every vault, so it is a story
+  with a migration question in it, not a rider on 44.8.
+status: open
+
+### DW-169: `notes_restore_revision` now exists and works for any note, and only two surfaces can reach it.
+
+origin: found while implementing story 44.8, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_ipc.rs (`notes_restore_revision`),
+  src/components/notes/note-history-panel.tsx, src/components/notes/template-update-offer.tsx
+reason: Story 44.8 needed "accepting is undoable through the existing note history" to be true, and
+  found that the existing note history could show a revision and could not act on one — there was no
+  restore command anywhere in the app. It added one: `git show <rev>:<path>` into the ordinary write
+  path, so a restore is itself a revision and undoing an undo is free.
+  It is reachable from exactly two places: the history panel's `Restore this version`, and a template
+  update's per-note `Undo`. Three other surfaces are asking for it and predate it. The conflict
+  resolver can take theirs or take mine and cannot take "the one from before this morning". The
+  editor's "This note isn't on disk any more" banner tells the user their text is still in the buffer
+  and says nothing about the revision that still holds the file. `.keeper/trash/` holds every deleted
+  note (NFR-30) with no way to bring one back except a Finder window. None of these is a bug in 44.8;
+  they are three places where a verb that now exists has not been offered, and the reason to record
+  it is that "keeper never loses your bytes" is only as true as the number of doors back.
+status: open
+
+### DW-170: Story 44.6's shell wiring has never been through a compiler, on any machine — and neither a green test suite nor a green mutation sweep can tell you that.
+
+origin: found while re-verifying story 44.6 after the wave-3 `/tmp` harness incident, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_ipc.rs (`create_for_space`, `SpaceForCreate`,
+  `space_source`, and the seed application inside `create_note`) and
+  src-tauri/crates/keeper/src/notes_vault.rs (`index_written`)
+severity: **unknown, which is the point.** These are type questions, and no test in this repo can
+  reach them for this crate. A single wrong tuple order in `Frontmatter::parse`'s destructuring, or
+  a `FileStat` field that does not exist, is a build break on the owner's machine and invisible
+  here.
+reason: `cargo check -p keeper --lib` dies on this host inside `glib-sys`'s build script — there is
+  no `pkg-config` — before it reaches a single line of keeper's own source. So the five symbols
+  above have never been type-checked anywhere. This is not new to 44.6 (AD-56 says the shell is
+  untestable on Linux and every wave-3 story says so in its spec), but 44.6 is the sharpest
+  instance: it is the only wave-3 story whose new shell code is on the **write path**, so a
+  compile-time mistake there is a create that fails rather than a surface that renders oddly.
+  The general lesson, which W3Csv reached independently from a `tsc` error that survived a green
+  vitest suite AND a green 15/15 mutation sweep for hours: **a green test suite plus a green
+  mutation sweep is not a green build.** vitest transpiles without typechecking; `cargo test`
+  compiles only the crates it runs; and mutation testing cannot help with either, because a mutant
+  only probes behaviour the tests already assert. Both systems answer "does the code do the right
+  thing". Neither answers "does the code compile". On wave 3 the compile question was the one
+  nobody owned.
+  Mitigated as far as it can be from here: everything decidable was pushed into `keeper-core`
+  (`notes::seed` 27 tests, `notes::query` 45), and what is left in the shell is one read, one call
+  and one `push` per branch. But small is not compiled.
+evidence, and it is not theoretical: **hand-auditing the symbol list above found a real compile
+  error in code that had already passed every test in the story.** A refusal was built with
+  `IpcErrorCode::InvalidInput`, a variant that does not exist — notes refusals use `NotesInvalid`.
+  A compiler says that in milliseconds. 444 green Rust tests and 443 green frontend tests said
+  nothing, because none of them can reach this crate. Fixed at the site, with a comment naming this
+  entry so the next reader knows why a typo like that survived to be found by eye. The remaining
+  symbols were then checked against their definitions rather than against memory and are clean.
+  The same audit found a data-loss path this story made reachable, now closed in-story: `atomic_write`
+  overwrites unconditionally, and `siblings` reports an UNREADABLE directory as an EMPTY one, so a
+  folder keeper cannot list yields a filename keeper believes is free. Unreachable before 44.6
+  because `NoteCreateReq.dest` was a field every caller passed `None` for — the fifth dead value
+  this epic has found — and the space seed is the first thing to set it. `create_note` now refuses
+  when the path it is about to write already exists.
+what closes this: `cargo check --manifest-path src-tauri/Cargo.toml -p keeper` on the macOS host,
+  plus the six-step smoke test in section 11 of spec-44-6-new-note.md — create from the rail, from
+  Pinned (assert `pinned: true` on disk), from Journal (assert the `journal/` path), from
+  Recordings (assert BOTH the on-screen notice and the `INFO` line in Console.app, because DW-162
+  is the story of a decision that only existed in a `debug!` the packaged app cannot print), twice
+  from Inbox (the second create clears the first's notice), and the overwrite backstop —
+  `chmod 000` a seeded subfolder, create into that space, and confirm keeper refuses AND that the
+  file already there is byte-identical afterwards. That last one is the only item about data rather
+  than display, and byte equality is the check: a note replaced with a blank one looks exactly like
+  a note that was created.
+status: open
+
+### DW-171: Story 44.16's shell wiring has never been through a compiler either — and unlike 44.6's it writes over a file the user already has.
+
+origin: filed alongside DW-170, applying the same standard to 44.16 after W3NewNote argued a
+  one-line AD-56 caveat is too quiet for write-path code, 2026-08-09
+location: src-tauri/crates/keeper/src/notes_ipc.rs (`csv_path`, `read_csv`, `notes_csv_read`,
+  `notes_csv_set_cell`) and the two lines added to `keeper::lib`'s `invoke_handler`
+severity: **unknown, and the blast radius is larger than DW-170's.** 44.6's uncompiled code
+  *creates* a note: a mistake there is a create that fails, and nothing the user had is lost.
+  44.16's uncompiled code *overwrites an existing file in a synced vault*. A mistake there is
+  somebody's export rewritten and committed, on every machine the vault reaches. Nothing was
+  observed wrong; nothing could have been, which is the entry.
+reason: `cargo check -p keeper` dies on this host inside `glib-sys`'s build script for want of
+  `pkg-config`, before reaching a line of keeper's own source (measured, not assumed). So these
+  four functions have never been type-checked anywhere.
+
+  The specific questions a compiler would settle, none of which a test in this repo can reach:
+
+  | Symbol | The type question |
+  | --- | --- |
+  | `csv_path` | `note_protocol::contained_read` returns `Option<PathBuf>`; the `.filter(\|candidate\| candidate.is_file())` closure takes `&PathBuf`, and the `for rel in candidates` loop moves each `String` before `Ok((rel, path))` returns it. |
+  | `read_csv` | `&PathBuf` coercing to the `&Path` parameter; `std::fs::metadata(path)?.len()` as `u64` against `csv::MAX_CSV_BYTES`. |
+  | `notes_csv_set_cell` | `csv::set_cell` takes `usize`, the command receives `u32`; `rel: String` is borrowed by `write_vault_file` and then **moved** into `csv::project` — an ordering a compiler checks and a reader can talk themselves into. |
+  | both commands | `CsvError` mapped to `IpcError` by hand rather than through `notes_error`, so `NotesError` gained no variant — nothing enforces that the mapping stays exhaustive if `CsvError` grows one. |
+  | the tracing calls | `tracing::info!(%rel, row, column, "…: {error}")` relies on implicit captured identifiers in the message; `rel` is a `String` behind `%`. |
+
+  Mitigated as far as it can be from here, on AD-55/AD-56's own argument: every decision, every
+  byte of the parser and every user-facing sentence is in `keeper-core` and is proved there
+  (`notes::csv` 21 tests, 16 mutants, 16 caught). What is left in the shell is resolution, IO and
+  error mapping — one read, one compare, one write. But small is not compiled, and the general
+  lesson DW-170 records applies unchanged: a green test suite plus a green mutation sweep is not a
+  green build, because neither answers whether the code compiles.
+what closes this: `cargo check --manifest-path src-tauri/Cargo.toml -p keeper` on the macOS host,
+  plus a smoke test that must include the cases the type system cannot reach:
+  1. Embed `![[data.csv]]` for a file dropped into `attachments/` — the bare-name candidate is the
+     branch a vault-relative path never exercises.
+  2. Edit one cell, then **compare the file on disk byte for byte against a copy taken before the
+     edit**. Only that cell's bytes may differ. A visual check of the table cannot see a rewritten
+     line ending or a dropped BOM, which is the entire promise of this story.
+  3. Open the table, enter a cell, change nothing, blur. The file's mtime must not move, and
+     Console.app must carry the `INFO` line "csv cell unchanged, nothing written". **Both halves.**
+     DW-162 is the story of a decision that existed only in a log the packaged app cannot print;
+     checking the screen and not the log would repeat it exactly, and this is a path whose whole
+     observable behaviour is that nothing happens.
+  4. Edit a cell in a file with a BOM and CRLF terminators, then confirm the sync engine commits it
+     — `mark_dirty` reaching the commit cadence is the one claim in this story that no test on any
+     platform covers.
+  5. Confirm a file over 4 MiB refuses with the sentence naming both sizes rather than hanging.
+status: open
+
 ## DW-N1 — the editor caret opens in front of the frontmatter block
 
 **Status:** done 2026-08-04, by the design correction below. **Found:** 2026-08-03,
@@ -2457,3 +2941,728 @@ own fixture reached the interrupted states it claims to cover. Everywhere else t
 tested well and the impure shell is tested by a manual procedure the specs record as unrun — which is
 why DW-135, DW-139, DW-146, DW-151, DW-156 and DW-157 are all the same entry wearing different
 clothes: a load-bearing token that a green suite cannot see.
+### DW-172: Two more notes event listeners are declared and subscribed by nothing — `listenNotesShowUnread` and `listenNotesCaptureShown`.
+
+origin: found while fixing the third of the trio in story 44.6, 2026-08-09
+location: src/lib/ipc/client.ts (`listenNotesShowUnread`, `listenNotesCaptureShown`), against
+  `keeper/src/notes_ipc.rs`'s `NOTES_SHOW_UNREAD_EVENT` and `NOTES_CAPTURE_SHOWN_EVENT`
+reason: Story 44.6 found that `listenNotesOpenNote` was exported from the IPC client and called
+  from nowhere, so the tray's New Note created a note, raised the window, and showed the user
+  whatever had been on screen. That one is fixed (`useNotesOpenNote`, mounted in `App.tsx`, with the
+  assertion in `App.test.tsx` rather than in the hook's own suite — see below). Its two siblings are
+  still in that state: Rust emits both events and no webview code subscribes to either.
+  The consequence for each, stated rather than assumed: choosing the tray's unread line is supposed
+  to open the notes view with the origin filter armed (FR-113) and currently raises the window and
+  does nothing else; the capture-shown event is supposed to let the main window react when the
+  panel appears and currently informs nobody.
+  Not fixed in 44.6 because neither is the creation path — they belong to Epic 36's tray and Epic
+  37's capture panel, and a story that fixed all three would be three stories wearing one spec.
+  `useNotesOpenNote` is the pattern to copy; it is ~40 lines including the graceful no-Tauri-host
+  branch.
+severity: the quiet kind. **Nothing fails**, which is why this survived two epics. It is the shape
+  W3TemplateUpdate named while 44.8 was landing: a dead value is not always an armed hazard, it is
+  sometimes a promise the app has been making and cannot keep, and that kind is harder to find
+  because there is no error anywhere.
+the testing lesson, which is the reusable part: a hook suite that does `renderHook(() => useThing())`
+  proves the hook works and can NEVER distinguish a mounted listener from an unmounted one. That is
+  exactly how this class of defect hides. The assertion has to live where the component tree is
+  really rendered — for 44.6 that is `App.test.tsx`, and the mutation that deletes the call from
+  `App.tsx` fails it. `use-notify-navigate.test.ts` has the same hook-only shape and is the reason
+  nobody noticed the notes trio; worth the same treatment when someone is next in that file.
+status: open
+
+### DW-190: Comments anchored to parts of a PDF need a PDF renderer keeper does not have.
+
+origin: story 45.21, 2026-08-10 — the speculative half of the story, decided before building
+location: `src/components/viewers/document-viewer.tsx` (`PdfBody`), against
+  `src-tauri/crates/keeper/src/file_protocol.rs`'s `keeper-file://`
+reason: 45.8 renders a PDF as `<embed type="application/pdf">` routed to the platform's own
+  renderer (PDFKit under WKWebView), which is why a 400-page document costs one element and no
+  marshalling. **That choice also puts the document permanently out of JavaScript's reach**, and
+  this was measured rather than assumed. WebKit's own
+  `Source/WebCore/html/HTMLEmbedElement.idl` exposes exactly `align`, `height`, `name`, `src`,
+  `type`, `width` and `getSVGDocument()` — there is **no `contentDocument` and no
+  `contentWindow`**, unlike `<iframe>` and `<object>`, which have both (confirmed independently
+  against a spec-conformant DOM: `"contentDocument" in element` is `false` for `embed` and `true`
+  for the other two). `getSVGDocument()` is same-origin-guarded and answers only for SVG; a PDF is
+  not SVG, and `keeper-file://` is a different origin from the app document anyway.
+  So: no document, therefore no selection (a `Selection` belongs to a document), therefore no
+  coordinates and no page events. An overlay `<div>` can capture a drag, but keeper cannot read the
+  embed's scroll offset or current page, so a rectangle drawn on it is pinned to viewport
+  coordinates of a document whose position keeper cannot observe — it drifts the moment the reader
+  scrolls, and drifts silently.
+  The epic's own fallback, "anchor to a page and a rectangle", is therefore half impossible: the
+  rectangle cannot be drawn meaningfully and the page number could only ever be one the reader
+  TYPES. What would be left — a comment list with a typed page number — was deliberately not built,
+  because a paragraph of prose about a document anchored by a number a person typed **is a note**,
+  keeper already has notes, and a second prose store beside the file would be a second write path
+  for prose with its own sidecar format, its own conflict semantics and an anchor keeper cannot
+  verify. That is what AD-88 and AD-89 exist to refuse.
+what it would take, in order:
+  1. a PDF renderer that runs in JavaScript (pdf.js or equivalent) — a new dependency of
+     substantial size, a re-opened zero-egress review, and a canvas plus a text layer per visible
+     page with a virtualiser to bound it, replacing an `<embed>` that costs one element;
+  2. an anchor format that survives the document being replaced — a page and a rectangle does not,
+     because re-exporting re-paginates; the state of the art is a text-quote anchor
+     (prefix/exact/suffix, à la W3C Web Annotation) with a page+rect fallback, which needs the text
+     layer from (1);
+  3. a store with sync semantics — where comments live, what a conflict does, what a rename does;
+  4. only then the overlay, the gutter and the show/hide toggle.
+severity: none today — nothing is half-built, no control is offered and no comment can be lost.
+  The hazard is a future story adding a comment button to `DocumentViewer` without reading this:
+  it would anchor to a scroll position nothing can observe, and the drift would be silent.
+the reusable part: the export half of 45.21 shipped and this half did not, and the difference was
+  measuring the platform before designing against it. Ten minutes reading WebKit's IDL replaced an
+  epic's worth of speculation about what an overlay could anchor to.
+status: open
+
+### DW-191: A default space keeper stood down because the user already had that name is never recorded, so deleting the user's space brings keeper's version back.
+
+origin: story 45.17, 2026-08-10 — found by W3TagsDelete while proving the delete/restore path,
+  and deliberately not fixed inside that story
+location: `src-tauri/crates/keeper-core/src/notes/seed.rs` (the seeded-key ledger),
+  against 44.3's five default spaces and 45.17's `notes_spaces_restore_defaults`
+reason: `seed` writes a ledger entry for each default space it CREATES, and 45.17's delete path
+  reads that ledger to decide whether a deleted default stays deleted. A default that was never
+  created — because the vault already contained a space with that name — leaves no entry. The
+  user's own space is therefore not protected by the mechanism that protects keeper's: delete it,
+  and the next seed sees a name that is absent from both the vault and the ledger and creates
+  keeper's version in its place. The user deletes their space and gets a different one back,
+  which is the exact surprise 44.7 refused for templates.
+  One line in `seed` closes it — record the key whether the space was written or stood down —
+  but that CHANGES 44.3's stated semantics, from "the spaces keeper made" to "the names keeper
+  has claimed", and it changes them for vaults that already exist. That is a product call about
+  an upgrade path, not a bug fix inside a story about deleting things, which is why it is here
+  rather than in 45.17.
+status: done 2026-08-11
+resolution: resolved by story 47.4 — `seed` records a default's key whether it was written or stood down for a name collision, so deleting the user's own space no longer brings keeper's back. The same defect in `templates.rs` was found while fixing this one and fixed in the same story.
+
+### DW-192: `notes_capture_impact`, the two recording commands and the capture rung are wired but have never been exercised by a running app.
+
+origin: epic 45 wave 3, 2026-08-10 — raised independently by W3CaptureTag, W3Recording and
+  W3CaptureWindow in their stand-down reports
+location: `src-tauri/crates/keeper/src/notes_ipc.rs` (`apply_settings`'s two capture arms,
+  `template_source`'s capture rung, `resolve_capture_draft`'s seed, `notes_capture_impact`),
+  `src-tauri/crates/keeper/src/notes_window.rs`, `keeper/src/ipc.rs`'s recording pair
+reason: these compile and their handler registration is now pinned by
+  `src/test/command-registration.test.ts`, so the "Command not found" class is closed. What is
+  NOT closed is whether they do the right thing: no note has ever been captured through this
+  code, no manifest has ever been written through IPC on any machine, and the
+  `quick-capture-*` capability glob has never been evaluated by a real webview. A capability
+  that did not take renders exactly like a frontend bug — the window appears and its buttons do
+  nothing — and no test on either box can tell the two apart.
+  Each story's spec carries its own ordered gate checks; this entry exists so the set is
+  findable from one place rather than five, and so it is not mistaken for covered because the
+  Rust compiles.
+status: open
+
+### DW-193: The `.gitattributes` lines already broken by the unquoted writer are left exactly as they are, and every one of them is a rule covering nothing.
+
+origin: story 46.1, 2026-08-10 — carved out by the epic spine before the story was written, and
+  confirmed against the owner's file during it
+location: `src-tauri/crates/keeper-sync/src/lfs/stage.rs` (`ensure_attributes`), against any
+  `.gitattributes` written by keeper before 46.1
+reason: 46.1 stops keeper EMITTING an unquoted pattern; it does not repair the ones already on
+  disk. The owner's file holds fifty-nine of them. Each is inert in the same two ways: git reads
+  `/2021 holiday/clip filter=lfs diff=lfs merge=lfs -text` as the pattern `/2021` with
+  `holiday/clip` as an attribute NAME, so the intended path is not routed through LFS at all —
+  and `is_false_modification` asks `routed_through_lfs`, so those paths also lose the
+  racily-clean dismissal that keeps a multi-gigabyte file from being re-hashed on every scan.
+  After 46.1 they stop multiplying, because the correctly quoted line keeper now writes is
+  recognised on the next run; the stale ones simply sit there.
+  The mechanism to fix them exists and is one function: `ensure_attributes` already reads the
+  whole file, rebuilds it in memory and writes it back, so re-emitting the managed block through
+  `quote_pattern` and dropping lines it can prove it wrote is a contained change. What makes it a
+  separate decision is that `.gitattributes` is a versioned file the user is invited to edit, and
+  keeper cannot distinguish "a broken line I wrote" from "a line the user adjusted afterwards"
+  by content alone — the managed marker says where keeper's block STARTS, not that every line
+  below it is still keeper's. Bundling a data migration into a bug fix also means the fix cannot
+  be reverted without reverting the migration, which is the reason the epic spine states for the
+  carve-out.
+  Whoever picks this up should decide it as a product question first: repair silently, repair
+  with a one-line notice, or leave them and let the correctly spelled rule be added alongside.
+status: done 2026-08-11
+resolution: resolved by story 47.1 — `ensure_attributes` repairs the lines git itself rejects, below the managed header only, and collapses duplicates keeping the LAST copy because git applies matching lines in order.
+
+### DW-194: An exact-path `.gitattributes` pattern leaves glob metacharacters live, so a real filename containing `[` gets a rule that matches everything except that file.
+
+origin: story 46.1, 2026-08-10 — flagged by ScoutGitattr while diagnosing the quoting defect and
+  deliberately kept out of the fix
+location: `src-tauri/crates/keeper-sync/src/lfs/stage.rs`, `pattern_for`'s exact-path branch
+  (`format!("/{}", …)`)
+reason: the exact-path branch spells a filename as a gitattributes PATTERN, and a pattern is
+  wildmatch — `*`, `?`, `[`, and `\` are operators there. C-style quoting does not help, and this
+  is the part worth writing down: unquoting runs FIRST and produces the pattern, then wildmatch
+  interprets it. The two layers compose rather than cancel, so 46.1's fix carries the bug through
+  intact.
+  Measured against git 2.53.0, with the pattern quoted exactly as keeper now writes it:
+
+  ```
+  .gitattributes:  "/notes/draft[final]" filter=lfs
+  notes/draft[final]  ->  filter: unspecified      <- the actual file, NOT routed
+  notes/draftf        ->  filter: lfs              <- a file that is not the one
+  ```
+
+  `[final]` is a character class, so the rule covers `draftf`, `drafti`, `draftn`, `drafta` and
+  `draftl`, and misses the file it was written for. The `*` case fails the other way and is
+  quieter: `"/budget*2026"` does route `budget*2026`, and also routes `budget-q3-2026`, so an
+  unrelated file is silently converted to an LFS pointer.
+  Consequence is the same class as DW-193 — a large file that was meant to be routed becomes an
+  ordinary git blob, which is the outcome `lfs::stage` exists to prevent — but the cause is
+  different and so is the fix: escape the four wildmatch operators inside the pattern (`\[`,
+  `\*`, `\?`, `\\`) at the point the exact path is built, INSIDE the quotes, since the escape is
+  consumed by wildmatch after unquoting rather than by the quoting. That is a change to what a
+  pattern MEANS, it needs its own round-trip evidence against `git check-attr`, and it interacts
+  with DW-193 (patterns already on disk would need the same treatment), which is why it is not
+  folded into a story about blanks.
+  Note the extension branch is not affected: `pattern_for_extension` emits `*.<ext>` where the
+  `*` is intended, and `engine.rs:1802` already refuses an extension holding `/` or whitespace.
+status: done 2026-08-11
+resolution: resolved by story 47.1 — `* ? [ \\` escaped in the literal half of both producer branches, applied before quoting because git strips them in that order.
+
+### DW-195: The tray's notes section still hand-types its labels, so a registry retitle that now reaches four surfaces still misses the three notes verbs in the menu bar.
+
+origin: story 46.16, 2026-08-10 — the recording half of exactly this defect was the story; the
+  notes half was found while writing the projection and deliberately left
+location: `src-tauri/crates/keeper/src/tray.rs` — `build_notes_items`'s initial labels plus
+  `new_note_label`, `capture_label`, `journal_label`
+reason: 46.16 made the tray project `keeper_core::palette` for the recording verbs
+  (`tray_recording_verbs`), so their words and order are the registry's and a rename reaches the
+  menu bar. The notes section was left hand-built, and the words are duplicated: `palette.rs`
+  ships `notes-new` → "New Note", `notes-capture` → "Quick Capture",
+  `notes-journal-today` → "Today's Journal", and `tray.rs` spells all three again. UX-DR42 says
+  the palette, the cheat sheet, the native menu and the tray carry the same titles; nothing
+  enforces it for notes, so the next retitle drifts here exactly as "Start Recording" did.
+  It was not folded in because the notes labels are COMPOSED, not projected: `new_note_label`
+  returns the honest "no vault yet" wording instead of the verb, `capture_label` carries the
+  global-shortcut registration failure (UX-DR43), and the slots/unread line carry model data. The
+  shape of the fix is therefore "registry title as the BASE word, composition unchanged": add a
+  notes id list beside `tray_verb_ids`, gate it on the notes capability, take the base from the
+  projection and keep `paint_notes` composing the suffix.
+  One thing that widening must NOT inherit from the recording projection: order. Recording verbs
+  take the registry's order because they are rebuilt per menu, but the notes items are built once
+  and only mutated (AD-61 — a Linux tray menu cannot be swapped after it is set), so their slot
+  order has to stay the tray's own or a registry reshuffle would move labels onto the wrong
+  handles. `notes-open` / `notes-search` are registered and deliberately absent from the tray,
+  which is the other reason the id list stays explicit rather than "the whole Notes section".
+status: done 2026-08-11
+resolution: resolved by story 47.4 — the tray's notes labels project `keeper_core::palette`, pinned by two source-scan assertions rather than by value, because duplication is a fact about source text.
+
+### DW-196: `DestinationProfileRow` now carries the recordings root and the head it was joined from as two independent `Option`s, so a row that says one without the other is representable.
+
+origin: story 46.10, 2026-08-10 — created by the story, named by it, and deliberately not
+  collapsed inside it
+location: `src-tauri/crates/keeper/src/ipc.rs` — `DestinationProfileRow.recordings_root` /
+  `.recordings_subfolder`, filled together in `destination_profile_row` and consumed together in
+  `destination_profile_vms`
+reason: 46.10 needed the profile-relative subfolder on the destination picker's rows, because the
+  card now edits it and the exact stored string is what must be echoed back to
+  `sync_profile_save` — a head recovered from the resolved root by `strip_prefix` would come back
+  component-normalised, and `20-media//sessions` and `20-media/sessions` are one root but two
+  different stored values. The honest shape is one field, `Option<(PathBuf, String)>` or a small
+  `RecordingsPlace { root, subfolder }`, so "a root with no head" cannot be written down. What
+  shipped is two `Option`s that agree by construction: `destination_profile_row` is the only
+  place either is built and builds both from the same `profile.recordings` block, and
+  `destination_profile_vms` `?`s on both, so a disagreement drops the row rather than inventing
+  half of one.
+  Nothing is wrong today. Six test fixtures set `unflagged.recordings_root = None` and leave the
+  now-stale `recordings_subfolder` behind, and it changes no verdict because `recordings_root` is
+  checked first at every one of the six read sites. The cost is the next reader's, and the next
+  field: a seventh site that consults the head first would read a head for a folder that holds no
+  recordings.
+  It was not collapsed in 46.10 for one reason only, and it is not a design reason: the `keeper`
+  shell crate does not build on Linux, the story was implemented there, and the collapse is
+  thirteen edit sites in a file no local gate can compile. Two were provable by inspection;
+  thirteen were not. The fix belongs in the next story that is already running the macOS gate on
+  `ipc.rs`, and it is mechanical: introduce the struct, add a `recordings_root()` accessor so the
+  five existing readers keep their one-line shape, and rewrite the six fixture mutations to
+  `row.recordings = None`.
+status: done 2026-08-11
+resolution: resolved by story 47.5 — the pair became one `Option<RecordingsPlace>`, so it cannot be half-set.
+
+### DW-197: `WriteScope::file` survived AD-102 with no production caller left, and it is the pre-fork mental model sitting in the module as a trap.
+
+origin: story 46.14, 2026-08-10 — created by the story, named by it, and deliberately not
+  removed inside it
+location: `src-tauri/crates/keeper-sync/src/files_write.rs` — `WriteScope::file`, plus the six
+  tests that still exercise it (`a_profile_with_no_vault_refuses_every_path_and_names_itself`,
+  `a_folder_whose_name_extends_the_vaults_is_not_inside_the_vault`,
+  `a_nested_vault_subfolder_is_matched_one_component_at_a_time`,
+  `the_configured_subfolder_is_normalised_however_it_was_typed`,
+  `traversal_is_refused_wherever_it_is_aimed`, `the_vault_directory_itself_cannot_be_deleted`,
+  `a_directory_is_refused_as_a_folder_whatever_it_is_named`)
+reason: AD-102 replaced `file` with `WriteScope::route` / `owner` / `classify`. Its two former
+  callers are gone — `files_listing_vm` now asks `owner`, and `deletable` was deleted outright —
+  so as of this story `file` is reached only from its own tests. That is worse than dead code:
+  `file` answers `Err(OutsideVault)` for exactly the paths AD-102 now routes to the second
+  writer, so it IS the pre-fork mental model, still public, still plausible-looking, and a
+  future reader reaching for it would bypass the fork this story exists to make unbypassable.
+  Not removed here because the deletion is not the mechanical part — six existing tests assert
+  refusals through it that AD-102 has turned into routing decisions, so each one needs its
+  intent re-expressed against `directory` (the create path, still live) or `owner` rather than
+  mechanically repointed, and doing that at the end of a wave in a file three other agents were
+  reading is how a green suite stops meaning anything.
+fix: delete `WriteScope::file`; migrate each test above to `directory` where it is asserting the
+  component-by-component vault match or the create refusal, and to `owner` where it is asserting
+  the escape / vault-root / is-a-directory refusals. `vault_relative` stays — it is the shared
+  core of `directory` and `classify`. No production line changes.
+status: done 2026-08-11
+resolution: resolved by story 47.5 — `WriteScope::file` deleted, its seven tests migrated to `directory` or `owner`, proven by compilation.
+
+### DW-198: the hotkey path re-centres the draft capture window on every press, and story 46.15 made that asymmetry visible.
+
+origin: story 46.15, 2026-08-10 — found while wiring the size through, named here rather than
+  fixed because the fix costs NFR-27 something and the trade needs to be chosen, not slipped in
+location: `src-tauri/crates/keeper/src/notes_window.rs` — `show` (the no-argument entry point)
+  passes `None` to `reveal`, which falls through to `position(window)`; its two callers are
+  `hotkey::install_capture`'s press handler and the tray's Quick Capture item
+reason: `show` deliberately has no settings read in front of it — the hotkey path is
+  `set_position` → `show` → `set_focus` and NFR-27 gives it 300 ms. The consequence, which
+  predates this story, is that the prewarmed window's REMEMBERED POSITION is honoured only when
+  it is raised through `notes_capture_open`, and is re-centred on the pointer's monitor every
+  time the hotkey or the tray raises it. A person who unlocks the draft window and drags it
+  somewhere finds it back in the middle on the next hotkey press.
+  Story 46.15 did not cause this and did not widen it — `reveal(None)` now touches the position
+  and nothing else, where before it would also have re-asserted a default size and lock. But it
+  DID make the asymmetry legible: the size survives a hotkey press and a restart (adopted once
+  at boot, off the hot path), and the position does not. "It remembers how big I made it but not
+  where I put it" is a report waiting to be filed.
+fix: adopt the position the same way the size is adopted — once, at boot, in `lib.rs`'s setup,
+  alongside the existing `notes_window::adopt_placement` call, so the hot path stays three
+  synchronous calls. That is not free: `position` is `apply_placement`'s fallback precisely
+  because a hidden window's monitor is "where it was last placed", so honouring a stored
+  position means the panel stops following the pointer between monitors. Which of those two a
+  person wants is exactly what the lock already says — locked follows the pointer, unlocked
+  stays put — so the shape is: at boot, if the stored placement is unlocked and carries a
+  position, apply it; on every `show`, do what `reveal(None)` does today. Needs the macOS gate.
+status: done 2026-08-11
+resolution: resolved by story 47.5 — the hotkey no longer re-centres a window the user placed. Departs from this entry's literal fix text and implements its reasoning; the reason is in the story's spec §1.
+
+### DW-199: on GTK, an unlocked capture window's own 5 px resize border sits over the chrome buttons.
+
+origin: story 46.15, 2026-08-10 — a platform fact confirmed from tao's source during the story,
+  recorded rather than designed around because it needs a look at the real window to size
+location: `src/components/capture/capture-window.tsx` — `CaptureWindowChrome`'s strip
+  (`h-8 … px-1`, buttons flush to the right edge); the behaviour itself is tao 0.35's
+  `src/platform_impl/linux/window.rs` motion/button handlers
+reason: tao gives an undecorated resizable window its edge hit-testing INSIDE the surface — a
+  5 px × scale strip along each edge — and the webview never sees clicks that land in it. On
+  macOS and Windows the resize border is outside the client area, so this is Linux-only. The
+  capture chrome's close button is flush against the top-right corner, which is where two of
+  those strips overlap, so on GTK an UNLOCKED window plausibly turns the top and right few
+  pixels of that button into a resize handle. Two related tao facts from the same reading: the
+  cursor stays the default arrow during an edge drag (tao's own FIXME), and edge dragging is off
+  while the window is maximized.
+  Not addressed here because the fix is a number — how much inset the chrome needs — and this
+  story could not run a GTK window to measure it. Guessing a padding that is wrong in either
+  direction is worse than recording the hazard: too little fixes nothing, too much moves a
+  control on every platform to solve a problem on one.
+fix: on a Linux desktop, unlock a capture window and click the top-right two pixels of the close
+  button. If it resizes instead of closing, give the strip a right/top inset of one resize border
+  when unlocked (the same conditional the drag region already uses), sized from what is measured
+  rather than from tao's constant. No Rust change; no capability change.
+status: done 2026-08-11
+resolution: resolved by story 47.5 — the inset is computed in Rust from tao's real rule (`scale_factor() * 5`, zero when locked, maximized or non-GTK) and carried to the webview as a number, so the frontend still reads nothing about the platform.
+
+### DW-200: A legacy `.gitattributes` line whose only defect is a live glob metacharacter is not repaired, because a line git accepts is evidence of nothing.
+
+origin: story 47.1, 2026-08-11 — named by the repair's own boundary rule rather than found afterwards
+location: `src-tauri/crates/keeper-sync/src/lfs/stage.rs`, `ensure_attributes`'s repair candidacy
+reason: 47.1 repairs a line only when git itself REJECTS it, because that is the one case where the
+  original intent is recoverable by construction. A line the old writer emitted for a file named
+  `report [final].pdf` parses fine — as a character class — so it silently over-matches, and there
+  is no way to tell it apart from a hand-added recursive glob a person meant literally. The measured
+  cost is that the stale class keeps resolving `reportf` through LFS beside the new correct line,
+  with empty stderr and nothing to notice.
+  Closing it needs a version marker in `MANAGED_HEADER` so the repair can know which of its own
+  spellings wrote a line — which is a file-format change and wants its own decision, not a
+  widening of a boundary that is currently provable.
+  Same entry covers the backslash-in-extension variant: `*.a\b` is read as `*.ab`.
+status: open
+
+### DW-201: `pattern_for` normalises a backslash to a slash before escaping, so a literal backslash in a filename is destroyed at the separator step.
+
+origin: story 47.1, 2026-08-11
+location: `src-tauri/crates/keeper-sync/src/lfs/stage.rs`, `pattern_for`
+reason: a backslash is a legal character in a Linux filename, and the separator normalisation runs
+  before the glob escaping, so an oversized `a\b` is routed by the pattern `/a/b` — a path that
+  names a different file, or no file. Nobody has reported it because the filename is rare, but it
+  is the same shape as story 47.2's finding: a rendering standing in for the bytes, and the
+  rendering reaching a different file than the one it came from.
+  Adjacent to 47.2's non-UTF-8 path work and probably belongs with it — that story established the
+  rule (refuse rather than resolve when the rendering is not reversible) and this is a second place
+  it applies.
+status: open
+
+### DW-202: The summon hotkey shows the inbox without unfolding the column it lives in.
+
+origin: story 48.1, 2026-08-11
+location: the summon-hotkey focus target vs `useSurfaceColumn`'s folded state
+reason: 48.1 gave four surface columns a fold. A hotkey that focuses something inside a folded
+  column focuses a thing nobody can see — the keystroke appears to do nothing. Not a regression
+  (the fold is new), but it is the first of a class: every existing "focus this" path now has a
+  column that may be shut in front of it. The fix is one unfold call at the summon path; the
+  reason it is deferred is that the same question applies to every other focus path and answering
+  it once, deliberately, is better than four unfolds added as each is noticed.
+status: open
+
+### DW-203: Two resize hosts reach the same column through one className hinge.
+
+origin: story 48.1, 2026-08-11
+location: `src/components/ui/resizable-columns.tsx`, `src/lib/column-widths.ts`
+reason: the seam and the column root both write width through a shared className path, so the
+  two hosts are coupled by a string rather than by a type. It works and is tested; it is the
+  shape that breaks quietly when a third host appears.
+status: open
+
+### DW-204: `columnTemplate`'s fitted branch hard-codes `MIN_COLUMN_WIDTH`.
+
+origin: story 48.1, 2026-08-11
+location: `src/lib/column-widths.ts`
+reason: 48.1 gave each surface column its own floor, justified per column, because the 72px
+  constant was chosen for a property KEY whose escape hatch is an overflow trigger. The fitted
+  branch of `columnTemplate` still bakes the 72 in, so a fitted column ignores the floor its
+  own id declares. No live consumer hits it today; the next one will.
+status: open
+
+### DW-205: A note's editor refcount cannot span a capture window.
+
+origin: story 48.3, 2026-08-11
+location: `src/lib/stores/notes-editor.ts`, against `keeper::notes_window`
+reason: 46.12 made two panels on one note share a document by refcount. A capture window is a
+  separate webview, so a separate JS realm and a separate module registry — the refcount cannot
+  reach it, and a note open in a panel AND in a capture window has two independent buffers. Today
+  each saves through the same Rust writer and last-write-wins, which is the pre-46.12 behaviour
+  and not a new defect; it becomes one the moment either side grows an unsaved-state promise.
+status: open
+
+### DW-206: A foreign `filter.lfs.process` still reaches the clone's own checkout, because `gix::clone::PrepareCheckout` hands out no mutable repository.
+
+origin: found while fixing the field incident of 2026-08-13 (a global `git lfs install` driver
+  failing every `status`), 2026-08-16
+location: `src-tauri/crates/keeper-sync/src/git/repo.rs` — `clone` (`:560-573`), against
+  `drop_foreign_lfs_driver` (`:80`) and `gix::clone::PrepareCheckout::main_worktree`
+reason: `drop_foreign_lfs_driver` removes a non-repository `filter "lfs"` section from the
+  merged in-memory config of a repository handle, and `open` calls it before anybody reads a
+  file — so every status, commit and pull pass is protected. The initial clone is not. gix
+  materializes the worktree from inside `PrepareCheckout`, whose only accessor is
+  `repo(&self) -> &Repository` (gix 0.86, `clone/checkout.rs:156`), and the surgery needs
+  `&mut` for `config_snapshot_mut`. `fetch_then_checkout` builds that value with private
+  fields, so a caller cannot construct one from a `fetch_only` repository either. The
+  consequence is narrow but real: on a machine whose global config names `git-lfs` and whose
+  `PATH` (Finder's, on a desktop launch) does not have it, the FIRST clone of a repository
+  carrying LFS-tracked paths fails with `checkout failed: … Process handshake …` instead of
+  leaving pointer text for keeper's own materialization pass. Every later pass on the same
+  folder is fine, and the message names the cause, so this is a bad first minute rather than a
+  stuck folder.
+  Three routes, none free. (a) Do the checkout ourselves after `fetch_only`: needs
+  `gix_worktree_state::checkout` plus the options gix assembles in `Cache::checkout_options`,
+  which is `pub(crate)` — re-deriving validation, permissions and symlink handling is exactly
+  the code most expensive to get wrong. (b) Pass `open::Options::filter_config_section` (a
+  `fn(&Metadata) -> bool`) through `clone::PrepareFetch::new` so no global section is trusted:
+  one line, but the predicate cannot see the section NAME, so it also drops global `http.*`
+  (proxy, sslVerify), url rewrites and credential helpers for the one operation that talks to
+  the network — a silent regression for anyone behind a proxy. (c) Ask upstream for
+  `PrepareCheckout::repo_mut()`, or for the two gix behaviours that make this bite at all:
+  drivers merged by name across scopes the way git merges them, and an empty `process` treated
+  as absent (git's `apply_filter` tests `*ca->drv->process`, gix's `maybe_launch_process` tests
+  only `Some`). (c) is the honest fix and is not ours to schedule.
+status: open
+
+- source_spec: none
+  summary: Restyle the note editor's Find/Replace bar so it matches the app's UI instead of rendering as unstyled inputs and buttons.
+  evidence: Split from a four-goal intent (note pane truncation, find bar, toolbar additions, file embedding). Independently shippable: pure presentation inside the editor chrome, no shared contract.
+
+- source_spec: none
+  summary: Add a mark (`==highlight==`) command and an emoji picker button to the markdown format toolbar.
+  evidence: Split from the same four-goal intent. Independently shippable: two additions to `format-toolbar.tsx` plus format commands; `emoji-complete.ts` already provides `:shortcode:` autocomplete, so the picker is a second entry point rather than new emoji infrastructure.
+
+- source_spec: none
+  summary: Audit inline embedding of image/video/audio/html/json/csv/pdf across all notes including session notes, and add editing of the rendered text for html, csv and json.
+  evidence: Split from the same four-goal intent, and the largest of the four. Much of it already exists — `FILE_FORMATS` in `src/lib/viewers/registry.ts` covers all seven types, `FileEmbedWidget`, `CsvTableWidget`, `ImageWidget` and `RecordingEmbedWidget` render them — so the real work is an audit of the gaps plus editable rendered text, not new embedding infrastructure.
+
+- source_spec: spec-note-panel-never-clipped
+  summary: The Files and Chat surfaces still carry `shrink-0` on their columns, so a wide tree or inbox can still starve the document beside it.
+  evidence: The panel strip fix is shared — those two surfaces render the same `PanelStrip` and now claim the same 280px basis — but their columns still refuse to shrink, so the deficit lands on the panel again. Story 55.1 was scoped to Notes and told not to touch them ("Never: do not touch the Files or Chat surfaces' columns"). The fix is one line each: drop `shrink-0` from `FILES_COLUMN_CLASS` and `CHAT_LIST_COLUMN_CLASS`. Deferred rather than done because neither surface's floor has been thought about the way `notes-list`'s 240 was, and changing three surfaces on one surface's evidence is how a fix becomes a regression somewhere nobody was looking.
+  status: open
+
+- source_spec: spec-note-panel-never-clipped
+  summary: While a column is squeezed, the drag handle's `aria-valuenow` and the resizer report the remembered width, not the rendered one.
+  evidence: Deliberate — the remembered width is what a widened window restores, and it is the number the user set, so persisting or announcing the squeezed value would be the write this spec forbids. But a screen reader is told 320 while the column is 263, and dragging from a squeezed state jumps to the remembered width before it moves. Neither is wrong enough to trade for a stored-width bug; both deserve a considered answer about what a resizer should say when the layout is overriding it.
+  status: open
+
+- source_spec: spec-note-panel-never-clipped
+  summary: No test lane exercises real flexbox — layout regressions of this kind can only be caught by arithmetic or by hand.
+  evidence: jsdom computes no layout, so every assertion in this story checks the *inputs* to the distribution (`flexBasis`, `minWidth`) and none checks the result. The bug being fixed was invisible to all 4600 tests precisely because it lived in the distribution. Verified for this story by rebuilding the box tree against the compiled stylesheet in a real engine and reading widths back, which is repeatable but manual. A headless-browser lane for a handful of layout invariants would make it automatic.
+  status: open
+
+- source_spec: spec-find-bar-matches-the-ui
+  summary: The find bar shows no match count, so "how many" and "which one" are still unanswerable.
+  evidence: The stock panel had none either, so this is not a regression — but it is the affordance people expect from a find bar, and rebuilding the panel was the cheap moment to add it. Held back deliberately: counting every match on each keystroke is a performance question about large notes (`SearchQuery.getCursor` walks the document), and a restyle is the wrong story to answer it in. Wants a cap and a "500+" form.
+  status: open
+
+- source_spec: spec-find-bar-matches-the-ui
+  summary: The file viewers mount CodeMirror without `search()`, so there is no find at all in a `.md`, `.csv` or `.json` opened from Files.
+  evidence: `⌘F` is wired in `note-editor.tsx` only. `findBar()` is now one extension and would drop into `text-viewer.tsx` unchanged, but adding find where there was none is a feature, not a restyle, and the viewers have their own `⌘F` question (the Files pane filter) to settle first.
+  status: open
+
+- source_spec: spec-toolbar-mark-and-emoji
+  summary: The emoji picker has no recents and no skin-tone variants.
+  evidence: Both are state, and this was a picker. Recents in particular would change what "opens on" means and needs a decision about where that state lives (per vault? per device? synced?) before it is worth building. The opening set in `format-toolbar.tsx` is the hand-maintained stand-in.
+  status: open
+
+- source_spec: spec-toolbar-mark-and-emoji
+  summary: `==highlight==` renders in keeper and is invisible to anything else reading the vault.
+  evidence: It is not in CommonMark or GFM; the extension in `markdown-marks.ts` is keeper's own, matching the spelling Obsidian and most wikis use. A note exported or read by a plain CommonMark renderer shows the equals signs. Worth stating in the vault docs rather than fixing — there is nothing to fix short of not supporting it.
+  status: open
+
+- source_spec: spec-note-embeds-media
+  summary: `.docx`, `.pptx` and `.xlsx` embedded in a note are still links.
+  evidence: They are `documentRow`s with no inline renderer — `document-viewer.tsx` shows a PDF through the webview's own renderer and offers the other three as a download. What a spreadsheet should look like inside a paragraph is a design question, not a wiring one, so `drawableFor` returns null for them and the link stays.
+  status: open
+
+- source_spec: spec-note-embeds-media
+  summary: `![[note.md]]` is still a link rather than a transclusion.
+  evidence: Deliberate and stated in `file-embed.ts`: showing one note inside another is a different feature with a different meaning, and mounting a raw editor over a note would be a second way to write one without `notes_save`'s base revision or its conflict copy. Rust refuses that write too, so both halves agree. Listed here because "every file type renders inline except this one" is the kind of gap a reader will otherwise report as a bug.
+
+  status: open
+
+- source_spec: spec-note-embeds-media
+  summary: A PDF embed cannot report a failed load.
+  evidence: `<embed>` fires no `error` event, so the degrade-to-a-link path every other kind has does not exist for PDF. Safe today because the path came back from a resolver that stats the file, so "the vault holds it" is established before the element is built — but a file deleted between the resolve and the paint shows an empty box rather than the link. Fixing it means probing the bytes or watching for a zero-size box, neither of which is obviously worth it.
+  status: open
+
+- source_spec: spec-html-rendered-and-editable
+  summary: The JSON structure view is still read-only, so "editable rendered text" is true of HTML and CSV and not of JSON.
+  evidence: `json-structure.ts` says so in its header and gives its reason. Making a value editable there is the same shape this story built for HTML — a parse that records source offsets, a splice verified before it is applied — but the JSON parser is deliberately not `JSON.parse` (it preserves number text, key order and repeats), so the offsets have to come out of that parser rather than a second scan. Its own story.
+  status: open
+
+- source_spec: spec-html-rendered-and-editable
+  summary: Pressing Enter inside an editable HTML text run drops the line break.
+  evidence: `contenteditable="plaintext-only"` inserts a break element, and the splice reads `textContent`, which does not include it — so the text is written without the newline. Lossy in one direction only and never corrupting (the verified splice still applies), but a reader who expects a paragraph break gets a space. Fixing it means deciding what a line break inside a run should become in the markup, which is a markup decision and therefore the Source tab's.
+  status: open
+
+- source_spec: spec-html-rendered-and-editable
+  summary: A `<style>` block is dropped, so a page renders in keeper's typography rather than its own.
+  evidence: Deliberate and stated in `html-view.ts`: applying a file's CSS would be styling this application's own DOM from a document somebody was handed. A scoped or sanitised subset is possible and is a separate question with its own answer.
+  status: open
+
+- source_spec: none
+  summary: `files-pane.test.tsx` "re-reads a remembered folder once when Refresh rescues a failed first list" times out under parallel load.
+  evidence: Observed twice while hunting an unrelated unhandled rejection — once during a `lefthook` pre-push run (tests sharing the machine with clippy and typecheck) and once in a bare full run. `TestingLibraryElementError: Unable to find role="treeitem" and name "Notes"` after the 5s `waitFor` budget; the pane is rendered and the tree is empty, so the second list has not landed. Passes 15/15 in isolation. Not investigated: it is a different subsystem from the work in flight, and guessing at a timing fix without reproducing it deliberately would be a change nobody can evaluate.
+  status: open
+
+- source_spec: spec-no-sync-unit-stalls-in-silence
+  summary: The filter-protocol deadlock itself is guarded against but not root-caused.
+  evidence: Observed precisely — content fully delivered (every open file at EOF), `keeper lfs filter-process` blocked in `pktline::read` on stdin, parent blocked in `Client::invoke`. `Request::fill` handles the flush packet correctly, so the missing packet is on the client side or in how a conversion is handed between gix's pool and ours. This change makes the deadlock survivable (bounded concurrency, abandonable walk, self-terminating filter) without explaining it. Reproducing it on a synthetic repo of large filtered files is its own story.
+  status: open
+
+- source_spec: spec-no-sync-unit-stalls-in-silence
+  summary: `.git/lfs/tmp` accumulates leaked scratch — 100 GB in 863 files over four days on one machine.
+  evidence: The files are `tempfile`-style `.tmpXXXXXX` names, which delete on drop; a process killed mid-transfer leaks one. Nothing in keeper sweeps them, so every crash costs disk permanently. A sweep at startup on the same terms as `recover_running` — remove scratch older than any live run — would return the space. Measured alongside `.git/lfs/incomplete` at 4 GB, itself untouched since 17 August.
+  status: open
+
+- source_spec: spec-no-sync-unit-stalls-in-silence
+  summary: A profile can sit in `offline` indefinitely with no path back.
+  evidence: `Offline` is set on a transient network error with the comment "the queue drains when connectivity returns (AD-49)", but the state is only refreshed by a sync that completes. When the only queued unit cannot complete, the profile reports `offline` forever while the server is reachable — observed for three days with `curl` answering the remote in 30 ms. The state needs a way to be re-evaluated that does not depend on the thing it is blocking.
+  status: open
+
+- source_spec: spec-repair-the-lfs-stat-invariant
+  summary: Nothing detects a broken pointer-stat invariant on its own; the repair runs only when a person presses "Recheck all files".
+  evidence: `repair_index_stat` restores it, and `rescan` calls it, but a folder whose invariant broke while nobody was looking still converts its whole worktree on every status pass until somebody notices and presses the button. The card now says the folder needs attention after three consecutive failures, which is what makes the button findable — but a cheap periodic check (does a materialized entry's stat still describe its file?) would make the repair automatic. Left out here because a self-repairing index is a write nobody asked for, and this story's job was to make the failure visible and fixable.
+  status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: `tests/hooks_never_run.rs` fails on any host whose git configuration sets `core.hooksPath`, which makes every repo-local `.git/hooks/*` inert.
+  evidence: Pre-existing and unrelated to this story — it exercises `GitCli::push` and git hook behaviour, and touches nothing story 56.1 changed. Its own sanity assertion (`hooks_never_run.rs:87`) requires a planted `.git/hooks/pre-push` to block a plain `git push`, which cannot happen when `core.hooksPath` points elsewhere. Verified: `git config --show-origin --get-all core.hooksPath` reports `file:/home/dev/.gitconfig  /home/dev/.config/git/hooks`, and the test passes under `GIT_CONFIG_GLOBAL=/dev/null cargo test -p keeper-sync --test hooks_never_run`. The fix is for the test to plant its hook and force `-c core.hooksPath=.git/hooks` on the sanity push, so the fixture proves what it claims regardless of the developer's own git config.
+  status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: No production path constructs a `VirtualPolicy`, so FR-329's "a malformed pattern refuses at startup" is not yet reachable by any user.
+  evidence: This is 56.1's declared non-goal — 56.2 is the consumer in the epic's strict 56.1 → 56.2 chain — but FR-329 is listed as a requirement 56.1 must satisfy, and it is satisfied only in the sense that `compile` refuses when called. The sibling refusals are reachable (`ExcludeSet::new` at `engine.rs:6111` and `stability.rs:252`, `LfsPolicy::from_profile` at `lfs/stage.rs:1193`), and `SyncProfile::validate` deliberately validates no glob field, so it is not the gate either. 56.2's review must confirm its consumer compiles the policy before any materialization decision, or the refusal machinery ships unreachable.
+  status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: A host cannot decline the repository's virtualization policy: an empty `virtualPatterns` is silence, so a machine can replace the committed list but never withdraw from it.
+  evidence: `VirtualPolicy::compile` treats a profile list that says nothing as "this tier is silent", which is the right reading of an unset key and the wrong one for a key deliberately set to `[]`. The operator case that arises is a laptop that is often offline and wants everything materialized; today the only spellings are a pattern that matches nothing or a negation-only list, both accidental. Distinguishing key-absent from key-empty needs the `Option<Vec<String>>` shape on the profile field, which is entangled with the `SyncProfileReq` `Option` rule (DW-116) that 56.1 declared a non-goal. Settle it in the story that renders the control (56.7/56.9), together with the tier surface AD-132 asks for.
+  status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: `.keepervirtual` and the virtualization keys have no user-facing documentation; only `keeper-syncd`'s annotated `[[profile]]` template describes them.
+  evidence: The daemon template gained both keys in this story, because the daemon accepts them the moment `SyncProfile` carries them and an operator setting a byte-affecting policy blind is the same failure one step earlier than the typo the module hard-refuses. The committed file is the artifact a whole team meets, and it is documented nowhere. Epic 56 assigns the chapter to story 56.8 (`docs/sync.md` grows a virtual-files section, last of all), which is where it belongs — recorded here so the file name, the `!` protection rule and the union-across-tiers behaviour are not left to be rediscovered from the source.
+  status: open
+
+- source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
+  summary: The shared gitignore dialect has no spelling for "root-anchored, single segment" outside the virtualization lists.
+  evidence: `exclude::anchor` applies the basename rule to any pattern without a `/`, so `excludes = ["notes.md"]` and `lfsNever = ["notes.md"]` mean "at any depth" with no way to say "the root's own". Story 56.1 resolved this for its own lists by handling gitignore's leading `/` in `virtual_policy::anchor_line`, and deliberately did not change the two older fields, whose current meaning is depended upon. Teaching `add_pattern` the leading slash would make all three consistent; it is a behaviour change to two shipped config keys and needs its own story.
+  status: open
+
+- source_spec: spec-56-2-a-listing-that-knows-what-it-does-not-hold
+  summary: A present `remote` key in a listing (or in `verify --json`) does not always mean the server was asked — `audit_remote_objects` returns a fully-formed intact audit with no round trip for `lfsMode = disabled` and for a filesystem remote with no `.lfsconfig`.
+  evidence: `Engine::audit_remote_objects` short-circuits to `RemoteAudit::default()` on `LfsMode::Disabled` and returns `missing: []` without contacting anything when the remote is a local store, both by design (`engine.rs`, the two early returns before the batch client is built). The absent-vs-present contract story 56.2 built for `ls-files --remote` therefore holds for the *key* but not for the *answer*: a monitoring wrapper reading `listings[].remote.missing == []` as "every object is on the server" gets a false green for exactly the profiles whose objects were never uploaded. Pre-existing and shared with `verify --remote`, which has carried the same shape since DW-140; fixing it means the audit saying which of the three ways it answered, which is a change to a shipped JSON document and needs its own story.
+  status: open
+
+- source_spec: spec-56-2-a-listing-that-knows-what-it-does-not-hold
+  summary: `ls-files` is keyed by the index, so a path that was materialized and then removed from the index produces no row at all — not even `absent` — although the ledger still remembers it and the store may still hold the object.
+  evidence: `lfs::listing::collect` iterates `stage::indexed_pointers`' answer and joins the `materialized` ledger into it, which is the right key for "which of this checkout's LFS paths do I hold" and the wrong one for "what is this clone still holding". A committed deletion or a sparse-cone change drops the row while `prune`'s candidate set and 56.5's release sweep both read the ledger, so the listing an operator would reach for to audit that sweep cannot show the same set of rows. Deliberate for this story — the module doc frames the verb as index-keyed — and worth settling in 56.5, where the sweep's own reporting makes the second key necessary.
+  status: open
+
+- source_spec: spec-56-3-a-file-you-can-ask-for
+  summary: `Engine::reserve` is an in-process map, so `keeper-syncd materialize` does not exclude a running `keeper-syncd watch` — and every one-shot CLI invocation runs `db::recover_running`, which flips the live daemon's in-flight rows back to `pending`.
+  evidence: `reserve` (engine.rs) is a `Mutex<HashMap>` on the `Engine` instance and `Engine::open` calls `recover_running` unconditionally, so two processes over one `sync.db` and one index have no mutual exclusion: `with_db` is a mutex rather than a transaction, so `enqueue_unique`'s SELECT-then-INSERT can race the daemon's identical call, and `git::repo::refresh_index_stat` can write an index the daemon read a moment earlier. Pre-existing for every one-shot verb (`sync --once`, `verify`, `rescan`, `ls-files`), and the reason it is recorded here rather than fixed here is that the fix is a cross-process lock plus a `BEGIN IMMEDIATE` around the enqueue triple — a change to the whole CLI surface, not to one verb. Story 56.3 is nonetheless the first verb *designed* to be run beside a running daemon, and it states the honest limit on `Engine::materialize_entry` instead of claiming the exclusion it does not have. Asking for five files in a row resets the daemon's in-flight transfers five times.
+  status: open
+
+- source_spec: spec-56-3-a-file-you-can-ask-for
+  summary: `lfs::stage::worktree_pointer` folds a read failure into `None`, so an unreadable pointer file is reported to the user as a local modification they must undo.
+  evidence: `worktree_pointer` ends `File::open(...).ok()?` (added by 56.2), so a permission error, an ACL or an immutable flag is indistinguishable from "these bytes are not pointer text". `lfs::hydrate::plan` then decides on length alone and answers `ContentRefusal::LocallyModified` — "does not hold the pointer this folder committed" — for a file that does hold it, and `AlreadyHeld` for an unreadable file whose length happens to equal the pointer's size. `plan`'s doc covers a failing `stat`, not a failing read. The honest fix changes `worktree_pointer` to a `Result` and gives the refusal an `Unreadable { path, reason }` variant, which touches the `browse` listing that shares the helper — the reason it is not done inside a story whose surface is the verb.
+  status: open
+
+- source_spec: spec-56-3-a-file-you-can-ask-for
+  summary: "keeper does not overwrite a local modification" is enforced when the decision is made and not re-checked immediately before `rename(2)`, so an editor save landing in that millisecond window is destroyed.
+  evidence: `lfs::hydrate::plan` reads the worktree, and `lfs::stage::materialize` then re-checks only `store.contains` before its `.keeper.<name>.tmp` + `rename`. Nothing re-verifies that the target still holds the committed pointer. `Engine::materialize_landed` has had the identical shape since story 34.x, so the window is not new — what is new is that a *user* triggers it, and the user is the person most likely to be saving that file. Closing it means re-stating the target inside `stage::materialize` (a shared function both the request and the arrival path use) and deciding what a mismatch there costs a background arrival, which is a change to the publish primitive rather than to this verb.
+  status: open
+
+- source_spec: spec-56-3-a-file-you-can-ask-for
+  summary: An `alreadyMaterialized` answer writes no `materialized` ledger row, so a path a human explicitly asked for can be invisible to 56.5's release clocks.
+  evidence: `Engine::materialize_entry`'s already-held arm returns before `db::remember_materialized`, deliberately — `at_ms` is the *materialization* clock and nothing was materialized — so a path materialized by `git lfs pull`, by a pre-ledger keeper, or by the documented same-length tie has no row. It is safe in the conservative direction (no row means the sweep has no candidate to release) and it is the wrong shape for FR-334's last-use fact, which 56.5 owns: the sweep's key is the question of whether the ledger or the worktree decides what "this clone holds" means. Settle it with the second key already recorded for `ls-files` (DW, story 56.2).
+  status: open
+
+- source_spec: spec-56-3-a-file-you-can-ask-for
+  summary: A subpath containing a backslash is looked up under a normalized name but checked and probed under the literal one, so the verb can answer about a different file than the caller named.
+  evidence: `lfs::stage::index_key` replaces `\` with `/` (correct on Windows, where it is a separator; on Linux and macOS it is an ordinary filename character), so `indexed_pointer(repo, "40-media\\clip.mp4")` returns the pointer committed for `40-media/clip.mp4`, while `SparseCone::includes` and `hydrate::plan` use the literal name and answer about a path that does not exist. The result is a refusal sentence naming the wrong file, or an oid and size belonging to a path the user did not ask for — never a write, because `plan`'s `stat` fails. Pre-existing in `index_key` and shared with 56.2's listing; the fix is either to refuse a segment containing the platform's other separator or to carry `index_key`'s normalized path through every consumer, which is a change to the crate's path frame.
+  status: open
+
+- source_spec: spec-56-3-a-file-you-can-ask-for
+  summary: An inline publish does not retire a pending `LfsDownload` row for the same object, so the daemon can later fetch bytes that are already on disk.
+  evidence: `Engine::materialize_entry` publishes inline when `store.contains` is true and leaves any covering journal row alone; `materialize_pending` has always done the same. On a metered or slow link that is exactly the transfer the verb exists to avoid, in the case where the object arrived by another route (a pendrive copy, another profile sharing the store, a manual `git lfs pull`). Not fixed here because "the object is present, so this unit is satisfied" is a claim about the *store*, and the place that owns it is the transfer's own precondition rather than one verb — `do_lfs` could check the store before the batch request and complete the unit, which would benefit every caller and needs its own regression fixture.
+  status: open
+
+- source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
+  summary: A release deletes the `materialized` row outright, so `last_used_ms` and `synced_at_ms` are discarded at the exact moment the columns were designed to still answer.
+  evidence: `db.rs`'s own doc says `oid`/`size_bytes` exist "so a row still answers after the worktree stops holding a pointer to consult", and the five late columns are described as "facts the ledger has to hold before anything can decide what to release" — but `forget_materialized` is a `DELETE`. The pin is protected (the refusal is upstream and the statement now carries `AND COALESCE(pinned, 0) = 0`), so nothing the owner asked for is lost today; what goes is the recency history 56.5's TTL sweep would use to choose what to release next, and the "content last landed here" fact a row can still answer. The right shape is a released marker (or a null `at_ms`) that retracts presence without erasing history, plus teaching `db::materialized_paths` to skip released rows — which is a schema decision that belongs with 56.5's own clock columns rather than ahead of them.
+  status: open
+
+- source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
+  summary: Releasing a hard-linked file reports bytes it did not reclaim, because `rename(2)` replaces one directory entry and the inode survives under the other name.
+  evidence: `Release.size_bytes` is the pointer's size unconditionally and `dehydrate_line` renders it as `released 4.0 MB`, whose doc calls it the bytes this machine no longer holds. With `nlink > 1` the content is still on disk under the other name, so the figure — and any consumer totalling `sizeBytes` — over-counts by the whole file. Nothing in the guard chain reads `nlink`, though the `symlink_metadata` already in hand answers it on unix. Not a safety defect in either direction (the bytes are *more* safe, not less), which is why it is recorded rather than fixed: the honest answers are either refusing a multiply-linked file or reporting zero reclaimed, and choosing between them is a reporting decision that 56.9's space-freed surface should make once, for the sweep and the verb together.
+  status: open
+
+- source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
+  summary: A selector that is one profile's id and another profile's name makes both folders permanently unreleasable, and the refusal advises the one thing that cannot work.
+  evidence: `select` filters `profile.id == wanted || profile.name == wanted` with no precedence, so both match, the single-profile destructure fails, and the message is "`{wanted}` matches 2 folders; name the one you mean by its id" — while the id is precisely what is ambiguous. Pre-existing and shared by every verb that calls `select` (`materialize`, `ls-files`, `pause`, `resume`, `verify`), and the fix — prefer an exact id match before filtering by name — changes the selector for all of them, which is why it is not made inside a story whose surface is one deleting verb. Nothing makes a profile name unique, so the collision is reachable by a user who names a folder after another folder's ULID.
+  status: open
+
+- source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
+  summary: `lfs::stage::dehydrate`'s post-create cleanup paths are structurally verified but not exercised, because none of them can be forced from a fixture without stubbing the filesystem.
+  evidence: All three post-create failures (`write_all`, `File::set_permissions` on an owned handle, `rename` onto a file the identity re-check just proved regular) funnel through one `if published.is_err()` cleanup, so there is a single path to audit rather than three — but on Linux none of them can be provoked from a temp directory, and this tree does not stub the filesystem here. The pre-create refusal is covered (`a_target_whose_length_moved_is_refused_and_leaves_no_staging_file`), and a leaked `.keeper.*.tmp` is tier-0 excluded so it can never be committed; the residual risk is litter nobody sweeps, which is the same gap `.git/lfs/tmp` already has its own ledger entry for.
+  status: open
+
+- source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
+  summary: A profile with a filesystem remote that also carries a committed `.lfsconfig` can never release anything, because the per-object proof is routed to an LFS server that cannot be addressed.
+  evidence: `Engine::remote_serves` takes the filesystem-remote branch only when `lfsconfig.is_none()`, mirroring `Engine::audit_remote_objects` exactly — an explicit `.lfsconfig` names a server, so it outranks the shape of the remote URL, which is the right precedence. The consequence is that such a profile falls to `lfs_access`, which cannot derive an endpoint from a path remote, so every release refuses `UnprovenOnRemote` forever. Fail-closed and consistent with the existing audit, so it is not a defect — but it is a folder shape (a pendrive remote plus a committed `.lfsconfig` pointing at a forge) whose releases silently never happen, and the honest fix is for the proof to say which of the three ways it answered, which is the same change DW (story 56.2) already asks for on `audit_remote_objects`.
+  status: open
+
+- source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
+  summary: The `.keeper.{name}.tmp` staging spelling adds 12 bytes to a file name, so a path whose name is within 12 bytes of `NAME_MAX` can never be materialized or released.
+  evidence: Both `lfs::stage::materialize` and the new `lfs::stage::dehydrate` build the sibling staging name by prefixing `.keeper.` and suffixing `.tmp`, so the create fails `ENAMETOOLONG` every time and the error names the temp file rather than the cause. Inherited rather than introduced — `materialize` has had the shape since story 34.x — and it affects both directions equally, which is why it is recorded against the primitive rather than the verb. The fix is to truncate the base name in the staging spelling or fall back to a hash-derived name, which touches the shipped materialize path and wants its own fixture.
+  status: open
+
+- source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
+  summary: `git::resolve`'s `the_three_ways_a_git_can_fail_are_reported_distinctly` fails under whole-suite process pressure while passing in isolation.
+  evidence: Observed once during a full three-crate `cargo test` run on this branch (`881 passed; 1 failed`), then 5/5 passing — once alone with `--exact`, three times over the whole `keeper-sync --lib` binary, and in four subsequent full-suite runs (3395 and 3406 passing, 0 failed). The test writes fake `git` shell scripts and immediately execs them, which is the classic `ETXTBSY`/fork-pressure race when a dozen test binaries fork concurrently. It touches nothing story 56.4 changed; what the story contributed is 39 more tests and therefore more concurrent forks. The fixture wants the script written, closed and `fsync`ed — or a retry on `ETXTBSY` — before the exec.
+  status: open
+
+- source_spec: spec-56-5-it-lets-go-a-day-after-it-landed
+  summary: The release sweep pays a whole-file hash and a remote round trip per candidate before reaching the `OpenUnknown` refusal, so on every production host today each pass spends its whole byte budget to make no progress at all.
+  evidence: `Engine::release_resolved` runs `lfs::stage::content_oid` and `Engine::remote_serves` before `platform.open_file_state`, which story 56.4 chose deliberately — the open-file answer is "the answer most likely to have changed while the steps above ran". `OpenFileState::Unknown` is, however, a statement about the *platform* and not about a path (its own doc says no platform answers it yet), so a single capability probe per pass would let the sweep decline before hashing anything, and the cost is real: up to `RELEASE_BUDGET_BYTES` of reads and a budget's worth of round trips per successful sync, forever, on every host, for zero releases. It is recorded rather than fixed because the probe's effect is not observable from a test — the candidate file survives either way — and this epic's own testing rule is that an unassertable change to the verb that deletes data is exactly the change not to make. It wants either a `TestPlatform` call counter (so "did not hash" becomes assertable) or a platform that answers the open-file question, at which point the whole question disappears.
+  status: open
+
+- source_spec: spec-56-5-it-lets-go-a-day-after-it-landed
+  summary: A folder config layer that fails validation is discarded whole, so any `Allowed` field's committed value silently reverts to the profile's default rather than to the value the file asked for.
+  evidence: `profile::folder::in_force` applies `FolderTier::apply`, which returns the layer or a fault for the whole file — so one unknown key or one out-of-range number anywhere in `.keeper/keeper.toml` drops every key in it, and the profile record's defaults take over on every clone that reads the file. Story 56.5 fixed the direction that loses data for the one field whose default deletes, by declining the release sweep when `folder_config_is_faulted` reports a fault against that folder's own layer paths — but the general shape remains for `virtualPatterns`, `virtualOverBytes`, `lfsThresholdBytes` and every future `Allowed` field, and the fault is only visible on the settings surface. The honest fix is per-key rather than per-file refusal (keep the keys that parse, refuse and name the ones that do not), which changes what a fault *means* for every consumer of the tier and needs its own story and its own fixtures.
+  status: open
+
+- source_spec: spec-56-5-it-lets-go-a-day-after-it-landed
+  summary: No test drives the two release clocks through the writers production actually calls, because the integration fixture has to keep keeper's committer off the paths whose provenance each test plants.
+  evidence: `tests/release_sweep.rs` seeds content into the worktree behind keeper's back, which no real arrival does, so the fixture excludes those names from the committer — otherwise keeper's scan meets every seeded path as new local content and `note_local_authorship` correctly overwrites the provenance the test is about. The consequence is that `commit_local` → `note_local_authorship` and `do_lfs` → `note_unit_synced` are covered only at the `db` layer plus a read of the call sites; the wiring itself, including the stale-unit oid check and the post-commit ordering, has no end-to-end fence. Closing it means a fixture that reaches a materialized state the way production does — a real pull into a second clone, or a real commit-then-upload against a filesystem remote — which is a fixture shape this suite does not have yet and which story 56.6's `verify` work will need for its own reasons.
+  status: open
+
+- source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
+  summary: `VerifyReport::virtual_paths` reaches `keeper-syncd` and nothing else, so the desktop surface cannot tell a clean folder from one where ten thousand paths were excused.
+  evidence: `sync_verify` (`keeper/src/sync_ipc.rs`) flattens only `report.bad` into `Vec<String>`, so the Settings pane renders `SYNC_VERIFY_CLEAN_SENTENCE` and nothing else after a pass that excused most of the folder. The field's own doc says a row nobody reports anywhere is indistinguishable from a check that stopped running, and that guarantee is honoured on the CLI alone. Carrying the count to the app needs a wire type and a generated binding, which story 56.6 declared a non-goal (`git status --porcelain -- src/lib/ipc/gen` must stay empty) because 56.7 owns the row states and 56.9 owns the surface that reads them. The sentence was reworded so it no longer promises what the pass does not check, which is the honest half of the fix; the count itself belongs with the states.
+  status: open
+
+- source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
+  summary: `Engine::verify` is no longer strictly read-only for a folder that carries a virtualization policy: it opens the repository, which can clear a stale `index.lock` and rewrite `.git/config`.
+  evidence: The two-fact excuse needs the index, so `verify` now calls `git::repo::open`, whose door deliberately does housekeeping — `release_stale_index_lock` deletes an `index.lock` older than 60 s, `release_stale_ref_locks` does the same for refs, and `drop_foreign_lfs_driver` rewrites `.git/config` (the DW-140/DW-206 guards). `verify` is the one pass that takes no reservation, so it is the most likely to run beside a keeper commit or a user's own `git`. Narrowed rather than removed: a folder whose policy tier is `Unset` never opens the repository at all, so the overwhelming majority of folders are unaffected, and the comment claiming the pass only reads was corrected. A read-only open (or a reservation for verify) is a change to `git::repo::open`'s contract or to the engine's locking, not to this story.
+  status: open
+
+- source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
+  summary: A FIFO, socket or device node standing where a missing LFS object's path should be still reaches `lfs::stage::clean`, whose `File::open` blocks forever on a FIFO.
+  evidence: The new gate asks `lfs::stage::worktree_pointer`, which answers `None` for anything that is not a regular file (`!meta.is_file()`), so a non-regular file falls through to the `clean` arm exactly as it did before this story. Pre-existing — `republish_missing_objects` has always called `clean` on whatever stood at the path — and the fix is the same `Metadata::is_file` filter `copy.rs` already applies before it opens anything (`classify`'s non-regular refusal), applied at the repair site. Left out here because the story's gate is about pointer text and widening it to a general "is this openable" guard is a change to the repair path's own contract, which has no other test coverage.
+  status: open
+
+- source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
+  summary: A verified copy started while its folder is syncing refuses every virtual path with `SyncError::Busy`, and which paths refuse depends on where the ~1 Hz supervisor happens to be.
+  evidence: `Engine::materialize_entry` takes the per-profile reservation and answers `SyncError::Busy` when the tick holds it, and the copy renders that sentence as the entry's refusal. The reservation is taken and released per path, so the same copy of the same folder run twice can produce different sets of copied and refused files, and the job still settles `Done`. The direction is safe — a refusal, never a stub — and it is named in the story's own I/O matrix, but a copy is the operation a user reaches for when they want a complete second copy. A bounded retry per path, or one job-level refusal instead of N entry-level ones, is a policy decision about the copy verb rather than a defect in the hydration seam.
+  status: open
+
+- source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
+  summary: `LfsMode::PointerOnly` keeps a whole folder's content as pointers by profile-wide configuration, and `verify` still reports every one of those paths as a fault unless a per-path policy also authorizes it.
+  evidence: The excuse story 56.6 built is deliberately per path — the index plus `VirtualPolicy`, which AD-122 requires to be a separate type precisely because `LfsMode` is profile-wide and the ask is per path — so a folder set to `PointerOnly` with no `.keepervirtual` and no `virtualPatterns` produces the same wall of `LFS object … is missing locally` rows it produced before this story. Pre-existing (the mode shipped long before the policy) and deliberately not folded into the excuse conditions, because making the mode an authorization would tie the per-path selector back to the profile-wide lever that AD-122 exists to keep it away from. The honest resolution is for the mode to compile into a policy that authorizes everything, which is a change to how `VirtualPolicy` is built rather than to how `verify` reads it.
+  status: open
+
+- source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
+  summary: Two suites flake under heavy parallel load on the dev box — one Rust suite in the `keeper-sync`/`keeper-core`/`keeper-syncd` run and `files-pane.test.tsx > waits for a real list before deciding a profile is gone` — and neither reproduces in isolation.
+  evidence: Observed twice across roughly six full gate runs of the epic-56 stack, on a machine simultaneously running vitest's six workers and a cargo test job. Neither failure printed a `failures:` block in the captured window, and four consecutive re-runs (two Rust, two frontend) were clean, including three isolated runs of the new `virtual_state_is_not_a_fault` suite (18 passed each time). The frontend test predates this epic and exists on `main`. Not diagnosed and deliberately not silenced: a flake named with its evidence is worth more than a `#[ignore]`, and the right fix is to find the shared resource — most likely a port, a temp path or a CPU-starved timeout — rather than to retry the assertion.
+  status: open
+
+- source_spec: spec-56-7-the-row-says-what-it-is-and-what-a-delete-will-do
+  summary: The Files row's sync mark is not in the row's `aria-describedby`, so the sentence naming a file's sync state — including the three new virtual states — is never announced while a screen reader navigates the tree.
+  evidence: The row carries `aria-label={node.name}`, and `files-pane.tsx`'s own comment states the rule this creates: "aria-label on the row replaces its subtree's contribution to the name, so a size or a vault marker rendered only as a child would be on screen and absent from the accessibility tree entirely". `countId`, `sizeId`, the new `mtimeId` and `roleId` are all in the list; `<SyncStatusMark>` has no id and is in none of them. Pre-existing — `session-tree.tsx` carries the identical omission under the identical comment, and the mark has had its own `aria-label` and `title` since 44.17, so it is reachable by direct inspection and only unreachable during row navigation. Story 56.7's tests query the mark element directly and cannot see this. The fix is a `syncId` in both trees, exactly as `mtimeId` was added, and it belongs in one pass over both surfaces rather than half-applied here.
+  status: open
+
+- source_spec: spec-56-7-the-row-says-what-it-is-and-what-a-delete-will-do
+  summary: A queued LFS download over a path whose worktree still holds the real bytes reads `Waiting` and says the content is still on the remote, while the bytes are on this disk.
+  evidence: `classify`'s arriving-content rung requires the worktree to hold pointer text, so an `Incoming` reason over non-pointer bytes falls to `Waiting { Some(Incoming) }`, whose sentence is "This file's content is still on the remote and has not been downloaded yet." `Engine::pending` models exactly this state — it computes `replacing` from `db::materialized_paths`, i.e. "a download queued for a path this machine already holds content for". Both the classification and the sentence are unchanged by story 56.7, so this is pre-existing; it is narrow because a local modification takes precedence over the inbound half in `Engine::pending` and a pull writes the new pointer before the download is claimed. The proposed fix — preferring the ledger over `Waiting` on that branch — inverts `classify`'s documented precedence rule that waiting beats virtual and materialized, which is a decision about the ladder rather than a patch to it.
+  status: open
+
+- source_spec: spec-56-7-the-row-says-what-it-is-and-what-a-delete-will-do
+  summary: `Engine::materialized_paths` reads a profile's whole `materialized` table on every folder expansion, unfiltered by the cone being listed.
+  evidence: `db::materialized_paths` is `SELECT path FROM materialized WHERE profile_id = ?1` with no prefix filter and no cap, so its cost grows with everything the profile has ever hydrated and not released rather than with the folder on screen — while `list_resolved` caps itself at `LISTING_CAP` and `browse_marks_for` exists precisely because per-listing engine work was too expensive on this hardware. Narrowed rather than removed in this story: the read is skipped entirely when the pending view is unavailable, it is the same statement and the same table `Engine::pending` already reads once per marks walk, and it is taken exactly where `list_profiles` is taken two statements above it. A cone-scoped reader (`AND (path = ?2 OR path LIKE ?2 || '/%')`) is a new `db.rs` accessor beside `materialized_paths` rather than a change to it, because `Engine::pending`'s `replacing` flag needs the whole set.
+  status: open
+
+- source_spec: spec-56-9-the-button-and-the-time-you-have-left
+  summary: The Files row offers Release on a pinned row and on a folder whose LFS mode releases nothing, where the wire already carries Rust's word saying the request will be refused.
+  evidence: `files-pane.tsx` gates Release and Pin on `entry.sync.status === "materialized"` and on nothing else, though the same row is holding `release.hold`. `Engine::dehydrate_entry` refuses a pinned path (`ContentRefusal::Pinned`) and refuses on the mode gate (`AlwaysMaterializes` / `LfsDisabled`), so for `hold === "Pinned"` and for both mode causes the press is a guaranteed red `role="alert"` from a control the pane had the information to withhold. Deliberately not fixed here for two reasons that pull the other way: epic 56's own acceptance criterion is that a materialized row offers Release and Pin, unconditionally; and on every host today `SyncPlatform::open_file_state` answers `Unknown`, so EVERY manual release already refuses with `OpenUnknown` — which story 56.4 recorded as its deliberate consequence — so a "hide the verb when it will refuse" rule would hide it always. The honest fix is a disabled-with-a-reason affordance, which needs `FilesRowAction` to grow a `disabled` field and both render sites to learn it, and which should land with the platform's real open-file answer rather than before it. `hold === "Not sent"` is NOT in this class: `dehydrate_entry` takes its remote proof fresh, so a row whose `synced_at_ms` memo was never written may still release.
+  status: open
+
+- source_spec: spec-56-9-the-button-and-the-time-you-have-left
+  summary: `ReleaseSchedule::hold()` renders the word "Kept" for a row whose Release works and for a row whose Release cannot, and nothing beside the button distinguishes them.
+  evidence: `Indefinite` (the folder's `releaseTtlMs` is `0`) and the two mode causes all answer `"Kept"`. But `dehydrate_entry` has no TTL check anywhere — its gates are containment, tracking, subpaths, stat, pointer identity, size, the pin and content identity — so a `releaseTtlMs = 0` row releases on request, while a mode-gated row is refused. The sentences differ and are what a reader gets from the tooltip and the `sr-only` phrase, so nothing is misstated; what is missing is a word that separates "no automatic clock, but you may still ask" from "this folder does not release at all". Worth a distinct word rather than a longer sentence, and worth deciding together with the deferred disabled-verb affordance above, since the two answer the same question from opposite sides.
+  status: open
+
+- source_spec: spec-56-9-the-button-and-the-time-you-have-left
+  summary: `sync_browse` now scans the profile's whole `materialized` table twice for one directory listing — once for the marks and once for the deadlines.
+  evidence: `sync_ipc::sync_browse` reads `engine.materialized_paths(&id)` for `browse::MaterializedView` and then `engine.release_schedules(&id)` for the countdown; both are unfiltered scans of the same table for the same profile (`db::materialized_paths`, `db::materialized_rows`), and the first read's own comment already calls itself "an unfiltered scan of everything this profile has ever hydrated, paid on every folder expansion". The keys `release_schedules` returns are exactly the keys `materialized_paths` returns, so one read could feed both views. Not folded in this story because it changes the failure coupling deliberately established by 56.7: a schedules read that fails currently costs the rows their countdown only, while a shared read would also cost them their `Materialized` mark, and the fix lands in the one crate that cannot be compiled on this host. It should be taken together with the cone-scoped reader already deferred by 56.7, which would make both reads cheap rather than making one of them disappear.
+  status: open
+
+- source_spec: spec-56-9-the-button-and-the-time-you-have-left
+  summary: `Engine::dehydrate_entry` hashes the whole file to prove content identity while it is an `async fn`, so awaiting it from a Tauri command blocks a runtime worker for the length of a multi-gigabyte read.
+  evidence: `release_resolved` calls `content_oid`, a whole-file SHA-256, with no `spawn_blocking` and no yield point, inside an `async fn`. The shape is pre-existing — the release sweep already calls it from `mark_synced` on the engine's own runtime — but story 56.9 adds the first INTERACTIVE caller: `sync_release_entry` must `.await` it directly, because `spawn_blocking` cannot host a future. `sync_materialize_entry` beside it does not have the problem, precisely because `materialize_entry` is synchronous and is therefore already on the blocking pool. The fix belongs in `keeper-sync`, where the hash is: either `block_in_place` around the identity proof or a `spawn_blocking` inside `release_resolved`, so both doors get it and neither has to remember.
+  status: open
+
+- source_spec: spec-56-9-the-button-and-the-time-you-have-left
+  summary: A second Files row verb pressed before the first resolves clears the first's refusal sentence and can replace it with "the folder is already syncing".
+  evidence: `runRowVerb` calls `setWriteError(null)` before every attempt and there is one `writeError` slot for the pane, so two presses in flight together end with whichever rejected last — and the engine's per-profile reservation means the second is likely to reject `Busy` rather than on its own merits, so the sentence the person reads is about contention rather than about their file. The three verbs the pane already had share the same single sink and the same absence of an in-flight guard, so this is the shape of the surface rather than something 56.9 introduced; what 56.9 changed is that these verbs now REPORT rather than swallow, which is what makes the collision visible. The fix is one in-flight ref per pane (or per row) and a decision about whether a press during flight should queue, replace or be ignored — a small design question worth asking once for all six verbs.
+  status: open
+
+- source_spec: spec-56-8-a-virtual-files-chapter
+  summary: `docs/sync.md` §13 says an `ls-files` row carries a modification time and what the ledger recorded, but the human row prints only state, size, path, oid and `[pinned]` — those four fields exist only under `--json`.
+  evidence: `keeper-syncd/src/commands.rs:1395-1401` formats the human row as `"  {state:<12}  {size:>9}  {path}  {oid}{pinned}"` and nothing else, while `mtimeMs`, `materializedAtMs`, `lastUsedMs` and `syncedAtMs` appear only in the serialized `LfsFile` (`keeper-sync/src/lfs/listing.rs:109`). The claim at `docs/sync.md:1274-1276` ("plus a modification time and, once a path has been materialized, what the ledger recorded about it") therefore describes the JSON document while sitting in a paragraph about the printed rows, and an operator reading it will run the verb without `--json` and not find them. Pre-existing: written by story 56.2, surfaced while writing §9. Not fixed here because the honest repair is a choice between two changes of different size — reword the sentence to name `--json`, or print an mtime column in the human row, which is a behaviour change a docs branch must not make.
+  status: open
+
+- source_spec: spec-56-8-a-virtual-files-chapter
+  summary: `docs/sync.md` §13 states "Every other refusal exits `1`" for `dehydrate`, but an unknown or ambiguous profile selector on the same verb exits `2`.
+  evidence: `sync_exit_code` (`keeper-syncd/src/commands.rs:127-176`) maps `SyncError::Refused(_)` to `EXIT_FAILURE = 1` and `SyncError::Config(_)` to `EXIT_CONFIG = 2`, and the profile resolver raises `Config` for both "no such profile" and "`{wanted}` matches {n} folders; name the one you mean by its id" — reachable on `materialize`, `dehydrate`, `pin` and `unpin`. The sentence at `docs/sync.md:1318` is true of every refusal and false of the selector error beside it, so a script that branches on `1` versus non-zero mis-reads a typo'd profile name as a refusal. Pre-existing: written by story 56.4, surfaced while auditing §9's exit-code claims against §13. Not fixed here because the exit-code contract belongs to §13 and this branch is scoped to §9 plus the sentences epic 56 falsified.
+  status: open

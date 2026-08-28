@@ -2,7 +2,7 @@
 import type { NoteRowVm } from "./NoteRowVm";
 
 /**
- * One window of the note list, with the total behind it (FR-103).
+ * One window of the note list, with the counts behind it (FR-103, FR-166).
  */
 export type NoteListVm = { 
 /**
@@ -10,11 +10,26 @@ export type NoteListVm = {
  */
 rows: Array<NoteRowVm>, 
 /**
- * Total matching notes, so the scrollbar is honest about a window it has not
- * been sent.
+ * How many notes this lens SELECTS, so the scrollbar is honest about a
+ * window it has not been sent and the count is honest about a vault the
+ * viewport never rendered (Story 44.11).
+ *
+ * Never a count of rendered rows and never a count of the page: it is
+ * [`crate::notes::counts::Selection::total`], taken over the whole matched
+ * set before any offset or window.
  */
 total: number, 
 /**
- * Offset of `rows[0]` within the total.
+ * How many notes the lens MATCHED, before the space's `keeper.limit`
+ * declined any (Story 44.11, DW-163).
+ *
+ * Equal to `total` for every lens with no cap in force, which is every
+ * list outside a space and every space that sets no limit. When it is
+ * larger, the surface says both numbers — a cap that quietly shrank a
+ * count is the same defect as a count of the rendered window.
+ */
+matched: number, 
+/**
+ * Offset of `rows[0]` within `total`.
  */
 offset: number, };

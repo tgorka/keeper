@@ -42,7 +42,6 @@ import type { BridgeLoginVm, LoginFieldVm } from "@/lib/ipc/client";
 import { bridgeBotRoom } from "@/lib/ipc/client";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
-import { cn } from "@/lib/utils";
 
 /** How long "Linked ✓" shows before the Sheet auto-advances (ms). */
 const SUCCESS_AUTO_ADVANCE_MS = 1500;
@@ -363,7 +362,7 @@ function SuccessPanel({ networkName }: { networkName: string }) {
       className="flex flex-col items-center gap-2 py-8 text-center"
       data-slot="bridge-login-success"
     >
-      <p className={cn("font-medium text-lg", "text-bridge-healthy")}>Linked ✓</p>
+      <p className="font-heading text-title text-bridge-healthy">Linked ✓</p>
       <p className="text-muted-foreground text-sm">{networkName} is connected.</p>
     </div>
   );

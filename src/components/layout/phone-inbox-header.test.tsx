@@ -78,21 +78,37 @@ describe("PhoneInboxHeader", () => {
     expect(leadingDrawerStore.getState().isOpen).toBe(true);
   });
 
-  it("shows a bridge-health dot only when the worst state is unhealthy", () => {
-    // healthy → quiet (no dot).
+  it("shows a bridge-health lamp only when the worst state is unhealthy", () => {
+    // healthy → quiet (no lamp).
     bridgeHealthStore.getState().applySnapshot(healthSnapshot("healthy"));
     const { rerender } = render(<PhoneInboxHeader />);
     expect(document.querySelector('[data-slot="bridge-health-dot"]')).toBeNull();
 
-    // degraded → the amber/degraded dot appears with an accessible label.
+    // The two unhealthy states must differ by SHAPE, not only by amber-versus-
+    // red, and the word must reach the accessibility tree. It reaches it
+    // through the button's name rather than the lamp's own text, because an
+    // explicit `aria-label` on the button replaces whatever is inside it — the
+    // trap the old `AvatarBadge` fell into by putting `aria-label` on a
+    // role-less span, where most screen readers never announced it at all.
     bridgeHealthStore.getState().applySnapshot(healthSnapshot("degraded"));
     rerender(<PhoneInboxHeader />);
-    expect(screen.getByLabelText("Action needed")).toBeInTheDocument();
+    expect(document.querySelector('[data-slot="bridge-health-dot"]')).toHaveAttribute(
+      "data-state",
+      "working",
+    );
+    expect(
+      screen.getByRole("button", { name: "Open navigation, Action needed" }),
+    ).toBeInTheDocument();
 
-    // disconnected → the disconnected dot.
     bridgeHealthStore.getState().applySnapshot(healthSnapshot("disconnected"));
     rerender(<PhoneInboxHeader />);
-    expect(screen.getByLabelText("Disconnected")).toBeInTheDocument();
+    expect(document.querySelector('[data-slot="bridge-health-dot"]')).toHaveAttribute(
+      "data-state",
+      "fault",
+    );
+    expect(
+      screen.getByRole("button", { name: "Open navigation, Disconnected" }),
+    ).toBeInTheDocument();
   });
 
   it("keeps the status cluster quiet when nothing is monitored", () => {

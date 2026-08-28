@@ -1,5 +1,6 @@
 /**
- * `[[` wikilink completion and create-on-Enter (Story 37.7, FR-108).
+ * The `[[` wikilink grammar, plus completion and create-on-Enter (Story 37.7,
+ * FR-108).
  *
  * The candidate list comes from the core link graph over `notes_link_targets`,
  * never from anything the webview keeps — the index lives in Rust and a second
@@ -9,6 +10,11 @@
  * not an error and not a dead end. Accepting it writes the note through the
  * ordinary writer and links it, so following a link you have just invented is
  * the same act as following one that was already there.
+ *
+ * {@link WIKILINK} lives here rather than beside the decorations that use it
+ * because it is now read by two of them — the live-preview renderer and the
+ * recording-embed widget — and a wikilink that the renderer and the embed
+ * disagreed about would be a link that renders one way and resolves another.
  */
 import type {
   Completion,
@@ -21,6 +27,34 @@ import { notesCreate, notesLinkTargets } from "@/lib/ipc/client";
 
 /** The text between `[[` and the caret. */
 const OPEN_WIKILINK = /\[\[([^[\]|]*)$/;
+
+/**
+ * `[[target]]`, `[[target|alias]]` and the `![[…]]` embed form, anywhere in a
+ * line. Lezer's markdown grammar knows nothing about wikilinks, so this is the
+ * whole of keeper's knowledge of the syntax.
+ *
+ * Group 1 is the target, group 2 the alias when there is one, and a leading `!`
+ * survives in group 0 — which is how a caller tells an embed from a link
+ * without a second pattern.
+ *
+ * Stateful (`g`): reset `lastIndex` or use `matchAll`, never `test`.
+ */
+export const WIKILINK = /!?\[\[([^[\]|]+)(?:\|([^[\]]+))?]]/g;
+
+/** The attribute a click handler reads the link target back out of. */
+export const WIKILINK_ATTR = "data-keeper-wikilink";
+
+/**
+ * The attribute a click handler reads an ORDINARY markdown link's destination
+ * out of (Story 45.18).
+ *
+ * Beside {@link WIKILINK_ATTR} because the two are read by one handler and
+ * differ only in what they carry — a note's name, or a URL. Separate from the
+ * `title` the same decoration already sets: `title` is what a hover shows and a
+ * user-visible string is not a data channel, so a future story that shortens a
+ * long destination for display would silently break following it.
+ */
+export const LINK_ATTR = "data-keeper-link";
 
 /** Replace the typed name with `name]]`, swallowing brackets already closed
  *  for us, and park the caret after the link. */
@@ -78,8 +112,12 @@ export function wikilinkSource(
             template: null,
             dest: null,
             tags: [],
+            // A wikilink names a note, not a space. The note it stubs out has
+            // to be reachable by the link that was just written and by nothing
+            // else, so it inherits nothing.
+            space: null,
           }).then((created) => {
-            onCreated?.(created.id);
+            onCreated?.(created.note.id);
           });
         },
       });

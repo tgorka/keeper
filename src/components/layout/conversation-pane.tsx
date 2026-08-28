@@ -1476,7 +1476,13 @@ export function ConversationPane({
   }, [items, onEdit]);
 
   return (
-    <main className="flex h-full min-w-0 flex-1 flex-col bg-background">
+    // The seam against the detail panel is this pane's, not the panel's:
+    // DESIGN.md → Elevation & Depth gives a boundary to the earlier sibling,
+    // and `last:` cancels it in the far commoner arrangement where the detail
+    // panel is closed or floating in a Sheet and there is nothing to the right
+    // but the window. Same pixels either way; one owner, so the next person to
+    // add a right-hand neighbour cannot accidentally draw a second line.
+    <main className="flex h-full min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0">
       {showHeader && (
         <div className="flex shrink-0 items-center justify-between gap-2 border-border border-b p-2">
           <div className="flex min-w-0 items-center gap-2">
@@ -1504,7 +1510,7 @@ export function ConversationPane({
                     roomId: selectedRoomId,
                   })
                 }
-                className="focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+                className=""
               >
                 <Download aria-hidden="true" />
               </Button>
@@ -1517,7 +1523,7 @@ export function ConversationPane({
               aria-label="Toggle detail panel"
               aria-pressed={detailOpen}
               onClick={onToggleDetail}
-              className="shrink-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+              className="shrink-0"
             >
               <PanelRight aria-hidden="true" />
             </Button>

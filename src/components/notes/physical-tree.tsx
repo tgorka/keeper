@@ -17,6 +17,12 @@
  * vault's folder tree is unbounded and walking all of it to render a collapsed
  * group would be a cold scan the user did not ask for.
  *
+ * **The fold is remembered** (Story 47.3). It still arrives collapsed on a
+ * keeper that has never touched it — an open default would make every mount of
+ * the notes surface a cold directory read — but once it is opened it stays
+ * open across surface switches and restarts, in the notes rail's own cookie
+ * alongside Spaces and Tags.
+ *
  * Selecting a folder sets a folder scope. That scope is the one the list does
  * NOT serve from `notes_list`: a vault-relative directory is not one of the
  * query's axes, so FR-106's own command returns the folder's rows and the pane
@@ -24,8 +30,10 @@
  */
 import { ChevronDown, ChevronRight, Folder } from "lucide-react";
 import { useEffect, useState } from "react";
+import { FoldSection } from "@/components/layout/sidebar-group";
 import { notesTree } from "@/lib/ipc/client";
 import { notesFiltersStore, useNotesFiltersStore } from "@/lib/stores/notes-filters";
+import { notesRailFoldStore, useNotesRailFold } from "@/lib/stores/notes-rail-fold";
 import { cn } from "@/lib/utils";
 
 /** Join a parent directory and a child name into a vault-relative path. */
@@ -134,7 +142,11 @@ function FolderNode({
 }
 
 export function PhysicalTree({ vaultId }: { vaultId: string | null }) {
-  const [open, setOpen] = useState(false);
+  // Story 47.3: the fold lives in the rail's cookie, not in this component. It
+  // was a `useState` here, which meant the tree re-collapsed on every surface
+  // switch — and it was the ONLY foldable thing in the whole notes rail, which
+  // is how a rail with three sections shipped with one control.
+  const folded = useNotesRailFold((state) => state.groups.files);
   const [dirs, setDirs] = useState<string[] | null>(null);
   const activePath = useNotesFiltersStore((s) => (s.scope.kind === "folder" ? s.scope.path : null));
 
@@ -149,7 +161,10 @@ export function PhysicalTree({ vaultId }: { vaultId: string | null }) {
   }, [vaultId]);
 
   useEffect(() => {
-    if (!open || dirs !== null || vaultId === null) {
+    // Still lazy, and now lazy against the remembered fold: a keeper that comes
+    // up with Files shut does not walk the vault's root, and one that comes up
+    // with it open reads exactly one level, as a click always has.
+    if (folded || dirs !== null || vaultId === null) {
       return;
     }
     let cancelled = false;
@@ -167,25 +182,24 @@ export function PhysicalTree({ vaultId }: { vaultId: string | null }) {
     return () => {
       cancelled = true;
     };
-  }, [open, dirs, vaultId]);
+  }, [folded, dirs, vaultId]);
 
   if (vaultId === null) {
     return null;
   }
 
   return (
-    <section aria-label="Files" className="flex min-h-0 shrink-0 flex-col px-2 pb-1">
-      <button
-        type="button"
-        aria-expanded={open}
-        className="flex items-center gap-1 px-2 py-1 text-left font-medium text-muted-foreground text-xs uppercase tracking-wide outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
-        onClick={() => setOpen((shown) => !shown)}
-      >
-        {open ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
-        Files
-      </button>
-      {open && dirs !== null && (
-        <div aria-label="Folder tree" className="max-h-48 overflow-y-auto" role="tree">
+    <FoldSection
+      label="Files"
+      icon={folded ? ChevronRight : ChevronDown}
+      folded={folded}
+      onToggle={() => notesRailFoldStore.getState().toggleGroup("files")}
+      id="notes-rail-files"
+      className="shrink-0"
+      bodyClassName="max-h-48 overflow-y-auto"
+    >
+      {dirs !== null && (
+        <div aria-label="Folder tree" role="tree">
           {dirs.map((dir, index) => (
             <FolderNode
               key={dir}
@@ -200,6 +214,6 @@ export function PhysicalTree({ vaultId }: { vaultId: string | null }) {
           ))}
         </div>
       )}
-    </section>
+    </FoldSection>
   );
 }

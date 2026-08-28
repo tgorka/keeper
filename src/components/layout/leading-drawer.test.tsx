@@ -99,10 +99,10 @@ describe("LeadingDrawer", () => {
     expect(screen.getByRole("button", { name: /^Chats/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^Approvals/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^Bridges/ })).toBeInTheDocument();
-    // The account footer's account switcher row is present (settings gear lives
+    // in its per-row menu). Named by its menu since Story 55.10: the row
     // in its per-row menu).
     expect(
-      screen.getByRole("button", { name: `Filter inbox to ${account.userId}` }),
+      screen.getByRole("button", { name: `Account menu for ${account.userId}` }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add account" })).toBeInTheDocument();
   });
@@ -127,7 +127,13 @@ describe("LeadingDrawer", () => {
   it("closes when the account filter changes while open", async () => {
     renderDrawer();
     await openDrawer();
-    fireEvent.click(screen.getByRole("button", { name: `Filter inbox to ${account.userId}` }));
+    // Driven through the store, not through whatever control sets it today:
+    // this test is about the drawer CLOSING when the filter changes, and
+    // routing it through a button made it fail when the button moved into a
+    // menu (Story 55.10) — a false alarm about a contract that had not moved.
+    act(() => {
+      accountsStore.getState().toggleFilter(account.accountId);
+    });
     expect(accountsStore.getState().filterAccountId).toBe(account.accountId);
     expect(leadingDrawerStore.getState().isOpen).toBe(false);
   });

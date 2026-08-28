@@ -20,7 +20,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, SyncError};
-use crate::profile::{ProfileState, SyncProfile};
+use crate::profile::{self, ProfileState, SyncProfile};
 use crate::stability::{FileSample, PersistedEntry};
 
 pub const DB_FILE_NAME: &str = "sync.db";
@@ -123,9 +123,100 @@ fn migrate(conn: &Connection) -> Result<()> {
             id          TEXT NOT NULL,
             label       TEXT NOT NULL
         );
+
+        -- Migrations that rewrite CONTENT rather than schema, and must
+        -- therefore run exactly once. Schema migrations need no marker: an
+        -- `ALTER TABLE ... ADD COLUMN` guarded by the column list is its own
+        -- idempotence. A row rewrite is not, because after it runs the old
+        -- value becomes a legitimate one again.
+        -- Paths this clone has ever held real content for.
+        --
+        -- The only way to tell an arriving object that REPLACES something from
+        -- one that is simply new here, and it cannot be derived: a queued
+        -- download always finds pointer text in the worktree, and git history
+        -- answers a different question — a file added a week ago and never
+        -- fetched here is new to this machine however old it is upstream.
+        --
+        -- One row per path, written when content lands. Cheap to keep and the
+        -- only fact that makes the distinction true.
+        --
+        -- `last_used_ms`, `synced_at_ms`, `pinned`, `oid` and `size_bytes`
+        -- (Story 56.2) and `local_origin` (Story 56.5) are missing here on
+        -- purpose, exactly as `activity`'s late columns are:
+        -- `ensure_materialized_columns` adds them, so a fresh install and one
+        -- that predates them reach the same schema down one path.
+        CREATE TABLE IF NOT EXISTS materialized (
+            profile_id  TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            at_ms       INTEGER NOT NULL,
+            PRIMARY KEY (profile_id, path)
+        );
+
+        CREATE TABLE IF NOT EXISTS meta (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL
+        );
         "#,
     )?;
     ensure_activity_columns(conn)?;
+    ensure_journal_columns(conn)?;
+    ensure_materialized_columns(conn)?;
+    ensure_prune_default(conn)?;
+    Ok(())
+}
+
+/// The marker naming the one-shot in [`ensure_prune_default`].
+const PRUNE_DEFAULT_MARKER: &str = "lfs_prune_local_default_on";
+
+/// Carry a store written before releasing the redundant LFS object copy became
+/// the default (`lfs_prune_local`).
+///
+/// A changed serde default cannot reach an install that already exists: a
+/// profile is stored as its serialization, and serialization writes every
+/// field, so every row written before the change holds a literal
+/// `"lfsPruneLocal": false`. Without this, the new default would apply to new
+/// folders only — and the folders with a second copy worth reclaiming are
+/// precisely the old ones.
+///
+/// **Exactly once**, marked in `meta`, because `false` has two meanings after
+/// the change: the old default, which this rewrites, and a deliberate opt-out,
+/// which must survive every later `open`. Running once is the only thing that
+/// keeps them apart. `keeper-syncd` applies its `config.toml` *after* `open`,
+/// so a profile that asks for `lfsPruneLocal = false` there is written back on
+/// the same boot and stays that way.
+///
+/// It does not touch `updated_ms`: the operator changed nothing, and a folder
+/// reporting an edit nobody made is a worse lie than a stale timestamp.
+fn ensure_prune_default(conn: &Connection) -> Result<()> {
+    let applied: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [PRUNE_DEFAULT_MARKER],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if applied.is_some() {
+        return Ok(());
+    }
+    // `json_set` rather than a read-modify-write through serde: it preserves
+    // every other key byte for byte, including ones written by a keeper newer
+    // than this one, which a round trip through `SyncProfile` would drop.
+    let moved = conn.execute(
+        "UPDATE profiles
+            SET json = json_set(json, '$.lfsPruneLocal', json('true'))
+          WHERE json_extract(json, '$.lfsPruneLocal') = 0",
+        [],
+    )?;
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+        (PRUNE_DEFAULT_MARKER, moved.to_string()),
+    )?;
+    if moved > 0 {
+        tracing::info!(
+            profiles = moved,
+            "releasing the redundant local LFS object copy is now the default",
+        );
+    }
     Ok(())
 }
 
@@ -160,6 +251,720 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Add the late nullable columns `materialized` has grown, if they are not
+/// there yet (Stories 56.2 and 56.5).
+///
+/// Six facts the ledger has to hold before anything can decide what to
+/// release: when the content was last *read* (`last_used_ms`), when the remote
+/// last confirmed it holds the object (`synced_at_ms`), whether the owner has
+/// asked for this path to stay on the machine (`pinned`), the object's
+/// identity and length (`oid`, `size_bytes`) so a row still answers after the
+/// worktree stops holding a pointer to consult, and which way the content
+/// travelled (`local_origin`, Story 56.5) so the release sweep knows which of
+/// the two clocks applies to this path.
+///
+/// Literally [`ensure_activity_columns`]'s shape, including the `drop(stmt)`
+/// before the first `conn.execute` — `rusqlite` holds the connection while a
+/// prepared statement lives, so an `ALTER TABLE` issued with the PRAGMA
+/// statement still alive is a borrow error, not a runtime surprise. The one
+/// difference is that these six columns are not all the same type, so the
+/// loop carries the type beside the name rather than hard-coding `INTEGER`.
+///
+/// **Nullable and without a `DEFAULT`, and no `meta` marker.** `NULL` is the
+/// honest reading of every one of them on a pre-existing row: nobody measured
+/// a last use, no remote confirmation was recorded, nothing was pinned. An
+/// `ALTER TABLE ... ADD COLUMN` guarded by the column list is its own
+/// idempotence — the rule stated at the top of [`migrate`] — so a second
+/// `migrate` on the same connection adds nothing and errors on nothing.
+///
+/// `pinned` and `local_origin` are `INTEGER`s read as booleans, which is how
+/// SQLite spells one; [`materialized_rows`] narrows both, so no caller sees
+/// the encoding.
+///
+/// **`NULL` in `local_origin` means *arrived from the remote*, and that is the
+/// truth of the existing data rather than a default** (AD-131). The only two
+/// writers this table had before Story 56.5 — `materialize_landed` and
+/// `materialize_pending` — both publish content *over a pointer*, so every row
+/// that can already exist was written by an arrival. A row this clone authored
+/// carries a `1`, written by [`note_local_authorship`].
+fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
+    // Column 1 of `table_info` is the column name.
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (column, kind) in [
+        ("last_used_ms", "INTEGER"),
+        ("synced_at_ms", "INTEGER"),
+        ("pinned", "INTEGER"),
+        ("oid", "TEXT"),
+        ("size_bytes", "INTEGER"),
+        ("local_origin", "INTEGER"),
+    ] {
+        if !existing.iter().any(|c| c == column) {
+            conn.execute(
+                &format!("ALTER TABLE materialized ADD COLUMN {column} {kind}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Add the journal's late columns — `label` and `urgency` — if they are not
+/// there yet.
+///
+/// A unit's payload says what work to do; the label says what to *call* it
+/// while it is being done, and the urgency says whether anybody is waiting for
+/// it. All three are separate columns because they have different identities:
+/// [`enqueue_unique`] deduplicates on the payload string, so folding either of
+/// the other two into it would make two paths that share one object — the
+/// ordinary case for duplicated content — into two downloads of the same
+/// bytes.
+///
+/// Both nullable and both without a `DEFAULT`, which is the honest reading of
+/// a row written before they existed: no better name than the work itself, and
+/// nobody waiting. `ALTER TABLE ... ADD COLUMN` guarded by the column list is
+/// its own idempotence — the rule stated at the top of [`migrate`] — so this
+/// needs no `meta` marker and a second `migrate` adds nothing.
+///
+/// One column at a time rather than [`ensure_materialized_columns`]' typed-pair
+/// loop: two additions do not earn a table, and `PRAGMA table_info`'s statement
+/// must be dropped before any `conn.execute` runs on the same connection.
+fn ensure_journal_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(journal)")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if !existing.iter().any(|c| c == "label") {
+        conn.execute("ALTER TABLE journal ADD COLUMN label TEXT", [])?;
+    }
+    if !existing.iter().any(|c| c == "urgency") {
+        conn.execute("ALTER TABLE journal ADD COLUMN urgency INTEGER", [])?;
+    }
+    Ok(())
+}
+
+/// Name a queued unit, if it does not have a name yet.
+///
+/// Separate from [`enqueue_unique`] rather than an argument to it, because the
+/// unit that comes back may be one queued earlier: the caller is naming
+/// *whatever will deliver this work*, which is exactly the covering unit that
+/// function returns. `label IS NULL` makes the first path win — with several
+/// paths sharing one object any of them is a truthful thing to display, and a
+/// last-one-wins race would make the line flicker between them.
+pub fn label_unit(conn: &Connection, id: i64, label: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE journal SET label = ?2 WHERE id = ?1 AND label IS NULL",
+        (id, label),
+    )?;
+    Ok(())
+}
+
+/// Mark a queued unit as something somebody is waiting for, and make it
+/// claimable now (Story 56.3).
+///
+/// Two writes rather than one, because "somebody is waiting" is worth nothing
+/// on a row [`claim_ready`] cannot see. Both are narrow, both are by id, and
+/// both are idempotent.
+///
+/// # Why urgency is not a payload field
+///
+/// This is a **separate narrow UPDATE** on whatever id [`enqueue_unique`]
+/// returned, and that is not a style choice. `enqueue_unique` deduplicates on
+/// the serialized payload, so an urgency field inside
+/// [`WorkKind::LfsDownload`] would make the requested unit a *different* unit
+/// from the background one and fetch the same immutable bytes twice — the
+/// defect [`WorkKind::covered_while_running`] records with its own measurement
+/// (106 queued units for 95 distinct objects). The urgency belongs to the row
+/// that will deliver the work, and that row is the covering one.
+///
+/// [`recover_running`] is the second reason it has to live there rather than on
+/// a duplicate: its `MIN(id)` collapse deletes every pending row but the oldest
+/// for a payload, so an urgency written onto a row that was going to be
+/// collapsed would simply vanish at the next restart.
+///
+/// # `MAX`, where `label_unit` is first-writer-wins
+///
+/// The tie-break is inverted on purpose. A label must not flicker — with
+/// several paths sharing one object any of their names is truthful, so the
+/// first one wins. A request must be able to raise a row a background scan
+/// queued minutes ago, and must never be able to lower one another request
+/// raised, so it takes the maximum. `COALESCE` because the column is nullable
+/// for every row written before it existed.
+///
+/// # Why it also lifts a deferral and a backoff
+///
+/// `enqueue_unique` counts `deferred` as cover, and [`claim_ready`] only ever
+/// offers `state = 'pending'`. A request that deduplicated onto a deferred row
+/// — an `LfsDownload` whose removable remote was absent, say — would otherwise
+/// report a unit id for work nothing will claim until an unrelated resume or
+/// volume re-attach happens to run [`undefer_profile`]. The same holds for a
+/// pending row whose `not_before_ms` is a retry backoff in the future. So a
+/// promotion returns the row to `pending` and brings its earliest attempt
+/// forward to now: the person asking is a reason to try again immediately, and
+/// `attempts` is deliberately left alone so a second failure backs off exactly
+/// as far as it would have.
+pub fn promote_unit(conn: &Connection, id: i64, now_ms: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE journal SET urgency = MAX(COALESCE(urgency, 0), ?2) WHERE id = ?1",
+        (id, Urgency::Requested.level()),
+    )?;
+    conn.execute(
+        "UPDATE journal
+            SET state = 'pending', not_before_ms = MIN(not_before_ms, ?2)
+          WHERE id = ?1 AND state IN ('pending', 'deferred')",
+        (id, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Whether anybody is waiting for one unit, read at the moment the answer
+/// matters (Story 56.3).
+///
+/// The journal is the memory, and this is what makes that claim true rather
+/// than decorative: the level is read when the completion arm decides what to
+/// publish, not copied out of the row when the unit was claimed. A request that
+/// arrives while its covering download is already `running` — which
+/// [`WorkKind::covered_while_running`] makes the ordinary case — raises the
+/// urgency of a row the supervisor read minutes ago, and a snapshot taken at
+/// claim time would drop that request on the floor.
+///
+/// A row that is gone reads [`Urgency::Background`]: the only way to be asked
+/// about a deleted row is a completion arm running after [`complete`], and the
+/// conservative answer there is the arrival policy the profile configured.
+pub fn unit_urgency(conn: &Connection, id: i64) -> Result<Urgency> {
+    let level: Option<Option<i64>> = conn
+        .query_row("SELECT urgency FROM journal WHERE id = ?1", [id], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
+        .optional()?;
+    Ok(Urgency::from_level(level.flatten().unwrap_or(0)))
+}
+
+/// Every download this profile is still waiting for: its name, object and size.
+///
+/// Downloads only. An upload is also unfinished work, but the path it carries
+/// is already reported by `git status` as a local change, and listing it twice
+/// under two different sentences would be one fact wearing two hats.
+pub fn queued_downloads(
+    conn: &Connection,
+    profile_id: &str,
+) -> Result<Vec<(Option<String>, String, u64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT label,
+                json_extract(payload, '$.oid'),
+                json_extract(payload, '$.size')
+           FROM journal
+          WHERE profile_id = ?1
+            AND kind = 'lfsDownload'
+            AND state != 'parked'
+          ORDER BY id",
+    )?;
+    let rows = stmt.query_map([profile_id], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (label, oid, size) = row?;
+        out.push((label, oid, size.max(0) as u64));
+    }
+    Ok(out)
+}
+
+/// Record that content for `path` now exists on this machine.
+///
+/// Called when an object is materialized, which is the one moment the fact is
+/// known. Materializing again is the ordinary case — a second version arriving
+/// — and the newest timestamp is the useful one, so the conflicting row is
+/// updated rather than rejected.
+///
+/// # Why this is an upsert and not `INSERT OR REPLACE`
+///
+/// It was `INSERT OR REPLACE` until Story 56.2, and that spelling became a
+/// data-loss bug the moment this table grew a column: under the
+/// `(profile_id, path)` primary key SQLite resolves a REPLACE by **deleting
+/// the conflicting row and inserting a fresh one**, so every column this
+/// statement does not name is silently reset to `NULL`. The first
+/// re-materialization after [`ensure_materialized_columns`] ran would have
+/// blanked `pinned`, `synced_at_ms` and `last_used_ms` — and `pinned` is the
+/// hard floor a release sweep is not allowed to cross, so the loss would be
+/// invisible until content the owner asked to keep was gone.
+///
+/// Naming `at_ms` explicitly in the `DO UPDATE` is therefore the whole point:
+/// this function knows exactly one fact, and it is now incapable of touching
+/// any other.
+pub fn remember_materialized(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    now_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO materialized (profile_id, path, at_ms) VALUES (?1, ?2, ?3)
+         ON CONFLICT(profile_id, path) DO UPDATE SET at_ms = excluded.at_ms",
+        (profile_id, path, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Record that the content at this path was read through keeper just now
+/// (Story 56.5, `last_used_ms`).
+///
+/// One fact, one column, in [`label_unit`]'s shape. It deliberately does not
+/// touch `local_origin`: a *use* says nothing about who wrote the bytes, and
+/// the whole point of AD-131's two clocks is that a use must never make an
+/// unconfirmed locally-authored path eligible for release.
+///
+/// **UPDATE-only.** A use of a path this clone holds no materialization row
+/// for is a fact this table cannot hold: `at_ms` is `NOT NULL` and means
+/// *content landed here*, which this function has no way to know. An absent
+/// row therefore stays absent and the call succeeds — the caller is a
+/// best-effort memo on a read path, not a transaction.
+pub fn note_use(conn: &Connection, profile_id: &str, path: &str, now_ms: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE materialized SET last_used_ms = ?3 WHERE profile_id = ?1 AND path = ?2",
+        (profile_id, path, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Record that the content now at this path arrived from the remote, and which
+/// object it is (Story 56.5, `last_used_ms` + `local_origin = 0` + `oid` +
+/// `size_bytes`).
+///
+/// Called immediately after [`remember_materialized`] on every publish-over-a-
+/// pointer path. Four columns because they are one fact: *this path's content
+/// arrived from the remote just now, and it is this object*. Arriving is the
+/// first thing that ever happened to it here, so the remote-origin clock starts
+/// now rather than at some `NULL` a later reader would have to interpret; and
+/// an arrival is one of only two moments the committed pointer is in hand, so
+/// it is one of only two honest places to record which object is at a path.
+///
+/// # Why the identity is written here and was written nowhere before
+///
+/// `oid` and `size_bytes` had **no writer at all** until this call. Story 56.2
+/// added the columns and [`ensure_materialized_columns`]' own note says why
+/// they exist — so a row still answers "after the worktree stops holding a
+/// pointer to consult" — but nothing ever filled them, so the release sweep's
+/// byte ceiling read `None` for every candidate and bounded nothing. One pass
+/// could hash thirty-two objects of any size while holding the profile's
+/// reservation, which is precisely the cost `RELEASE_BUDGET_BYTES`' own doc
+/// says it exists to prevent.
+///
+/// The length binds as `i64::try_from(size_bytes).unwrap_or(i64::MAX)`, because
+/// SQLite's integer is signed and this one is not. Saturating is the safe
+/// direction: an `as` cast would wrap a `u64` above `i64::MAX` negative,
+/// [`materialized_rows`] narrows a negative to `None`, and `None` is the one
+/// answer that makes a candidate contribute nothing to the budget meant to
+/// bound it. A saturated length reads back as enormous, so the pass stops at
+/// that candidate after giving it its one attempt.
+///
+/// It deliberately does not touch `synced_at_ms`: the object is upstream by
+/// construction, but NFR-40's proof is taken fresh at the moment of deletion,
+/// and this clock's job is only to select which timer applies. It also does
+/// not touch `pinned` — see [`remember_materialized`]'s doc for what a
+/// statement that knew more than it needed to cost last time.
+///
+/// **UPDATE-only**, for [`note_use`]'s reason: `remember_materialized` writes
+/// the row an instant earlier, so the row is there, and if it somehow is not
+/// then this table cannot hold the fact.
+pub fn note_arrival(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    now_ms: i64,
+    oid: &str,
+    size_bytes: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE materialized SET last_used_ms = ?3, local_origin = 0, oid = ?4, size_bytes = ?5
+          WHERE profile_id = ?1 AND path = ?2",
+        (
+            profile_id,
+            path,
+            now_ms,
+            oid,
+            i64::try_from(size_bytes).unwrap_or(i64::MAX),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Record that this clone created or modified the content now at this path,
+/// and which object it is (Story 56.5, `local_origin = 1` **and**
+/// `synced_at_ms = NULL`, with `oid` and `size_bytes`).
+///
+/// One fact: *this clone wrote the content now at this path, and it is this
+/// object*. New local bytes are, by definition, bytes the remote has not
+/// confirmed, so clearing `synced_at_ms` is not bookkeeping tidiness — a path
+/// confirmed upstream last week and re-edited this morning would otherwise be
+/// released a TTL after *the old confirmation*, discarding content that exists
+/// nowhere else. FR-341 is the `?` in `Engine::release_due_at`, and this is
+/// what puts the `NULL` there.
+///
+/// The identity travels with the same fact and for the same reason it does in
+/// [`note_arrival`]: a local clean is the other moment the committed pointer is
+/// in hand, so it is the other honest place to record which object is at a
+/// path. Before Story 56.5 `oid` and `size_bytes` had no writer anywhere —
+/// [`ensure_materialized_columns`] records why they exist, "so a row still
+/// answers after the worktree stops holding a pointer to consult", and until
+/// these two writers nothing ever answered. `size_bytes` binds through the same
+/// saturating `i64::try_from(size_bytes).unwrap_or(i64::MAX)`; see
+/// [`note_arrival`] for why saturating rather than wrapping is the safe
+/// direction for a number the release budget reads.
+///
+/// **An upsert, unlike the clock writers.** A local authorship is discovered at
+/// commit time from the worktree, which may be the first thing this ledger ever
+/// hears about the path — a file the owner created here has no arrival to have
+/// written a row. `at_ms` is honest on insert: content for this path does exist
+/// on this machine, that is precisely why there is something to upload. It
+/// never touches `pinned` or `last_used_ms`.
+pub fn note_local_authorship(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    now_ms: i64,
+    oid: &str,
+    size_bytes: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO materialized
+             (profile_id, path, at_ms, local_origin, synced_at_ms, oid, size_bytes)
+         VALUES (?1, ?2, ?3, 1, NULL, ?4, ?5)
+         ON CONFLICT(profile_id, path)
+           DO UPDATE SET local_origin = 1, synced_at_ms = NULL,
+                         oid = excluded.oid, size_bytes = excluded.size_bytes",
+        (
+            profile_id,
+            path,
+            now_ms,
+            oid,
+            i64::try_from(size_bytes).unwrap_or(i64::MAX),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Record that the remote was observed holding the object for this path
+/// (Story 56.5, `synced_at_ms`).
+///
+/// Written only where a per-path proof already exists — an upload unit that
+/// completed, or an object `lfs::audit::serves` affirmed — and never at
+/// `mark_synced`, which is a per-*profile* edge that says nothing about one
+/// path (AD-131).
+///
+/// **A stored confirmation authorizes eligibility, never a deletion.** It is a
+/// memo taken at some earlier instant; `Engine::remote_serves` re-proves the
+/// object at the moment the content would go, and NFR-40 is unmoved by this
+/// column existing.
+///
+/// **UPDATE-only**, for [`note_use`]'s reason, and it deliberately does not
+/// touch `local_origin`: confirming an upload does not make the path
+/// remote-authored, it makes it a *confirmed local* path, which is the state
+/// the second clock exists to measure.
+pub fn note_synced(conn: &Connection, profile_id: &str, path: &str, now_ms: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE materialized SET synced_at_ms = ?3 WHERE profile_id = ?1 AND path = ?2",
+        (profile_id, path, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Record the owner's standing instruction about one path (Story 56.5,
+/// `pinned`), the writer [`is_pinned`] has been reading for.
+///
+/// One column either way, naming exactly `pinned`: it must not disturb either
+/// clock, `local_origin`, the recorded identity or `at_ms`, and unpinning must
+/// leave a path's accumulated history exactly as it was so the path simply
+/// becomes a candidate again.
+///
+/// # Why the two directions are not one statement
+///
+/// **Pinning upserts.** A pin is a standing instruction about a path, not an
+/// observation about content, so pinning a path whose content is not here yet
+/// is the ordinary case: an owner pre-pins what they are about to materialize.
+/// `at_ms` on insert is the instant the instruction was given, which is the
+/// only timestamp this call knows; the arrival that follows overwrites it with
+/// the truth through [`remember_materialized`].
+///
+/// **Unpinning is UPDATE-only**, and the asymmetry is load-bearing. One upsert
+/// serving both directions meant `keeper-syncd unpin media clip.mp4` on a path
+/// with no ledger row *INSERTed* one, asserting "content landed here now" for
+/// content that is not here. `Engine::release_due_at` reads that phantom as a
+/// candidate forever — not pinned, `local_origin` `false`, both clocks `NULL`,
+/// so the `at_ms` fallback applies and it comes due a TTL later — and it can
+/// only ever refuse `AlreadyPointer`, spending a per-pass budget slot every
+/// pass to do it. It also lies to the readers that take this table to mean
+/// *paths this clone has held content for*: [`materialized_paths`], which feeds
+/// `Engine::pending_files`' `replacing` flag, and `lfs::listing::collect`.
+/// Withdrawing an instruction the ledger never recorded is nothing at all,
+/// exactly as [`note_use`] and [`note_synced`] are UPDATE-only for the same
+/// reason.
+pub fn set_pinned(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    pinned: bool,
+    now_ms: i64,
+) -> Result<()> {
+    if pinned {
+        conn.execute(
+            "INSERT INTO materialized (profile_id, path, at_ms, pinned) VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT(profile_id, path) DO UPDATE SET pinned = 1",
+            (profile_id, path, now_ms),
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE materialized SET pinned = 0 WHERE profile_id = ?1 AND path = ?2",
+            (profile_id, path),
+        )?;
+    }
+    Ok(())
+}
+
+/// Every path this clone has held content for.
+///
+/// Read whole rather than asked per row: the caller is deciding a mark for a
+/// list, and one statement beats a query per line.
+pub fn materialized_paths(
+    conn: &Connection,
+    profile_id: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT path FROM materialized WHERE profile_id = ?1")?;
+    let rows = stmt.query_map([profile_id], |r| r.get::<_, String>(0))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
+/// One row of the `materialized` ledger, late columns included (Stories 56.2
+/// and 56.5).
+///
+/// A struct rather than a tuple because five of the eight fields are
+/// `Option`s of two types and four of them are timestamps: a transposition
+/// between `last_used_ms` and `synced_at_ms` would compile, pass every type
+/// check, and make a release decision on the wrong fact.
+///
+/// **Every late timestamp is an `Option` and that is a fact, not a
+/// placeholder.** A row written before Story 56.2 — or by
+/// [`remember_materialized`], which sets `at_ms` and nothing else — reads back
+/// `None` for all of them, and `None` means "nobody recorded this" rather than
+/// zero, epoch, or absent-from-the-remote. Story 56.5's writers
+/// ([`note_use`], [`note_arrival`], [`note_local_authorship`], [`note_synced`],
+/// [`set_pinned`]) fill them in, each one fact at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedRow {
+    /// Repository-relative, `/`-joined — the same frame every other path in
+    /// this database is in.
+    pub path: String,
+    /// When content for this path last landed here. The one column with a
+    /// writer.
+    pub at_ms: i64,
+    /// When the content was last read through keeper.
+    pub last_used_ms: Option<i64>,
+    /// When the remote last confirmed it holds the object.
+    pub synced_at_ms: Option<i64>,
+    /// The object this path's content is, when the row recorded one.
+    pub oid: Option<String>,
+    /// How large that object is, when the row recorded it. Narrowed from
+    /// SQLite's signed integer the same way `list_activity` narrows a size: a
+    /// negative byte count is not a byte count, and it means exactly what
+    /// `NULL` means.
+    pub size_bytes: Option<u64>,
+    /// Whether the owner has asked for this path to stay on this machine.
+    /// `false` for every row that has never said otherwise, including every
+    /// row written before the column existed — an unpinned path is the
+    /// default, so absence and `0` are the same answer and an `Option` here
+    /// would be a distinction nobody can act on.
+    pub pinned: bool,
+    /// Which way the content at this path travelled (Story 56.5, AD-131).
+    /// `true` means this clone created or modified it; `false` means it
+    /// arrived from the remote. `false` for every row that has never said
+    /// otherwise, including every row written before the column existed —
+    /// which is honest rather than a default, because the only writers this
+    /// table had before Story 56.5 were arrival paths. It selects which
+    /// release clock applies: `synced_at_ms` for local content, so content
+    /// this machine authored and has not yet pushed is never eligible, and
+    /// `last_used_ms` for content that came from the remote.
+    pub local_origin: bool,
+}
+
+/// Every `materialized` row this profile has, whole.
+///
+/// Wider than [`materialized_paths`], and beside it rather than replacing it:
+/// that one answers a single yes/no per path, which is all the arrival
+/// decision needs and all it should be able to see, while this one carries the
+/// columns a listing reports. Read in one statement for the same reason it is:
+/// the caller is building a list, and a query per row is how a folder of a
+/// hundred thousand paths becomes a minute of SQLite.
+pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<MaterializedRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, at_ms, last_used_ms, synced_at_ms, oid, size_bytes, pinned, local_origin
+           FROM materialized
+          WHERE profile_id = ?1
+          ORDER BY path",
+    )?;
+    let rows = stmt.query_map([profile_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+            r.get::<_, Option<i64>>(6)?,
+            r.get::<_, Option<i64>>(7)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (path, at_ms, last_used_ms, synced_at_ms, oid, size, pinned, local_origin) = row?;
+        out.push(MaterializedRow {
+            path,
+            at_ms,
+            last_used_ms,
+            synced_at_ms,
+            oid,
+            // A row from before the column existed reads back `NULL`, and a
+            // negative size is not a size: both mean the same thing here.
+            size_bytes: size.and_then(|bytes| u64::try_from(bytes).ok()),
+            pinned: pinned.unwrap_or(0) != 0,
+            // `NULL` is *arrived from the remote*: see the column's own note
+            // in [`ensure_materialized_columns`].
+            local_origin: local_origin.unwrap_or(0) != 0,
+        });
+    }
+    Ok(out)
+}
+
+/// Has the owner asked for this one path's content to stay on this machine?
+///
+/// One column, one path, one statement. Beside [`materialized_rows`] rather
+/// than expressed through it for the reason [`materialized_paths`] is beside
+/// it: the caller here is deciding about a single path and reading the whole
+/// ledger to answer would be a table scan to fetch one bit.
+///
+/// **An absent row and a `NULL` are both `false`**, which is
+/// [`MaterializedRow::pinned`]'s documented rule, not a convenience: an
+/// unpinned path is the default, so a row that has never said otherwise —
+/// including every row written before the column existed — means the same
+/// thing as no row at all. There is no third answer for a caller to act on.
+///
+/// This function knows exactly one fact, and [`remember_materialized`]'s doc
+/// records what a statement that knew more than it needed to cost last time.
+pub fn is_pinned(conn: &Connection, profile_id: &str, path: &str) -> Result<bool> {
+    let pinned = conn
+        .query_row(
+            "SELECT pinned FROM materialized WHERE profile_id = ?1 AND path = ?2",
+            (profile_id, path),
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?;
+    Ok(pinned.flatten().unwrap_or(0) != 0)
+}
+
+/// Forget that this machine holds content for one path.
+///
+/// The counterpart to [`remember_materialized`], called once the content has
+/// actually gone. The row's whole meaning is "content for this path exists
+/// here", and it does not: a retained row is a false statement about this
+/// machine, and the consumer it would mislead is [`materialized_paths`], which
+/// feeds `Engine::pending_files`' `replacing` flag — a queued download would be
+/// announced as replacing content that is no longer there.
+///
+/// It is **not** what makes `lfs::listing` call a path virtual. That comes from
+/// the worktree (`listing::collect` reads `worktree_pointer(..).is_some()`);
+/// the ledger only supplies the timestamps and the pin.
+///
+/// Deletes exactly `(profile_id, path)` and nothing else. Removing an absent
+/// row succeeds — the same contract [`crate::platform::SyncPlatform::secret_delete`]
+/// states, and for the same reason: the caller wants the fact gone, and it
+/// already being gone is that.
+///
+/// # Why the statement will not touch a pinned row
+///
+/// A pinned path never reaches here: the refusal is upstream, in
+/// [`crate::engine::Engine::dehydrate_entry`], which reads [`is_pinned`] twice
+/// and declines. `AND COALESCE(pinned, 0) = 0` is the belt to that braces, and
+/// it is here for the loss class [`remember_materialized`]'s own doc records:
+/// `pinned` is the hard floor a release sweep may not cross, so losing it is
+/// "invisible until content the owner asked to keep was gone". A statement that
+/// is structurally incapable of discarding a pin cannot participate in that,
+/// whatever a future caller does. `COALESCE` because a `NULL` **is** unpinned —
+/// [`MaterializedRow::pinned`]'s documented rule, and every row written before
+/// the column existed reads back that way.
+pub fn forget_materialized(conn: &Connection, profile_id: &str, path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM materialized
+          WHERE profile_id = ?1 AND path = ?2 AND COALESCE(pinned, 0) = 0",
+        (profile_id, path),
+    )?;
+    Ok(())
+}
+
+/// Queued transfers that have no name yet, as oid → the units wanting it.
+///
+/// Every row queued before the `label` column existed is in here, which on an
+/// install that upgraded mid-backlog is the entire queue: naming happens when
+/// work is enqueued, and that already happened. Without a way to fill them in
+/// afterwards the feature would arrive for a folder that has nothing left to do.
+///
+/// Keyed by oid rather than by unit because the answer is found by walking the
+/// index once and asking "does anything want this object", which is O(index)
+/// instead of O(index × units).
+pub fn unlabelled_transfers(
+    conn: &Connection,
+    profile_id: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<i64>>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, json_extract(payload, '$.oid') FROM journal
+          WHERE profile_id = ?1
+            AND state != 'parked'
+            AND label IS NULL
+            AND json_extract(payload, '$.oid') IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([profile_id], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out: std::collections::BTreeMap<String, Vec<i64>> = std::collections::BTreeMap::new();
+    for row in rows {
+        let (id, oid) = row?;
+        out.entry(oid).or_default().push(id);
+    }
+    Ok(out)
+}
+
+/// How much transferable work is left for one profile: units, and their bytes.
+///
+/// Counted together in one statement so the two numbers can never disagree,
+/// and restricted to rows that carry a size — a push or a commit is real work
+/// but it is not a file, and counting it under "files left" would be a lie
+/// told in the same breath as a byte total it contributes nothing to.
+///
+/// `parked` is excluded for the same reason it is excluded from `pending`: a
+/// parked unit is not waiting, it has stopped.
+pub fn queued_transfers(conn: &Connection, profile_id: &str) -> Result<(u32, u64)> {
+    let (count, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(json_extract(payload, '$.size')), 0)
+           FROM journal
+          WHERE profile_id = ?1
+            AND state != 'parked'
+            AND json_extract(payload, '$.size') IS NOT NULL",
+        [profile_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((count.max(0) as u32, bytes.max(0) as u64))
 }
 
 // ---------------------------------------------------------------------------
@@ -259,9 +1064,18 @@ pub fn clear_file_state(conn: &Connection, profile_id: &str) -> Result<usize> {
 
 /// Insert or replace a profile. Validation runs first so a bad profile can
 /// never reach the database, whatever route it arrived by.
+///
+/// The folder tier is taken back off before the write (AD-98). Every read hands
+/// out a profile with the folder's own `.keeper/*.toml` layered on, so without
+/// [`profile::as_stored`] the first read-modify-write — `set_enabled` is the
+/// plain one — would copy the file's values into the row, and deleting the file
+/// later would reveal a copy of it rather than the value the user chose. That
+/// is the `config.json` failure AD-98 exists to end, and this is the one write
+/// funnel it can be prevented at.
 pub fn upsert_profile(conn: &Connection, profile: &SyncProfile, now_ms: i64) -> Result<()> {
     profile.validate()?;
-    let json = serde_json::to_string(profile)
+    let profile = profile::as_stored(profile, stored_profile(conn, &profile.id)?.as_ref());
+    let json = serde_json::to_string(&profile)
         .map_err(|e| SyncError::Config(format!("profile is not serializable: {e}")))?;
     conn.execute(
         "INSERT INTO profiles (id, json, updated_ms) VALUES (?1, ?2, ?3)
@@ -271,6 +1085,8 @@ pub fn upsert_profile(conn: &Connection, profile: &SyncProfile, now_ms: i64) -> 
     Ok(())
 }
 
+/// Every profile **as it is in force**: the stored row with the folder's own
+/// config layered on top (Story 46.8).
 pub fn list_profiles(conn: &Connection) -> Result<Vec<SyncProfile>> {
     let mut stmt = conn.prepare("SELECT json FROM profiles ORDER BY id")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -278,7 +1094,7 @@ pub fn list_profiles(conn: &Connection) -> Result<Vec<SyncProfile>> {
     for row in rows {
         let json = row?;
         match serde_json::from_str::<SyncProfile>(&json) {
-            Ok(profile) => out.push(profile),
+            Ok(profile) => out.push(profile::in_force(profile)),
             // A profile written by a newer keeper must not brick an older one.
             // Skip it loudly rather than failing the whole listing.
             Err(err) => tracing::warn!(error = %err, "skipping unreadable sync profile row"),
@@ -287,7 +1103,17 @@ pub fn list_profiles(conn: &Connection) -> Result<Vec<SyncProfile>> {
     Ok(out)
 }
 
+/// One profile as it is in force, exactly as [`list_profiles`] reports it.
 pub fn get_profile(conn: &Connection, id: &str) -> Result<Option<SyncProfile>> {
+    Ok(stored_profile(conn, id)?.map(profile::in_force))
+}
+
+/// One profile as the **table** holds it, with no folder layer on top.
+///
+/// Private, and the only two callers are the ones that must not see the file:
+/// [`get_profile`], which layers it itself, and [`upsert_profile`], which needs
+/// the pre-write row to restore the fields a folder file owns.
+fn stored_profile(conn: &Connection, id: &str) -> Result<Option<SyncProfile>> {
     let json: Option<String> = conn
         .query_row("SELECT json FROM profiles WHERE id = ?1", [id], |r| {
             r.get(0)
@@ -359,12 +1185,34 @@ impl WorkKind {
     pub const PUSH: &'static str = "push";
     /// The `kind` column spelling for one LFS object upload. Same reason.
     pub const LFS_UPLOAD: &'static str = "lfsUpload";
+    /// The `kind` column spelling for a pull. Same reason — a rejected push
+    /// queues one and has to be able to assert it did (DW-207).
+    pub const PULL: &'static str = "pull";
+
+    /// Whether an identical unit ALREADY RUNNING covers this work.
+    ///
+    /// A transfer is content-addressed: `LfsDownload { oid, size }` names
+    /// immutable bytes, so a second unit for an object already in flight can
+    /// only fetch what the first one is fetching. A push is the opposite — it
+    /// publishes whatever the worktree holds *when it runs*, so a change made
+    /// after it started genuinely needs its own unit, and treating the running
+    /// one as cover would drop that change until something else queued a push.
+    ///
+    /// That asymmetry is why [`enqueue_unique`] ignored `running` for
+    /// everything: correct for pushes, and quietly wrong for transfers.
+    /// Measured on a folder pulling 53 GB — 106 queued units for 95 distinct
+    /// objects, every duplicate a `running` object re-queued by the next scan.
+    /// The visible symptom is a queue that never shrinks; the invisible one is
+    /// the same bytes fetched twice.
+    pub fn covered_while_running(&self) -> bool {
+        matches!(self, Self::LfsUpload { .. } | Self::LfsDownload { .. })
+    }
 
     /// Discriminant used as the journal's `kind` column, so a row can be
     /// filtered without deserializing its payload.
     pub fn tag(&self) -> &'static str {
         match self {
-            Self::Pull => "pull",
+            Self::Pull => Self::PULL,
             Self::Push => Self::PUSH,
             Self::LfsUpload { .. } => Self::LFS_UPLOAD,
             Self::LfsDownload { .. } => "lfsDownload",
@@ -397,6 +1245,66 @@ impl WorkState {
     }
 }
 
+/// Whether anybody is waiting for a queued unit (Story 56.3).
+///
+/// Two levels and no more. The question a claim has to answer is "did a human
+/// ask for this, or did a scan find it", and a numeric priority space would
+/// invite a third answer nobody can define — the journal has no notion of how
+/// *much* somebody wants a file.
+///
+/// # It is a column, not a second queue
+///
+/// [`claim_ready`] is one statement over `state = 'pending' AND not_before_ms
+/// <= now`; urgency prepends one term to its `ORDER BY` and changes nothing
+/// else. A separate "urgent" table would duplicate the claim, and a
+/// `not_before_ms = 0` trick would lie about scheduling and still lose to an
+/// older background row. One nullable integer keeps FIFO order within a level,
+/// keeps `CLAIM_LIMIT` per profile per tick, and keeps the batch bounded: a
+/// requested unit takes a slot, it does not take the tick, so nothing is
+/// starved.
+///
+/// # It is not part of the payload
+///
+/// See [`raise_urgency`] — putting it in the payload would change
+/// [`enqueue_unique`]'s dedup key and re-download bytes this machine is already
+/// fetching.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Urgency {
+    /// A scan found this work. The level a row written before the column
+    /// existed reads back as, which is why it is the default.
+    #[default]
+    Background,
+    /// A person asked for this path by name, so it is claimed ahead of
+    /// background work in the same tick and published even under
+    /// [`crate::profile::LfsMode::PointerOnly`].
+    Requested,
+}
+
+impl Urgency {
+    /// The stored integer. Ordered, because the whole point is that
+    /// `COALESCE(urgency, 0) DESC` sorts by it and `MAX` raises by it.
+    pub fn level(self) -> i64 {
+        match self {
+            Self::Background => 0,
+            Self::Requested => 1,
+        }
+    }
+
+    /// The level a stored integer names.
+    ///
+    /// Saturating rather than exact: `NULL` arrives here as `0` from the
+    /// caller's `unwrap_or`, and anything a future release writes above
+    /// `Requested` still reads as "somebody is waiting" rather than as an error
+    /// that would park an otherwise perfectly good row.
+    pub fn from_level(level: i64) -> Self {
+        if level >= Self::Requested.level() {
+            Self::Requested
+        } else {
+            Self::Background
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkItem {
     pub id: i64,
@@ -411,6 +1319,18 @@ pub struct WorkItem {
     /// retry no delay at all.
     pub attempts: u32,
     pub last_error: Option<String>,
+    /// What to call this unit while it runs — a repository-relative path, set
+    /// by whoever queued it and never an absolute one, because progress lines
+    /// end up in screenshots. `None` where the work has no single file to name
+    /// (a push carries many), and the line then says the profile's name alone,
+    /// exactly as it did before this column existed.
+    pub label: Option<String>,
+    /// Whether anybody is waiting for this unit.
+    ///
+    /// Read from the row rather than remembered anywhere else, so it is the
+    /// *journal* that remembers a human asked — which is what makes the fact
+    /// survive a restart, a `recover_running` and a re-drive.
+    pub urgency: Urgency,
 }
 
 /// Record a unit of work before attempting it.
@@ -450,14 +1370,28 @@ pub fn enqueue_unique(
 ) -> Result<i64> {
     let payload = serde_json::to_string(kind)
         .map_err(|e| SyncError::Journal(format!("work item is not serializable: {e}")))?;
+    // `running` counts as cover only for work whose identity is its content —
+    // see [`WorkKind::covered_while_running`] for the asymmetry and what
+    // ignoring it cost.
+    //
+    // `ORDER BY id`, so "the covering row" is a defined row and not whichever
+    // one the query planner reached first. It matters for the two writes a
+    // caller makes onto the returned id: [`recover_running`]'s duplicate
+    // collapse keeps `MIN(id)`, so a label or an urgency written onto the
+    // higher of a legacy duplicate pair would be thrown away at the next
+    // restart.
+    let sql = if kind.covered_while_running() {
+        "SELECT id FROM journal
+          WHERE profile_id = ?1 AND payload = ?2
+            AND state IN ('pending','deferred','running')
+          ORDER BY id LIMIT 1"
+    } else {
+        "SELECT id FROM journal
+          WHERE profile_id = ?1 AND payload = ?2 AND state IN ('pending','deferred')
+          ORDER BY id LIMIT 1"
+    };
     let existing: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM journal
-             WHERE profile_id = ?1 AND payload = ?2 AND state IN ('pending','deferred')
-             LIMIT 1",
-            (profile_id, &payload),
-            |r| r.get(0),
-        )
+        .query_row(sql, (profile_id, &payload), |r| r.get(0))
         .optional()?;
     if let Some(id) = existing {
         return Ok(id);
@@ -465,31 +1399,75 @@ pub fn enqueue_unique(
     enqueue(conn, profile_id, kind, now_ms, not_before_ms)
 }
 
-/// Claim the ready units for one profile, marking them `running` in the same
-/// statement so two supervisors can never take the same row.
+/// Claim the ready units for one profile, marking them `running` so two
+/// supervisors can never take the same row.
+///
+/// # The order is urgency, then age — and one slot is kept back
+///
+/// `COALESCE(urgency, 0) DESC, id` puts a unit somebody asked for ahead of
+/// every background unit in the same batch, and leaves background work in its
+/// existing FIFO order among itself (Story 56.3). `COALESCE` because the
+/// column is nullable for every row queued before it existed, and `DESC` on a
+/// two-level [`Urgency`] rather than a priority number for the reason that
+/// type gives.
+///
+/// That order alone would starve background work outright, and the first
+/// version of this shipped believing it could not. `limit` is a bound per
+/// *tick*, not per request: ask for sixteen files and every slot in the batch
+/// is a requested download, `drain_journal` runs the batch serially, and the
+/// `Push` that carries a local edit to the server waits for all sixteen
+/// transfers — then for the next batch, for as long as requests keep arriving.
+/// A folder that stops publishing local work while somebody browses media is
+/// unbacked-up data, which outranks any latency a request can lose.
+///
+/// So a full batch is never *entirely* requested work while background work is
+/// waiting: the youngest requested row gives its slot back to the oldest
+/// background row. One slot is enough — `drain_journal` runs every tick, so the
+/// background queue drains at one unit per second in the worst case while
+/// fifteen sixteenths of the batch still serve the person waiting. The batch
+/// size, and therefore `limit`'s meaning, does not change.
 pub fn claim_ready(
     conn: &Connection,
     profile_id: &str,
     now_ms: i64,
     limit: u32,
 ) -> Result<Vec<WorkItem>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, payload, attempts, last_error FROM journal
+    let mut rows = ready_rows(
+        conn,
+        "SELECT id, payload, attempts, last_error, label, urgency FROM journal
          WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
-         ORDER BY id LIMIT ?3",
+         ORDER BY COALESCE(urgency, 0) DESC, id LIMIT ?3",
+        profile_id,
+        now_ms,
+        limit,
     )?;
-    let rows = stmt.query_map((profile_id, now_ms, limit), |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, Option<String>>(3)?,
-        ))
-    })?;
+    // Only when the batch is full AND holds nothing but requested work: with a
+    // spare slot the background row was claimed by the statement above anyway,
+    // and with one row in the batch there is no slot to keep back.
+    let all_requested = rows
+        .iter()
+        .all(|(_, _, _, _, _, urgency)| urgency.unwrap_or(0) > 0);
+    if limit > 1 && rows.len() as u32 == limit && all_requested {
+        let background = ready_rows(
+            conn,
+            "SELECT id, payload, attempts, last_error, label, urgency FROM journal
+             WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
+               AND COALESCE(urgency, 0) = 0
+             ORDER BY id LIMIT ?3",
+            profile_id,
+            now_ms,
+            1,
+        )?;
+        if let Some(oldest) = background.into_iter().next() {
+            // The youngest requested row, which is the last one: it keeps its
+            // place in the queue and is claimed on the next tick.
+            rows.pop();
+            rows.push(oldest);
+        }
+    }
 
     let mut claimed = Vec::new();
-    for row in rows {
-        let (id, payload, attempts, last_error) = row?;
+    for (id, payload, attempts, last_error, label, urgency) in rows {
         match serde_json::from_str::<WorkKind>(&payload) {
             Ok(kind) => claimed.push(WorkItem {
                 id,
@@ -497,6 +1475,8 @@ pub fn claim_ready(
                 kind,
                 attempts: attempts.max(0).saturating_add(1) as u32,
                 last_error,
+                label,
+                urgency: Urgency::from_level(urgency.unwrap_or(0)),
             }),
             Err(err) => {
                 // An unreadable payload can never succeed; parking it keeps the
@@ -516,6 +1496,42 @@ pub fn claim_ready(
         )?;
     }
     Ok(claimed)
+}
+
+/// One claim query's raw rows, in the order the statement returned them.
+///
+/// Split out because [`claim_ready`] runs the same projection twice — once for
+/// the batch and once for the background row it keeps a slot for — and two
+/// spellings of six column indices is how the two come to disagree.
+type ReadyRow = (
+    i64,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+fn ready_rows(
+    conn: &Connection,
+    sql: &str,
+    profile_id: &str,
+    now_ms: i64,
+    limit: u32,
+) -> Result<Vec<ReadyRow>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map((profile_id, now_ms, limit), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(SyncError::from)
 }
 
 /// Clear a unit that completed. This is the only place work leaves the journal.
@@ -544,6 +1560,14 @@ pub fn reschedule(
 /// Called at startup: a unit left `running` is one whose process died
 /// mid-flight, and it must be re-driven rather than stranded. This single
 /// statement is what turns "crashed" into "repeated".
+///
+/// Neither statement below touches `label` or `urgency`, and that is what makes
+/// a request survive a crash: the row comes back `pending` still carrying the
+/// level [`raise_urgency`] wrote, so the person who asked keeps their place in
+/// the next claim. It is also the second reason urgency must live on the
+/// *covering* row rather than on a duplicate — the `MIN(id)` collapse below
+/// deletes every pending row but the oldest for a payload, so an urgency
+/// written onto a duplicate would be thrown away here.
 pub fn recover_running(conn: &Connection, now_ms: i64) -> Result<usize> {
     let n = conn.execute(
         "UPDATE journal SET state = 'pending', not_before_ms = ?1 WHERE state = 'running'",
@@ -551,6 +1575,28 @@ pub fn recover_running(conn: &Connection, now_ms: i64) -> Result<usize> {
     )?;
     if n > 0 {
         tracing::info!(count = n, "re-queued sync work interrupted by a restart");
+    }
+    // Collapse what the return can reveal. Until `enqueue_unique` learned to
+    // treat a running transfer as cover, an object being downloaded could be
+    // queued a second time by the next scan; the pair is invisible while one
+    // half is `running` and becomes two identical pending rows the moment this
+    // statement runs. Identical payload is identical work, so the older row
+    // keeps the queue's place and the copy goes.
+    //
+    // Both halves of the fix are needed: this one clears the queues that
+    // already exist, and the enqueue rule stops new ones forming.
+    let collapsed = conn.execute(
+        "DELETE FROM journal
+          WHERE state = 'pending'
+            AND id NOT IN (
+                SELECT MIN(id) FROM journal
+                 WHERE state = 'pending'
+                 GROUP BY profile_id, payload
+            )",
+        [],
+    )?;
+    if collapsed > 0 {
+        tracing::info!(count = collapsed, "collapsed duplicate queued work");
     }
     Ok(n)
 }
@@ -1340,6 +2386,317 @@ mod tests {
         assert_eq!(claim_ready(&c, "p", 1_000, 10).expect("claim").len(), 1);
     }
 
+    /// AC 3 is a property of ONE statement, so it is asserted on that statement
+    /// (Story 56.3).
+    ///
+    /// Twenty background downloads, then one a person asked for, then one claim
+    /// of `CLAIM_LIMIT`-many rows. The requested unit must be first and the
+    /// background units behind it must still be in id order — that second half
+    /// is what stops "urgency" from quietly becoming "reshuffle the queue", and
+    /// it is the property no clock and no sleeping is needed to see.
+    #[test]
+    fn a_requested_unit_is_claimed_ahead_of_background_work_without_reordering_it() {
+        let c = conn();
+        let background: Vec<i64> = (0..20)
+            .map(|n| {
+                enqueue(
+                    &c,
+                    "p",
+                    &WorkKind::LfsDownload {
+                        oid: format!("{n:064x}"),
+                        size: 10,
+                    },
+                    1,
+                    0,
+                )
+                .expect("queue background work")
+            })
+            .collect();
+        let asked = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: format!("{:064x}", 999),
+                size: 10,
+            },
+            1,
+            0,
+        )
+        .expect("queue the requested unit");
+        assert!(
+            asked > background[19],
+            "the requested unit is the YOUNGEST row, so id order alone would put \
+             it last: that is the whole test"
+        );
+        promote_unit(&c, asked, 1).expect("promote");
+
+        // 16 is `engine::CLAIM_LIMIT`, spelled here because this crate's db
+        // layer must not depend on the engine's constant to state its own
+        // property.
+        let claimed = claim_ready(&c, "p", 1, 16).expect("claim");
+        assert_eq!(claimed.len(), 16, "the batch is still bounded by the limit");
+        assert_eq!(
+            claimed[0].id, asked,
+            "the unit somebody is waiting for is claimed first"
+        );
+        assert_eq!(claimed[0].urgency, Urgency::Requested);
+        assert_eq!(
+            claimed[1..].iter().map(|item| item.id).collect::<Vec<_>>(),
+            background[..15].to_vec(),
+            "and background work keeps its FIFO order among itself"
+        );
+        assert!(claimed[1..]
+            .iter()
+            .all(|item| item.urgency == Urgency::Background));
+
+        // The rest are still there and claimable: a requested unit took a slot,
+        // not the tick.
+        let rest = claim_ready(&c, "p", 1, 16).expect("second claim");
+        assert_eq!(
+            rest.iter().map(|item| item.id).collect::<Vec<_>>(),
+            background[15..].to_vec()
+        );
+    }
+
+    /// A batch is never entirely requested work while background work waits.
+    ///
+    /// The starvation the first version of the urgency order shipped with, in
+    /// the shape that matters: the `Push` carrying a local edit to the server is
+    /// the oldest row in the queue, and the user then asks for more files than
+    /// one batch holds. Under a pure `urgency DESC, id` order the push waits for
+    /// sixteen transfers, then sixteen more, for as long as requests keep
+    /// arriving — a folder that stops publishing local work while somebody
+    /// browses media. One slot is kept for it, so it runs on the very next tick.
+    #[test]
+    fn a_burst_of_requests_cannot_starve_the_push_that_backs_up_local_work() {
+        let c = conn();
+        let push = enqueue(&c, "p", &WorkKind::Push, 1, 0).expect("queue the push first");
+        for n in 0..20 {
+            let id = enqueue(
+                &c,
+                "p",
+                &WorkKind::LfsDownload {
+                    oid: format!("{n:064x}"),
+                    size: 10,
+                },
+                1,
+                0,
+            )
+            .expect("queue a requested download");
+            promote_unit(&c, id, 1).expect("promote");
+        }
+
+        let claimed = claim_ready(&c, "p", 1, 16).expect("claim");
+        assert_eq!(claimed.len(), 16, "the batch is still full");
+        assert_eq!(
+            claimed.iter().filter(|i| i.id == push).count(),
+            1,
+            "the oldest background unit is in the batch although sixteen \
+             requested units could have filled it: {:?}",
+            claimed.iter().map(|i| i.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            claimed[..15]
+                .iter()
+                .filter(|i| i.urgency == Urgency::Requested)
+                .count(),
+            15,
+            "and the other fifteen slots still serve the person waiting, ahead \
+             of the push in execution order"
+        );
+    }
+
+    /// A request may raise a queued row and nothing may lower one.
+    ///
+    /// `MAX` is the inversion of [`label_unit`]'s first-writer-wins, and the
+    /// direction matters: a background scan that re-enqueued the covering row
+    /// must not be able to demote a file a person is sitting and waiting for.
+    #[test]
+    fn urgency_can_be_raised_and_never_lowered() {
+        let c = conn();
+        let id = enqueue(&c, "p", &WorkKind::Pull, 1, 0).expect("enqueue");
+
+        promote_unit(&c, id, 1).expect("promote");
+        // The only writer of a lower level is a fresh row, so this is the shape
+        // that could demote: the same UPDATE with `Background`'s level.
+        c.execute(
+            "UPDATE journal SET urgency = MAX(COALESCE(urgency, 0), ?2) WHERE id = ?1",
+            (id, Urgency::Background.level()),
+        )
+        .expect("try to lower");
+        assert_eq!(
+            claim_ready(&c, "p", 1, 10).expect("claim")[0].urgency,
+            Urgency::Requested,
+            "a later background write must not demote a row somebody asked for"
+        );
+    }
+
+    /// A promotion lifts a deferral and a backoff, or the request is a unit
+    /// nothing will ever claim.
+    ///
+    /// `enqueue_unique` counts a `deferred` row as cover, and `claim_ready` only
+    /// ever offers `pending`. Without this the CLI would print "queued as unit
+    /// N" for a download whose removable remote was absent an hour ago and wait
+    /// for a resume nobody is going to perform.
+    #[test]
+    fn promoting_a_deferred_or_backed_off_unit_makes_it_claimable_now() {
+        let c = conn();
+        let deferred = enqueue(&c, "p", &WorkKind::Pull, 1, 0).expect("enqueue");
+        // Claimed and then deferred, which is the state an absent volume leaves
+        // behind — and it is the shape that makes the attempt assertion below
+        // mean something, because the claim is what spends an attempt.
+        claim_ready(&c, "p", 1, 10).expect("first attempt");
+        reschedule(
+            &c,
+            deferred,
+            WorkState::Deferred,
+            9_000,
+            Some("media absent"),
+        )
+        .expect("defer it, as an absent volume does");
+        assert!(
+            claim_ready(&c, "p", 1_000, 10).expect("claim").is_empty(),
+            "a deferred row is not claimable, which is the premise"
+        );
+
+        promote_unit(&c, deferred, 1_000).expect("promote");
+        let claimed = claim_ready(&c, "p", 1_000, 10).expect("claim after the promotion");
+        assert_eq!(claimed.len(), 1, "the person asking is a reason to try now");
+        assert_eq!(claimed[0].id, deferred);
+        assert_eq!(claimed[0].urgency, Urgency::Requested);
+        assert_eq!(
+            claimed[0].attempts, 2,
+            "the promotion neither spends nor refunds an attempt, so a second \
+             failure backs off exactly as far as it would have"
+        );
+    }
+
+    /// The journal is what remembers a human asked, so a crash must not forget
+    /// it.
+    #[test]
+    fn urgency_survives_a_restart() {
+        let c = conn();
+        let id = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: format!("{:064x}", 7),
+                size: 10,
+            },
+            1,
+            0,
+        )
+        .expect("enqueue");
+        promote_unit(&c, id, 1).expect("promote");
+        claim_ready(&c, "p", 1, 10).expect("claim it, then die");
+
+        assert_eq!(recover_running(&c, 200).expect("recover"), 1);
+        let again = claim_ready(&c, "p", 200, 10).expect("re-claim");
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            again[0].urgency,
+            Urgency::Requested,
+            "the row is pending again and still requested"
+        );
+    }
+
+    /// The urgency a completion arm acts on is read from the row, not from a
+    /// snapshot taken when the row was claimed.
+    ///
+    /// The sequence that made this necessary: a background download is already
+    /// `running` when the person asks for its path.
+    /// `WorkKind::covered_while_running` makes that running row the covering
+    /// unit, so `promote_unit` writes onto a row the supervisor read minutes
+    /// ago. [`unit_urgency`] is what lets the completion arm see it.
+    #[test]
+    fn a_running_units_urgency_is_still_readable_after_it_was_claimed() {
+        let c = conn();
+        let id = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: format!("{:064x}", 11),
+                size: 10,
+            },
+            1,
+            0,
+        )
+        .expect("enqueue");
+        let claimed = claim_ready(&c, "p", 1, 10).expect("claim");
+        assert_eq!(claimed[0].urgency, Urgency::Background);
+        assert_eq!(
+            unit_urgency(&c, id).expect("read"),
+            Urgency::Background,
+            "nobody has asked yet"
+        );
+
+        // The request arrives mid-transfer and deduplicates onto the running
+        // row, exactly as `enqueue_unique` promises.
+        promote_unit(&c, id, 2).expect("promote the running row");
+        assert_eq!(
+            unit_urgency(&c, id).expect("read"),
+            Urgency::Requested,
+            "the row the transfer is running for now says somebody is waiting"
+        );
+        complete(&c, id).expect("complete");
+        assert_eq!(
+            unit_urgency(&c, id).expect("read a row that is gone"),
+            Urgency::Background,
+            "a deleted row falls back to the profile's own arrival policy"
+        );
+    }
+
+    /// A `journal` planted at the pre-56.3 DDL upgrades in place, and its rows
+    /// still claim.
+    ///
+    /// The failure mode this guards is a daemon that cannot start: `claim_ready`
+    /// now names `urgency` in its projection, so an install whose table predates
+    /// the column would raise `no such column` on every tick. `ALTER TABLE ...
+    /// ADD COLUMN` guarded by the column list is its own idempotence, which is
+    /// why this needs no `meta` marker — asserted rather than trusted, twice,
+    /// because the second `migrate` is what every launch performs.
+    #[test]
+    fn a_journal_predating_the_urgency_column_upgrades_in_place() {
+        let c = Connection::open_in_memory().expect("in-memory db");
+        c.execute_batch(
+            "CREATE TABLE journal (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 profile_id  TEXT NOT NULL,
+                 kind        TEXT NOT NULL,
+                 payload     TEXT NOT NULL,
+                 state       TEXT NOT NULL,
+                 attempts    INTEGER NOT NULL DEFAULT 0,
+                 not_before_ms INTEGER NOT NULL DEFAULT 0,
+                 created_ms  INTEGER NOT NULL,
+                 last_error  TEXT,
+                 label       TEXT
+             );
+             INSERT INTO journal
+                 (profile_id, kind, payload, state, not_before_ms, created_ms, label)
+             VALUES ('p', 'pull', '{\"kind\":\"pull\"}', 'pending', 0, 1, 'old');",
+        )
+        .expect("plant the pre-56.3 schema");
+
+        migrate(&c).expect("migrate an existing install");
+        let claimed = claim_ready(&c, "p", 1, 10).expect("the old row still claims");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].label.as_deref(), Some("old"));
+        assert_eq!(
+            claimed[0].urgency,
+            Urgency::Background,
+            "NULL is the honest reading of a row queued before anybody could ask"
+        );
+
+        migrate(&c).expect("migrating twice changes nothing");
+        recover_running(&c, 2).expect("put it back");
+        assert_eq!(
+            claim_ready(&c, "p", 2, 10)
+                .expect("claim after a second migrate")
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn a_poison_payload_is_parked_instead_of_retried_forever() {
         let c = conn();
@@ -1480,6 +2837,488 @@ mod tests {
         let row = &list_activity(&c, "p", 10).expect("list")[0];
         assert_eq!(row.size_bytes, Some(12_288));
         assert_eq!(row.unit_id, Some(unit));
+    }
+
+    #[test]
+    fn a_materialized_table_predating_the_late_columns_upgrades_in_place() {
+        // The exact shape `sync.db` had before Story 56.2. A row of it records
+        // that content for a path landed on this machine, which is the only
+        // evidence distinguishing an arriving object that REPLACES something
+        // from one that is simply new here — so losing one is losing that
+        // distinction permanently, and recreating the table empty would lose
+        // every one at once.
+        let c = Connection::open_in_memory().expect("in-memory db");
+        c.execute_batch(
+            "CREATE TABLE materialized (
+                 profile_id  TEXT NOT NULL,
+                 path        TEXT NOT NULL,
+                 at_ms       INTEGER NOT NULL,
+                 PRIMARY KEY (profile_id, path)
+             );
+             INSERT INTO materialized (profile_id, path, at_ms)
+             VALUES ('p', '40-media/clip.mp4', 1_700);",
+        )
+        .expect("plant the pre-56.2 schema");
+
+        migrate(&c).expect("migrate an existing install");
+
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read the ledger"),
+            vec![MaterializedRow {
+                path: "40-media/clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: None,
+                synced_at_ms: None,
+                oid: None,
+                size_bytes: None,
+                pinned: false,
+                local_origin: false,
+            }],
+            "the old row survives with its timestamp untouched, and every late \
+             column reads as absent rather than as zero, epoch or unpinned-by-record"
+        );
+
+        // A second `migrate` on the same connection is the upgrade path an
+        // ordinary `open` takes on every launch. `ALTER TABLE ... ADD COLUMN`
+        // guarded by the column list is its own idempotence, which is why this
+        // schema addition needs no `meta` marker — assert it rather than trust
+        // it, because the failure mode is a daemon that cannot start.
+        migrate(&c).expect("migrating twice changes nothing");
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read the ledger").len(),
+            1
+        );
+        assert_eq!(
+            materialized_paths(&c, "p").expect("read the paths"),
+            std::collections::HashSet::from(["40-media/clip.mp4".to_owned()]),
+            "the narrow reader the arrival decision uses still answers the same"
+        );
+    }
+
+    /// Re-materializing a path moves `at_ms` and touches nothing else (Story
+    /// 56.2).
+    ///
+    /// This is the hazard the story exists to close, and it is invisible by
+    /// construction: `remember_materialized` was `INSERT OR REPLACE`, and under
+    /// the `(profile_id, path)` primary key SQLite resolves a REPLACE by
+    /// DELETING the conflicting row and inserting a fresh one — so every column
+    /// the statement does not name comes back `NULL`. Nothing would have
+    /// complained; the first re-download after this table grew a `pinned`
+    /// column would simply have un-pinned the path, and 56.5's release sweep
+    /// reads `pinned` as the one thing it may not cross.
+    ///
+    /// The row is planted with all five late columns filled, because a test that
+    /// only checked `pinned` would pass against a statement that named `pinned`
+    /// and forgot the rest.
+    #[test]
+    fn re_materializing_a_pinned_path_moves_only_its_timestamp() {
+        let c = conn();
+        remember_materialized(&c, "p", "40-media/clip.mp4", 1_700).expect("first landing");
+        c.execute(
+            "UPDATE materialized
+                SET pinned = 1,
+                    last_used_ms = 1_750,
+                    synced_at_ms = 1_760,
+                    oid = 'abc123',
+                    size_bytes = 4_194_304
+              WHERE profile_id = 'p' AND path = '40-media/clip.mp4'",
+            [],
+        )
+        .expect("fill the late columns the way a later story will");
+
+        remember_materialized(&c, "p", "40-media/clip.mp4", 9_900).expect("a second landing");
+
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read the ledger"),
+            vec![MaterializedRow {
+                path: "40-media/clip.mp4".to_owned(),
+                at_ms: 9_900,
+                last_used_ms: Some(1_750),
+                synced_at_ms: Some(1_760),
+                oid: Some("abc123".to_owned()),
+                size_bytes: Some(4_194_304),
+                pinned: true,
+                local_origin: false,
+            }],
+            "only the timestamp moved: an upsert that named more than `at_ms`, \
+             or a REPLACE that named less, fails here"
+        );
+    }
+
+    /// The pin is the one thing a release may not cross, so every way of not
+    /// being pinned has to answer the same `false` (Story 56.4).
+    #[test]
+    fn is_pinned_reads_one_path_and_treats_absence_and_null_alike() {
+        let c = conn();
+        assert!(
+            !is_pinned(&c, "p", "40-media/clip.mp4").expect("no row"),
+            "a path this machine has never materialized is not pinned"
+        );
+
+        remember_materialized(&c, "p", "40-media/clip.mp4", 1_700).expect("landing");
+        remember_materialized(&c, "p", "40-media/other.mp4", 1_700).expect("landing");
+        assert!(
+            !is_pinned(&c, "p", "40-media/clip.mp4").expect("null column"),
+            "the one writer sets `at_ms` and nothing else, so `pinned` reads \
+             back NULL — which means the default, not a third answer"
+        );
+
+        c.execute(
+            "UPDATE materialized SET pinned = 1
+              WHERE profile_id = 'p' AND path = '40-media/clip.mp4'",
+            [],
+        )
+        .expect("pin it the way 56.5's writer will");
+        assert!(is_pinned(&c, "p", "40-media/clip.mp4").expect("pinned"));
+        assert!(
+            !is_pinned(&c, "p", "40-media/other.mp4").expect("sibling"),
+            "one path's pin is not its neighbour's"
+        );
+        assert!(
+            !is_pinned(&c, "q", "40-media/clip.mp4").expect("other profile"),
+            "and not another folder's, even at the same path"
+        );
+    }
+
+    /// Each clock writer knows exactly one fact and cannot touch another
+    /// (Story 56.5).
+    ///
+    /// The whole row is planted first, so a statement that named more columns
+    /// than its own fact fails here rather than in a release six months later
+    /// — which is the loss class `remember_materialized`'s doc records.
+    #[test]
+    fn each_clock_writer_moves_its_own_column_and_no_other() {
+        let c = conn();
+        remember_materialized(&c, "p", "40-media/clip.mp4", 1_700).expect("landing");
+        set_pinned(&c, "p", "40-media/clip.mp4", true, 1_700).expect("pin");
+        note_synced(&c, "p", "40-media/clip.mp4", 1_710).expect("confirm");
+        note_use(&c, "p", "40-media/clip.mp4", 1_720).expect("use");
+
+        let only = |c: &Connection| materialized_rows(c, "p").expect("read").remove(0);
+        assert_eq!(
+            only(&c),
+            MaterializedRow {
+                path: "40-media/clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: Some(1_720),
+                synced_at_ms: Some(1_710),
+                oid: None,
+                size_bytes: None,
+                pinned: true,
+                local_origin: false,
+            },
+            "four writers, four facts, none of them disturbing another"
+        );
+
+        note_use(&c, "p", "40-media/clip.mp4", 9_000).expect("a later use");
+        let row = only(&c);
+        assert_eq!(row.last_used_ms, Some(9_000));
+        assert!(row.pinned, "a use does not withdraw the owner's pin");
+        assert_eq!(
+            row.synced_at_ms,
+            Some(1_710),
+            "nor does it forge a remote confirmation"
+        );
+        assert!(
+            !row.local_origin,
+            "and reading a file is not authoring it — the whole point of AD-131's \
+             two clocks is that a use cannot make an unconfirmed local path eligible"
+        );
+    }
+
+    /// An arrival records one fact whole: the content came from upstream, it is
+    /// here now, and it is this object (Story 56.5).
+    #[test]
+    fn an_arrival_starts_the_remote_origin_clock_and_says_where_it_came_from() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        set_pinned(&c, "p", "clip.mp4", true, 1_700).expect("pin");
+        note_synced(&c, "p", "clip.mp4", 1_650).expect("the remote held the old bytes");
+        note_local_authorship(&c, "p", "clip.mp4", 1_700, "aaa111", 64)
+            .expect("this clone wrote it once");
+        assert!(materialized_rows(&c, "p").expect("read")[0].local_origin);
+
+        // A later pull replaces the content with the remote's version, so the
+        // provenance moves back with it — and so does the identity, because the
+        // object at this path is not the one this clone wrote any more.
+        note_arrival(&c, "p", "clip.mp4", 2_000, "bbb222", 4_194_304).expect("arrival");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(row.last_used_ms, Some(2_000));
+        assert!(
+            !row.local_origin,
+            "the bytes at this path came from upstream now, whoever wrote the last ones"
+        );
+        assert_eq!(
+            row.oid.as_deref(),
+            Some("bbb222"),
+            "an arrival is one of the two moments the committed pointer is in hand, \
+             so it is one of the two places the identity can honestly be recorded"
+        );
+        assert_eq!(
+            row.size_bytes,
+            Some(4_194_304),
+            "and the length travels with it — the sweep's byte ceiling reads this \
+             column, and bounded nothing at all while it had no writer"
+        );
+        assert_eq!(
+            row.at_ms, 1_700,
+            "and the arrival memo does not move the landing timestamp — \
+             `remember_materialized` owns that one"
+        );
+        assert!(row.pinned, "nor does it withdraw the owner's pin");
+        assert_eq!(
+            row.synced_at_ms, None,
+            "nor forge a remote confirmation: the authorship cleared it, and an \
+             arrival knows nothing about NFR-40's per-object proof"
+        );
+    }
+
+    /// A local modification invalidates any prior confirmation, because the
+    /// new bytes are not the ones the remote agreed to (Story 56.5, FR-341).
+    ///
+    /// This is the data-loss case the second column exists for: a path
+    /// confirmed upstream last week and re-edited this morning would otherwise
+    /// be released a TTL after the OLD confirmation, discarding content that
+    /// exists nowhere else.
+    #[test]
+    fn authoring_over_confirmed_content_clears_the_confirmation() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        note_arrival(&c, "p", "clip.mp4", 1_700, "aaa111", 64).expect("arrival");
+        note_synced(&c, "p", "clip.mp4", 1_800).expect("the remote holds it");
+        set_pinned(&c, "p", "clip.mp4", true, 1_800).expect("pin");
+
+        note_local_authorship(&c, "p", "clip.mp4", 2_000, "bbb222", 4_096)
+            .expect("the owner edited it");
+
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert!(row.local_origin, "these bytes are this clone's");
+        assert_eq!(
+            row.synced_at_ms, None,
+            "and the remote has never seen them, whatever it confirmed about the old ones"
+        );
+        assert_eq!(
+            row.oid.as_deref(),
+            Some("bbb222"),
+            "the conflict path records the object this clone wrote, not the one \
+             that arrived"
+        );
+        assert_eq!(row.size_bytes, Some(4_096), "and its length with it");
+        assert!(row.pinned, "the owner's standing instruction is untouched");
+        assert_eq!(
+            row.last_used_ms,
+            Some(1_700),
+            "and so is the use clock, which this writer knows nothing about"
+        );
+    }
+
+    /// A local authorship or a pin may be the first thing this ledger hears
+    /// about a path, so both insert; the three clock writers and a *withdrawn*
+    /// pin may not (Story 56.5).
+    ///
+    /// `at_ms` is `NOT NULL` and means *content landed here*, which a use, a
+    /// confirmation or an `unpin` has no way to know — so a fact about a path
+    /// with no row is a fact this table cannot hold, and the conservative
+    /// outcome is no candidate rather than a fabricated one.
+    #[test]
+    fn only_the_upsert_writers_may_create_a_row() {
+        let c = conn();
+        note_use(&c, "p", "ghost.mp4", 1_700).expect("a use of a path with no row");
+        note_arrival(&c, "p", "ghost.mp4", 1_700, "aaa111", 64).expect("an arrival with no row");
+        note_synced(&c, "p", "ghost.mp4", 1_700).expect("a confirmation with no row");
+        // The phantom-candidate guard. `keeper-syncd unpin` on a path this
+        // ledger has never heard of used to INSERT a row asserting content
+        // landed here now, and `Engine::release_due_at` reads exactly that row
+        // as a candidate a TTL later — forever, one budget slot a pass, for a
+        // release that can only ever refuse `AlreadyPointer`.
+        set_pinned(&c, "p", "ghost.mp4", false, 1_700).expect("an unpin with no row");
+        assert!(
+            materialized_rows(&c, "p").expect("read").is_empty(),
+            "none of the four UPDATE-only writers invented a row, and none errored"
+        );
+
+        // The owner creating a file here is the case with no arrival to have
+        // written a row, and the pin is a standing instruction about a path
+        // whose content may not be here yet. Both insert.
+        note_local_authorship(&c, "p", "written-here.mp4", 2_000, "bbb222", 4_096)
+            .expect("authorship");
+        set_pinned(&c, "p", "not-here-yet.mp4", true, 2_100).expect("pre-pin");
+        let rows = materialized_rows(&c, "p").expect("read");
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            vec!["not-here-yet.mp4", "written-here.mp4"]
+        );
+        assert_eq!(rows[1].at_ms, 2_000);
+        assert!(rows[1].local_origin);
+        assert_eq!(rows[1].oid.as_deref(), Some("bbb222"));
+        assert_eq!(rows[1].size_bytes, Some(4_096));
+        assert!(rows[0].pinned);
+        assert!(
+            !rows[0].local_origin,
+            "pinning a path says nothing about who wrote it"
+        );
+        assert_eq!(
+            rows[0].oid, None,
+            "nor about which object is there: a pin is an instruction, not an \
+             observation about content"
+        );
+    }
+
+    /// Unpinning gives a path back to the sweep and takes nothing else with it
+    /// (Story 56.5, FR-334).
+    #[test]
+    fn withdrawing_a_pin_makes_the_path_a_candidate_again() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        note_arrival(&c, "p", "clip.mp4", 1_700, "aaa111", 4_096).expect("arrival");
+        note_synced(&c, "p", "clip.mp4", 1_750).expect("the remote holds it");
+        set_pinned(&c, "p", "clip.mp4", true, 1_800).expect("pin");
+        assert!(is_pinned(&c, "p", "clip.mp4").expect("pinned"));
+
+        set_pinned(&c, "p", "clip.mp4", false, 1_900).expect("unpin");
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read").remove(0),
+            MaterializedRow {
+                path: "clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: Some(1_700),
+                synced_at_ms: Some(1_750),
+                oid: Some("aaa111".to_owned()),
+                size_bytes: Some(4_096),
+                pinned: false,
+                local_origin: false,
+            },
+            "the floor is gone and nothing else moved: both clocks, the \
+             provenance, the identity and the landing instant are exactly where \
+             they were, so the path is due whenever it would have been due had it \
+             never been pinned"
+        );
+
+        // A pin is idempotent, which is what lets the CLI verb be re-run.
+        set_pinned(&c, "p", "clip.mp4", true, 2_000).expect("pin");
+        set_pinned(&c, "p", "clip.mp4", true, 2_100).expect("pin again");
+        assert!(is_pinned(&c, "p", "clip.mp4").expect("still pinned"));
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read").remove(0).at_ms,
+            1_700,
+            "and re-pinning a row that exists does not restamp the landing instant"
+        );
+    }
+
+    /// A length SQLite's signed integer cannot hold saturates, and never wraps
+    /// (Story 56.5).
+    ///
+    /// This column is the release sweep's byte ceiling, so the direction of the
+    /// degradation is a safety property rather than a rounding choice. An `as`
+    /// cast would turn a `u64` above `i64::MAX` negative, `materialized_rows`
+    /// narrows a negative to `None`, and `None` is the one answer that makes a
+    /// candidate contribute *nothing* to the budget meant to bound it — so the
+    /// largest object in the folder would be the one the ceiling could not see.
+    /// Saturating reads back as enormous instead, which stops the pass at that
+    /// candidate after giving it its one attempt.
+    #[test]
+    fn a_length_larger_than_the_column_can_hold_saturates_rather_than_wrapping() {
+        let c = conn();
+        remember_materialized(&c, "p", "arrived.mp4", 1_700).expect("landing");
+        note_arrival(&c, "p", "arrived.mp4", 1_700, "aaa111", u64::MAX).expect("arrival");
+        note_local_authorship(&c, "p", "written-here.mp4", 1_800, "bbb222", u64::MAX)
+            .expect("authorship");
+
+        for row in materialized_rows(&c, "p").expect("read") {
+            assert_eq!(
+                row.size_bytes,
+                Some(i64::MAX as u64),
+                "{} saturated at what the column can say rather than wrapping \
+                 negative into `None`",
+                row.path
+            );
+        }
+
+        let smallest: i64 = c
+            .query_row(
+                "SELECT MIN(size_bytes) FROM materialized WHERE profile_id = 'p'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read the raw column");
+        assert!(
+            smallest > 0,
+            "nothing negative reached the column: {smallest}"
+        );
+    }
+
+    /// One folder's facts are not another's, at the same path (Story 56.5).
+    #[test]
+    fn every_clock_writer_is_scoped_to_one_profile() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        remember_materialized(&c, "q", "clip.mp4", 1_700).expect("landing");
+
+        note_use(&c, "p", "clip.mp4", 5_000).expect("use");
+        note_synced(&c, "p", "clip.mp4", 5_100).expect("confirm");
+        set_pinned(&c, "p", "clip.mp4", true, 5_200).expect("pin");
+        note_local_authorship(&c, "p", "clip.mp4", 5_300, "aaa111", 64).expect("authorship");
+
+        let other = materialized_rows(&c, "q").expect("read").remove(0);
+        assert_eq!(
+            other,
+            MaterializedRow {
+                path: "clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: None,
+                synced_at_ms: None,
+                oid: None,
+                size_bytes: None,
+                pinned: false,
+                local_origin: false,
+            },
+            "the neighbour folder's row at the same path is untouched"
+        );
+    }
+
+    /// Forgetting one path leaves every other fact in the ledger alone — and
+    /// the owner's pin is one of those facts.
+    #[test]
+    fn forget_materialized_removes_exactly_one_row() {
+        let c = conn();
+        remember_materialized(&c, "p", "a.mp4", 1_700).expect("landing");
+        remember_materialized(&c, "p", "b.mp4", 1_800).expect("landing");
+        remember_materialized(&c, "q", "a.mp4", 1_900).expect("landing");
+
+        forget_materialized(&c, "p", "a.mp4").expect("forget");
+        assert_eq!(
+            materialized_rows(&c, "p")
+                .expect("read")
+                .into_iter()
+                .map(|row| row.path)
+                .collect::<Vec<_>>(),
+            vec!["b.mp4".to_owned()],
+            "the sibling in the same folder survives"
+        );
+        assert_eq!(
+            materialized_rows(&c, "q").expect("read").len(),
+            1,
+            "and so does the same path in another folder"
+        );
+
+        forget_materialized(&c, "p", "a.mp4")
+            .expect("forgetting an absent row must succeed, as deleting an absent secret does");
+        forget_materialized(&c, "p", "never-here.mp4").expect("nor is a path it never knew");
+
+        // And a pinned row is not one it can take, whatever a caller asks. The
+        // refusal that keeps a pinned path away from here lives in the engine;
+        // this is the statement being incapable of the loss on its own.
+        remember_materialized(&c, "p", "kept.mp4", 2_000).expect("landing");
+        c.execute(
+            "UPDATE materialized SET pinned = 1 WHERE profile_id = 'p' AND path = 'kept.mp4'",
+            [],
+        )
+        .expect("pin it the way 56.5's writer will");
+        forget_materialized(&c, "p", "kept.mp4").expect("the statement succeeds");
+        assert!(
+            is_pinned(&c, "p", "kept.mp4").expect("still pinned"),
+            "the row — and with it the owner's pin — survived the delete"
+        );
     }
 
     #[test]
@@ -1886,5 +3725,227 @@ mod tests {
             back, held,
             "the previous state is intact: no delete without its inserts"
         );
+    }
+
+    /// A row written before releasing the redundant copy became the default
+    /// holds a literal `"lfsPruneLocal": false` — serde writes every field — so
+    /// the new default cannot reach it on its own, and the folders with a
+    /// second copy worth reclaiming are exactly the old ones.
+    ///
+    /// A store that predates the change is simulated the only way an in-memory
+    /// one can be: by dropping the marker, which is precisely what such a store
+    /// does not have.
+    #[test]
+    fn a_store_written_before_the_flip_is_carried_onto_the_new_default() {
+        let c = conn();
+        c.execute("DELETE FROM meta WHERE key = ?1", [PRUNE_DEFAULT_MARKER])
+            .expect("unmark");
+        let legacy = r#"{
+            "id": "01OLD", "name": "tgdrive", "localPath": "/w/tgdrive",
+            "remoteUrl": "https://git.example/u/tgdrive.git", "branch": "main",
+            "direction": "bidirectional", "lane": "main",
+            "subpaths": [], "excludes": [], "removable": false, "volumeId": null,
+            "lfsMode": "materialize", "lfsThresholdBytes": 4194304,
+            "lfsPruneLocal": false, "lfsNever": ["*.md"],
+            "settleMs": 5000, "pollIntervalMs": 15000, "tags": [],
+            "commitSubjectTemplate": "", "authorOverride": null, "enabled": true
+        }"#;
+        c.execute(
+            "INSERT INTO profiles (id, json, updated_ms) VALUES (?1, ?2, ?3)",
+            ("01OLD", legacy, 7_i64),
+        )
+        .expect("insert a pre-flip row");
+
+        migrate(&c).expect("the next open");
+
+        let carried = stored_profile(&c, "01OLD")
+            .expect("read")
+            .expect("the row is still there");
+        assert!(
+            carried.lfs_prune_local,
+            "an install that already exists is what the migration is for"
+        );
+        assert_eq!(
+            carried.lfs_never,
+            vec!["*.md".to_owned()],
+            "json_set rewrites one key and leaves the rest byte for byte"
+        );
+        let updated: i64 = c
+            .query_row(
+                "SELECT updated_ms FROM profiles WHERE id = '01OLD'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("timestamp");
+        assert_eq!(
+            updated, 7,
+            "the operator edited nothing, and a folder reporting an edit \
+             nobody made is the worse lie"
+        );
+    }
+
+    /// After the one-shot, `false` means an opt-out — a folder that has to be
+    /// restorable with no network. Re-running the rewrite on every open would
+    /// undo that choice, which is the whole reason the marker exists.
+    #[test]
+    fn a_deliberate_opt_out_survives_every_later_open() {
+        let c = conn();
+        let mut p = profile("01KEEP");
+        p.lfs_prune_local = false;
+        upsert_profile(&c, &p, 1).expect("insert");
+
+        migrate(&c).expect("a later open");
+
+        assert!(
+            !stored_profile(&c, "01KEEP")
+                .expect("read")
+                .expect("row")
+                .lfs_prune_local,
+            "the one-shot already ran; it must not run again"
+        );
+    }
+
+    /// Two paths whose content is identical share one object, and one object is
+    /// one download. The name is carried in a column rather than in the payload
+    /// precisely so that stays true — folding it into the payload would make
+    /// `enqueue_unique` see two different units and fetch the same bytes twice.
+    #[test]
+    fn two_paths_sharing_one_object_stay_one_download_under_the_first_name() {
+        let c = conn();
+        let unit = WorkKind::LfsDownload {
+            oid: "a".repeat(64),
+            size: 4_096,
+        };
+        let first = enqueue_unique(&c, "p", &unit, 1, 1).expect("first");
+        label_unit(&c, first, "70-comms/keeper-rec/camera-0001.mov").expect("label");
+        let second = enqueue_unique(&c, "p", &unit, 2, 2).expect("second");
+        label_unit(&c, second, "40-media/a-copy-of-the-same-file.mov").expect("relabel");
+
+        assert_eq!(first, second, "one object, one unit");
+        let claimed = claim_ready(&c, "p", 10, 10).expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].label.as_deref(),
+            Some("70-comms/keeper-rec/camera-0001.mov"),
+            "the first name wins; a last-one-wins race would make the line flicker"
+        );
+    }
+
+    /// The pair the status line reads. A push is real work and is not a file:
+    /// counting it would put a file count beside a byte total it contributes
+    /// nothing to, and the two numbers would disagree in the same sentence.
+    #[test]
+    fn queued_transfers_counts_sized_work_only_and_ignores_parked() {
+        let c = conn();
+        enqueue(&c, "p", &WorkKind::Push, 1, 1).expect("push");
+        enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: "b".repeat(64),
+                size: 1_000,
+            },
+            1,
+            1,
+        )
+        .expect("download");
+        let parked = enqueue(
+            &c,
+            "p",
+            &WorkKind::LfsDownload {
+                oid: "c".repeat(64),
+                size: 9_000_000,
+            },
+            1,
+            1,
+        )
+        .expect("second download");
+        c.execute(
+            "UPDATE journal SET state = 'parked' WHERE id = ?1",
+            [parked],
+        )
+        .expect("park it");
+
+        assert_eq!(
+            queued_transfers(&c, "p").expect("counted"),
+            (1, 1_000),
+            "the push has no size and the parked unit is not waiting"
+        );
+        assert_eq!(
+            queued_transfers(&c, "other").expect("counted"),
+            (0, 0),
+            "and it never reaches across profiles"
+        );
+    }
+
+    /// The bug the queue tail made visible: 106 units for 95 objects on a
+    /// folder pulling 53 GB, every duplicate a `running` object re-queued by
+    /// the next scan. A transfer is content-addressed — the same oid names the
+    /// same immutable bytes — so a second unit can only fetch what the first
+    /// one is already fetching.
+    #[test]
+    fn a_running_transfer_covers_an_identical_enqueue() {
+        let c = conn();
+        let unit = WorkKind::LfsDownload {
+            oid: "f".repeat(64),
+            size: 4_096,
+        };
+        let first = enqueue_unique(&c, "p", &unit, 1, 1).expect("first");
+        let claimed = claim_ready(&c, "p", 10, 10).expect("claim");
+        assert_eq!(claimed.len(), 1, "it is running now");
+
+        let second = enqueue_unique(&c, "p", &unit, 2, 2).expect("second");
+        assert_eq!(second, first, "the running unit is the one that covers it");
+        let total: i64 = c
+            .query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(total, 1, "a queue that never shrinks is how this looked");
+    }
+
+    /// A push is NOT covered by one in flight: it publishes what the worktree
+    /// holds when it runs, so a change made after it started needs its own
+    /// unit. Dropping it would strand that change until something else queued
+    /// a push — which is why the running state was ignored in the first place.
+    #[test]
+    fn a_running_push_does_not_cover_a_later_one() {
+        let c = conn();
+        let first = enqueue_unique(&c, "p", &WorkKind::Push, 1, 1).expect("first");
+        claim_ready(&c, "p", 10, 10).expect("claim");
+
+        let second = enqueue_unique(&c, "p", &WorkKind::Push, 2, 2).expect("second");
+        assert_ne!(
+            second, first,
+            "the running push cannot publish a change made after it started"
+        );
+    }
+
+    /// The queues that already exist. While one half is `running` the pair is
+    /// invisible; the moment recovery returns it to `pending` there are two
+    /// identical rows, and identical payload is identical work.
+    #[test]
+    fn recovery_collapses_a_duplicate_the_return_reveals() {
+        let c = conn();
+        let unit = WorkKind::LfsDownload {
+            oid: "a".repeat(64),
+            size: 8,
+        };
+        let kept = enqueue(&c, "p", &unit, 1, 1).expect("first");
+        // Exactly the shape the old enqueue rule produced: a second row for an
+        // object already in flight.
+        c.execute("UPDATE journal SET state = 'running' WHERE id = ?1", [kept])
+            .expect("run it");
+        let copy = enqueue(&c, "p", &unit, 2, 2).expect("duplicate");
+
+        recover_running(&c, 5).expect("recover");
+
+        let rows: Vec<i64> = c
+            .prepare("SELECT id FROM journal ORDER BY id")
+            .expect("prepare")
+            .query_map([], |r| r.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows");
+        assert_eq!(rows, vec![kept], "the copy goes, the queue's place stays");
+        assert!(!rows.contains(&copy));
     }
 }

@@ -102,8 +102,15 @@ export function highlightSegments(
   return segments.length === 0 ? [{ key: "0", text: body, match: false }] : segments;
 }
 
-/** A single hit body with the query terms tinted. */
-function HighlightedBody({ body, query }: { body: string; query: string }) {
+/**
+ * A single hit body with the query terms tinted.
+ *
+ * Exported for the document-search panel (FR-267): a notes hit and a message hit
+ * are different rows over different stores, but the tint is the same affordance
+ * and there is no honest reason for two of it — a second copy would drift from
+ * this one the first time the highlight token changes.
+ */
+export function HighlightedBody({ body, query }: { body: string; query: string }) {
   const segments = useMemo(() => highlightSegments(body, query), [body, query]);
   return (
     <>

@@ -1,10 +1,39 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/components/layout/app-shell";
+import { SIDEBAR_WIDTH_CLASS } from "@/components/layout/sidebar-pane";
+import { COLUMN_COLLAPSE_PREFIX, COLUMN_EXPAND_PREFIX } from "@/components/layout/surface-column";
+import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import {
+  COLUMN_FOLD_COOKIE,
+  columnFoldCookie,
+  columnsUnfolded,
+  resetColumnFoldForTest,
+} from "@/lib/stores/column-fold";
 import { detailStore } from "@/lib/stores/detail-ui";
+import {
+  FILES_TREE_COOKIE,
+  filesTreeCookie,
+  filesTreeStore,
+  nodeKey,
+  resetFilesTreeForTest,
+} from "@/lib/stores/files-tree";
+import {
+  PANELS_COOKIE,
+  panelsCookie,
+  panelsStore,
+  resetPanelsStoreForTest,
+} from "@/lib/stores/panels";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { roomsStore } from "@/lib/stores/rooms";
+import {
+  readSidebarFold,
+  resetSidebarFoldForTest,
+  SIDEBAR_FOLD_COOKIE,
+  sidebarFoldCookie,
+  unfolded,
+} from "@/lib/stores/sidebar-fold";
 
 const beginTitleBarDrag = vi.fn();
 
@@ -47,6 +76,27 @@ afterEach(() => {
   primaryViewStore.getState().setView("inbox");
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   beginTitleBarDrag.mockClear();
+  // The panel list is remembered in a cookie, so one test's arrangement would
+  // otherwise be the next test's restore.
+  resetPanelsStoreForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: arranging or clearing cookie state is this test's subject
+  document.cookie = `${PANELS_COOKIE}=; path=/; max-age=0`;
+  // The fold is remembered in a cookie too, so one test's fold would otherwise
+  // be the next test's restore — and `hydrateSidebarFold` runs once per module,
+  // so the reset has to clear both halves.
+  resetSidebarFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state is this test's subject
+  document.cookie = `${SIDEBAR_FOLD_COOKIE}=; path=/; max-age=0`;
+  // And so is the Files tree's expansion (Story 46.3), for the same reason and
+  // with the same two halves.
+  resetFilesTreeForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state is this test's subject
+  document.cookie = `${FILES_TREE_COOKIE}=; path=/; max-age=0`;
+  // Story 48.1's surface-column fold, for the same reason and with the same two
+  // halves: a module-level store and a cookie.
+  resetColumnFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing cookie state is this test's subject
+  document.cookie = `${COLUMN_FOLD_COOKIE}=; path=/; max-age=0`;
 });
 
 describe("AppShell", () => {
@@ -179,6 +229,29 @@ describe("AppShell", () => {
     expect(screen.queryByRole("region", { name: "Sync" })).not.toBeInTheDocument();
   });
 
+  // ── Files view (Story 43.8) ────────────────────────────────────────────────
+  it("renders the Files pane for the files view when the sync capability is on", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    primaryViewStore.getState().setView("files");
+    render(<AppShell />);
+
+    expect(screen.getByRole("region", { name: "Files" })).toBeInTheDocument();
+    // The browser replaces the chat cluster rather than sitting beside it.
+    expect(screen.queryByText("Select a conversation to start reading.")).not.toBeInTheDocument();
+    // Sibling surfaces, not the same one.
+    expect(screen.queryByRole("region", { name: "Sync" })).not.toBeInTheDocument();
+  });
+
+  it("does not render the Files pane when the sync capability is off", () => {
+    // A stale "files" primary-view must never show a browser over folders this
+    // build cannot sync — the same rule the Sync pane above is gated by.
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    primaryViewStore.getState().setView("files");
+    render(<AppShell />);
+
+    expect(screen.queryByRole("region", { name: "Files" })).not.toBeInTheDocument();
+  });
+
   // ── Overlay-titlebar drag band (Story 34.2) ────────────────────────────────
   it("renders no drag band where the platform draws its own title bar", () => {
     // Off macOS the window controls live in a real title bar above the webview, so
@@ -202,7 +275,7 @@ describe("AppShell", () => {
     const columns = document.querySelectorAll("[data-tauri-drag-region]");
     expect(columns).toHaveLength(2);
     // The drawer column is exactly the drawer's width, then the rest of the row.
-    expect(columns[0]).toHaveClass("bg-sidebar", "w-[260px]");
+    expect(columns[0]).toHaveClass("bg-sidebar", SIDEBAR_WIDTH_CLASS.expanded);
     expect(columns[1]).toHaveClass("bg-background");
   });
 
@@ -304,5 +377,224 @@ describe("AppShell", () => {
     } finally {
       document.removeEventListener("mousedown", shim);
     }
+  });
+
+  /**
+   * Story 45.1, and DW-172's lesson made into an assertion.
+   *
+   * Three tray listeners shipped in epic 44 declared and never mounted, because
+   * `renderHook` mounts the hook itself and can therefore never see that `App`
+   * does not. The panel restore is the same shape of thing: a `useEffect` that
+   * is correct in isolation and worthless if the shell does not call it. So it
+   * is asserted HERE, against the real shell, by writing a cookie the way the
+   * last run would have and looking for the panel on screen.
+   */
+  it("restores the panels the last run left open", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging or clearing cookie state is this test's subject
+    document.cookie = panelsCookie(
+      [
+        {
+          id: "p",
+          target: { kind: "file", profileId: "p1", relativePath: "docs/report.pdf" },
+          replaced: null,
+          folded: false,
+        },
+      ],
+      "p",
+    );
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    primaryViewStore.getState().setView("files");
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The panel is named after the file it holds, so finding the frame proves
+    // the cookie was read, the store was hydrated and the strip was mounted.
+    // What it RESOLVES to is the strip's own suite: with no Tauri host the
+    // listing call fails and the panel renders that reason, which is the
+    // correct behaviour and not what this test is about.
+    expect(await screen.findByLabelText("report.pdf")).toBeInTheDocument();
+    expect(panelsStore.getState().panels).toHaveLength(1);
+  });
+
+  /**
+   * The Files tree comes back open (Story 46.3), asserted at the SHELL for the
+   * third time and the third reason it is the only place that can fail.
+   *
+   * `FilesPane`'s own suite calls `hydrateFilesTree` itself, so it would pass
+   * unchanged on a build where `AppShell` never called it — which is precisely
+   * DW-172 again, and precisely the shape of the defect this story fixed: a
+   * restore that lives in a component the shell unmounts.
+   */
+  it("restores the folders the Files tree last had open", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = filesTreeCookie(new Set([nodeKey("p1", ""), nodeKey("p1", "docs")]));
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    primaryViewStore.getState().setView("files");
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The store, not the tree on screen: with no Tauri host the profile list
+    // never arrives, so there is nothing to render the expansion against. What
+    // this asserts is the one thing only the shell can get wrong.
+    expect(filesTreeStore.getState().expanded).toEqual(
+      new Set([nodeKey("p1", ""), nodeKey("p1", "docs")]),
+    );
+  });
+
+  /**
+   * The fold survives a restart (Story 45.20, FR-198).
+   *
+   * At the SHELL, deliberately, because the shell is the only place that can
+   * fail: `hydrateSidebarFold` is mounted here, and a hook-level test of the
+   * store can never see that `AppShell` does not call it (DW-172). That is the
+   * exact defect epic 44 shipped with three tray listeners.
+   */
+  it("comes back folded when the last run left it folded", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = sidebarFoldCookie({ menu: true, groups: { spaces: false, networks: false } });
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The rail, and a control that says how to get out of it. The nav is still
+    // there and still navigable — a fold is not a disappearance.
+    expect(screen.getByRole("button", { name: "Expand menu" })).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass("w-12");
+    expect(screen.getByRole("button", { name: "Chats" })).toBeInTheDocument();
+  });
+
+  it("comes back unfolded when the last run left it unfolded", async () => {
+    // The inverse, written down, because "folded" is the state a restore that
+    // did nothing could not produce and "unfolded" is the state it could. Both
+    // arms or the test only proves the cookie can say one thing.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = sidebarFoldCookie(unfolded());
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("button", { name: "Collapse menu" })).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass(
+      SIDEBAR_WIDTH_CLASS.expanded,
+    );
+  });
+
+  it("folds on the press and writes it out, so the next run reads it back", async () => {
+    // The act, not the offer. This is the whole loop the previous two tests
+    // only read one end of: press, persist, and re-read through the same
+    // parser a restart would use.
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse menu" }));
+
+    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass("w-12");
+    expect(readSidebarFold(document.cookie).menu).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand menu" }));
+    expect(readSidebarFold(document.cookie).menu).toBe(false);
+  });
+
+  it("withdraws the fold control below the collapse breakpoint and folds anyway", async () => {
+    // Under 1080px the viewport has already decided; the user's remembered
+    // choice cannot unfold into a width that is not there, and the control is
+    // absent rather than present and inert.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = sidebarFoldCookie(unfolded());
+    mockViewportWidth(1000);
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("navigation", { name: "Views" })).toHaveClass("w-12");
+    expect(screen.queryByRole("button", { name: "Expand menu" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Collapse menu" })).not.toBeInTheDocument();
+    // Still navigable, still named.
+    expect(screen.getByRole("button", { name: "Chats" })).toBeInTheDocument();
+  });
+
+  /**
+   * The surface columns come back folded (Story 48.1), asserted at the SHELL for
+   * the fourth time and the fourth instance of the same reason.
+   *
+   * `hydrateColumnFold` is mounted here and nowhere else, because the four
+   * columns live on three primary views that are each unmounted whenever
+   * another is showing. `column-fold.test.ts` calls the hydrate itself and
+   * would pass unchanged on a build where `AppShell` never did (DW-172) — which
+   * is exactly the defect Story 45.15 shipped one epic ago, a whole chain built
+   * and never mounted.
+   *
+   * The chat list is the column this test can reach: it is what the default
+   * "inbox" view renders.
+   */
+  it("brings the chat list back folded when the last run left it folded", async () => {
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = columnFoldCookie({ ...columnsUnfolded(), "chat-list": true });
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const label = SURFACE_COLUMNS["chat-list"].label;
+    expect(
+      screen.getByRole("button", { name: `${COLUMN_EXPAND_PREFIX} ${label}` }),
+    ).toBeInTheDocument();
+    // The list itself is gone, and the conversation pane beside it is not.
+    expect(screen.queryByLabelText("Loading conversations")).not.toBeInTheDocument();
+    expect(screen.getByRole("main")).toBeInTheDocument();
+  });
+
+  it("brings it back showing when the last run left it showing", async () => {
+    // The other arm: "folded" is the state a restore that did nothing could not
+    // produce, and "showing" is the state it could.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = columnFoldCookie(columnsUnfolded());
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["chat-list"].label}`,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
+  });
+
+  it("keeps offering the column folds below the sidebar's collapse breakpoint", async () => {
+    // The sidebar's own fold is WITHDRAWN under 1080px because the viewport has
+    // already forced it. A surface column is the opposite case: it is exactly
+    // where room is short that putting one away is worth offering, and nothing
+    // has decided it for the user.
+    mockViewportWidth(1000);
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole("button", { name: "Collapse menu" })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["chat-list"].label}`,
+      }),
+    ).toBeInTheDocument();
   });
 });

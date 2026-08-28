@@ -2,6 +2,21 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
+  // The footprint the card asks for. A mock that does not know a command the
+  // component calls is a mock that lies about the surface under test — and this
+  // one threw at the property access, which is how it was noticed.
+  syncFootprint: vi.fn(async () => ({
+    onDisk: 1024,
+    lfsCache: 512,
+    reclaimable: 256,
+    scratch: 0,
+    content: 4096,
+    onDiskLabel: "1 KB",
+    lfsCacheLabel: "512 B",
+    reclaimableLabel: "256 B",
+    scratchLabel: "0 B",
+    contentLabel: "4 KB",
+  })),
   // The shared profile/status mirror.
   syncProfiles: vi.fn(),
   syncStatuses: vi.fn(),
@@ -59,6 +74,7 @@ import {
   copySummarySentence,
   formatCopyBytes,
   formatSyncWaited,
+  PENDING_MARKS,
   SYNC_ACTIVITY_EMPTY_SENTENCE,
   SYNC_ACTIVITY_TITLE,
   SYNC_CONFLICT_SENTENCE,
@@ -66,10 +82,14 @@ import {
   SYNC_DELIVERY_DETAIL_LABEL,
   SYNC_DELIVERY_RETRYING_SENTENCE,
   SYNC_DELIVERY_STATES,
+  SYNC_FOOTPRINT_TESTID,
   SYNC_PANE_EMPTY_SENTENCE,
   SYNC_PARKED_NO_ERROR_SENTENCE,
   SYNC_PARKED_TITLE,
+  SYNC_PENDING_CURRENT_WORD,
   SYNC_PENDING_EMPTY_SENTENCE,
+  SYNC_PENDING_INBOUND_WORD,
+  SYNC_PENDING_OUTBOUND_WORD,
   SYNC_PENDING_TITLE,
   SYNC_PROBLEMS_TITLE,
   SYNC_RESCAN_LABEL,
@@ -78,6 +98,8 @@ import {
   SYNC_RETRY_LABEL,
   SYNC_SETTLING_NOTE,
   SYNC_SETTLING_SENTENCE,
+  SYNC_UNSPELLABLE_SENTENCE,
+  SYNC_UNSPELLABLE_TITLE,
   SyncPane,
   syncParkedSummary,
   syncPendingReason,
@@ -124,6 +146,7 @@ import {
   copyStatus,
   syncActivity,
   syncFolderNow,
+  syncFootprint,
   syncGetCredential,
   syncListSettingsGet,
   syncOpenPath,
@@ -213,6 +236,10 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     commitSubjectTemplate: "",
     notes: false,
     notesSubfolder: null,
+    recordings: false,
+    recordingsSubfolder: "recordings",
+    sessions: false,
+    sessionsSubfolder: "60-sessions",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -226,6 +253,8 @@ function statusVm(over: Partial<SyncStatusVm> = {}): SyncStatusVm {
     state: "watching",
     phase: "idle",
     line: RUST_LINE,
+    queuedFiles: 0,
+    queuedBytes: 0,
     filesDone: 0,
     filesTotal: null,
     bytesDone: 0,
@@ -265,7 +294,7 @@ function progressVm(over: Partial<SyncProgressVm> = {}): SyncProgressVm {
 }
 
 function problemsVm(over: Partial<SyncProblemsVm> = {}): SyncProblemsVm {
-  return { warning: null, error: null, parked: [], conflicts: [], ...over };
+  return { warning: null, error: null, parked: [], conflicts: [], unspellable: [], ...over };
 }
 
 /**
@@ -372,6 +401,64 @@ afterEach(() => {
 });
 
 describe("SyncPane profile header", () => {
+  /**
+   * The line that answers "why is it 220 GB here and less on the server".
+   *
+   * A synced folder holds the working tree AND a local LFS cache of the same
+   * content, so a folder of large files is close to twice its own size by
+   * design — and without this line that difference reads as a leak.
+   */
+  it("says what the folder costs, and how much of it the server already has", async () => {
+    render(<SyncPane />);
+
+    const line = await screen.findByTestId(SYNC_FOOTPRINT_TESTID);
+    expect(line).toHaveTextContent("1 KB on disk");
+    expect(line).toHaveTextContent("256 B the server already has");
+    // What the folder tracks at full size — 4 KB of content held as 1 KB on
+    // disk, which is a folder whose large files have been released. Worked out
+    // from the LFS pointers, so it is the same figure whether or not the bytes
+    // were ever fetched, and it is what a virtual folder would leave behind.
+    expect(line).toHaveTextContent("4 KB of content");
+  });
+
+  /**
+   * A folder with no large files weighs what it weighs, and saying so twice in
+   * one sentence reads as a bug in the sentence rather than as a fact.
+   */
+  it("says nothing about content when content is what is on disk", async () => {
+    // `bigint`, because that is what ts-rs generates for a `u64` and what the
+    // command actually resolves with. The module-level mock above predates the
+    // generated type and gets away with numbers only because a `vi.mock` factory
+    // is not checked against it.
+    vi.mocked(syncFootprint).mockResolvedValueOnce({
+      onDisk: 1024n,
+      lfsCache: 0n,
+      reclaimable: 0n,
+      scratch: 0n,
+      content: 1024n,
+      onDiskLabel: "1 KB",
+      lfsCacheLabel: "0 B",
+      reclaimableLabel: "0 B",
+      scratchLabel: "0 B",
+      contentLabel: "1 KB",
+    });
+    render(<SyncPane />);
+
+    const line = await screen.findByTestId(SYNC_FOOTPRINT_TESTID);
+    expect(line.textContent ?? "").not.toContain("of content");
+  });
+
+  /**
+   * A zero is not a fact anybody needs. A row of "0 B scratch" teaches a reader
+   * to stop reading the line, which costs more than the line gives.
+   */
+  it("leaves out the parts that are zero", async () => {
+    render(<SyncPane />);
+
+    const line = await screen.findByTestId(SYNC_FOOTPRINT_TESTID);
+    expect(line.textContent ?? "").not.toContain("scratch");
+  });
+
   it("renders the Rust-composed line verbatim beside a state word, path and host", async () => {
     await renderPane();
 
@@ -391,6 +478,7 @@ describe("SyncPane profile header", () => {
       pulled: true,
       filesChanged: 0,
       conflicts: [],
+      stale: [],
       bytes: 0,
       line: "Nothing to sync — this folder already matches the remote.",
       ...over,
@@ -586,9 +674,27 @@ describe("SyncPane profile header", () => {
     });
 
     // Worded the way the Rust status line words its counter, so the fast copy
-    // and the polled sentence above read as one quantity.
-    expect(await screen.findByText("3/12 files · 4.1 MB/s")).toBeInTheDocument();
+    // and the polled sentence above read as one quantity. Two elements, not
+    // one string: the rate needs a box of its own to stop it dragging the row
+    // about, and the file count cannot have one.
+    expect(await screen.findByText("3/12 files")).toBeInTheDocument();
+    const rate = screen.getByText("4.1 MB/s");
     expect(screen.getByText("clips/holiday.mov")).toBeInTheDocument();
+
+    // The reservation itself, asserted as the class because jsdom has no
+    // layout to measure: `2 kB/s` and `294.8 kB/s` differ by four characters,
+    // and without a fixed box everything after the rate would move every tick.
+    expect(rate.className).toContain("min-w-[11ch]");
+    expect(rate.className).toContain("text-right");
+
+    // And in that order. The figures are the fixed-width half and the half that
+    // changes every tick; a reader watching a rate should not have to find it
+    // at the end of a path whose length depends on how deep the file sits.
+    // Stated as the property rather than as literal text: `textContent` glues
+    // the spans together without the flex gap, so a string match here pins the
+    // layout's whitespace instead of the thing that matters.
+    const detail = rate.closest("p")?.textContent ?? "";
+    expect(detail.indexOf("4.1 MB/s")).toBeLessThan(detail.indexOf("clips/holiday.mov"));
   });
 
   it("claims nothing is in flight for a folder that has stopped", async () => {
@@ -658,6 +764,31 @@ describe("SyncPane profile header", () => {
     // absent rather than zero, and no separator is orphaned where it would be.
     expect(await screen.findByText("6/12 files")).toBeInTheDocument();
     expect(screen.queryByText(/B\/s/)).not.toBeInTheDocument();
+  });
+
+  it("leaves no orphaned separator on a phase that cannot carry a rate", async () => {
+    // The walk over a 155 000-file folder. It reports a count and never a rate,
+    // because a scan moves no bytes over any link - so reserving the rate's
+    // eleven characters printed `23/155662 files ·` followed by blank space,
+    // which is what the owner saw the moment the walk began reporting.
+    const scanning = "Scanning tgdrive — 23/155662 files";
+    mockStatuses.mockResolvedValue([
+      statusVm({ state: "syncing", phase: "scanning", line: scanning }),
+    ]);
+    render(<SyncPane />);
+    await screen.findByText(scanning);
+
+    act(() => {
+      emitProgress?.(
+        progressVm({ fraction: null, filesDone: 23, filesTotal: 155_662, bytesPerSecond: null }),
+      );
+    });
+
+    const counter = await screen.findByText("23/155662 files");
+    expect(screen.queryByText(/B\/s/)).not.toBeInTheDocument();
+    // The detail line is the counter and nothing else: no separator, and no
+    // reserved room for a figure this phase can never produce.
+    expect(counter.parentElement?.textContent).toBe("23/155662 files");
   });
 
   it("drops a stale streamed fraction once the poll says the folder is settled", async () => {
@@ -1221,9 +1352,53 @@ describe("SyncPane activity delivery", () => {
 
 describe("SyncPane pending", () => {
   const pending: SyncPendingVm[] = [
-    { path: "notes/draft.md", reason: "settling", sinceMs: NOW - 300_000 },
-    { path: "notes/scratch.md", reason: "untracked", sinceMs: null },
+    { path: "notes/draft.md", reason: "settling", sinceMs: NOW - 300_000, sizeBytes: null },
+    { path: "notes/scratch.md", reason: "untracked", sinceMs: null, sizeBytes: null },
   ];
+
+  /**
+   * The lists are paths — repository-relative, four folders deep, beside a size
+   * and a date. Capped at 720px they truncate into ellipses while the window
+   * sits half empty, and the tail of a path is the half that identifies it.
+   *
+   * The forms are the opposite case and keep their measure, which is why this
+   * asserts both halves rather than "no max-width anywhere".
+   */
+  /**
+   * The other half of going full-bleed, and the half that bit: Radix renders a
+   * scroll viewport's child as `display: table`, so its width is `max-content`.
+   * The longest path in the longest list then decides how wide the card is, and
+   * the row of actions ends up past the window's edge with `Remove` unclickable.
+   */
+  it("keeps the scrolling body inside the window rather than sizing to its content", async () => {
+    await renderPane();
+    await screen.findByText(RUST_LINE);
+
+    const viewport = document.querySelector('[data-slot="scroll-area-viewport"]');
+    expect(viewport).not.toBeNull();
+    expect(viewport?.className).toContain("[&>div]:!block");
+    expect(viewport?.className).toContain("[&>div]:!w-full");
+  });
+
+  it("gives the lists the whole window and the forms a measure", async () => {
+    await renderPane();
+    // Any rendered row will do; this one is the folder card's own line.
+    await screen.findByText(RUST_LINE);
+
+    const body = document.querySelector('[data-slot="sync-body"]');
+    expect(body).not.toBeNull();
+    expect(body?.className).not.toMatch(/max-w-/);
+    expect(body?.className).not.toMatch(/mx-auto/);
+    // And no gutter: a folder's card is a section of this pane rather than an
+    // object floating on it, so the card colour reaches every edge.
+    expect(body?.className).not.toMatch(/\bp-6\b/);
+    expect(body?.className).not.toMatch(/\bgap-6\b/);
+    const card = document.querySelector('[data-slot="card"]');
+    expect(card?.className).toContain("rounded-none");
+    // Separated by a rule, because with the cards meeting there is no
+    // background between them left to do it.
+    expect(card?.className).toContain("border-b");
+  });
 
   it("lists what is waiting and why", async () => {
     mockPending.mockResolvedValue(pending);
@@ -1234,7 +1409,89 @@ describe("SyncPane pending", () => {
     expect(rows).toHaveLength(2);
     expect(rows[0]).toHaveTextContent("notes/draft.md");
     expect(rows[1]).toHaveTextContent("notes/scratch.md");
-    expect(rows[1]).toHaveTextContent("New file, not synced yet");
+    // The reason is the row's accessible description now, not visible prose:
+    // the glyph carries it for a reader who can see it.
+    expect(rows[1]).toHaveTextContent("New file");
+    expect(rows[1]).toHaveTextContent(SYNC_PENDING_OUTBOUND_WORD);
+  });
+
+  /** The list carries both directions now, so each row has to say which one it
+   * is without the reader parsing the sentence at the far end. */
+  it("marks which way each pending row is travelling", async () => {
+    mockPending.mockResolvedValue([
+      { path: "notes/scratch.md", reason: "untracked", sinceMs: null, sizeBytes: null },
+      {
+        path: "70-comms/camera-0001.mov",
+        reason: "incoming",
+        sinceMs: null,
+        sizeBytes: 405_800_000,
+      },
+    ]);
+    await renderPane();
+
+    const list = await screen.findByRole("list", { name: `${SYNC_PENDING_TITLE}: tgdrive` });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows[0]).toHaveTextContent(SYNC_PENDING_OUTBOUND_WORD);
+    expect(rows[1]).toHaveTextContent(SYNC_PENDING_INBOUND_WORD);
+    // Both halves of the mark: which way, and whether the far end already has
+    // something. A bare arrow is new content; a circled one is a second version.
+    expect(rows[0]).toHaveTextContent("New file");
+    expect(rows[1]).toHaveTextContent("New file");
+    // And the fourth combination, which needed a fact the repository does not
+    // hold: an object replacing content this machine has had before.
+    expect(
+      syncPendingReason({
+        path: "media/held-before.mov",
+        reason: "incomingUpdate",
+        sinceMs: null,
+        sizeBytes: 4_096,
+      }),
+    ).toBe("incomingUpdate");
+    expect(PENDING_MARKS.incomingUpdate.word).toBe(`Changed · ${SYNC_PENDING_INBOUND_WORD}`);
+    expect(PENDING_MARKS.incomingUpdate.icon).not.toBe(PENDING_MARKS.incoming.icon);
+    expect(PENDING_MARKS.modified.icon).not.toBe(PENDING_MARKS.untracked.icon);
+    // The size is a column of its own, and both directions have one — the
+    // uploads used to show none, which is what made the list read as two.
+    expect(rows[1]).toHaveTextContent("405.8 MB");
+    // And no prose: the sentence lives in the accessible name, not the row.
+    expect(rows[1]).not.toHaveTextContent("Waiting to download ·");
+  });
+
+  /** Which of the queued rows is the one actually moving right now. */
+  it("marks the row the transfer is on, and only that one", async () => {
+    mockPending.mockResolvedValue([
+      { path: "70-comms/camera-0000.mov", reason: "incoming", sinceMs: null, sizeBytes: 9_500_000 },
+      {
+        path: "70-comms/camera-0001.mov",
+        reason: "incoming",
+        sinceMs: null,
+        sizeBytes: 405_800_000,
+      },
+    ]);
+    await renderPane();
+
+    act(() => {
+      emitProgress?.(
+        progressVm({
+          phase: "downloadingLfs",
+          fraction: 0.2,
+          current: "70-comms/camera-0001.mov",
+          bytesPerSecond: 294_800,
+        }),
+      );
+    });
+
+    const list = await screen.findByRole("list", { name: `${SYNC_PENDING_TITLE}: tgdrive` });
+    const rows = within(list).getAllByRole("listitem");
+    // First, not second: it was second in the engine's order. A row marked and
+    // then left below the fold is not marked as far as anyone can see, and this
+    // list runs to eighty rows mid backlog.
+    expect(rows[0]).toHaveAttribute("aria-current", "true");
+    expect(rows[0]).toHaveTextContent("camera-0001.mov");
+    expect(rows[1]).not.toHaveAttribute("aria-current");
+    // Named, not merely shaded: a background colour is nothing to a screen
+    // reader and nothing to anyone who cannot separate these two greys.
+    expect(rows[0]).toHaveTextContent(SYNC_PENDING_CURRENT_WORD);
   });
 
   it("explains a settling file as a wait so far, never as a finish time", async () => {
@@ -1488,6 +1745,71 @@ describe("SyncPane problems", () => {
       within(list).getByText("notes/shared.sync-conflict-20260727-air.md"),
     ).toBeInTheDocument();
     expect(screen.getByText(SYNC_CONFLICT_SENTENCE)).toBeInTheDocument();
+  });
+
+  it("reports a name that is not text, in both the readable and the byte-exact form", async () => {
+    // DW-200. The engine finds these; before this they reached no surface, so
+    // keeper knew about a file it never mentioned. Two entries whose LOSSY
+    // renderings are identical — which is the whole hazard: `a\xff.txt` and
+    // `a\xfe.txt` read the same to a person and are two different files.
+    // React only *warns* about duplicate keys, so the row count below cannot
+    // catch a pane keyed on the lossy `display`. Captured and restored around
+    // the render, and asserted after, so a failure here never leaves the rest
+    // of the file with a muted console.
+    const complaints: string[] = [];
+    const spy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => complaints.push(args.map(String).join(" ")));
+    mockProblems.mockResolvedValue(
+      problemsVm({
+        unspellable: [
+          { display: "a\uFFFD.txt", escaped: "a\\xff.txt" },
+          { display: "a\uFFFD.txt", escaped: "a\\xfe.txt" },
+        ],
+      }),
+    );
+    let list: HTMLElement;
+    try {
+      await renderPane();
+      list = await screen.findByRole("list", { name: `${SYNC_UNSPELLABLE_TITLE}: tgdrive` });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    // The byte-exact form is what makes the row actionable — a person can paste
+    // it into a shell. Without it the two rows above are indistinguishable.
+    expect(within(list).getByText("a\\xff.txt")).toBeInTheDocument();
+    expect(within(list).getByText("a\\xfe.txt")).toBeInTheDocument();
+    // …and the readable form is still shown, because `a\uFFFD.txt` is what the
+    // person will recognise in their file manager.
+    expect(within(list).getAllByText("a\uFFFD.txt")).toHaveLength(2);
+    expect(screen.getByText(SYNC_UNSPELLABLE_SENTENCE)).toBeInTheDocument();
+    // The rows must be KEYED on the byte-exact name, and this is the assertion
+    // that says so. A mutation that keyed on `display` SURVIVED until this line
+    // existed, because React renders duplicate-keyed siblings and only warns.
+    // It is not pedantry: this list is the one place in the app where two
+    // entries routinely share a `display`, so a duplicate key here is a real
+    // reconciliation hazard the moment the list changes.
+    expect(complaints.filter((line) => line.includes("same key"))).toEqual([]);
+  });
+
+  it("says nothing about names when every name in the folder is text", async () => {
+    // The section must not appear on the overwhelmingly common folder, and
+    // "Problems" with an empty body is a worry with no cause (AD-S5).
+    //
+    // The folder has a DIFFERENT problem, deliberately: with nothing at all
+    // wrong the whole Problems section is absent and this test would pass
+    // against a name list rendered unconditionally. Asked this way it pins the
+    // one conditional it is about.
+    mockProblems.mockResolvedValue(problemsVm({ warning: "Large files are missing." }));
+    await renderPane();
+    await screen.findByText("Large files are missing.");
+
+    expect(screen.queryByText(SYNC_UNSPELLABLE_TITLE)).not.toBeInTheDocument();
+    expect(screen.queryByText(SYNC_UNSPELLABLE_SENTENCE)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("list", { name: `${SYNC_UNSPELLABLE_TITLE}: tgdrive` }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows the live warning and error the engine reported", async () => {
@@ -1759,17 +2081,27 @@ describe("sync pane projections", () => {
   });
 
   it("words each pending reason, and shows an unknown one as itself", () => {
-    expect(syncPendingReason({ path: "a", reason: "modified", sinceMs: null })).toBe(
-      "Changed, not synced yet",
-    );
+    expect(
+      syncPendingReason({ path: "a", reason: "modified", sinceMs: null, sizeBytes: null }),
+    ).toBe("Changed, not synced yet");
     // A settling row with no recorded start still says what it is waiting for.
-    expect(syncPendingReason({ path: "a", reason: "settling", sinceMs: null })).toBe(
-      SYNC_SETTLING_SENTENCE,
-    );
+    expect(
+      syncPendingReason({ path: "a", reason: "settling", sinceMs: null, sizeBytes: null }),
+    ).toBe(SYNC_SETTLING_SENTENCE);
     // A reason Rust grows later is shown, not swallowed.
-    expect(syncPendingReason({ path: "a", reason: "quarantined", sinceMs: null })).toBe(
-      "quarantined",
-    );
+    expect(
+      syncPendingReason({ path: "a", reason: "quarantined", sinceMs: null, sizeBytes: null }),
+    ).toBe("quarantined");
+    // The size is NOT in here any more: it is a column of its own, on every
+    // row, so this composes the accessible description alone.
+    expect(
+      syncPendingReason({
+        path: "70-comms/camera-0001.mov",
+        reason: "incoming",
+        sinceMs: null,
+        sizeBytes: 405_800_000,
+      }),
+    ).toBe("Waiting to download");
   });
 
   it("counts a single attempt in the singular and an unknown kind as itself", () => {

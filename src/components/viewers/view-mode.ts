@@ -1,0 +1,185 @@
+/**
+ * Which of a file's views the reader last chose, remembered per FORMAT
+ * (Story 45.4, FR-177, AD-88, UX-DR67).
+ *
+ * **Per format, never per file.** A person who prefers to see CSVs as a table
+ * prefers it for every CSV, and a person who reads JSON as source reads all of
+ * it as source. Keying by path would mean the preference has to be re-taught
+ * once per file and would grow without bound in whatever store held it — and
+ * the first file of a format a reader opens would always be the wrong view.
+ *
+ * **`document.cookie`, not `localStorage`.** Same reasoning `column-widths.ts`
+ * wrote down and the same store: a chosen view is a lens the reader picked, not
+ * a fact Rust has any use for, so it earns no settings row and no binding.
+ * `localStorage` is refused across this codebase (`iosSyncDisclosureShownGet`
+ * says so out loud), and the durable place the frontend already keeps a pane
+ * preference is a cookie. One answer to "where does a remembered view live",
+ * not two.
+ *
+ * Everything here is pure and takes the cookie string as an argument, so the
+ * parsing and the defaulting are assertable without a document. What a pure
+ * test of these CANNOT prove is that the component reads and writes them at the
+ * right moments — that is asserted in `raw-rendered-view.test.tsx` against a
+ * real render, because "the preference is stored correctly and consulted
+ * never" is the shape of defect this epic exists to stop shipping.
+ */
+
+/**
+ * The views a text-shaped format can have.
+ *
+ * `raw` is always editable and is the one every format has. `rendered` is the
+ * format's own drawing of itself — a preview, a table, a structure — and is
+ * read-only. `note` is Story 51.5's third mode and exists for markdown alone:
+ * the same live-preview layer the `rendered` half mounts, editable, over the
+ * same buffer and the same explicit Save (FR-294).
+ *
+ * Widened here rather than by a second per-format enum because the cookie
+ * below stores one vocabulary for every format, and a value this type does not
+ * admit is dropped by {@link isViewMode} — so the two would have to agree
+ * anyway, and one of them would eventually not.
+ */
+export type ViewMode = "raw" | "rendered" | "note";
+
+/** The cookie every format's remembered view shares. One cookie, not one each
+ *  — a jar with a name per format is a jar that hits the per-origin cap. */
+export const VIEW_MODE_COOKIE = "keeper_viewer_modes";
+
+/** A year, matching `COLUMN_WIDTH_MAX_AGE`. A view preference that expires in a
+ *  week silently resets on the person who opens keeper on Mondays. */
+export const VIEW_MODE_MAX_AGE = 60 * 60 * 24 * 365;
+
+/**
+ * What the file in front of the reader can offer, which is what its default is
+ * a function of (Story 52.3, FR-305).
+ *
+ * One field today and shaped as a record anyway, because the alternative at the
+ * call site is a bare boolean — `viewModeFor(jar, format, true)` says nothing
+ * about which of three views the `true` is about, and the second such flag would
+ * be positional beside it.
+ */
+export interface OfferedViews {
+  /**
+   * Whether this file is offered Note mode: markdown, note mode allowed by the
+   * surface, and not read-only.
+   *
+   * The surface's verdict, never re-derived here. `raw` and the format's own
+   * `rendered` half are not in this record because neither is ever withheld —
+   * raw is the view every text format has (AD-88), and a format with no
+   * rendered half renders no tablist at all, so there is nothing to default.
+   */
+  note: boolean;
+}
+
+/**
+ * The view a format opens in when the reader has never said.
+ *
+ * `note` when Note mode is offered, and `rendered` otherwise (Story 52.3, item
+ * 9 of the owner's sixth report). `spec-51-5:62` recorded the opposite as a
+ * deliberate non-goal — "a person opening a file to read it must not land in an
+ * editor" — and the owner has since asked for the reverse twice, so it is
+ * reversed on his say and the reasoning is written down rather than lost: Note
+ * mode is the live-preview view, so landing in it shows the reader the same
+ * drawing of their document Preview does, with a caret in it. Reading is not
+ * interrupted; only writing stops needing a click.
+ *
+ * Where Note is not offered — a read-only file, an oversize one, a `.csv`, a
+ * `.json` — this is unchanged: `rendered`, because the rendered view is the
+ * thing and the raw view is the name of the thing. Raw stays one click away and
+ * is what a reader asks for deliberately.
+ *
+ * A function rather than the constant this used to be, because "the default" is
+ * now a question about a particular file and a constant cannot answer one.
+ */
+export function defaultViewMode(offered: OfferedViews): ViewMode {
+  return offered.note ? "note" : "rendered";
+}
+
+/** Format ids come from the registry's `FILE_FORMATS` table, so they are ours
+ *  and are constrained rather than escaped. */
+const FORMAT_ID = /^[a-z][a-z0-9+-]*$/;
+
+/**
+ * Whether a decoded cookie fragment is one of the views.
+ *
+ * `note` joined the vocabulary in Story 51.5, and the compatibility runs both
+ * ways on purpose: a jar written by an older build holds `raw` or `rendered`
+ * and still resolves, and a jar holding `note` is not silently reset by a
+ * build that has the mode. What a `note` preference means on a file that
+ * offers no Note tab is `raw-rendered-view.tsx`'s question, not this table's —
+ * the jar remembers what the reader asked for, and the surface decides what it
+ * can honour.
+ */
+function isViewMode(value: string): value is ViewMode {
+  return value === "raw" || value === "rendered" || value === "note";
+}
+
+/**
+ * Every remembered view in a `document.cookie` string.
+ *
+ * A malformed pair is dropped rather than throwing. The jar is shared with
+ * every other cookie on the origin and with older builds of keeper, and a
+ * viewer that refuses to render because somebody's jar has a stale entry is a
+ * far worse outcome than a file that opens in its format's default view.
+ */
+export function readViewModes(cookie: string): Record<string, ViewMode> {
+  const modes: Record<string, ViewMode> = {};
+  for (const pair of cookie.split(";")) {
+    const separator = pair.indexOf("=");
+    if (separator === -1 || pair.slice(0, separator).trim() !== VIEW_MODE_COOKIE) {
+      continue;
+    }
+    for (const entry of decodeURIComponent(pair.slice(separator + 1).trim()).split("|")) {
+      const colon = entry.indexOf(":");
+      if (colon === -1) {
+        continue;
+      }
+      const format = entry.slice(0, colon);
+      const mode = entry.slice(colon + 1);
+      if (FORMAT_ID.test(format) && isViewMode(mode)) {
+        modes[format] = mode;
+      }
+    }
+  }
+  return modes;
+}
+
+/**
+ * The view `format` opens in: what the reader last chose, or the default for a
+ * file offering these views.
+ *
+ * **The jar is read first, and only an ABSENT answer takes the default** (Story
+ * 52.3). That order is the whole of why changing the default is safe: a reader
+ * who once pressed Preview kept a `rendered` in this jar, and he still opens in
+ * Preview. What a stored choice cannot do is claim a view this file does not
+ * have — that resolution belongs to the surface, which lights the tab it can
+ * honour and leaves the jar alone (`raw-rendered-view.tsx`).
+ *
+ * Total on purpose. A format the jar has never heard of, a jar that is empty, a
+ * jar written by a build that spelled the value differently — all of them answer
+ * a view rather than `undefined`, because every caller of this would otherwise
+ * have to repeat the same fallback and one of them would get it wrong.
+ */
+export function viewModeFor(cookie: string, format: string, offered: OfferedViews): ViewMode {
+  return readViewModes(cookie)[format] ?? defaultViewMode(offered);
+}
+
+/**
+ * The `document.cookie` assignment that records `format` opening in `mode` — or
+ * forgets it, when `mode` is null, so a reset leaves nothing behind to re-adopt.
+ *
+ * Takes the current cookie because a cookie write replaces one name's value
+ * wholesale: composing the next value from the current one is what keeps the
+ * CSV preference when the JSON one is changed.
+ */
+export function viewModeCookie(cookie: string, format: string, mode: ViewMode | null): string {
+  const modes = readViewModes(cookie);
+  if (mode === null) {
+    delete modes[format];
+  } else {
+    modes[format] = mode;
+  }
+  const value = Object.entries(modes)
+    .map(([key, each]) => `${key}:${each}`)
+    .join("|");
+  return `${VIEW_MODE_COOKIE}=${encodeURIComponent(value)}; path=/; max-age=${VIEW_MODE_MAX_AGE}`;
+}

@@ -16,7 +16,6 @@
  * Renders only the Add Account button when there are no accounts.
  */
 import {
-  Check,
   CloudOff,
   Loader2,
   LogOut,
@@ -40,7 +39,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -53,6 +51,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuRadioGroup,
@@ -64,6 +63,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import { Lamp } from "@/components/ui/lamp";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useSignOut } from "@/hooks/use-sign-out";
 import { accountHueVar } from "@/lib/account-hue";
@@ -91,7 +91,6 @@ interface AccountFooterProps {
 }
 
 const FOCUS_RING = "focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none";
-
 /** The homeserver host for a resolved homeserver URL, or the raw string when it
  * cannot be parsed as a URL. */
 function homeserverLabel(homeserverUrl: string): string {
@@ -103,9 +102,15 @@ function homeserverLabel(homeserverUrl: string): string {
 }
 
 /**
- * The 3-state sync glyph, a passive projection of the account's connection
- * status: no batch yet (`undefined`) → a syncing spinner; `online` → a synced
- * check; `offline` → a gray offline cloud. Never a toast.
+ * The sync glyph, a passive projection of the account's connection status: no
+ * batch yet (`undefined`) → a syncing spinner; `offline` → a gray offline
+ * cloud; `online` → nothing at all. Never a toast.
+ *
+ * `online` used to draw a check. It was on screen essentially always, which is
+ * what made it useless: a mark that is present whenever nothing is wrong tells
+ * a reader nothing when they look at it, and it cost a row that is now 130px
+ * wide the space to say which account it is. The two states worth a glyph are
+ * the two that are not fine, and those still have one.
  */
 function SyncGlyph({ status }: { status: ConnectionStatus | undefined }) {
   if (status === undefined) {
@@ -119,7 +124,7 @@ function SyncGlyph({ status }: { status: ConnectionStatus | undefined }) {
   if (status === "offline") {
     return <CloudOff aria-label="Offline" className="size-3.5 shrink-0 text-muted-foreground" />;
   }
-  return <Check aria-label="Synced" className="size-3.5 shrink-0 text-muted-foreground" />;
+  return null;
 }
 
 /** The hue-tinted initials avatar for an account. */
@@ -159,7 +164,7 @@ function BeeperCoverageDialog({
         <BeeperCoverageDisclosure />
         <DialogFooter>
           <DialogClose asChild>
-            <Button type="button" variant="outline" className={FOCUS_RING}>
+            <Button type="button" variant="outline">
               Close
             </Button>
           </DialogClose>
@@ -289,7 +294,6 @@ function SignOutDialog({
             <>
               <AlertDialogAction
                 variant="destructive"
-                className={FOCUS_RING}
                 disabled={signingOut || !identityMatches}
                 onClick={(event) => {
                   event.preventDefault();
@@ -302,7 +306,6 @@ function SignOutDialog({
                 <Button
                   type="button"
                   variant="outline"
-                  className={FOCUS_RING}
                   disabled={signingOut}
                   onClick={() => {
                     // Reversible: return to the keep-archive choice in place.
@@ -313,14 +316,13 @@ function SignOutDialog({
                 >
                   Keep archive instead
                 </Button>
-                <AlertDialogCancel className={FOCUS_RING}>Cancel</AlertDialogCancel>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
               </div>
             </>
           ) : (
             <>
               <AlertDialogAction
                 variant="destructive"
-                className={FOCUS_RING}
                 disabled={signingOut}
                 onClick={(event) => {
                   // Keep the dialog mounted while the async sign-out runs.
@@ -334,13 +336,12 @@ function SignOutDialog({
                 <Button
                   type="button"
                   variant="secondary"
-                  className={FOCUS_RING}
                   disabled={signingOut}
                   onClick={() => setArmed(true)}
                 >
                   …and delete this Account's archive
                 </Button>
-                <AlertDialogCancel className={FOCUS_RING}>Cancel</AlertDialogCancel>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
               </div>
             </>
           )}
@@ -474,21 +475,80 @@ function GlobalDndToggle() {
   };
 
   return (
-    <DropdownMenuItem
+    // A `menuitemcheckbox`, not a `menuitem` with a tick drawn on it (Story 49).
+    // The tick was the whole of the state and a tick is a picture: to anyone not
+    // looking at this menu, an app-wide switch that silences every notification
+    // on every account reported nothing at all about which way it was set.
+    // `aria-checked` is the same fact in the vocabulary a menu has for it, and
+    // the indicator now comes from the primitive rather than from a `ml-auto`
+    // glyph beside the words.
+    <DropdownMenuCheckboxItem
+      checked={enabled === true}
       onSelect={(e) => {
         // Keep the menu open so the trailing check reflects the new state in place.
         e.preventDefault();
-        onToggle();
       }}
+      onCheckedChange={onToggle}
     >
       <MoonStar aria-hidden="true" />
       Do not disturb
-      {enabled === true && <Check aria-hidden="true" className="ml-auto" />}
-    </DropdownMenuItem>
+    </DropdownMenuCheckboxItem>
   );
 }
 
-function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
+/** What an unverified device's lamp says, on the row trigger and in the menu. */
+const VERIFY_NEEDED_WORD = "Verification needed";
+
+/**
+ * The row-menu trigger's reveal (Story 49).
+ *
+ * The owner's note was that the `⋮` beside every avatar is clutter and that the
+ * avatar should open the menu instead. Half of that is right and half of it
+ * would have cost a shipped function: **the avatar is already a control**. It
+ * carries `aria-pressed` and it is the inbox account filter — one click to
+ * filter to an account, one to clear — so a menu on the avatar's click is a
+ * filter nobody can reach. What is actually wrong is that two permanently drawn
+ * controls per account is two, worst on the folded rail where they stack and
+ * each account costs 68px of a 48px-wide strip.
+ *
+ * So the `⋮` is still here, still a real button, still in the tab order and
+ * still named — it is only quiet. It appears when the pointer is over its row,
+ * when anything in that row has focus (which includes itself, so tabbing to it
+ * shows it before it is reached), and while its own menu is open. `opacity-0`
+ * alone would leave an invisible button eating clicks aimed at the avatar
+ * underneath it on the folded rail, so it gives up pointer events with its
+ * paint and takes them back with it; keyboard activation never depended on
+ * either.
+ *
+ * **The cost, stated rather than buried:** a control revealed on hover is a
+ * control a mouse user has to discover, and the first time is by accident. The
+ * trade is one row of clutter per account against one discovery, and the menu
+ * holds nothing that is only there (Settings, Incognito, DND and Sign out are
+ * all reachable elsewhere or destructive-by-appointment). The one thing that
+ * must never hide is the unverified-device lamp, which is why a row wearing it
+ * opts out below. The other is a pointer that cannot hover: Tailwind compiles
+ * `group-hover` inside `@media (hover: hover)`, so on a coarse pointer the
+ * reveal would never fire and the control would be permanently invisible AND
+ * unclickable. `pointer-coarse` puts it back on screen there, drawn as it
+ * always was.
+ */
+const ROW_MENU_QUIET =
+  "pointer-events-none opacity-0 transition-opacity group-hover/account-row:pointer-events-auto group-hover/account-row:opacity-100 group-focus-within/account-row:pointer-events-auto group-focus-within/account-row:opacity-100 aria-expanded:pointer-events-auto aria-expanded:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100";
+
+function AccountRowMenu({
+  account,
+  collapsed,
+  children,
+}: {
+  account: AccountVm;
+  collapsed: boolean;
+  /** The row's own contents, when the ROW is the trigger.
+   *
+   * Given in both shapes since the folded rail's avatar became the trigger
+   * too; the small corner dot is what remains for a caller that hands nothing
+   * down. */
+  children?: React.ReactNode;
+}) {
   // The Settings dialog open-state is shared (Story 3.1) so the verify banner and
   // the UTD stub can open it too; the per-row menu drives the same store. The
   // single dialog instance is mounted once in {@link AccountFooter}.
@@ -500,22 +560,75 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
   const showVerifyBadge = useShowVerifyBadgeForAccount(account.accountId);
   const userId = account.userId;
   const isBeeper = isBeeperAccount(account);
-  const menuLabel = `Account menu for ${userId}`;
+  // The unverified-device state has to ride the trigger's own name: the button
+  // carries an explicit `aria-label`, so anything inside it is overridden. It
+  // used to be an `aria-hidden` accent dot and nothing else — a security state
+  // announced to nobody, in the one colour the app uses for "this is fine".
+  const menuLabel = showVerifyBadge
+    ? `Account menu for ${userId}, ${VERIFY_NEEDED_WORD}`
+    : `Account menu for ${userId}`;
+
+  const filterAccountId = useAccountsStore((state) => state.filterAccountId);
+  const toggleFilter = useAccountsStore((state) => state.toggleFilter);
+  const filtered = filterAccountId === account.accountId;
+  const filterLabel = filtered ? `Clear filter for ${userId}` : `Filter inbox to ${userId}`;
+
+  // The ROW is the trigger when it hands us its contents.
+  //
+  // It used to be a three-dot button in a reserved gutter beside a row that did
+  // something else entirely — toggled the inbox filter. Two controls, one of
+  // them 24px wide, for one account. The row now opens everything the account
+  // can do, and the filter is the first of those things rather than a hidden
+  // second meaning of clicking the name.
+  const rowTrigger = children !== undefined && (
+    <DropdownMenuTrigger asChild>
+      <button
+        type="button"
+        aria-label={menuLabel}
+        className={cn(
+          // The row is the control now (Story 49), and it had nothing to say
+          // so on hover: no tint, no cursor change, nothing but a pointer
+          // passing over text. `hover:bg-accent` is what every other clickable
+          // row in the drawer does, so this one stops being the exception.
+          "flex min-w-0 flex-1 items-center gap-2 rounded-md p-1.5 text-left hover:bg-accent",
+          FOCUS_RING,
+        )}
+      >
+        {children}
+      </button>
+    </DropdownMenuTrigger>
+  );
 
   const trigger = (
     <DropdownMenuTrigger asChild>
       <Button
         type="button"
         variant="ghost"
-        size="icon-sm"
+        // On the folded rail it is an overlay on the avatar's free corner
+        // rather than a second storey under it: two stacked 32px tiles per
+        // account is what made the folded footer as tall as it is, and the
+        // sync glyph already owns the other corner. `icon-xs` is 24px, which
+        // is the smallest a pointer target is allowed to be (WCAG 2.5.8), and
+        // it leaves the avatar's top and right free for the filter press.
+        size={collapsed ? "icon-xs" : "icon-sm"}
         aria-label={menuLabel}
-        className={cn("relative shrink-0", FOCUS_RING)}
+        className={cn(
+          "relative shrink-0",
+          collapsed && "-bottom-1 -left-1 absolute",
+          // A row whose device is unverified keeps its menu drawn: the lamp on
+          // this trigger IS the persistent verify signal once the banner is
+          // dismissed, and a security state that appears on hover is a security
+          // state nobody sees.
+          !showVerifyBadge && ROW_MENU_QUIET,
+        )}
       >
         <MoreVertical aria-hidden="true" />
         {showVerifyBadge && (
-          <Badge
-            aria-hidden="true"
-            className="-top-0.5 -right-0.5 absolute size-2 rounded-full p-0"
+          <Lamp
+            state="working"
+            label={null}
+            data-slot="verify-badge"
+            className="-top-0.5 -right-0.5 absolute"
           />
         )}
       </Button>
@@ -526,19 +639,42 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
     <>
       <DropdownMenu>
         {collapsed ? (
+          // Folded, the tooltip is the only thing that says whose account this
+          // is, so it wraps whichever trigger there is — the avatar when the row
+          // handed one down, the old dot when it did not.
           <Tooltip>
-            <TooltipTrigger asChild>{trigger}</TooltipTrigger>
+            <TooltipTrigger asChild>{rowTrigger ?? trigger}</TooltipTrigger>
             <TooltipContent side="right">{menuLabel}</TooltipContent>
           </Tooltip>
         ) : (
-          trigger
+          // The row when it gave us one, and the old small trigger only when it
+          // did not — so an expanded footer has exactly one control per account.
+          (rowTrigger ?? trigger)
         )}
         <DropdownMenuContent align="end" side="right">
-          <DropdownMenuItem onSelect={() => primaryViewStore.getState().setView("settings")}>
+          {/* First, because it is the thing the row itself used to do and the
+              one action here that is about the inbox rather than the account.
+              Its checked state is what the row's `aria-pressed` used to carry. */}
+          <DropdownMenuCheckboxItem
+            checked={filtered}
+            onCheckedChange={() => toggleFilter(account.accountId)}
+          >
+            {filterLabel}
+          </DropdownMenuCheckboxItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            // Named outright rather than left to the contents: a menu item's
+            // name is concatenated from its children with each text node
+            // trimmed first, so "Settings" and the lamp's word would arrive as
+            // "SettingsVerification needed" — one token, announced once, read
+            // by nobody as two facts.
+            aria-label={showVerifyBadge ? `Settings, ${VERIFY_NEEDED_WORD}` : undefined}
+            onSelect={() => primaryViewStore.getState().setView("settings")}
+          >
             <Settings aria-hidden="true" />
             Settings
             {showVerifyBadge && (
-              <Badge aria-hidden="true" className="ml-auto size-2 rounded-full p-0" />
+              <Lamp state="working" label={null} data-slot="verify-badge" className="ml-auto" />
             )}
           </DropdownMenuItem>
           {isBeeper && (
@@ -568,54 +704,46 @@ function AccountRowMenu({ account, collapsed }: { account: AccountVm; collapsed:
 function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boolean }) {
   const status = useAccountStatus(account.accountId);
   const filterAccountId = useAccountsStore((s) => s.filterAccountId);
-  const toggleFilter = useAccountsStore((s) => s.toggleFilter);
   const active = filterAccountId === account.accountId;
   const userId = account.userId;
   const homeserver = homeserverLabel(account.homeserverUrl);
 
   if (collapsed) {
-    const filterLabel = active ? `Clear filter for ${userId}` : `Filter inbox to ${userId}`;
+    // The avatar IS the control, exactly as the expanded row became one in
+    // Story 49. It used to toggle the inbox filter while a separate dot in the
+    // corner opened the menu — so the folded rail and the unfolded one answered
+    // the same press differently, and the menu was behind a target a few pixels
+    // wide. The filter is the menu's first item in both shapes now.
     return (
-      <div className="flex shrink-0 flex-col items-center gap-1">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              aria-label={filterLabel}
-              aria-pressed={active}
-              onClick={() => toggleFilter(account.accountId)}
-              className={cn(
-                "relative flex items-center justify-center rounded-md p-1",
-                FOCUS_RING,
-                active && "bg-accent",
-              )}
-            >
-              <AccountAvatar account={account} />
-              <span className="absolute right-0 bottom-0">
-                <SyncGlyph status={status} />
-              </span>
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="right">{`${userId} — ${homeserver}`}</TooltipContent>
-        </Tooltip>
-        <AccountRowMenu account={account} collapsed={collapsed} />
+      <div className="group/account-row relative flex shrink-0 justify-center">
+        <AccountRowMenu account={account} collapsed={collapsed}>
+          <span
+            className={cn(
+              "relative flex items-center justify-center rounded-md p-1",
+              active && "bg-accent",
+            )}
+          >
+            <AccountAvatar account={account} />
+            <span className="absolute right-0 bottom-0">
+              <SyncGlyph status={status} />
+            </span>
+          </span>
+        </AccountRowMenu>
       </div>
     );
   }
 
-  const filterLabel = active ? `Clear filter for ${userId}` : `Filter inbox to ${userId}`;
   return (
-    <div className={cn("flex shrink-0 items-center gap-2 rounded-md pr-1", active && "bg-accent")}>
-      <button
-        type="button"
-        aria-label={filterLabel}
-        aria-pressed={active}
-        onClick={() => toggleFilter(account.accountId)}
-        className={cn(
-          "flex min-w-0 flex-1 items-center gap-2 rounded-md p-1.5 text-left",
-          FOCUS_RING,
-        )}
-      >
+    <div
+      className={cn(
+        // No `pr-1`: it reserved the gutter the three-dot trigger sat in, and
+        // with the row itself opening the menu that gutter is width the
+        // account's own name can have back.
+        "group/account-row flex shrink-0 items-center gap-2 rounded-md",
+        active && "bg-accent",
+      )}
+    >
+      <AccountRowMenu account={account} collapsed={collapsed}>
         <AccountAvatar account={account} />
         <span
           aria-hidden="true"
@@ -631,8 +759,7 @@ function AccountRow({ account, collapsed }: { account: AccountVm; collapsed: boo
           </span>
         </span>
         <SyncGlyph status={status} />
-      </button>
-      <AccountRowMenu account={account} collapsed={collapsed} />
+      </AccountRowMenu>
     </div>
   );
 }
@@ -666,7 +793,6 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
               variant="ghost"
               size="icon"
               aria-label="Add account"
-              className={FOCUS_RING}
               onClick={openAddAccount}
             >
               <Plus aria-hidden="true" />
@@ -679,7 +805,7 @@ export function AccountFooter({ collapsed }: AccountFooterProps) {
           type="button"
           variant="ghost"
           aria-label="Add account"
-          className={cn("w-full justify-start gap-2", FOCUS_RING)}
+          className="w-full justify-start gap-2"
           onClick={openAddAccount}
         >
           <Plus aria-hidden="true" />

@@ -79,8 +79,7 @@ use std::time::Duration;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind};
 use notify::{EventKind, PollWatcher, RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{
-    new_debouncer, new_debouncer_opt, DebounceEventResult, DebouncedEvent, Debouncer,
-    RecommendedCache,
+    new_debouncer_opt, DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -363,9 +362,26 @@ fn fold_batch(
 /// Two variants rather than a boxed trait object because `Debouncer` is generic
 /// over its watcher and the poll fallback is a genuinely different type;
 /// `Watcher` is not object-safe in a way that would help here.
+///
+/// # `NoCache`, and never `RecommendedCache`
+///
+/// The file-id cache exists to correlate a remove with a create into a rename.
+/// Nothing here reads that: [`fold_batch`] collapses every event to "this path
+/// changed, and possibly closed", and the supervisor answers it with a walk. So
+/// the cache buys this crate nothing — and it is not free. `FileIdMap::add_path`
+/// is a `WalkDir` plus a `stat` per entry, run inside `watch()`, so arming a
+/// watch walks the entire tree: on the folder that reported this, 154,765
+/// entries on a USB volume, about ten minutes, holding the profile's
+/// one-operation-at-a-time reservation with the journal full of ready work — at
+/// every process start, and again on every dropped-event rescan.
+///
+/// `RecommendedCache` is the trap: it is `NoCache` on Linux and `FileIdMap`
+/// everywhere else, so the dev box and the whole test suite saw the free half
+/// and the shipped Mac app paid the other one. Naming the policy makes the two
+/// platforms behave the same, which is the only way this stays fixed.
 enum Backend {
-    Native(Debouncer<RecommendedWatcher, RecommendedCache>),
-    Poll(Debouncer<PollWatcher, RecommendedCache>),
+    Native(Debouncer<RecommendedWatcher, NoCache>),
+    Poll(Debouncer<PollWatcher, NoCache>),
 }
 
 impl Backend {
@@ -471,19 +487,27 @@ impl FolderWatcher {
                 // only the ones it is about to commit.
                 .with_compare_contents(false);
             Backend::Poll(
-                new_debouncer_opt::<_, PollWatcher, RecommendedCache>(
+                new_debouncer_opt::<_, PollWatcher, NoCache>(
                     timeout,
                     None,
                     handler,
-                    RecommendedCache::new(),
+                    NoCache::new(),
                     notify_config,
                 )
                 .map_err(|err| map_notify_error("start watcher", &root, err))?,
             )
         } else {
             Backend::Native(
-                new_debouncer(timeout, None, handler)
-                    .map_err(|err| map_notify_error("start watcher", &root, err))?,
+                // `new_debouncer` would pick `RecommendedCache` — see `Backend`
+                // for the ten minutes that costs on macOS.
+                new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+                    timeout,
+                    None,
+                    handler,
+                    NoCache::new(),
+                    notify::Config::default(),
+                )
+                .map_err(|err| map_notify_error("start watcher", &root, err))?,
             )
         };
 

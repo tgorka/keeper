@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+use crate::capture::Placement;
 use crate::error::{CoreError, PlatformError};
 use crate::vm::DockBadgeMode;
 
@@ -186,7 +187,28 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
 ///
 /// Non-secret key/value store in `keeper.db` (Story 2.6). Never holds secret
 /// material.
+///
+/// # The layer stack is consulted first (Story 46.6, AD-98)
+///
+/// A `keeper.toml` layer resolves **here**, ahead of the table, which is the
+/// whole of AD-98: the file keeps winning on every read instead of winning once
+/// at boot and being erased by the next UI toggle. Every one of the ~40 typed
+/// getters below is built on this function, so they all inherit layering — and
+/// they all keep their own parsing and clamping, because what the overlay
+/// returns is a string in exactly the convention the table stores.
+///
+/// The overlay is checked **before** [`open`]. It has to be: `open` is a fresh
+/// connection, a WAL pragma and eight `CREATE TABLE IF NOT EXISTS` statements,
+/// and a layered read must not pay for a database it is not going to use.
+///
+/// [`set_setting`] still writes the table under a shadowed key rather than
+/// refusing. A refused write would have to be handled by every caller; a write
+/// that lands and is reported as shadowed is handled in one place, the settings
+/// pane, which reads [`crate::config::overrides`] to say so.
 pub fn get_setting(data_dir: &Path, key: &str) -> Result<Option<String>, CoreError> {
+    if let Some(resolved) = crate::config::setting_override(key) {
+        return Ok(Some(resolved.value));
+    }
     let conn = open(data_dir)?;
     let value = conn
         .query_row(
@@ -691,18 +713,80 @@ pub fn set_menu_bar_presence(data_dir: &Path, enabled: bool) -> Result<(), CoreE
     )
 }
 
+/// The `settings` key holding the default fold state of a session's spaces
+/// (Story 49.3, FR-276). Stored as `"1"`/`"0"`; absent = unfolded (a space
+/// arrives open unless somebody has said otherwise).
+const SESSIONS_SPACES_FOLDED_KEY: &str = "sessions.spaces_folded";
+
+/// Read the default fold state of a session's spaces (Story 49.3, FR-276).
+/// Absent / anything-but-`"1"` ⇒ `false` (spaces arrive unfolded). Stored in the
+/// `settings` k/v table under `sessions.spaces_folded`.
+///
+/// **The default only** — never a space's own fold. A fold somebody set by hand
+/// is chrome they arranged, and it lives in the frontend's cookie
+/// (`src/lib/stores/session-spaces-fold.ts`): one entry per space per session is
+/// not a preference, and putting it here would grow the settings table without
+/// bound and round-trip a chevron through IPC.
+pub fn get_sessions_spaces_folded(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, SESSIONS_SPACES_FOLDED_KEY)?.as_deref() == Some("1"))
+}
+
+/// Write the default fold state of a session's spaces (Story 49.3, FR-276).
+/// Persists `"1"`/`"0"` into the `settings` k/v table under
+/// `sessions.spaces_folded` — the same literal the key is registered with
+/// (`Shape::Flag01` in [`crate::config::keys`]), because a getter that compares
+/// against text the config layer never writes makes the setting do the opposite
+/// of what a `keeper.toml` said.
+pub fn set_sessions_spaces_folded(data_dir: &Path, folded: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        SESSIONS_SPACES_FOLDED_KEY,
+        if folded { "1" } else { "0" },
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
 
-/// Import `config.json` from the data dir over the settings table (Story 22.6,
-/// FR-80) — the file wins, enabling hand-edited / version-controlled setups.
+/// A scalar JSON value in the registry's on-disk string convention, or `None`
+/// when the value is not a scalar.
 ///
-/// Format: one flat JSON object; string, number, and boolean values only.
-/// Booleans map to the registry's `"1"`/`"0"` convention, numbers to their
-/// decimal text; every key is imported verbatim into the k/v table, and the
-/// existing typed getters keep clamping/normalizing on read, so an out-of-range
-/// hand-edit degrades to the documented default rather than misbehaving.
+/// **The one definition of that convention.** Booleans become `"1"`/`"0"`,
+/// numbers their decimal text, strings themselves. [`import_config_file`] and
+/// the TOML layer stack ([`crate::config`]) both go through here, so a
+/// `config.json` and a `keeper.toml` carrying the same value cannot put
+/// different text in the table — which they would if each formatted its own,
+/// since `format!("{}", 3.0f64)` is `"3"` and `serde_json`'s is `"3.0"`.
+pub fn scalar_setting_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Bool(flag) => Some((if *flag { "1" } else { "0" }).to_owned()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// Import `config.json` from the data dir into the settings table (Story 22.6,
+/// FR-80) — the hand-edited / version-controlled setup that predates the layer
+/// stack.
+///
+/// # Precedence: this is the bottom (Story 46.6, AD-98)
+///
+/// Superseded by `keeper.toml`, and deliberately kept. This writes *rows*; the
+/// layer stack resolves *above* the rows in [`get_setting`], so **every TOML
+/// layer outranks this file** and a `config.json` only decides keys no layer
+/// mentions. It is still imported because someone may be running one, and
+/// deleting it would silently revert their machine to defaults at the next
+/// update. It also keeps the flaw that motivated AD-98: the values it writes
+/// are rows like any other, so the next UI toggle erases them. A person who
+/// wants a setting that *stays* wants `~/.keeper/keeper.toml`.
+///
+/// Format: one flat JSON object; string, number, and boolean values only,
+/// mapped by [`scalar_setting_text`]. Every key is imported verbatim into the
+/// k/v table, and the existing typed getters keep clamping/normalizing on read,
+/// so an out-of-range hand-edit degrades to the documented default rather than
+/// misbehaving.
 ///
 /// Returns the imported keys (empty when the file is absent — the normal
 /// case). A malformed file or a non-scalar value is an `Err` — the caller
@@ -729,16 +813,11 @@ pub fn import_config_file(data_dir: &Path) -> Result<Vec<String>, CoreError> {
     })?;
     let mut imported = Vec::with_capacity(object.len());
     for (key, value) in object {
-        let text = match value {
-            serde_json::Value::String(text) => text.clone(),
-            serde_json::Value::Bool(flag) => (if *flag { "1" } else { "0" }).to_owned(),
-            serde_json::Value::Number(number) => number.to_string(),
-            _ => {
-                return Err(CoreError::Internal(format!(
-                    "malformed {}: key {key:?} must be a string, number, or boolean",
-                    path.display()
-                )));
-            }
+        let Some(text) = scalar_setting_text(value) else {
+            return Err(CoreError::Internal(format!(
+                "malformed {}: key {key:?} must be a string, number, or boolean",
+                path.display()
+            )));
         };
         set_setting(data_dir, key, &text)?;
         imported.push(key.clone());
@@ -1013,23 +1092,167 @@ pub fn set_active_vault(data_dir: &Path, vault_id: &str) -> Result<(), CoreError
     set_setting(data_dir, NOTES_ACTIVE_VAULT_KEY, vault_id)
 }
 
-/// The `settings` key holding the Quick Capture panel's unsent text (Phase 5,
-/// FR-101). Persisted rather than held in the window, because the panel's whole
-/// promise is that closing it never loses what you typed — including across a
-/// quit, a crash or a relaunch.
-const NOTES_CAPTURE_BUFFER_KEY: &str = "notes.capture_buffer";
+/// The `settings` key prefix recording which note one quick-capture window is
+/// holding (Phase 5, FR-101; Story 45.14): `notes.capture_draft.<key>`.
+///
+/// This replaced `notes.capture_buffer`, and the replacement is the whole of
+/// Story 45.14 in one line. The old key held the panel's unsent **text**,
+/// because the panel was a textarea and the note did not exist until Escape.
+/// Quick capture now mounts the note editor (AD-93), so the durable thing is
+/// the note file itself — strictly more durable than a debounced settings row,
+/// and the only place a tag or an attachment can be written, neither of which
+/// can be applied to a String.
+///
+/// **Keyed, not global.** One slot for "the capture buffer" is an assumption
+/// that exactly one capture window exists; two windows sharing it would clobber
+/// each other. Story 45.15 opens several, so the key is a parameter from the
+/// first commit rather than a retrofit.
+const NOTES_CAPTURE_DRAFT_PREFIX: &str = "notes.capture_draft.";
 
-/// Read the Quick Capture buffer (Phase 5, FR-101). Absent ⇒ the empty string:
-/// a panel opening for the first time and a panel whose text was committed are
-/// the same state, and neither is an error.
-pub fn get_capture_buffer(data_dir: &Path) -> Result<String, CoreError> {
-    Ok(get_setting(data_dir, NOTES_CAPTURE_BUFFER_KEY)?.unwrap_or_default())
+/// The note a capture window is holding, and the body it was created with.
+///
+/// `pristine` exists so "has anybody written in this note?" is answered by
+/// comparing bytes to what creation produced, rather than by trusting the
+/// window to say so or by testing the body for emptiness — a capture template
+/// (Story 45.16) makes a brand-new draft non-empty, so emptiness would tear off
+/// a fresh page on every dismissal and litter the vault with untouched notes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureDraft {
+    /// The note's stable id, not its path: a draft the user renames by typing a
+    /// first line must stay the same draft.
+    pub note_id: String,
+    /// The body `create_note` wrote — a template's scaffold, or the empty string.
+    pub pristine: String,
 }
 
-/// Write the Quick Capture buffer (Phase 5, FR-101). The caller debounces; this
-/// stores verbatim, including the empty string that clears it after a commit.
-pub fn set_capture_buffer(data_dir: &Path, text: &str) -> Result<(), CoreError> {
-    set_setting(data_dir, NOTES_CAPTURE_BUFFER_KEY, text)
+impl CaptureDraft {
+    /// Whether nobody has written in this draft since creation.
+    ///
+    /// The question a capture window asks when a thought is finished: an
+    /// untouched page is handed back for the next summon, a written-on one is
+    /// torn off and the next summon gets a fresh note. Getting it wrong in
+    /// either direction is visible — reuse a written note and the next thought
+    /// lands on top of the last one; tear off an untouched one and every idle
+    /// press of the hotkey leaves an empty file in the vault.
+    ///
+    /// Compared with the surrounding whitespace trimmed off both sides,
+    /// because the round trip through the editor and `notes_save` is entitled
+    /// to settle a trailing newline that nobody typed — and a draft that
+    /// differs from its scaffold by one `\n` is not a thought anybody had.
+    /// Interior whitespace is never touched: two blank lines a person put
+    /// between two paragraphs are writing.
+    pub fn is_untouched(&self, body: &str) -> bool {
+        self.pristine.trim() == body.trim()
+    }
+}
+
+/// The `settings` key for one capture window's draft pointer.
+fn capture_draft_key(key: &str) -> String {
+    format!("{NOTES_CAPTURE_DRAFT_PREFIX}{key}")
+}
+
+/// Read which note a capture window is holding (Story 45.14).
+///
+/// Three ways to get `None`, and they are deliberately one answer to the
+/// caller — a window opening for the first time, a window whose page was torn
+/// off, and a pointer keeper cannot read all mean "make a fresh page", and a
+/// capture that refused because a settings row rotted would lose the thought it
+/// exists to catch.
+///
+/// They are **not** one answer to the log. A cleared pointer is the ordinary
+/// end of every capture, so it returns silently; only genuinely unreadable
+/// content warns. Writing the clear as something the reader then calls
+/// malformed would put a warning in the log every time somebody filed a note,
+/// which is how a real warning becomes invisible.
+pub fn get_capture_draft(data_dir: &Path, key: &str) -> Result<Option<CaptureDraft>, CoreError> {
+    let Some(raw) = get_setting(data_dir, &capture_draft_key(key))? else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    match serde_json::from_str::<CaptureDraft>(&raw) {
+        Ok(draft) if !draft.note_id.trim().is_empty() => Ok(Some(draft)),
+        Ok(_) => Ok(None),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %key,
+                "notes: capture draft pointer is malformed; the next capture gets a fresh note"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Write, or clear with `None`, which note a capture window is holding
+/// (Story 45.14). Clearing is how a finished thought is torn off the pad.
+///
+/// The empty string is the cleared value, matching [`set_active_vault`] and
+/// [`set_capture_hotkey`], and [`get_capture_draft`] reads it back silently.
+/// The pair has to agree: any other spelling of "cleared" would be read as
+/// corruption and warn on every capture.
+pub fn set_capture_draft(
+    data_dir: &Path,
+    key: &str,
+    draft: Option<&CaptureDraft>,
+) -> Result<(), CoreError> {
+    let value = match draft {
+        Some(draft) => serde_json::to_string(draft).map_err(|error| {
+            CoreError::Internal(format!(
+                "could not serialise the capture draft pointer: {error}"
+            ))
+        })?,
+        None => String::new(),
+    };
+    set_setting(data_dir, &capture_draft_key(key), &value)
+}
+
+/// The `settings` key prefix for one capture window's remembered placement
+/// (Story 45.15, FR-192).
+///
+/// Keyed by the same capture key as the draft pointer above, and for the same
+/// reason: what a person moved is *this note's window*, not "the third window
+/// that happened to open". A key derived from the target survives a restart,
+/// an OS window-id change and a reordering; a label or an index survives none
+/// of them.
+const NOTES_CAPTURE_PLACEMENT_PREFIX: &str = "notes.capture_placement.";
+
+/// The `settings` key for one capture window's placement.
+fn capture_placement_key(key: &str) -> String {
+    format!("{NOTES_CAPTURE_PLACEMENT_PREFIX}{key}")
+}
+
+/// Read where a capture window sits and who decides (Story 45.15, FR-192).
+///
+/// Absent or unreadable ⇒ [`Placement::default`], which is keeper's own
+/// placement — exactly what every capture window did before this story. A
+/// person who has never touched the lock must not be able to tell this feature
+/// was added, so "no row" and "the default" are deliberately the same picture.
+///
+/// Never an error for a bad value: [`Placement::decode`] is total. A settings
+/// row a future build wrote in a spelling this one does not know costs the user
+/// their remembered position for one session and never their window.
+pub fn get_capture_placement(data_dir: &Path, key: &str) -> Result<Placement, CoreError> {
+    Ok(get_setting(data_dir, &capture_placement_key(key))?
+        .map_or_else(Placement::default, |raw| Placement::decode(&raw)))
+}
+
+/// Write where a capture window sits (Story 45.15, FR-192).
+///
+/// Called when a window is dismissed rather than on every `Moved` event: a drag
+/// emits one event per compositor frame, and a settings write per frame would
+/// put a sqlite transaction on the path of a gesture. The cost of the choice is
+/// stated where it lands — a position moved and then lost to `kill -9` is not
+/// remembered — and that is the right trade for a window whose default
+/// placement is already good.
+pub fn set_capture_placement(
+    data_dir: &Path,
+    key: &str,
+    placement: &Placement,
+) -> Result<(), CoreError> {
+    set_setting(data_dir, &capture_placement_key(key), &placement.encode())
 }
 
 /// Build the `settings` key that records the revision of one note this device has
@@ -2502,17 +2725,251 @@ mod tests {
     }
 
     #[test]
-    fn the_capture_buffer_survives_a_round_trip_and_clears_to_empty() {
+    fn a_capture_draft_pointer_is_per_window_and_clears_to_absent() {
         let dir = temp_dir();
-        assert_eq!(get_capture_buffer(&dir).expect("get absent buffer"), "");
-        set_capture_buffer(&dir, "half a thought\nand a second line").expect("set buffer");
+        // Two keys, because one global slot is the Story 45.15 defect this
+        // signature exists to make unrepresentable. Both windows must be able
+        // to hold a DIFFERENT note at the same time.
         assert_eq!(
-            get_capture_buffer(&dir).expect("get set buffer"),
-            "half a thought\nand a second line",
-            "stored verbatim, newlines and all"
+            get_capture_draft(&dir, "draft").expect("get absent draft"),
+            None
         );
-        set_capture_buffer(&dir, "").expect("clear buffer after commit");
-        assert_eq!(get_capture_buffer(&dir).expect("get cleared buffer"), "");
+        let first = CaptureDraft {
+            note_id: "01FIRSTNOTE".to_owned(),
+            pristine: "# Standup\n\n## Agenda\n".to_owned(),
+        };
+        let second = CaptureDraft {
+            note_id: "01SECONDNOTE".to_owned(),
+            pristine: String::new(),
+        };
+        set_capture_draft(&dir, "draft", Some(&first)).expect("set first");
+        set_capture_draft(&dir, "note:v1/n1", Some(&second)).expect("set second");
+        assert_eq!(
+            get_capture_draft(&dir, "draft").expect("get first"),
+            Some(first.clone()),
+            "the scaffold is stored verbatim, newlines and all — it is what an \
+             untouched draft is compared against"
+        );
+        assert_eq!(
+            get_capture_draft(&dir, "note:v1/n1").expect("get second"),
+            Some(second),
+            "a second window holds its own note; writing one must not move the other"
+        );
+
+        // Tearing off a finished thought clears only the window that finished it.
+        set_capture_draft(&dir, "note:v1/n1", None).expect("clear second");
+        assert_eq!(
+            get_capture_draft(&dir, "note:v1/n1").expect("get cleared"),
+            None
+        );
+        assert_eq!(
+            get_capture_draft(&dir, "draft").expect("get first again"),
+            Some(first),
+            "clearing one window's draft must not tear off another's"
+        );
+        // The stored spelling of "cleared", not just the answer read back
+        // through the same module. The writer and the reader have to agree on
+        // it: any other value — `null`, `{}`, a space — reads back as `None`
+        // just the same, and would ALSO take the malformed branch and log a
+        // warning every single time somebody filed a thought. A warning that
+        // fires on the ordinary path is a warning nobody will ever read.
+        assert_eq!(
+            get_setting(&dir, "notes.capture_draft.note:v1/n1").expect("read the raw row"),
+            Some(String::new()),
+            "a torn-off page is stored as the empty string, the same clear \
+             `set_active_vault` and `set_capture_hotkey` use"
+        );
+
+        // A pointer keeper cannot read costs one fresh note, never a refusal:
+        // capture that returns an error because a settings row rotted is
+        // capture that loses the thought it exists to catch.
+        set_setting(&dir, "notes.capture_draft.draft", "{ not json").expect("corrupt");
+        assert_eq!(
+            get_capture_draft(&dir, "draft").expect("malformed reads as absent"),
+            None
+        );
+        // And so does a pointer that parses but names no note. Built through
+        // `to_string` rather than written as a literal: a hand-typed literal
+        // that does not match the field naming would take the malformed arm
+        // above and pass this assertion for the wrong reason.
+        let blank = serde_json::to_string(&CaptureDraft {
+            note_id: "  ".to_owned(),
+            pristine: "x".to_owned(),
+        })
+        .expect("serialise blank id");
+        set_setting(&dir, "notes.capture_draft.draft", &blank).expect("blank id");
+        assert_eq!(
+            get_capture_draft(&dir, "draft").expect("blank id reads as absent"),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_untouched_draft_is_the_scaffold_and_nothing_else() {
+        // A capture template (Story 45.16) makes a brand-new draft non-empty,
+        // so "is this page blank?" is the wrong question and "does it still say
+        // what creation put in it?" is the right one.
+        let scaffolded = CaptureDraft {
+            note_id: "01SCAFFOLD".to_owned(),
+            pristine: "# Standup\n\n## Agenda\n".to_owned(),
+        };
+        assert!(
+            scaffolded.is_untouched("# Standup\n\n## Agenda\n"),
+            "the page the template made is a page nobody has written on"
+        );
+        assert!(
+            !scaffolded.is_untouched("# Standup\n\n## Agenda\n- ring the dentist\n"),
+            "one line under the scaffold is a thought, and the page is torn off"
+        );
+        assert!(
+            !scaffolded.is_untouched(""),
+            "a scaffold somebody deleted is an edit, not a blank page"
+        );
+
+        // The round trip through the editor and `notes_save` is entitled to
+        // settle a trailing newline nobody typed. Without this, a vault with a
+        // capture template would accumulate one untouched note per dismissal.
+        assert!(
+            scaffolded.is_untouched("# Standup\n\n## Agenda"),
+            "a trailing newline that came back different is not writing"
+        );
+        assert!(
+            scaffolded.is_untouched("\n # Standup\n\n## Agenda\n\n\n"),
+            "nor is surrounding whitespace at either end"
+        );
+        // But interior blank lines are: two paragraphs a person separated are
+        // not the same document as one.
+        assert!(
+            !scaffolded.is_untouched("# Standup\n## Agenda\n"),
+            "the blank line between the heading and the section is content"
+        );
+
+        // The template-less case, which is every capture until 45.16 lands.
+        let blank = CaptureDraft {
+            note_id: "01BLANK".to_owned(),
+            pristine: String::new(),
+        };
+        assert!(blank.is_untouched(""), "nothing typed into nothing");
+        assert!(blank.is_untouched("\n\n"), "and neither is a stray newline");
+        assert!(
+            !blank.is_untouched("ring the dentist"),
+            "a thought, however short, is a page of its own"
+        );
+    }
+
+    /// Story 45.15's acceptance, on the value this module owns: **two capture
+    /// windows, two placements, and moving one does not move the other** —
+    /// asserted on both rows after each write, because a store that returns the
+    /// right answer for the row you just wrote and the wrong one for its
+    /// neighbour is precisely the single-global-slot defect wearing a key.
+    #[test]
+    fn two_capture_windows_remember_two_placements_independently() {
+        let dir = temp_dir();
+        // Untouched is keeper's own placement, for every key, including ones
+        // nothing has ever written.
+        assert_eq!(
+            get_capture_placement(&dir, "draft").expect("get absent draft placement"),
+            Placement::default()
+        );
+        assert_eq!(
+            get_capture_placement(&dir, "note:v1/n1").expect("get absent note placement"),
+            Placement::default()
+        );
+
+        let dragged = Placement {
+            locked: false,
+            position: Some((1_200, 40)),
+            // Dragged *and* resized: the two travel under one key, so a store
+            // that round-trips the position and drops the size would look
+            // correct here without one of these fields.
+            size: Some((900, 600)),
+            always_on_top: true,
+        };
+        let pinned = Placement {
+            locked: true,
+            position: Some((-15, 900)),
+            size: None,
+            always_on_top: true,
+        };
+        set_capture_placement(&dir, "draft", &dragged).expect("place draft");
+        assert_eq!(
+            get_capture_placement(&dir, "draft").expect("read draft"),
+            dragged
+        );
+        assert_eq!(
+            get_capture_placement(&dir, "note:v1/n1").expect("read untouched neighbour"),
+            Placement::default(),
+            "moving one window must not place a window nobody has moved"
+        );
+
+        set_capture_placement(&dir, "note:v1/n1", &pinned).expect("place note window");
+        assert_eq!(
+            get_capture_placement(&dir, "note:v1/n1").expect("read note window"),
+            pinned
+        );
+        assert_eq!(
+            get_capture_placement(&dir, "draft").expect("read draft again"),
+            dragged,
+            "placing the second window must not move the first"
+        );
+
+        // A negative coordinate is ordinary: a second monitor to the left of
+        // the primary one has negative x, and a row that could not hold one
+        // would send the window back to the main screen on every restart.
+        assert_eq!(
+            get_capture_placement(&dir, "note:v1/n1")
+                .expect("read note window")
+                .position,
+            Some((-15, 900))
+        );
+
+        // A row keeper cannot read costs the position and never the window. A
+        // half-readable one is the interesting case and it is asserted field by
+        // field: the readable half is kept, the unreadable half is *absent*
+        // rather than zero, because a window at (12, 0) is a window that moved
+        // somewhere the user never put it.
+        set_setting(&dir, "notes.capture_placement.draft", "free 12 banana")
+            .expect("half-readable placement");
+        let salvaged = get_capture_placement(&dir, "draft").expect("read half-readable");
+        assert!(!salvaged.locked, "the readable half is still readable");
+        assert_eq!(
+            salvaged.position, None,
+            "a fabricated axis is worse than none"
+        );
+
+        // The same for the size: unreadable costs the size and nothing else.
+        // Asserted through the store rather than only in `capture.rs`, because
+        // the settings row is where a hand edit actually lands.
+        set_setting(
+            &dir,
+            "notes.capture_placement.draft",
+            "free 12 34 size 0 600",
+        )
+        .expect("zero-width placement");
+        let salvaged = get_capture_placement(&dir, "draft").expect("read zero-width");
+        assert_eq!(
+            salvaged.position,
+            Some((12, 34)),
+            "the readable half is kept"
+        );
+        assert_eq!(
+            salvaged.size, None,
+            "a window with no width cannot be seen, focused or closed"
+        );
+
+        // A row that says nothing keeper understands is keeper's own placement,
+        // whole — not an error, and not a window at the origin.
+        set_setting(
+            &dir,
+            "notes.capture_placement.draft",
+            "written by a later build",
+        )
+        .expect("unreadable placement");
+        assert_eq!(
+            get_capture_placement(&dir, "draft").expect("unreadable reads as default"),
+            Placement::default()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3354,6 +3811,234 @@ mod tests {
         assert!(get_menu_bar_presence(&dir).expect("read back on"));
         set_menu_bar_presence(&dir, false).expect("disable");
         assert!(!get_menu_bar_presence(&dir).expect("read back off"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sessions_spaces_folded_defaults_off_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ unfolded (a space arrives open unless somebody said otherwise).
+        assert!(!get_sessions_spaces_folded(&dir).expect("read default"));
+        set_sessions_spaces_folded(&dir, true).expect("fold by default");
+        assert!(get_sessions_spaces_folded(&dir).expect("read back folded"));
+        set_sessions_spaces_folded(&dir, false).expect("unfold by default");
+        assert!(!get_sessions_spaces_folded(&dir).expect("read back unfolded"));
+        // The stored text, not just the round trip: the getter compares against
+        // `"1"`, and the key is registered `Shape::Flag01`, so a writer that put
+        // `"true"` here would round-trip through itself and still invert every
+        // `keeper.toml` that sets the key (config/mod.rs:394-399).
+        set_sessions_spaces_folded(&dir, true).expect("fold by default again");
+        assert_eq!(
+            get_setting(&dir, "sessions.spaces_folded").expect("read raw"),
+            Some("1".to_owned())
+        );
+        set_sessions_spaces_folded(&dir, false).expect("unfold by default again");
+        assert_eq!(
+            get_setting(&dir, "sessions.spaces_folded").expect("read raw"),
+            Some("0".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // The layer stack in front of the table (Story 46.6, AD-98)
+    // -----------------------------------------------------------------
+
+    use crate::config::{self, LayerTier};
+
+    /// AD-98 in one assertion: the file keeps winning on every read. Before this
+    /// story `config.json` won once at boot and the next `set_setting` erased
+    /// it — so the write here, AFTER the layer is in place, must not change what
+    /// the reader sees, and must still be there when the layer goes away.
+    #[test]
+    fn a_layer_beats_the_table_and_the_table_is_still_written() {
+        let dir = temp_dir();
+        set_setting(&dir, RECORDING_CODEC_KEY, "h264").expect("seed the table");
+        {
+            let _layers = config::install_for_test(config::layers_from(&[(
+                RECORDING_CODEC_KEY,
+                "hevc",
+                LayerTier::UserGlobal,
+            )]));
+            assert_eq!(
+                get_setting(&dir, RECORDING_CODEC_KEY).expect("read"),
+                Some("hevc".to_owned())
+            );
+            // A shadowed write lands rather than being refused; the settings
+            // pane reports it instead.
+            set_setting(&dir, RECORDING_CODEC_KEY, "prores").expect("shadowed write");
+            assert_eq!(
+                get_setting(&dir, RECORDING_CODEC_KEY).expect("still the file"),
+                Some("hevc".to_owned())
+            );
+        }
+        assert_eq!(
+            get_setting(&dir, RECORDING_CODEC_KEY).expect("the table underneath"),
+            Some("prores".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ordering claim, proved rather than asserted: with a `data_dir` that
+    /// cannot be opened at all, a layered read still succeeds. It can only do
+    /// that if the overlay is consulted BEFORE [`open`] — which is the point,
+    /// since `open` is a connection, a WAL pragma and eight `CREATE TABLE IF NOT
+    /// EXISTS` statements that a layered read must not pay for.
+    ///
+    /// Move the overlay check below `open` and this fails with the
+    /// `DirUnavailable` the unlayered read below already proves is waiting.
+    #[test]
+    fn the_overlay_is_consulted_before_the_database_is_opened() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        // A FILE where the data dir should be: `create_dir_all` cannot succeed.
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, b"x").expect("write the blocker");
+        // Proof the probe is real: an unlayered read of the same path fails.
+        assert!(
+            get_setting(&blocked, RECORDING_CODEC_KEY).is_err(),
+            "the probe must be a path the database layer genuinely cannot use"
+        );
+        let _layers = config::install_for_test(config::layers_from(&[(
+            RECORDING_CODEC_KEY,
+            "hevc",
+            LayerTier::UserGlobal,
+        )]));
+        assert_eq!(
+            get_setting(&blocked, RECORDING_CODEC_KEY).expect("resolved without a database"),
+            Some("hevc".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Layering lands in `get_setting`, so all ~40 typed getters inherit it —
+    /// **with their clamping intact**, because what the overlay hands back is a
+    /// string in exactly the convention the table stores and the getter parses.
+    ///
+    /// Three of them here, each with a different shape of guard: a two-sided
+    /// `clamp`, a one-sided `min`, and a normalize-to-a-legal-set. An
+    /// out-of-range hand-edit degrades to the documented default rather than
+    /// reaching the sidecar.
+    #[test]
+    fn a_layer_value_out_of_range_still_clamps_in_the_typed_getter() {
+        let dir = temp_dir();
+        let _layers = config::install_for_test(config::layers_from(&[
+            // clamp(100, 5000)
+            (RECORDING_SEGMENT_MB_KEY, "99999", LayerTier::UserGlobal),
+            // clamp(1, 600)
+            (
+                RECORDING_DURATION_CAP_MINUTES_KEY,
+                "0",
+                LayerTier::UserGlobal,
+            ),
+            // min(60)
+            (UNDO_SEND_WINDOW_KEY, "99", LayerTier::UserGlobal),
+            // not a number at all ⇒ the documented default
+            (RECORDING_FPS_KEY, "banana", LayerTier::MainMachine),
+        ]));
+        assert_eq!(
+            get_recording_segment_mb(&dir).expect("segment"),
+            RECORDING_SEGMENT_MB_MAX
+        );
+        assert_eq!(
+            get_recording_duration_cap_minutes(&dir).expect("cap"),
+            RECORDING_DURATION_CAP_MINUTES_MIN
+        );
+        assert_eq!(
+            get_undo_send_window(&dir).expect("undo"),
+            UNDO_SEND_WINDOW_MAX
+        );
+        assert_eq!(get_recording_fps(&dir).expect("fps"), RECORDING_FPS_DEFAULT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An in-range layer value passes through the same getters unchanged — the
+    /// clamp test above would also pass if layering did nothing at all.
+    #[test]
+    fn a_layer_value_in_range_reaches_the_typed_getter_unchanged() {
+        let dir = temp_dir();
+        let _layers = config::install_for_test(config::layers_from(&[
+            (RECORDING_SEGMENT_MB_KEY, "800", LayerTier::UserGlobal),
+            (UNDO_SEND_WINDOW_KEY, "3", LayerTier::UserGlobal),
+            (RECORDING_FPS_KEY, "30", LayerTier::UserGlobal),
+        ]));
+        assert_eq!(get_recording_segment_mb(&dir).expect("segment"), 800);
+        assert_eq!(get_undo_send_window(&dir).expect("undo"), 3);
+        assert_eq!(get_recording_fps(&dir).expect("fps"), 30);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The un-namespaced keys that predate the `recording.*` / `notify.*`
+    /// namespaces resolve through the overlay like any other — nothing in the
+    /// lookup is keyed on a dot.
+    #[test]
+    fn the_legacy_un_namespaced_keys_resolve_through_a_layer() {
+        let dir = temp_dir();
+        set_setting(&dir, "honor_remote_deletions", "off").expect("seed");
+        // The spellings a layer FILE actually produces (`Shape::coerce`), not
+        // the `"1"`/`"0"` a convention-blind mapping would have written: these
+        // two keys predate that convention and their readers compare against
+        // `"on"` and `"true"`. Asserted through the real getter, because
+        // "resolves to a string" is not the promise — "the setting is on" is.
+        let _layers = config::install_for_test(config::layers_from(&[
+            ("honor_remote_deletions", "on", LayerTier::UserGlobal),
+            ("favorites_collapsed", "true", LayerTier::MainShared),
+        ]));
+        assert!(
+            crate::archive::get_honor_remote_deletions(&dir).expect("policy"),
+            "a layer saying on must read as on"
+        );
+        assert_eq!(
+            get_setting(&dir, "favorites_collapsed").expect("read"),
+            Some("true".to_owned()),
+            "the shell's getter compares against \"true\""
+        );
+    }
+
+    /// A key no layer mentions still comes from the table, and an unset key is
+    /// still `None`. The overlay adds a lookup; it does not replace one.
+    #[test]
+    fn an_unlayered_key_still_comes_from_the_table() {
+        let dir = temp_dir();
+        set_setting(&dir, RECORDING_CODEC_KEY, "h264").expect("seed");
+        let _layers = config::install_for_test(config::layers_from(&[(
+            RECORDING_FPS_KEY,
+            "60",
+            LayerTier::UserGlobal,
+        )]));
+        assert_eq!(
+            get_setting(&dir, RECORDING_CODEC_KEY).expect("table"),
+            Some("h264".to_owned())
+        );
+        assert_eq!(get_setting(&dir, "nothing.sets.this").expect("unset"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `config.json` is the bottom of the stack: it writes rows, and any TOML
+    /// layer outranks the rows. Both stores name the same key here, and the file
+    /// layer wins.
+    #[test]
+    fn a_toml_layer_outranks_an_imported_config_json() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("create the data dir");
+        std::fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            br#"{"recording.codec": "h264", "recording.fps": 15}"#,
+        )
+        .expect("write config.json");
+        let imported = import_config_file(&dir).expect("import");
+        assert_eq!(imported.len(), 2);
+        let _layers = config::install_for_test(config::layers_from(&[(
+            RECORDING_CODEC_KEY,
+            "hevc",
+            LayerTier::UserGlobal,
+        )]));
+        assert_eq!(
+            get_setting(&dir, RECORDING_CODEC_KEY).expect("layer wins"),
+            Some("hevc".to_owned())
+        );
+        // A key config.json sets and no layer mentions still decides.
+        assert_eq!(get_recording_fps(&dir).expect("fps from json"), 15);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

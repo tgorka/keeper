@@ -88,7 +88,12 @@ pub enum SyncError {
     /// A path cannot be represented on the remote or on a peer's filesystem
     /// (reserved name, illegal character, too long). This is one of the few
     /// conditions that genuinely requires a human: the user must rename.
-    #[error("path cannot be synchronized: {reason}")]
+    /// The message names the path because the surfaces that show this one only
+    /// ever render `to_string()`: `record_failure` copies it into the profile's
+    /// warning verbatim, and a "path cannot be synchronized" with no path is a
+    /// sentence a user can do nothing with. The path is theirs already — they
+    /// named the file — so it carries no secret the taxonomy forbids.
+    #[error("{} cannot be synchronized: {reason}", .path.display())]
     InvalidPathForRemote { path: PathBuf, reason: String },
 
     /// The profile's volume is not mounted. **Not a failure** — AD-48's whole
@@ -138,6 +143,20 @@ pub enum SyncError {
     #[error("{profile}: {reason}")]
     Diverged { profile: String, reason: String },
 
+    /// The remote moved between this profile's last reconcile and its push, so
+    /// git refused the update (DW-207).
+    ///
+    /// The same git output as [`Self::Diverged`] and a different condition. On
+    /// a bidirectional profile sharing a branch with another machine, being
+    /// overtaken between merge and push is *routine* — the other machine
+    /// pushed, which is the entire point of sharing the branch. The answer is
+    /// the reconcile loop keeper already owns: fetch, merge, push again. So
+    /// this is transient and needs nobody, where `Diverged` is permanent and
+    /// needs a human, and telling them apart is what stops a shared folder from
+    /// parking itself every time two machines are awake at once.
+    #[error("{profile}: the remote moved while pushing ({reason}) — reconciling")]
+    RemoteMoved { profile: String, reason: String },
+
     /// The durable journal or profile store could not be read or written.
     /// Treated as fatal for the profile: without the journal we cannot promise
     /// NFR-24, and continuing would risk losing work silently.
@@ -163,6 +182,34 @@ pub enum SyncError {
     /// invalid subpath, a threshold out of range).
     #[error("invalid sync configuration: {0}")]
     Config(String),
+
+    /// keeper will not change the bytes at one path, and the refusal says why
+    /// (Story 56.3, FR-338).
+    ///
+    /// The one variant that carries a *typed* refusal rather than a string,
+    /// because two exhaustive matches have to classify it —
+    /// `keeper-syncd::sync_exit_code` and `keeper::sync_ipc::sync_ipc_error` —
+    /// and 56.4 adds four more refusals to the same vocabulary. Growing
+    /// [`crate::lfs::hydrate::ContentRefusal`] therefore costs no churn in
+    /// either match, where five more `SyncError` variants would have cost it
+    /// twice each.
+    ///
+    /// The message is the refusal's own sentence, unchanged: it is written for
+    /// the person who asked, and a prefix worded here would be a second voice
+    /// in front of it.
+    #[error("{0}")]
+    Refused(crate::lfs::hydrate::ContentRefusal),
+
+    /// A sync for this folder is already running.
+    ///
+    /// Not a misconfiguration and not a failure: a scheduled run and a "Sync
+    /// now" click overlapping is the ordinary case, and the work is already
+    /// being done by the run that got there first. It had been reported as
+    /// `Config`, which rendered as "invalid sync configuration: … is already
+    /// syncing" — a sentence that sends somebody to look for a broken setting
+    /// that does not exist.
+    #[error("{0} is already syncing; the run already in progress will finish it")]
+    Busy(String),
 
     /// The operation was cancelled — by the user, by shutdown, or by a volume
     /// disappearing mid-flight. Never surfaced as a failure.
@@ -207,8 +254,18 @@ impl SyncError {
             | Self::Config(_) => Retriability::Permanent,
             // Ambiguous by nature; a bounded retry is cheaper than parking a
             // profile on a transient EINTR or a momentarily locked file.
-            Self::Git(_) | Self::Io { .. } => Retriability::Transient,
-            Self::Cancelled => Retriability::Permanent,
+            //
+            // `RemoteMoved` joins them deliberately: another machine pushing
+            // first is the ordinary weather of a shared branch, and the retry
+            // lands after the reconcile that `do_push` queues alongside it.
+            Self::Git(_) | Self::Io { .. } | Self::RemoteMoved { .. } => Retriability::Transient,
+            // Nothing to retry: the run that holds the folder is doing this work.
+            Self::Busy(_) | Self::Cancelled => Retriability::Permanent,
+            // A refusal is an ANSWER, not a fault: the request named a path
+            // whose bytes keeper will not change, and asking again unchanged
+            // gets the same answer. A retry could only succeed by overwriting
+            // the very thing the refusal protects.
+            Self::Refused(_) => Retriability::Permanent,
         }
     }
 
@@ -218,6 +275,13 @@ impl SyncError {
     /// an inline action. Deliberately narrow: the product promise (FR-89) is
     /// that convergence never waits on a prompt, so only conditions no policy
     /// can decide are allowed to return `true`.
+    ///
+    /// [`Self::Refused`] is deliberately absent. It answers ONE request about
+    /// ONE path and says nothing about the folder: a user who asked for a file
+    /// they had edited has a working folder that needs nothing done to it, and
+    /// returning `true` would raise the folder-needs-attention surface — an
+    /// amber warning and a notice with an inline action — over a sentence the
+    /// caller has already been shown.
     pub fn needs_user_action(&self) -> bool {
         matches!(
             self,
@@ -246,10 +310,13 @@ impl SyncError {
             Self::Integrity { .. } => "integrity",
             Self::Quota { .. } => "quota",
             Self::Diverged { .. } => "diverged",
+            Self::RemoteMoved { .. } => "remote-moved",
             Self::Journal(_) => "journal",
             Self::Git(_) => "git",
             Self::Io { .. } => "io",
             Self::Config(_) => "config",
+            Self::Busy(_) => "busy",
+            Self::Refused(_) => "refused",
             Self::Cancelled => "cancelled",
         }
     }
@@ -347,12 +414,32 @@ mod tests {
             SyncError::Git(String::new()).code(),
             SyncError::io("read", "/x", std::io::Error::other("x")).code(),
             SyncError::Config(String::new()).code(),
+            SyncError::Refused(crate::lfs::hydrate::ContentRefusal::Missing {
+                path: String::new(),
+            })
+            .code(),
             SyncError::Cancelled.code(),
         ];
         let mut seen = codes.to_vec();
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), codes.len(), "duplicate error code");
+    }
+
+    #[test]
+    fn an_unsynchronizable_path_is_named_by_its_message() {
+        // `record_failure` puts `to_string()` into the profile's warning and
+        // nothing downstream destructures the variant, so a path missing from
+        // the message is a path the user never learns.
+        let err = SyncError::InvalidPathForRemote {
+            path: PathBuf::from("20-records/pipe.fifo"),
+            reason: "only regular files and symlinks can be synchronized".to_owned(),
+        };
+        assert!(
+            err.to_string().contains("20-records/pipe.fifo"),
+            "got: {err}"
+        );
+        assert!(err.needs_user_action());
     }
 
     #[test]

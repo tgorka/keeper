@@ -233,10 +233,14 @@ export function ApprovalPane() {
   return (
     <section
       aria-label="Approvals"
-      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
+      // `last:border-r-0` — DESIGN.md → Elevation & Depth: the earlier sibling
+      // owns its trailing edge, and the last child cancels, because an edge
+      // with nothing beyond it is a line against the window. This pane is the
+      // last child of the shell row whenever it is mounted at all.
+      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0"
     >
       <header className="shrink-0 border-border border-b px-6 py-4">
-        <h1 className="font-heading font-medium text-lg">Approvals</h1>
+        <h1 className="font-heading text-title">Approvals</h1>
         <p className="text-muted-foreground text-sm">
           Review and approve drafts across every account. Nothing sends without you.
         </p>
@@ -276,8 +280,11 @@ export function ApprovalPane() {
             <ul className="flex flex-col gap-6 p-6">
               {groups.map((group, groupIndex) => (
                 <li key={group.accountId}>
+                  {/* Not `label-caps`: this heading's text is a Matrix user id,
+                      and an identifier rendered in the wrong case is a wrong
+                      identifier. A section label may shout; a fact may not. */}
                   <h2
-                    className="mb-2 flex items-center gap-2 font-medium text-muted-foreground text-xs uppercase tracking-wide"
+                    className="mb-2 flex items-center gap-2 font-heading text-sm font-semibold"
                     style={{ color: accountHueVar(group.hueIndex) }}
                   >
                     <span

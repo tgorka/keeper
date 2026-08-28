@@ -26,7 +26,14 @@ export function VerifyBanner() {
   }
 
   return (
-    <div className="shrink-0 px-3 pb-2">
+    // `py-2`, not `pb-2`. The band had 12px either side and 8px below but ZERO
+    // above, so the card's top edge sat glued to whatever band was above it —
+    // an enclosed card whose four borders are the same 1px reads as thinner on
+    // top when only three of them have any air. Equal gutters, DESIGN.md's own
+    // 8px, so the edge is even on all four sides. There is no seam to add here:
+    // an `Alert` is `rounded-lg border`, a self-enclosed object, and the panes
+    // row below it is not its neighbour across a boundary.
+    <div className="shrink-0 px-3 py-2">
       <Alert role="status" className="pr-24">
         <AlertDescription className="text-foreground">{VERIFY_BANNER_TEXT}</AlertDescription>
         <AlertAction className="flex items-center gap-1">

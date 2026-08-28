@@ -2,10 +2,8 @@
 
 /**
  * One recordings-flagged sync profile, as the destination picker needs it
- * (Story 41.2, FR-131).
+ * (Story 41.2, FR-131; Story 46.10 added the fourth field).
  *
- * Three fields and no more, because the picker asks exactly one question:
- * "which synced folder should hold recordings, and where would they land?"
  * `recordings_root` is RESOLVED here — `local_path` joined with the profile's
  * recordings subfolder — for the same reason
  * [`RecordingSettingsVm::destination_dir`] is: no surface anywhere joins a
@@ -30,4 +28,27 @@ name: string,
 /**
  * The profile's RESOLVED recordings root, as an absolute path.
  */
-recordingsRoot: string, };
+recordingsRoot: string, 
+/**
+ * The profile-relative recordings subfolder `recordings_root` was composed
+ * FROM — the "head" of the path a recording takes (Story 46.10).
+ *
+ * Carried beside the resolved root rather than sliced back out of it by the
+ * surface, and read in the same breath as it, so the two can never disagree:
+ * a card that showed a head from one read and a root from another would be
+ * describing two different profiles a fraction of a second apart. It is also
+ * not recoverable by string surgery — `local_path` is not on this row, and
+ * the join normalised nothing, so `20-media//sessions` and `20-media/sessions`
+ * resolve to one root and are two different stored values, only one of which
+ * an edit box may echo back to `sync_profile_save`.
+ *
+ * May be more than one component (`40-media/recordings`): a nested subfolder
+ * is valid and always has been (`RecordingsConfig::validate` refuses empty,
+ * absolute, escaping and vault-overlapping values, and nothing else).
+ *
+ * This is the half of the destination path that TRAVELS. It lives in the
+ * profile row in `sync.db`, so every machine syncing this folder records
+ * into it; the other half — `recording.path_template` — is a per-machine
+ * settings key and does not.
+ */
+subfolder: string, };

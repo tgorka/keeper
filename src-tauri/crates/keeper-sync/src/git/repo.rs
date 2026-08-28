@@ -25,12 +25,13 @@
 use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
 use crate::error::{Result, SyncError};
 use crate::git::fetch::Credential;
+use crate::lfs::pointer::{Pointer, MAX_POINTER_BYTES};
 
 /// How long an `index.lock` must sit untouched before it is debris.
 ///
@@ -70,11 +71,123 @@ pub fn open(path: &Path, trust_full: bool) -> Result<gix::Repository> {
     if trust_full {
         options = options.with(gix::sec::Trust::Full);
     }
-    let repo = gix::open_opts(path, options)
-        .map_err(|err| SyncError::Git(format!("open failed: {err}")))?;
+    let mut repo = gix::open_opts(path, options)
+        .map_err(|err| SyncError::Git(format!("open failed: {}", super::fetch::flatten(&err))))?;
     release_stale_index_lock(repo.git_dir());
     release_stale_ref_locks(repo.git_dir());
+    drop_foreign_lfs_driver(&mut repo)?;
     Ok(repo)
+}
+
+/// Remove every `filter "lfs"` driver that is not this repository's own from the
+/// merged, in-memory configuration.
+///
+/// # The failure this ends
+///
+/// `git lfs install` — the same command whose hooks [`super::cli`] neutralizes —
+/// writes a driver into the user's **global** config:
+///
+/// ```text
+/// [filter "lfs"]
+///     process  = git-lfs filter-process
+///     clean    = git-lfs clean -- %f
+///     smudge   = git-lfs smudge -- %f
+///     required = true
+/// ```
+///
+/// gitoxide collects one driver per configuration *section* and then takes the
+/// **first** whose name matches (`gix::filter::extract_drivers` feeding
+/// `gix_filter::pipeline::util::extract_driver`). Sections arrive in scope order,
+/// so a global `filter "lfs"` precedes the local one
+/// [`enforce_local_config_with_filter`] writes — and keys are **not** merged
+/// across the two the way git merges them. The global section is therefore the
+/// whole answer: keeper's `clean`/`smudge` are never consulted, its
+/// `required = false` never applies, and `process` wins over both.
+///
+/// `process` is the long-running filter protocol, and gitoxide's launch of it
+/// fails hard whatever `required` says (`gix_filter::driver::State::
+/// maybe_launch_process` returns `ProcessHandshake` before any driver leniency is
+/// consulted). On a desktop launch `PATH` is Finder's, so `/bin/sh -c
+/// "git-lfs filter-process"` finds no `git-lfs`, exits, and the handshake read
+/// hits EOF:
+///
+/// ```text
+/// status failed: IO error while writing blob or reading file metadata or
+/// changing filetype: Process handshake with command … "/bin/sh" "-c"
+/// "git-lfs filter-process" "sh" failed: Failed to read or write to the
+/// process: failed to fill whole buffer
+/// ```
+///
+/// The trigger is any content re-read of an LFS entry, measured against gix
+/// 0.86: `index_as_worktree` falls through to a content comparison whenever the
+/// entry's stat tuple stops matching, and `FastEq` streams that content — through
+/// the filter — as long as the SIZE still agrees, which for an LFS entry it
+/// normally does (the entry's stat is the worktree file's, AD-46). A recording
+/// whose mtime moved after the last index write is exactly that shape, and so is
+/// the racily-clean case.
+///
+/// Field measurement (2026-08-13 → 2026-08-16, 90 430 identical lines in one
+/// user's log): the state is self-perpetuating. `status` fails, so nothing
+/// commits, so the index is never rewritten, so the same entry is re-read on the
+/// next pass — no retry, restart or reinstall can clear it.
+///
+/// # Why the whole section goes
+///
+/// keeper *is* the LFS implementation for a folder it manages: it writes the
+/// pointers, owns the object store under `.git/lfs`, uploads through its own
+/// journal and prunes objects it has replicated. A driver belonging to another
+/// installation is wrong here even when its binary is present — the same
+/// reasoning [`super::cli`] applies to git-lfs's hooks, one layer down. Only the
+/// repository's own scopes (`.git/config`, `.git/config.worktree`) may name the
+/// `lfs` driver.
+///
+/// Nothing on disk is touched: the surgery is on the merged snapshot this
+/// `Repository` handle holds, so a user's `~/.gitconfig` keeps working for every
+/// repository keeper does not manage.
+pub fn drop_foreign_lfs_driver(repo: &mut gix::Repository) -> Result<()> {
+    // Reading first keeps the common case free: committing a snapshot re-reads
+    // every value and clears the repository's caches, and this runs on every
+    // open, which is once per sync pass.
+    if !has_foreign_lfs_driver(repo) {
+        return Ok(());
+    }
+    let mut snapshot = repo.config_snapshot_mut();
+    // A loop, not one call: `remove_section_filter` removes the last match, and
+    // a machine can carry several (system *and* global, or two global files
+    // reached through an `include`).
+    while snapshot
+        .remove_section_filter("filter", Some("lfs".into()), |meta| {
+            !is_repository_scope(meta)
+        })
+        .is_some()
+    {}
+    snapshot
+        .commit()
+        .map_err(|err| SyncError::Git(format!("could not drop a foreign lfs filter: {err}")))?;
+    Ok(())
+}
+
+/// Whether any `filter "lfs"` section comes from outside this repository.
+fn has_foreign_lfs_driver(repo: &gix::Repository) -> bool {
+    repo.config_snapshot()
+        .sections_by_name("filter")
+        .into_iter()
+        .flatten()
+        .any(|section| {
+            section
+                .header()
+                .subsection_name()
+                .is_some_and(|name| name == "lfs")
+                && !is_repository_scope(section.meta())
+        })
+}
+
+/// `.git/config` and `.git/config.worktree`, and nothing else.
+///
+/// The scope, not the trust level: a global file is perfectly trustworthy and
+/// still has no business naming the `lfs` driver for a folder keeper manages.
+fn is_repository_scope(meta: &gix::config::file::Metadata) -> bool {
+    meta.source.kind() == gix::config::source::Kind::Repository
 }
 
 /// Remove an `index.lock` left behind by a process that was killed.
@@ -454,15 +567,19 @@ pub fn clone(
             super::fetch::classify("clone", &super::fetch::flatten(&err), &host, interrupt)
         })?;
 
-    let (repo, _outcome) = checkout
+    let (mut repo, _outcome) = checkout
         .main_worktree(gix::progress::Discard, interrupt)
         .map_err(|err| {
             cancelled_or(interrupt, || {
-                SyncError::Git(format!("checkout failed: {err}"))
+                SyncError::Git(format!("checkout failed: {}", super::fetch::flatten(&err)))
             })
         })?;
 
     enforce_local_config(&repo)?;
+    // The checkout above is the one filtered operation keeper cannot protect
+    // this way — `gix::clone::PrepareCheckout` hands out no mutable repository
+    // (DW-206). Everything the caller does with this handle afterwards is.
+    drop_foreign_lfs_driver(&mut repo)?;
     Ok(repo)
 }
 
@@ -482,7 +599,7 @@ const IDENTITY_EMAIL: &str = "keeper@keeper.invalid";
 /// hard-failure this prevents. Idempotent: an existing value is overwritten
 /// rather than appended, so repeated calls do not grow the file.
 pub fn enforce_local_config(repo: &gix::Repository) -> Result<()> {
-    enforce_local_config_with_filter(repo, None)
+    enforce_local_config_with_filter(repo, None, false)
 }
 
 /// As [`enforce_local_config`], additionally registering keeper as the `lfs`
@@ -494,17 +611,49 @@ pub fn enforce_local_config(repo: &gix::Repository) -> Result<()> {
 /// cache misses — it reports every LFS-tracked file as modified. keeper itself
 /// tolerates that, but nobody running `git status` by hand should have to.
 ///
-/// Single-invocation `clean`/`smudge` rather than the long-running
-/// `filter.lfs.process` protocol: both git and gitoxide support it, it is far
-/// less machinery, and the per-call cost only lands when git's stat cache
-/// already missed.
+/// All three keys are written, and `filter.lfs.process` is the load-bearing one
+/// (DW-140). git prefers a `process` driver over a `clean`/`smudge` pair
+/// *whatever scope each was defined in*, so the repository-local pair this
+/// function used to write alone was silently outranked by the
+/// `filter.lfs.process` that `git lfs install` leaves in `~/.gitconfig` — on
+/// every machine that has ever had the real git-lfs. The pair is still written
+/// because it costs one line and is what a `git` old enough to lack process
+/// filters would use; the local `process` key is what actually takes effect.
 ///
-/// `required` is deliberately left false. A worktree whose keeper binary has
-/// moved must still be checkout-able — it would just get pointers, which is
-/// recoverable, where a required filter would hard-fail every git command.
+/// # Why this is not what [`drop_foreign_lfs_driver`] already does (DW-206)
+///
+/// The two halves look like the same fix and are not, because they defend
+/// different gits. `drop_foreign_lfs_driver` performs surgery on the merged
+/// snapshot **this `Repository` handle holds** — its own doc says nothing on
+/// disk is touched — so it settles what *gitoxide* consults, in this process.
+/// keeper also shells out: `merge`, `push`, `checkout` and `sparse-checkout`
+/// are the git binary (see the module docs), and that binary re-reads
+/// `~/.gitconfig` for itself. An in-memory removal cannot reach it.
+///
+/// Measured, on the config state DW-206 leaves behind — local `clean`/`smudge`,
+/// no local `process`, global `filter.lfs.process = git-lfs filter-process`:
+/// `git add` staged a **git-lfs** pointer, not the output of keeper's `clean`.
+/// The global driver still won. Writing a repository-scoped `process` key is
+/// what out-ranks it, because git *does* merge keys across scopes with the
+/// narrowest winning — which is the same rule, read from the other side, that
+/// let the global one beat a local `clean`/`smudge` in the first place.
+///
+/// A foreign `process` — what `git lfs install --local` leaves here — is still
+/// stripped, for DW-206's reason: keeper owns this section. The strip runs
+/// *before* the write, so it removes theirs and never ours.
+///
+/// `required` is deliberately left false, and the reasoning changed rather than
+/// survived: it is not that a failure is harmless, it is that
+/// [`crate::lfs::filter::run_process`] no longer *has* the failure mode that
+/// made `false` dangerous. A per-path refusal is reported as `status=error` and
+/// the process stays up, so git falls back for one path instead of emptying the
+/// rest of the checkout. What `false` still buys is the original case: a
+/// worktree whose keeper binary moved must remain checkout-able, as pointers,
+/// rather than hard-failing every git command in the folder.
 pub fn enforce_local_config_with_filter(
     repo: &gix::Repository,
     filter_program: Option<&Path>,
+    serves_process: bool,
 ) -> Result<()> {
     let path = repo.git_dir().join("config");
     let mut config = read_config(&path, gix::config::Source::Local)?;
@@ -545,12 +694,54 @@ pub fn enforce_local_config_with_filter(
             "\"{quoted}\" lfs smudge --repo \"{}\" %f",
             workdir.display()
         );
+        // Strip first, write second (DW-206 + DW-140). Every `process` key here
+        // is somebody else's — `git lfs install --local` writes one, and keeper
+        // owns this section — and clearing them before the write is what lets
+        // the write below be the only one left. Doing it the other way round
+        // would delete the key this function exists to install. Several
+        // `[filter "lfs"]` sections in one file are legal, so every one of them
+        // is stripped rather than the last; a file with no such section yet
+        // yields no ids and the loop does nothing.
+        let ids: Vec<_> = config
+            .sections_and_ids()
+            .filter(|(section, _)| {
+                section.header().name() == "filter"
+                    && section
+                        .header()
+                        .subsection_name()
+                        .is_some_and(|name| name == "lfs")
+            })
+            .map(|(_, id)| id)
+            .collect();
+        for id in ids {
+            if let Some(mut section) = config.section_mut_by_id(id) {
+                while section.remove("process").is_some() {}
+            }
+        }
+
         config
             .set_raw_value("filter.lfs.clean", clean.as_str())
             .map_err(|err| SyncError::Git(format!("could not set filter.lfs.clean: {err}")))?;
         config
             .set_raw_value("filter.lfs.smudge", smudge.as_str())
             .map_err(|err| SyncError::Git(format!("could not set filter.lfs.smudge: {err}")))?;
+        // Only when the program has been *asked* and answered — see
+        // [`crate::lfs::filter::serves_process`]. A `process` key naming a binary
+        // that cannot serve it is worse than none at all: gitoxide's launch
+        // failure is hard whatever `required` says, so the folder stops syncing
+        // rather than degrading to pointers.
+        if serves_process {
+            // No `%f`: the long-running protocol names each path in-band.
+            let process = format!(
+                "\"{quoted}\" lfs filter-process --repo \"{}\"",
+                workdir.display()
+            );
+            config
+                .set_raw_value("filter.lfs.process", process.as_str())
+                .map_err(|err| {
+                    SyncError::Git(format!("could not set filter.lfs.process: {err}"))
+                })?;
+        }
         config
             .set_raw_value("filter.lfs.required", "false")
             .map_err(|err| SyncError::Git(format!("could not set filter.lfs.required: {err}")))?;
@@ -703,10 +894,21 @@ pub struct RepoStatus {
     pub deleted: Vec<PathBuf>,
     /// Paths on disk that git does not track.
     pub untracked: Vec<PathBuf>,
+    /// Tracked paths whose state could not be determined, and why.
+    ///
+    /// Empty in every ordinary pass. A non-empty vector means the status is a
+    /// report about the *rest* of the folder: these paths were stepped over so
+    /// the others could be answered at all. See [`status_paths`].
+    pub unreadable: Vec<UnreadablePath>,
 }
 
 impl RepoStatus {
     /// Whether anything at all differs.
+    ///
+    /// Deliberately blind to [`Self::unreadable`]: a path nobody can read is
+    /// not a change to synchronize, and answering "yes, something differs"
+    /// because of one would send the commit path off to stage a file it cannot
+    /// open. The condition is reported, not converged.
     pub fn is_empty(&self) -> bool {
         self.added.is_empty()
             && self.modified.is_empty()
@@ -714,6 +916,32 @@ impl RepoStatus {
             && self.untracked.is_empty()
     }
 }
+
+/// A tracked path the engine could not read, and the reason it could not.
+///
+/// `reason` is an errno rendering — "Permission denied (os error 13)" — never
+/// file content, so it is safe in a log and in the UI (AD-21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadablePath {
+    /// Repository-relative.
+    pub path: PathBuf,
+    /// What the filesystem said.
+    pub reason: String,
+}
+
+impl std::fmt::Display for UnreadablePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.path.display(), self.reason)
+    }
+}
+
+/// How many unreadable paths one pass will step over before giving up.
+///
+/// A handful of them is a permissions accident and worth working around. A
+/// thousand is a different fault — an unmounted subtree, a revoked group, a
+/// failing disk — and quietly synchronizing "everything except those thousand
+/// files" would be a worse answer than refusing, because it looks like success.
+const MAX_UNREADABLE_SKIPPED: usize = 32;
 
 /// Classify everything `gix::status` reports.
 ///
@@ -737,75 +965,809 @@ impl RepoStatus {
 /// `.gitignore`, `.git/info/exclude` and the global excludes file correctly.
 /// It costs one entry per untracked file instead of one per directory — the
 /// same paths the caller had to produce anyway.
+/// # One unreadable file does not cost the folder its synchronization
+///
+/// gitoxide reports a per-entry IO failure by aborting the whole walk: the
+/// error surfaces only when the worker thread is joined, after every successful
+/// item has already been yielded, so there is no "skip it and keep going" for
+/// the caller to take. One file whose read fails therefore used to fail every
+/// pass — and because `collect_stable_changes` propagates that, a single
+/// unreadable path stalled the entire profile indefinitely. Two machines hit it
+/// in the field within a day of each other, one of them for sixteen consecutive
+/// passes with nothing else syncing.
+///
+/// That is the failure NFR-24 and FR-89 exist to forbid: convergence must not
+/// wait on a human. And it is not an inherent property of the operation: given
+/// the same unreadable tracked file, plain `git status` reports it as modified
+/// and carries on. keeper was strictly less robust than the tool it wraps, on a
+/// file git itself shrugs at. So a failing status is not the answer here, it is
+/// the question. [`unreadable_tracked_paths`] finds which paths cannot be read, and
+/// the walk is repeated with those excluded by pathspec, which gitoxide honours
+/// before it ever opens them. The result describes the rest of the folder
+/// truthfully and names what it had to step over in [`RepoStatus::unreadable`],
+/// so the engine can raise it with the user while everything else converges.
+///
+/// The fallback matters as much as the mechanism: when the diagnosis finds
+/// nothing — a file that opens but fails mid-read, a disk failing under the
+/// hash — the original error is returned unchanged rather than a guess.
+/// # The diagnosis is remembered, because it costs a walk of the whole index
+///
+/// Finding the bad path means one `lstat` and one `open` per tracked entry:
+/// about six seconds on the 154 000-file profile this was found on, and it is a
+/// removable USB volume. The condition persists until a human fixes it, and the
+/// durability probe asks for a status roughly once a second while a recording
+/// runs — so re-diagnosing per call would peg a core and thrash the disk for as
+/// long as the file stayed broken.
+///
+/// So the answer is memoized per repository. A pass with a remembered set
+/// excludes it up front and never scans at all; only a status that fails
+/// *anyway* pays for a fresh walk. The memo is keyed by git directory rather
+/// than by profile because being unreadable is a property of the disk, not of
+/// whoever is asking.
+///
+/// It re-verifies before it trusts itself: every remembered path is re-checked
+/// each pass — at most [`MAX_UNREADABLE_SKIPPED`] of them, so the check is
+/// bounded — and one that has become readable is dropped, which is what lets a
+/// file return to synchronization the moment its permissions are restored,
+/// with no restart and nothing for the user to press.
 pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
+    // No reporter, so the interval cannot matter: the walk asks nothing. And no
+    // claim, so it changes nothing either — see [`WalkPolicy::read_only`].
+    status_paths_reported(repo, None, Duration::MAX, WalkPolicy::read_only())
+}
+
+/// [`status_paths`], plus a way for a slow walk to say how far it has got.
+///
+/// The walk is the one step that can run for minutes with nothing on screen:
+/// on a 155 000-file folder on a USB volume it stats every tracked file, and
+/// until now it published exactly nothing while doing so - the pane read
+/// `Idle - N waiting to sync` and the owner had no way to tell a folder that
+/// was working from one that was wedged. `report` is called at most once a
+/// second with `(items produced, index entries)`; see [`WalkReport`].
+pub fn status_paths_reported(
+    repo: &gix::Repository,
+    report: Option<WalkReport<'_>>,
+    interval: Duration,
+    policy: WalkPolicy,
+) -> Result<RepoStatus> {
+    let known = still_unreadable(repo, remembered_unreadable(repo));
+    let skip: Vec<PathBuf> = known.iter().map(|item| item.path.clone()).collect();
+
+    // `WalkReport` is a shared reference and therefore `Copy`, which is the
+    // point: the retry arm below needs the same reporter, and a `&mut dyn
+    // FnMut` could not be handed to both walks.
+    let status = match status_paths_excluding(repo, &skip, report, interval, policy) {
+        Ok(mut status) => {
+            status.unreadable = known;
+            status
+        }
+        Err(first) => {
+            let found = unreadable_tracked_paths(repo);
+            if found.is_empty() {
+                // Nothing to blame, so nothing to work around. The caller gets
+                // the real error rather than a story about a path we invented.
+                remember_unreadable(repo, &[]);
+                return Err(first);
+            }
+            if found.len() > MAX_UNREADABLE_SKIPPED {
+                tracing::warn!(
+                    count = found.len(),
+                    "too many unreadable paths to step over; reporting the failure instead"
+                );
+                remember_unreadable(repo, &[]);
+                return Err(first);
+            }
+            let skip: Vec<PathBuf> = found.iter().map(|item| item.path.clone()).collect();
+            let mut status = status_paths_excluding(repo, &skip, report, interval, policy)?;
+            for item in &found {
+                tracing::warn!(path = %item.path.display(), reason = %item.reason,
+                    "this file could not be read; the rest of the folder was synchronized without it");
+            }
+            status.unreadable = found;
+            status
+        }
+    };
+
+    remember_unreadable(repo, &status.unreadable);
+    Ok(status)
+}
+
+/// Unreadable paths already diagnosed for a repository, keyed by git directory.
+///
+/// A process-wide memo rather than engine state on purpose: all three callers
+/// of [`status_paths`] would otherwise have to thread and agree on the same
+/// set, and the thing being remembered belongs to the repository either way.
+/// Bounded twice over — one entry per repository this process has synchronized,
+/// each holding at most [`MAX_UNREADABLE_SKIPPED`] paths.
+static UNREADABLE_MEMO: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<UnreadablePath>>>,
+> = std::sync::OnceLock::new();
+
+fn unreadable_memo(
+) -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<UnreadablePath>>> {
+    UNREADABLE_MEMO.get_or_init(Default::default)
+}
+
+fn remembered_unreadable(repo: &gix::Repository) -> Vec<UnreadablePath> {
+    match unreadable_memo().lock() {
+        Ok(memo) => memo.get(repo.git_dir()).cloned().unwrap_or_default(),
+        // A poisoned memo is a cache miss, never a failed sync: the worst it
+        // costs is the walk it existed to avoid.
+        Err(_) => Vec::new(),
+    }
+}
+
+fn remember_unreadable(repo: &gix::Repository, unreadable: &[UnreadablePath]) {
+    let Ok(mut memo) = unreadable_memo().lock() else {
+        return;
+    };
+    if unreadable.is_empty() {
+        memo.remove(repo.git_dir());
+    } else {
+        memo.insert(repo.git_dir().to_path_buf(), unreadable.to_vec());
+    }
+}
+
+/// Which of `known` still cannot be read, with a refreshed reason.
+fn still_unreadable(repo: &gix::Repository, known: Vec<UnreadablePath>) -> Vec<UnreadablePath> {
+    if known.is_empty() {
+        return known;
+    }
+    let Ok(workdir) = workdir(repo) else {
+        return Vec::new();
+    };
+    known
+        .into_iter()
+        .filter_map(|item| {
+            why_unreadable(&workdir.join(&item.path)).map(|reason| UnreadablePath {
+                path: item.path,
+                reason,
+            })
+        })
+        .collect()
+}
+
+/// How far the walk has got through the index, as gix counts it.
+///
+/// # Why the emitted items are not a liveness signal
+///
+/// A status walk emits only what CHANGED. Every entry it examines and finds
+/// clean produces nothing at all, so once a worktree's dirty entries run out
+/// part-way through the index the walk goes legitimately silent for the whole
+/// remainder of the pass — and a watchdog reading emission as liveness kills a
+/// healthy walk.
+///
+/// **Measured, not reasoned about.** On a 155 662-entry folder mid-migration
+/// the same pass finished three times at ~4 300 s while 73 542 entries were
+/// dirty, then — as the repair sweep converted 500 of them per pass — was
+/// abandoned 61 consecutive times, every time at 2 912 s with exactly 600 s of
+/// silence and roughly 1 400 s of honest work still to do. The folder had no
+/// stall; the proxy did.
+///
+/// gix increments this once per index entry it has finished comparing, *after*
+/// whatever filter conversion that entry needed. So it moves while the walk is
+/// quietly scanning and freezes when a conversion deadlocks, which is exactly
+/// the distinction emission cannot make.
+#[derive(Clone, Debug)]
+struct ScannedEntries {
+    counter: gix::progress::StepShared,
+}
+
+impl gix::progress::Count for ScannedEntries {
+    fn set(&self, step: gix::progress::Step) {
+        self.counter.store(step, Ordering::Relaxed);
+    }
+
+    fn step(&self) -> gix::progress::Step {
+        self.counter.load(Ordering::Relaxed)
+    }
+
+    fn inc_by(&self, step: gix::progress::Step) {
+        self.counter.fetch_add(step, Ordering::Relaxed);
+    }
+
+    /// The whole reason this type exists rather than `gix::progress::Discard`:
+    /// `Discard::counter()` hands out a fresh `Arc` per call, so gix counts
+    /// into an atomic nobody else holds and the caller can never read it.
+    fn counter(&self) -> gix::progress::StepShared {
+        std::sync::Arc::clone(&self.counter)
+    }
+}
+
+impl gix::progress::Progress for ScannedEntries {
+    /// Deliberately not a reset. gix calls this with the index size before it
+    /// takes the counter, and a fresh instance is armed per walk, so the only
+    /// thing a reset could do here is race the watchdog to zero.
+    fn init(&mut self, _max: Option<gix::progress::Step>, _unit: Option<gix::progress::Unit>) {}
+
+    fn set_name(&mut self, _name: String) {}
+
+    fn name(&self) -> Option<String> {
+        None
+    }
+
+    fn id(&self) -> gix::progress::Id {
+        gix::progress::UNKNOWN
+    }
+
+    fn message(&self, _level: gix::progress::MessageLevel, _message: String) {}
+}
+
+/// Abandons a status walk that has stopped making progress.
+///
+/// # Why a watchdog and not a total timeout
+///
+/// A status pass has no honest upper bound. It converts every filtered file it
+/// suspects of having changed, and one of those can be a gigabyte of video that
+/// takes minutes on an external disk. A pass that is *slow* is doing its job; a
+/// pass that has stopped moving is not, and only the second is worth killing.
+/// So the clock is reset by progress, and it fires on stillness.
+///
+/// # What counts as progress
+///
+/// Two signals, either of which resets the clock: an item coming out of the
+/// walk, and gix's own count of index entries compared (see
+/// [`ScannedEntries`]). The second is load-bearing — a walk with nothing left
+/// to report is still working, and for most of a large clean tree that is the
+/// only signal there is.
+///
+/// # Why it interrupts rather than just reporting
+///
+/// gix polls the flag from inside the walk, so setting it unwinds the threads
+/// that are stuck and returns control here. A watchdog that only logged would
+/// leave the folder exactly as stuck as before while claiming to have noticed —
+/// which is the failure mode this whole change exists to remove.
+struct StatusWatchdog {
+    heartbeat: std::sync::Arc<AtomicU64>,
+    scanned: gix::progress::StepShared,
+    started: Instant,
+}
+
+impl StatusWatchdog {
+    fn arm(
+        interrupt: std::sync::Arc<AtomicBool>,
+        heartbeat: std::sync::Arc<AtomicU64>,
+        scanned: gix::progress::StepShared,
+    ) -> Self {
+        Self::arm_with(
+            interrupt,
+            heartbeat,
+            scanned,
+            WATCHDOG_POLL,
+            STATUS_SILENCE_LIMIT,
+        )
+    }
+
+    /// The intervals as parameters, so the behaviour that matters — firing on
+    /// stillness, staying quiet under load — is testable in milliseconds
+    /// instead of in the ten minutes production waits.
+    fn arm_with(
+        interrupt: std::sync::Arc<AtomicBool>,
+        heartbeat: std::sync::Arc<AtomicU64>,
+        scanned: gix::progress::StepShared,
+        poll: Duration,
+        limit: Duration,
+    ) -> Self {
+        let watcher_interrupt = std::sync::Arc::clone(&interrupt);
+        let watcher_heartbeat = std::sync::Arc::clone(&heartbeat);
+        let watcher_scanned = std::sync::Arc::clone(&scanned);
+        // Detached: it observes three atomics and owns nothing the walk needs,
+        // so there is no join to get wrong and no lock it can hold. It ends
+        // when the walk does, because the walk stops beating and the flag it
+        // sets is read once more before anyone looks at it.
+        std::thread::Builder::new()
+            .name("keeper-status-watchdog".into())
+            .spawn(move || {
+                let mut last_beat = 0u64;
+                let mut last_scan = 0usize;
+                let mut quiet = Duration::ZERO;
+                loop {
+                    std::thread::sleep(poll);
+                    if watcher_interrupt.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let beat = watcher_heartbeat.load(Ordering::Relaxed);
+                    if beat == u64::MAX {
+                        // The walk finished and said so; nothing left to watch.
+                        return;
+                    }
+                    let scan = watcher_scanned.load(Ordering::Relaxed);
+                    // Either signal is progress. The second one is the reason
+                    // this guard stopped killing healthy walks: a pass whose
+                    // dirty entries are exhausted emits nothing for the rest of
+                    // the index while comparing tens of thousands of files.
+                    if beat != last_beat || scan != last_scan {
+                        last_beat = beat;
+                        last_scan = scan;
+                        quiet = Duration::ZERO;
+                        continue;
+                    }
+                    quiet += poll;
+                    if quiet >= limit {
+                        tracing::error!(
+                            items = beat,
+                            scanned = scan,
+                            silent_for_s = quiet.as_secs(),
+                            "the status walk stopped making progress; abandoning it"
+                        );
+                        watcher_interrupt.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    // Said once per minute rather than once per poll: a long
+                    // honest conversion should leave a trail, not a flood.
+                    if quiet.as_secs().is_multiple_of(60) {
+                        tracing::info!(
+                            items = beat,
+                            scanned = scan,
+                            silent_for_s = quiet.as_secs(),
+                            "the status walk is still working on one file"
+                        );
+                    }
+                }
+            })
+            .ok();
+        // `interrupt` is not kept: the watcher owns the clone that sets it and
+        // the caller owns the clone that reads it, so a third handle here would
+        // be a field nobody touches.
+        drop(interrupt);
+        Self {
+            heartbeat,
+            scanned,
+            started: Instant::now(),
+        }
+    }
+
+    /// One item came out of the walk. Answers how many have, so the caller
+    /// needs no counter of its own.
+    fn beat(&self) -> u64 {
+        self.heartbeat.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// How many items the walk has produced.
+    fn beats(&self) -> u64 {
+        self.heartbeat.load(Ordering::Relaxed)
+    }
+
+    /// How many index entries the walk has compared. See [`ScannedEntries`]:
+    /// this is the number that keeps moving over a clean tree, and the one a
+    /// person reads to know whether a quiet pass was working.
+    fn scans(&self) -> usize {
+        self.scanned.load(Ordering::Relaxed)
+    }
+
+    /// How long the walk has been running.
+    fn elapsed_ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
+    }
+
+    /// The sentence a caller shows when the walk was abandoned.
+    ///
+    /// It names both counts, because "status failed" without them cannot tell
+    /// "stuck on the first file" from "stuck on the last one", and that
+    /// difference is the whole of the next person's investigation. Two numbers
+    /// rather than one: the changes found say how much of the pass's *output*
+    /// survived, and the files checked say where in the index it stopped —
+    /// which are different questions on a tree that is mostly clean.
+    fn silence_error(&self, seen: u64) -> SyncError {
+        SyncError::Git(format!(
+            "the folder's status scan stopped responding after {seen} entries and \
+             {}s, having checked {} files, so keeper abandoned it rather than \
+             waiting. This is usually a stalled content filter; the next pass \
+             will try again.",
+            self.started.elapsed().as_secs(),
+            self.scans()
+        ))
+    }
+}
+
+impl Drop for StatusWatchdog {
+    fn drop(&mut self) {
+        // Tell the watcher the walk is over, whichever way it ended.
+        self.heartbeat.store(u64::MAX, Ordering::Relaxed);
+    }
+}
+
+/// Hand back the walk's result, or refuse it because the walk was abandoned.
+///
+/// **The refusal is the point.** An interrupt does not make gix yield an error
+/// — it makes the iterator END, which from the loop is indistinguishable from a
+/// walk that finished. Without this check the caller receives a status computed
+/// from whatever was reached before the stall and treats it as a description of
+/// the whole worktree; `commit_local` would then commit that reading. Observed
+/// on the first run of this guard against a real stalled folder: 19 entries of
+/// a 567-file tree, offered as `added=0 modified=1 deleted=2`.
+fn finish_walk(
+    interrupt: &AtomicBool,
+    watchdog: &StatusWatchdog,
+    out: RepoStatus,
+) -> Result<RepoStatus> {
+    if interrupt.load(Ordering::Relaxed) {
+        return Err(watchdog.silence_error(watchdog.beats()));
+    }
+    Ok(out)
+}
+
+/// How often the watchdog looks. Short enough to be responsive, long enough to
+/// cost nothing over a pass that runs for minutes.
+const WATCHDOG_POLL: Duration = Duration::from_secs(5);
+
+/// How long the walk may go without moving at all before it is abandoned.
+///
+/// Not a performance budget — a liveness one. A status pass over a large
+/// worktree can legitimately spend minutes on one file: converting a gigabyte
+/// of video through the LFS filter is real work, and killing it because it is
+/// slow would be a bug of its own. What it may never do is stop *both* emitting
+/// items and comparing index entries, which is what a deadlocked filter looks
+/// like from here.
+///
+/// Ten minutes is far longer than the slowest honest file and far shorter than
+/// the four days a stalled folder went unnoticed in the field.
+const STATUS_SILENCE_LIMIT: Duration = Duration::from_secs(600);
+
+/// The most files this walk converts at once.
+///
+/// **The number that took a vault down for four days.** `thread_limit: None`
+/// means "one thread per core", and each thread that meets a filtered file
+/// holds an LFS filter conversion open while it streams the file through. On a
+/// worktree of `*.mov` recordings that produced 55 conversions in flight at
+/// once against a much smaller pool of filter processes — every one of them
+/// blocked, none able to finish, no error, no progress, forever.
+///
+/// Four is enough to keep a disk busy and small enough that the conversions in
+/// flight cannot outnumber the workers that serve them. A status pass is not
+/// the hot path; it runs before a pull and once per scan.
+const STATUS_THREAD_LIMIT: usize = 4;
+
+/// The ceiling is the fix, so it is enforced where it cannot be argued with
+/// rather than in a test somebody can delete: raising this back to "one per
+/// core" is what deadlocked 55 conversions against a smaller filter pool.
+const _: () = assert!(STATUS_THREAD_LIMIT >= 1 && STATUS_THREAD_LIMIT <= 8);
+
+/// What a walk in progress can say about itself: index entries compared, and
+/// the number of index entries there are.
+///
+/// **Both numbers count the same thing**, which is the whole point and was not
+/// true before. The numerator used to be items *emitted* — a walk's changed
+/// paths — against a denominator of index entries. On a folder mid-LFS
+/// migration that reads as `9113/155662` and creeps, because it is measuring
+/// how many differences have been found, not how far the walk has got; and it
+/// stops dead for the whole of any stretch where the walk finds nothing, which
+/// on a mostly clean tree is most of the pass.
+///
+/// `scanned` is what gix itself counts through the index (see `ScannedEntries`),
+/// so the pair is monotonic, bounded by its own denominator, and moves at the
+/// rate the walk is actually working. It is what turns ten silent minutes into
+/// "checked 41 000 of 155 000 files" and means it.
+///
+/// `Sync`, because the ticker that publishes it runs beside the walk rather
+/// than inside it — see `status_paths_excluding`.
+pub type WalkReport<'a> = &'a (dyn Fn(u64, u64) + Sync);
+
+/// File one walked item into the bucket that describes what has to happen.
+///
+/// Lifted out of the loop so the loop can live inside a `thread::scope` without
+/// eighty lines of match arms moving one indent to the right; the classification
+/// is unchanged.
+fn push_item(out: &mut RepoStatus, item: gix::status::Item) {
     use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
 
-    let platform = repo
-        .status(gix::progress::Discard)
-        .map_err(|err| SyncError::Git(format!("status failed: {err}")))?
-        .index_worktree_options_mut(|options| {
-            if let Some(dirwalk) = options.dirwalk_options.as_mut() {
-                dirwalk.set_emit_untracked(gix::dir::walk::EmissionMode::Matching);
+    match item {
+        Item::TreeIndex(change) => match change {
+            gix::diff::index::Change::Addition { location, .. } => {
+                out.added.push(to_path(location.as_ref()));
             }
-        });
-    let iter = platform
-        .into_iter(None)
-        .map_err(|err| SyncError::Git(format!("status failed: {err}")))?;
-
-    let mut out = RepoStatus::default();
-    for item in iter {
-        let item = item.map_err(|err| SyncError::Git(format!("status failed: {err}")))?;
-        match item {
-            Item::TreeIndex(change) => match change {
-                gix::diff::index::Change::Addition { location, .. } => {
-                    out.added.push(to_path(location.as_ref()));
-                }
-                gix::diff::index::Change::Deletion { location, .. } => {
-                    out.deleted.push(to_path(location.as_ref()));
-                }
-                gix::diff::index::Change::Modification { location, .. } => {
-                    out.modified.push(to_path(location.as_ref()));
-                }
-                // A rename is a deletion at the source fused with an addition
-                // at the destination; keeping both keeps the two vectors a
-                // faithful description of what the tree has to become.
-                gix::diff::index::Change::Rewrite {
-                    source_location,
-                    location,
-                    ..
-                } => {
-                    out.deleted.push(to_path(source_location.as_ref()));
-                    out.added.push(to_path(location.as_ref()));
-                }
-            },
-            Item::IndexWorktree(WorktreeItem::Modification {
-                rela_path, status, ..
-            }) => match status {
-                index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
-                    out.deleted.push(to_path(rela_path.as_ref()));
-                }
-                index_as_worktree::EntryStatus::Change(_) => {
-                    out.modified.push(to_path(rela_path.as_ref()));
-                }
-                // A conflicted entry is a divergence the merge machinery never
-                // produces here (AD-43 makes conflict copies instead), and
-                // `NeedsUpdate` / `IntentToAdd` mean the content is unchanged.
-                _ => {}
-            },
-            Item::IndexWorktree(WorktreeItem::DirectoryContents { entry, .. }) => {
-                if entry.status == gix::dir::entry::Status::Untracked {
-                    out.untracked.push(to_path(entry.rela_path.as_ref()));
-                }
+            gix::diff::index::Change::Deletion { location, .. } => {
+                out.deleted.push(to_path(location.as_ref()));
             }
-            Item::IndexWorktree(WorktreeItem::Rewrite {
-                source,
-                dirwalk_entry,
+            gix::diff::index::Change::Modification { location, .. } => {
+                out.modified.push(to_path(location.as_ref()));
+            }
+            // A rename is a deletion at the source fused with an addition at
+            // the destination; keeping both keeps the two vectors a faithful
+            // description of what the tree has to become.
+            gix::diff::index::Change::Rewrite {
+                source_location,
+                location,
                 ..
-            }) => {
-                out.deleted.push(to_path(source.rela_path()));
-                out.added.push(to_path(dirwalk_entry.rela_path.as_ref()));
+            } => {
+                out.deleted.push(to_path(source_location.as_ref()));
+                out.added.push(to_path(location.as_ref()));
+            }
+        },
+        Item::IndexWorktree(WorktreeItem::Modification {
+            rela_path, status, ..
+        }) => match status {
+            index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
+                out.deleted.push(to_path(rela_path.as_ref()));
+            }
+            index_as_worktree::EntryStatus::Change(_) => {
+                out.modified.push(to_path(rela_path.as_ref()));
+            }
+            // A conflicted entry is a divergence the merge machinery never
+            // produces here (AD-43 makes conflict copies instead), and
+            // `NeedsUpdate` / `IntentToAdd` mean the content is unchanged.
+            _ => {}
+        },
+        Item::IndexWorktree(WorktreeItem::DirectoryContents { entry, .. }) => {
+            if entry.status == gix::dir::entry::Status::Untracked {
+                out.untracked.push(to_path(entry.rela_path.as_ref()));
             }
         }
+        Item::IndexWorktree(WorktreeItem::Rewrite {
+            source,
+            dirwalk_entry,
+            ..
+        }) => {
+            out.deleted.push(to_path(source.rela_path()));
+            out.added.push(to_path(dirwalk_entry.rela_path.as_ref()));
+        }
+    }
+}
+
+/// Whether a finished walk still owes one closing progress report.
+///
+/// Two rules meet here, and they pull in opposite directions.
+///
+/// A walk that never reached its first tick must stay silent: publishing the
+/// scanning phase on every poll of an idle folder is what made the menu-bar
+/// glyph flip once a second, and the report exists for the ten-minute walk, not
+/// the ten-millisecond one. That is the `spoke` half — a ticker that did speak
+/// must not leave the last figure it happened to catch as the final word, or
+/// the bar stops short of its own end (the macOS gate saw `[198, 382, 296,
+/// 392]` against a denominator of 400).
+///
+/// A ZERO interval is the opposite case and always owes the report. It means
+/// "report every item", which the ticker cannot deliver: it sleeps a clamped
+/// millisecond before its first look, and a small walk has already set `done`
+/// by then. Without this arm every caller of `Engine::report_every_walk_item`
+/// is racing its own fixture — `a_pending_poll_publishes_the_progress_of_its_own_walk`
+/// failed on the macOS gate for exactly this reason while passing on Linux,
+/// with an empty event stream and a walk that had genuinely run.
+fn owes_closing_report(spoke: bool, interval: Duration) -> bool {
+    spoke || interval.is_zero()
+}
+
+/// What a walk does besides answering the question it was asked.
+///
+/// Two decisions, both of which cost or save whole minutes on a large folder,
+/// and neither of which the walk can make for itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalkPolicy {
+    /// Write the stat data the walk observed back into the index.
+    ///
+    /// gitoxide hands these over and expects the caller to save them:
+    /// `EntryStatus::NeedsUpdate(stat)` is collected into
+    /// `gix::status::Outcome`, whose own documentation says that without the
+    /// write-back "subsequent `status` operations will take longer to
+    /// complete". Dropping them is what made tgdrive's pane a permanent
+    /// "Scanning": measured on that folder, 60 280 of 155 662 index entries
+    /// carried no stat at all, so every pass re-read 25.4 GB — 24.2 GB of it
+    /// back through the LFS clean filter — to learn what the previous pass had
+    /// already learned and thrown away.
+    ///
+    /// Only for a caller that holds the folder's walk claim. The write is the
+    /// walk's own index with stat fields replaced, so a leg that staged
+    /// something after the walk started would have that work overwritten.
+    pub persist_stats: bool,
+    /// Walk the directories looking for files git does not track.
+    ///
+    /// This is the expensive half of a walk and it is not proportional to what
+    /// changed: it `lstat`s the whole tree every time. Measured on tgdrive,
+    /// `find . -type f` over 157 490 files takes 996 s on that USB volume, and
+    /// that is the floor for a pass that asks the question at all.
+    ///
+    /// The commit leg must ask it — an untracked file is exactly what it exists
+    /// to publish. A five-second UI poll does not: a new file reaches the
+    /// Pending list through the watcher and the stability gate long before any
+    /// walk would find it, so the poll asks only about entries the index
+    /// already names, and sweeps for untracked ones on the cadence in
+    /// `Engine::UNTRACKED_SWEEP_INTERVAL`.
+    pub find_untracked: bool,
+}
+
+impl WalkPolicy {
+    /// Everything: find untracked files, and save what was learned.
+    pub const fn full() -> Self {
+        Self {
+            persist_stats: true,
+            find_untracked: true,
+        }
+    }
+
+    /// Only what the index already names — no directory walk — but still save
+    /// the stats, because that is what makes the next pass cheaper.
+    pub const fn tracked_only() -> Self {
+        Self {
+            persist_stats: true,
+            find_untracked: false,
+        }
+    }
+
+    /// Answer the question and change nothing. For callers that do not hold the
+    /// walk claim, and for every test that asserts on a walk's output rather
+    /// than on its effect.
+    pub const fn read_only() -> Self {
+        Self {
+            persist_stats: false,
+            find_untracked: true,
+        }
+    }
+}
+
+/// The walk, with the pace its caller reports at.
+///
+/// `skip` is held out of the walk entirely. The exclusions are spelled
+/// `:(exclude,literal)<path>`: `literal` because a synced folder is full of
+/// names that are also glob syntax — `[2026]`, `*`, `?` all occur in real user
+/// content — and a pattern that quietly matched more than the one path it names
+/// would hide unrelated files from every pass.
+///
+/// `interval` is the publisher's policy, not git's: see the engine's
+/// `WALK_REPORT_INTERVAL`. `Duration::MAX` with no reporter is the silent case.
+///
+/// `policy` decides the two things that dominate the cost on a large folder:
+/// whether the directories are walked at all, and whether what was learned is
+/// written down. See [`WalkPolicy`].
+fn status_paths_excluding(
+    repo: &gix::Repository,
+    skip: &[PathBuf],
+    report: Option<WalkReport<'_>>,
+    interval: Duration,
+    policy: WalkPolicy,
+) -> Result<RepoStatus> {
+    // `flatten`, not `{err}`: a status that trips over one unreadable tracked
+    // file reports "IO error while writing blob or reading file metadata or
+    // changing filetype" in its top frame, and the errno that says *why* —
+    // permission denied, EOF from a file rewritten mid-read — is two `source()`
+    // hops down. gix never names the path, so the cause is all there is.
+    // The walk is told when to give up before it is told what to look for: a
+    // pass that cannot be abandoned is a pass that can hang a folder forever,
+    // which is what this function did in the field (DW: a vault went four days
+    // without a fetch, `running` in the journal, no error, no progress).
+    let interrupt = std::sync::Arc::new(AtomicBool::new(false));
+    let heartbeat = std::sync::Arc::new(AtomicU64::new(0));
+    // gix counts its own way through the index into this; the watchdog reads it
+    // so a pass with nothing left to report still counts as alive. See
+    // `ScannedEntries` for the 61 healthy walks that were killed without it.
+    let scanned: gix::progress::StepShared = std::sync::Arc::new(AtomicUsize::new(0));
+    let watchdog = StatusWatchdog::arm(
+        std::sync::Arc::clone(&interrupt),
+        std::sync::Arc::clone(&heartbeat),
+        std::sync::Arc::clone(&scanned),
+    );
+
+    let platform = repo
+        .status(ScannedEntries {
+            counter: std::sync::Arc::clone(&scanned),
+        })
+        .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?
+        .should_interrupt_owned(std::sync::Arc::clone(&interrupt))
+        .index_worktree_options_mut(|options| {
+            if policy.find_untracked {
+                if let Some(dirwalk) = options.dirwalk_options.as_mut() {
+                    dirwalk.set_emit_untracked(gix::dir::walk::EmissionMode::Matching);
+                }
+            } else {
+                // `None` is how gix is told not to walk the directories at all.
+                // Clearing it rather than filtering the emissions is the whole
+                // point: the cost is the `lstat` of every entry in the tree,
+                // not the reporting of the few that are untracked.
+                options.dirwalk_options = None;
+            }
+            // See `STATUS_THREAD_LIMIT`: unbounded parallelism here is what
+            // produced 55 simultaneous LFS conversions against a smaller pool
+            // of filter processes and deadlocked every one of them.
+            options.thread_limit = Some(STATUS_THREAD_LIMIT);
+        });
+    let patterns: Vec<gix::bstr::BString> = skip
+        .iter()
+        .map(|path| {
+            let mut pattern = gix::bstr::BString::from(":(exclude,literal)");
+            pattern.extend_from_slice(&gix::path::into_bstr(path.as_path()));
+            pattern
+        })
+        .collect();
+    let mut iter = platform
+        .into_iter(patterns)
+        .map_err(|err| SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err))))?;
+
+    // The denominator, read once: the index is already mapped by the walk
+    // itself, and re-asking per item would put a load behind a counter whose
+    // whole purpose is to cost nothing.
+    let entries = repo
+        .index_or_empty()
+        .map(|index| index.entries().len() as u64)
+        .unwrap_or(0);
+
+    // Progress comes off a clock, not off the items.
+    //
+    // It used to be published from inside this loop, which meant it could only
+    // move when the walk *emitted* something. A pass whose dirty entries run
+    // out part-way then compares tens of thousands of clean files in complete
+    // silence — the same stretch that used to get healthy walks killed — and
+    // the pane froze on whatever number the last emission left behind. This is
+    // also why the number the owner saw was items emitted rather than entries
+    // compared: inside the loop, the emission count was the only one that was
+    // guaranteed to have moved.
+    //
+    // Scoped, so the ticker can borrow the caller's reporter rather than
+    // forcing every call site through an `Arc`. It wakes on a short slice so
+    // the scope's join never adds a report interval to the end of a fast walk:
+    // `neuradrive` finishes in 150 ms and runs every few seconds.
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    // Whether the ticker ever spoke, which is one half of
+    // [`owes_closing_report`] - the rule that decides whether this walk still
+    // owes a final figure when it returns.
+    let spoke = std::sync::Arc::new(AtomicBool::new(false));
+    let mut out = RepoStatus::default();
+    let walked = std::thread::scope(|scope| -> Result<RepoStatus> {
+        if let Some(report) = report {
+            let ticking = std::sync::Arc::clone(&scanned);
+            let ticking_done = std::sync::Arc::clone(&done);
+            let ticking_spoke = std::sync::Arc::clone(&spoke);
+            scope.spawn(move || {
+                // The wake is short so the scope's join never adds a report
+                // interval to the end of a fast walk, and it never exceeds the
+                // interval itself so a test can ask for a millisecond cadence
+                // and get one.
+                let slice = interval.clamp(Duration::from_millis(1), Duration::from_millis(20));
+                let mut waited = Duration::ZERO;
+                loop {
+                    std::thread::sleep(slice);
+                    if ticking_done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    waited += slice;
+                    if waited >= interval {
+                        waited = Duration::ZERO;
+                        ticking_spoke.store(true, Ordering::Relaxed);
+                        report(ticking.load(Ordering::Relaxed) as u64, entries);
+                    }
+                }
+            });
+        }
+        // `done` is set on every exit from the walk, including the error one:
+        // a ticker left running would hold the scope open forever.
+        let walked = (|| -> Result<()> {
+            for item in iter.by_ref() {
+                // Before the item is inspected: a walk that is producing
+                // anything at all is alive, whatever the item turns out to be.
+                // The heartbeat is the count, so there is no second counter to
+                // keep in step with it.
+                let seen = watchdog.beat();
+                let item = item.map_err(|err| {
+                    // An interrupt usually ends the iterator rather than
+                    // surfacing here, which is why the real guard is after the
+                    // loop — but if it ever does surface, the reason the walk
+                    // stopped is the useful sentence, not gix's inner error.
+                    if interrupt.load(Ordering::Relaxed) {
+                        return watchdog.silence_error(seen);
+                    }
+                    SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err)))
+                })?;
+                push_item(&mut out, item);
+            }
+            Ok(())
+        })();
+        done.store(true, Ordering::Relaxed);
+        // The closing figure, from this thread now the ticker has been told to
+        // stop, so there is exactly one last report and no race for it.
+        if let Some(report) = report {
+            if owes_closing_report(spoke.load(Ordering::Relaxed), interval) {
+                report(scanned.load(Ordering::Relaxed) as u64, entries);
+            }
+        }
+        walked.map(|()| std::mem::take(&mut out))
+    })?;
+    let mut out = walked;
+
+    // The step gitoxide leaves to the caller, and the one keeper used to skip.
+    //
+    // Before `finish_walk`, because an interrupted walk still learned something
+    // true about every entry it did reach — and after the scope, because the
+    // iterator has to be finished for its outcome to exist at all.
+    if policy.persist_stats {
+        persist_observed_stats(repo, iter);
     }
 
     for bucket in [
@@ -817,7 +1779,153 @@ pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
         bucket.sort();
         bucket.dedup();
     }
+    // **After the loop, not inside it.** An interrupt does not make gix yield an
+    // error — it makes the iterator END, which is indistinguishable from a walk
+    // that finished. Returning here would hand the caller a status computed
+    // from the entries reached before the stall and let `commit_local` act on
+    // it as though it described the whole worktree. Observed on the very first
+    // run of this guard: 19 entries of a 567-file tree, reported as
+    // `added=0 modified=1 deleted=2`.
+    let out = finish_walk(&interrupt, &watchdog, out)?;
+
+    // The shape of the pass, once, at INFO. A folder that later stalls is
+    // diagnosed by comparing this line between runs — how many entries, how
+    // long — and its absence is what made the field failure unreadable.
+    //
+    // Named, because two profiles produce interleaved lines and one of them may
+    // hold 641 files while the other holds 155 662: `elapsed_ms=108` next to
+    // `elapsed_ms=3044748` is unreadable without knowing which folder each
+    // belongs to, and that cost real time during the field diagnosis. The
+    // worktree's own directory name is the profile's name in every case that
+    // matters and needs nothing threaded through to obtain.
+    tracing::info!(
+        folder = repo
+            .workdir()
+            .and_then(|dir| dir.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        entries = watchdog.beats(),
+        scanned = watchdog.scans(),
+        elapsed_ms = watchdog.elapsed_ms(),
+        added = out.added.len(),
+        modified = out.modified.len(),
+        deleted = out.deleted.len(),
+        "status walk finished"
+    );
     Ok(out)
+}
+
+/// Save the stat data a finished walk observed, so the next one can answer from
+/// `lstat` instead of reading the file again.
+///
+/// gitoxide collects these while it walks — `EntryStatus::NeedsUpdate(stat)`,
+/// gathered into `gix::status::Outcome` — and then leaves the write to the
+/// caller, saying so in its own documentation: without it, "subsequent `status`
+/// operations will take longer to complete".
+///
+/// Best-effort, and quiet about the ordinary cases. `into_outcome` returns
+/// `None` for a walk that ended early, which is not a failure: the pass was
+/// interrupted and there is nothing to save. A failed write is worth a line,
+/// because the folder will keep paying for it, but it is not worth failing a
+/// pass that has already produced a correct answer.
+fn persist_observed_stats(repo: &gix::Repository, iter: gix::status::Iter) {
+    let Some(mut outcome) = iter.into_outcome() else {
+        return;
+    };
+    if !outcome.has_changes() {
+        return;
+    }
+    let observed = outcome
+        .index_worktree
+        .tracked_file_modification
+        .entries_to_update;
+    match outcome.write_changes() {
+        Some(Ok(())) => tracing::info!(
+            folder = repo
+                .workdir()
+                .and_then(|dir| dir.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            entries = observed,
+            "wrote the stat data this walk observed into the index"
+        ),
+        Some(Err(err)) => tracing::warn!(
+            error = %err,
+            entries = observed,
+            "could not write the walk's stat data back; the next pass will re-read those files"
+        ),
+        None => {}
+    }
+}
+
+/// Tracked paths that cannot be read right now, and what the filesystem said.
+///
+/// Only ever reached after a status has already failed, which is what makes the
+/// cost defensible: it is one `lstat` and one `open` per tracked entry, no
+/// content is read, and nothing calls it on a healthy repository.
+///
+/// # What it can and cannot catch
+///
+/// An `open` proves the file can be *started*, not finished. A disk failing
+/// mid-file, or a file truncated between the stat and the read, still fails the
+/// status and is invisible here — deliberately, because the alternative is
+/// reading every tracked byte to find out. [`status_paths`] returns the
+/// original error when this finds nothing, so an undiagnosable failure stays
+/// exactly as loud as it was.
+///
+/// A missing path is not unreadable: a deleted file is an ordinary change and
+/// status reports it as one. Only an error that is *not* `NotFound` counts.
+fn unreadable_tracked_paths(repo: &gix::Repository) -> Vec<UnreadablePath> {
+    let Ok(workdir) = workdir(repo) else {
+        return Vec::new();
+    };
+    let Ok(index) = repo.index_or_empty() else {
+        return Vec::new();
+    };
+    let state = &*index;
+
+    let mut out: Vec<UnreadablePath> = Vec::new();
+    for entry in state.entries() {
+        let rela = to_path(entry.path(state));
+        if let Some(reason) = why_unreadable(&workdir.join(&rela)) {
+            out.push(UnreadablePath { path: rela, reason });
+            // One past the ceiling is enough to prove the ceiling was breached,
+            // and stops a failing volume from being walked to its end.
+            if out.len() > MAX_UNREADABLE_SKIPPED {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Why `absolute` cannot be read, or `None` if it can.
+fn why_unreadable(absolute: &Path) -> Option<String> {
+    let metadata = match std::fs::symlink_metadata(absolute) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => return Some(err.to_string()),
+    };
+
+    if metadata.is_symlink() {
+        // The blob of a symlink is its target, so reading the link is the whole
+        // of what staging it needs.
+        return match std::fs::read_link(absolute) {
+            Ok(_) => None,
+            Err(err) => Some(err.to_string()),
+        };
+    }
+    if !metadata.is_file() {
+        // A directory or device where a file is tracked is a different
+        // condition with its own error, and not one an exclusion would fix.
+        return None;
+    }
+    match std::fs::File::open(absolute) {
+        Ok(_) => None,
+        // Gone between the two syscalls: an ordinary deletion, not a fault.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => Some(err.to_string()),
+    }
 }
 
 /// The commit `HEAD` resolves to, or `None` on an unborn branch.
@@ -825,12 +1933,18 @@ pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
 /// A freshly initialized repository with no commits is an ordinary state, not
 /// an error — every profile starts there.
 pub fn head_commit_id(repo: &gix::Repository) -> Result<Option<gix::hash::ObjectId>> {
-    let mut head = repo
-        .head()
-        .map_err(|err| SyncError::Git(format!("could not read HEAD: {err}")))?;
-    let id = head
-        .try_peel_to_id()
-        .map_err(|err| SyncError::Git(format!("could not peel HEAD: {err}")))?;
+    let mut head = repo.head().map_err(|err| {
+        SyncError::Git(format!(
+            "could not read HEAD: {}",
+            super::fetch::flatten(&err)
+        ))
+    })?;
+    let id = head.try_peel_to_id().map_err(|err| {
+        SyncError::Git(format!(
+            "could not peel HEAD: {}",
+            super::fetch::flatten(&err)
+        ))
+    })?;
     Ok(id.map(gix::Id::detach))
 }
 
@@ -1125,6 +2239,14 @@ pub fn ensure_remote(repo: &gix::Repository, remote_url: &str) -> Result<bool> {
 /// Used to find checked-out LFS pointers that still need materializing: only a
 /// tracked path can hold one, so this bounds that scan to the index rather than
 /// walking the whole worktree.
+///
+/// **Byte-exact.** This used to build each path with `BStr::to_string`, which
+/// is a lossy UTF-8 decode: a tracked file whose name is not valid UTF-8 came
+/// back as a path with `U+FFFD` in it, which names a different file or no file
+/// at all — so the materialization scan silently skipped it, or, in a folder
+/// that also held a file genuinely named with `U+FFFD`, stat'd and rewrote the
+/// wrong one. [`gix::path::from_bstr`] is the conversion [`to_path`] already
+/// uses for status output and it keeps the bytes (Story 47.2).
 pub fn tracked_paths(repo: &gix::Repository) -> Result<Vec<PathBuf>> {
     let index = repo
         .index_or_empty()
@@ -1132,8 +2254,136 @@ pub fn tracked_paths(repo: &gix::Repository) -> Result<Vec<PathBuf>> {
     Ok(index
         .entries()
         .iter()
-        .map(|entry| PathBuf::from(entry.path(&index).to_string()))
+        .map(|entry| to_path(entry.path(&index)))
         .collect())
+}
+
+/// Tracked paths whose worktree file could still be a checked-out pointer.
+///
+/// [`tracked_paths`] bounds the materialization sweep to the index, and that was
+/// enough while the answer was cheap to use. It is not: the caller stats — and
+/// for anything small enough, reads — every path it is handed, so on a folder of
+/// 154,765 entries on a USB volume the sweep costs about ten minutes of
+/// filesystem I/O to find the handful of pointers actually waiting. That runs
+/// inside the profile's one-operation-at-a-time reservation, so for those ten
+/// minutes nothing else about the folder can happen at all.
+///
+/// The index already knows the answer. Its entries carry the `stat` git recorded
+/// at checkout, and a checked-out pointer is a file of at most
+/// [`crate::lfs::pointer::MAX_POINTER_BYTES`]; anything larger on disk is
+/// content, not a stub. So the size the index remembers is a filter that costs
+/// no I/O whatsoever, and one that cannot lose a pointer: a pointer only ever
+/// reaches the worktree through a checkout, and a checkout is exactly the moment
+/// git records its size here.
+///
+/// A materialized file whose stat has been refreshed to its real length is
+/// therefore excluded, which is the entire point — it is also, by definition,
+/// the file that no longer needs materializing.
+pub fn pointer_sized_tracked_paths(repo: &gix::Repository, max_bytes: u32) -> Result<Vec<PathBuf>> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    Ok(index
+        .entries()
+        .iter()
+        .filter(|entry| entry.stat.size <= max_bytes)
+        .map(|entry| to_path(entry.path(&index)))
+        .collect())
+}
+
+/// Tracked paths git is carrying that keeper cannot spell (Story 47.2).
+///
+/// The index is the only complete inventory of a repository that costs no
+/// filesystem walk — it is already resident — and it is the one place a file
+/// that was committed long ago and has not changed since can still be seen. A
+/// status walk cannot answer this: a tracked, unmodified file is exactly the
+/// case that reports nothing, and it was the case the owner hit.
+///
+/// Allocates only for the offenders. [`crate::names::UnspellableName::of_bytes`]
+/// answers `None` after a UTF-8 validation and nothing else, so a repository
+/// with a hundred thousand ordinary paths pays one scan of the index's own
+/// bytes and builds no strings at all.
+pub fn unspellable_tracked_paths(
+    repo: &gix::Repository,
+) -> Result<Vec<crate::names::UnspellableName>> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    let mut out: Vec<crate::names::UnspellableName> = index
+        .entries()
+        .iter()
+        .filter_map(|entry| crate::names::UnspellableName::of_bytes(entry.path(&index)))
+        .collect();
+    // The index is sorted by raw path bytes, which is not the order the
+    // escaped renderings sort in; a report that reshuffles between polls reads
+    // as churn. Dedup because one path can hold several unmerged stages.
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Restore the pointer-blob / worktree-stat invariant across the whole index.
+///
+/// # The failure this repairs
+///
+/// [`refresh_index_stat`] is called in exactly one place: immediately after a
+/// materialization, on the paths that materialization touched. That is correct
+/// and it is not enough. A run that dies between writing the real files and
+/// refreshing their stat — the `Too many open files` exhaustion that a
+/// Finder-launched app hit for days is one way — leaves the index describing
+/// pointers and the worktree holding gigabytes. Nothing ever calls it again for
+/// those paths, so the invariant stays broken for the life of the folder.
+///
+/// What that costs is not cosmetic. Every entry whose stat disagrees is a file
+/// `status` must convert through the LFS filter to compare, so a routine status
+/// pass turns into streaming the entire worktree through a filter pipeline —
+/// which is how one vault reached 93 GB of conversions and stopped syncing
+/// entirely.
+///
+/// # Why it re-stats rather than re-checks out
+///
+/// The bytes on disk are right; only the index's memory of them is stale. A
+/// checkout would re-materialize files that are already correct, cost the
+/// transfer again, and touch mtimes the user may be relying on. Re-stat is the
+/// smaller and truer repair: it changes what git *remembers*, not what the user
+/// *has*.
+///
+/// Answers how many entries it corrected, so a caller can say whether there was
+/// anything to repair — "nothing was wrong" and "I fixed 500 files" are
+/// different sentences and a button that cannot tell them apart teaches nothing.
+pub fn repair_index_stat(repo: &gix::Repository) -> Result<usize> {
+    let paths = tracked_paths(repo)?;
+    let workdir = workdir(repo)?;
+    // Only the entries whose worktree file is NOT a pointer: those are the
+    // materialized ones, and they are the only ones whose stat can have been
+    // left describing something else. An entry that still holds a pointer on
+    // disk is already consistent and re-stating it would be a write for
+    // nothing.
+    let stale: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|rel| {
+            let full = workdir.join(rel);
+            let Ok(meta) = std::fs::symlink_metadata(&full) else {
+                return false;
+            };
+            if !meta.is_file() {
+                return false;
+            }
+            // A pointer is tiny by construction. Anything larger cannot be one,
+            // and reading the head of every small file is cheap next to the
+            // conversion this exists to avoid.
+            if meta.len() >= MAX_POINTER_BYTES as u64 {
+                return true;
+            }
+            let Ok(head) = std::fs::read(&full) else {
+                return false;
+            };
+            Pointer::parse(&head).is_none()
+        })
+        .collect();
+    let corrected = stale.len();
+    refresh_index_stat(repo, &stale)?;
+    Ok(corrected)
 }
 
 /// Re-stat `paths` and write the refreshed index.
@@ -1184,12 +2434,307 @@ pub fn refresh_index_stat(repo: &gix::Repository, paths: &[PathBuf]) -> Result<(
     }
     index
         .write(gix::index::write::Options::default())
-        .map_err(|err| SyncError::Git(format!("could not write the index: {err}")))?;
+        .map_err(|err| {
+            SyncError::Git(format!(
+                "could not write the index: {}",
+                super::fetch::flatten(&err)
+            ))
+        })?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    /// The watchdog fires on STILLNESS, not on duration and not on silence.
+    ///
+    /// This is the whole distinction the field failures turned on, twice. A
+    /// status pass converting a gigabyte of video is slow and healthy; a pass
+    /// scanning a clean tree is *silent* and healthy; only a pass that has
+    /// stopped doing both is stuck. A guard that could not tell them apart
+    /// would either kill honest work or keep waiting on a deadlock — both worse
+    /// than no guard at all, because both look like a decision.
+    const FAST_POLL: Duration = Duration::from_millis(20);
+    const FAST_LIMIT: Duration = Duration::from_millis(200);
+
+    /// A fresh counter of index entries compared, for the tests that drive one
+    /// by hand.
+    fn scan_counter() -> gix::progress::StepShared {
+        Arc::new(AtomicUsize::new(0))
+    }
+
+    #[test]
+    fn a_walk_that_keeps_producing_is_never_interrupted() {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let watchdog = StatusWatchdog::arm_with(
+            Arc::clone(&interrupt),
+            Arc::clone(&heartbeat),
+            scan_counter(),
+            FAST_POLL,
+            FAST_LIMIT,
+        );
+
+        // Several times the silence limit, spent beating slowly enough that a
+        // duration-based guard would have fired long ago.
+        let until = Instant::now() + FAST_LIMIT * 4;
+        while Instant::now() < until {
+            watchdog.beat();
+            std::thread::sleep(FAST_POLL / 2);
+        }
+
+        assert!(
+            !interrupt.load(Ordering::Relaxed),
+            "a walk that is producing items is alive, however long it takes"
+        );
+        assert!(watchdog.beats() > 0, "the beats are the item count");
+    }
+
+    /// A walk with nothing left to report is still a walk.
+    ///
+    /// The regression this pins is the one that killed 61 consecutive healthy
+    /// passes on a 155 662-entry folder: emission stopped when the dirty
+    /// entries ran out, roughly 1 400 s before the pass would have finished,
+    /// and the guard read that as a deadlocked filter. Nothing beats here at
+    /// all — only gix's own count of entries compared moves.
+    #[test]
+    fn a_walk_that_only_scans_is_never_interrupted() {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let scanned = scan_counter();
+        let watchdog = StatusWatchdog::arm_with(
+            Arc::clone(&interrupt),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&scanned),
+            FAST_POLL,
+            FAST_LIMIT,
+        );
+
+        let until = Instant::now() + FAST_LIMIT * 4;
+        while Instant::now() < until {
+            scanned.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(FAST_POLL / 2);
+        }
+
+        assert!(
+            !interrupt.load(Ordering::Relaxed),
+            "a pass comparing index entries is working, even when every one of \
+             them is clean and it therefore emits nothing"
+        );
+        assert!(
+            watchdog.scans() > 0,
+            "the scan count is what proved it alive"
+        );
+        assert_eq!(watchdog.beats(), 0, "and it did so with no item emitted");
+    }
+
+    /// The atomic gix counts into MUST be the one the watchdog reads.
+    ///
+    /// This is the half a unit test of the loop cannot reach, and the half that
+    /// silently does nothing when it is wrong. `gix::progress::Discard` — what
+    /// this walk passed before — implements `counter()` as
+    /// `Arc::new(AtomicUsize::default())`, a FRESH handle per call: gix counts
+    /// diligently, into an atomic nobody else holds. Wired that way the guard
+    /// still compiles, still fires, and its new liveness signal is simply
+    /// always zero. So the number is asserted end to end, against real gix,
+    /// over a real repository.
+    #[test]
+    fn gix_counts_index_entries_into_the_atomic_the_watchdog_reads() {
+        let (_dir, repo) = repo_with_two_files();
+        let scanned = scan_counter();
+
+        let platform = repo
+            .status(ScannedEntries {
+                counter: Arc::clone(&scanned),
+            })
+            .expect("status platform");
+        for item in platform
+            .into_iter(Vec::<gix::bstr::BString>::new())
+            .expect("status iterator")
+        {
+            item.expect("status item");
+        }
+
+        assert_eq!(
+            scanned.load(Ordering::Relaxed),
+            2,
+            "both committed entries were compared and neither was counted where \
+             the watchdog could see it"
+        );
+    }
+
+    /// The behaviour the whole change exists for: a walk that stops moving is
+    /// abandoned rather than waited on. Without this the guard is decoration.
+    #[test]
+    fn a_walk_that_goes_still_is_interrupted() {
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let watchdog = StatusWatchdog::arm_with(
+            Arc::clone(&interrupt),
+            Arc::clone(&heartbeat),
+            scan_counter(),
+            FAST_POLL,
+            FAST_LIMIT,
+        );
+        // One item, then nothing at all — the shape of a deadlocked conversion:
+        // no further emission AND no further entry compared.
+        watchdog.beat();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !interrupt.load(Ordering::Relaxed) {
+            std::thread::sleep(FAST_POLL);
+        }
+
+        assert!(
+            interrupt.load(Ordering::Relaxed),
+            "stillness past the limit has to set the flag gix polls, or the walk \
+             hangs exactly as it did in the field"
+        );
+    }
+
+    /// The counter is the item count, and the caller needs no second one.
+    #[test]
+    fn a_beat_answers_how_many_have_been_seen() {
+        let watchdog = StatusWatchdog::arm(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            scan_counter(),
+        );
+        assert_eq!(watchdog.beat(), 1);
+        assert_eq!(watchdog.beat(), 2);
+        assert_eq!(watchdog.beats(), 2);
+    }
+
+    /// The filter that keeps the materialization sweep off the filesystem.
+    ///
+    /// A pointer is at most `MAX_POINTER_BYTES` on disk, and git records what it
+    /// checked out, so the index alone separates "might still be a stub" from
+    /// "is content". Handing the caller every tracked path instead cost about
+    /// ten minutes of stats and reads per sweep on a 154,765-entry folder on a
+    /// USB volume — inside the profile's reservation, with ready work queued
+    /// behind it.
+    #[test]
+    fn only_pointer_sized_entries_are_offered_as_smudge_candidates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .status()
+                    .expect("git")
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        // A stub the size a pointer is, and content the size content is.
+        std::fs::write(root.join("stub.mp4"), vec![b'x'; 130]).expect("write");
+        std::fs::write(root.join("content.mp4"), vec![b'y'; 8_192]).expect("write");
+        git(&["add", "-A"]);
+
+        let repo = open(root, false).expect("open");
+        let candidates = pointer_sized_tracked_paths(&repo, 1_024).expect("candidates");
+
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from("stub.mp4")],
+            "only the entry small enough to be a pointer is worth a stat"
+        );
+        assert_eq!(
+            tracked_paths(&repo).expect("tracked").len(),
+            2,
+            "and the unfiltered inventory still holds both, so this is a filter and not a loss"
+        );
+    }
+
+    /// A walk that was abandoned must not be mistaken for one that finished.
+    ///
+    /// The regression this pins cost nothing only because it was caught on the
+    /// guard's first real run: gix ends the iterator on interrupt instead of
+    /// erroring, so the partial result reached the caller looking complete.
+    #[test]
+    fn an_abandoned_walk_is_refused_rather_than_returned_short() {
+        let watchdog = StatusWatchdog::arm_with(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(19)),
+            scan_counter(),
+            FAST_POLL,
+            Duration::from_secs(3600),
+        );
+        let partial = RepoStatus {
+            deleted: vec![PathBuf::from("a"), PathBuf::from("b")],
+            ..RepoStatus::default()
+        };
+
+        let interrupted = AtomicBool::new(true);
+        let refused = finish_walk(&interrupted, &watchdog, partial.clone());
+        assert!(
+            refused.is_err(),
+            "a truncated status offered as a whole one is how a stall becomes a \
+             commit of deletions nobody made"
+        );
+
+        let ran = AtomicBool::new(false);
+        let kept = finish_walk(&ran, &watchdog, partial).expect("a completed walk is returned");
+        assert_eq!(kept.deleted.len(), 2, "an honest walk keeps its findings");
+    }
+
+    /// Dropping the guard tells the watcher to stop, so a finished walk leaves
+    /// no thread behind polling atomics for ten minutes.
+    #[test]
+    fn a_finished_walk_releases_its_watcher() {
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        {
+            let _watchdog = StatusWatchdog::arm(
+                Arc::new(AtomicBool::new(false)),
+                Arc::clone(&heartbeat),
+                scan_counter(),
+            );
+        }
+        assert_eq!(
+            heartbeat.load(Ordering::Relaxed),
+            u64::MAX,
+            "the sentinel is how the watcher learns the walk is over"
+        );
+    }
+
+    /// The sentence a stalled scan produces has to name what was reached.
+    ///
+    /// "status failed" cannot tell "stuck on the first file" from "stuck on the
+    /// last one", and that difference is the whole of the next investigation.
+    #[test]
+    fn the_refusal_names_what_it_got_through() {
+        let scanned = scan_counter();
+        scanned.store(41_000, Ordering::Relaxed);
+        let watchdog = StatusWatchdog::arm(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&scanned),
+        );
+        let message = watchdog.silence_error(4_217).to_string();
+
+        assert!(
+            message.contains("4217"),
+            "the count is the diagnosis: {message}"
+        );
+        assert!(
+            message.contains("41000"),
+            "and so is how far into the index it got, which on a mostly-clean \
+             tree is the only number that separates 'stuck at the start' from \
+             'nearly done': {message}"
+        );
+        assert!(
+            message.contains("stopped responding"),
+            "it has to say the scan stopped, not that it failed: {message}"
+        );
+        assert!(
+            message.contains("try again"),
+            "and that the folder is not lost: {message}"
+        );
+    }
+
     #[test]
     fn a_stale_index_lock_is_released_but_a_fresh_one_is_left_alone() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1647,6 +3192,168 @@ mod tests {
         (dir, repo)
     }
 
+    /// Zero the stat data of one index entry, the way a plumbing write leaves
+    /// it (`git update-index --cacheinfo`, and whatever produced 60 280 such
+    /// entries in the field folder).
+    fn strip_stat(repo: &gix::Repository, rela: &str) {
+        let mut index = gix::index::File::at(
+            repo.index_path(),
+            repo.object_hash(),
+            false,
+            Default::default(),
+        )
+        .expect("read the index from disk");
+        let position = index
+            .entry_index_by_path(rela.into())
+            .expect("the fixture path is in the index");
+        index.entries_mut()[position].stat = gix::index::entry::Stat::default();
+        index
+            .write(gix::index::write::Options::default())
+            .expect("write the stat-less index");
+    }
+
+    /// The stat data of one index entry, read fresh from disk.
+    fn stat_of(root: &std::path::Path, rela: &str) -> gix::index::entry::Stat {
+        let repo = open(root, true).expect("reopen");
+        let index = repo.index().expect("index");
+        let position = index
+            .entry_index_by_path(rela.into())
+            .expect("the fixture path is in the index");
+        index.entries()[position].stat
+    }
+
+    /// A walk that is allowed to save what it learned, saves it.
+    ///
+    /// This is the whole of DW's "Scanning 151578/155662 forever". An entry
+    /// with no stat cannot be answered by `lstat`, so every pass reads the file
+    /// and — for an LFS path — runs it back through the clean filter. gitoxide
+    /// hands the observed stat over and leaves the write to the caller; keeper
+    /// dropped it, so the next pass re-learned the same thing. Measured on the
+    /// field folder: 60 280 of 155 662 entries, 25.4 GB re-read per walk.
+    #[test]
+    fn a_persisting_walk_writes_the_stat_it_observed() {
+        let (dir, _repo) = repo_with_two_files();
+        strip_stat(&open(dir.path(), true).expect("reopen"), "a.txt");
+        assert_eq!(
+            stat_of(dir.path(), "a.txt").mtime.secs,
+            0,
+            "the fixture must start stat-less, or this test proves nothing"
+        );
+
+        let repo = open(dir.path(), true).expect("reopen");
+        let status =
+            status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full()).expect("status");
+        assert!(
+            status.modified.is_empty(),
+            "the file matches its blob; a stat-less entry is not a modified one: {status:?}"
+        );
+
+        assert_ne!(
+            stat_of(dir.path(), "a.txt").mtime.secs,
+            0,
+            "the walk read the file and must have written down what it found"
+        );
+    }
+
+    /// And the commit that follows the walk does not revert it.
+    ///
+    /// The trap this pins: `stage_and_commit` used to clone the handle's
+    /// *cached* index snapshot, and a pass loads that cache early — the walk
+    /// reads the index for its own denominator. So the stats the walk had just
+    /// written were reverted by the very same pass, on every folder that
+    /// actually committed something, and the saving would have shown up only on
+    /// idle passes.
+    #[test]
+    fn a_commit_after_a_persisting_walk_keeps_the_stats_the_walk_wrote() {
+        let (dir, _repo) = repo_with_two_files();
+        strip_stat(&open(dir.path(), true).expect("reopen"), "a.txt");
+
+        // One handle for the whole pass, exactly as `commit_local` uses it.
+        let repo = open(dir.path(), true).expect("reopen");
+        status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full()).expect("status");
+        let after_walk = stat_of(dir.path(), "a.txt").mtime.secs;
+        assert_ne!(after_walk, 0, "the walk must have written the stat first");
+
+        std::fs::write(dir.path().join("c.txt"), "gamma").expect("write");
+        stage_and_commit(
+            &repo,
+            &StagedChange {
+                added: vec![PathBuf::from("c.txt")],
+                ..StagedChange::default()
+            },
+            &provenance(),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
+
+        assert_eq!(
+            stat_of(dir.path(), "a.txt").mtime.secs,
+            after_walk,
+            "staging wrote a stale index and threw the walk's work away"
+        );
+    }
+
+    /// And a walk that was not asked to save anything changes nothing.
+    ///
+    /// The read-only policy is what every caller without the folder's walk
+    /// claim gets, because the write is the walk's own index with stat fields
+    /// replaced: a leg that staged something after the walk started would have
+    /// that work overwritten.
+    #[test]
+    fn a_read_only_walk_leaves_the_index_exactly_as_it_found_it() {
+        let (dir, _repo) = repo_with_two_files();
+        strip_stat(&open(dir.path(), true).expect("reopen"), "a.txt");
+        let before = std::fs::read(dir.path().join(".git/index")).expect("read index");
+
+        let repo = open(dir.path(), true).expect("reopen");
+        status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::read_only()).expect("status");
+
+        assert_eq!(
+            std::fs::read(dir.path().join(".git/index")).expect("read index"),
+            before,
+            "a read-only walk must not rewrite the index at all"
+        );
+    }
+
+    /// The poll's cheap walk: index entries yes, directory scan no.
+    ///
+    /// The directory scan is the half that costs the whole tree whatever
+    /// changed — 996 s of `lstat` on the field folder, per pass. What it buys
+    /// is untracked paths, which a five-second poll does not need: the watcher
+    /// and the stability gate name a new file long before a walk finds it.
+    #[test]
+    fn a_tracked_only_walk_skips_the_untracked_search_and_still_reports_changes() {
+        let (dir, _repo) = repo_with_two_files();
+        std::fs::write(dir.path().join("a.txt"), "alpha-changed").expect("modify");
+        std::fs::write(dir.path().join("new.txt"), "untracked").expect("write");
+
+        let repo = open(dir.path(), true).expect("reopen");
+        let full =
+            status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full()).expect("status");
+        assert_eq!(
+            full.untracked,
+            [PathBuf::from("new.txt")],
+            "the full policy is what finds an untracked file: {full:?}"
+        );
+
+        let repo = open(dir.path(), true).expect("reopen");
+        let tracked = status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::tracked_only())
+            .expect("status");
+        assert!(
+            tracked.untracked.is_empty(),
+            "the poll's walk must not have walked the directories: {tracked:?}"
+        );
+        assert_eq!(
+            tracked.modified,
+            [PathBuf::from("a.txt")],
+            "and it must still answer the question the index can answer: {tracked:?}"
+        );
+    }
+
     #[test]
     fn enforce_local_config_writes_the_key_that_keeps_status_working() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1663,6 +3370,55 @@ mod tests {
         );
     }
 
+    /// The key that decides whether keeper's filter is ever reached (DW-140).
+    ///
+    /// git prefers `filter.<drv>.process` over a `clean`/`smudge` pair
+    /// *whatever scope each was defined in*, so a global one — which
+    /// `git lfs install` writes into `~/.gitconfig` on every machine that has
+    /// ever had the real client — outranks the repository-local pair keeper
+    /// used to register alone. Writing a local `process` key is the only way to
+    /// win that comparison, and it is the whole reason this registration
+    /// exists.
+    #[test]
+    fn the_filter_registration_claims_the_key_that_actually_takes_effect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+
+        enforce_local_config_with_filter(
+            &repo,
+            Some(Path::new("/Applications/keeper.app/keeper")),
+            true,
+        )
+        .expect("enforce");
+
+        // Read back through gix rather than off the raw file: the on-disk form
+        // escapes the quotes around the program path, and asserting on that
+        // spelling would test the encoder instead of the registration.
+        let reopened = open(dir.path(), true).expect("reopen");
+        let snapshot = reopened.config_snapshot();
+        let process = snapshot
+            .string("filter.lfs.process")
+            .expect("the long-running form must be registered, not only clean/smudge")
+            .to_string();
+        assert_eq!(
+            process,
+            "\"/Applications/keeper.app/keeper\" lfs filter-process --repo \"".to_owned()
+                + &dir.path().display().to_string()
+                + "\""
+        );
+        // No `%f`: the protocol names each path in-band, and a stray
+        // placeholder would arrive as an argument the filter never asked for.
+        assert!(!process.contains("%f"), "{process}");
+        // The single-shot pair stays: it costs one line and is what a git old
+        // enough to lack process filters would use.
+        assert!(snapshot
+            .string("filter.lfs.clean")
+            .is_some_and(|value| value.to_string().contains("lfs clean")));
+        assert!(snapshot
+            .string("filter.lfs.smudge")
+            .is_some_and(|value| value.to_string().contains("lfs smudge")));
+    }
+
     #[test]
     fn enforce_local_config_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1675,6 +3431,167 @@ mod tests {
             text.matches("sparse").count(),
             1,
             "a repeated call must overwrite, not append: {text}"
+        );
+    }
+
+    /// The `[filter "lfs"]` section `git lfs install --local` leaves in
+    /// `.git/config`, with the long-running driver keeper cannot answer.
+    fn with_local_lfs_process(root: &std::path::Path) {
+        let config = root.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).expect("read config");
+        text.push_str("[filter \"lfs\"]\n\tprocess = git-lfs filter-process\n\trequired = true\n");
+        std::fs::write(&config, text).expect("write config");
+    }
+
+    /// Somebody else's long-running driver is replaced by keeper's own, not
+    /// merely deleted (DW-206 refined by DW-140).
+    ///
+    /// The original of this test asserted no `process` key survived at all,
+    /// which was right while keeper had none to offer: gitoxide takes `process`
+    /// in preference to the pair below it and fails hard when it cannot be
+    /// launched, whatever `required` says, so a driver keeper could not answer
+    /// made the two keys it had just written unreachable. Now keeper *can*
+    /// answer one, and leaving the slot empty is what loses: git prefers a
+    /// `process` driver from any scope, so an empty local slot hands every
+    /// filtered operation of the git binary back to whatever `~/.gitconfig`
+    /// names. Both halves are asserted below — theirs is gone, ours is there.
+    #[test]
+    fn registering_the_filter_replaces_a_foreign_process_driver_with_keepers_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        with_local_lfs_process(dir.path());
+
+        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), true)
+            .expect("enforce");
+
+        let reopened = open(dir.path(), true).expect("reopen");
+        let config = reopened.config_snapshot();
+        let process = config
+            .string("filter.lfs.process")
+            .expect("keeper's own driver must occupy the slot")
+            .to_string();
+        assert!(
+            process.contains("/opt/keeper") && process.contains("lfs filter-process"),
+            "the surviving driver has to be keeper's: {process}"
+        );
+        assert!(
+            !process.contains("git-lfs"),
+            "no trace of the driver that was here: {process}"
+        );
+        // Exactly one, so the strip really ran rather than the write landing
+        // beside a survivor in another section.
+        let text = std::fs::read_to_string(dir.path().join(".git/config")).expect("read config");
+        assert_eq!(text.matches("process = ").count(), 1, "{text}");
+        assert!(
+            config
+                .string("filter.lfs.clean")
+                .is_some_and(|value| value.to_string().contains("lfs clean")),
+            "the clean filter has to survive"
+        );
+        assert_eq!(config.boolean("filter.lfs.required"), Some(false));
+    }
+
+    #[test]
+    fn a_foreign_lfs_driver_is_dropped_and_the_local_one_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        // Registered without a long-running driver of keeper's own, which is
+        // what this test needs to arrange: the foreign one has to be the only
+        // `process` in the merged config, or it is not the one gix would launch
+        // and the fixture is not the situation being tested. The case where
+        // keeper *has* registered one is
+        // `keepers_own_process_driver_survives_a_foreign_section`.
+        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), false)
+            .expect("enforce");
+        let mut repo = open(dir.path(), true).expect("reopen");
+
+        // A global `[filter "lfs"]`, in the position a real one occupies: ahead
+        // of the repository's own section, because scopes merge in precedence
+        // order and gitoxide answers with the FIRST driver of that name.
+        let foreign = gix::config::File::from_bytes_owned(
+            &mut b"[filter \"lfs\"]\n\tprocess = git-lfs filter-process\n".to_vec(),
+            gix::config::file::Metadata::from(gix::config::Source::User),
+            Default::default(),
+        )
+        .expect("parse the foreign config");
+        {
+            let mut snapshot = repo.config_snapshot_mut();
+            let mut merged = foreign;
+            merged
+                .append(snapshot.clone())
+                .expect("merge the repository's own scopes after it");
+            *snapshot = merged;
+            snapshot.commit().expect("commit the doctored config");
+        }
+        assert_eq!(
+            repo.config_snapshot().string("filter.lfs.process"),
+            Some("git-lfs filter-process".into()),
+            "arranged: the foreign driver is what gix would launch"
+        );
+
+        drop_foreign_lfs_driver(&mut repo).expect("drop");
+
+        let config = repo.config_snapshot();
+        assert_eq!(
+            config.string("filter.lfs.process"),
+            None,
+            "a driver from outside the repository may not decide how it is filtered"
+        );
+        assert!(
+            config
+                .string("filter.lfs.clean")
+                .is_some_and(|value| value.to_string().contains("lfs clean")),
+            "the repository's own registration is what must remain"
+        );
+    }
+
+    /// The two halves composed: keeper's own long-running driver must survive
+    /// the surgery that removes everybody else's (DW-206 + DW-140).
+    ///
+    /// `drop_foreign_lfs_driver` filters on **scope**, not on content, so this
+    /// is really asking whether the key `enforce_local_config_with_filter`
+    /// writes lands in a repository scope. If it ever did not, the drop would
+    /// take keeper's own driver with it and every filtered operation would fall
+    /// back to whatever `~/.gitconfig` names — the exact silence DW-140 is
+    /// about, reintroduced by the fix for DW-206.
+    #[test]
+    fn keepers_own_process_driver_survives_a_foreign_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), true)
+            .expect("enforce");
+        let mut repo = open(dir.path(), true).expect("reopen");
+
+        let foreign = gix::config::File::from_bytes_owned(
+            &mut b"[filter \"lfs\"]\n\tprocess = git-lfs filter-process\n".to_vec(),
+            gix::config::file::Metadata::from(gix::config::Source::User),
+            Default::default(),
+        )
+        .expect("parse the foreign config");
+        {
+            let mut snapshot = repo.config_snapshot_mut();
+            let mut merged = foreign;
+            merged
+                .append(snapshot.clone())
+                .expect("merge the repository's own scopes after it");
+            *snapshot = merged;
+            snapshot.commit().expect("commit the doctored config");
+        }
+
+        drop_foreign_lfs_driver(&mut repo).expect("drop");
+
+        let config = repo.config_snapshot();
+        let surviving = config
+            .string("filter.lfs.process")
+            .map(|value| value.to_string())
+            .expect("keeper's own driver must outlive the drop");
+        assert!(
+            surviving.contains("/opt/keeper") && surviving.contains("lfs filter-process"),
+            "what survived has to be keeper's: {surviving}"
+        );
+        assert!(
+            !surviving.contains("git-lfs"),
+            "and the foreign one has to be gone: {surviving}"
         );
     }
 
@@ -1839,6 +3756,256 @@ mod tests {
         assert!(status.deleted.is_empty());
     }
 
+    /// A walk that finishes inside the pacing interval says nothing.
+    ///
+    /// This half is not an optimisation, it is the constraint: publishing the
+    /// scanning phase on every poll of an idle folder is what made the menu-bar
+    /// glyph flip once a second, and the report exists for the ten-minute walk,
+    /// not the ten-millisecond one.
+    #[test]
+    fn a_walk_that_finishes_immediately_reports_no_progress() {
+        let (dir, repo) = repo_with_two_files();
+        // The walk MUST produce items, or this test would pass for the wrong
+        // reason: a clean tree emits nothing and there is no pacing to prove.
+        std::fs::write(dir.path().join("c.txt"), "untracked").expect("write");
+        std::fs::write(dir.path().join("a.txt"), "alpha-changed").expect("modify");
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+
+        status_paths_reported(
+            &repo,
+            Some(&report),
+            Duration::from_secs(1),
+            WalkPolicy::read_only(),
+        )
+        .expect("status");
+        assert!(
+            seen.lock().expect("lock").is_empty(),
+            "a fast walk must stay silent, got {:?}",
+            seen.lock().expect("lock")
+        );
+    }
+
+    /// And a ZERO interval reports even when the walk beats the ticker to it.
+    ///
+    /// Same fixture as the silence guard above, so the two differ in exactly
+    /// one input: the interval. `Duration::ZERO` is what
+    /// `Engine::report_every_walk_item` asks for, and the ticker cannot serve
+    /// it — it sleeps a clamped millisecond before its first look, by which
+    /// time a two-file walk has finished and set `done`. Every engine-level
+    /// test that subscribes to `Scanning` progress rests on this closing
+    /// report; without it those tests assert that the machine is slow.
+    #[test]
+    fn a_zero_interval_walk_reports_its_closing_figure() {
+        let (dir, repo) = repo_with_two_files();
+        std::fs::write(dir.path().join("c.txt"), "untracked").expect("write");
+        std::fs::write(dir.path().join("a.txt"), "alpha-changed").expect("modify");
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+
+        status_paths_reported(
+            &repo,
+            Some(&report),
+            Duration::ZERO,
+            WalkPolicy::read_only(),
+        )
+        .expect("status");
+        let seen = seen.lock().expect("lock").clone();
+        let last = seen.last().copied().expect("a zero interval reports");
+        assert!(
+            last.0 > 0 && last.1 > 0,
+            "the closing report is the pair the UI renders: {seen:?}"
+        );
+        assert_eq!(
+            last.1, 2,
+            "the denominator is the index entry count: {seen:?}"
+        );
+    }
+
+    /// The rule itself, which is where the mutation is detectable.
+    ///
+    /// The walk above cannot carry this claim on its own: whether a two-entry
+    /// walk beats the ticker's first millisecond is a property of the machine,
+    /// so on a slow enough box it passes with the closing report deleted. This
+    /// is the same rule with the timing removed.
+    #[test]
+    fn the_closing_report_is_owed_when_the_ticker_was_silent_only_at_zero() {
+        assert!(
+            owes_closing_report(true, Duration::from_secs(1)),
+            "a ticker that spoke must not leave a mid-walk figure as the final word"
+        );
+        assert!(
+            !owes_closing_report(false, Duration::from_secs(1)),
+            "a paced walk that stayed under one interval must stay silent"
+        );
+        assert!(
+            owes_closing_report(false, Duration::ZERO),
+            "report-every-item cannot depend on the ticker winning a race"
+        );
+        assert!(owes_closing_report(true, Duration::ZERO));
+    }
+
+    /// And a walk that does take time reports the pair the UI renders.
+    ///
+    /// The fixture is the failure, not a convenience: 3 000 committed files
+    /// that are all **clean**, plus one untracked path. The walk therefore
+    /// emits exactly one item and compares 3 000 index entries.
+    ///
+    /// Against that, the two candidate designs give opposite answers:
+    ///
+    /// * published from inside the item loop, counting emissions — **one**
+    ///   report, reading `1`, for the whole pass. That is what the owner was
+    ///   looking at when a 155 662-entry folder sat on `9113/155662`.
+    /// * published off a clock, counting entries — a report per interval,
+    ///   climbing to 3 000, which is what the walk is actually doing.
+    #[test]
+    fn a_slow_walk_reports_index_entries_compared_not_items_emitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let mut added = Vec::with_capacity(3_000);
+        for i in 0..3_000 {
+            let name = format!("f{i:05}.txt");
+            std::fs::write(dir.path().join(&name), b"x").expect("write");
+            added.push(PathBuf::from(name));
+        }
+        stage_and_commit(
+            &repo,
+            &StagedChange {
+                added,
+                ..StagedChange::default()
+            },
+            &provenance(),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
+        let repo = gix::open(dir.path()).expect("reopen");
+        // The one emission. Everything else the walk touches is clean, so a
+        // reporter tied to emissions has nothing further to say.
+        std::fs::write(dir.path().join("untracked.txt"), "u").expect("write");
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+
+        // ZERO, not a millisecond cadence: whether a 3 000-entry walk outlasts
+        // a tick is a property of the machine, and this test is about WHAT is
+        // counted, not about whether the clock got a turn. At ZERO the closing
+        // report is owed unconditionally, so the assertions below run on every
+        // machine — and an emissions-based numerator still fails them.
+        status_paths_excluding(
+            &repo,
+            &[],
+            Some(&report),
+            Duration::ZERO,
+            WalkPolicy::read_only(),
+        )
+        .expect("status");
+
+        let seen = seen.lock().expect("lock").clone();
+        assert!(
+            !seen.is_empty(),
+            "3 000 entries were compared and the walk said nothing"
+        );
+        // The denominator is the index, which holds the committed files and not
+        // the untracked one.
+        assert!(
+            seen.iter().all(|pair| pair.1 == 3_000),
+            "the denominator is the index entry count: {:?}",
+            &seen[..seen.len().min(8)]
+        );
+        // Drawn against that denominator, so it can never pass it. An emission
+        // count could: the untracked path is emitted and is not an index entry.
+        assert!(
+            seen.iter().all(|pair| pair.0 <= pair.1),
+            "the numerator overran its own denominator: {:?}",
+            &seen[..seen.len().min(8)]
+        );
+        // Counts up. Not *strictly*: a tick that lands between two comparisons
+        // honestly repeats the figure rather than inventing movement.
+        assert!(
+            seen.windows(2).all(|pair| pair[1].0 >= pair[0].0),
+            "the count walked backwards: {:?}",
+            &seen[..seen.len().min(8)]
+        );
+        // The regression, stated as a number: one emission happened, so a
+        // loop-driven reporter could not have got past it.
+        let reached = seen.iter().map(|pair| pair.0).max().unwrap_or(0);
+        assert!(
+            reached > 1,
+            "the count never got past the single emitted item ({reached}), which \
+             is exactly the freeze this reports off a clock to avoid: {:?}",
+            &seen[..seen.len().min(8)]
+        );
+    }
+
+    /// A walk that reported at all reports where it stopped.
+    ///
+    /// The ticker fires on its own cadence, so the walk almost never ends on
+    /// one: whatever figure the last tick happened to catch would otherwise be
+    /// the final word, and the pane would sit a few thousand entries short of
+    /// the end with no way to tell "finished" from "stalled near the end". The
+    /// macOS gate saw exactly that — `[198, 382, 296, 392]` against a
+    /// denominator of 400.
+    ///
+    /// **The claim is conditional on purpose.** How many ticks an 8 000-entry
+    /// walk outlasts is a property of the machine, not of this code: the same
+    /// fixture produced four reports on Linux and fewer than two on the macOS
+    /// gate, where the walk finished inside a single 5 ms slice. Demanding a
+    /// tick count is how the previous revision of this test failed CI while
+    /// the behaviour it guards was correct. What must hold on every machine is
+    /// that the LAST word is the denominator whenever there was a word at all;
+    /// `the_closing_report_is_owed_when_the_ticker_was_silent_only_at_zero`
+    /// carries the rule itself, with the clock taken out.
+    #[test]
+    fn a_walk_that_reported_says_where_it_stopped() {
+        const ENTRIES: usize = 8_000;
+        const CADENCE: Duration = Duration::from_millis(1);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let mut added = Vec::with_capacity(ENTRIES);
+        for i in 0..ENTRIES {
+            let name = format!("f{i:05}.txt");
+            std::fs::write(dir.path().join(&name), b"x").expect("write");
+            added.push(PathBuf::from(name));
+        }
+        stage_and_commit(
+            &repo,
+            &StagedChange {
+                added,
+                ..StagedChange::default()
+            },
+            &provenance(),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
+        let repo = gix::open(dir.path()).expect("reopen");
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+        status_paths_excluding(&repo, &[], Some(&report), CADENCE, WalkPolicy::read_only())
+            .expect("status");
+
+        let seen = seen.lock().expect("lock").clone();
+        assert!(
+            seen.windows(2).all(|pair| pair[1].0 >= pair[0].0),
+            "the count walked backwards: {seen:?}"
+        );
+        if let Some(last) = seen.last().copied() {
+            assert_eq!(
+                last,
+                (ENTRIES as u64, ENTRIES as u64),
+                "the walk compared every entry and its last word said otherwise: {seen:?}"
+            );
+        }
+    }
+
     #[test]
     fn status_classifies_a_modification_and_a_deletion_over_a_committed_fixture() {
         let (dir, repo) = repo_with_two_files();
@@ -1944,5 +4111,102 @@ mod tests {
             Some(false),
             "clone must leave the sparse index disabled in .git/config"
         );
+    }
+
+    /// Story 47.2 — the index scan must keep path bytes, not decode them.
+    ///
+    /// `tracked_paths` used to build each path with `BStr::to_string`, a lossy
+    /// UTF-8 decode. The resulting `PathBuf` names a different file or no file
+    /// at all, and its one caller is the LFS materialization scan, which
+    /// `lstat`s and rewrites what it is given.
+    #[cfg(unix)]
+    #[test]
+    fn the_index_scan_keeps_the_bytes_of_a_name_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        // Raw bytes, because no string literal can express this name.
+        let odd = std::ffi::OsString::from_vec(b"doc-\xffepuap.txt".to_vec());
+        if crate::names::create_unspellable(dir.path(), b"doc-\xffepuap.txt").is_none() {
+            eprintln!("{}", crate::names::UNSPELLABLE_UNAVAILABLE);
+            return;
+        }
+        std::fs::write(dir.path().join("ordinary.txt"), b"x").expect("write");
+
+        let status = status_paths(&repo).expect("status");
+        let changes = crate::git::commit::StagedChange {
+            added: status.untracked.clone(),
+            ..Default::default()
+        };
+        crate::git::commit::stage_and_commit(
+            &repo,
+            &changes,
+            &crate::provenance::Provenance::new(
+                "p",
+                "dev",
+                "01",
+                "host",
+                crate::provenance::SyncSource::Manual,
+            ),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("git carries path bytes, so this commits");
+
+        let tracked = tracked_paths(&repo).expect("tracked");
+        assert!(
+            tracked.iter().any(|p| p.as_os_str() == odd),
+            "the path must come back byte-identical; got {tracked:?}"
+        );
+        // The specific way it used to be wrong: the lossy form is a path that
+        // reaches nothing, and a caller that stats it silently does nothing.
+        assert!(
+            !dir.path().join("doc-\u{FFFD}epuap.txt").exists(),
+            "the lossy rendering names no file, which is why decoding lost it"
+        );
+
+        // And the same index answers the report question, for the ordinary
+        // file too — an inventory that flagged everything would be useless.
+        let found = unspellable_tracked_paths(&repo).expect("scan");
+        assert_eq!(
+            found.iter().map(|n| n.escaped.as_str()).collect::<Vec<_>>(),
+            vec!["doc-\\xffepuap.txt"]
+        );
+    }
+
+    /// A repository of ordinary names has nothing to report, and a folder that
+    /// is not a repository yet has no index to read.
+    #[test]
+    fn an_ordinary_repository_reports_no_unspellable_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        // Non-ASCII but perfectly valid UTF-8: this must NOT be reported, or
+        // every user outside ASCII gets a permanent warning about their files.
+        std::fs::write(dir.path().join("zaświadczenie.pdf"), b"x").expect("write");
+        let status = status_paths(&repo).expect("status");
+        crate::git::commit::stage_and_commit(
+            &repo,
+            &crate::git::commit::StagedChange {
+                added: status.untracked.clone(),
+                ..Default::default()
+            },
+            &crate::provenance::Provenance::new(
+                "p",
+                "dev",
+                "01",
+                "host",
+                crate::provenance::SyncSource::Manual,
+            ),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit");
+
+        assert!(unspellable_tracked_paths(&repo).expect("scan").is_empty());
     }
 }

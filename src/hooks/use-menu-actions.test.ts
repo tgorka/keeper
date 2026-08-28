@@ -140,6 +140,29 @@ describe("useMenuActions", () => {
     expect(dispatchPaletteAction).toHaveBeenCalledWith("open-archive", null);
   });
 
+  /**
+   * Story 45.20's actual ask: **a Recordings entry in the MENU BAR that opens
+   * the Recordings page.** The registry test proves the item exists and the
+   * dispatch test proves the handler switches the view; this is the door
+   * between them, and it is the one the user presses. Without it the two halves
+   * are each green and the menu click can still land on nothing.
+   */
+  it("routes a Recordings menu click through to the archive's own id", async () => {
+    roomsStore.setState({ selected: null });
+    renderHook(() => useMenuActions());
+    await waitFor(() => expect(registered).toBeDefined());
+
+    act(() => {
+      registered?.({ payload: "open-recordings" });
+    });
+
+    // The id arrives unchanged: it is not a toggle, so nothing may flip it, and
+    // in particular it must not be resolved to the capture surface's id.
+    expect(dispatchPaletteAction).toHaveBeenCalledWith("open-recordings", null);
+    expect(dispatchPaletteAction).not.toHaveBeenCalledWith("open-recording", null);
+    expect(resolveMenuActionId("open-recordings")).toBe("open-recordings");
+  });
+
   it("unlistens on unmount", async () => {
     const { unmount } = renderHook(() => useMenuActions());
     await waitFor(() => expect(registered).toBeDefined());

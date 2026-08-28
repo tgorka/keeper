@@ -28,7 +28,7 @@ use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,29 @@ pub struct SyncOutcome {
     pub bytes: u64,
     /// Conflict copies created during this run, as repository-relative paths.
     pub conflicts: Vec<String>,
+    /// Paths this run resolved to the remote **without** keeping a copy,
+    /// because the profile declares them regenerable
+    /// ([`SyncProfile::regenerable`]).
+    ///
+    /// Nothing is on disk to clean up, which is exactly why they are reported:
+    /// the file is now whatever the other device generated, so it is stale
+    /// until the tool that writes it runs again — and this run is the only
+    /// moment anything knows that happened.
+    pub stale: Vec<String>,
+}
+
+/// What one convergence had to do beyond merging.
+///
+/// Two lists rather than one because they ask different things of the user:
+/// a copy is a file sitting in the worktree that somebody has to look at and
+/// delete, while a stale path is nothing on disk at all — only a fact that the
+/// file is now the other device's answer and wants regenerating.
+#[derive(Debug, Default)]
+struct Converged {
+    /// Conflict copies written, as repository-relative paths.
+    copies: Vec<String>,
+    /// Regenerable paths resolved to the remote with no copy kept.
+    stale: Vec<String>,
 }
 
 /// What is asking for a recordings push (Story 41.5, FR-136).
@@ -161,12 +184,36 @@ pub struct PathDurability {
     pub problem: Option<String>,
 }
 
-/// Result of a verification pass (Story 25.6).
+/// Result of a verification pass (Story 25.6, Story 56.6).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
     pub checked: u64,
+    /// Paths whose content is deliberately not on this machine: the index
+    /// carries the committed pointer the worktree holds, and the folder's
+    /// compiled [`lfs::virtual_policy::VirtualPolicy`] authorizes that content
+    /// to stay away (AD-129).
+    ///
+    /// Counted rather than merely suppressed. A row nobody reports anywhere is
+    /// indistinguishable from a check that stopped running, and the whole risk
+    /// of this story is a check that went quiet.
+    pub virtual_paths: u64,
     /// `(path, reason)` for everything that failed.
     pub bad: Vec<(String, String)>,
+}
+
+/// What one repair pass could and could not put back (DW-208).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepublishReport {
+    /// Objects the server does not have, whatever became of them here.
+    pub missing: u64,
+    /// Of those, the ones this machine can still supply and has queued.
+    pub queued: u64,
+    /// What that will cost to send.
+    pub queued_bytes: u64,
+    /// The rest: named, because a human knowing which files to go looking for
+    /// on which other machine is the only thing that can still recover them.
+    pub unrecoverable: Vec<lfs::audit::MissingObject>,
 }
 
 /// Why a path is not synced yet (Story 32.2).
@@ -197,6 +244,25 @@ pub enum PendingReason {
     Added,
     /// Tracked and no longer on disk.
     Deleted,
+    /// Queued to come IN: an LFS object this clone does not hold yet.
+    ///
+    /// `replacing` says whether this machine has ever held content for that
+    /// path — the difference between a file arriving and a new version of one
+    /// arriving. It cannot be inferred from the repository: a queued download
+    /// always finds pointer text in the worktree, and history answers a
+    /// different question, since a file added upstream a week ago and never
+    /// fetched here is new to this clone however old it is there. It is read
+    /// from what keeper itself recorded when content last landed.
+    ///
+    /// The other reasons are computed from `git status` and the completeness
+    /// gate, which between them see only what this machine has changed. A
+    /// folder pulling 53 GB therefore listed nothing as pending while 106
+    /// objects sat in the journal — the list said "not synced yet" and meant
+    /// "not synced yet, outbound".
+    ///
+    /// Carries the size because that is the whole question about an inbound
+    /// object: a queue of 106 is two minutes or four days depending on it.
+    Incoming { size_bytes: u64, replacing: bool },
 }
 
 /// One path the folder is waiting on.
@@ -206,6 +272,15 @@ pub struct PendingFile {
     /// Repository-relative.
     pub path: String,
     pub reason: PendingReason,
+    /// How big the thing waiting is, when that is knowable.
+    ///
+    /// Inbound rows have always carried it — the announced size of an object
+    /// that has not arrived. Outbound rows are measured off the worktree, so a
+    /// list holding both reads as one list rather than two half-populated
+    /// columns. `None` where there is nothing to measure: a deletion has no
+    /// file left, and a path that vanished between the walk and the stat is not
+    /// worth failing a listing over.
+    pub size_bytes: Option<u64>,
 }
 
 /// A unit of work the engine has given up on, as a human needs to see it.
@@ -238,6 +313,28 @@ pub struct ProblemReport {
     pub parked: Vec<ParkedUnit>,
     /// Conflict copies still sitting in the working tree, repository-relative.
     pub conflicts: Vec<String>,
+    /// Tracked files whose names are not valid UTF-8 (Story 47.2).
+    ///
+    /// **Reported because the alternative is silence.** git carries such a file
+    /// perfectly well — it stores path bytes and never decodes them — so it
+    /// commits, pushes and clones like any other, and nothing else in keeper
+    /// has any reason to mention it. What keeper cannot do is *name* it: every
+    /// surface renders it lossily, so the Files pane shows a row of
+    /// substitution characters and no action keyed on that row works. The only
+    /// way an owner found one was to go looking with `ls`, which is not a
+    /// report.
+    ///
+    /// **Not an error and not a failure.** Nothing is stuck, nothing is
+    /// parked, nothing needs retrying; the honest sentence is "this is here,
+    /// this is what it looks like, and keeper cannot act on it by name". It
+    /// sits on this report rather than getting a surface of its own because
+    /// this is already the list of things about a folder a person should know
+    /// and has no other way to learn (AD-S3).
+    ///
+    /// Read from the index, so it covers files committed long ago that no
+    /// status walk would mention. Untracked ones are on the pending list
+    /// instead, and once the first sync carries them they appear here.
+    pub unspellable: Vec<crate::names::UnspellableName>,
 }
 
 /// Units claimed from the journal per profile per tick.
@@ -246,8 +343,142 @@ pub struct ProblemReport {
 /// profile's reservation for minutes and starve its watcher.
 const CLAIM_LIMIT: u32 = 16;
 
+/// Files repaired per pass when the record contradicts the rules.
+///
+/// Bounded for the same reason [`CLAIM_LIMIT`] is: the folder this was built
+/// for has 54 872 of them, and a single commit of 54 872 files is neither a
+/// commit anybody can read nor a pass anybody can interrupt. Each pass hashes
+/// exactly this many files, publishes a count, and leaves the rest for the
+/// next one - and every pass permanently removes that many full reads from
+/// every future scan.
+///
+/// Larger than `CLAIM_LIMIT` because the work is local and cheap per item (one
+/// read of a file that is, by construction, under the LFS threshold) where a
+/// claimed unit can be a multi-gigabyte transfer.
+const REPAIR_BATCH: usize = 500;
+
+/// Index entries examined per repair pass.
+///
+/// The pass reads a pack for every *filtered* entry it examines, and on the
+/// folder this was built for that is most of them. Unbounded, one pass held the
+/// index lock for eight minutes at 0% CPU before it had converted anything -
+/// which is the same mistake as the walk it replaces, one layer down. A window
+/// plus a remembered cursor keeps each pass short and still covers the whole
+/// index over successive passes.
+const REPAIR_WINDOW: usize = 5_000;
+
+/// The most rows one Pending poll puts in its list, per source.
+///
+/// A cap on the LIST, not on the truth. The headline count — "N waiting to
+/// sync, M waiting for writes to stop" — is computed separately from indexed
+/// `COUNT(*)`s (see [`crate::progress::status_line`]), so bounding the list
+/// hides no work from the user.
+///
+/// It bounds two things that were both unbounded, and both measured on the
+/// same folder:
+///
+/// * the repair backlog, ~37 500 paths, where [`REPAIR_WINDOW`] already bounds
+///   the probe and this bounds what crosses the IPC boundary;
+/// * the settling rows, **128 483** of them, where the poll used to `stat`
+///   every single one — 128 483 blocking syscalls on a USB volume, per poll.
+///
+/// Larger than the list the pane renders, so scrolling never runs out of rows
+/// before the engine converts or releases them.
+const PENDING_LIST_CAP: usize = 500;
+
 /// How often the supervisor wakes when nothing else prompts it.
 const TICK_MS: u64 = 1_000;
+
+/// How long a repair-backlog probe stays good enough to answer a poll with.
+///
+/// Longer than the pane's five-second poll by enough that a probe costing
+/// seconds is amortized rather than repeated, and far shorter than the hours a
+/// backlog of tens of thousands takes to drain. See [`Engine::repair_memo`].
+const REPAIR_MEMO_TTL: Duration = Duration::from_secs(30);
+
+/// How often a Pending poll pays for a directory walk to look for untracked
+/// files.
+///
+/// The poll runs every five seconds and the directory walk is the expensive
+/// half of a status: it `lstat`s the whole tree whatever changed. On the folder
+/// this was written for that is 996 s of `lstat` per pass, measured, for rows
+/// the stability gate is already holding — a new file is announced by the
+/// watcher, recorded by the gate, and shown as `Settling` without any walk
+/// finding it.
+///
+/// So the poll asks the index-only question, and pays for the directory walk on
+/// this cadence instead: often enough that a file the watcher missed — a create
+/// during a restart, an event the backend dropped — surfaces within the quarter
+/// hour, rarely enough that it is no longer the reason the pane says
+/// "Scanning". The first poll after a start always sweeps, because a process
+/// that has just come up knows nothing about what happened while it was down.
+///
+/// A profile with no live watcher sweeps on every poll: there is nothing to
+/// trust in that case, and correctness outranks the cost.
+const UNTRACKED_SWEEP_INTERVAL: Duration = Duration::from_secs(900);
+
+/// How often a folder's transfer scratch is swept.
+///
+/// Scratch is what an interrupted transfer leaves behind, and nothing else ever
+/// reclaims it: it is not in the working tree, so no status walk sees it; it is
+/// not an LFS object, so no prune considers it. Until this, the only thing that
+/// swept it was the "Recheck all files" button — which meant the space came back
+/// only for a person who already suspected something was wrong and went looking
+/// for a button to press. On the folder that prompted this, that was 915 files
+/// and 123 GB sitting behind a button nobody had a reason to press.
+///
+/// An hour, matching `SCRATCH_DEBRIS_AGE`: the sweep runs as often as a file can
+/// become eligible for it, and no oftener.
+const SWEEP_EVERY_MS: i64 = 3_600_000;
+
+/// Paths one release sweep may attempt (Story 56.5, AD-126).
+///
+/// Bounded for [`CLAIM_LIMIT`]'s reason: the sweep runs inside the reservation
+/// the sync tick already holds, and a pass that walked forty thousand eligible
+/// paths would hold it for minutes and starve the folder's watcher. Whatever
+/// this pass does not reach, the next successful sync does — which is true
+/// because of [`Engine::release_cursor`] and was false without it: this bounds
+/// ATTEMPTS, and a prefix of candidates that refuses identically on every pass
+/// would otherwise hide the tail of the ledger forever.
+///
+/// `pub` for one reason: `tests/release_sweep.rs` builds its fixture from this
+/// number rather than from a literal, so raising the budget does not silently
+/// turn "more candidates than one pass allows" into "fewer".
+pub const RELEASE_BUDGET_OBJECTS: usize = 32;
+
+/// Bytes one release sweep may put through the content-identity proof.
+///
+/// The second dimension, and it is not decoration: 56.4's proof **reads every
+/// byte** of every candidate before deleting it, so a count ceiling alone
+/// permits 32 four-gigabyte files — 128 GB of hashing in a pass that is
+/// supposed to be housekeeping. A gigabyte is a few seconds of disk and bounds
+/// the actual cost rather than the item count.
+///
+/// The total **stops the pass** at the first candidate that would cross it,
+/// rather than skipping that candidate and carrying on. Skipping would make an
+/// object larger than the whole budget permanently unreleasable; stopping means
+/// it is simply first in line next time and still gets its one attempt.
+///
+/// `pub` for [`RELEASE_BUDGET_OBJECTS`]' reason: this ceiling is a promise about
+/// what one pass costs, and a suite deriving its object sizes from a literal
+/// would stop exercising it the moment the number moved.
+pub const RELEASE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// How often a folder's release candidates are looked at.
+///
+/// An hour, matching [`SWEEP_EVERY_MS`] and for the same shape of reason: the
+/// TTL this gate serves is measured in days, so asking every successful sync —
+/// which on a busy folder is every few seconds — would read the whole ledger
+/// over and over to learn nothing. It is a *look* interval and not a schedule:
+/// nothing fires on this clock, it only bounds how often the question is asked
+/// on an edge that was going to happen anyway (AD-62 forbids a second
+/// scheduler). It is also the grace a folder nothing has ever swept gets before
+/// its first deletion — see [`Engine::release_is_due`].
+///
+/// `pub` for [`RELEASE_BUDGET_OBJECTS`]' reason: `tests/release_sweep.rs`
+/// advances its injected clock by this interval to reach a second pass, and a
+/// literal there would silently stop reaching one if this changed.
+pub const RELEASE_LOOK_EVERY_MS: i64 = 3_600_000;
 
 /// How many consecutive transient failures before a profile stops calling
 /// itself healthy.
@@ -384,6 +615,16 @@ enum ProfileWatch {
     },
 }
 
+/// How often a walk that is taking time says where it has got to.
+///
+/// The pace is the whole design. A walk over a small folder finishes inside one
+/// interval and reports **nothing**, which is deliberate: publishing a phase on
+/// every poll of an idle folder is what made the menu-bar glyph flip once a
+/// second (DW-116), and that lesson stands. Only a walk that is genuinely
+/// taking time gets to say so - and on the folder this was built for, one
+/// second is 30 files out of 155 000, so the line moves visibly.
+const WALK_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct Engine {
     platform: Arc<dyn SyncPlatform>,
     /// Single connection behind a mutex. `sync.db` is small and every access is
@@ -402,6 +643,8 @@ pub struct Engine {
     device: Mutex<DeviceIdentity>,
     git: GitCli,
     http: reqwest::Client,
+    /// The client LFS objects move through — see `http::transfer_client`.
+    transfer_http: reqwest::Client,
     /// Live status per profile id, the polled snapshot the tray reads.
     status: Mutex<HashMap<String, SyncStatus>>,
     /// Per-profile completeness gates, retained across ticks so a settling file
@@ -409,6 +652,21 @@ pub struct Engine {
     gates: Mutex<HashMap<String, StabilityGate>>,
     /// Profiles with an operation in flight (the one-per-profile rule).
     busy: Mutex<HashMap<String, ()>>,
+    /// Untracked entries already reported as unsyncable nested repositories.
+    ///
+    /// The refusal in [`Self::expand_untracked`] is a standing fact about the
+    /// tree, not an event: git reports a nested repository as one collapsed
+    /// entry on every single walk, so a folder holding a few dozen of them
+    /// re-derived and re-logged the identical warning once per walk, forever.
+    /// On one real profile that was 178,000 of the last 200,000 log lines and
+    /// a 1.2 GB log. Keyed by `(profile id, path)` and said once.
+    collapsed_reported: Mutex<HashSet<(String, PathBuf)>>,
+    /// Profiles whose queue has already been offered a name-filling walk in
+    /// this process. One walk is enough: what it cannot name — an object whose
+    /// path has since been deleted — it will not name on the next drain either,
+    /// and repeating an index walk per drain to learn that again is how a
+    /// display nicety becomes a cost.
+    labels_backfilled: Mutex<HashSet<String>>,
     /// Consecutive transient failures per profile.
     ///
     /// A transient error is retried and, on its own, is not worth alarming
@@ -428,6 +686,46 @@ pub struct Engine {
     /// scanning is paced by the profile's own `poll_interval_ms`, which until
     /// now was parsed, validated, documented and read by nothing (DW-116).
     next_scan_ms: Mutex<HashMap<String, i64>>,
+    /// When each profile's transfer scratch may next be swept.
+    ///
+    /// Absent means "now", so a folder is swept on the first tick after keeper
+    /// starts. That is deliberate and it is the case that matters: the run that
+    /// leaves scratch behind is the one that was killed, and the next start is
+    /// the first moment anything can clean up after it.
+    next_sweep_ms: Mutex<HashMap<String, i64>>,
+    /// When each profile's release candidates may next be looked at (Story
+    /// 56.5).
+    ///
+    /// Beside [`Self::next_sweep_ms`] and deliberately **not** in the same
+    /// shape: absent means "an interval from now", not "now".
+    /// [`Self::release_is_due`] arms this on first sight and declines the pass,
+    /// because this sweep deletes where the other two read. It is removed
+    /// wherever the other two windows are — a profile removal, an
+    /// enable/disable, an explicit wake — because a window that survived a
+    /// re-add would mean a folder somebody just re-attached releases on its very
+    /// first sync instead of an interval later.
+    ///
+    /// **A disabled TTL never puts an entry here, and clears one that is
+    /// there.** [`Self::release_is_due`] returns before it reads the clock, so
+    /// turning the sweep back on starts a fresh interval rather than finding a
+    /// window that has already opened.
+    next_release_ms: Mutex<HashMap<String, i64>>,
+    /// Where each profile's last release pass stopped, so successive passes
+    /// cover the whole ledger (Story 56.5).
+    ///
+    /// A cursor rather than a fresh start, for [`Self::repair_cursor`]'s reason
+    /// and with more at stake. [`RELEASE_BUDGET_OBJECTS`] counts ATTEMPTS, and
+    /// the candidate list is re-derived in the same `ORDER BY path` order every
+    /// pass — so a prefix that refuses identically every time (32 paths the
+    /// owner edited in place; or, on every real host today, simply the first 32,
+    /// because `open_file_state` defaults to `Unknown`) meant paths 33..n were
+    /// never attempted once, and the promise that a later pass takes the
+    /// remainder was false.
+    ///
+    /// The path and not an index, because rows come and go between passes and
+    /// an index into a list that shrank points somewhere else. Wraps at the end;
+    /// see [`RELEASE_BUDGET_OBJECTS`].
+    release_cursor: Mutex<HashMap<String, String>>,
     /// Absolute path to the binary git should invoke as the `lfs` filter.
     ///
     /// `None` when the running executable cannot be resolved — the filter is an
@@ -435,6 +733,9 @@ pub struct Engine {
     /// correctness requirement for keeper itself, so a missing path degrades
     /// rather than fails.
     filter_program: Option<PathBuf>,
+    /// Whether [`Self::filter_program`] answered the `lfs filter-process`
+    /// handshake, and may therefore be registered as `filter.lfs.process`.
+    filter_serves_process: bool,
     sinks: Mutex<Vec<(u64, ProgressSink)>>,
     next_sink: AtomicU64,
     interrupt: Arc<AtomicBool>,
@@ -448,6 +749,26 @@ pub struct Engine {
     /// [`Engine::sync_once`] reads this before and after its run and reports
     /// the difference, which is exactly "what this run moved".
     transferred: Mutex<HashMap<String, u64>>,
+    /// Transfer rate per profile, measured across the whole run rather than
+    /// within one object.
+    ///
+    /// [`TransferTally`] carries a [`RateMeter`] of its own, but a tally lives
+    /// for exactly one `do_lfs` call, and [`RateMeter`] withholds a figure until
+    /// a full second of movement backs it — correctly, because one 100 ms
+    /// producer tick can carry a whole buffered chunk. Those two facts together
+    /// mean an object that finishes inside a second never reports a rate at all,
+    /// so a folder of ordinary files showed throughput only for the occasional
+    /// object above ~50 MB and nothing whatsoever for the hundred small ones
+    /// around it — which reads as a stalled folder, and was reported as one.
+    ///
+    /// Fed from the same cumulative counter as [`Engine::transferred`], so what
+    /// it measures is the run: previous objects' bytes and the time they took
+    /// are exactly what makes a figure available while the current object is
+    /// still too young to have one. The meter's own rules are untouched — a
+    /// window that carries no bytes still falls silent within
+    /// `RATE_WINDOW_MS`, so a genuine stall stops reporting rather than
+    /// freezing the last number on screen.
+    session_rate: Mutex<HashMap<String, RateMeter>>,
     /// Live filesystem watchers per profile id (AD-34-11).
     ///
     /// The supervisor owns these rather than either host, because the
@@ -511,6 +832,79 @@ pub struct Engine {
     /// construction. Contention is nil: three increments per commit at the
     /// most, against locks the same call already takes for the journal.
     counters: Mutex<HashMap<String, EngineCounters>>,
+    /// How often a walk in progress is allowed to publish where it has got to.
+    ///
+    /// A field rather than a constant so a test can drive the reporting
+    /// behaviour without waiting out real seconds per item. Production never
+    /// changes it; see [`WALK_REPORT_INTERVAL`] for why the pace exists at all.
+    walk_report_interval: Duration,
+    /// Where each profile's next repair pass resumes in its tracked-path list.
+    ///
+    /// A cursor rather than a fresh start, because a pass that always began at
+    /// the top would re-examine the same cheap prefix forever and never reach
+    /// the inconsistencies deeper in the tree. Wraps at the end; see
+    /// [`REPAIR_WINDOW`].
+    repair_cursor: Mutex<HashMap<String, usize>>,
+    /// The last repair-backlog probe per profile, and when it was taken.
+    ///
+    /// The probe is cheap next to the walk it replaces and expensive next to
+    /// nothing: it opens the repository and materializes every tracked path
+    /// before examining a window of them. Measured on a 155 662-entry folder,
+    /// 3 to 21 seconds. The Pending pane polls every five seconds, so running
+    /// it per poll meant the answer was never ready when the next question
+    /// arrived — the pane sat on "Loading folders…" and the allocator churned
+    /// a six-figure path list on a loop.
+    ///
+    /// A backlog of tens of thousands does not change meaningfully inside
+    /// [`REPAIR_MEMO_TTL`], and the sweep that drains it publishes its own
+    /// progress, so a slightly old answer here is honest.
+    repair_memo: Mutex<HashMap<String, (Instant, Vec<PathBuf>)>>,
+
+    /// Profiles with a full-tree status walk in flight.
+    ///
+    /// Measured on hesperia's `tgdrive`: **two** concurrent walks of the same
+    /// 155 662-entry USB folder, in 26 of 26 one-second samples over seven
+    /// minutes — two `keeper-status-watchdog` threads, two
+    /// `gix::status::index_worktree::producer`s, two `index_as_worktree`
+    /// scopes. Nothing bounded it: the commit leg and every Pending poll each
+    /// called `status_paths_reported` directly, and a walk of that folder takes
+    /// 72 minutes, so a five-second poll only had to reach the walk branch once
+    /// to leave a second full-tree pass running for over an hour beside the
+    /// first.
+    ///
+    /// Two walks of one tree are not twice the work — they are twice the work
+    /// plus the seek contention of interleaving them on one external volume.
+    /// The claim is `try`-only on both legs: nobody waits for a walk, because a
+    /// caller that waits 72 minutes for a UI poll is the bug in a new place.
+    walking: Mutex<std::collections::HashSet<String>>,
+
+    /// When each profile's Pending poll last paid for a directory walk.
+    ///
+    /// Absent means "never in this run", and a run that has just started must
+    /// sweep: whatever happened while the process was down was announced to
+    /// nobody. In memory on purpose — the guarantee this offers is per run, and
+    /// a persisted timestamp would let a restart skip the one sweep it most
+    /// needs. See [`UNTRACKED_SWEEP_INTERVAL`].
+    untracked_sweep: Mutex<HashMap<String, Instant>>,
+}
+
+/// A profile's in-flight full-tree walk, released when this is dropped.
+///
+/// A `Drop` guard rather than a matching pair of calls, because the walk it
+/// covers can end four ways — completion, the watchdog's abandonment, an
+/// unreadable-tree error, or a panic on a worker — and three of those do not
+/// come back to the line that made the claim. A leaked claim is a folder that
+/// never walks again, which is a far worse failure than the duplicate walk this
+/// removes.
+struct WalkClaim<'a> {
+    walking: &'a Mutex<std::collections::HashSet<String>>,
+    profile_id: String,
+}
+
+impl Drop for WalkClaim<'_> {
+    fn drop(&mut self) {
+        Engine::lock(self.walking).remove(&self.profile_id);
+    }
 }
 
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
@@ -533,6 +927,27 @@ impl Engine {
     /// declared prerequisite, and discovering it mid-push would leave a profile
     /// half-applied.
     pub fn open(platform: Arc<dyn SyncPlatform>) -> Result<Self> {
+        // Before anything opens a repository. A Finder-launched macOS app
+        // inherits launchd's 256 descriptors, and gitoxide's object store maps
+        // one file per object it reads — a checkout of a few hundred exhausts
+        // them mid-tree and the folder silently stops catching up. Once per
+        // process; a second engine finds the limit already raised.
+        static RAISED: std::sync::Once = std::sync::Once::new();
+        RAISED.call_once(|| match crate::openfiles::raise() {
+            crate::openfiles::Raised::Raised { from, to } => {
+                tracing::info!(from, to, "raised the open-file limit");
+            }
+            crate::openfiles::Raised::AlreadyEnough(soft) => {
+                tracing::debug!(soft, "open-file limit already sufficient");
+            }
+            crate::openfiles::Raised::Unchanged => {
+                tracing::warn!(
+                    "could not raise the open-file limit; a large checkout may fail with \
+                     `Too many open files`"
+                );
+            }
+        });
+
         let data_dir = platform.data_dir()?;
         let conn = db::open(&data_dir)?;
         let device = db::device_identity(&conn, &platform.host_label())?;
@@ -554,10 +969,15 @@ impl Engine {
             });
         }
 
-        let http = reqwest::Client::builder()
-            .user_agent(crate::AGENT)
-            .build()
-            .map_err(|err| SyncError::Config(format!("could not build an HTTP client: {err}")))?;
+        // Timeouts live in `crate::http`, and the reason they are not inline
+        // here is that their absence was invisible: a client built without them
+        // never fails, it waits — and a wait on a dead socket parks the whole
+        // profile until the process restarts.
+        let http = crate::http::client(crate::AGENT)?;
+        // A second client, and the only difference is its read ceiling: an
+        // upload's guard is progress, not silence. See
+        // `http::TRANSFER_READ_TIMEOUT`.
+        let transfer_http = crate::http::transfer_client(crate::AGENT)?;
 
         let engine = Self {
             platform,
@@ -565,27 +985,108 @@ impl Engine {
             device: Mutex::new(device),
             git,
             http,
+            transfer_http,
             status: Mutex::new(HashMap::new()),
             gates: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
+            collapsed_reported: Mutex::new(HashSet::new()),
+            labels_backfilled: Mutex::new(HashSet::new()),
             transient_failures: Mutex::new(HashMap::new()),
             next_scan_ms: Mutex::new(HashMap::new()),
+            next_sweep_ms: Mutex::new(HashMap::new()),
+            next_release_ms: Mutex::new(HashMap::new()),
+            release_cursor: Mutex::new(HashMap::new()),
             // `current_exe` is the daemon in a CLI run and the app binary in a
             // desktop run; both understand `lfs clean|smudge`.
             filter_program: std::env::current_exe().ok(),
+            // ...but "whatever executable linked the engine" understands the
+            // long-running protocol only if it says so, and a `process` driver
+            // that cannot be launched wedges the folder rather than degrading
+            // (DW-140). Asked once, here, rather than per repository open.
+            filter_serves_process: std::env::current_exe()
+                .ok()
+                .is_some_and(|exe| lfs::filter::serves_process(&exe)),
             sinks: Mutex::new(Vec::new()),
             next_sink: AtomicU64::new(1),
             interrupt: Arc::new(AtomicBool::new(false)),
             transferred: Mutex::new(HashMap::new()),
+            session_rate: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             watch_wake: Mutex::new(HashSet::new()),
             lfs_ssh_credentials: Mutex::new(HashMap::new()),
             watch_tap: OnceLock::new(),
             finished_tap: OnceLock::new(),
             counters: Mutex::new(HashMap::new()),
+            walk_report_interval: WALK_REPORT_INTERVAL,
+            repair_cursor: Mutex::new(HashMap::new()),
+            repair_memo: Mutex::new(HashMap::new()),
+            walking: Mutex::new(std::collections::HashSet::new()),
+            untracked_sweep: Mutex::new(HashMap::new()),
         };
         engine.seed_status()?;
         Ok(engine)
+    }
+
+    /// Claim the one full-tree walk this profile is allowed to have running.
+    ///
+    /// `None` means somebody else is already walking this folder. There is no
+    /// waiting variant on purpose: the two callers are a commit pass and a UI
+    /// poll, and on a folder whose walk takes over an hour, a caller that
+    /// queued behind one would be indistinguishable from the freeze this
+    /// exists to remove. Both legs have a correct answer for "not now" — the
+    /// commit pass defers to the supervisor's next tick, and the poll answers
+    /// from the index and the gate, which is what it does anyway whenever a
+    /// repair backlog exists.
+    fn claim_walk(&self, profile_id: &str) -> Option<WalkClaim<'_>> {
+        Self::lock(&self.walking)
+            .insert(profile_id.to_owned())
+            .then(|| WalkClaim {
+                walking: &self.walking,
+                profile_id: profile_id.to_owned(),
+            })
+    }
+
+    /// What a Pending poll asks of the walk it is about to run.
+    ///
+    /// The index-only question is answered from `lstat` per entry; the
+    /// directory walk that finds untracked files costs the whole tree, every
+    /// time, and on the folder this was written for that is 996 s. The poll
+    /// therefore skips it and sweeps on [`UNTRACKED_SWEEP_INTERVAL`] — except
+    /// where skipping would mean not knowing:
+    ///
+    /// * the first poll of a run, because nothing was watching while the
+    ///   process was down;
+    /// * a profile whose watcher is not live, because then there is no second
+    ///   source for a new file at all.
+    ///
+    /// Records the sweep as taken, so this is called exactly once per poll.
+    fn poll_walk_policy(&self, profile_id: &str) -> git::repo::WalkPolicy {
+        let watched = matches!(
+            Self::lock(&self.watchers).get(profile_id),
+            Some(ProfileWatch::Live { .. })
+        );
+        let now = Instant::now();
+        let mut swept = Self::lock(&self.untracked_sweep);
+        let due = match swept.get(profile_id) {
+            None => true,
+            Some(last) => now.saturating_duration_since(*last) >= UNTRACKED_SWEEP_INTERVAL,
+        };
+        if !watched || due {
+            swept.insert(profile_id.to_owned(), now);
+            return git::repo::WalkPolicy::full();
+        }
+        git::repo::WalkPolicy::tracked_only()
+    }
+
+    /// Report a walk's progress on every item, for tests.
+    ///
+    /// The pacing is what keeps an idle folder from publishing a phase once a
+    /// second, so a test that wants to *see* a report either waits out a real
+    /// interval per item or says this. It exists to make the long-operation
+    /// behaviour testable, which is the only way it stays true.
+    #[cfg(test)]
+    fn report_every_walk_item(&mut self) {
+        self.walk_report_interval = Duration::ZERO;
     }
 
     /// Poison-tolerant lock. A panic in one profile's handler must not take
@@ -756,6 +1257,9 @@ impl Engine {
         Self::lock(&self.status).remove(id);
         Self::lock(&self.gates).remove(id);
         Self::lock(&self.next_scan_ms).remove(id);
+        Self::lock(&self.next_sweep_ms).remove(id);
+        Self::lock(&self.next_release_ms).remove(id);
+        Self::lock(&self.release_cursor).remove(id);
         self.drop_watcher(id);
         Ok(())
     }
@@ -767,6 +1271,24 @@ impl Engine {
         };
         profile.enabled = enabled;
         self.upsert_profile(&profile)?;
+        // Said out loud, because until now it was not.
+        //
+        // Pausing wrote a row and nothing else: no line in the log, and a
+        // transfer already in flight kept its window before anything noticed.
+        // So a person who pressed Pause on a folder that was retrying saw it go
+        // on retrying, and had no way to tell whether the press had landed —
+        // and neither did anybody reading the log afterwards, which is how a
+        // report of "pause does not work" arrives with no evidence either way.
+        tracing::info!(
+            profile = profile.name,
+            enabled,
+            "sync profile paused or resumed on request"
+        );
+        if !enabled {
+            // The state says so at once rather than at the next tick, which is
+            // the tick this profile is about to stop having.
+            self.set_state(&profile.id, ProfileState::Paused);
+        }
         if enabled {
             // Work deferred while paused becomes eligible again immediately;
             // making the user wait out a backoff they did not cause is rude.
@@ -775,21 +1297,56 @@ impl Engine {
             // ...and neither is making them wait out a scan window: resuming is
             // a request to look now.
             Self::lock(&self.next_scan_ms).remove(id);
+            Self::lock(&self.next_sweep_ms).remove(id);
+            Self::lock(&self.next_release_ms).remove(id);
+            Self::lock(&self.release_cursor).remove(id);
         }
         Ok(())
     }
 
     pub fn status(&self, id: &str) -> Result<SyncStatus> {
-        Self::lock(&self.status)
+        let mut snapshot = Self::lock(&self.status)
             .get(id)
             .cloned()
-            .ok_or_else(|| SyncError::Config(format!("no such sync profile: {id}")))
+            .ok_or_else(|| SyncError::Config(format!("no such sync profile: {id}")))?;
+        self.fill_queued(&mut snapshot);
+        Ok(snapshot)
     }
 
     pub fn statuses(&self) -> Result<Vec<SyncStatus>> {
         let mut all: Vec<SyncStatus> = Self::lock(&self.status).values().cloned().collect();
+        for snapshot in &mut all {
+            self.fill_queued(snapshot);
+        }
         all.sort_by(|a, b| a.profile_name.cmp(&b.profile_name));
         Ok(all)
+    }
+
+    /// Answer "how much is left" from the journal, at the moment of asking.
+    ///
+    /// These two are **derived**, and keeping them in the snapshot was the same
+    /// mistake [`Self::pending`] refuses to make: a remembered answer to a
+    /// question the journal already answers disagrees with it the moment
+    /// anything changes. It did, and visibly — a unit completed, the Pending
+    /// list dropped it (that list is computed), and the line above went on
+    /// saying "94 files left, 48.7 GB" because the snapshot was written only
+    /// after a whole claimed batch of up to [`CLAIM_LIMIT`] units had been
+    /// attempted. On a slow link that is hours of a number that never moves.
+    ///
+    /// One indexed aggregate over a table holding a queue, on a path polled
+    /// every couple of seconds. Cheaper than the bug it removes, and it cannot
+    /// go stale because there is nothing left to go stale.
+    ///
+    /// A failed read leaves the pair at zero rather than propagating: the
+    /// caller asked for a status, and a folder that cannot be counted is still
+    /// a folder whose state, phase and error are worth reporting.
+    fn fill_queued(&self, snapshot: &mut SyncStatus) {
+        if let Ok((files, bytes)) =
+            self.with_db(|conn| db::queued_transfers(conn, &snapshot.profile_id))
+        {
+            snapshot.queued_files = files;
+            snapshot.queued_bytes = bytes;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -810,7 +1367,20 @@ impl Engine {
     ///
     /// A sink returning `false` has gone away (a closed IPC channel), and is
     /// dropped here rather than accumulating for the life of the process.
-    fn publish(&self, event: SyncProgress) {
+    ///
+    /// A frame in a rate-carrying phase that arrives without a figure is given
+    /// the run's own (see [`Engine::session_rate`]): the object in flight may be
+    /// too young to have measured anything, and the transfer it is part of is
+    /// not. This is the single choke point every frame passes through, so the
+    /// HTTP leg, the filesystem-remote copy and the fetch leg all report a rate
+    /// on the same terms instead of three of them deciding separately.
+    fn publish(&self, mut event: SyncProgress) {
+        if event.bytes_per_second.is_none() && event.phase.carries_rate() {
+            // Observed rather than merely read, so the window still rolls while
+            // frames arrive: a transfer that stops moving falls silent here
+            // exactly as it does inside one object's tally.
+            event.bytes_per_second = self.observe_session_rate(&event.profile_id, Instant::now());
+        }
         {
             let mut status = Self::lock(&self.status);
             if let Some(snapshot) = status.get_mut(&event.profile_id) {
@@ -1027,6 +1597,7 @@ impl Engine {
             if !profile.enabled {
                 continue;
             }
+            self.sweep_scratch_if_due(&profile).await;
             match self.tick_profile(&profile).await {
                 Ok(()) => {
                     Self::lock(&self.transient_failures).remove(&profile.id);
@@ -1095,6 +1666,146 @@ impl Engine {
         let interval = profile.effective_poll_interval_ms() as i64;
         due.insert(profile.id.clone(), now.saturating_add(interval));
         true
+    }
+
+    /// Whether this profile's transfer scratch may be swept on this tick.
+    ///
+    /// Same shape as [`Self::scan_is_due`] and for the same reason: a schedule
+    /// on the platform clock is a schedule a test can advance, and housekeeping
+    /// that could only be observed by waiting an hour would not be tested.
+    /// Delete transfer scratch this folder will never use again.
+    ///
+    /// Fenced in `spawn_blocking`: this is `read_dir` plus up to a few thousand
+    /// `unlink`s on a volume that may be an external disk, and the supervisor
+    /// ticks at 1 Hz. Awaited rather than detached, so two sweeps of the same
+    /// folder can never overlap.
+    ///
+    /// `incomplete/` is swept alongside `tmp/` even though it exists to let a
+    /// download resume, because the hasher state that would resume it lives in
+    /// the process: once keeper restarts, a partial file there is bytes nothing
+    /// can continue from. Keeping it would cost disk to preserve a resume that
+    /// cannot happen.
+    ///
+    /// Never fails the tick. Housekeeping that could stop a folder syncing would
+    /// have traded a disk-space problem for a sync problem.
+    async fn sweep_scratch_if_due(&self, profile: &SyncProfile) {
+        if !self.sweep_is_due(profile) {
+            return;
+        }
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        let name = profile.name.clone();
+        // The sweep reports its own anomaly when it removes anything, so there
+        // is nothing to log here: a sweep that found nothing is the normal case
+        // and has nothing to say.
+        let _ = tokio::task::spawn_blocking(move || store.sweep_scratch(&name)).await;
+        self.report_blobs_over_threshold(profile).await;
+    }
+
+    /// Say, once an hour, how much of this folder git is carrying as plain
+    /// blobs that today's threshold would have sent to LFS.
+    ///
+    /// The threshold moves — this folder went from 4 MiB to 0.25 MB — and a
+    /// commit cannot change its mind afterwards. So a drive quietly accumulates
+    /// files the current rule disagrees with, and nothing says so until
+    /// somebody runs the check by hand, which they only do once they already
+    /// suspect something. Reported and not fixed: converting them means
+    /// rewriting history, which is not a thing keeper does to a folder two
+    /// people are syncing.
+    async fn report_blobs_over_threshold(&self, profile: &SyncProfile) {
+        let root = profile.local_path.clone();
+        let threshold = profile.lfs_threshold_bytes;
+        let name = profile.name.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let Ok(repo) = git::repo::open(&root, false) else {
+                return;
+            };
+            let Ok(tracked) = git::repo::tracked_paths(&repo) else {
+                return;
+            };
+            let (count, bytes) =
+                crate::footprint::blobs_over_threshold(&repo, &root, &tracked, threshold);
+            if count == 0 {
+                return;
+            }
+            crate::anomaly::Anomaly {
+                what: "files git carries as plain blobs that today's threshold would send to LFS",
+                measured: format!("files={count} bytes={bytes} threshold={threshold}"),
+                expected: "none, on a folder whose threshold has never moved",
+                consequence: "history keeps them as blobs for good; the cost is permanent and \
+                              known, and nothing new is being added to it",
+            }
+            .report(&name);
+        })
+        .await;
+    }
+
+    fn sweep_is_due(&self, profile: &SyncProfile) -> bool {
+        let now = self.platform.now_ms();
+        let mut due = Self::lock(&self.next_sweep_ms);
+        match due.get(&profile.id) {
+            None => {}
+            Some(at) if now >= *at => {}
+            Some(_) => return false,
+        }
+        due.insert(profile.id.clone(), now.saturating_add(SWEEP_EVERY_MS));
+        true
+    }
+
+    /// Whether this profile's release candidates may be looked at now (Story
+    /// 56.5).
+    ///
+    /// [`Self::sweep_is_due`]'s shape, with two differences, and both of them
+    /// are the point.
+    ///
+    /// **A disabled TTL is answered before the clock is read, and it clears the
+    /// window.** Both of the other two gates stamp a next-due instant as a side
+    /// effect of being asked. If a `releaseTtlMs = 0` folder asked this one it
+    /// would arm a window; an operator who turned the sweep on an hour later
+    /// would find that window already open and see content released on the very
+    /// next sync — the opposite of what turning a knob on should mean. So the
+    /// zero returns `false` without reading the clock at all, and it `remove`s
+    /// whatever entry a previous non-zero setting left behind. That `remove` is
+    /// what makes `docs/sync.md`'s promise — it disables the sweep before any
+    /// window is armed, so turning it back on later starts a fresh window rather
+    /// than firing on the next sync — true rather than false: without it, the
+    /// clock runs on while the sweep is off and re-enabling walks straight into
+    /// a window that opened in the meantime. The test asserts the map is empty
+    /// rather than only that the answer was `false`.
+    ///
+    /// **First sight ARMS and DECLINES**, where [`Self::scan_is_due`] arms and
+    /// proceeds. That divergence is deliberate: a scan is a read, so a folder
+    /// just added may as well be walked at once, while this sweep DELETES. A
+    /// folder keeper has never swept — freshly added, resumed, re-enabled, or a
+    /// daemon that has just restarted — is exactly the one whose ledger keeper
+    /// knows least about: rows an older keeper wrote, clocks that moved while
+    /// nothing was watching, an owner who may be halfway through attaching it.
+    /// So it gets one whole [`RELEASE_LOOK_EVERY_MS`] of grace, and **no release
+    /// happens on a profile's very first successful sync**.
+    fn release_is_due(&self, profile: &SyncProfile) -> bool {
+        // The lock first, because the zero arm has to be able to clear an entry
+        // and must do it without reading the clock.
+        let mut due = Self::lock(&self.next_release_ms);
+        if profile.effective_release_ttl_ms().is_none() {
+            due.remove(&profile.id);
+            return false;
+        }
+        let now = self.platform.now_ms();
+        let armed = now.saturating_add(RELEASE_LOOK_EVERY_MS);
+        match due.get(&profile.id) {
+            // First sight: arm the window and decline the pass. See this
+            // method's doc — this is the divergence from `scan_is_due`, and it
+            // is what buys a folder nothing has ever swept its interval of
+            // grace before anything is deleted from it.
+            None => {
+                due.insert(profile.id.clone(), armed);
+                false
+            }
+            Some(at) if now >= *at => {
+                due.insert(profile.id.clone(), armed);
+                true
+            }
+            Some(_) => false,
+        }
     }
 
     /// Whether this profile's tree may be walked on this tick.
@@ -2140,12 +2851,19 @@ impl Engine {
     ///   answers where one is needed.
     /// * **`problem` is the profile's last recorded *permanent* failure, not a
     ///   push-specific one.** That is the engine's only record of a failure in
-    ///   words, and a refused push is one — a rejected ref classifies as
-    ///   [`SyncError::Diverged`], which is permanent and lands there verbatim.
-    ///   A failure still being retried deliberately carries no sentence yet
-    ///   (`record_failure`'s policy, not this one), which is right: work that
-    ///   is about to be retried is not something to hand a recorder words
+    ///   words. A failure still being retried deliberately carries no sentence
+    ///   yet (`record_failure`'s policy, not this one), which is right: work
+    ///   that is about to be retried is not something to hand a recorder words
     ///   about.
+    ///
+    ///   A refused push used to land here, because a rejected ref classified as
+    ///   [`SyncError::Diverged`] whatever the profile was. On a shared
+    ///   bidirectional branch it no longer does: being overtaken is a race, it
+    ///   comes back as [`SyncError::RemoteMoved`], and it reconciles on its own
+    ///   (DW-207). So the honest reading of a recording in that window is
+    ///   `committed` without `pushed` and **no sentence** — the publication has
+    ///   not failed, it is a step behind. A race that genuinely will not settle
+    ///   still parks eventually, and parking is what records the words.
     ///
     /// # What is a refusal
     ///
@@ -2291,6 +3009,26 @@ impl Engine {
                 return Ok(durability);
             }
         };
+        // A path the walk had to step over is a path whose state nobody knows,
+        // and "unknown" must never round up to "safe" on this surface: the
+        // whole question being asked is whether a recording is already durable,
+        // and a wrong yes is the answer that loses one. The status succeeded,
+        // which is exactly why this has to be checked — before the fix that let
+        // it succeed, the failing branch above caught this case for free.
+        if status
+            .unreadable
+            .iter()
+            .any(|item| item.path.as_path() == rela)
+        {
+            tracing::warn!(
+                profile = profile.name,
+                path = %rela.display(),
+                "this file could not be read, so the recording's durability is unknown; \
+                 the last known state stands"
+            );
+            return Ok(durability);
+        }
+
         // A path in `HEAD` that the status walk also names has moved since the
         // commit — staged again, edited again, or deleted — so the commit no
         // longer describes what is on the drive.
@@ -2376,16 +3114,22 @@ impl Engine {
         // re-read by whoever is about to do work. See
         // [`Self::release_satisfied_waits`] for the two failures that shape it.
         self.release_satisfied_waits(profile, now)?;
+        // Before claiming, because a unit claimed without a name reports the
+        // folder for the whole transfer — an hour, on a slow link.
+        self.backfill_labels(profile);
         let claimed = self.with_db(|conn| db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT))?;
         if claimed.is_empty() {
             if scan_when_idle {
-                self.scan_and_enqueue(profile)?;
+                self.scan_and_enqueue(profile, source)?;
             }
             return Ok(());
         }
 
         for item in claimed {
-            match self.execute(profile, &item.kind, item.id, source).await {
+            match self
+                .execute(profile, &item.kind, item.id, item.label.as_deref(), source)
+                .await
+            {
                 Ok(()) => {
                     self.with_db(|conn| db::complete(conn, item.id))?;
                     self.clear_warning(&profile.id);
@@ -2574,6 +3318,17 @@ impl Engine {
                         &profile.name,
                         format!("sync has failed {consecutive} times in a row: {err}"),
                     );
+                    // And say it where the folder is looked at, not only where
+                    // notifications go. A run of transient failures used to
+                    // leave the card reading whatever it read before —
+                    // `Idle`, or a stale `Offline` from the failure that
+                    // started it — while the queue retried in a loop nobody
+                    // could see. A folder that has failed this many times in a
+                    // row is not idle, and the sentence belongs beside it.
+                    self.set_state(&profile.id, ProfileState::NeedsAttention);
+                    if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
+                        snapshot.error = Some(err.to_string());
+                    }
                 }
             }
             Retriability::Permanent => {
@@ -2599,9 +3354,10 @@ impl Engine {
     /// walked yet in this process, and the count seeded at open stands until the
     /// first walk measures a real one.
     fn refresh_pending(&self, profile_id: &str) {
+        let now = self.platform.now_ms();
         let settling = Self::lock(&self.gates)
             .get(profile_id)
-            .map(|gate| gate.tracked() as u32);
+            .map(|gate| gate.tracked(now) as u32);
         if let Ok(pending) = self.pending_for(profile_id) {
             if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
                 snapshot.pending = pending;
@@ -2769,14 +3525,24 @@ impl Engine {
     // Work execution
     // -----------------------------------------------------------------------
 
-    /// `unit_id` is the journal row being executed. Only the push leg uses it:
-    /// the activity rows its commit records name it as the unit whose success
-    /// delivers them (Story 34.16).
+    /// `unit_id` is the journal row being executed. The push leg names it as
+    /// the unit whose success delivers the activity rows its commit records
+    /// (Story 34.16), and the LFS legs carry it down to
+    /// [`Self::materialize_landed`], which asks the journal whether anybody is
+    /// waiting for that row (Story 56.3).
+    ///
+    /// The id travels rather than the answer. A request that arrives while its
+    /// covering download is already `running` — the ordinary case, since
+    /// [`WorkKind::covered_while_running`] makes a running transfer count as
+    /// cover — raises the urgency of a row this loop read before the person
+    /// asked, so a `bool` copied out at claim time would drop that request
+    /// silently. See [`db::unit_urgency`].
     async fn execute(
         &self,
         profile: &SyncProfile,
         kind: &WorkKind,
         unit_id: i64,
+        label: Option<&str>,
         source: SyncSource,
     ) -> Result<()> {
         match kind {
@@ -2784,16 +3550,22 @@ impl Engine {
             // a journaled pull has no caller to hand them back to.
             WorkKind::Pull => {
                 self.do_pull(profile, source).await?;
-                self.mark_synced(profile);
+                self.mark_synced(profile).await;
                 Ok(())
             }
             WorkKind::Push => {
                 self.do_push(profile, source, Some(unit_id)).await?;
-                self.mark_synced(profile);
+                self.mark_synced(profile).await;
                 Ok(())
             }
-            WorkKind::LfsDownload { oid, size } => self.do_lfs(profile, oid, *size, false).await,
-            WorkKind::LfsUpload { oid, size } => self.do_lfs(profile, oid, *size, true).await,
+            WorkKind::LfsDownload { oid, size } => {
+                self.do_lfs(profile, oid, *size, label, false, Some(unit_id))
+                    .await
+            }
+            WorkKind::LfsUpload { oid, size } => {
+                self.do_lfs(profile, oid, *size, label, true, Some(unit_id))
+                    .await
+            }
             WorkKind::OpenPullRequest { branch } => self.do_open_pr(profile, branch).await,
             WorkKind::Verify => self.verify(&profile.id).await.map(drop),
         }
@@ -2830,9 +3602,19 @@ impl Engine {
     ///
     /// Never fatal. Reclaiming space is housekeeping, and a pass that did
     /// everything asked of it must not report failure because a delete did not.
-    fn mark_synced(&self, profile: &SyncProfile) {
-        if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
-            snapshot.last_sync_ms = Some(self.platform.now_ms());
+    /// The release sweep is hooked here for the same reason the prune is, and
+    /// carries the same contract: a refusal is not a failure, an error is
+    /// logged, and neither can turn a sync that worked into a sync that
+    /// reported failure (Story 56.5).
+    ///
+    /// `async` since Story 56.5, because the sweep's per-object remote proof is
+    /// a round trip. The `status` guard is scoped so no `MutexGuard` crosses
+    /// the `.await`.
+    async fn mark_synced(&self, profile: &SyncProfile) {
+        {
+            if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
+                snapshot.last_sync_ms = Some(self.platform.now_ms());
+            }
         }
         if profile.lfs_prune_local {
             if let Err(err) = self.prune_lfs_store(profile) {
@@ -2842,6 +3624,13 @@ impl Engine {
                     "released no LFS objects this pass",
                 );
             }
+        }
+        if let Err(err) = self.release_expired(profile).await {
+            tracing::warn!(
+                profile = profile.name,
+                error = %err,
+                "released no expired content this pass",
+            );
         }
     }
 
@@ -3002,7 +3791,11 @@ impl Engine {
             );
             git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?
         };
-        git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
+        git::repo::enforce_local_config_with_filter(
+            &repo,
+            self.filter_program.as_deref(),
+            self.filter_serves_process,
+        )?;
         self.reconcile_sparse_cone(profile, &repo)?;
         Ok(repo)
     }
@@ -3092,7 +3885,11 @@ impl Engine {
         trust_full: bool,
     ) -> Result<gix::Repository> {
         let repo = git::repo::open(&profile.local_path, trust_full)?;
-        git::repo::enforce_local_config_with_filter(&repo, self.filter_program.as_deref())?;
+        git::repo::enforce_local_config_with_filter(
+            &repo,
+            self.filter_program.as_deref(),
+            self.filter_serves_process,
+        )?;
         // A kill between `gix::init` and the config write in `adopt` leaves a
         // repository with no remote, and this branch — taken from then on,
         // because `.git` exists — would otherwise fail every future sync with
@@ -3162,9 +3959,9 @@ impl Engine {
     /// they are the one thing a merge leaves behind that the user has to act
     /// on, and the working tree stops naming them as soon as they are
     /// committed.
-    async fn do_pull(&self, profile: &SyncProfile, source: SyncSource) -> Result<Vec<String>> {
+    async fn do_pull(&self, profile: &SyncProfile, source: SyncSource) -> Result<Converged> {
         if !profile.direction.pulls() {
-            return Ok(Vec::new());
+            return Ok(Converged::default());
         }
         // The very first sync of a profile has no working tree yet, so the
         // repository has to be materialized before anything can fetch into it.
@@ -3228,6 +4025,9 @@ impl Engine {
             .publish_while(
                 &profile,
                 SyncPhase::Fetching,
+                // A fetch moves many paths at once and can only honestly name
+                // the folder.
+                None,
                 report_rx,
                 |event, sample| {
                     let now = Instant::now();
@@ -3251,10 +4051,10 @@ impl Engine {
         // is that the two refs differ.
         let Some(remote_id) = outcome.remote_id else {
             // The remote has no such branch yet — a brand-new repository.
-            return Ok(Vec::new());
+            return Ok(Converged::default());
         };
         if outcome.local_id == Some(remote_id) {
-            return Ok(Vec::new());
+            return Ok(Converged::default());
         }
 
         // A fetch only moves `refs/remotes/origin/<branch>`; without an apply
@@ -3282,7 +4082,7 @@ impl Engine {
             if ahead {
                 // Nothing to apply — we hold every commit the remote has, plus
                 // our own. The push leg publishes them.
-                return Ok(Vec::new());
+                return Ok(Converged::default());
             }
         }
 
@@ -3294,7 +4094,7 @@ impl Engine {
                 .map_err(|err| SyncError::Journal(format!("merge task failed: {err}")))??;
             // A fast-forward takes the remote's history wholesale: nothing was
             // contested, so nothing was copied aside.
-            return Ok(Vec::new());
+            return Ok(Converged::default());
         }
 
         // Diverged. A one-way lane stops here because a human deciding is the
@@ -3321,7 +4121,7 @@ impl Engine {
             Self::commit_source(&profile, source),
         )
         .with_tags(profile.tags.clone());
-        let conflicts = tokio::task::spawn_blocking(move || {
+        let converged = tokio::task::spawn_blocking(move || {
             Self::converge_with_conflict_copies(
                 &git,
                 &profile_for_task,
@@ -3334,7 +4134,24 @@ impl Engine {
         .await
         .map_err(|err| SyncError::Journal(format!("converge task failed: {err}")))??;
 
-        if conflicts.is_empty() {
+        if !converged.stale.is_empty() {
+            // Nothing is on disk to act on, so this is a prompt rather than a
+            // work item: the paths are declared regenerable, the remote's
+            // revision won, and the tool that writes them has to run again
+            // before they describe this device. Saying it here is the only
+            // chance anybody gets — no later scan can tell a generated file
+            // that is current from one that is not.
+            self.warn(
+                &profile.id,
+                &profile.name,
+                format!(
+                    "{} generated file(s) took the remote's version — regenerate them",
+                    converged.stale.len()
+                ),
+            );
+        }
+
+        if converged.copies.is_empty() {
             tracing::info!(profile = profile.name, "merged diverged history cleanly");
         } else {
             // Non-blocking by contract: both revisions survive, so there is
@@ -3344,13 +4161,14 @@ impl Engine {
                 &profile.name,
                 format!(
                     "{} file(s) changed on both sides — your version was kept alongside as .sync-conflict-…",
-                    conflicts.len()
+                    converged.copies.len()
                 ),
             );
             // Until now the warning counted the copies and nothing named them,
             // so the one artifact the user has to deal with was unfindable
             // once the notification was dismissed.
-            let rows: Vec<db::ActivityEntry> = conflicts
+            let rows: Vec<db::ActivityEntry> = converged
+                .copies
                 .iter()
                 .map(|path| {
                     // Unlike a deletion, the copy is sitting in the folder
@@ -3375,7 +4193,7 @@ impl Engine {
             let now = self.platform.now_ms();
             self.with_db(|conn| db::record_activity(conn, &profile.id, now, &rows))?;
         }
-        Ok(conflicts)
+        Ok(converged)
     }
 
     /// Converge a diverged branch without asking anyone (AD-43).
@@ -3383,6 +4201,21 @@ impl Engine {
     /// The remote keeps the canonical path and the local revision is preserved
     /// beside it, so the `-X theirs` merge that follows can never lose content:
     /// by the time it runs, every contested file already exists twice.
+    ///
+    /// **Changing the same path is not the same as disagreeing about it.** Two
+    /// devices that ran the same formatter, or regenerated the same
+    /// deterministic listing, both show the path in their diff against the
+    /// merge base — and a copy made for that is pure litter: it is byte-identical
+    /// to the file it sits beside, and the user has to open both to find that
+    /// out. So the contested set is narrowed by one more question, one process
+    /// rather than one per path: does `HEAD` actually differ from the remote tip
+    /// *here*? A path that survives both filters is a real disagreement.
+    ///
+    /// [`SyncProfile::regenerable`] removes the remaining case, where the
+    /// content genuinely differs but the local revision is worth nothing —
+    /// a generated index listing two different new files. Only paths the user
+    /// declared get that treatment; keeper never guesses that an edit is
+    /// disposable.
     ///
     /// Blocking.
     fn converge_with_conflict_copies(
@@ -3392,7 +4225,7 @@ impl Engine {
         stamp: &str,
         device: &str,
         provenance: &Provenance,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Converged> {
         let repo_path = &profile.local_path;
         let base = git.merge_base(repo_path, "HEAD", tracking)?;
         let ours: std::collections::HashSet<PathBuf> = git
@@ -3403,9 +4236,28 @@ impl Engine {
             .diff_names(repo_path, &base, tracking)?
             .into_iter()
             .collect();
+        // Tip against tip: what the two sides actually hold different bytes for.
+        let differing: std::collections::HashSet<PathBuf> = git
+            .diff_names(repo_path, "HEAD", tracking)?
+            .into_iter()
+            .collect();
+        // Compiled here rather than per profile: divergence is the rare path,
+        // and a set nobody configured costs one `is_empty` to skip.
+        let regenerable = crate::exclude::PatternSet::new(&profile.regenerable)?;
 
-        let mut copied = Vec::new();
+        let mut converged = Converged::default();
         for rela in ours.intersection(&theirs) {
+            // Both sides moved, and landed on the same content: there is
+            // nothing to preserve and nothing to tell the user about.
+            if !differing.contains(rela.as_path()) {
+                continue;
+            }
+            if !regenerable.is_empty() && regenerable.matches(rela) {
+                converged
+                    .stale
+                    .push(rela.to_string_lossy().replace('\\', "/"));
+                continue;
+            }
             let source = repo_path.join(rela);
             // A path deleted locally has nothing to preserve.
             if !source.is_file() {
@@ -3420,7 +4272,7 @@ impl Engine {
             };
             std::fs::copy(&source, &destination)
                 .map_err(|err| SyncError::io("write conflict copy", destination.clone(), err))?;
-            copied.push(
+            converged.copies.push(
                 destination
                     .strip_prefix(repo_path)
                     .unwrap_or(&destination)
@@ -3438,7 +4290,84 @@ impl Engine {
                 provenance,
             ),
         )?;
-        Ok(copied)
+        // Sorted so a run is reportable in a stable order: a set iteration is
+        // deliberately unordered and two devices comparing notes on the same
+        // divergence should read the same list.
+        converged.copies.sort();
+        converged.stale.sort();
+        Ok(converged)
+    }
+
+    /// The last repair-backlog probe for this profile, if it is still fresh.
+    ///
+    /// `None` means "ask again", not "there is no backlog" — the two are
+    /// different answers and conflating them would make a poll during the TTL
+    /// claim a folder is clean.
+    fn remembered_repair(&self, profile_id: &str) -> Option<Vec<PathBuf>> {
+        Self::lock(&self.repair_memo)
+            .get(profile_id)
+            .filter(|(taken, _)| taken.elapsed() < REPAIR_MEMO_TTL)
+            .map(|(_, found)| found.clone())
+    }
+
+    /// Remember a probe, including an empty one: "this folder has no backlog"
+    /// is exactly as expensive to establish as the opposite and exactly as
+    /// worth not re-establishing five seconds later.
+    fn remember_repair(&self, profile_id: &str, found: &[PathBuf]) {
+        Self::lock(&self.repair_memo)
+            .insert(profile_id.to_owned(), (Instant::now(), found.to_vec()));
+    }
+
+    /// A bounded batch of paths whose committed blob contradicts their
+    /// attributes, or `None` when there are none.
+    ///
+    /// `Some` means "commit this instead of walking": these paths are modified
+    /// by definition — the filter's output cannot equal a raw blob — so asking
+    /// the filesystem to confirm it costs a read and a filter round trip each
+    /// and answers what the index already said. See
+    /// [`lfs::stage::mismatched_filtered_paths`].
+    ///
+    /// The stability gate is not consulted, and that is correct rather than a
+    /// shortcut: the gate exists to hold a file whose *writer* has not
+    /// finished, and nothing here is about the file's bytes changing. What is
+    /// wrong is the record, and the record is not being written to.
+    fn repair_recorded_pointers(
+        &self,
+        profile: &SyncProfile,
+    ) -> Result<Option<git::commit::StagedChange>> {
+        if profile.lfs_mode == LfsMode::Disabled {
+            return Ok(None);
+        }
+        let repo = self.open_repo(profile)?;
+        let tracked = git::repo::tracked_paths(&repo)?;
+        let from = Self::lock(&self.repair_cursor)
+            .get(&profile.id)
+            .copied()
+            .unwrap_or(0);
+        let (found, next) = lfs::stage::mismatched_filtered_paths(
+            &repo,
+            &tracked,
+            from,
+            REPAIR_WINDOW,
+            REPAIR_BATCH,
+        );
+        Self::lock(&self.repair_cursor).insert(profile.id.clone(), next);
+        if found.is_empty() {
+            return Ok(None);
+        }
+        // Said once per batch rather than once per path: a folder in this state
+        // has tens of thousands, and the useful facts are how many are left and
+        // that something is being done about it.
+        tracing::info!(
+            profile = profile.name,
+            batch = found.len(),
+            "these files are committed as plain blobs although this folder's rules filter them; \
+             rewriting them as pointers so the next scan does not have to read them again"
+        );
+        Ok(Some(git::commit::StagedChange {
+            modified: found,
+            ..Default::default()
+        }))
     }
 
     /// Scan, gate and commit whatever settled. Returns how many paths landed.
@@ -3459,7 +4388,16 @@ impl Engine {
             // preserved by the merge's own conflict handling instead.
             return Ok(0);
         }
-        let staged = self.collect_stable_changes(profile)?;
+        // Before the walk, not after it: a path whose recorded blob contradicts
+        // its own attributes is already known to be work, and the walk is the
+        // most expensive possible way to rediscover it. Each one costs a full
+        // read and a filter round trip *per walk* until it is committed, which
+        // is what turned this folder's 84-second stat floor into 25 to 74
+        // minutes. The index knows the answer for nothing.
+        let staged = match self.repair_recorded_pointers(profile)? {
+            Some(repair) => repair,
+            None => self.collect_stable_changes(profile)?,
+        };
         if staged.is_empty() {
             return Ok(0);
         }
@@ -3517,6 +4455,114 @@ impl Engine {
     /// `push_unit` is this push's own journal row, when a journaled unit is
     /// driving. It is handed to the commit so the rows it records can name the
     /// work that will publish them (Story 34.16).
+    /// Push once, as the profile's own credential.
+    fn push_once(
+        &self,
+        profile: &SyncProfile,
+        refspec: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        let git = self.git.clone();
+        let repo_path = profile.local_path.clone();
+        let refspec = refspec.to_owned();
+        let credential = self.credential(profile);
+        async move {
+            let credential = credential?;
+            tokio::task::spawn_blocking(move || {
+                git.push(&repo_path, "origin", &refspec, credential.as_ref())
+            })
+            .await
+            .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))?
+        }
+    }
+
+    /// What a refused push means for *this* profile (DW-207).
+    ///
+    /// git says the same thing however the folder is configured — "! [rejected]
+    /// … (fetch first)", "failed to push some refs" — and
+    /// [`git::cli::classify_message`] can only read that text, so it answers
+    /// [`SyncError::Diverged`]: permanent, and needing a human. On a one-way
+    /// lane that is exactly right, because a human deciding is the point
+    /// (AD-50).
+    ///
+    /// On a **bidirectional profile sharing a branch** it is wrong. Being
+    /// overtaken between the merge and the push is what two machines syncing
+    /// one branch *do* — the other one pushed first, which is the entire point
+    /// of sharing it — and the answer is the reconcile this engine already
+    /// owns.
+    ///
+    /// # Why the reconcile happens HERE, inline
+    ///
+    /// The first cut of this queued a `Pull` and returned a transient error,
+    /// leaving the retry to the scheduler. Measured in the field, that spun:
+    /// **613 rejected pushes in 135 seconds**, ~4.5 per second, before the
+    /// queued reconcile finally got its turn. It converged — the merge ran, the
+    /// commits landed — but it hammered the forge six hundred times to do it
+    /// and burned the profile's failure counter on the way, so a folder that
+    /// was fixing itself told its owner "sync has failed 6 times in a row".
+    ///
+    /// The cause is queue ordering: every unpushed commit has queued its own
+    /// `Push` unit, `claim_ready` takes them in front of a `Pull` enqueued
+    /// afterwards, and each one meets the same unmoved remote. Fetching and
+    /// merging *in this unit*, then retrying *this* push, removes the ordering
+    /// question entirely: one reconcile, one retry, and the ordinary case ends
+    /// with nothing surfaced at all — which is what a race between two machines
+    /// deserves.
+    ///
+    /// Bounded on purpose: exactly one reconcile and one retry. If the remote
+    /// moved *again* in that window the error comes back transient, the
+    /// scheduler backs off, and the next pass tries the whole thing once more.
+    async fn reconcile_and_retry_push(
+        &self,
+        profile: &SyncProfile,
+        source: SyncSource,
+        refspec: &str,
+        err: SyncError,
+    ) -> Result<()> {
+        let SyncError::Diverged { reason, .. } = &err else {
+            return Err(err);
+        };
+        // A lane, or a one-way profile: the remote moving is a decision, and
+        // the human who owns the lane is the one who takes it.
+        if profile.lane == SyncLane::Worktree || profile.direction == SyncDirection::PushOnly {
+            return Err(err);
+        }
+        let reason = reason.clone();
+        tracing::info!(
+            profile = profile.name,
+            %reason,
+            "the remote moved while pushing; reconciling"
+        );
+
+        // Fetch and merge. `do_pull` commits settled work first, which is what
+        // lets the merge run at all, and it never pushes — so this cannot
+        // recurse back into here.
+        self.do_pull(profile, source).await?;
+
+        match self.push_once(profile, refspec).await {
+            Ok(()) => {
+                tracing::info!(
+                    profile = profile.name,
+                    "the reconcile landed and the push went through"
+                );
+                Ok(())
+            }
+            // Overtaken a second time inside one pass, or refused for a reason
+            // the reconcile cannot address. Transient either way: the scheduler
+            // backs off and the next pass reconciles again from scratch.
+            Err(again) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %again,
+                    "the push was still refused after reconciling"
+                );
+                Err(SyncError::RemoteMoved {
+                    profile: profile.name.clone(),
+                    reason,
+                })
+            }
+        }
+    }
+
     async fn do_push(
         &self,
         profile: &SyncProfile,
@@ -3569,24 +4615,21 @@ impl Engine {
         event.files_total = (count > 0).then_some(count);
         self.publish(event);
 
-        let git = self.git.clone();
-        let repo_path = profile.local_path.clone();
         // A lane publishes ONLY its own branch. The base branch is never in
         // the refspec, so pushing over a human's work is impossible by
         // construction rather than by care (AD-50).
         let working = Self::working_branch(profile);
         let refspec = format!("refs/heads/{working}:refs/heads/{working}");
-        let credential = self.credential(profile)?;
         // Counted where the invocation is, not where it returns: an attempt
         // against an unreachable remote is still this policy firing, and a
         // session that claims "one push at the end" has to be able to show it
         // even when that push failed (Story 41.5).
         self.bump_counters(&profile.id, |counters| counters.pushes += 1);
-        tokio::task::spawn_blocking(move || {
-            git.push(&repo_path, "origin", &refspec, credential.as_ref())
-        })
-        .await
-        .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))??;
+        let pushed = self.push_once(profile, &refspec).await;
+        if let Err(err) = pushed {
+            self.reconcile_and_retry_push(profile, source, &refspec, err)
+                .await?;
+        }
 
         if count > 0 {
             let mut event = self.progress(profile, SyncPhase::Pushing);
@@ -3619,12 +4662,16 @@ impl Engine {
     /// `node_modules/`, build output or a `.env` went to the remote in full.
     ///
     /// `status_paths` now asks the dirwalk to emit untracked content file by
-    /// file, so git decides what is ignored and a directory never reaches here.
-    /// If one somehow does, it is skipped and logged rather than walked: not
-    /// syncing a folder is visible and recoverable, whereas publishing a
-    /// secret because a walk ignored `.gitignore` is neither.
-    fn expand_untracked(root: &Path, entries: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    /// file, so git decides what is ignored. A **nested repository** still
+    /// arrives collapsed and always will — its files belong to that repository,
+    /// not to this one, and git will not list them — so the refusal is a
+    /// standing property of the tree rather than an anomaly. It is returned
+    /// rather than logged here: this is called on both the commit walk and
+    /// every UI poll, and logging inside it reported the same folders on every
+    /// pass. [`Self::report_collapsed`] says each one once.
+    fn expand_untracked(root: &Path, entries: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
         let mut out = Vec::with_capacity(entries.len());
+        let mut collapsed = Vec::new();
         for rela in entries {
             if rela.components().any(|c| c.as_os_str() == ".git") {
                 continue;
@@ -3637,17 +4684,68 @@ impl Engine {
                 Err(err) => return Err(SyncError::io("stat untracked entry", absolute, err)),
             };
             if metadata.is_dir() {
-                tracing::warn!(
-                    path = %rela.display(),
-                    "sync: skipping a collapsed untracked directory — git should have listed its \
-                     files individually, and walking it here would ignore .gitignore"
-                );
+                collapsed.push(rela.clone());
                 continue;
             }
             out.push(rela.clone());
         }
         out.sort();
-        Ok(out)
+        Ok((out, collapsed))
+    }
+
+    /// Warn about each collapsed untracked directory once per profile.
+    ///
+    /// Once, because the condition does not change between walks and the folder
+    /// is not going to start syncing: the honest report is a fact stated on
+    /// discovery, not a metronome. The set is never pruned — a repository that
+    /// stops being nested becomes an ordinary file entry that never reaches
+    /// here again, and a few dozen remembered paths cost less than one line of
+    /// the log they replace.
+    fn report_collapsed(&self, profile_id: &str, collapsed: &[PathBuf]) {
+        if collapsed.is_empty() {
+            return;
+        }
+        let mut reported = Self::lock(&self.collapsed_reported);
+        for rela in collapsed {
+            if reported.insert((profile_id.to_owned(), rela.clone())) {
+                tracing::warn!(
+                    path = %rela.display(),
+                    "sync: skipping an untracked directory git reported collapsed — it is its own \
+                     repository, so its files are not this folder's to commit, and walking it here \
+                     would ignore .gitignore"
+                );
+            }
+        }
+    }
+
+    /// Raise the paths this pass could not read, if any.
+    ///
+    /// These need a human — a permission has to be restored, a file has to be
+    /// released by whatever holds it, or the path has to be excluded — so this
+    /// goes to the warning surface rather than the log alone. The engine keeps
+    /// converging everything else meanwhile, which is the whole point of
+    /// stepping over them (FR-89: convergence never waits on a prompt).
+    ///
+    /// One profile carries one warning string, so a second unreadable path
+    /// cannot have its own line. It is counted rather than dropped: "and 3
+    /// more" is the difference between a user who knows to keep looking and one
+    /// who fixes a single file and assumes they are done.
+    fn report_unreadable(&self, profile: &SyncProfile, unreadable: &[git::repo::UnreadablePath]) {
+        let Some(first) = unreadable.first() else {
+            return;
+        };
+        let others = match unreadable.len() - 1 {
+            0 => String::new(),
+            rest => format!(", and {rest} more"),
+        };
+        self.warn(
+            &profile.id,
+            &profile.name,
+            format!(
+                "could not read {first}{others} — everything else in this folder synchronized \
+                 without it; restore access to the file or exclude it",
+            ),
+        );
     }
 
     /// Walk the working tree and keep only what the completeness gate passes.
@@ -3673,7 +4771,53 @@ impl Engine {
     /// or enqueues the push.
     fn collect_stable_changes(&self, profile: &SyncProfile) -> Result<git::commit::StagedChange> {
         let repo = self.open_repo(profile)?;
-        let status = git::repo::status_paths(&repo)?;
+        // One walk per folder. If a Pending poll is already inside one, this
+        // pass has nothing to add by starting a second: it would read the same
+        // tree, reach the same verdicts, and halve the throughput of the walk
+        // already running. Staging nothing is an outcome this caller already
+        // handles on every quiet pass, and the supervisor's next tick retries.
+        let Some(_claim) = self.claim_walk(&profile.id) else {
+            tracing::info!(
+                profile = %profile.name,
+                "a status walk is already in flight; deferring this pass to the next tick"
+            );
+            return Ok(git::commit::StagedChange::default());
+        };
+        // A walk that takes longer than a second says so, on the surface the
+        // owner is looking at. Before this, the one step that can run for ten
+        // minutes on a 155 000-file folder published nothing at all, so the pane
+        // read `Idle - N waiting to sync` for the whole of it and there was no
+        // way to tell work from a wedge. Fast folders still report nothing: the
+        // pacing lives in `git::repo`, and DW-116's flipping glyph stays fixed.
+        let status = {
+            let report = |scanned: u64, entries: u64| {
+                let mut event = self.progress(profile, SyncPhase::Scanning);
+                event.files_done = scanned;
+                // Both counts are index entries now (see [`git::repo::WalkReport`]),
+                // so the numerator can no longer overrun the denominator and
+                // the bar cannot render past its end. A zero denominator is
+                // still not a denominator: an index the walk could not read
+                // bounds nothing, and the count alone is the honest answer.
+                event.files_total = (entries > 0).then_some(entries);
+                self.publish(event);
+            };
+            // `full`: this leg holds the walk claim, and finding untracked
+            // files is what it exists to do. It is also the leg that must save
+            // the stats — a folder whose index carries none pays 25.4 GB of
+            // re-reads per pass until somebody writes them down.
+            git::repo::status_paths_reported(
+                &repo,
+                Some(&report),
+                self.walk_report_interval,
+                git::repo::WalkPolicy::full(),
+            )?
+        };
+        // The pass only got this far because those paths were stepped over, and
+        // a folder that syncs while quietly omitting a file is the one outcome
+        // worse than a folder that stops: nobody looks for what they were not
+        // told about. Raised here rather than in `git::repo` because this is the
+        // layer that knows which profile is speaking.
+        self.report_unreadable(profile, &status.unreadable);
         let now = self.platform.now_ms();
 
         let mut gates = Self::lock(&self.gates);
@@ -3686,13 +4830,14 @@ impl Engine {
         // simultaneous `&mut` borrows of one field would not compile.
         let mut new_paths: Vec<PathBuf> = Vec::new();
         let mut changed_paths: Vec<PathBuf> = Vec::new();
-        // gitoxide's dirwalk reports untracked content with `CollapseDirectory`,
-        // so a brand-new folder arrives as ONE entry naming the directory. The
-        // commit path can only stage regular files and symlinks, so a collapsed
-        // entry has to be expanded here — otherwise every new subdirectory
-        // raises "only regular files and symlinks can be synchronized" forever
-        // and nothing inside it ever syncs.
-        let untracked = Self::expand_untracked(&profile.local_path, &status.untracked)?;
+        // gitoxide's dirwalk reports untracked content file by file, but a
+        // nested repository still arrives as ONE entry naming the directory.
+        // The commit path can only stage regular files and symlinks, so those
+        // are separated out here — otherwise every one of them raises "only
+        // regular files and symlinks can be synchronized" forever.
+        let (untracked, collapsed) =
+            Self::expand_untracked(&profile.local_path, &status.untracked)?;
+        self.report_collapsed(&profile.id, &collapsed);
         let groups: [(&Vec<PathBuf>, bool); 3] = [
             (&status.added, true),
             (&untracked, true),
@@ -3711,6 +4856,23 @@ impl Engine {
                     StabilityVerdict::Stable => {
                         if is_new {
                             new_paths.push(rela.clone());
+                        } else if let Some(bytes) =
+                            lfs::stage::truncated_media(&repo, rela, &absolute)
+                        {
+                            // Not an edit — an accident, and one whose commit
+                            // is unrecoverable: cleaning an empty file emits a
+                            // pointer to nothing, which then replaces the only
+                            // reference every peer has to the real object
+                            // (DW-140). Held out of the staged set and named
+                            // out loud instead.
+                            self.warn(
+                                &profile.id,
+                                &profile.name,
+                                format!(
+                                    "{} is empty but should hold {bytes} bytes — not committing it; restore it from the remote before syncing this folder",
+                                    rela.display()
+                                ),
+                            );
                         } else if !lfs::stage::is_false_modification(&repo, rela, &absolute) {
                             // An LFS-tracked path whose entry is racily clean
                             // reports the worktree's bytes as differing from
@@ -3766,7 +4928,13 @@ impl Engine {
             }
         }
         for rela in &staged.deleted {
-            if let Some(size) = Self::removed_size(&repo, rela) {
+            // A deleted path cannot be stat'd, so the index is the only place
+            // left to ask — and it answers an LFS entry with the size the
+            // pointer names rather than the pointer's own ~130 bytes. This used
+            // to be `Self::removed_size`, a second inlined copy of exactly that
+            // derivation; `lfs::stage::indexed_size` is now the only one
+            // (Story 56.2).
+            if let Some(size) = lfs::stage::indexed_size(&repo, rela) {
                 staged.sizes.insert(rela.clone(), size);
             }
         }
@@ -3856,7 +5024,7 @@ impl Engine {
             .chain(staged.modified.iter())
             .cloned()
             .collect();
-        let staging = lfs::stage::prepare(profile, &store, &candidates)?;
+        let staging = lfs::stage::prepare(&repo, profile, &store, &candidates)?;
 
         // The denominator for staging progress, read before the augmentation
         // below: it is the same count `commit_local` has already published, and
@@ -3932,6 +5100,17 @@ impl Engine {
             };
             let unit_id =
                 self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now))?;
+            // git's spelling, the frame the ledger and the release sweep both
+            // key on. The label is what lets the completion edge below know
+            // which path this unit confirms (Story 56.5).
+            let key = lfs::stage::index_key(&object.path);
+            self.with_db(|conn| db::label_unit(conn, unit_id, &key))?;
+            // The provenance memo does NOT go here. It is a statement about a
+            // ledger row, and it is written once `stage_and_commit` has proved a
+            // commit exists — see below. These journal rows DO go here, for the
+            // reason the long comment above gives, and that reason is unchanged:
+            // an unreferenced object on the remote costs disk, a lost upload
+            // obligation costs the file.
             lfs_units.insert(object.path.clone(), unit_id);
         }
 
@@ -3954,6 +5133,33 @@ impl Engine {
             lfs = staging.uploads.len(),
             "committed"
         );
+
+        // The provenance memo, here and not in the enqueue loop above (Story
+        // 56.5, FR-341, AD-131). This clone produced these bytes, so the
+        // local-origin clock applies and the path is not eligible for release at
+        // any age until the remote confirms it — and `note_local_authorship`
+        // also clears any `synced_at_ms`, because the new bytes are not the
+        // bytes upstream holds.
+        //
+        // Which is exactly why it may not run before the commit exists.
+        // `stage_and_commit` can return `Err` — an `index.lock`, ENOSPC, a git
+        // failure — or `Ok(None)`, meaning every staged path turned out
+        // byte-identical to `HEAD` and nothing was committed at all. Written
+        // first, a byte-identical rewrite of a path that ARRIVED from the remote
+        // flipped it to `local_origin = 1` and erased a correct `synced_at_ms`,
+        // making remote-origin content unreleasable until a now-pointless upload
+        // unit drained — which offline is never. On any folder whose files are
+        // being touched, the sweep then quietly reclaimed nothing.
+        //
+        // Read from `staging.uploads` rather than through `lfs_units`, whose
+        // value is a unit id: the ledger wants the object's identity, and both
+        // collections are built from that one list in that one order.
+        for object in &staging.uploads {
+            let key = lfs::stage::index_key(&object.path);
+            self.with_db(|conn| {
+                db::note_local_authorship(conn, &profile.id, &key, now, &object.oid, object.size)
+            })?;
+        }
 
         // The commit is proven to exist, so this is the first moment an
         // activity row can honestly claim it. Recording in `commit_local`
@@ -4012,30 +5218,6 @@ impl Engine {
         }
         let now = self.platform.now_ms();
         self.with_db(|conn| db::record_activity(conn, &profile.id, now, &rows))
-    }
-
-    /// How big a deleted path used to be, if the repository still knows.
-    ///
-    /// The index entry git kept for the path names the blob it last recorded,
-    /// and a blob's length *is* the file's length — except for an LFS-tracked
-    /// path, where the blob is a pointer and the real size is the number
-    /// written inside it. Both are answered here. Anything else — a path whose
-    /// index entry an earlier, half-finished stage already removed — answers
-    /// `None`: a guessed figure in a size column is worse than a blank one.
-    fn removed_size(repo: &gix::Repository, rela: &Path) -> Option<u64> {
-        let index = repo.index_or_empty().ok()?;
-        // The index keys paths with forward slashes on every platform, the
-        // same conversion `lfs::stage::indexed_pointer` makes.
-        let key = rela.to_string_lossy().replace('\\', "/");
-        let entry = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes()))?;
-        let blob = repo.find_header(entry.id).ok()?.size();
-        // A pointer is under 1 KiB by specification, so a larger blob cannot
-        // be one and must not be loaded to find that out.
-        if blob > lfs::pointer::MAX_POINTER_BYTES as u64 {
-            return Some(blob);
-        }
-        let object = repo.find_object(entry.id).ok()?;
-        Some(lfs::pointer::Pointer::parse(&object.data).map_or(blob, |pointer| pointer.size))
     }
 
     /// Where this profile's LFS server is, and what to show it (Story 34.17).
@@ -4286,12 +5468,18 @@ impl Engine {
         })
     }
 
+    /// `unit` is the journal row this transfer belongs to, carried through to
+    /// [`Self::materialize_landed`], which asks the journal whether anybody is
+    /// waiting for it. `None` for a caller that is not draining a row. Ignored
+    /// on the upload leg, which publishes nothing to the worktree.
     async fn do_lfs(
         &self,
         profile: &SyncProfile,
         oid: &str,
         size: u64,
+        label: Option<&str>,
         upload: bool,
+        unit: Option<i64>,
     ) -> Result<()> {
         if profile.lfs_mode == LfsMode::Disabled {
             return Ok(());
@@ -4304,7 +5492,14 @@ impl Engine {
         } else {
             SyncPhase::DownloadingLfs
         };
-        self.publish(self.progress(profile, phase));
+        // The file, not the folder. Every other leg of a sync moves many paths
+        // at once and can only honestly name the profile; a transfer moves
+        // exactly one object, and the path it lands at is the most useful thing
+        // a progress line can say — especially on a slow link, where one object
+        // owns the line for an hour.
+        let mut event = self.progress(profile, phase);
+        event.current = label.map(str::to_owned);
+        self.publish(event);
 
         // `.lfsconfig` at the repository root overrides the derived endpoint —
         // the documented precedence, and the shape a self-hosted LFS server
@@ -4331,7 +5526,7 @@ impl Engine {
         if lfsconfig.is_none() {
             if let Some(remote) = lfs::local::remote_store(&profile.remote_url) {
                 return self
-                    .copy_lfs_object(profile, remote, oid, size, upload)
+                    .copy_lfs_object(profile, remote, oid, size, upload, label, unit)
                     .await;
             }
         }
@@ -4379,7 +5574,7 @@ impl Engine {
         // a channel rather than touching the engine directly.
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let transfer = Arc::new(
-            lfs::basic::BasicTransfer::new(self.http.clone(), store.clone())
+            lfs::basic::BasicTransfer::new(self.transfer_http.clone(), store.clone())
                 .with_sink(Box::new(move |event| {
                     // `false` detaches the reporter for good, so this says
                     // "stop" only once the receiver is genuinely gone.
@@ -4403,6 +5598,7 @@ impl Engine {
             .publish_while(
                 profile,
                 phase,
+                label,
                 event_rx,
                 |event, transfer_event| {
                     tally.fold(&transfer_event);
@@ -4426,13 +5622,104 @@ impl Engine {
             }
         }
 
-        if !upload {
+        if upload {
+            // The remote now holds this object, and the unit's label is the
+            // path it was queued for — `commit_local` names every upload unit
+            // with `index_key`. This is the only per-path confirmation keeper
+            // gets for content it authored, and without it a locally created
+            // file is unreleasable at any age (Story 56.5, FR-341).
+            self.note_unit_synced(profile, label, oid);
+        } else {
             // The object is in the store; the worktree still holds the pointer
             // that was checked out. Replacing it is what makes a peer's clone
             // contain real bytes rather than a text stub.
-            self.materialize_pending(profile, &store)?;
+            //
+            // The path that just arrived, not the whole tree: see
+            // [`Self::materialize_landed`] for the 40 hours the sweep spent here.
+            self.materialize_landed(profile, &store, oid, label, unit)?;
         }
         Ok(())
+    }
+
+    /// Memo that the remote now holds the object one upload unit carried
+    /// (Story 56.5, FR-341).
+    ///
+    /// The label is the unit's name, and `commit_local` sets it to
+    /// [`lfs::stage::index_key`] of the path being uploaded, which is exactly
+    /// the `materialized` ledger's key. An unlabelled unit — every upload
+    /// queued before this story — writes nothing and is not an error: no label
+    /// means no path this confirmation could honestly be attached to.
+    ///
+    /// # A stale unit must not forge a confirmation
+    ///
+    /// `oid` is what actually crossed the wire, and the memo is written only
+    /// when the label's currently indexed pointer still names it. The ordinary
+    /// sequence that makes that necessary: path A is committed as oid X and
+    /// upload unit U is enqueued and labelled `A`; the server is unreachable so
+    /// U waits; the owner edits A; A is committed as oid Y, and
+    /// [`db::note_local_authorship`] correctly clears A's `synced_at_ms`; U
+    /// finally completes and stamps `synced_at_ms = now` for A — recording that
+    /// the remote holds A's content when what it holds is the superseded X.
+    ///
+    /// The bytes survived that only because [`Self::release_resolved`] takes a
+    /// fresh [`Self::remote_serves`] proof at the moment of deletion, so
+    /// AD-131's two independent barriers collapsed to one for exactly the path
+    /// most likely to have been edited. A mismatch means the unit is stale and
+    /// honestly confirms nothing: logged at `debug!` and dropped.
+    ///
+    /// Fail closed. A repository this cannot open, or a path the index no
+    /// longer carries a pointer for, records nothing either — an unwritten memo
+    /// costs one unreleasable path until the next upload of it, and a wrong one
+    /// costs a guard.
+    ///
+    /// One index read, and free where it sits: this method is synchronous and
+    /// runs immediately after a network transfer. The [`gix::Repository`] lives
+    /// in a scoped block, as every other one in this file does.
+    ///
+    /// **Shared object, two paths: only the labelled one is confirmed.**
+    /// `db::label_unit` is first-writer-wins so that a name does not flicker,
+    /// which means one unit covers both paths but names one. The other keeps
+    /// its `NULL` and stays unreleasable, which is the conservative direction
+    /// and the one FR-341 asks for.
+    ///
+    /// Best-effort: the bytes reached the remote, and failing the unit because
+    /// a memo did not land would re-upload them.
+    fn note_unit_synced(&self, profile: &SyncProfile, label: Option<&str>, oid: &str) {
+        let Some(path) = label else {
+            return;
+        };
+        let current = {
+            let Ok(repo) = git::repo::open(&profile.local_path, profile.removable) else {
+                tracing::debug!(
+                    profile = profile.name,
+                    path = path,
+                    "uploaded the object, but could not open the repository to check \
+                     whether this path still names it",
+                );
+                return;
+            };
+            lfs::stage::indexed_pointer(&repo, &PathBuf::from(path))
+        };
+        if !current.is_some_and(|pointer| pointer.oid == oid) {
+            tracing::debug!(
+                profile = profile.name,
+                path = path,
+                oid = oid,
+                "uploaded an object this path no longer commits; recording no \
+                 confirmation, because the remote does not hold the bytes this \
+                 path now names",
+            );
+            return;
+        }
+        let now = self.platform.now_ms();
+        if let Err(err) = self.with_db(|conn| db::note_synced(conn, &profile.id, path, now)) {
+            tracing::debug!(
+                profile = profile.name,
+                path = path,
+                error = %err,
+                "uploaded the object, but could not record the confirmation",
+            );
+        }
     }
 
     /// Move one LFS object to or from a filesystem remote (Story 34.18).
@@ -4445,6 +5732,12 @@ impl Engine {
     ///
     /// Blocking, so it runs on `spawn_blocking`: the copy hashes every byte to
     /// verify it, which for this subsystem means gigabytes.
+    ///
+    /// `unit` rides through for [`Self::do_lfs`]'s reason: this is the
+    /// filesystem-remote half of the same leg, so a requested unit delivered
+    /// off a pendrive must publish on the same terms one delivered over HTTP
+    /// does.
+    #[allow(clippy::too_many_arguments)]
     async fn copy_lfs_object(
         &self,
         profile: &SyncProfile,
@@ -4452,6 +5745,8 @@ impl Engine {
         oid: &str,
         size: u64,
         upload: bool,
+        label: Option<&str>,
+        unit: Option<i64>,
     ) -> Result<()> {
         // An unmounted volume is absence, never failure (AD-48), and it must not
         // read as a corrupt or missing object. `Deferred` waits for the volume to
@@ -4486,12 +5781,189 @@ impl Engine {
             "copied a large object to a filesystem remote"
         );
 
-        if !upload {
+        if upload {
+            // The filesystem remote now holds the object, which is the same
+            // per-path confirmation the HTTP leg records — a pendrive is a
+            // remote (Story 56.5, FR-341).
+            self.note_unit_synced(profile, label, &oid);
+        } else {
             // The object is in the store; the worktree still holds the pointer
             // that was checked out. Replacing it is what makes this clone contain
             // real bytes rather than a text stub.
-            self.materialize_pending(profile, &local)?;
+            //
+            // The path that just arrived, not the whole tree: see
+            // [`Self::materialize_landed`] for the 40 hours the sweep spent here.
+            self.materialize_landed(profile, &local, &oid, label, unit)?;
         }
+        Ok(())
+    }
+
+    /// Replace the pointer for the one path an object just landed for.
+    ///
+    /// [`Self::materialize_pending`] is the whole-tree sweep, and it is the
+    /// right shape exactly once per pass: it reads the index and then stats —
+    /// and reads — every tracked file small enough to be a pointer. Per
+    /// *object* it is quadratic, and on real content that is not a slow path,
+    /// it is a stopped one. Measured on the folder that reported this: 154,765
+    /// tracked paths on a USB APFS volume at 3.9 ms per path cold is ~10
+    /// minutes for one sweep, so a backlog of 238 objects would have spent ~40
+    /// hours re-reading the same tree — one file materialized every 2 to 15
+    /// minutes, the queue frozen at "238 files left, 4.5 GB", and no throughput
+    /// figure at all, because the worker was inside a sweep instead of on the
+    /// wire. Delivering one object must never cost a walk of the repository.
+    ///
+    /// A transfer names its path in the journal row's label (that is what
+    /// `label_unit` is for), so the object that just arrived needs one stat, one
+    /// read and one index refresh. An unlabelled row (`None`) defers to the
+    /// sweep rather than paying for a walk here.
+    ///
+    /// # A request is for content, so it covers every path that content sits at
+    ///
+    /// Two paths holding identical bytes share one object and therefore one
+    /// download — the case `label_unit`'s first-writer-wins rule exists for.
+    /// For a *background* arrival the label is the whole answer: the second
+    /// path keeps its pointer until the next sweep, one tick away in
+    /// [`Self::scan_and_enqueue`], which is where a whole-tree question
+    /// belongs.
+    ///
+    /// For a *requested* arrival the label is not enough, and the first version
+    /// of this shipped believing it was. Ask for `a.mp4` and then for
+    /// `a-copy.mp4` before delivery: the second request deduplicates onto the
+    /// same row (correctly — the bytes are identical), the label still says
+    /// `a.mp4`, and under `PointerOnly` nothing publishes `a-copy.mp4` ever,
+    /// because the sweep is switched off in that mode. The request reported a
+    /// unit id and silently never delivered. So a requested arrival asks the
+    /// index which paths this oid belongs to and publishes each of them that
+    /// still holds pointer text. The cost — one index read per requested
+    /// completion, never per background one — is bounded by the thing that
+    /// makes it safe: a human, or one click, produced it.
+    ///
+    /// # Whether it was requested is read from the journal, not passed in
+    ///
+    /// [`db::unit_urgency`] is consulted here rather than at claim time,
+    /// because a request that arrives while its covering download is already
+    /// `running` — which [`WorkKind::covered_while_running`] makes ordinary —
+    /// raises the urgency of a row the supervisor read before the person asked.
+    ///
+    /// # Being requested bypasses the mode gate, and nothing else
+    ///
+    /// `lfs_mode != Materialize` is the right answer for *arrival*:
+    /// [`LfsMode::PointerOnly`] means "leave what arrives as pointers", and
+    /// [`LfsMode::Disabled`] has no pointers to replace. It is fatal for a
+    /// *request*, because `PointerOnly` is the mode in which paths are virtual
+    /// in the first place — so without this, asking for a file under
+    /// `PointerOnly` would fetch the object into the store, return `Ok`, and
+    /// leave the worktree holding pointer text: green tests over an inert
+    /// feature (Story 56.3).
+    ///
+    /// It bypasses exactly that one gate. `Disabled` still refuses, because
+    /// nothing routes the path through the clean filter there and real bytes
+    /// would become a new blob in the next commit. The sparse cone, the
+    /// pointer-text check and the store-contains check below all still hold,
+    /// because each of them answers a question the request did not settle —
+    /// what the worktree holds *now*, not what it held when the row was queued.
+    fn materialize_landed(
+        &self,
+        profile: &SyncProfile,
+        store: &lfs::store::LfsStore,
+        oid: &str,
+        label: Option<&str>,
+        unit: Option<i64>,
+    ) -> Result<()> {
+        let requested = match unit {
+            Some(id) => self.with_db(|conn| db::unit_urgency(conn, id))? == db::Urgency::Requested,
+            None => false,
+        };
+        // Pointer-only leaves content as a pointer on purpose — the
+        // whole-profile lever `materialize_pending` documents — and disabled has
+        // no pointers to replace. A path somebody asked for is the exception,
+        // and only for `PointerOnly`: see this function's doc.
+        if profile.lfs_mode == LfsMode::Disabled
+            || (profile.lfs_mode != LfsMode::Materialize && !requested)
+        {
+            return Ok(());
+        }
+        let Some(rela) = label.map(PathBuf::from) else {
+            return Ok(());
+        };
+        let cone = SparseCone::new(&profile.subpaths);
+        // The labelled path first: it is the one the progress line named and
+        // the one a caller is most likely waiting on.
+        let mut wanted: Vec<PathBuf> = Vec::new();
+        if cone.includes(&rela) {
+            wanted.push(rela.clone());
+        }
+        if requested {
+            let repo = self.open_repo(profile)?;
+            for (key, pointer) in lfs::stage::indexed_pointers(&repo) {
+                if pointer.oid != oid {
+                    continue;
+                }
+                let other = PathBuf::from(&key);
+                if other != rela && cone.includes(&other) {
+                    wanted.push(other);
+                }
+            }
+        }
+
+        let mut landed: Vec<PathBuf> = Vec::new();
+        for candidate in &wanted {
+            let one = std::slice::from_ref(candidate);
+            let Some(smudge) = lfs::stage::pending_smudges(&profile.local_path, one)?.pop() else {
+                // Not a pointer any more: another arm materialized it, or the
+                // file has been replaced since the row was queued. Either way
+                // there is nothing here to replace.
+                continue;
+            };
+            if !store.contains(&smudge.pointer.oid, smudge.pointer.size) {
+                // The pointer in the worktree names a different object than the
+                // one that landed — the path was edited since the row was
+                // queued. The sweep owns that discovery, and queues the object
+                // it now needs.
+                continue;
+            }
+            lfs::stage::materialize(store, &profile.local_path, &smudge)?;
+            // The one moment this is knowable: content for this path now exists
+            // here, so the next object for it is a replacement rather than an
+            // arrival.
+            // git's spelling, from the very function 56.4's release and Story
+            // 56.5's sweep key their rows through. A `\`-joined
+            // `to_string_lossy` would, on Windows, write an arrival row the
+            // sweep can never find and nothing would ever be released.
+            let published = lfs::stage::index_key(&smudge.path);
+            let now = self.platform.now_ms();
+            self.with_db(|conn| db::remember_materialized(conn, &profile.id, &published, now))?;
+            // The content came from upstream, and landing here is the first
+            // thing that ever happened to it on this machine: the remote-origin
+            // clock starts now (Story 56.5, AD-131). The identity rides along
+            // because this is the one moment the pointer is in hand, and
+            // `RELEASE_BUDGET_BYTES` can only bound a pass over rows that
+            // recorded a size.
+            self.with_db(|conn| {
+                db::note_arrival(
+                    conn,
+                    &profile.id,
+                    &published,
+                    now,
+                    &smudge.pointer.oid,
+                    smudge.pointer.size,
+                )
+            })?;
+            tracing::info!(
+                profile = profile.name,
+                path = published,
+                "materialized LFS content"
+            );
+            landed.push(smudge.path);
+        }
+        if landed.is_empty() {
+            return Ok(());
+        }
+        // Every worktree file just changed size, so its index entry carries the
+        // pointer's stat and status would call it modified. Re-stat them in one
+        // pass, which is what `refresh_index_stat` takes a slice for.
+        let repo = self.open_repo(profile)?;
+        git::repo::refresh_index_stat(&repo, &landed)?;
         Ok(())
     }
 
@@ -4525,10 +5997,15 @@ impl Engine {
         }
         let repo = self.open_repo(profile)?;
         let cone = SparseCone::new(&profile.subpaths);
-        let tracked: Vec<PathBuf> = git::repo::tracked_paths(&repo)?
-            .into_iter()
-            .filter(|path| cone.includes(path))
-            .collect();
+        // Pointer-sized entries only: see
+        // [`git::repo::pointer_sized_tracked_paths`] for the ten minutes of
+        // worktree I/O the unfiltered list costs on a real folder, and why the
+        // index's own recorded size cannot lose a pointer.
+        let tracked: Vec<PathBuf> =
+            git::repo::pointer_sized_tracked_paths(&repo, lfs::pointer::MAX_POINTER_BYTES as u32)?
+                .into_iter()
+                .filter(|path| cone.includes(path))
+                .collect();
         let pending = lfs::stage::pending_smudges(&profile.local_path, &tracked)?;
         if pending.is_empty() {
             return Ok(());
@@ -4546,6 +6023,28 @@ impl Engine {
                     continue;
                 }
                 lfs::stage::materialize(store, &profile.local_path, smudge)?;
+                // The one moment this is knowable: content for this path now
+                // exists here, so the next object for it is a replacement
+                // rather than an arrival.
+                // git's spelling, for `materialize_landed`'s reason: an arrival
+                // row and a release must key the same row on every platform.
+                let landed = lfs::stage::index_key(&smudge.path);
+                self.with_db(|conn| db::remember_materialized(conn, &profile.id, &landed, now))?;
+                // Arrived from upstream, so the remote-origin clock applies and
+                // starts now (Story 56.5, AD-131). The identity rides along for
+                // `materialize_landed`'s reason: this is the one moment the
+                // pointer is in hand, and the byte ceiling can only bound rows
+                // that recorded a size.
+                self.with_db(|conn| {
+                    db::note_arrival(
+                        conn,
+                        &profile.id,
+                        &landed,
+                        now,
+                        &smudge.pointer.oid,
+                        smudge.pointer.size,
+                    )
+                })?;
                 materialized += 1;
                 continue;
             }
@@ -4556,7 +6055,16 @@ impl Engine {
                 oid: smudge.pointer.oid.clone(),
                 size: smudge.pointer.size,
             };
-            self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
+            // The path is carried beside the unit rather than inside it: the
+            // payload is what `enqueue_unique` deduplicates on, and two paths
+            // sharing one object — ordinary for duplicated content — must stay
+            // one download. `label_unit` names the covering unit, so the second
+            // path finds the first one's name already there and leaves it.
+            let label = smudge.path.to_string_lossy().into_owned();
+            self.with_db(|conn| {
+                let id = db::enqueue_unique(conn, &profile.id, &unit, now, now)?;
+                db::label_unit(conn, id, &label)
+            })?;
         }
         if materialized > 0 {
             tracing::info!(
@@ -4693,7 +6201,7 @@ impl Engine {
         }
         let _reservation = self
             .reserve(&profile.id)
-            .ok_or_else(|| SyncError::Config(format!("{} is already syncing", profile.name)))?;
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
 
         tracing::info!(
             profile = profile.name,
@@ -4723,7 +6231,9 @@ impl Engine {
         }
 
         if profile.direction.pulls() {
-            outcome.conflicts = self.do_pull(&profile, source).await?;
+            let converged = self.do_pull(&profile, source).await?;
+            outcome.conflicts = converged.copies;
+            outcome.stale = converged.stale;
             outcome.pulled = true;
             // Whatever the apply checked out may include pointers. Materialize
             // what is already local and queue the rest, BEFORE the push leg —
@@ -4787,7 +6297,7 @@ impl Engine {
         // raised: that is the whole definition of a successful pass, and it is
         // the only definition under which a pull-only profile — or a push with
         // nothing staged — can ever record that it worked.
-        self.mark_synced(&profile);
+        self.mark_synced(&profile).await;
 
         self.set_state(&profile.id, ProfileState::Watching);
         self.publish(self.progress(&profile, SyncPhase::Idle));
@@ -4817,6 +6327,321 @@ impl Engine {
             bytes = reclaimed,
             "released local LFS objects the remote already holds",
         );
+        Ok(())
+    }
+
+    /// Let go of content whose release clock has run out (Story 56.5, FR-341,
+    /// FR-342, AD-126, AD-131).
+    ///
+    /// Runs on [`Self::mark_synced`]'s success edge, inside the reservation the
+    /// pass already holds, beside [`Self::prune_lfs_store`] — and on no timer.
+    /// AD-62 forbids a second scheduler over one git repository absolutely, so
+    /// the invocation point is an edge that was going to happen anyway: content
+    /// is released by the first successful sync after its TTL expires, which is
+    /// also the moment keeper has just proved it can reach the remote it would
+    /// have to fetch the content back from.
+    ///
+    /// # A paused folder is not touched, and that is checked HERE
+    ///
+    /// The supervisor skips a disabled profile before `tick_profile`, so the
+    /// obvious reading is that this can never see one. It is wrong.
+    /// [`Self::sync_once`] checks the volume and the reservation and **not**
+    /// `enabled`, so `keeper-syncd sync --once` on a paused folder, the app's
+    /// `sync_folder_now`, and a notes vault's automatic push all reach
+    /// `mark_synced` on a profile whose owner said *stop touching this*. Without
+    /// the check below, each of those deleted up to
+    /// [`RELEASE_BUDGET_OBJECTS`] files' content out of exactly that folder.
+    ///
+    /// [`Self::dehydrate_entry`] refuses the identical operation with
+    /// [`lfs::hydrate::ContentRefusal::Paused`], and this method's own doc says
+    /// the sweep is not a privileged caller — so a pause the request door
+    /// honours and the sweep ignores would make that sentence false in the one
+    /// direction that costs data. `docs/sync.md` states as fact that a paused
+    /// folder never releases anything.
+    ///
+    /// It is the **first** statement, ahead of the TTL, the mode gate and the
+    /// due gate, so a paused folder does not even arm a window that would be
+    /// open the moment it is resumed.
+    ///
+    /// # A folder whose own config layer is broken releases nothing
+    ///
+    /// `releaseTtlMs` is a folder-tier field (FR-344, AD-132) and `0` is how a
+    /// repository says *never release my content*. The folder applier is
+    /// all-or-nothing: one bad key anywhere in a committed
+    /// `.keeper/keeper.toml` discards the whole layer, the `0` with it, and the
+    /// profile record's 24 h default takes over — turning "keep everything"
+    /// into "delete after a day" on every clone that reads that file. A caller
+    /// that deletes data must not read a permissive default out of a file the
+    /// reader could not parse, so a faulted layer declines the pass. Fail
+    /// closed, and ahead of the due gate for the pause's reason.
+    ///
+    /// # The candidate set is a value, not a side effect
+    ///
+    /// Eligibility is [`release_due_at`] and nothing else: a pure function over
+    /// a ledger row. A pinned path and a locally-authored path the remote has
+    /// never confirmed are not *considered*, which is a stronger property than
+    /// being considered and refused — the latter would rest entirely on 56.4's
+    /// guards, and AD-131 exists to stop one guard carrying the whole risk.
+    ///
+    /// # Every 56.4 refusal still applies
+    ///
+    /// The sweep is not a privileged caller. It runs the identical
+    /// [`Self::release_resolved`] body — the same content-identity hash, the
+    /// same per-object remote proof taken at the moment of deletion, the same
+    /// fail-closed `open_file_state`, the same double pin read. A stored
+    /// `synced_at_ms` selected the candidate; it authorized nothing. On a real
+    /// host today every one of these therefore refuses `OpenUnknown`, which is
+    /// 56.4's recorded and deliberate consequence.
+    ///
+    /// # A refusal is not a failure, and neither is it always silent
+    ///
+    /// [`SyncError::Refused`] is the *expected* answer for most candidates, so
+    /// it is logged at `debug!` and the pass moves to the next one — with one
+    /// exception, [`lfs::hydrate::ContentRefusal::AlreadyPointer`]. That
+    /// refusal means the worktree holds pointer text, so the ledger row is a
+    /// false claim that this machine holds the content: it can never release,
+    /// it burns a budget slot on every pass forever, and it lies to
+    /// [`db::materialized_paths`] — which feeds [`Self::pending`]'s
+    /// `replacing` flag — and to `lfs::listing`. So the sweep retracts the row,
+    /// best-effort. `db::forget_materialized` carries
+    /// `AND COALESCE(pinned, 0) = 0`, so a pinned row cannot be discarded this
+    /// way.
+    ///
+    /// Scoped to the sweep on purpose: [`Self::release_resolved`]'s own
+    /// `AlreadyPointer` arms are unchanged, because Story 56.4's tests pin what
+    /// the request door does with that answer, and a CLI verb reporting a no-op
+    /// is not evidence that the ledger is wrong about anything.
+    ///
+    /// # One hard error does not abandon the rest of the pass
+    ///
+    /// A non-refusal error used to return, and the candidate list is
+    /// `ORDER BY path` with stable causes: an EACCES on a mode-000 file reaches
+    /// `lfs::stage::content_oid`, an EACCES/ELOOP/EIO on a parent reaches the
+    /// `symlink_metadata` arm. So one badly-permissioned file early in the
+    /// alphabet permanently prevented every alphabetically later path in that
+    /// folder from ever being released, with no evidence but an hourly
+    /// "released no expired content this pass" that reads like a quiet pass.
+    ///
+    /// Each one is therefore logged `warn!` with its path and the pass carries
+    /// on — and the **first** error is still returned at the end, so
+    /// [`Self::mark_synced`]'s swallow still gets its one line and the mutation
+    /// proof of that swallow still bites. Continued past *and* returned: the
+    /// two are answers to different questions, coverage and honesty.
+    ///
+    /// # Budgeted on both dimensions, and rotated
+    ///
+    /// [`RELEASE_BUDGET_OBJECTS`] bounds how long the reservation is held;
+    /// [`RELEASE_BUDGET_BYTES`] bounds the hashing, because the identity proof
+    /// reads every byte of every candidate. The count is checked *before* a
+    /// candidate is attempted; the byte total is accumulated *after* one is,
+    /// so the candidate that crosses the ceiling stops the pass having had its
+    /// attempt. That asymmetry is deliberate: skipping it instead — the naive
+    /// `if bytes + size > BUDGET { continue }` — would make an object larger
+    /// than the whole budget permanently unreleasable.
+    ///
+    /// The count ceiling counts **attempts**, not releases, which is what makes
+    /// [`Self::release_cursor`] load-bearing rather than a nicety. Re-derived
+    /// from the top in the same `ORDER BY path` order every pass, a prefix of
+    /// candidates that refuses the same way every time — 32 paths the owner
+    /// edited in place, or on every real host today simply the first 32, since
+    /// `open_file_state` defaults to `Unknown` and `release_resolved` refuses
+    /// `OpenUnknown` — meant paths 33..n were never attempted once. Both
+    /// [`RELEASE_BUDGET_OBJECTS`]' own doc and `docs/sync.md` promise the next
+    /// pass takes the remainder; the rotation is what makes that true.
+    async fn release_expired(&self, profile: &SyncProfile) -> Result<()> {
+        // The pause, first and before anything reads a clock. See this method's
+        // doc: `sync_once` does not check `enabled`, so this is the only thing
+        // standing between a paused folder and a deletion — and it is ahead of
+        // the due gate so such a folder arms no window either.
+        if !profile.enabled {
+            return Ok(());
+        }
+        // Fail closed on a folder whose own config layer will not parse. A `0`
+        // in a committed `.keeper/keeper.toml` means "never release my
+        // content", and one bad key elsewhere in that file discards the whole
+        // layer and restores the 24 h default — so the permissive reading of an
+        // unparseable file is the one answer this caller may not take.
+        if crate::profile::folder::folder_config_is_faulted(&profile.local_path) {
+            tracing::debug!(
+                profile = profile.name,
+                "release sweep declines a folder whose own config layer is faulted: \
+                 `releaseTtlMs` may be set there and could not be read",
+            );
+            return Ok(());
+        }
+        // Before the clock: a zero TTL must not even arm a window. See
+        // `release_is_due`, which repeats the check because it is the gate's own
+        // invariant and not this caller's courtesy.
+        let Some(ttl_ms) = profile.effective_release_ttl_ms() else {
+            return Ok(());
+        };
+        // The same mode gate the request door runs, so a mode that refuses one
+        // refuses the other — but swallowed here rather than propagated. A
+        // folder in the default mode is not a *failure*, it is a folder with
+        // nothing for this sweep to do, and propagating would log a warning on
+        // every successful sync of every ordinary folder. Ahead of the due
+        // gate, so such a folder does not arm a window either.
+        if let Err(err) = release_mode_gate(profile) {
+            tracing::debug!(
+                profile = profile.name,
+                reason = %err,
+                "release sweep has nothing to do in this LFS mode",
+            );
+            return Ok(());
+        }
+        if !self.release_is_due(profile) {
+            return Ok(());
+        }
+
+        let now = self.platform.now_ms();
+        let rows = self.with_db(|conn| db::materialized_rows(conn, &profile.id))?;
+        let candidates: Vec<&db::MaterializedRow> = rows
+            .iter()
+            .filter(|row| release_due_at(row, ttl_ms).is_some_and(|due| now >= due))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        // Rotate the window, mirroring `repair_cursor`/`REPAIR_WINDOW`: take
+        // everything sorting after where the last pass stopped, then wrap
+        // around to everything up to and including it. An absent cursor is the
+        // empty string, which every path sorts after, so a first pass reads as
+        // the plain ordered list and needs no branch of its own.
+        let cursor = Self::lock(&self.release_cursor)
+            .get(&profile.id)
+            .cloned()
+            .unwrap_or_default();
+        let window = candidates
+            .iter()
+            .copied()
+            .filter(|row| row.path > cursor)
+            .chain(candidates.iter().copied().filter(|row| row.path <= cursor))
+            .take(RELEASE_BUDGET_OBJECTS);
+
+        let mut bytes = 0u64;
+        let mut released = 0usize;
+        let mut reclaimed = 0u64;
+        // Kept and returned at the end rather than returned here: see this
+        // method's doc for why the pass both continues past a hard error and
+        // still reports the first one.
+        let mut first_error: Option<SyncError> = None;
+        let mut stopped_at: Option<String> = None;
+        for row in window {
+            // Where the next pass resumes, recorded per candidate rather than
+            // after the loop, so a `break` on the byte ceiling leaves the same
+            // honest mark a full window does.
+            stopped_at = Some(row.path.clone());
+            // The ledger's own size, when it has one. A row that never recorded
+            // a size — every row written before Story 56.5 — counts as nothing
+            // against the byte ceiling: that residual is real and is stated
+            // here rather than left silent, and it is bounded by the object
+            // ceiling, which counts such a row like any other.
+            bytes = bytes.saturating_add(row.size_bytes.unwrap_or(0));
+
+            // The row's path is already `index_key`'s spelling, which is the
+            // frame `release_target` produces and `release_resolved` expects.
+            let (rela, path) = match release_target(profile, &row.path) {
+                Ok(target) => target,
+                Err(SyncError::Refused(refusal)) => {
+                    tracing::debug!(
+                        profile = profile.name,
+                        path = row.path,
+                        refusal = %refusal,
+                        "release sweep declined a candidate",
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        profile = profile.name,
+                        path = row.path,
+                        error = %err,
+                        "release sweep could not resolve a candidate; the pass \
+                         continues past it",
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                    continue;
+                }
+            };
+            match self.release_resolved(profile, &rela, path).await {
+                Ok(release) => {
+                    released += 1;
+                    reclaimed = reclaimed.saturating_add(release.size_bytes);
+                }
+                // The worktree holds pointer text, so the row claiming this
+                // machine holds the content is false. Retracted here and only
+                // here — `release_resolved`'s own arms are 56.4's and stay as
+                // they are. See this method's doc.
+                Err(SyncError::Refused(
+                    refusal @ lfs::hydrate::ContentRefusal::AlreadyPointer { .. },
+                )) => {
+                    tracing::debug!(
+                        profile = profile.name,
+                        path = row.path,
+                        refusal = %refusal,
+                        "release sweep retracted a ledger row for a path that holds \
+                         pointer text",
+                    );
+                    if let Err(err) =
+                        self.with_db(|conn| db::forget_materialized(conn, &profile.id, &row.path))
+                    {
+                        tracing::debug!(
+                            profile = profile.name,
+                            path = row.path,
+                            error = %err,
+                            "could not retract that row; it will be reconsidered next pass",
+                        );
+                    }
+                }
+                Err(SyncError::Refused(refusal)) => {
+                    tracing::debug!(
+                        profile = profile.name,
+                        path = row.path,
+                        refusal = %refusal,
+                        "release sweep declined a candidate",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        profile = profile.name,
+                        path = row.path,
+                        error = %err,
+                        "release sweep could not release a candidate; the pass \
+                         continues past it",
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+            // Accumulated, then checked — not checked, then accumulated. The
+            // candidate that crosses the ceiling has already had its one
+            // attempt, which is what stops an object larger than the whole
+            // budget from being skipped on every pass forever.
+            if bytes >= RELEASE_BUDGET_BYTES {
+                break;
+            }
+        }
+        if let Some(path) = stopped_at {
+            Self::lock(&self.release_cursor).insert(profile.id.clone(), path);
+        }
+        if released > 0 {
+            tracing::info!(
+                profile = profile.name,
+                paths = released,
+                bytes = reclaimed,
+                "released content whose retention window had expired",
+            );
+        }
+        // `mark_synced` swallows this into one `warn!` line and the sync still
+        // succeeds; every candidate after the failing one has already had its
+        // attempt.
+        if let Some(err) = first_error {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -4851,26 +6676,1345 @@ impl Engine {
         }
         self.with_db(|conn| db::clear_file_state(conn, id))?;
         Self::lock(&self.gates).remove(id);
-        // The walk must happen now, not at the end of the poll window: pressing
-        // this is a request to look, and a folder that sat unchanged for a minute
-        // afterwards would read as the button having done nothing.
-        Self::lock(&self.next_scan_ms).remove(id);
-        self.note_watch_wake(id);
+
+        // Scratch first: a person pressing this button has a folder that is
+        // misbehaving, and leaked transfer scratch is both a symptom of that and
+        // a cost that nothing else will ever reclaim. Best effort, like the
+        // repair below — housekeeping may not fail the button.
+        if let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? {
+            let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+            store.sweep_scratch(&profile.name);
+        }
+
+        // "Recheck all files" now means git's memory too, not only keeper's.
+        //
+        // Forgetting `file_state` makes keeper look at everything again; it
+        // does nothing for the index entries whose cached stat stopped
+        // describing the worktree, and those are what turn a status pass into
+        // a filter conversion of the entire folder. A person whose folder has
+        // stopped syncing presses this button — it should be able to repair
+        // the thing that stopped it. See `repair_index_stat`.
+        //
+        // Best effort, deliberately: a repository this cannot open is one the
+        // walk below will report on properly, and failing the button here would
+        // take away the "forget and look again" half that always works.
+        match self.repair_stat_invariant(id) {
+            Ok(0) => {}
+            Ok(corrected) => tracing::info!(
+                profile = id,
+                corrected,
+                "recheck: restored the index stat for materialized content"
+            ),
+            Err(err) => tracing::warn!(
+                profile = id,
+                error = %err,
+                "recheck: could not restore the index stat; looking again anyway"
+            ),
+        }
+
+        self.wake_now(id);
         tracing::info!(profile = id, "forgot the remembered tree state on request");
         Ok(())
     }
 
-    /// Re-verify stored content for a profile (Story 25.6).
+    /// Re-stat every materialized LFS entry whose index stat has gone stale.
+    ///
+    /// Split out so `rescan` reads as the two things it now does, and so the
+    /// repair can be reached from anywhere else that finds the invariant
+    /// broken.
+    fn repair_stat_invariant(&self, id: &str) -> Result<usize> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Ok(0);
+        };
+        let repo = git::repo::open(&profile.local_path, profile.removable)?;
+        git::repo::repair_index_stat(&repo)
+    }
+
+    /// Ask for a walk **now**, remembering everything already known.
+    ///
+    /// The half of [`Self::rescan`] that is a request to *look*, without the
+    /// half that is a request to *forget*. Anything that merely knows the tree
+    /// changed wants this one. The part of `rescan` that does the damage is
+    /// `clear_file_state`, not `gates.remove`: the durable rows are what carry
+    /// an episode across a dropped gate — [`Self::ensure_gate`] imports them —
+    /// so deleting them restarts the settle window for every unrelated file in
+    /// the profile, and a caller on a short cadence does that forever.
+    ///
+    /// That is not hypothetical. The notes cadence called `rescan` for exactly
+    /// this purpose — its comment said "asked to notice now" — and on a folder
+    /// that is both a notes vault and a recordings destination it wiped the
+    /// gate roughly once a second. A recording stops, writes its note stub, the
+    /// stub makes the vault dirty, the cadence fires, and the segments the
+    /// recording just closed lose the episode they need to be committed. The
+    /// recording could not sync *because* it had written a note about itself.
+    pub fn wake_now(&self, id: &str) {
+        // Both halves, or neither works: the flag is what makes the next tick
+        // walk at all, and the cleared deadline is what stops it waiting out the
+        // rest of the poll interval first.
+        Self::lock(&self.next_scan_ms).remove(id);
+        Self::lock(&self.next_sweep_ms).remove(id);
+        Self::lock(&self.next_release_ms).remove(id);
+        // ...and the rotation with it, for the reason the window is dropped: a
+        // remembered halfway point across a re-add would make the first pass
+        // after it start in the middle of a ledger it has never walked.
+        Self::lock(&self.release_cursor).remove(id);
+        self.note_watch_wake(id);
+    }
+
+    /// Ask the server whether it holds every object this folder's pointers name
+    /// (DW-140).
+    ///
+    /// The remote half of [`Self::verify`], and the half that finds permanent
+    /// loss. A pointer whose object never reached the server is a valid git
+    /// blob, a clean `git status`, a green folder — and content only one machine
+    /// in the world still has. Nothing in the sync path notices; the push gate
+    /// that should have prevented it is the thing being checked.
+    ///
+    /// Read-only and cheap: one batch round trip per few hundred objects, no
+    /// transfer, no writes. The `download` operation is what asks the question,
+    /// because that is the one whose per-object 404 means "I cannot serve this".
+    ///
+    /// A folder with no LFS at all answers instantly and intact, which is the
+    /// honest answer rather than an error about a server it never uses.
+    pub async fn audit_remote_objects(&self, id: &str) -> Result<lfs::audit::RemoteAudit> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+        if profile.lfs_mode == LfsMode::Disabled {
+            return Ok(lfs::audit::RemoteAudit::default());
+        }
+        self.publish(self.progress(&profile, SyncPhase::Verifying));
+
+        let repo = self.open_repo(&profile)?;
+        let tracked = git::repo::tracked_paths(&repo)?;
+        let (objects, paths) = lfs::audit::tracked_objects(&repo, &tracked);
+        drop(repo);
+        if objects.is_empty() {
+            return Ok(lfs::audit::RemoteAudit::default());
+        }
+        let checked = paths.values().map(|used| used.len() as u64).sum();
+        let bytes = objects.iter().map(|object| object.size).sum();
+
+        let lfsconfig = match std::fs::read_to_string(profile.local_path.join(".lfsconfig")) {
+            Ok(text) => Some(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(SyncError::io(
+                    "read .lfsconfig",
+                    profile.local_path.join(".lfsconfig"),
+                    err,
+                ));
+            }
+        };
+        // A filesystem remote has no batch API to ask. The objects either sit in
+        // the directory or they do not, and `verify` on the peer answers that
+        // better than a fabricated round trip would.
+        if lfsconfig.is_none() && lfs::local::remote_store(&profile.remote_url).is_some() {
+            return Ok(lfs::audit::RemoteAudit {
+                checked,
+                objects: objects.len() as u64,
+                bytes,
+                missing: Vec::new(),
+            });
+        }
+
+        let (endpoint, auth) = self
+            .lfs_access(
+                &profile,
+                lfsconfig.as_deref(),
+                lfs::ssh::Operation::Download,
+            )
+            .await?;
+        let client = lfs::batch::BatchClient::new(self.http.clone(), endpoint, auth.clone())
+            .with_ref(format!("refs/heads/{}", profile.branch))
+            .with_auth_refresh(self.lfs_auth_refresh(&profile, auth.clone()));
+        let specs = client.download(&objects).await?;
+        // The audit just asked the server about every object this folder's
+        // pointers name, and got a per-object affirmative for each one it
+        // serves. That is exactly the per-path proof `synced_at_ms` records, so
+        // it is memoized here rather than thrown away and re-asked by the
+        // release sweep (Story 56.5, FR-341).
+        //
+        // Only from here: the `LfsMode::Disabled` return and the filesystem
+        // short-circuit above both leave without asking the server anything, so
+        // neither may write a confirmation.
+        //
+        // Best-effort and logged. `verify --remote` reports what the remote
+        // holds; it must not fail because a memo did not land.
+        let now = self.platform.now_ms();
+        let confirmed: Vec<&String> = objects
+            .iter()
+            .filter(|object| lfs::audit::serves(&specs, object))
+            .map(|object| &object.oid)
+            .collect();
+        if let Err(err) = self.with_db(|conn| {
+            for oid in &confirmed {
+                for rela in paths.get(oid.as_str()).into_iter().flatten() {
+                    db::note_synced(conn, &profile.id, &lfs::stage::index_key(rela), now)?;
+                }
+            }
+            Ok(())
+        }) {
+            tracing::debug!(
+                profile = profile.name,
+                error = %err,
+                "audited the remote, but could not record the confirmations",
+            );
+        }
+        Ok(lfs::audit::report(&specs, &paths, checked, bytes))
+    }
+
+    /// Can the remote hand over **this one object**, asked now (Story 56.4,
+    /// NFR-40, AD-123)?
+    ///
+    /// The proof [`Self::dehydrate_entry`] takes immediately before it deletes
+    /// the only local copy. Per object, affirmative, and fresh: no age, no
+    /// pattern, no ref comparison and no stored `synced_at_ms` authorizes a
+    /// deletion here.
+    ///
+    /// # Why every failure is `false` and never an error
+    ///
+    /// [`lfs::batch::BatchClient`] maps a transport failure to
+    /// [`SyncError::Network`] ([`Retriability::Transient`]), a batch-level 404
+    /// to [`SyncError::Config`] and an unauthenticated answer to
+    /// [`SyncError::Auth`]. Propagating any of them from a release would turn
+    /// "I could not establish that these bytes exist elsewhere" into a fault a
+    /// scheduler is entitled to retry — and 56.5 will drive this verb from a
+    /// sweep. Collapsing them into `false`, which the caller renders as
+    /// [`lfs::hydrate::ContentRefusal::UnprovenOnRemote`] (`Permanent`),
+    /// preserves the only sentence that matters: keeper will not delete these
+    /// bytes. Each reason is logged `warn!`, so an operator can still tell an
+    /// unreachable server from an absent object.
+    ///
+    /// # Why a filesystem remote is proved directly, and per object
+    ///
+    /// [`Self::audit_remote_objects`] reports a filesystem remote intact
+    /// **without asking anything**, which is defensible for a report and would
+    /// be a fabricated authorisation for a deletion. Such a remote's LFS store
+    /// is a real directory in the client layout
+    /// ([`lfs::local::remote_store`]), so `contains` is a genuine,
+    /// size-verified, per-object answer — strictly better evidence than a batch
+    /// response, and what makes this story's happy path assertable with no
+    /// network at all.
+    ///
+    /// The `.lfsconfig` read and the endpoint/auth/ref ingredients are
+    /// [`Self::audit_remote_objects`]'s, unchanged: one way of addressing a
+    /// server, not two.
+    async fn remote_serves(&self, profile: &SyncProfile, oid: &str, size: u64) -> bool {
+        let lfsconfig = match std::fs::read_to_string(profile.local_path.join(".lfsconfig")) {
+            Ok(text) => Some(text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    oid,
+                    error = %err,
+                    "cannot read .lfsconfig, so nothing can be established about this object; \
+                     keeping the local copy"
+                );
+                return false;
+            }
+        };
+        // An explicit `.lfsconfig` names a server, so it wins over the shape of
+        // the remote URL — the same precedence `lfs_access` applies.
+        if lfsconfig.is_none() {
+            if let Some(store) = lfs::local::remote_store(&profile.remote_url) {
+                let held = store.contains(oid, size);
+                if !held {
+                    tracing::warn!(
+                        profile = profile.name,
+                        oid,
+                        "the filesystem remote's object store does not hold this object at this \
+                         size; keeping the local copy"
+                    );
+                }
+                return held;
+            }
+        }
+
+        let (endpoint, auth) = match self
+            .lfs_access(profile, lfsconfig.as_deref(), lfs::ssh::Operation::Download)
+            .await
+        {
+            Ok(access) => access,
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    oid,
+                    error = %err,
+                    "cannot address an LFS server for this folder, so nothing can be established \
+                     about this object; keeping the local copy"
+                );
+                return false;
+            }
+        };
+        let client = lfs::batch::BatchClient::new(self.http.clone(), endpoint, auth.clone())
+            .with_ref(format!("refs/heads/{}", profile.branch))
+            .with_auth_refresh(self.lfs_auth_refresh(profile, auth.clone()));
+        let object = lfs::batch::ObjectId::new(oid, size);
+        match client.download(std::slice::from_ref(&object)).await {
+            // `serves` requires an affirmative row for THIS object, at this
+            // size, with a download action on it — and no errored row for it
+            // anywhere in the answer. An answer that mentioned nothing, or
+            // mentioned something else, or owes an href it did not supply, has
+            // said nothing.
+            Ok(specs) => lfs::audit::serves(&specs, &object),
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    oid,
+                    error = %err,
+                    "the LFS server could not be asked whether it holds this object; keeping the \
+                     local copy"
+                );
+                false
+            }
+        }
+    }
+
+    /// Every LFS path in this profile, and whether this machine holds its
+    /// content (Story 56.2, FR-336, FR-337).
+    ///
+    /// The engine's answer rather than the caller's, for the reason every other
+    /// verb here is: `keeper-syncd` and the desktop shell both need it, and a
+    /// listing assembled twice is a listing that will eventually disagree with
+    /// itself about one folder (AD-52). What the daemon adds on top is two
+    /// renderings of this `Vec` and nothing else.
+    ///
+    /// # Cost
+    ///
+    /// One `SELECT`, one `lstat` per LFS path, and a bounded read of the paths
+    /// whose length says they could be pointer text — the discipline
+    /// [`lfs::stage::worktree_pointer`] documents. The index is read and parsed
+    /// **once** through [`lfs::stage::indexed_pointers`], where the per-path
+    /// `indexed_pointer` this could have been built from re-parses it per row.
+    ///
+    /// The index read is not the whole cost, and understating it would be the
+    /// mistake `is_pointer_candidate` was written to avoid one layer down:
+    /// recognising a pointer means asking the object database for a blob's
+    /// **header** once per unconflicted index entry, and loading the blob for
+    /// every entry whose header says 1..=1024 bytes. There is no cheaper
+    /// prefilter available — an index entry's `stat.size` is the *worktree*
+    /// file's for an LFS path, so `git::repo::pointer_sized_tracked_paths`'
+    /// filter would drop every materialized LFS path — so on a hundred-thousand
+    /// path folder this is a hundred thousand header lookups in one blocking
+    /// call. That is the honest figure for a verb a human invokes, and the
+    /// reason nothing calls it on a tick.
+    ///
+    /// # It reads; it does not create
+    ///
+    /// Deliberately **not** [`Self::open_repo`], which is the engine's
+    /// *materialize* path: for a folder that is not a repository yet it clones
+    /// over the network or adopts in place, then pins repo config and runs
+    /// [`Self::reconcile_sparse_cone`], which adds and deletes worktree files.
+    /// A listing that did any of that would be the opposite of what it is sold
+    /// as — an operator asking which paths are virtual would pull gigabytes, or
+    /// silently turn a plain folder into a keeper repository. So a folder with
+    /// no `.git` answers with an **empty listing**: it has no index, therefore
+    /// no LFS paths, and creating one is somebody else's verb.
+    ///
+    /// `lfs_mode` is deliberately **not** consulted. A profile switched to
+    /// [`LfsMode::Disabled`] does not stop its committed pointers from being
+    /// pointers, and short-circuiting on the mode would make this verb tell an
+    /// operator "no LFS paths" about a folder whose Files pane shows a dozen —
+    /// which is precisely the assembled-twice divergence AD-52 is about. A
+    /// folder that never used LFS has no pointers in its index and answers
+    /// empty for the honest reason.
+    ///
+    /// Blocking, like every other repository caller: a `gix::Repository` is
+    /// neither `Send` nor cheap to hold, so it never spans an await point.
+    pub fn lfs_files(&self, id: &str) -> Result<Vec<lfs::listing::LfsFile>> {
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+        if !profile.local_path.join(".git").exists() {
+            return Ok(Vec::new());
+        }
+        let pointers = {
+            // Removable media is opened with full trust for the reason
+            // `open_repo` states (AD-48); the difference is that this opens
+            // what is there and never makes one.
+            let repo = git::repo::open(&profile.local_path, profile.removable)?;
+            lfs::stage::indexed_pointers(&repo)
+        };
+        if pointers.is_empty() {
+            // Nothing to join a ledger against, and the `SELECT` would be a
+            // query issued to answer about no rows.
+            return Ok(Vec::new());
+        }
+        let ledger = self.with_db(|conn| db::materialized_rows(conn, &profile.id))?;
+        Ok(lfs::listing::collect(
+            &profile.local_path,
+            &pointers,
+            &ledger,
+        ))
+    }
+
+    /// Ask for one virtual path's content (Story 56.3, FR-338, AD-128).
+    ///
+    /// The engine's single entry point for on-demand hydration, and both doors
+    /// onto it — `keeper-syncd materialize` and the `sync_materialize_entry`
+    /// command — call exactly this and add no policy of their own. Three
+    /// answers, all of them `Ok`: the content was published here and now, it
+    /// was already there, or a transfer was queued and the id of the unit that
+    /// will deliver it is on the [`lfs::hydrate::Materialization`].
+    ///
+    /// # Nothing here is a second implementation
+    ///
+    /// [`lfs::stage::materialize`] stays the only publish,
+    /// [`git::repo::refresh_index_stat`] the only index-stat repair,
+    /// [`WorkKind::LfsDownload`] the only transfer and
+    /// [`Self::materialize_landed`] the only completion arm. The per-path
+    /// decision is [`lfs::hydrate::plan`]'s, the containment rule is
+    /// [`crate::browse::plain_segments`]'s, and the queue is the journal's.
+    ///
+    /// Deliberately **not** [`Self::materialize_pending`], the whole-tree
+    /// sweep: its own doc records the 40 hours lost to calling it per object,
+    /// and a request for one path must cost one path.
+    ///
+    /// # The order of the checks is the contract
+    ///
+    /// Containment first, so an escaping subpath is refused whatever state the
+    /// folder is in and the refusal cannot be probed for. Then the mode, which
+    /// needs no disk. Then the repository — opened with
+    /// [`git::repo::open`] and never [`Self::open_repo`], which for a folder
+    /// that is not a repository yet clones over the network or adopts in place:
+    /// a verb sold as "give me this file" must not be able to pull gigabytes or
+    /// turn a plain folder into a keeper repository, which is the high-severity
+    /// defect 56.2's review found in the sibling listing. Then the index, the
+    /// cone, and only then the worktree.
+    ///
+    /// # One operation at a time, within this process
+    ///
+    /// Takes [`Self::reserve`], and a busy profile answers
+    /// [`SyncError::Busy`] exactly as [`Self::sync_once`] does. The reservation
+    /// is released on every exit path including a panic, and clears the
+    /// progress phase with it (see `Reservation::drop`).
+    ///
+    /// It is an **in-process** exclusion, and the honest limit is worth writing
+    /// down here because this is the first verb designed to be run *while* a
+    /// daemon runs: `keeper-syncd materialize` is a different process from
+    /// `keeper-syncd watch`, each with its own reservation map, so nothing
+    /// stops the two from writing the index at the same time. Ordinary use is
+    /// the app door, where the engine is a singleton and the exclusion is real.
+    /// A cross-process lock is a change to every one-shot verb, not to this
+    /// one (recorded in `deferred-work.md`).
+    ///
+    /// Blocking, like every other repository caller: a `gix::Repository` is
+    /// neither `Send` nor cheap to hold, so each open is scoped to a block and
+    /// never spans an await point.
+    pub fn materialize_entry(
+        &self,
+        id: &str,
+        subpath: &str,
+    ) -> Result<lfs::hydrate::Materialization> {
+        use lfs::hydrate::{ContentRefusal, Materialization, MaterializeOutcome, Plan};
+
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+
+        // The one lexical containment rule in the crate (AD-65), carried across
+        // verbatim rather than restated. Ahead of the reservation, so a subpath
+        // that may not be asked for is refused whatever the folder is doing —
+        // and it costs no disk, so there is nothing to serialize yet.
+        let segments = crate::browse::plain_segments(subpath)
+            .map_err(ContentRefusal::from)
+            .map_err(SyncError::Refused)?;
+        if segments.is_empty() {
+            // `plain_segments` answers the profile ROOT with no segments, which
+            // is correct for a listing and meaningless here: a folder has no
+            // content to materialize. Refused as an escape because that is what
+            // asking for the root as a file is — browse's own sentence names the
+            // subpath that was asked for.
+            return Err(SyncError::Refused(ContentRefusal::Escapes(
+                crate::browse::BrowseRefusal::Escapes {
+                    subpath: subpath.to_owned(),
+                },
+            )));
+        }
+        // The other half of the same rule, and this verb needs it more than the
+        // read verbs that already run it: `plain_segments` is lexical, so it
+        // cannot see a *parent* component replaced by a symlink pointing out of
+        // the folder — and this is a write. `browse::resolve` canonicalizes
+        // both ends and refuses after resolution (AD-59). `Ok(None)` is a path
+        // that is simply not on disk, which is [`ContentRefusal::Missing`]'s
+        // business a few lines down, not an escape.
+        crate::browse::resolve(&profile.local_path, subpath)
+            .map_err(ContentRefusal::from)
+            .map_err(SyncError::Refused)?;
+        let rela = lfs::hydrate::joined(&segments);
+        let path = rela.to_string_lossy().into_owned();
+
+        // A paused folder is one keeper does not touch — the rule
+        // `commit_local` and the watcher both state — and a request is no
+        // exception: the bytes would land in a working tree the user took
+        // keeper's hands off, and a queued unit would never be claimed, because
+        // the tick skips a disabled profile entirely. Saying so is the only
+        // honest answer available.
+        if !profile.enabled {
+            return Err(SyncError::Refused(ContentRefusal::Paused {
+                profile: profile.name.clone(),
+            }));
+        }
+        // An unplugged volume is absence, never failure (AD-48). Without this
+        // the `.git` test below reports the folder as tracking nothing, which
+        // tells the user their file is not tracked when their drive is merely
+        // out.
+        if !self.volume_ready(&profile)? {
+            return Err(SyncError::MediaAbsent);
+        }
+
+        let _reservation = self
+            .reserve(&profile.id)
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        // Before the disk, because it needs none. A listing deliberately
+        // ignores the mode; a write must not — see
+        // [`ContentRefusal::LfsDisabled`].
+        if profile.lfs_mode == LfsMode::Disabled {
+            return Err(SyncError::Refused(ContentRefusal::LfsDisabled {
+                profile: profile.name.clone(),
+            }));
+        }
+        // A folder with no `.git` has no index, therefore no committed pointer,
+        // therefore nothing to ask for — and creating one is somebody else's
+        // verb, which is the whole reason this does not use `open_repo`.
+        if !profile.local_path.join(".git").exists() {
+            return Err(SyncError::Refused(ContentRefusal::NotTracked { path }));
+        }
+        let indexed = {
+            // Removable media is opened with full trust for the reason
+            // `open_repo` states (AD-48); the difference is that this opens what
+            // is there and never makes one.
+            let repo = git::repo::open(&profile.local_path, profile.removable)?;
+            lfs::stage::indexed_pointer(&repo, &rela)
+        };
+        let Some(indexed) = indexed else {
+            // A plain tracked file and a path git does not track land here
+            // together, deliberately: neither has a committed pointer.
+            return Err(SyncError::Refused(ContentRefusal::NotTracked { path }));
+        };
+        // The same cone `materialize_landed` applies, so a request cannot reach
+        // content the profile exists to keep away (Story 27.2).
+        if !SparseCone::new(&profile.subpaths).includes(&rela) {
+            return Err(SyncError::Refused(ContentRefusal::OutsideSubpaths { path }));
+        }
+
+        let smudge = match lfs::hydrate::plan(&profile.local_path, &rela, &indexed)
+            .map_err(SyncError::Refused)?
+        {
+            Plan::AlreadyHeld => {
+                // The content is here, and this is also the only verb that can
+                // notice its index entry still describing the pointer — after a
+                // crash between the publish and the re-stat, or after a `git
+                // lfs pull` that keeper never saw. `refresh_index_stat` writes
+                // only when an entry's stat has actually gone stale, so for an
+                // ordinary already-materialized path this reads the index and
+                // stops. The alternative is a path that reads MODIFIED forever
+                // and cannot be repaired by asking for it again.
+                {
+                    let repo = git::repo::open(&profile.local_path, profile.removable)?;
+                    git::repo::refresh_index_stat(&repo, std::slice::from_ref(&rela))?;
+                }
+                return Ok(Materialization {
+                    path,
+                    oid: indexed.oid,
+                    size_bytes: indexed.size,
+                    outcome: MaterializeOutcome::AlreadyMaterialized,
+                    unit_id: None,
+                });
+            }
+            Plan::Publish(smudge) => smudge,
+        };
+
+        // Not `ensure_layout`: this reads the store to decide, and a verb that
+        // created the store's directory tree on the way to refusing would be
+        // writing to answer a question.
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        if !store.contains(&indexed.oid, indexed.size) {
+            // The object is not here. The journal is the queue, and
+            // `enqueue_unique` returns whatever unit already covers this work —
+            // so a repeat request is one row and one download, and a request for
+            // an object already in flight is covered by
+            // `WorkKind::covered_while_running`.
+            let unit = WorkKind::LfsDownload {
+                oid: indexed.oid.clone(),
+                size: indexed.size,
+            };
+            let now = self.platform.now_ms();
+            let unit_id = self.with_db(|conn| {
+                let unit_id = db::enqueue_unique(conn, &profile.id, &unit, now, now)?;
+                // The path is carried BESIDE the unit rather than inside it, and
+                // so is the urgency: the payload is what `enqueue_unique`
+                // deduplicates on, so either one folded into it would re-fetch
+                // bytes this machine is already getting (`db::promote_unit`).
+                db::label_unit(conn, unit_id, &path)?;
+                // Marks the row and makes it claimable now: the covering row
+                // may be one a backoff or an absent volume deferred, and
+                // urgency on a row `claim_ready` cannot see is worth nothing.
+                db::promote_unit(conn, unit_id, now)?;
+                Ok(unit_id)
+            })?;
+            // The supervisor claims it, not this call: `keeper-syncd` has no
+            // event loop to wait on and draining inline would make urgency
+            // pointless. In this process that collapses the wait to the next
+            // tick; from the CLI, whose engine is its own, the running daemon
+            // picks the row up on its own next pass instead.
+            self.wake_now(&profile.id);
+            tracing::info!(
+                profile = profile.name,
+                path = path,
+                unit = unit_id,
+                "queued a requested LFS download"
+            );
+            return Ok(Materialization {
+                path,
+                oid: indexed.oid,
+                size_bytes: indexed.size,
+                outcome: MaterializeOutcome::Queued,
+                unit_id: Some(unit_id),
+            });
+        }
+
+        // One frame of the phase the queued branch already publishes, so a
+        // local copy of a four-gigabyte object is not silent. No new phase, no
+        // new field, no new channel.
+        let mut event = self.progress(&profile, SyncPhase::DownloadingLfs);
+        event.current = Some(path.clone());
+        self.publish(event);
+
+        lfs::stage::materialize(&store, &profile.local_path, &smudge)?;
+        // The one moment this is knowable: content for this path now exists
+        // here, so the next object for it is a replacement rather than an
+        // arrival.
+        let now = self.platform.now_ms();
+        self.with_db(|conn| db::remember_materialized(conn, &profile.id, &path, now))?;
+        // Arrived from upstream — this branch publishes an object over a
+        // pointer — so the remote-origin clock applies and starts now (Story
+        // 56.5, AD-131). `path` is already `index_key`'s spelling. The identity
+        // rides along because this is the one moment the pointer is in hand:
+        // `RELEASE_BUDGET_BYTES` can only bound a pass over rows that recorded
+        // a size, and re-deriving it later means another index read per row.
+        self.with_db(|conn| {
+            db::note_arrival(conn, &profile.id, &path, now, &indexed.oid, indexed.size)
+        })?;
+        {
+            // The worktree file just changed size, so its index entry carries
+            // the pointer's stat and status would call it modified. Re-stat that
+            // ONE path — `repair_index_stat` is the whole-repository button and
+            // this is not it. Writing the index through a read-only open is the
+            // existing `repair_stat_invariant` precedent.
+            let repo = git::repo::open(&profile.local_path, profile.removable)?;
+            git::repo::refresh_index_stat(&repo, std::slice::from_ref(&smudge.path))?;
+        }
+        tracing::info!(
+            profile = profile.name,
+            path = path,
+            "materialized LFS content on request"
+        );
+        Ok(Materialization {
+            path,
+            oid: indexed.oid,
+            size_bytes: indexed.size,
+            outcome: MaterializeOutcome::Materialized,
+            unit_id: None,
+        })
+    }
+
+    /// Release one path's content back to the pointer this folder committed
+    /// (Story 56.4, FR-332, FR-333).
+    ///
+    /// [`Self::materialize_entry`]'s inverse and the only entry point onto it.
+    /// It writes the **committed blob byte for byte** through a sibling temp
+    /// file and one `rename` ([`lfs::stage::dehydrate`]), forgets the ledger
+    /// row, and re-stats that one index entry so the path reads clean.
+    ///
+    /// # This is the verb where a mistake destroys data
+    ///
+    /// So `Ok` means, and only means, "content was here, it is provably
+    /// elsewhere, and it is now gone from this machine". Everything else is a
+    /// [`lfs::hydrate::ContentRefusal`] the caller distinguishes by type —
+    /// including [`lfs::hydrate::ContentRefusal::AlreadyPointer`], which
+    /// `keeper-syncd` renders as a no-op at exit 0. One uniform contract beats
+    /// an outcome enum whose "nothing happened" arm a caller can forget to
+    /// check.
+    ///
+    /// # Only a folder that is meant to hold pointers
+    ///
+    /// [`lfs::hydrate::ContentRefusal::AlwaysMaterializes`] refuses every mode
+    /// but [`LfsMode::PointerOnly`], and it is a **mode gate rather than a
+    /// permanent limit**. In the default mode [`Self::materialize_pending`]
+    /// re-materializes any tracked path inside the cone whose worktree holds a
+    /// pointer — copying it back out of this machine's object store, or
+    /// queueing a download of it — so a release there gives back nothing and
+    /// costs a fetch, and a sweep driving this verb would fight the scan loop
+    /// forever. The gate lifts when the virtualization policy reaches the
+    /// arrival sweep and the two verbs stop disagreeing about what a folder
+    /// holds, which is a later story's work and not a limitation of this one.
+    ///
+    /// # The order of the guards is the contract
+    ///
+    /// The free checks first, exactly as [`Self::materialize_entry`] has them:
+    /// containment ([`release_target`]), the pause, the volume, the
+    /// reservation, then the mode ([`release_mode_gate`]) — and then every
+    /// release-specific guard, in [`Self::release_resolved`], which is where
+    /// they are listed and where they run.
+    ///
+    /// The split is Story 56.5's and it is what lets the release sweep run
+    /// **every** one of those refusals without re-taking a reservation the
+    /// sync tick is already holding: the sweep calls
+    /// [`Self::release_mode_gate`]'s free counterpart and
+    /// [`Self::release_resolved`] directly, so there is exactly one copy of the
+    /// chain that deletes content. This door keeps its guards in this order
+    /// because that order is what a caller arriving from outside — a CLI verb,
+    /// an IPC command — is owed.
+    pub async fn dehydrate_entry(&self, id: &str, subpath: &str) -> Result<lfs::hydrate::Release> {
+        use lfs::hydrate::ContentRefusal;
+
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+
+        // The crate's one lexical containment rule (AD-65), ahead of the
+        // reservation for `materialize_entry`'s reason: a subpath that may not
+        // be asked for is refused whatever the folder is doing.
+        let (rela, path) = release_target(&profile, subpath)?;
+
+        if !profile.enabled {
+            return Err(SyncError::Refused(ContentRefusal::Paused {
+                profile: profile.name.clone(),
+            }));
+        }
+        // An unplugged volume is absence, never failure (AD-48) — and never a
+        // reason to delete anything: the content is not gone, the drive is out.
+        if !self.volume_ready(&profile)? {
+            return Err(SyncError::MediaAbsent);
+        }
+
+        let _reservation = self
+            .reserve(&profile.id)
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        release_mode_gate(&profile)?;
+        self.release_resolved(&profile, &rela, path).await
+    }
+
+    /// Every release-specific guard, and the release itself, for one path whose
+    /// door has already been passed (Story 56.4, extracted in Story 56.5).
+    ///
+    /// `rela` is the repository-relative path [`release_target`] resolved and
+    /// `path` is its `index_key` spelling; the caller has already taken the
+    /// profile's reservation, checked the pause and the volume, and passed
+    /// [`release_mode_gate`]. Both callers — [`Self::dehydrate_entry`] and
+    /// [`Self::release_expired`] — run this identical body, which is the point:
+    /// **the sweep is not a privileged caller**, and a second copy of a chain
+    /// that deletes content is the one duplication this epic cannot afford.
+    ///
+    /// # The order of the guards is the contract
+    ///
+    /// After the index and the cone, the release-specific ones, cheapest first:
+    ///
+    /// 1. **`Missing` / `Modified`** from one `lstat`.
+    /// 2. **`AlreadyPointer`**, at most a kilobyte of read, so the common
+    ///    already-released path costs nothing further. A `size 0` pointer lands
+    ///    here too: it stands for the empty object, so there is no content on
+    ///    this machine to release, and every guard below it is degenerate for
+    ///    one.
+    /// 3. **`Pinned`**, one `SELECT`. The hard floor goes before the two
+    ///    expensive proofs: a pinned path must not pay for a full hash or a
+    ///    round trip to be told no.
+    /// 4. **`Modified` by content identity** — length, then SHA-256 against the
+    ///    committed oid. A stat comparison would wave through a same-length
+    ///    edit written back with the original mtime and then delete it; see
+    ///    [`lfs::stage::content_oid`].
+    /// 5. **`UnprovenOnRemote`**, the per-object proof taken at the moment of
+    ///    the deletion ([`Self::remote_serves`]). A stored `synced_at_ms` — the
+    ///    memo Story 56.5's sweep selects candidates by — authorizes
+    ///    *eligibility* and never a deletion; NFR-40 rests on this line.
+    /// 6. **`Open` / `OpenUnknown`**, last, because it is the answer most
+    ///    likely to have changed while the steps above ran.
+    /// 7. **`Pinned`, again**, immediately before the deletion. NFR-40 puts the
+    ///    authorization at the moment of the deletion, and step 3 happened
+    ///    before a whole-file hash and a round trip — the two slowest things
+    ///    here. One indexed `SELECT` on a two-column primary key is what "at
+    ///    the moment of the deletion" costs.
+    ///
+    /// The local store is deliberately **not** a precondition, which is the one
+    /// place this does not mirror [`Self::materialize_entry`]: that verb copies
+    /// *from* the store, so absence is fatal there. Here `lfs_prune_local`
+    /// deletes the store copy precisely when the worktree holds the content
+    /// (`lfs::prune`'s condition 2), which is the definition of a materialized
+    /// path — so requiring it would refuse in the commonest state of all.
+    /// NFR-40 therefore rests entirely on the remote proof, which is where
+    /// NFR-40 puts it.
+    ///
+    /// # Once the content is gone, the deletion is the fact
+    ///
+    /// The rename is the point of no return, so nothing after it may turn a
+    /// completed release into a reported failure: a locked `sync.db` or a held
+    /// `index.lock` would otherwise make this exit non-zero with the bytes
+    /// already deleted, contradicting the contract `docs/sync.md` and
+    /// `keeper-syncd`'s own `dehydrate` state — every refusal exits 1 and
+    /// changes nothing on disk. Both bookkeeping steps therefore log at `warn!`
+    /// and the release still succeeds. Neither loss is permanent: a stale
+    /// ledger row is overwritten by the next materialization of that path, and
+    /// a skipped re-stat is repaired by asking to release the path again —
+    /// which is what the `AlreadyPointer` arm's own `refresh_index_stat` is
+    /// there for, since `git::repo::repair_index_stat` only refreshes entries
+    /// whose worktree file is **not** a pointer and so cannot reach a released
+    /// one.
+    ///
+    /// [`git::repo::open`], never [`Self::open_repo`]: a verb sold as "let this
+    /// file go" must not be able to clone a repository or adopt a plain folder.
+    /// Every [`gix::Repository`] lives in a scoped block that ends before any
+    /// `.await`, because one is neither `Send` nor cheap to hold and this
+    /// method is `async` for the batch round trip.
+    async fn release_resolved(
+        &self,
+        profile: &SyncProfile,
+        rela: &Path,
+        path: String,
+    ) -> Result<lfs::hydrate::Release> {
+        use crate::platform::OpenFileState;
+        use lfs::hydrate::{ContentRefusal, Release};
+
+        // No `.git` means no index, so no committed pointer and nothing to
+        // release — and making one is somebody else's verb.
+        if !profile.local_path.join(".git").exists() {
+            return Err(SyncError::Refused(ContentRefusal::NotTracked { path }));
+        }
+        let committed = {
+            let repo = git::repo::open(&profile.local_path, profile.removable)?;
+            // The blob's own BYTES, not a re-rendering of the parsed pointer: a
+            // non-canonical committed pointer renders to a different blob hash
+            // and a phantom modification forever (AD-124).
+            lfs::stage::indexed_pointer_blob(&repo, rela)
+        };
+        let Some((pointer, blob)) = committed else {
+            return Err(SyncError::Refused(ContentRefusal::NotTracked { path }));
+        };
+        if !SparseCone::new(&profile.subpaths).includes(rela) {
+            return Err(SyncError::Refused(ContentRefusal::OutsideSubpaths { path }));
+        }
+
+        let absolute = profile.local_path.join(rela);
+        let metadata = match std::fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SyncError::Refused(ContentRefusal::Missing { path }));
+            }
+            // A path keeper cannot even SEE is not a path it can describe. An
+            // EACCES on the parent, an ELOOP, an EIO off a failing disk is not
+            // a modification, and `Modified`'s sentence — your file does not
+            // hold the content this folder committed — would be false and would
+            // send the owner looking for an edit instead of at their
+            // permissions or their disk. Nothing has been written on this
+            // branch, so the honest answer costs nothing.
+            Err(err) => return Err(SyncError::io("stat the path to release", &absolute, err)),
+        };
+        // `is_file` rather than `!is_dir`: a fifo, a socket or a device node has
+        // a length that is not a number of bytes anyone can read out of it, and
+        // a directory standing here is something a user put there.
+        if !metadata.is_file() {
+            return Err(SyncError::Refused(ContentRefusal::Modified { path }));
+        }
+        // Nothing to release. Checked against the COMMITTED oid, so pointer
+        // text for some other object is not mistaken for this one and falls to
+        // the content-identity guard below as the modification it is.
+        if lfs::stage::worktree_pointer(&absolute, &metadata)
+            .is_some_and(|found| found.oid == pointer.oid)
+        {
+            // This is also the only verb that can notice a released path whose
+            // index entry still describes the content it used to hold — after a
+            // crash between the rename and the re-stat, or an `index.lock` held
+            // by somebody else at that instant. `git::repo::repair_index_stat`
+            // cannot reach it: that one only refreshes entries whose worktree
+            // file is NOT a pointer. So asking again is the repair, exactly as
+            // `materialize_entry`'s `AlreadyHeld` arm is for the other
+            // direction, and for the same reason: without it the path reads
+            // MODIFIED forever and every status walk pays a full content
+            // comparison for it. `refresh_index_stat` writes only when an
+            // entry's stat has actually gone stale, so the ordinary
+            // already-released path reads the index and stops.
+            {
+                let repo = git::repo::open(&profile.local_path, profile.removable)?;
+                git::repo::refresh_index_stat(&repo, &[rela.to_path_buf()])?;
+            }
+            return Err(SyncError::Refused(ContentRefusal::AlreadyPointer { path }));
+        }
+        // A pointer spelling `size 0` stands for the empty object, so there is
+        // no content on this machine to release — and every guard below is
+        // degenerate for one: `len != size` passes for any empty file,
+        // `content_oid` of an empty file IS that pointer's oid, and
+        // `stage::dehydrate` would accept any zero-byte file and write ~90
+        // bytes over it while reporting `sizeBytes: 0`. Carved out here rather
+        // than left to the accident that `lfs::audit::tracked_objects` skips
+        // size-0 objects, which is that function's own carve-out for its own
+        // reason: "the empty object is not content anyone can lose".
+        if pointer.size == 0 {
+            return Err(SyncError::Refused(ContentRefusal::AlreadyPointer { path }));
+        }
+        if self.with_db(|conn| db::is_pinned(conn, &profile.id, &path))? {
+            return Err(SyncError::Refused(ContentRefusal::Pinned { path }));
+        }
+
+        // One frame of an existing phase, because what follows is a hash of a
+        // possibly-enormous file and a round trip. No new phase, no new field.
+        let mut event = self.progress(profile, SyncPhase::Verifying);
+        event.current = Some(path.clone());
+        self.publish(event);
+
+        // Content identity. The length short-circuits the same predicate rather
+        // than being a second guard, and the digest is what a same-length,
+        // same-mtime edit cannot survive.
+        if metadata.len() != pointer.size {
+            return Err(SyncError::Refused(ContentRefusal::Modified { path }));
+        }
+        let (found_oid, read) = lfs::stage::content_oid(&absolute)?;
+        if found_oid != pointer.oid || read != pointer.size {
+            return Err(SyncError::Refused(ContentRefusal::Modified { path }));
+        }
+
+        if !self
+            .remote_serves(profile, &pointer.oid, pointer.size)
+            .await
+        {
+            return Err(SyncError::Refused(ContentRefusal::UnprovenOnRemote {
+                path,
+            }));
+        }
+        match self.platform.open_file_state(&absolute) {
+            OpenFileState::Closed => {}
+            OpenFileState::Open => {
+                return Err(SyncError::Refused(ContentRefusal::Open { path }));
+            }
+            // The trait default, and therefore the answer on every real host
+            // today. Fail-closed is the whole point (AD-125).
+            OpenFileState::Unknown => {
+                return Err(SyncError::Refused(ContentRefusal::OpenUnknown { path }));
+            }
+        }
+        // The pin again, with nothing between this and the deletion. See this
+        // method's guard list, step 7.
+        if self.with_db(|conn| db::is_pinned(conn, &profile.id, &path))? {
+            return Err(SyncError::Refused(ContentRefusal::Pinned { path }));
+        }
+
+        lfs::stage::dehydrate(
+            &profile.local_path,
+            &lfs::stage::PendingRelease {
+                path: rela.to_path_buf(),
+                pointer: pointer.clone(),
+                blob,
+                // The very `lstat` the content proof was taken against, so the
+                // publish can require that this is still the same file.
+                guard: crate::stability::FileSample::from_metadata(&metadata),
+            },
+        )?;
+        // The content is gone. From here the deletion is the fact and the
+        // bookkeeping is best-effort — see this method's doc.
+        if let Err(err) = self.with_db(|conn| db::forget_materialized(conn, &profile.id, &path)) {
+            tracing::warn!(
+                profile = profile.name,
+                path = path,
+                error = %err,
+                "released the content, but could not retract the ledger row: this folder will \
+                 keep claiming it holds the content until that path is materialized again"
+            );
+        }
+        // The worktree file just shrank to ~130 bytes, so its index entry
+        // carries the content's stat and status would call it modified.
+        // Re-stat that ONE path — `repair_index_stat` is the whole-repository
+        // button and this is not it.
+        let restat = {
+            let opened = git::repo::open(&profile.local_path, profile.removable);
+            opened.and_then(|repo| git::repo::refresh_index_stat(&repo, &[rela.to_path_buf()]))
+        };
+        if let Err(err) = restat {
+            tracing::warn!(
+                profile = profile.name,
+                path = path,
+                error = %err,
+                "released the content, but could not refresh the index entry: git will report \
+                 this path as modified until somebody asks to release it again, which repairs it"
+            );
+        }
+        tracing::info!(
+            profile = profile.name,
+            path = path,
+            oid = pointer.oid,
+            size = pointer.size,
+            "released LFS content on request"
+        );
+        Ok(Release {
+            path,
+            oid: pointer.oid,
+            size_bytes: pointer.size,
+        })
+    }
+
+    /// Record that somebody just read this path's content through keeper
+    /// (Story 56.5, AD-126).
+    ///
+    /// The remote-origin release clock, and the reason it is keeper's own
+    /// timestamp rather than the filesystem's `atime`: Linux has defaulted to
+    /// `relatime` since 2.6.30, so `atime` on a file read twice an hour is a
+    /// day stale, and on a `noatime` mount it never moves at all.
+    ///
+    /// **Best-effort and infallible by signature.** Every caller is on a read
+    /// path — an open, a text or document read, an export, the head of a media
+    /// stream — and none of them may fail because a memo could not be written.
+    /// A path with no ledger row writes nothing ([`db::note_use`] is
+    /// UPDATE-only) and is not an error: no row means this clone never recorded
+    /// holding content here, so there is no clock to move.
+    ///
+    /// It takes no reservation and touches no file. The lexical validation is
+    /// [`release_target`]'s, shared so that the key this writes is the key the
+    /// sweep will later read — a `\`-joined spelling would write a row nothing
+    /// ever consults.
+    pub fn note_use(&self, id: &str, subpath: &str) {
+        let logged = |what: &str, err: &SyncError| {
+            tracing::debug!(
+                profile = id,
+                subpath = subpath,
+                error = %err,
+                "{what}",
+            );
+        };
+        let profile = match self.with_db(|conn| db::get_profile(conn, id)) {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return,
+            Err(err) => {
+                logged("could not read the profile to record a use", &err);
+                return;
+            }
+        };
+        let path = match release_target(&profile, subpath) {
+            Ok((_, path)) => path,
+            Err(err) => {
+                logged("declined to record a use of this subpath", &err);
+                return;
+            }
+        };
+        let now = self.platform.now_ms();
+        if let Err(err) = self.with_db(|conn| db::note_use(conn, &profile.id, &path, now)) {
+            logged("could not record a use", &err);
+        }
+    }
+
+    /// Set or clear the owner's standing instruction that this path's content
+    /// stays on this machine (Story 56.5, FR-334).
+    ///
+    /// The writer [`db::is_pinned`] has been reading for since Story 56.2 —
+    /// without it 56.4's hard floor is a guard nothing in production can ever
+    /// arm, and the release sweep this story adds would have no absolute
+    /// override at all.
+    ///
+    /// # What it checks, and what it deliberately does not
+    ///
+    /// It refuses a path this folder does not track
+    /// ([`lfs::hydrate::ContentRefusal::NotTracked`]) and a path outside the
+    /// sparse cone ([`lfs::hydrate::ContentRefusal::OutsideSubpaths`]), so a pin
+    /// is never recorded against a path no sweep will ever look at — one index
+    /// read for both. The cone check is not redundant with the tracked one: a
+    /// skip-worktree entry still yields a pointer, so without it this verb
+    /// exited 0 for a path [`Self::release_resolved`] refuses forever.
+    ///
+    /// It refuses a detached removable volume with [`SyncError::MediaAbsent`],
+    /// for [`Self::dehydrate_entry`]'s reason: an unplugged volume is absence,
+    /// never failure (AD-48), and never a folder that stopped tracking things.
+    ///
+    /// It does **not** require the content to be present, and it takes no
+    /// reservation. A pin is a standing instruction about a
+    /// path rather than an operation on content: requiring the bytes would mean
+    /// an owner cannot pre-pin a path they are about to materialize, and would
+    /// put a whole guard chain behind a single `UPDATE`. Nothing here writes to
+    /// the worktree, so there is nothing for a reservation to serialize against.
+    ///
+    /// Idempotent: pinning a pinned path is the same answer as pinning an
+    /// unpinned one, which is why [`lfs::hydrate::Pin`] reports a state rather
+    /// than an outcome.
+    pub fn pin_entry(&self, id: &str, subpath: &str, pinned: bool) -> Result<lfs::hydrate::Pin> {
+        use lfs::hydrate::{ContentRefusal, Pin};
+
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+        let (rela, path) = release_target(&profile, subpath)?;
+        // An unplugged volume is absence, never failure (AD-48), and it must be
+        // said before the `.git` probe below — which is a filesystem question
+        // whose answer for a detached removable folder is `false`. Without this
+        // the operator was told `NotTracked`: that this folder does not track a
+        // path it does track, sending them to look at their `.gitattributes`
+        // instead of at the drive that is out. `dehydrate_entry` answers the
+        // identical state with `MediaAbsent`, and the two verbs must not
+        // describe one folder two ways.
+        if !self.volume_ready(&profile)? {
+            return Err(SyncError::MediaAbsent);
+        }
+        // No `.git` means no index, so nothing this folder tracks — and making
+        // one is somebody else's verb, exactly as it is for a release.
+        if !profile.local_path.join(".git").exists() {
+            return Err(SyncError::Refused(ContentRefusal::NotTracked { path }));
+        }
+        let tracked = {
+            let repo = git::repo::open(&profile.local_path, profile.removable)?;
+            lfs::stage::indexed_pointer_blob(&repo, &rela).is_some()
+        };
+        if !tracked {
+            return Err(SyncError::Refused(ContentRefusal::NotTracked { path }));
+        }
+        // Beside the tracked check and for the same reason. A skip-worktree
+        // index entry still yields a pointer, so a path outside the sparse cone
+        // reads as tracked — and `release_resolved` refuses it
+        // `OutsideSubpaths` forever. Without this, `pin` exited 0 and inserted a
+        // row claiming this machine holds content the sparse checkout
+        // guarantees it does not, against a path no release will ever consider:
+        // exactly the promise nothing keeps that this verb's own doc says a pin
+        // must never be.
+        if !SparseCone::new(&profile.subpaths).includes(&rela) {
+            return Err(SyncError::Refused(ContentRefusal::OutsideSubpaths { path }));
+        }
+        let now = self.platform.now_ms();
+        self.with_db(|conn| db::set_pinned(conn, &profile.id, &path, pinned, now))?;
+        tracing::info!(
+            profile = profile.name,
+            path = path,
+            pinned = pinned,
+            "recorded a pin instruction",
+        );
+        Ok(Pin { path, pinned })
+    }
+
+    /// Re-publish anything the server is missing that this machine can still
+    /// supply (DW-208).
+    ///
+    /// # Why nothing else does this
+    ///
+    /// `WorkKind::LfsUpload` is enqueued in exactly one place — `commit_local`,
+    /// for files being *freshly staged in that commit*. That is correct for the
+    /// path it serves and it means an obligation, once dropped, is never picked
+    /// up again: a file that is committed and unchanged produces no staging, so
+    /// no upload, so a pointer whose object silently never reached the server
+    /// stays that way forever. [`Self::rescan`] cannot help either — it forgets
+    /// the remembered tree state and asks for a walk, and a walk finds nothing
+    /// to stage in a file that has not changed.
+    ///
+    /// Measured on a real folder: 4 objects, 1.69 GB, committed 2026-08-10 and
+    /// still absent from the server a week later, through dozens of syncs,
+    /// several restarts and a "Recheck all files". Nothing in the engine was
+    /// ever going to try again.
+    ///
+    /// [`Self::audit_remote_objects`] is the half that *finds* them. This is
+    /// the half that fixes the ones that are fixable, and it is deliberately
+    /// separate: detection is read-only and safe to run anywhere, repair moves
+    /// gigabytes.
+    ///
+    /// # What "can still supply" means
+    ///
+    /// Two sources, in order of cost. The object may still be in this machine's
+    /// own store, in which case the upload is queued and the bytes are already
+    /// there. Otherwise the worktree file may *be* the content: re-cleaning it
+    /// hashes it back into the store and proves it, because a file whose digest
+    /// no longer matches the pointer is a different file and publishing it
+    /// under that oid would be a lie.
+    ///
+    /// Anything neither source can produce is reported, not papered over. Those
+    /// bytes exist on some other machine or nowhere, and the only thing that
+    /// helps is a human knowing which files to go looking for.
+    pub async fn republish_missing_objects(&self, id: &str) -> Result<RepublishReport> {
+        let audit = self.audit_remote_objects(id).await?;
+        let mut report = RepublishReport {
+            missing: audit.missing.len() as u64,
+            ..RepublishReport::default()
+        };
+        if audit.is_intact() {
+            return Ok(report);
+        }
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
+            return Err(SyncError::Config(format!("no such sync profile: {id}")));
+        };
+
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        store.ensure_layout()?;
+        let now = self.platform.now_ms();
+        // One upload per object, however many paths name it.
+        let mut queued: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for object in &audit.missing {
+            if queued.contains(&object.oid) {
+                continue;
+            }
+            let absolute = profile.local_path.join(&object.path);
+            let have = store.contains(&object.oid, object.size) || {
+                // Not in the store. The worktree file may still be the content
+                // — that is the ordinary state on the machine that recorded it
+                // — so hash it back in and check what came out.
+                //
+                // Unless the worktree holds the pointer that names THIS
+                // object, which since Epic 56 is the ordinary state of an
+                // authorized virtual path. Asked BEFORE the call and not
+                // around its answer, because `stage::clean` is not a probe: it
+                // streams the file into the store, so re-cleaning ~130 bytes
+                // of pointer text would deposit a junk object under the
+                // pointer text's own sha — an object no pointer names, that
+                // `prune` will not remove for want of a reference — and then
+                // compare that sha to the oid it stands for, which can never
+                // match. No read, no store write, no comparison.
+                //
+                // Only that pointer, and the oid comparison is what keeps the
+                // gate the width of the sentence. A tracked file whose genuine
+                // content IS pointer text — this project's own LFS
+                // documentation under a small `lfs_threshold_bytes`, a test
+                // fixture that holds an example pointer — is recoverable
+                // exactly as it always was, and calling it beyond this machine
+                // would be the loudest warning the product prints, told about
+                // a file sitting right there.
+                let holds_the_pointer_for_this_object = std::fs::metadata(&absolute)
+                    .ok()
+                    .and_then(|meta| lfs::stage::worktree_pointer(&absolute, &meta))
+                    .is_some_and(|pointer| pointer.oid == object.oid);
+                if holds_the_pointer_for_this_object {
+                    false
+                } else {
+                    match lfs::stage::clean(&store, &absolute) {
+                        Ok(pointer) => pointer.oid == object.oid && pointer.size == object.size,
+                        Err(err) => {
+                            tracing::debug!(
+                                path = %object.path,
+                                error = %err,
+                                "cannot rebuild a missing object from the worktree"
+                            );
+                            false
+                        }
+                    }
+                }
+            };
+            if !have {
+                report.unrecoverable.push(object.clone());
+                continue;
+            }
+            let unit = WorkKind::LfsUpload {
+                oid: object.oid.clone(),
+                size: object.size,
+            };
+            self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now))?;
+            queued.insert(object.oid.clone());
+            report.queued += 1;
+            report.queued_bytes += object.size;
+        }
+
+        if report.queued > 0 {
+            // Look now: the whole point of pressing the button is not to wait.
+            self.wake_now(&profile.id);
+            tracing::info!(
+                profile = profile.name,
+                queued = report.queued,
+                bytes = report.queued_bytes,
+                "re-publishing objects the server was missing"
+            );
+        }
+        for object in &report.unrecoverable {
+            self.warn(
+                &profile.id,
+                &profile.name,
+                format!(
+                    "{} is not on the server and its content is not on this machine — {} bytes that only another machine can still supply",
+                    object.path, object.size
+                ),
+            );
+        }
+        Ok(report)
+    }
+
+    /// Re-verify stored content for a profile (Story 25.6, Story 56.6).
+    ///
+    /// # Why the remote proof is NOT taken here
+    ///
+    /// A pointer whose object is not in this machine's store is either damage
+    /// or the entirely normal state of a folder that keeps pointers
+    /// (Epic 56). Telling the two apart from bytes on this disk is what the
+    /// index and the compiled policy do below; telling them apart *for
+    /// certain* would need the server, and this verb deliberately does not ask
+    /// it. [`Self::remote_serves`] is one batch round trip **per object**, so
+    /// composing it per path would answer NFR-41's own fixture — a folder with
+    /// 10 000 authorized virtual paths — with 10 000 round trips, and would
+    /// break the contract `docs/sync.md` states: that plain `verify` is the
+    /// half answerable without a network.
+    ///
+    /// The proof lives where it is already batched, index-driven and paid for
+    /// once: [`Self::audit_remote_objects`] behind `--remote`, whose
+    /// `missing_total` carries its own non-zero exit gate in `keeper-syncd`.
+    /// The offline half excuses; the remote half condemns.
+    ///
+    /// # What earns an excuse
+    ///
+    /// Four facts, and every one of them free. The **index** says the bytes on
+    /// disk are the pointer this repository committed; the compiled
+    /// **policy** says that path is authorized to stay away; the object is
+    /// **absent** rather than sitting here truncated; and where the folder's
+    /// remote is a directory this machine can see
+    /// ([`filesystem_remote_store`]) that store **holds** the object. The
+    /// fourth is what keeps the division of labour honest for an external
+    /// drive, whose remote half asks nothing. A folder whose `lfs_mode` is
+    /// `Disabled` earns nothing: with LFS off, no pass will ever materialize
+    /// the path, so calling its absent content normal would be a promise
+    /// nothing keeps.
     pub async fn verify(&self, id: &str) -> Result<VerifyReport> {
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
             return Err(SyncError::Config(format!("no such sync profile: {id}")));
         };
         self.publish(self.progress(&profile, SyncPhase::Verifying));
 
-        let root = profile.local_path.clone();
+        // Everything the walk needs, moved in whole — the policy compiled
+        // INSIDE the closure and not before it. `verify` takes no reservation,
+        // so `Reservation::drop` cannot clean up after it and the `Idle`
+        // publish at the tail is the only thing that does; a `?` between the
+        // `Verifying` publish and that line leaves the tray spinning and a bar
+        // on the card until the process ends. That is Story 34.8, and a config
+        // typo (FR-329) is a new way to reach it.
+        let walked = profile.clone();
         let report = tokio::task::spawn_blocking(move || -> Result<VerifyReport> {
+            let root = walked.local_path.clone();
+            // Compiled ONCE per call and never per path: the struct's own doc
+            // forbids building a `GlobSet` inside a walk. A policy that cannot
+            // be parsed fails the verb quoting the line (FR-329) rather than
+            // being read as a permissive "nothing is virtual" — the direction
+            // 56.5 settled for a folder config that could not be read.
+            let policy = lfs::virtual_policy::VirtualPolicy::compile(&walked)?;
             let mut report = VerifyReport::default();
             let store = lfs::store::LfsStore::in_git_dir(root.join(".git"));
+            // Whether ANY path in this folder could be excused, settled once
+            // because both halves are facts about the folder rather than about
+            // a path. No source said what may stay away, so nothing may; or
+            // LFS is off entirely, in which case nothing will ever materialize
+            // a pointer and calling the path's absent content normal would be
+            // dishonest. Settling it here is also what keeps the ordinary
+            // folder — the overwhelming majority, carrying no policy at all —
+            // from paying an index parse plus one object-header lookup per
+            // tracked path on every verify, the scheduled ones included.
+            let excusable = policy.tier() != lfs::virtual_policy::VirtualPolicyTier::Unset
+                && walked.lfs_mode != LfsMode::Disabled;
+            // One index read for the whole walk. A folder with no repository,
+            // or one whose index cannot be read, answers with an empty map and
+            // therefore excuses NOTHING: the index is the only thing that can
+            // tell a checkout's committed pointer from a pointer-shaped file
+            // somebody saved by hand, and `VirtualPolicy::resolve` does no I/O
+            // by design (FR-328) so it cannot.
+            let indexed = if excusable {
+                git::repo::open(&root, walked.removable)
+                    .ok()
+                    .map(|repo| lfs::stage::indexed_pointers(&repo))
+                    .unwrap_or_default()
+            } else {
+                std::collections::BTreeMap::new()
+            };
+            // The third fact, taken here because it is free: a remote that is
+            // a directory this machine can see is asked with a `stat`, not a
+            // round trip. Resolved once, and only when an excuse is possible.
+            let remote = if excusable {
+                filesystem_remote_store(&walked)
+            } else {
+                None
+            };
             let mut stack = vec![root.clone()];
             while let Some(dir) = stack.pop() {
                 let entries = match std::fs::read_dir(&dir) {
@@ -4899,10 +8043,63 @@ impl Engine {
                         if lfs::pointer::is_pointer_candidate(&head) {
                             if let Some(pointer) = lfs::pointer::Pointer::parse(&head) {
                                 if !store.contains(&pointer.oid, pointer.size) {
-                                    report.bad.push((
-                                        display_relative(&root, &path),
-                                        format!("LFS object {} is missing locally", pointer.oid),
-                                    ));
+                                    // The excuse is earned by every fact that
+                                    // is free, never by one (AD-129). The
+                                    // policy answer is an authorization about
+                                    // a pattern and a size — "this path *may*
+                                    // stay away" — and the index is what
+                                    // proves the bytes on disk are the pointer
+                                    // this repository committed rather than a
+                                    // stray file that happens to start with
+                                    // `version https://git-lfs...`. Either
+                                    // alone is a guess, and everything
+                                    // unproven stays reported, word for word
+                                    // as before.
+                                    let rela = path.strip_prefix(&root).unwrap_or(&path);
+                                    let committed = indexed
+                                        .get(&lfs::stage::index_key(rela))
+                                        .is_some_and(|entry| {
+                                            entry.oid == pointer.oid && entry.size == pointer.size
+                                        });
+                                    let authorized = policy.resolve(rela, pointer.size)
+                                        == lfs::virtual_policy::Virtualization::Virtual;
+                                    // `contains` is length-verified, so an
+                                    // object sitting here at the WRONG length
+                                    // answered `false` above — a truncated
+                                    // blob left by a `kill -9` or a
+                                    // half-restored backup, which is the very
+                                    // damage `LfsStore::contains` exists to
+                                    // catch. Only a genuinely ABSENT object is
+                                    // the normal state of a virtual path.
+                                    let absent = !store.object_path(&pointer.oid).exists();
+                                    // The third fact, and without it "the
+                                    // offline half excuses, the remote half
+                                    // condemns" is simply false for an
+                                    // external drive: `audit_remote_objects`
+                                    // short-circuits a filesystem remote to
+                                    // `missing: []` without asking it
+                                    // anything, so an object that vanished
+                                    // from the drive would be reported by
+                                    // nothing at all. When the drive is there
+                                    // the proof costs a `stat`, so it is taken.
+                                    // `None` — a remote that is a URL, or a
+                                    // drive that is out (absence is never
+                                    // failure, AD-48) — leaves the two-fact
+                                    // excuse exactly as it was.
+                                    let elsewhere = remote.as_ref().is_none_or(|remote| {
+                                        remote.contains(&pointer.oid, pointer.size)
+                                    });
+                                    if committed && authorized && absent && elsewhere {
+                                        report.virtual_paths += 1;
+                                    } else {
+                                        report.bad.push((
+                                            display_relative(&root, &path),
+                                            format!(
+                                                "LFS object {} is missing locally",
+                                                pointer.oid
+                                            ),
+                                        ));
+                                    }
                                 }
                                 continue;
                             }
@@ -4920,10 +8117,18 @@ impl Engine {
         .await
         .map_err(|err| SyncError::Journal(format!("verify task failed: {err}")));
 
-        // Published before the `?`, not after it. `verify` takes no reservation
-        // — it only reads — so it is the one pass `Reservation::drop` does not
-        // cover, and an unreadable tree used to leave `Verifying` on the tray
-        // and a bar on the card until the process ended (Story 34.8).
+        // Published before the `?`, not after it, and this is the reason every
+        // fallible step above lives inside the closure. `verify` takes no
+        // reservation, so it is the one pass `Reservation::drop` does not
+        // cover, and an unreadable tree — or a policy that will not compile —
+        // used to leave `Verifying` on the tray and a bar on the card until the
+        // process ended (Story 34.8).
+        //
+        // It moves nothing a user owns: no worktree file is written and no
+        // object is added to the store. It is not *pure*, though, and the
+        // claim is worth narrowing rather than repeating — opening the
+        // repository to read the index is a `gix` open, which may clear a stale
+        // `index.lock` and may write `.git/config` on first use.
         self.publish(self.progress(&profile, SyncPhase::Idle));
         report?
     }
@@ -4970,44 +8175,202 @@ impl Engine {
 
         // Settling paths are absolute in `file_state` (that is what the gate
         // samples), and everything the user sees must be repository-relative.
+        //
+        // **Bounded, and off the runtime.** This loop used to `stat` every row
+        // the gate held, inline in an async fn. On the folder this was written
+        // for the gate holds 128 483 of them, so one Pending poll made 128 483
+        // blocking syscalls on a USB volume from a tokio worker — which is why
+        // the Pending list never arrived AND why Activity, a single indexed
+        // query, appeared to hang beside it: they share the runtime, and the
+        // frontend renders the three legs together.
+        //
+        // Capping the LIST does not cost the count. "N waiting for writes to
+        // stop" comes from `status.settling`, a `COUNT(*)`; see
+        // [`crate::progress::status_line`]. What is bounded here is how many
+        // rows cross the IPC boundary and get a size measured.
         let settling = self.with_db(|conn| db::load_file_state(conn, profile_id))?;
-        let mut out: Vec<PendingFile> = Vec::with_capacity(settling.len());
-        let mut named: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(settling.len());
-        for (path, entry) in settling {
-            let relative = path.strip_prefix(&profile.local_path).unwrap_or(&path);
-            // A row written before a pattern was added to the profile: the gate
-            // will drop it on the next walk, and until then it must not be
-            // shown.
-            if excludes.is_excluded(relative) {
-                continue;
-            }
-            let relative = relative.to_string_lossy().into_owned();
-            if named.insert(relative.clone()) {
-                out.push(PendingFile {
-                    path: relative,
-                    reason: PendingReason::Settling {
-                        since_ms: entry.pending_since_ms,
-                    },
-                });
-            }
-        }
+        let local_path = profile.local_path.clone();
+        let filter = excludes.clone();
+        let (mut out, mut named) = tokio::task::spawn_blocking(
+            move || -> (Vec<PendingFile>, std::collections::HashSet<String>) {
+                let mut out: Vec<PendingFile> = Vec::new();
+                let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (path, entry) in settling {
+                    if out.len() >= PENDING_LIST_CAP {
+                        break;
+                    }
+                    let relative = path.strip_prefix(&local_path).unwrap_or(&path);
+                    // A row written before a pattern was added to the profile:
+                    // the gate will drop it on the next walk, and until then it
+                    // must not be shown.
+                    if filter.is_excluded(relative) {
+                        continue;
+                    }
+                    let relative = relative.to_string_lossy().into_owned();
+                    if named.insert(relative.clone()) {
+                        // `path` here is absolute — the gate stores it that
+                        // way, which is the whole reason `relative` is derived
+                        // above.
+                        let size_bytes = std::fs::metadata(&path)
+                            .ok()
+                            .filter(|m| m.is_file())
+                            .map(|m| m.len());
+                        out.push(PendingFile {
+                            path: relative,
+                            reason: PendingReason::Settling {
+                                since_ms: entry.pending_since_ms,
+                            },
+                            size_bytes,
+                        });
+                    }
+                }
+                (out, named)
+            },
+        )
+        .await
+        .map_err(|err| SyncError::Journal(format!("pending settling scan failed: {err}")))?;
 
         // A folder that is not a repository yet has nothing git can classify,
         // and materializing one is a clone — far too much for a poll. The
         // first sync adopts it and the next call is complete.
-        if profile.local_path.join(".git").exists() {
+        let is_repository = profile.local_path.join(".git").exists();
+
+        // Before the walk, not after it, and for exactly the reason
+        // [`Self::repair_recorded_pointers`] gives on the commit leg: a path
+        // whose recorded blob contradicts its own attributes is pending BY
+        // DEFINITION — the index says so, for free — and the walk is the most
+        // expensive possible way to rediscover it. The walk cleans the file,
+        // gets a pointer, compares it to a raw blob and calls it modified: one
+        // full read and one filter round trip per path, on every poll.
+        //
+        // The commit leg learned this and this one did not, which is what made
+        // an open Sync pane a permanent full-tree scan. Measured on the folder
+        // it was written for: ~37 500 such paths, 48 to 72 minutes per walk,
+        // restarted the moment it finished because the pane polls every five
+        // seconds and the poll before it had only just returned.
+        //
+        // Answering from the index instead is not a thinner list, it is the
+        // first list that arrives at all: the walk it replaces never finished,
+        // so Pending read "Loading…" for days. Bounded by the same window the
+        // repair sweep uses and started from the same cursor — READ, never
+        // advanced, because moving it here would make the sweep skip the work
+        // it is the only leg that can do.
+        let repair = if is_repository {
+            match self.remembered_repair(&profile.id) {
+                Some(remembered) => remembered,
+                None => {
+                    let repo_path = profile.local_path.clone();
+                    let removable = profile.removable;
+                    let filtered = profile.lfs_mode != LfsMode::Disabled;
+                    let from = Self::lock(&self.repair_cursor)
+                        .get(&profile.id)
+                        .copied()
+                        .unwrap_or(0);
+                    let found = tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
+                        if !filtered {
+                            return Vec::new();
+                        }
+                        let Ok(repo) = git::repo::open(&repo_path, removable) else {
+                            return Vec::new();
+                        };
+                        let Ok(tracked) = git::repo::tracked_paths(&repo) else {
+                            return Vec::new();
+                        };
+                        lfs::stage::mismatched_filtered_paths(
+                            &repo,
+                            &tracked,
+                            from,
+                            REPAIR_WINDOW,
+                            PENDING_LIST_CAP,
+                        )
+                        .0
+                    })
+                    .await
+                    .map_err(|err| {
+                        SyncError::Journal(format!("pending repair probe failed: {err}"))
+                    })?;
+                    self.remember_repair(&profile.id, &found);
+                    found
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        for rela in &repair {
+            if excludes.is_excluded(rela) {
+                continue;
+            }
+            let relative = rela.to_string_lossy().into_owned();
+            if named.insert(relative.clone()) {
+                out.push(PendingFile {
+                    path: relative,
+                    reason: PendingReason::Modified,
+                    size_bytes: std::fs::metadata(profile.local_path.join(rela))
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len()),
+                });
+            }
+        }
+
+        // The same one-walk-per-folder claim the commit leg takes, and the
+        // reason the claim exists: this branch is reached from a five-second UI
+        // poll, so without it a folder whose walk runs for over an hour ends up
+        // with a second full-tree pass beside the first — measured, two at once
+        // for as long as anyone watched. Losing the claim costs the poll only
+        // the untracked rows; the settling rows and the repair backlog above
+        // are already assembled, and the walk that does hold the claim is
+        // computing the same verdicts for the commit path anyway.
+        let walk_claim = (is_repository && repair.is_empty())
+            .then(|| self.claim_walk(profile_id))
+            .flatten();
+        if walk_claim.is_some() {
             let repo_path = profile.local_path.clone();
             let removable = profile.removable;
             let filter = excludes.clone();
+            let interval = self.walk_report_interval;
+            // The expensive half of a walk is the directory scan, and a
+            // five-second poll does not need it: a new file reaches this list
+            // through the watcher and the stability gate long before a walk
+            // would find it. Measured on tgdrive, `find . -type f` over 157 490
+            // files takes 996 s on that volume — every poll, for rows the gate
+            // already holds. So the poll asks about the index and sweeps for
+            // untracked paths on a cadence; see `untracked_sweep_due`.
+            let policy = self.poll_walk_policy(profile_id);
+            // The walk runs on a blocking thread and cannot touch `&self`, so
+            // its progress comes back over a channel and is published from
+            // here. Without this the Pending list is the one surface that
+            // still went silent for the whole walk - which is exactly where
+            // the owner was looking when they asked what keeper was doing.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
             // The status walk and the untracked expansion are both blocking
             // filesystem work on a tree that may hold a hundred thousand
             // files; running them on the async runtime would stall every other
             // profile while a UI poll finished.
-            let (status, untracked) = tokio::task::spawn_blocking(
-                move || -> Result<(git::repo::RepoStatus, Vec<PathBuf>)> {
+            let task = tokio::task::spawn_blocking(
+                move || -> Result<(
+                    git::repo::RepoStatus,
+                    Vec<PathBuf>,
+                    std::collections::HashMap<PathBuf, u64>,
+                )> {
                     let repo = git::repo::open(&repo_path, removable)?;
-                    let status = git::repo::status_paths(&repo)?;
+                    let report = move |seen: u64, entries: u64| {
+                        // A closed receiver means the caller has gone; the walk
+                        // still has a list to finish, so the send is dropped.
+                        let _ = tx.send((seen, entries));
+                    };
+                    let status =
+                        git::repo::status_paths_reported(&repo, Some(&report), interval, policy)?;
+                    // Asked here, where the repository is already open and on a
+                    // blocking thread: a deleted path cannot be stat'd, and the
+                    // index is the only thing that still knows how big it was.
+                    let deleted_sizes = status
+                        .deleted
+                        .iter()
+                        .filter_map(|rela| {
+                            lfs::stage::indexed_size(&repo, rela).map(|size| (rela.clone(), size))
+                        })
+                        .collect();
                     // Tier 0 before the expansion, not only after it: that walk
                     // `lstat`s every entry, and a `node_modules` the user has
                     // not put in `.gitignore` would otherwise cost fifty
@@ -5018,12 +8381,35 @@ impl Engine {
                         .filter(|rela| !filter.is_excluded(rela.as_path()))
                         .cloned()
                         .collect();
-                    let untracked = Self::expand_untracked(&repo_path, &candidates)?;
-                    Ok((status, untracked))
+                    // The poll reports what is waiting; the commit walk owns
+                    // saying why a nested repository never will be.
+                    let (untracked, _collapsed) = Self::expand_untracked(&repo_path, &candidates)?;
+                    Ok((status, untracked, deleted_sizes))
                 },
-            )
-            .await
-            .map_err(|err| SyncError::Journal(format!("pending scan task failed: {err}")))??;
+            );
+
+            // Drain the walk's progress as it arrives, then take its result.
+            //
+            // The channel's own close is the signal: `tx` lives in the closure,
+            // so `recv` yields every report and then `None` once the walk has
+            // returned and dropped it. Nothing is lost and nothing is polled
+            // twice.
+            //
+            // This was a `select!` between `recv` and the join handle, which is
+            // wrong in a way only the macOS gate caught: `select!` picks a ready
+            // branch at RANDOM, so a walk that finished before the first drain
+            // could take the handle's branch and discard every queued report.
+            // On Linux the timing hid it; the same test failed on the Mac.
+            while let Some((scanned, entries)) = rx.recv().await {
+                let mut event = self.progress(&profile, SyncPhase::Scanning);
+                event.files_done = scanned;
+                // Index entries on both sides; see [`git::repo::WalkReport`].
+                event.files_total = (entries > 0).then_some(entries);
+                self.publish(event);
+            }
+            let (status, untracked, deleted_sizes) = task
+                .await
+                .map_err(|err| SyncError::Journal(format!("pending scan task failed: {err}")))??;
 
             let buckets: [(&Vec<PathBuf>, PendingReason); 4] = [
                 (&status.added, PendingReason::Added),
@@ -5040,17 +8426,147 @@ impl Engine {
                     // Already named as settling, or reported by two status
                     // buckets at once (staged as added, then edited again).
                     if named.insert(relative.clone()) {
+                        // Measured off the worktree, and only where there is
+                        // something to measure: a deleted path has no file, and
+                        // a stat that fails is a size nobody can report rather
+                        // than a listing that fails.
+                        let size_bytes = match reason {
+                            // Off the index, because the file is gone. What it
+                            // reports is what was there — which is the whole
+                            // question about something that has been deleted
+                            // and not yet published.
+                            PendingReason::Deleted => deleted_sizes.get(rela).copied(),
+                            _ => std::fs::metadata(profile.local_path.join(rela))
+                                .ok()
+                                .filter(|m| m.is_file())
+                                .map(|m| m.len()),
+                        };
                         out.push(PendingFile {
                             path: relative,
                             reason: reason.clone(),
+                            size_bytes,
                         });
                     }
                 }
             }
         }
 
+        // The inbound half, from the journal. Added after the status buckets so
+        // `named` gives a local change precedence: if a path is somehow both
+        // edited here and queued from the remote, what the operator did is the
+        // more actionable of the two facts.
+        let held = self
+            .with_db(|conn| db::materialized_paths(conn, profile_id))
+            .unwrap_or_default();
+        for (label, oid, size_bytes) in
+            self.with_db(|conn| db::queued_downloads(conn, profile_id))?
+        {
+            // An object whose path is not in the index cannot be named — it was
+            // queued for a path since deleted. It is still work, and dropping
+            // it would make this list disagree with the count in the status
+            // line, so it says plainly what it is.
+            let path =
+                label.unwrap_or_else(|| format!("LFS object {}…", &oid[..oid.len().min(12)]));
+            if named.insert(path.clone()) {
+                let replacing = held.contains(&path);
+                out.push(PendingFile {
+                    path,
+                    reason: PendingReason::Incoming {
+                        size_bytes,
+                        replacing,
+                    },
+                    size_bytes: Some(size_bytes),
+                });
+            }
+        }
+
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
+    }
+
+    /// Every path this clone has held content for (Story 56.7, FR-345).
+    ///
+    /// The fact [`crate::browse::MaterializedView`] is built from, and the
+    /// reason the Files pane can tell a hydrated LFS path from an ordinary
+    /// file: `browse` opens no repository, so both are just regular files to
+    /// it, and this ledger is what closes the gap.
+    ///
+    /// Synchronous like [`Self::list_profiles`], because it is one indexed
+    /// `SELECT` over a table with a row per materialized path and there is
+    /// nothing here to move off the runtime. Deliberately **not** folded into
+    /// the shell's cached `browse_marks_for` walk alongside [`Self::pending`]:
+    /// that cache exists to stop a repeated tree walk, a statement this cheap
+    /// has no need of it, and caching the answer would let a stale row outlive
+    /// a release — the pane would offer to free space that is already free.
+    ///
+    /// Narrower than [`db::materialized_rows`] on purpose, for the reason
+    /// [`db::materialized_paths`] itself gives: this is one yes-or-no per
+    /// path, which is the whole of what a mark needs and the whole of what it
+    /// should be able to see. A caller that wants the timestamps, the pin or
+    /// the recorded size is asking a listing question and wants
+    /// [`Self::lfs_files`].
+    pub fn materialized_paths(
+        &self,
+        profile_id: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        self.with_db(|conn| db::materialized_paths(conn, profile_id))
+    }
+
+    /// Why every path this clone holds content for will or will not be released
+    /// (Story 56.9, FR-343).
+    ///
+    /// [`Self::materialized_paths`]' richer twin, and the reason the Files pane
+    /// can put a countdown on a row: `browse` opens no repository and knows
+    /// nothing about a TTL, so this ledger read plus [`release_schedule`] is the
+    /// whole of where a deadline can come from.
+    ///
+    /// **One lock, one answer.** The profile and its rows are read inside a
+    /// single [`Self::with_db`] closure, not two: two locks leave a window in
+    /// which a profile edit lands between them, and every row in the listing
+    /// would then be classified against a folder shape that no longer exists —
+    /// a countdown drawn from a TTL nobody has any more, or a "Kept" for a mode
+    /// that has just been switched off. Two statements, and synchronous for
+    /// [`Self::materialized_paths`]' reason: both are indexed `SELECT`s over a
+    /// table with a row per materialized path, and there is nothing here to move
+    /// off the runtime. Deliberately **not** folded into the shell's cached
+    /// `browse_marks_for` walk, for that method's reason and more sharply: a
+    /// cached deadline is a clock that keeps counting down after the content it
+    /// belonged to has already gone, so the pane would offer to free space that
+    /// is already free *and* tell the owner when it would happen.
+    ///
+    /// The keys are the ledger's own path spelling — [`lfs::stage::index_key`]'s
+    /// `/`-joined form, git's spelling, the same keys
+    /// [`Self::materialized_paths`] hands back — so a caller that already
+    /// matches marks against a listing matches these the same way, on every
+    /// platform.
+    ///
+    /// The TTL and the mode are read once for the folder rather than per row,
+    /// because they are facts about the folder; [`release_schedule`] is then a
+    /// pure classification of each row against them. The mode is handed over as
+    /// a mode rather than as [`release_mode_gate`]'s verdict, because the gate
+    /// refuses two opposite configurations with one `Err` and a row's cell has
+    /// to tell them apart — see [`release_schedule`]'s own doc.
+    pub fn release_schedules(
+        &self,
+        profile_id: &str,
+    ) -> Result<std::collections::HashMap<String, ReleaseSchedule>> {
+        let (profile, rows) = self.with_db(|conn| {
+            let Some(profile) = db::get_profile(conn, profile_id)? else {
+                return Err(SyncError::Config(format!(
+                    "no such sync profile: {profile_id}"
+                )));
+            };
+            let rows = db::materialized_rows(conn, profile_id)?;
+            Ok((profile, rows))
+        })?;
+        let ttl_ms = profile.effective_release_ttl_ms();
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let schedule = release_schedule(&row, ttl_ms, profile.lfs_mode);
+                (row.path, schedule)
+            })
+            .collect())
     }
 
     /// Everything currently wrong with this profile (Story 32.2).
@@ -5090,11 +8606,34 @@ impl Engine {
         .await
         .map_err(|err| SyncError::Journal(format!("conflict scan task failed: {err}")))?;
 
+        // Read from the index, in the same blocking pool the conflict scan uses
+        // and for the same reason: it is filesystem work on a file that may be
+        // tens of megabytes on a large repository, and this endpoint is polled.
+        //
+        // A folder that is not a repository yet has no index and nothing to
+        // say. An index that will not open is not this report's problem to
+        // raise — `sync_once` will fail on it loudly and land in `error` above —
+        // so it degrades to "nothing to add" rather than failing a call that
+        // has three other answers to deliver.
+        let repo_path = profile.local_path.clone();
+        let removable = profile.removable;
+        let unspellable = tokio::task::spawn_blocking(move || {
+            if !repo_path.join(".git").exists() {
+                return Vec::new();
+            }
+            git::repo::open(&repo_path, removable)
+                .and_then(|repo| git::repo::unspellable_tracked_paths(&repo))
+                .unwrap_or_default()
+        })
+        .await
+        .map_err(|err| SyncError::Journal(format!("index name scan task failed: {err}")))?;
+
         Ok(ProblemReport {
             warning: snapshot.as_ref().and_then(|s| s.warning.clone()),
             error: snapshot.and_then(|s| s.error),
             parked,
             conflicts,
+            unspellable,
         })
     }
 
@@ -5137,8 +8676,18 @@ impl Engine {
         }
     }
 
-    /// Queue the work a profile needs, based on what the tree looks like now.
-    fn scan_and_enqueue(&self, profile: &SyncProfile) -> Result<()> {
+    /// Commit whatever has settled and queue the work a profile needs.
+    ///
+    /// It commits rather than merely looking because **the walk is not a
+    /// query**: [`StabilityGate::is_stable`] forgets a path the instant it
+    /// reports `Stable`, so a scan that walked and then discarded the result
+    /// consumed the very verdict the commit leg was waiting to act on. The
+    /// path re-entered the gate as a first observation on the next pass, its
+    /// settle episode restarted, and on a tree walked once a second it never
+    /// survived long enough to be committed at all — the folder sat at "N
+    /// waiting for writes to stop" forever, with the wait perpetually reading
+    /// "under a minute so far" because it genuinely had just begun. Again.
+    fn scan_and_enqueue(&self, profile: &SyncProfile, source: SyncSource) -> Result<()> {
         let now = self.platform.now_ms();
         // The walk this function is about to do answers whatever the watcher
         // reported, so the wake is spent here rather than at the point the
@@ -5165,9 +8714,9 @@ impl Engine {
             // checking the former stranded work permanently: once a change was
             // committed the tree went clean, no push was ever queued, and the
             // local branch sat ahead of the remote forever.
-            let staged = self.collect_stable_changes(profile)?;
-            let unpushed = staged.is_empty() && self.has_unpushed_commits(profile)?;
-            if !staged.is_empty() || unpushed {
+            let committed = self.commit_local(profile, source, None)?;
+            let unpushed = committed == 0 && self.has_unpushed_commits(profile)?;
+            if committed > 0 || unpushed {
                 self.with_db(|conn| {
                     db::enqueue_unique(conn, &profile.id, &WorkKind::Push, now, now).map(drop)
                 })?;
@@ -5193,13 +8742,33 @@ impl Engine {
     }
 
     /// Add to a profile's cumulative transferred-byte counter.
+    ///
+    /// Every call is also an observation for the run's rate meter: this is the
+    /// moment bytes are known to have landed, and on a folder of small objects
+    /// it is the *only* moment, because each object's own tally dies with the
+    /// `do_lfs` call that owned it.
     fn add_transferred(&self, profile_id: &str, bytes: u64) {
         if bytes == 0 {
             return;
         }
-        let mut totals = Self::lock(&self.transferred);
-        let total = totals.entry(profile_id.to_owned()).or_insert(0);
-        *total = total.saturating_add(bytes);
+        {
+            let mut totals = Self::lock(&self.transferred);
+            let total = totals.entry(profile_id.to_owned()).or_insert(0);
+            *total = total.saturating_add(bytes);
+        }
+        self.observe_session_rate(profile_id, Instant::now());
+    }
+
+    /// Fold the profile's cumulative transferred bytes into its run meter.
+    ///
+    /// The clock is a parameter for [`RateMeter`]'s reason: a rate's window
+    /// boundaries are only testable if a test can choose when things happened.
+    fn observe_session_rate(&self, profile_id: &str, now: Instant) -> Option<u64> {
+        let total = self.transferred_bytes(profile_id);
+        Self::lock(&self.session_rate)
+            .entry(profile_id.to_owned())
+            .or_default()
+            .observe(total, now)
     }
 
     fn transferred_bytes(&self, profile_id: &str) -> u64 {
@@ -5228,6 +8797,7 @@ impl Engine {
         &self,
         profile: &SyncProfile,
         phase: SyncPhase,
+        current: Option<&str>,
         mut events: tokio::sync::mpsc::UnboundedReceiver<E>,
         mut fold: impl FnMut(&mut SyncProgress, E),
         work: F,
@@ -5235,7 +8805,12 @@ impl Engine {
     where
         F: Future<Output = T>,
     {
+        // Stamped on the frame this function owns rather than on one published
+        // before the work starts. Every frame from here overwrites the
+        // snapshot, so a name set anywhere else survives exactly until the
+        // first byte moves — which is to say, it is never seen.
         let mut event = self.progress(profile, phase);
+        event.current = current.map(str::to_owned);
         tokio::pin!(work);
         loop {
             tokio::select! {
@@ -5265,6 +8840,65 @@ impl Engine {
                     self.publish(event.clone());
                 }
             }
+        }
+    }
+
+    /// Give queued transfers their names, for a queue that predates them.
+    ///
+    /// A unit is named when it is enqueued, which is the cheap moment: the path
+    /// is right there. Rows queued before that column existed have no such
+    /// moment left, and on an install that upgraded mid-backlog that is every
+    /// row — 106 objects and 54.7 GB of them on the folder that prompted this,
+    /// which would have shown the folder's name and nothing else for days.
+    ///
+    /// The index is the only reverse map from object to path, so this walks it
+    /// once and answers every waiting unit in that pass. Runs at most once per
+    /// profile per process (see `labels_backfilled`) and never fails a sync: a
+    /// missing name is a worse line, not a worse outcome.
+    fn backfill_labels(&self, profile: &SyncProfile) {
+        if Self::lock(&self.labels_backfilled).contains(&profile.id) {
+            return;
+        }
+        let Ok(wanted) = self.with_db(|conn| db::unlabelled_transfers(conn, &profile.id)) else {
+            return;
+        };
+        Self::lock(&self.labels_backfilled).insert(profile.id.clone());
+        if wanted.is_empty() {
+            return;
+        }
+        let named = (|| -> Result<usize> {
+            let repo = git::repo::open(&profile.local_path, false)?;
+            let tracked = git::repo::tracked_paths(&repo)?;
+            let mut named = 0usize;
+            for rela in tracked {
+                let Some(pointer) = lfs::stage::indexed_pointer(&repo, &rela) else {
+                    continue; // an ordinary file, not an LFS path
+                };
+                let Some(ids) = wanted.get(&pointer.oid) else {
+                    continue;
+                };
+                // git's spelling, not the platform's. This column stopped being
+                // a display nicety in Story 56.5: `note_unit_synced` reads a
+                // completed unit's label as a `materialized` LEDGER KEY, and
+                // `db::unlabelled_transfers` selects any journal row carrying an
+                // `oid` — which includes `LfsUpload`. So a `\`-joined label here
+                // would, on Windows, stamp `synced_at_ms` against a key no
+                // ledger row uses, and every locally authored path in a queue
+                // that predates this story would stay unreleasable at any age —
+                // silently inert on exactly the install this function exists
+                // for. A no-op on Unix, where the two spellings agree.
+                let label = lfs::stage::index_key(&rela);
+                for id in ids {
+                    self.with_db(|conn| db::label_unit(conn, *id, &label))?;
+                    named += 1;
+                }
+            }
+            Ok(named)
+        })();
+        match named {
+            Ok(0) => {}
+            Ok(named) => tracing::info!(profile = profile.name, named, "named queued transfers"),
+            Err(err) => tracing::debug!(error = %err, "could not name queued transfers"),
         }
     }
 
@@ -5310,6 +8944,364 @@ impl Drop for Reservation<'_> {
         // published frame wiped by this one's cleanup.
         self.engine.clear_phase(&self.profile_id);
         Engine::lock(&self.engine.busy).remove(&self.profile_id);
+    }
+}
+
+/// Turn a caller's `/`-spelled subpath into the repository-relative path and
+/// the ledger key a release will act on, or refuse it (Story 56.4, extracted
+/// in Story 56.5).
+///
+/// Every lexical containment rule a deleting verb owes, in one place, so
+/// [`Engine::dehydrate_entry`] and [`Engine::release_expired`] cannot drift
+/// apart about what a subpath is allowed to name. Pure apart from the one
+/// `resolve` that has to touch the filesystem, and it takes no reservation:
+/// a subpath that may not be asked for is refused whatever the folder is
+/// doing.
+fn release_target(profile: &SyncProfile, subpath: &str) -> Result<(PathBuf, String)> {
+    use lfs::hydrate::ContentRefusal;
+
+    let segments = crate::browse::plain_segments(subpath)
+        .map_err(ContentRefusal::from)
+        .map_err(SyncError::Refused)?;
+    if segments.is_empty() {
+        // `plain_segments` answers the profile ROOT with no segments. A
+        // folder holds no content to release, and asking for one as a file
+        // is an escape — browse's own sentence names the subpath.
+        return Err(SyncError::Refused(ContentRefusal::Escapes(
+            crate::browse::BrowseRefusal::Escapes {
+                subpath: subpath.to_owned(),
+            },
+        )));
+    }
+    let rela = lfs::hydrate::joined(&segments);
+    // A backslash that is not a separator on this platform ALIASES onto a
+    // different index entry, and this verb deletes.
+    //
+    // On Unix `\` is an ordinary filename character, so `plain_segments`
+    // hands back ONE component for `40-media\clip.mp4` — but
+    // `lfs::stage::index_key` normalizes `\` to `/` before it asks the
+    // index, so the committed pointer that comes back belongs to the real
+    // `40-media/clip.mp4` while every step after it acts on the literal
+    // backslash-named file beside it. If that file happens to be a copy of
+    // the content, its length and digest match, the remote proves the real
+    // object, and the rename destroys an untracked file while reporting a
+    // successful release.
+    //
+    // Refusing is the safe direction for a deleting verb, and it is also
+    // literally true: this folder tracks the slash-spelled path, not this
+    // one. On Windows `\` IS a separator, `plain_segments` has already split
+    // on it, and no segment can contain one — so this costs nothing there.
+    if !std::path::is_separator('\\')
+        && segments
+            .iter()
+            .any(|segment| segment.to_string_lossy().contains('\\'))
+    {
+        return Err(SyncError::Refused(ContentRefusal::NotTracked {
+            path: rela.to_string_lossy().into_owned(),
+        }));
+    }
+    // The canonicalizing half of the same rule (AD-59), which the lexical
+    // half cannot do: a *parent* component replaced by a symlink pointing
+    // out of the folder is every-segment-normal and still outside. This is
+    // a write, so it runs it.
+    crate::browse::resolve(&profile.local_path, subpath)
+        .map_err(ContentRefusal::from)
+        .map_err(SyncError::Refused)?;
+    // git's spelling, from the very function that keys the index lookup —
+    // and the `materialized` ledger's rows are written in that spelling too.
+    // A `\`-joined `to_string_lossy` would, on Windows, miss a pin and
+    // delete nothing from the ledger while reporting a path keeper never
+    // used. On Unix the two agree, which the guard above is what guarantees.
+    let path = lfs::stage::index_key(&rela);
+    Ok((rela, path))
+}
+
+/// May this folder let content go at all? (Story 56.4, extracted in Story
+/// 56.5.)
+///
+/// Exhaustive, so a fourth mode has to decide rather than inherit. Shared by
+/// the request door and the sweep so that a mode which refuses one refuses the
+/// other — see [`Engine::dehydrate_entry`]'s doc for why
+/// [`LfsMode::Materialize`] is a mode gate and not a permanent limit.
+fn release_mode_gate(profile: &SyncProfile) -> Result<()> {
+    use lfs::hydrate::ContentRefusal;
+
+    match profile.lfs_mode {
+        LfsMode::PointerOnly => Ok(()),
+        LfsMode::Disabled => Err(SyncError::Refused(ContentRefusal::LfsDisabled {
+            profile: profile.name.clone(),
+        })),
+        // A folder that keeps everything it holds would have this back on
+        // the next pass; see `dehydrate_entry`'s own doc for why that is a
+        // mode gate and not a limit.
+        LfsMode::Materialize => Err(SyncError::Refused(ContentRefusal::AlwaysMaterializes {
+            profile: profile.name.clone(),
+        })),
+    }
+}
+
+/// The instant this row becomes releasable, or `None` for *never* (Story 56.5,
+/// FR-341, AD-131).
+///
+/// A free function with no `self`, no I/O and no clock, because this is where
+/// the whole feature's safety lives: the sweep reads rows, asks this, and
+/// compares the answer to now. That makes both guards one line each,
+/// unit-testable over hand-built rows, and — the property AC 2 asks for — it
+/// makes the sweep's *candidate set* a value a test can assert on. "Was not
+/// released" would also be true of a path that was considered and refused;
+/// "was not a candidate" is the stronger claim, and only a pure predicate can
+/// carry it.
+///
+/// **The pin is checked first, before any clock.** It is an absolute floor, not
+/// a term in an expression, and putting it above the provenance branch means no
+/// future clock can be added below it that a pinned row could reach.
+///
+/// **`row.synced_at_ms?` is FR-341.** For content this clone authored, a `NULL`
+/// there means the remote has never been observed holding these bytes, so they
+/// exist on exactly one machine and are not eligible **at any age** — the `?` is
+/// the whole rule, and no `unwrap_or` may ever appear on that line. Content that
+/// arrived from the remote measures from its last use instead, falling back to
+/// `at_ms`: that column is `NOT NULL` and is a real instant the content was
+/// here, so a folder whose rows predate this story is not inert.
+///
+/// `pub` rather than `pub(crate)` because AC 2 asks for the candidate set to be
+/// asserted *as a set*, over the rows a real repository and a real sync
+/// actually produced — and `tests/release_sweep.rs` cannot do that without
+/// asking the predicate. Exposing a pure function with no `self`, no I/O and no
+/// clock costs nothing: there is no state a caller could corrupt with it.
+pub fn release_due_at(row: &db::MaterializedRow, ttl_ms: u64) -> Option<i64> {
+    if row.pinned {
+        return None;
+    }
+    let since = if row.local_origin {
+        row.synced_at_ms?
+    } else {
+        row.last_used_ms.unwrap_or(row.at_ms)
+    };
+    Some(since.saturating_add(ttl_ms as i64))
+}
+
+/// Why a materialized row will or will not be released, in the shape a surface
+/// can draw (Story 56.9, FR-343).
+///
+/// **The one thing on the wire is a moment.** A countdown is the single string
+/// Rust cannot own: it is stale the instant it is serialized, and the Files
+/// tree does not poll — its listings are on demand and this story does not
+/// change that — so a `"23 hr"` resolved here would be whatever it was when
+/// the folder was last browsed and would sit there, wrong, for as long as the
+/// pane is open. An absolute epoch-ms instant is the only value that stays
+/// true without anyone re-asking, so the countdown is subtracted where a clock
+/// ticks and this enum carries the instant plus, for the rows that have no
+/// instant, keeper's own words for why.
+///
+/// The five wordy variants are the five separate reasons a materialized row is
+/// not on a clock — a pin, a folder that keeps large-file content, a folder
+/// with large-file support switched off, a switched-off TTL, and FR-341's
+/// never-confirmed row — and they are kept apart rather than folded into one
+/// "held" case because each is a different sentence to the person who asked,
+/// and because collapsing them would put the choice of words in the shell
+/// crate, which does not compile on every host this is developed on.
+///
+/// **The two mode causes are two sentences and one word.**
+/// [`release_mode_gate`] refuses [`LfsMode::Materialize`] and
+/// [`LfsMode::Disabled`] alike, because its subject is the *request door*:
+/// whether a caller may take content away. A row's cell is a different
+/// subject — what is holding *this* file — and there the two modes are
+/// opposite configurations. Telling the owner of a folder with large-file
+/// support OFF that it "is set to keep large-file content" is false of the
+/// folder and points them at a setting that reads the other way, so
+/// [`ReleaseSchedule::ModeKeeps`] and [`ReleaseSchedule::LfsOff`] are separate
+/// variants with separate sentences. They still draw the same word, because
+/// from the row's side "kept" is the one fact either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseSchedule {
+    /// Releases no earlier than this absolute epoch-ms instant.
+    Due { at_ms: i64 },
+    /// The path is pinned, so keeper keeps its content until the pin is
+    /// lifted. The one reason that outranks every other, and the only one the
+    /// person holding it can undo from the row itself.
+    Pinned,
+    /// FR-341: this clone authored the content and nothing has confirmed the
+    /// remote holds it, so the bytes exist on exactly one machine and are on
+    /// no clock at any age. The only variant whose word is "Not sent".
+    Unconfirmed,
+    /// The folder's release TTL is switched off (`releaseTtlMs = 0`), so its
+    /// content stays until a person releases it by hand. Shares its word with
+    /// [`Self::ModeKeeps`] and [`Self::LfsOff`]; what tells it apart is that
+    /// its sentence points at the folder's *release interval*, which is the
+    /// setting that would put these rows on a clock.
+    Indefinite,
+    /// The folder is in [`LfsMode::Materialize`], which re-materializes what
+    /// it holds, so a release would be undone on the next pass and a countdown
+    /// would promise something that never comes. Shares its word with
+    /// [`Self::Indefinite`] and [`Self::LfsOff`]; what tells it apart is that
+    /// its sentence names the folder deliberately *keeping* large-file
+    /// content.
+    ModeKeeps,
+    /// The folder has large-file support off ([`LfsMode::Disabled`]) and still
+    /// holds `materialized` rows — reachable, because a folder switched away
+    /// from [`LfsMode::PointerOnly`] keeps the ledger rows it already had, and
+    /// `browse::classify` goes on marking them materialized. Shares its word
+    /// with [`Self::Indefinite`] and [`Self::ModeKeeps`]; what tells it apart
+    /// is that its sentence names large-file support being OFF, which is the
+    /// opposite configuration to [`Self::ModeKeeps`] and would be a lie in its
+    /// sentence.
+    LfsOff,
+}
+
+impl ReleaseSchedule {
+    /// The instant, or the words. A `Result` rather than two `Option`s because
+    /// the choice is exclusive by construction: no variant, present or future,
+    /// can answer both or neither, and the compiler is what enforces it rather
+    /// than a list in a test.
+    ///
+    /// [`Self::releases_after_ms`] is this `.ok()` and [`Self::hold`] is this
+    /// `.err()`, so the pairing the shell reads off three wire fields is not
+    /// two matches kept in step by hand — it is one match, and adding a
+    /// variant is a compile error in exactly one place, here.
+    fn instant_or_words(&self) -> std::result::Result<i64, &'static str> {
+        match self {
+            Self::Due { at_ms } => Ok(*at_ms),
+            Self::Pinned => Err("Pinned"),
+            Self::Unconfirmed => Err("Not sent"),
+            // Three reasons, one word: see [`Self::hold`] for why, and
+            // [`Self::sentence`] for what actually separates them.
+            Self::Indefinite | Self::ModeKeeps | Self::LfsOff => Err("Kept"),
+        }
+    }
+
+    /// The absolute instant a surface counts down to — `Some` exactly for
+    /// [`Self::Due`].
+    ///
+    /// This and [`Self::hold`] are the mapping onto the wire, and they are two
+    /// complementary `Option`s rather than one enum because the consumer is a
+    /// serialized struct read by TypeScript: a row draws either a figure or a
+    /// word, so two nullable fields is exactly the shape the renderer wants,
+    /// and putting the split here means the shell does three field reads and
+    /// has no pairing to get wrong. The promise that makes that safe —
+    /// `releases_after_ms().is_some() == hold().is_none()` — is structural
+    /// rather than tested: both sides are one [`Self::instant_or_words`] away,
+    /// and that function's return type cannot express "both" or "neither", so
+    /// a variant that broke the pairing would not compile. This crate's tests
+    /// (`release_schedule_pairs_an_instant_with_words_exactly_one_way`) still
+    /// assert it, because the crate that consumes it cannot be compiled on
+    /// this host.
+    pub fn releases_after_ms(&self) -> Option<i64> {
+        self.instant_or_words().ok()
+    }
+
+    /// The one or two words a surface draws when there is no instant — `None`
+    /// exactly for [`Self::Due`].
+    ///
+    /// Short because it stands where a figure would stand, in a cell sized for
+    /// `23 hr`; the whole reason is [`Self::sentence`]'s job. "Not sent" rather
+    /// than "Unconfirmed" because the person is being told something about
+    /// their own file, not about keeper's bookkeeping, and the switched-off
+    /// TTL, the mode that keeps large-file content and the folder with
+    /// large-file support off all say "Kept" because from the row's side they
+    /// are the same fact — the difference between the three is a sentence, not
+    /// a word.
+    pub fn hold(&self) -> Option<&'static str> {
+        self.instant_or_words().err()
+    }
+
+    /// The sentence, written for the person who asked. Always present.
+    ///
+    /// Present for [`Self::Due`] too, and that one is load-bearing: the sweep
+    /// runs on the first successful sync after an hourly due-gate and is
+    /// budgeted to [`RELEASE_BUDGET_OBJECTS`] objects a pass, so a countdown
+    /// reaching zero means *eligible*, never *released*. A cell that let the
+    /// figure speak for itself would be claiming keeper deleted something at a
+    /// moment nothing happened, so the sentence says what the clock actually
+    /// buys.
+    ///
+    /// No mechanism words. These are read by someone who did not choose a TTL,
+    /// has not heard of LFS and is looking at a file they own, so they name the
+    /// content and the computer rather than pointers, sweeps and clocks.
+    pub fn sentence(&self) -> &'static str {
+        match self {
+            Self::Due { .. } => {
+                "keeper lets this content go on the first sync after the time runs out; \
+                 the copy stays here until then"
+            }
+            Self::Pinned => {
+                "This path is pinned, so keeper keeps its content on this computer until \
+                 the pin is lifted"
+            }
+            Self::Unconfirmed => {
+                "Nothing has confirmed this content reached the server, so keeper will not \
+                 put it on a release clock"
+            }
+            Self::Indefinite => {
+                "This folder keeps content on this computer until someone releases it"
+            }
+            Self::ModeKeeps => {
+                "This folder is set to keep large-file content on this computer, so nothing \
+                 is released on a clock"
+            }
+            Self::LfsOff => {
+                "Large-file support is off for this folder, so keeper is not releasing \
+                 anything from it on a clock"
+            }
+        }
+    }
+}
+
+/// Classify one ledger row for a surface (Story 56.9, FR-343).
+///
+/// **A classifier, not a second clock.** There is no arithmetic here at all:
+/// [`release_due_at`] already answers the only hard question — which of 56.5's
+/// two clocks a row measures from, and that a locally authored row the remote
+/// has never confirmed is never eligible — so this adds nothing but the three
+/// facts that come *before* a clock: the pin, the folder's LFS mode and whether
+/// the TTL is switched on at all. They are the same three the sweep asks
+/// (`Engine::release_expired`), and the only difference is that the pin is
+/// hoisted to the front here so a surface can name it. A second copy of the
+/// clock selection is the one way this story could make the Files pane disagree
+/// with the sweep about the same row.
+///
+/// **The pin is asked here as well as inside [`release_due_at`]** for two
+/// reasons. A surface has to say "pinned" rather than "never", which the `None`
+/// coming back cannot distinguish; and a classification that inferred the pin
+/// from that `None` would depend on another function's internals, so adding a
+/// third reason to refuse there would silently relabel every pinned row here.
+/// One extra read of one boolean is the cheaper half of that trade.
+///
+/// **The mode arrives as a mode, not as [`release_mode_gate`]'s refusal.** The
+/// gate answers a different question — may a *caller* take content out of this
+/// folder — and it says no to [`LfsMode::Materialize`] and
+/// [`LfsMode::Disabled`] alike. Those are opposite configurations, so a single
+/// boolean derived from the gate told the owner of a folder with large-file
+/// support OFF that it was "set to keep large-file content". Mapping the mode
+/// belongs here because this is where keeper's words for a *row* are chosen;
+/// the gate's refusal vocabulary is about the request door. Exhaustive, so a
+/// fourth mode has to decide which sentence it draws rather than inherit one.
+///
+/// Pure — no `self`, no I/O, no clock — like [`release_due_at`] and for its
+/// reason: every variant is then reachable from a hand-built row, and the
+/// precedence the shell's cells rest on is provable where a compiler runs.
+pub fn release_schedule(
+    row: &db::MaterializedRow,
+    ttl_ms: Option<u64>,
+    mode: LfsMode,
+) -> ReleaseSchedule {
+    if row.pinned {
+        return ReleaseSchedule::Pinned;
+    }
+    match mode {
+        LfsMode::PointerOnly => {}
+        LfsMode::Materialize => return ReleaseSchedule::ModeKeeps,
+        LfsMode::Disabled => return ReleaseSchedule::LfsOff,
+    }
+    let Some(ttl_ms) = ttl_ms else {
+        return ReleaseSchedule::Indefinite;
+    };
+    match release_due_at(row, ttl_ms) {
+        Some(at_ms) => ReleaseSchedule::Due { at_ms },
+        // `release_due_at` answers `None` for exactly two rows: a pinned one,
+        // refused above, and FR-341's locally-authored row the remote has never
+        // been observed holding. So this arm is that row and only that row.
+        None => ReleaseSchedule::Unconfirmed,
     }
 }
 
@@ -5366,28 +9358,123 @@ fn minute_of_day(hhmm: &str) -> Option<u16> {
     (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
 }
 
+/// The hydration capability a verified copy asks for (Story 56.6).
+///
+/// `copy.rs` knows nothing about profiles, indexes or object stores and must
+/// keep knowing nothing, so the path→profile rule lives here — in the crate
+/// that owns both facts, and the one that compiles on every host.
+impl crate::copy::ContentSource for Engine {
+    fn materialize(&self, absolute: &Path) -> Result<()> {
+        use lfs::hydrate::{ContentRefusal, MaterializeOutcome};
+
+        let profiles = self.with_db(db::list_profiles)?;
+        // Canonicalized before comparing, both sides, for the reason
+        // `browse::resolve` canonicalizes both sides (AD-59): a lexical
+        // `strip_prefix` over raw paths answers `NotTracked` for a synced
+        // folder reached through a symlinked ancestor — `/tmp` and `/var` are
+        // symlinks on macOS, and a relocated home directory is one everywhere
+        // — or through an ancestor spelled with different case on APFS or
+        // NTFS. That is a sentence the user knows to be false, and it would be
+        // told about every large file that then silently failed to reach the
+        // pendrive. The raw path is the fallback: a path that cannot be
+        // canonicalized is one nobody can compare, and refusing to look would
+        // be worse than comparing what was asked for.
+        let target = absolute
+            .canonicalize()
+            .unwrap_or_else(|_| absolute.to_path_buf());
+        // Longest matching root wins. A profile nested inside another one is
+        // the folder that actually carries the path, and resolving against the
+        // shorter root would ask the wrong repository for a subpath it does not
+        // track.
+        let owner = profiles
+            .iter()
+            .filter_map(|profile| {
+                let root = profile
+                    .local_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| profile.local_path.clone());
+                let rest = target.strip_prefix(&root).ok()?.to_path_buf();
+                Some((profile, rest, root))
+            })
+            .max_by_key(|(_, _, root)| root.as_os_str().len());
+        let Some((profile, rest, _)) = owner else {
+            // Under no folder keeper syncs, so there is no committed pointer
+            // and nothing to ask for — `NotTracked`'s own sentence, which
+            // already collapses exactly these cases.
+            return Err(SyncError::Refused(ContentRefusal::NotTracked {
+                path: absolute.to_string_lossy().into_owned(),
+            }));
+        };
+        // `/`-joined, the frame every subpath in this crate is already in;
+        // rebuilt from components rather than string-replaced so a Windows `\`
+        // never reaches `browse::plain_segments`.
+        //
+        // A component that is not valid UTF-8 is REFUSED rather than rendered,
+        // and `browse::BrowseRefusal::Unspellable` is the sentence for exactly
+        // this: `to_string_lossy` maps every invalid byte onto `U+FFFD`, so two
+        // distinct names collapse onto one key and the index lookup can succeed
+        // at the wrong entry — hydrating a different file than the one being
+        // copied. The lossy rendering appears in the message, where it can
+        // mislead nobody, and never in the key.
+        let mut segments = Vec::with_capacity(rest.components().count());
+        for part in rest.components() {
+            let Some(name) = part.as_os_str().to_str() else {
+                return Err(SyncError::Refused(ContentRefusal::Escapes(
+                    crate::browse::BrowseRefusal::Unspellable {
+                        subpath: absolute.to_string_lossy().into_owned(),
+                    },
+                )));
+            };
+            segments.push(name);
+        }
+        let subpath = segments.join("/");
+
+        // Asked BEFORE `materialize_entry`, because by the time that answers
+        // `Queued` it has already enqueued the download, labelled it, promoted
+        // it and woken the supervisor — and `wake_now` also clears
+        // `next_release_ms` and `release_cursor`, resetting 56.5's sweep
+        // rotation. So a copy of a folder that holds nothing but pointers
+        // would start fetching the whole zone the user never asked for, as a
+        // side effect of being refused. This is a read of at most
+        // `MAX_POINTER_BYTES` and one `stat` per path, and it decides the
+        // common case without touching the journal at all.
+        if let Some(pointer) = std::fs::symlink_metadata(absolute)
+            .ok()
+            .and_then(|meta| lfs::stage::worktree_pointer(absolute, &meta))
+        {
+            let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+            if !store.contains(&pointer.oid, pointer.size) {
+                return Err(SyncError::Refused(ContentRefusal::ContentNotHere {
+                    path: subpath,
+                }));
+            }
+        }
+
+        match self.materialize_entry(&profile.id, &subpath)?.outcome {
+            MaterializeOutcome::Materialized | MaterializeOutcome::AlreadyMaterialized => Ok(()),
+            // Belt and braces for the check above: a download queued between
+            // the two means the object is not on this machine, a copy cannot
+            // wait for one, and calling that hydrated is the silent-pointer-copy
+            // bug in a new place.
+            MaterializeOutcome::Queued => Err(SyncError::Refused(ContentRefusal::ContentNotHere {
+                path: subpath,
+            })),
+        }
+    }
+}
+
 /// UTC `yyyymmdd-hhmmss` for a conflict filename.
 ///
-/// Hand-rolled because `keeper-sync` deliberately has no `chrono`: the engine
-/// is time-agnostic and takes wall-clock milliseconds from the platform port.
-/// Civil-date arithmetic from a Unix timestamp is Howard Hinnant's
-/// `days_from_civil` inverse, which is exact for every date we can represent.
+/// UTC deliberately, unlike the `.trashinfo` `DeletionDate`
+/// [`crate::files_write`] writes: this name has to sort and compare the same
+/// on both machines that produced the conflict, and a local stamp would put
+/// two names an hour apart on one event.
+///
+/// The civil-date arithmetic itself is
+/// [`crate::platform::civil_from_unix_ms`], which is where it lives now that
+/// two modules format an instant into words.
 fn conflict_stamp(now_ms: i64) -> String {
-    let secs = now_ms.div_euclid(1_000);
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    let (hh, mm, ss) = (tod / 3_600, (tod % 3_600) / 60, tod % 60);
-
-    // Shift the epoch to 0000-03-01 so leap days land at the end of the cycle.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = era * 400 + yoe + i64::from(month <= 2);
+    let (year, month, day, hh, mm, ss) = crate::platform::civil_from_unix_ms(now_ms);
     format!("{year:04}{month:02}{day:02}-{hh:02}{mm:02}{ss:02}")
 }
 
@@ -5408,6 +9495,33 @@ fn display_relative(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned()
+}
+
+/// The object store belonging to this folder's remote, when that remote is a
+/// directory this machine can see (Story 56.6).
+///
+/// [`Engine::remote_serves`]' filesystem fast path without the network half.
+/// A remote that is a path has a real LFS store in the client layout
+/// ([`lfs::local::remote_store`]), so [`lfs::store::LfsStore::contains`] is a
+/// genuine, size-verified, per-object answer for the price of a `stat` — which
+/// is what makes it affordable inside a walk that must stay offline.
+///
+/// `None` in three cases, each meaning "do not read anything into this":
+///
+/// * the remote is a URL, so it has a server and [`Engine::audit_remote_objects`]
+///   is the half that asks it;
+/// * an explicit `.lfsconfig` names a server, which wins over the shape of the
+///   remote URL — the same precedence [`Engine::remote_serves`] and
+///   `lfs_access` apply, and a folder that has one may be pushing its objects
+///   somewhere the remote path knows nothing about;
+/// * the store's root is not on disk, which is an unplugged drive. Absence is
+///   never failure (AD-48), and a store nobody could ask must never be read as
+///   a store that answered no.
+fn filesystem_remote_store(profile: &SyncProfile) -> Option<lfs::store::LfsStore> {
+    if profile.local_path.join(".lfsconfig").exists() {
+        return None;
+    }
+    lfs::local::remote_store(&profile.remote_url).filter(|store| store.root().exists())
 }
 
 #[cfg(test)]
@@ -5493,6 +9607,117 @@ mod tests {
             "https://git.invalid/x/y.git",
         )
     }
+    /// A shared branch overtaken by the other machine is weather, not a
+    /// decision — and the reconcile happens *in this unit* (DW-207).
+    ///
+    /// The first cut queued a `Pull` and let the scheduler retry. Measured in
+    /// the field that spun 613 rejected pushes in 135 seconds before the
+    /// reconcile got its turn, because every unpushed commit had queued its own
+    /// `Push` and `claim_ready` takes those first. So the property under test
+    /// is ordering: the fetch has to be attempted *before* anything is handed
+    /// back to the scheduler.
+    ///
+    /// Asserted without a network by pointing the profile at a remote that
+    /// cannot resolve: the error that comes back is then the *pull's*, not
+    /// `RemoteMoved`. If the reconcile were skipped — deferred to a queue, as
+    /// it once was — this would answer `RemoteMoved` instead, which is exactly
+    /// the regression.
+    #[tokio::test]
+    async fn a_bidirectional_push_reconciles_before_it_retries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let profile = profile(dir.path());
+        engine.upsert_profile(&profile).expect("store the profile");
+
+        let err = engine
+            .reconcile_and_retry_push(
+                &profile,
+                SyncSource::Manual,
+                "refs/heads/main:refs/heads/main",
+                SyncError::Diverged {
+                    profile: profile.name.clone(),
+                    reason: "! refs/heads/main:refs/heads/main [rejected] (fetch first)".to_owned(),
+                },
+            )
+            .await
+            .expect_err("the fixture's remote does not resolve");
+        assert!(
+            !matches!(err, SyncError::RemoteMoved { .. }),
+            "the reconcile has to be attempted inline, not handed to the scheduler: {err:?}"
+        );
+    }
+
+    /// The case the permanent classification was written for stays permanent:
+    /// on a one-way lane a human deciding is the entire point (AD-50). Both
+    /// shapes return before any git work, so neither touches the network.
+    #[tokio::test]
+    async fn a_one_way_lane_still_parks_on_a_rejected_push() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        // A worktree lane is only valid as pushOnly, so the two one-way shapes
+        // are "a lane" and "a pushOnly profile on the main lane".
+        for mutate in [
+            (|p: &mut SyncProfile| {
+                p.lane = SyncLane::Worktree;
+                p.direction = SyncDirection::PushOnly;
+            }) as fn(&mut SyncProfile),
+            |p: &mut SyncProfile| p.direction = SyncDirection::PushOnly,
+        ] {
+            let mut profile = profile(dir.path());
+            mutate(&mut profile);
+            engine.upsert_profile(&profile).expect("store the profile");
+
+            let err = engine
+                .reconcile_and_retry_push(
+                    &profile,
+                    SyncSource::Manual,
+                    "refs/heads/main:refs/heads/main",
+                    SyncError::Diverged {
+                        profile: profile.name.clone(),
+                        reason: "(fetch first)".to_owned(),
+                    },
+                )
+                .await
+                .expect_err("a refused push on a lane is still an error");
+            assert!(
+                matches!(err, SyncError::Diverged { .. }),
+                "a lane keeps its human: {err:?}"
+            );
+            assert_eq!(err.retriability(), Retriability::Permanent);
+        }
+    }
+
+    /// Only a rejection is re-read. Everything else keeps the classification it
+    /// arrived with — an auth failure that started retrying itself would spin
+    /// against a credential that will never work.
+    #[tokio::test]
+    async fn any_other_push_failure_passes_through_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let profile = profile(dir.path());
+        engine.upsert_profile(&profile).expect("store the profile");
+
+        let err = engine
+            .reconcile_and_retry_push(
+                &profile,
+                SyncSource::Manual,
+                "refs/heads/main:refs/heads/main",
+                SyncError::Auth {
+                    host: "forge.example.com".to_owned(),
+                },
+            )
+            .await
+            .expect_err("an auth failure stays a failure");
+        assert!(matches!(err, SyncError::Auth { .. }), "{err:?}");
+        assert_eq!(err.retriability(), Retriability::Permanent);
+    }
+
     /// The supervisor ticks at 1 Hz so queued work starts promptly. Walking the
     /// tree at that rate is what made the menu-bar glyph blink on an idle
     /// folder, and it re-stats every file on the drive once a second.
@@ -5514,6 +9739,546 @@ mod tests {
         assert!(!engine.scan_is_due(&p), "still inside the window");
         platform.advance_ms(1);
         assert!(engine.scan_is_due(&p), "the window has opened");
+    }
+
+    /// The bug this fixes was not in the sweep. It was that nothing called it.
+    ///
+    /// `sweep_scratch` shipped with exactly one caller — the "Recheck all files"
+    /// button — so a folder accumulated scratch until somebody suspected a
+    /// problem and went hunting for a button. The folder that prompted this had
+    /// 915 files and 123 GB waiting behind that button.
+    #[test]
+    fn scratch_is_swept_on_the_first_tick_and_then_hourly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+
+        // First sight sweeps: the run that leaves scratch behind is the one that
+        // was killed, and the next start is the first chance to clean up.
+        assert!(engine.sweep_is_due(&p), "a folder is swept when first seen");
+        assert!(!engine.sweep_is_due(&p), "and not again on the next tick");
+
+        platform.advance_ms(SWEEP_EVERY_MS - 1);
+        assert!(!engine.sweep_is_due(&p), "still inside the hour");
+        platform.advance_ms(1);
+        assert!(engine.sweep_is_due(&p), "the hour has passed");
+    }
+
+    /// A ledger row with nothing recorded but the instant content landed.
+    fn ledger_row(path: &str, at_ms: i64) -> db::MaterializedRow {
+        db::MaterializedRow {
+            path: path.to_owned(),
+            at_ms,
+            last_used_ms: None,
+            synced_at_ms: None,
+            oid: None,
+            size_bytes: None,
+            pinned: false,
+            local_origin: false,
+        }
+    }
+
+    /// Every branch of the eligibility predicate, over hand-built rows (Story
+    /// 56.5, FR-341, AD-131).
+    ///
+    /// Asserted as a function and not only through the sweep, because this is
+    /// where the safety lives: the sweep's *candidate set* is whatever this
+    /// returns, so "a path was not released" and "a path was never considered"
+    /// are different claims and only this one can make the second.
+    #[test]
+    fn release_due_at_selects_a_clock_by_provenance_and_refuses_two_rows_outright() {
+        const TTL: u64 = 24 * 60 * 60 * 1000;
+
+        // Arrived from the remote and used: the use clock.
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.last_used_ms = Some(5_000);
+        assert_eq!(release_due_at(&row, TTL), Some(5_000 + TTL as i64));
+
+        // Arrived from the remote and never used since: `at_ms` is the fallback
+        // rather than `None`, because it is NOT NULL and is a real instant the
+        // content was here. Without it every row written before this story
+        // would be inert forever.
+        let row = ledger_row("clip.mp4", 1_000);
+        assert_eq!(release_due_at(&row, TTL), Some(1_000 + TTL as i64));
+
+        // Authored here and confirmed upstream: the confirmation clock.
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.local_origin = true;
+        row.synced_at_ms = Some(7_000);
+        assert_eq!(release_due_at(&row, TTL), Some(7_000 + TTL as i64));
+
+        // Authored here and never confirmed: not eligible at any age, and a
+        // recent use does not rescue it. This is FR-341, and it is the `?`.
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.local_origin = true;
+        row.last_used_ms = Some(i64::MAX / 2);
+        assert_eq!(
+            release_due_at(&row, TTL),
+            None,
+            "content that exists on this machine alone is never a candidate, \
+             whatever `last_used_ms` says — a use must not make it one"
+        );
+
+        // Pinned, before any clock is consulted. Both provenances, because the
+        // pin is a floor rather than a term in one branch's expression.
+        for local_origin in [false, true] {
+            let mut row = ledger_row("clip.mp4", 1_000);
+            row.pinned = true;
+            row.local_origin = local_origin;
+            row.last_used_ms = Some(1);
+            row.synced_at_ms = Some(1);
+            assert_eq!(
+                release_due_at(&row, TTL),
+                None,
+                "a pinned path is never a candidate, at any age, on either clock"
+            );
+        }
+
+        // The boundary, both sides of it — and asserted through the very
+        // predicate the sweep filters candidates with rather than through
+        // arithmetic. The first cut here said `assert!(due - 1 < due)`, which
+        // is true for every `i64` this code can produce: it claimed to cover
+        // the near side of the deadline and would have survived the sweep
+        // firing a millisecond early, which is the one mistake this line
+        // exists to catch.
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.last_used_ms = Some(0);
+        let due = release_due_at(&row, TTL).expect("a candidate");
+        assert_eq!(due, TTL as i64, "due exactly a TTL after the clock moved");
+        // `release_expired`'s own filter, verbatim.
+        let eligible = |now: i64| release_due_at(&row, TTL).is_some_and(|at| now >= at);
+        assert!(
+            !eligible(due - 1),
+            "one millisecond short of the deadline is not a candidate, and a \
+             sweep that answered otherwise would delete content early"
+        );
+        assert!(eligible(due), "and the deadline itself is");
+
+        // A zero TTL is never asked — `release_is_due` answers first — but the
+        // predicate must still be honest if it is: due immediately, not never.
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.last_used_ms = Some(4_000);
+        assert_eq!(release_due_at(&row, 0), Some(4_000));
+    }
+
+    /// Every branch of the surface classifier, in the order it asks them
+    /// (Story 56.9, FR-343).
+    ///
+    /// [`release_schedule`] adds no arithmetic to [`release_due_at`], so what is
+    /// worth asserting is the *precedence*: which fact wins when two of them
+    /// apply at once. Each pair below is a row where a naive ordering would
+    /// answer a different variant, and every one of those wrong answers is a
+    /// sentence shown to somebody about their own file.
+    #[test]
+    fn release_schedule_asks_the_pin_then_the_mode_then_the_ttl() {
+        const TTL: u64 = 24 * 60 * 60 * 1000;
+
+        // The pin is the first question, so it wins over a clock that ran out
+        // long ago and over every mode. A surface must say "pinned" here:
+        // "kept by the mode" would send the owner to change a setting that is
+        // not what is holding this path.
+        for mode in [
+            LfsMode::PointerOnly,
+            LfsMode::Materialize,
+            LfsMode::Disabled,
+        ] {
+            let mut row = ledger_row("clip.mp4", 1_000);
+            row.pinned = true;
+            row.last_used_ms = Some(1);
+            assert_eq!(
+                release_schedule(&row, Some(TTL), mode),
+                ReleaseSchedule::Pinned,
+                "the pin is asked before anything else, whatever the mode says"
+            );
+            // And with the sweep switched off entirely, the pin is still the
+            // more specific truth.
+            assert_eq!(release_schedule(&row, None, mode), ReleaseSchedule::Pinned);
+        }
+
+        // The mode beats a due clock: in a folder that re-materializes what it
+        // holds, a countdown would promise a release that never comes.
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.last_used_ms = Some(5_000);
+        assert_eq!(
+            release_schedule(&row, Some(TTL), LfsMode::Materialize),
+            ReleaseSchedule::ModeKeeps
+        );
+        // And it beats an absent TTL, because the mode is the more specific
+        // reason of the two and both would draw the same word.
+        assert_eq!(
+            release_schedule(&row, None, LfsMode::Materialize),
+            ReleaseSchedule::ModeKeeps
+        );
+
+        // The OTHER mode `release_mode_gate` refuses, and the reason this is
+        // not one boolean: a folder with large-file support switched OFF still
+        // carries the `materialized` rows it had while it was `PointerOnly`, so
+        // it reaches here — and "set to keep large-file content" would be the
+        // opposite of what its own settings say.
+        assert_eq!(
+            release_schedule(&row, Some(TTL), LfsMode::Disabled),
+            ReleaseSchedule::LfsOff,
+            "a folder with large-file support off is told that, not that it keeps content"
+        );
+        assert_eq!(
+            release_schedule(&row, None, LfsMode::Disabled),
+            ReleaseSchedule::LfsOff
+        );
+
+        // `releaseTtlMs = 0` reaches here as `None` (`effective_release_ttl_ms`)
+        // and is the operator's documented way to say "never release from this
+        // folder" — not a very short TTL.
+        assert_eq!(
+            release_schedule(&row, None, LfsMode::PointerOnly),
+            ReleaseSchedule::Indefinite
+        );
+
+        // FR-341: authored here, never confirmed upstream. Not on a clock at any
+        // age, and a recent use does not rescue it — this is the one row
+        // `release_due_at` answers `None` for that is not the pin.
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.local_origin = true;
+        row.last_used_ms = Some(i64::MAX / 2);
+        assert_eq!(
+            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
+            ReleaseSchedule::Unconfirmed,
+            "content that exists on this machine alone is never put on a clock"
+        );
+
+        // FR-341's other half, and the case the mutation above would otherwise
+        // hide: authored here AND confirmed upstream. This row IS on a clock,
+        // and the clock is the confirmation — the enormous `last_used_ms` beside
+        // it must not move the instant, because for content this clone authored
+        // a local use is not what makes the bytes safe to drop.
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.local_origin = true;
+        row.synced_at_ms = Some(7_000);
+        row.last_used_ms = Some(i64::MAX / 2);
+        assert_eq!(
+            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
+            ReleaseSchedule::Due {
+                at_ms: 7_000 + TTL as i64
+            },
+            "a confirmed locally-authored row counts down from the confirmation, \
+             never from a use"
+        );
+
+        // The ordinary row, and the instant is `release_due_at`'s own answer
+        // rather than a second sum: the use clock when there is one…
+        let mut row = ledger_row("clip.mp4", 1_000);
+        row.last_used_ms = Some(5_000);
+        assert_eq!(
+            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
+            ReleaseSchedule::Due {
+                at_ms: 5_000 + TTL as i64
+            }
+        );
+        // …and `at_ms` when it has not been used since it landed.
+        let row = ledger_row("clip.mp4", 1_000);
+        assert_eq!(
+            release_schedule(&row, Some(TTL), LfsMode::PointerOnly),
+            ReleaseSchedule::Due {
+                at_ms: 1_000 + TTL as i64
+            }
+        );
+    }
+
+    /// **The invariant the shell relies on**: a schedule carries an instant or
+    /// words, never both and never neither (Story 56.9, FR-343).
+    ///
+    /// `sync_ipc` maps this onto three wire fields and lives in a crate that
+    /// cannot be compiled on every host this is developed on, so the pairing is
+    /// asserted here, where a compiler and a test runner both are. The *type* is
+    /// now what guarantees it — both accessors are one
+    /// `ReleaseSchedule::instant_or_words` away and that `Result` cannot express
+    /// "both" or "neither", so a variant which broke the pairing would not
+    /// compile — and this test is still worth having: it is what catches an
+    /// accessor rewired to the wrong side of the `Result`, and it names the
+    /// consequence a compiler cannot, which is a materialized row with a release
+    /// cell and nothing in it.
+    #[test]
+    fn release_schedule_pairs_an_instant_with_words_exactly_one_way() {
+        let all = [
+            ReleaseSchedule::Due { at_ms: 1_700_000 },
+            ReleaseSchedule::Pinned,
+            ReleaseSchedule::Unconfirmed,
+            ReleaseSchedule::Indefinite,
+            ReleaseSchedule::ModeKeeps,
+            ReleaseSchedule::LfsOff,
+        ];
+
+        for schedule in &all {
+            assert_eq!(
+                schedule.releases_after_ms().is_some(),
+                schedule.hold().is_none(),
+                "exactly one of the instant and the words is present: {schedule:?}"
+            );
+            assert!(
+                !schedule.sentence().is_empty(),
+                "every schedule can say why: {schedule:?}"
+            );
+        }
+
+        // Pairwise distinct, because the sentence is the only thing carrying the
+        // difference between rows that draw the same word: `Indefinite`,
+        // `ModeKeeps` and `LfsOff` all say "Kept", and they send the owner to
+        // three different settings — one of them the opposite of another.
+        let mut sentences: Vec<&str> = all.iter().map(ReleaseSchedule::sentence).collect();
+        sentences.sort_unstable();
+        let distinct = sentences.len();
+        sentences.dedup();
+        assert_eq!(
+            sentences.len(),
+            distinct,
+            "six reasons, six sentences — a shared one would tell somebody the wrong \
+             thing about their own file"
+        );
+    }
+
+    /// The release look-gate ARMS AND DECLINES on first sight, which is the one
+    /// place it diverges from [`Engine::scan_is_due`] (Story 56.5).
+    ///
+    /// A scan is a read, so a folder just added may as well be walked at once.
+    /// This sweep DELETES, and a folder keeper has never swept — freshly added,
+    /// resumed, re-enabled, or a daemon that has just restarted — is precisely
+    /// the one whose ledger keeper knows least about. So the first successful
+    /// sync buys the folder a whole interval of grace rather than spending it,
+    /// and no release happens on a profile's very first sync.
+    #[test]
+    fn a_folder_gets_a_whole_interval_of_grace_before_its_first_release() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+
+        assert!(
+            !engine.release_is_due(&p),
+            "the first successful sync after keeper starts arms the window and \
+             releases nothing"
+        );
+        assert!(
+            !Engine::lock(&engine.next_release_ms).is_empty(),
+            "armed, though — declining forever would be a sweep that never runs"
+        );
+        assert!(!engine.release_is_due(&p), "and neither does the next one");
+
+        platform.advance_ms(RELEASE_LOOK_EVERY_MS - 1);
+        assert!(
+            !engine.release_is_due(&p),
+            "still inside the grace interval"
+        );
+        platform.advance_ms(1);
+        assert!(engine.release_is_due(&p), "the interval has passed");
+        assert!(
+            !engine.release_is_due(&p),
+            "and it is an interval, not a gate that stays open once reached"
+        );
+    }
+
+    /// A disabled TTL is answered before the clock is read, it arms no window,
+    /// and it DISCARDS one already armed (Story 56.5).
+    ///
+    /// If a zero asked the gate it would arm a window. An operator who turned
+    /// the sweep on an hour later would then find that window already open and
+    /// see content released on the very next sync — the opposite of what
+    /// turning a knob on should mean. "The answer was `false`" would also be
+    /// true of a gate that armed one, so the map itself is what is asserted.
+    ///
+    /// The `remove` is the second half of the same promise, and it is what
+    /// makes `docs/sync.md`'s sentence about turning the sweep back on true
+    /// rather than false: a window armed before the knob was turned off would
+    /// otherwise sit there ageing while the sweep was disabled, and be wide
+    /// open the moment it was re-enabled.
+    #[test]
+    fn a_zero_release_ttl_is_never_due_and_arms_no_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.release_ttl_ms = 0;
+
+        assert!(!engine.release_is_due(&p), "switched off is switched off");
+        platform.advance_ms(RELEASE_LOOK_EVERY_MS * 10);
+        assert!(!engine.release_is_due(&p), "and stays off however long");
+        assert!(
+            Engine::lock(&engine.next_release_ms).is_empty(),
+            "and it left no window behind for a later re-enable to walk into"
+        );
+
+        // Re-enabled, the folder waits a whole interval exactly as a folder
+        // seen for the first time does, rather than firing on the next sync.
+        p.release_ttl_ms = crate::profile::DEFAULT_RELEASE_TTL_MS;
+        assert!(
+            !engine.release_is_due(&p),
+            "a folder whose sweep has just been turned on arms a window and \
+             declines, like any folder nothing has ever swept"
+        );
+        platform.advance_ms(RELEASE_LOOK_EVERY_MS);
+        assert!(engine.release_is_due(&p), "and sweeps an interval later");
+
+        // Now the other direction, which is the one the `remove` is for. The
+        // line above re-armed a window; turning the knob off has to throw it
+        // away, or the clock runs on while the sweep is disabled and re-enabling
+        // walks straight into a window that opened in the meantime.
+        p.release_ttl_ms = 0;
+        assert!(!engine.release_is_due(&p));
+        assert!(
+            Engine::lock(&engine.next_release_ms).is_empty(),
+            "turning the sweep off discards the window it had armed"
+        );
+        platform.advance_ms(RELEASE_LOOK_EVERY_MS * 10);
+        p.release_ttl_ms = crate::profile::DEFAULT_RELEASE_TTL_MS;
+        assert!(
+            !engine.release_is_due(&p),
+            "so turning it back on starts a fresh interval rather than firing \
+             on the next sync, which is what an operator is promised"
+        );
+    }
+
+    /// A folder that never syncs never releases (Story 56.5).
+    ///
+    /// The sweep rides `mark_synced`, and a paused profile's supervisor skips
+    /// `tick_profile` entirely — so the question is never even asked. Asserted
+    /// through `tick`, which is where the skip lives, and on
+    /// `next_release_ms`: the gate arms a window as a side effect of being
+    /// asked, so an empty map is the proof that nothing asked.
+    ///
+    /// The direction matters. "Paused" means keeper is not touching this
+    /// folder, and a housekeeping pass that deleted content from a folder the
+    /// owner has paused would be the loudest possible contradiction of that.
+    #[tokio::test]
+    async fn a_paused_folder_never_reaches_the_release_sweep() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.enabled = false;
+        engine.upsert_profile(&p).expect("upsert");
+
+        platform.advance_ms(crate::profile::DEFAULT_RELEASE_TTL_MS as i64 * 100);
+        let _ = engine.tick().await;
+
+        assert!(
+            Engine::lock(&engine.next_release_ms).is_empty(),
+            "a paused folder's tick never gets as far as asking whether anything \
+             may be released, however long the clock has run"
+        );
+        assert!(
+            engine
+                .status(&p.id)
+                .expect("registered")
+                .last_sync_ms
+                .is_none(),
+            "and it never reports a successful pass, which is the edge the sweep \
+             rides — this is the same fact, said where the sweep reads it"
+        );
+    }
+
+    /// A paused folder loses nothing, even when something drives a sync at it
+    /// anyway (Story 56.5).
+    ///
+    /// The test above asserts the *supervisor's* skip. This one asserts the
+    /// sweep's own, which is a different fact and the one that was missing:
+    /// `sync_once` checks the volume and the reservation and NOT `enabled`, so
+    /// `keeper-syncd sync --once` on a paused folder, the app's
+    /// `sync_folder_now`, and a notes vault's automatic push all reach
+    /// `mark_synced` on a profile whose owner told keeper to stop touching it.
+    /// With no pause check of its own the sweep would delete content out of
+    /// exactly that folder — while `dehydrate_entry` refuses the identical
+    /// operation with `ContentRefusal::Paused`.
+    ///
+    /// `next_release_ms` is what makes this a fence rather than an observation:
+    /// the gate arms a window as a side effect of being asked, so an empty map
+    /// is proof the sweep declined *before* it asked anything. The mode is
+    /// `PointerOnly` on purpose — in any other mode the mode gate would decline
+    /// first and this test would still pass with the pause check deleted.
+    #[tokio::test]
+    async fn a_sync_driven_at_a_paused_folder_releases_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        p.lfs_mode = LfsMode::PointerOnly;
+        p.enabled = false;
+        engine.upsert_profile(&p).expect("upsert");
+
+        // A ledger row every clock says is long overdue.
+        engine
+            .with_db(|conn| db::remember_materialized(conn, &p.id, "media/clip.mp4", 1))
+            .expect("a ledger row");
+        platform.advance_ms(p.release_ttl_ms as i64 * 100);
+
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("nothing in `sync_once` refuses a paused folder — that is the point");
+
+        assert!(
+            Engine::lock(&engine.next_release_ms).is_empty(),
+            "the sweep declines a paused folder before it asks whether anything \
+             is due, so it arms no window either"
+        );
+        assert_eq!(
+            engine
+                .with_db(|conn| db::materialized_paths(conn, &p.id))
+                .expect("the ledger")
+                .len(),
+            1,
+            "and the row saying this folder holds that content is still there"
+        );
+    }
+
+    /// End to end through the call the tick actually makes, because the schedule
+    /// being right is worth nothing if the wiring is not.
+    #[tokio::test]
+    async fn a_due_sweep_removes_debris_and_leaves_a_live_transfer_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+
+        let tmp = p.local_path.join(".git").join("lfs").join("tmp");
+        std::fs::create_dir_all(&tmp).expect("scratch dir");
+        let debris = tmp.join(".tmpAbandoned");
+        let live = tmp.join(".tmpInFlight");
+        std::fs::write(&debris, b"left by a killed run").expect("write");
+        std::fs::write(&live, b"being written right now").expect("write");
+        // Backdated past the age gate. The gate is what tells the two apart —
+        // the names are random by construction and carry nothing.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7_200);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&debris)
+            .expect("open")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("backdate");
+
+        // Through `tick`, not through `sweep_scratch_if_due`. Calling the sweep
+        // directly would pass just as well with the call removed from the tick,
+        // and the call being absent from the tick *was* the bug.
+        engine.upsert_profile(&p).expect("upsert");
+        let _ = engine.tick().await;
+
+        assert!(!debris.exists(), "an hour-old temp file is debris");
+        assert!(live.exists(), "a temp file being written is not");
     }
 
     /// `poll_interval_ms` is user-supplied and older rows predate it meaning
@@ -5592,6 +10357,522 @@ mod tests {
         assert_eq!(
             engine.status(&p.id).expect("status").state,
             ProfileState::Syncing
+        );
+    }
+
+    /// The repair runs INSTEAD of the walk, which is the whole saving.
+    ///
+    /// A path whose committed blob contradicts its own attributes is modified by
+    /// definition, so asking the filesystem to confirm it buys nothing and costs
+    /// a full read plus a filter round trip - about 41 ms each, four at a time,
+    /// which is how 73 536 of them turned this folder's 84-second stat floor
+    /// into 25 to 74 minutes per pass. The index answers for nothing, so the
+    /// pass that repairs them must not walk at all.
+    #[test]
+    fn a_recorded_inconsistency_is_repaired_without_walking_the_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        // Reporting every item makes a walk impossible to miss: if this pass
+        // walked, `Scanning` would appear in the stream below.
+        engine.report_every_walk_item();
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1_000_000;
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // The state a per-extension rule leaves behind, built the way the field
+        // built it. `prepare` will not create it any more (that is the fix in
+        // `lfs::stage`), so the fixture commits the gif with the filter bypassed
+        // - which is exactly what a keeper that only asked about size did: the
+        // rule filters every `.gif`, and the blob is the file's own bytes.
+        std::fs::write(
+            p.local_path.join(".gitattributes"),
+            "*.gif filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .expect("rule");
+        std::fs::write(p.local_path.join("small.gif"), vec![3u8; 512]).expect("write");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p.local_path)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&[
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=cat",
+            "-c",
+            "filter.lfs.required=false",
+            "add",
+            ".gitattributes",
+            "small.gif",
+        ]);
+        git(&[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "raw",
+        ]);
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+
+        // Nothing on disk changed, so a walk would find nothing - and would pay
+        // for the discovery anyway.
+        // The sweep names it from the index alone, with no walk in sight.
+        assert_eq!(
+            engine
+                .repair_recorded_pointers(&p)
+                .expect("sweep")
+                .map(|staged| staged.modified),
+            Some(vec![PathBuf::from("small.gif")])
+        );
+        let repaired = engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("repair pass");
+        assert!(repaired > 0, "the inconsistency has to be repaired");
+
+        let phases: Vec<SyncPhase> = Engine::lock(&published)
+            .iter()
+            .map(|event| event.phase)
+            .collect();
+        assert!(
+            !phases.contains(&SyncPhase::Scanning),
+            "the repair must not walk the folder: {phases:?}"
+        );
+
+        // And it is durable: that path is recorded as a pointer now, so the next
+        // scan stats it like anything else instead of reading it, and it does
+        // not come back on the repair list.
+        let repo = engine.open_repo(&p).expect("open");
+        assert!(
+            lfs::stage::mismatched_filtered_paths(&repo, &[PathBuf::from("small.gif")], 0, 10, 10,)
+                .0
+                .is_empty(),
+            "a repaired path must not be repaired again"
+        );
+    }
+
+    /// And the POLL must not walk either, for the same reason.
+    ///
+    /// The commit leg learned this (above); the Pending poll did not, and that
+    /// asymmetry is what made an open Sync pane a permanent full-tree scan. The
+    /// pane polls every five seconds, the walk it triggered took 48 to 72
+    /// minutes on the folder this was written for, and the next poll started it
+    /// again — so the list the user was waiting for never arrived while the
+    /// machine stayed pinned. Answering from the index is not a thinner answer,
+    /// it is the first one that arrives.
+    #[tokio::test]
+    async fn a_pending_poll_names_the_repair_backlog_without_walking_the_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        // Reporting every item makes a walk impossible to miss: if this poll
+        // walked, `Scanning` would appear in the stream below.
+        engine.report_every_walk_item();
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1_000_000;
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // The same fixture as the sweep's test: a per-extension rule filters
+        // every `.gif`, and the blob is the file's own raw bytes.
+        std::fs::write(
+            p.local_path.join(".gitattributes"),
+            "*.gif filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .expect("rule");
+        std::fs::write(p.local_path.join("small.gif"), vec![3u8; 512]).expect("write");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p.local_path)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&[
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=cat",
+            "-c",
+            "filter.lfs.required=false",
+            "add",
+            ".gitattributes",
+            "small.gif",
+        ]);
+        git(&[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "raw",
+        ]);
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        assert!(
+            pending.iter().any(|row| row.path == "small.gif"
+                && matches!(row.reason, PendingReason::Modified)),
+            "the backlog is what the folder is waiting on, and the index names \
+             it for free: {pending:?}"
+        );
+
+        let phases: Vec<SyncPhase> = Engine::lock(&published)
+            .iter()
+            .map(|event| event.phase)
+            .collect();
+        assert!(
+            !phases.contains(&SyncPhase::Scanning),
+            "the poll must not walk the folder to rediscover what the index \
+             already recorded: {phases:?}"
+        );
+    }
+
+    /// With no backlog, the poll walks exactly as it always did.
+    ///
+    /// The other half of the same rule, and the one that keeps the shortcut
+    /// honest: skipping the walk is only defensible while there is a cheaper
+    /// answer, so a clean folder must still get the full one — untracked files
+    /// included, which the index cannot know about.
+    #[tokio::test]
+    async fn a_pending_poll_with_no_backlog_still_walks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // Nothing the index could name: a file git has never heard of.
+        std::fs::write(p.local_path.join("fresh.txt"), b"new").expect("write");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        assert!(
+            pending
+                .iter()
+                .any(|row| row.path == "fresh.txt" && row.reason == PendingReason::Untracked),
+            "an untracked path is only discoverable by walking: {pending:?}"
+        );
+    }
+
+    /// The probe answers a poll; it must not BE the poll.
+    ///
+    /// It opens the repository and materializes every tracked path before it
+    /// examines a window of them — 3 to 21 seconds on the 155 662-entry folder
+    /// this was written for. The pane asks every five seconds, so running it
+    /// per poll put the answer permanently behind the next question: the pane
+    /// sat on "Loading folders…" and the allocator churned a six-figure path
+    /// list on a loop, which is a regression the first version of this shortcut
+    /// shipped with.
+    ///
+    /// Asserted on the memo's own timestamp rather than on timing, because a
+    /// wall-clock assertion under load is a flake and this is a question about
+    /// whether work happened at all.
+    #[tokio::test]
+    async fn a_second_pending_poll_reuses_the_probe_instead_of_repeating_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let first = engine.pending(&p.id).await.expect("pending");
+        let taken = Engine::lock(&engine.repair_memo)
+            .get(&p.id)
+            .map(|(at, _)| *at)
+            .expect("the first poll has to leave an answer behind");
+
+        let second = engine.pending(&p.id).await.expect("pending");
+        let taken_again = Engine::lock(&engine.repair_memo)
+            .get(&p.id)
+            .map(|(at, _)| *at)
+            .expect("still memoized");
+
+        assert_eq!(
+            taken, taken_again,
+            "the second poll re-ran a probe it already had the answer to"
+        );
+        assert_eq!(first, second, "and it must be the same answer");
+    }
+
+    /// The Pending list is bounded, and the count it sits under is not.
+    ///
+    /// The gate on the folder this was written for held **128 483** rows, and
+    /// this poll used to `stat` every one of them, inline in an async fn. That
+    /// is 128 483 blocking syscalls on a USB volume per poll, from a tokio
+    /// worker — so the Pending list never arrived, and Activity, a single
+    /// indexed query, appeared to hang beside it because the frontend renders
+    /// the three legs together.
+    ///
+    /// Both halves are asserted: the list stops at [`PENDING_LIST_CAP`], and
+    /// the count behind "N waiting for writes to stop" still reports every row,
+    /// because it comes from a `COUNT(*)` and not from this list.
+    #[tokio::test]
+    async fn a_pending_poll_bounds_its_settling_list_without_understating_the_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        // More rows than the cap, each a real file so the stat that used to be
+        // unbounded has something to measure.
+        let held = PENDING_LIST_CAP + 25;
+        let mut rows = Vec::with_capacity(held);
+        for i in 0..held {
+            let name = format!("held-{i:05}.bin");
+            let absolute = p.local_path.join(&name);
+            std::fs::write(&absolute, b"still writing").expect("write");
+            rows.push((
+                absolute,
+                crate::stability::PersistedEntry {
+                    sample: crate::stability::FileSample {
+                        size: 13,
+                        mtime_ns: 1,
+                        ctime_ns: 1,
+                        inode: i as u64 + 1,
+                    },
+                    unchanged_since_ms: 1,
+                    pending_since_ms: 1,
+                    close_write: false,
+                },
+            ));
+        }
+        engine
+            .with_db(|conn| db::save_file_state(conn, &p.id, &rows))
+            .expect("seed the gate");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let settling = pending
+            .iter()
+            .filter(|row| matches!(row.reason, PendingReason::Settling { .. }))
+            .count();
+        assert_eq!(
+            settling, PENDING_LIST_CAP,
+            "the list is what is bounded, and it has to be bounded exactly"
+        );
+
+        assert_eq!(
+            engine
+                .with_db(|conn| db::load_file_state(conn, &p.id))
+                .expect("gate rows")
+                .len(),
+            held,
+            "the gate still holds every row — the cap bounds what the poll \
+             RENDERS, and the count behind \"N waiting for writes to stop\" is \
+             taken from this state, not from the list (see \
+             `crate::progress::status_line`). A cap that also shrank the state \
+             would be a lie about how much work is waiting"
+        );
+    }
+
+    /// One full-tree walk per folder, and the loser keeps working.
+    ///
+    /// Measured on hesperia: two concurrent walks of the same 155 662-entry USB
+    /// folder in 26 of 26 samples over seven minutes — the commit leg and a
+    /// five-second Pending poll, each calling the walk directly, on a tree
+    /// whose walk takes 72 minutes. Two walks of one tree are twice the work
+    /// plus the seek contention of interleaving them.
+    ///
+    /// Both halves matter. Losing the race must not raise an error and must not
+    /// stall: `collect_stable_changes` stages nothing and lets the supervisor
+    /// retry, which is the same outcome as any quiet pass.
+    #[test]
+    fn only_one_status_walk_runs_against_a_folder_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        std::fs::write(p.local_path.join("work.txt"), b"x").expect("write");
+        // Open the settle episode and age it out, so the folder really does
+        // hold something a walk would stage. Without this the assertion below
+        // passes for the wrong reason - a freshly written file is held by the
+        // stability gate whether the walk ran or not - and deleting the claim
+        // leaves the test green.
+        engine
+            .collect_stable_changes(&p)
+            .expect("the first pass opens the episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+
+        let held = engine.claim_walk(&p.id).expect("the first claim is free");
+        assert!(
+            engine.claim_walk(&p.id).is_none(),
+            "a second walk was allowed against a folder already being walked"
+        );
+        // A different folder is a different tree; the claim is per profile, not
+        // a global lock on walking.
+        assert!(
+            engine.claim_walk("another-profile").is_some(),
+            "the claim locked out an unrelated folder"
+        );
+
+        // The commit leg's answer to losing: nothing staged, no error.
+        let deferred = engine
+            .collect_stable_changes(&p)
+            .expect("a deferred pass is not a failure");
+        assert!(
+            deferred.added.is_empty()
+                && deferred.modified.is_empty()
+                && deferred.deleted.is_empty(),
+            "a pass that could not walk reported changes it never looked for: {deferred:?}"
+        );
+
+        // The claim is released, so the next pass is not locked out for the
+        // life of the process - and that pass finds the work the deferred one
+        // stayed silent about, which is what makes the silence above a
+        // consequence of the claim and not of an empty folder.
+        drop(held);
+        let ran = engine
+            .collect_stable_changes(&p)
+            .expect("the released folder walks");
+        assert_eq!(
+            ran.added,
+            vec![PathBuf::from("work.txt")],
+            "the folder had stageable work all along: {ran:?}"
+        );
+    }
+
+    /// The maintenance guarantee: an operation that takes time SAYS SO.
+    ///
+    /// The field report this exists for: "pending took very long; if keeper has
+    /// a process running it should display which one and give information that
+    /// suggests when it will finish (e.g. how many files are left)". Before it,
+    /// the walk over a 155 000-file folder published nothing for the ten minutes
+    /// it took, so the only line on screen was `tgdrive - 34521 waiting to
+    /// sync` - a fact about the queue, while the work itself was invisible and
+    /// indistinguishable from a wedge.
+    ///
+    /// Simulating "slow" is done with a folder big enough to outlast a report
+    /// tick rather than by making a disk slow: what has to stay true is that
+    /// the *counts reach the surface the owner reads*, and a test that waited
+    /// out real seconds to prove it would be a test nobody runs. The
+    /// silent-when-fast half is `git::repo`'s
+    /// `a_walk_that_finishes_immediately_reports_no_progress`.
+    #[test]
+    fn a_long_running_walk_reports_its_progress_where_the_owner_can_see_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
+        // A committed body the walk has to compare its way through. Progress is
+        // published off a clock now (see `git::repo::WalkReport`), so a folder
+        // that finishes inside one tick proves nothing about a folder that runs
+        // for an hour, which is the case this exists for.
+        const COMMITTED: usize = 400;
+        for i in 0..COMMITTED {
+            std::fs::write(p.local_path.join(format!("base-{i:05}.txt")), b"x").expect("write");
+        }
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(
+            commit_after_settling(&engine, &platform, &p),
+            COMMITTED as u64
+        );
+
+        // And work on top, so the second scan below has something to hand the
+        // commit and the walk is a real one rather than a no-op.
+        for i in 0..8 {
+            std::fs::write(p.local_path.join(format!("file-{i}.txt")), b"content").expect("write");
+        }
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+
+        // The stability gate admits a path only once a previous walk has seen
+        // it, so the first scan is the observation and the second is the one
+        // with work to hand the commit. Both walk, which is what is under test.
+        engine.collect_stable_changes(&p).expect("observe");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert!(!engine.collect_stable_changes(&p).expect("scan").is_empty());
+
+        let seen = Engine::lock(&published).clone();
+        let walking: Vec<&SyncProgress> = seen
+            .iter()
+            .filter(|event| event.phase == SyncPhase::Scanning && event.files_done > 0)
+            .collect();
+        assert!(
+            !walking.is_empty(),
+            "a walk in progress published no progress at all: {seen:?}"
+        );
+        let counts: Vec<u64> = walking.iter().map(|event| event.files_done).collect();
+        // It counts up, so a watcher can tell movement from a freeze - within a
+        // walk. Each walk is its own operation and starts again, which is what a
+        // drop back to a smaller number in this stream is.
+        assert!(
+            counts
+                .windows(2)
+                .all(|pair| pair[1] >= pair[0] || pair[1] <= COMMITTED as u64),
+            "a count moved backwards without restarting: {counts:?}"
+        );
+        // And it reaches the index it is drawn against: a report that stopped
+        // part way is a pane that freezes part way.
+        assert_eq!(
+            counts.iter().copied().max(),
+            Some(COMMITTED as u64),
+            "the report has to follow the walk to its end: {counts:?}"
+        );
+        assert!(
+            walking
+                .iter()
+                .all(|event| event.files_total == Some(COMMITTED as u64)),
+            "the denominator is the index entry count: {walking:?}"
+        );
+        // And the line the owner actually reads names the step and the numbers,
+        // rather than only what is queued behind it.
+        let mut status = engine.status(&p.id).expect("status");
+        status.phase = SyncPhase::Scanning;
+        status.files_done = walking.last().expect("a report").files_done;
+        status.files_total = walking.last().expect("a report").files_total;
+        let line = crate::progress::status_line(&status);
+        assert!(
+            line.starts_with("Scanning") && line.contains("files"),
+            "the owner has to be able to read what is happening; got {line:?}"
         );
     }
 
@@ -5681,7 +10962,7 @@ mod tests {
         std::fs::write(root.join("sub/a.txt"), b"x").expect("write");
         std::fs::write(root.join(".git/objects/pack"), b"x").expect("write");
 
-        let expanded = Engine::expand_untracked(
+        let (expanded, collapsed) = Engine::expand_untracked(
             root,
             &[
                 PathBuf::from("top.txt"),
@@ -5696,6 +10977,11 @@ mod tests {
             vec![PathBuf::from("top.txt")],
             "files pass through; a directory is refused, not walked"
         );
+        assert_eq!(
+            collapsed,
+            vec![PathBuf::from("sub")],
+            "the refusal is reported to the caller rather than logged per walk"
+        );
     }
 
     #[test]
@@ -5703,9 +10989,10 @@ mod tests {
         // The walk and the expansion are not atomic; a deleted file in between
         // is an ordinary outcome, not an error.
         let dir = tempfile::tempdir().expect("tempdir");
-        let expanded =
+        let (expanded, collapsed) =
             Engine::expand_untracked(dir.path(), &[PathBuf::from("gone.txt")]).expect("expand");
         assert!(expanded.is_empty());
+        assert!(collapsed.is_empty(), "a path that is gone is not a refusal");
     }
 
     #[test]
@@ -6007,6 +11294,84 @@ mod tests {
         );
         assert_eq!(fetched, 6_000_000, "the mark never walked back");
         assert_eq!(event.bytes_per_second, None, "a stalled fetch has no rate");
+    }
+
+    /// A folder of small objects reports throughput, and a stalled one stops.
+    ///
+    /// The rate the UI draws comes from the progress stream, and every figure in
+    /// it used to be measured inside one `do_lfs` call. `RateMeter` withholds a
+    /// number until a full second of movement backs it — correctly — so an
+    /// object that finished inside a second reported nothing, and a folder of
+    /// ordinary files showed a rate only for the occasional object above ~50 MB.
+    /// The owner's reading of that is the honest one: a hundred files landing
+    /// with no throughput figure anywhere looks exactly like a folder that has
+    /// stopped.
+    ///
+    /// So the run keeps its own meter, fed by the cumulative counter every
+    /// completed transfer already updates, and `publish` stamps it on any
+    /// rate-carrying frame that has nothing better. Both halves are asserted
+    /// here: the figure appears for objects far too small to measure alone, and
+    /// it is still withheld once the bytes stop — the meter's rules are reused,
+    /// not weakened.
+    #[test]
+    fn small_objects_still_report_a_rate_because_the_run_is_measured_not_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let seen = Arc::new(Mutex::new(Vec::<Option<u64>>::new()));
+        let sink = Arc::clone(&seen);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event.bytes_per_second);
+            true
+        }));
+
+        // The run's meter is anchored at zero bytes, which is where a run
+        // starts, and then four objects of 1 MB land — none of them on the wire
+        // long enough to measure, because each `add_transferred` is one whole
+        // completed transfer.
+        let t0 = Instant::now();
+        let at = |ms| t0 + std::time::Duration::from_millis(ms);
+        engine.observe_session_rate(&p.id, t0);
+        for _ in 0..4 {
+            engine.add_transferred(&p.id, 1_000_000);
+        }
+        // Two seconds of the run have now passed — time the objects never had
+        // individually, which is the whole point.
+        engine.observe_session_rate(&p.id, at(2_000));
+
+        let mut event = engine.progress(&p, SyncPhase::DownloadingLfs);
+        event.current = Some("clip-05.mp4".to_owned());
+        engine.publish(event);
+        assert_eq!(
+            Engine::lock(&seen).last().copied().flatten(),
+            Some(2_000_000),
+            "4 MB over two seconds of the run, on a frame whose object measured nothing"
+        );
+
+        // Nothing moves for a further window. The run's meter falls silent, so
+        // the frame carries no figure rather than freezing the last one.
+        engine.observe_session_rate(&p.id, at(4_000));
+        engine.publish(engine.progress(&p, SyncPhase::DownloadingLfs));
+        assert_eq!(
+            Engine::lock(&seen).last().copied().flatten(),
+            None,
+            "a run that has stopped moving bytes has no rate to report"
+        );
+
+        // And a phase with no byte producer never borrows the run's figure:
+        // `SyncPhase::carries_rate` is the whole gate.
+        engine.add_transferred(&p.id, 8_000_000);
+        engine.observe_session_rate(&p.id, at(6_000));
+        engine.publish(engine.progress(&p, SyncPhase::Committing));
+        assert_eq!(
+            Engine::lock(&seen).last().copied().flatten(),
+            None,
+            "committing moves no bytes, whatever the run has been doing"
+        );
     }
 
     #[test]
@@ -6992,6 +12357,337 @@ mod tests {
     /// itself, so it can measure the decision with a working one and without.
     ///
     /// The state used here needs no worktree read at all. A pointer written to
+    /// "Not synced yet" used to mean "not synced yet, outbound".
+    ///
+    /// The Pending list is computed from `git status` and the completeness
+    /// gate, which between them see only what this machine changed — so a
+    /// folder pulling 53 GB listed NOTHING while 106 objects sat in the journal
+    /// waiting to arrive. The inbound half comes from the journal, and it is
+    /// the half that answers "what is this folder still missing".
+    #[tokio::test]
+    async fn pending_lists_what_is_still_coming_in_not_only_what_is_going_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        assert!(
+            engine
+                .pending(&p.id)
+                .await
+                .expect("pending")
+                .iter()
+                .all(|file| !matches!(file.reason, PendingReason::Incoming { .. })),
+            "nothing is queued yet, so nothing is coming in"
+        );
+
+        let unit = WorkKind::LfsDownload {
+            oid: "d".repeat(64),
+            size: 405_800_000,
+        };
+        let id = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+            .expect("enqueue");
+        engine
+            .with_db(|conn| db::label_unit(conn, id, "70-comms/keeper-rec/camera-0001.mov"))
+            .expect("label");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let incoming = pending
+            .iter()
+            .find(|file| matches!(file.reason, PendingReason::Incoming { .. }))
+            .expect("the queued download is listed");
+        assert_eq!(incoming.path, "70-comms/keeper-rec/camera-0001.mov");
+        assert_eq!(
+            incoming.reason,
+            PendingReason::Incoming {
+                size_bytes: 405_800_000,
+                // Nothing was ever materialized for this path in this test, and
+                // that is what `replacing` reports — not what the repository's
+                // history says about the file.
+                replacing: false,
+            },
+            "the size is the whole question about an object that has not arrived"
+        );
+    }
+
+    /// The Pending list is the surface the owner was watching, and it ran its
+    /// OWN walk - so wiring the commit scan alone left it silent.
+    ///
+    /// That walk happens on a blocking thread, which cannot touch the engine,
+    /// so its counts come back over a channel and are published here. This is
+    /// the maintenance guard for that path: a Pending poll over a folder with
+    /// work in it publishes the walk's progress, and the numbers are the pair
+    /// the line renders.
+    #[tokio::test]
+    async fn a_pending_poll_publishes_the_progress_of_its_own_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = adoptable(dir.path());
+        // The seed ignores itself, so the first commit needs a file of its own.
+        std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
+        // Four hundred of them, because progress is published off a clock
+        // now: a seven-file walk finishes inside the first tick and a test
+        // built on one would be asserting that the clock is fast, not that the
+        // poll reports. See `git::repo::WalkReport`.
+        for i in 0..400 {
+            std::fs::write(p.local_path.join(format!("committed-{i:05}.txt")), b"x")
+                .expect("write");
+        }
+        engine.upsert_profile(&p).expect("upsert");
+        // `pending` only walks a folder that is already a repository - the
+        // first sync is what adopts it - so the fixture commits once before
+        // there is anything for a poll to find.
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 400);
+        for i in 0..6 {
+            std::fs::write(p.local_path.join(format!("waiting-{i}.txt")), b"x").expect("write");
+        }
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+
+        let listed = engine.pending(&p.id).await.expect("pending");
+        assert!(!listed.is_empty(), "the fixture has work, or nothing walks");
+
+        let counts: Vec<u64> = Engine::lock(&published)
+            .iter()
+            .filter(|event| event.phase == SyncPhase::Scanning && event.files_done > 0)
+            .map(|event| event.files_done)
+            .collect();
+        assert!(
+            !counts.is_empty(),
+            "the Pending poll walked and said nothing: {:?}",
+            Engine::lock(&published).clone()
+        );
+        // Non-decreasing, not strictly increasing: progress is published off a
+        // clock now, so a tick that lands between two comparisons honestly
+        // repeats the figure rather than inventing movement. The macOS gate
+        // caught this with `[120, 140, 193, 292, 346, 375, 400, 400]` — a walk
+        // that had reached the end of the index and said so twice.
+        assert!(
+            counts
+                .windows(2)
+                .all(|pair| pair[1] >= pair[0] || pair[1] <= 1),
+            "a count moved backwards without restarting: {counts:?}"
+        );
+    }
+
+    /// A second version arriving is not the same thing as a file arriving, and
+    /// the repository cannot tell them apart: a queued download finds pointer
+    /// text in the worktree either way. What separates them is whether THIS
+    /// machine has ever held content for that path, which is why keeper records
+    /// it when content lands.
+    #[tokio::test]
+    async fn an_object_for_a_path_this_clone_has_held_is_marked_as_replacing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let queue = |oid: &str, label: &str| {
+            let unit = WorkKind::LfsDownload {
+                oid: oid.to_owned(),
+                size: 4_096,
+            };
+            let id = engine
+                .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+                .expect("enqueue");
+            engine
+                .with_db(|conn| db::label_unit(conn, id, label))
+                .expect("label");
+        };
+        queue(&"a".repeat(64), "media/held-before.mov");
+        queue(&"b".repeat(64), "media/never-seen.mov");
+
+        // Only the first path has ever had content on this machine.
+        engine
+            .with_db(|conn| db::remember_materialized(conn, &p.id, "media/held-before.mov", 1))
+            .expect("remember");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let reason = |path: &str| {
+            pending
+                .iter()
+                .find(|file| file.path == path)
+                .map(|file| file.reason.clone())
+                .expect("listed")
+        };
+        assert_eq!(
+            reason("media/held-before.mov"),
+            PendingReason::Incoming {
+                size_bytes: 4_096,
+                replacing: true
+            }
+        );
+        assert_eq!(
+            reason("media/never-seen.mov"),
+            PendingReason::Incoming {
+                size_bytes: 4_096,
+                replacing: false
+            },
+            "new here, whatever the repository's history says about its age"
+        );
+    }
+
+    /// An object queued for a path since deleted cannot be named, and dropping
+    /// it would make this list disagree with the count the status line prints.
+    #[tokio::test]
+    async fn an_unnameable_incoming_object_is_still_listed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let unit = WorkKind::LfsDownload {
+            oid: "e".repeat(64),
+            size: 10,
+        };
+        engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+            .expect("enqueue");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let incoming = pending
+            .iter()
+            .find(|file| matches!(file.reason, PendingReason::Incoming { .. }))
+            .expect("an unnamed object is still work");
+        assert!(
+            incoming.path.starts_with("LFS object eeee"),
+            "it says what it is rather than pretending to be a path: {}",
+            incoming.path
+        );
+    }
+
+    /// The figures follow the journal, with nothing in between to go stale.
+    ///
+    /// They used to be written into the snapshot by the drain loop — after a
+    /// whole claimed batch of up to `CLAIM_LIMIT` units had been attempted. So
+    /// a completed download vanished from the Pending list (that one is
+    /// computed) while the line above it kept saying "94 files left, 48.7 GB",
+    /// for as long as the rest of the batch took: hours, on the link this was
+    /// reported from. No drain runs in this test, and none should have to.
+    #[test]
+    fn the_queue_figures_follow_the_journal_without_waiting_for_a_drain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let first = engine
+            .with_db(|conn| {
+                db::enqueue(
+                    conn,
+                    &p.id,
+                    &WorkKind::LfsDownload {
+                        oid: "a".repeat(64),
+                        size: 4_000,
+                    },
+                    1,
+                    1,
+                )
+            })
+            .expect("enqueue");
+        engine
+            .with_db(|conn| {
+                db::enqueue(
+                    conn,
+                    &p.id,
+                    &WorkKind::LfsDownload {
+                        oid: "b".repeat(64),
+                        size: 1_000,
+                    },
+                    1,
+                    1,
+                )
+            })
+            .expect("enqueue");
+
+        let before = engine.status(&p.id).expect("status");
+        assert_eq!((before.queued_files, before.queued_bytes), (2, 5_000));
+
+        engine
+            .with_db(|conn| db::complete(conn, first))
+            .expect("complete");
+
+        let after = engine.status(&p.id).expect("status");
+        assert_eq!(
+            (after.queued_files, after.queued_bytes),
+            (1, 1_000),
+            "one unit finished, and nothing had to remember to say so"
+        );
+    }
+
+    /// The queue that already exists is exactly the one that needs names.
+    ///
+    /// Naming happens at enqueue, so an install that upgrades mid-backlog has a
+    /// queue of rows that will never pass through that moment again: on the
+    /// folder that prompted this, 106 objects and 54.7 GB of them, every one
+    /// reporting the folder's name instead of a file for as long as it took to
+    /// deliver. The index is the only reverse map from object to path.
+    #[test]
+    fn a_queue_older_than_its_names_gets_them_filled_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let repo = engine.open_repo(&p).expect("open");
+        let pointer = lfs::stage::indexed_pointer(&repo, Path::new("clip.mp4"))
+            .expect("the committed blob is a pointer");
+
+        // A row shaped exactly like one queued before the column existed.
+        let unit = WorkKind::LfsDownload {
+            oid: pointer.oid.clone(),
+            size: pointer.size,
+        };
+        let id = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, 1, 1))
+            .expect("enqueue");
+
+        engine.backfill_labels(&p);
+
+        let claimed = engine
+            .with_db(|conn| db::claim_ready(conn, &p.id, 10, 10))
+            .expect("claim");
+        let named = claimed
+            .iter()
+            .find(|item| item.id == id)
+            .expect("the queued download is still there");
+        assert_eq!(
+            named.label.as_deref(),
+            Some("clip.mp4"),
+            "an unnamed queue is what the walk exists to answer"
+        );
+    }
+
     /// the index and not yet committed is a `HEAD`-to-index difference, which
     /// git reports from objects alone.
     #[test]
@@ -7373,6 +13069,92 @@ mod tests {
                 .find_reference(&format!("refs/heads/{}", p.branch))
                 .is_ok(),
             "the branch has to reach the remote once its objects have"
+        );
+    }
+
+    /// One object landing costs one path, never a walk of the repository.
+    ///
+    /// This is the shape of the field failure that produced
+    /// [`Engine::materialize_landed`]. The download leg finished by calling the
+    /// whole-tree sweep, so every delivered object re-read the index and then
+    /// stat-and-read every tracked file small enough to be a pointer. On the
+    /// folder that reported it — 154,765 tracked paths on a USB volume, 3.9 ms
+    /// per path cold, so ~10 minutes a sweep — a 238-object backlog moved one
+    /// file every 2 to 15 minutes and showed no throughput whatsoever, because
+    /// the worker spent its life inside a sweep rather than on the wire. Left
+    /// alone it would have taken about 40 hours to deliver 4.5 GB over a LAN.
+    ///
+    /// The cost is not directly observable from a test, but its cause is: the
+    /// sweep materializes *every* pointer whose object happens to be local,
+    /// while a targeted materialization touches the one path the journal row
+    /// names. So a second pointer whose object is already in the store, left
+    /// untouched by a download of the first, is exactly the discriminator — and
+    /// leaving it is safe, because the sweep in `scan_and_enqueue` is one tick
+    /// away and owns that whole-tree question.
+    #[tokio::test]
+    async fn a_landed_object_materializes_its_own_path_and_does_not_sweep_the_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1024;
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        let payload = |seed: u8| vec![seed; 4_096];
+        std::fs::write(p.local_path.join("landed.mp4"), payload(1)).expect("write");
+        std::fs::write(p.local_path.join("sibling.mp4"), payload(2)).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 2);
+
+        // The inbound state, which is what a clone without a smudge filter
+        // checks out: both objects are in the local store — the commit above put
+        // them there — and both worktree files are pointer text.
+        let repo = engine.open_repo(&p).expect("open");
+        let pointer = |rela: &str| {
+            lfs::stage::indexed_pointer(&repo, Path::new(rela)).expect("the blob is a pointer")
+        };
+        let landed = pointer("landed.mp4");
+        let sibling = pointer("sibling.mp4");
+        drop(repo);
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        for (rela, ptr) in [("landed.mp4", &landed), ("sibling.mp4", &sibling)] {
+            assert!(
+                store.contains(&ptr.oid, ptr.size),
+                "{rela}'s object has to be local for this test to discriminate"
+            );
+            std::fs::write(p.local_path.join(rela), ptr.render()).expect("check out the pointer");
+        }
+
+        // Exactly one object arrives, and the row names the path it arrives for.
+        let unit = WorkKind::LfsDownload {
+            oid: landed.oid.clone(),
+            size: landed.size,
+        };
+        let id = engine
+            .with_db(|conn| db::enqueue(conn, &p.id, &unit, platform.now_ms(), 0))
+            .expect("enqueue");
+        engine
+            .with_db(|conn| db::label_unit(conn, id, "landed.mp4"))
+            .expect("label");
+        engine
+            .drain_journal(&p, false, SyncSource::Watch)
+            .await
+            .expect("drain");
+
+        assert_eq!(
+            std::fs::read(p.local_path.join("landed.mp4")).expect("read"),
+            payload(1),
+            "the path the object landed for holds content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.local_path.join("sibling.mp4")).expect("read"),
+            sibling.render(),
+            "and no other path was even looked at — the sweep owns that"
         );
     }
 
@@ -8165,6 +13947,8 @@ mod tests {
                 reason: PendingReason::Settling {
                     since_ms: opened_at
                 },
+                // The bytes the gate is holding, measured off the worktree.
+                size_bytes: Some(13),
             }],
             "a held file reports why it is held and since when — not `untracked`, \
              which would read as sync being broken"
@@ -8179,6 +13963,133 @@ mod tests {
             1
         );
         assert!(engine.pending(&p.id).await.expect("pending").is_empty());
+    }
+
+    /// The scan is not a query, and treating it as one lost the file.
+    ///
+    /// [`StabilityGate::is_stable`] ends a path's episode the instant it
+    /// answers `Stable` — reading the verdict consumes it. `scan_and_enqueue`
+    /// walked the tree only to decide whether to queue a push and then threw
+    /// the staged set away, so the one pass on which a file finally settled was
+    /// the pass that spent its verdict and committed nothing. The file was
+    /// untracked again on the next walk: a first observation, with a brand-new
+    /// window. On a tree scanned more often than its settle window it never
+    /// survived to a commit at all, and the folder sat at "N waiting for writes
+    /// to stop" indefinitely with every wait honestly reading "under a minute
+    /// so far", because each one had genuinely just started.
+    #[tokio::test]
+    async fn a_scan_commits_what_settled_rather_than_spending_the_verdict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("segment-000.mov"), b"a closed segment").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        // With an empty journal the scan is the ONLY thing the supervisor runs,
+        // so it is the only thing that ever advances an episode. That is what
+        // makes discarding its result fatal rather than merely wasteful.
+        engine
+            .scan_and_enqueue(&p, SyncSource::Watch)
+            .expect("the first scan opens the episode");
+        assert_eq!(
+            engine.pending(&p.id).await.expect("pending").len(),
+            1,
+            "one observation is not two: the segment is still inside its window"
+        );
+
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        engine
+            .scan_and_enqueue(&p, SyncSource::Watch)
+            .expect("the window has elapsed");
+
+        assert!(
+            engine.pending(&p.id).await.expect("pending").is_empty(),
+            "the pass that settles a file must be the pass that commits it"
+        );
+        assert!(
+            engine
+                .activity(&p.id, 10)
+                .await
+                .expect("activity")
+                .iter()
+                .any(|entry| entry.path == "segment-000.mov"),
+            "and the commit is real — an emptied gate is not a synced file"
+        );
+    }
+
+    /// A short-cadence caller that asks the engine to LOOK must not also make
+    /// it FORGET.
+    ///
+    /// The notes cadence called [`Engine::rescan`] to mean "notice now" — but
+    /// that is the "Recheck all files" button, and it drops the gate for the
+    /// whole profile. On a folder that is both a notes vault and a recordings
+    /// destination it ran about once a second, so nothing but a note could ever
+    /// finish settling: a recording stopped, wrote its note stub, the stub made
+    /// the vault dirty, the cadence fired, and the segments the recording had
+    /// just closed lost the episode they needed. The recording could not sync
+    /// because it had written a note about itself.
+    ///
+    /// Both halves are asserted here, because "wake keeps it" is only half the
+    /// claim — the other half is that `rescan` still forgets, deliberately, and
+    /// a fix that made them the same thing would break the button instead.
+    #[tokio::test]
+    async fn a_cadence_that_wakes_lets_a_file_settle_where_one_that_rescans_never_can() {
+        // The control. A forget on every pass, and the file never lands however
+        // long it has been quiet — the shape of the reported bug.
+        let forgetting = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(forgetting.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(forgetting.path());
+        std::fs::write(p.local_path.join("segment-000.mov"), b"a closed segment").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        for _ in 0..4 {
+            engine.rescan(&p.id).expect("the cadence fires");
+            engine
+                .scan_and_enqueue(&p, SyncSource::Watch)
+                .expect("and the supervisor walks");
+            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        }
+        assert!(
+            engine
+                .activity(&p.id, 10)
+                .await
+                .expect("activity")
+                .is_empty(),
+            "a forget on every pass restarts every episode: nothing can ever settle"
+        );
+
+        // The same cadence, asking only to look.
+        let waking = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(waking.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(waking.path());
+        std::fs::write(p.local_path.join("segment-000.mov"), b"a closed segment").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+
+        for _ in 0..4 {
+            engine.wake_now(&p.id);
+            engine
+                .scan_and_enqueue(&p, SyncSource::Watch)
+                .expect("and the supervisor walks");
+            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        }
+        assert!(
+            engine
+                .activity(&p.id, 10)
+                .await
+                .expect("activity")
+                .iter()
+                .any(|entry| entry.path == "segment-000.mov"),
+            "a wake keeps the episode, so the second observation clears it"
+        );
     }
 
     #[tokio::test]
@@ -8201,7 +14112,183 @@ mod tests {
             vec![PendingFile {
                 path: "sub/deeper/x.txt".to_owned(),
                 reason: PendingReason::Untracked,
+                // `b"x"`, measured off the worktree like every outbound row.
+                size_bytes: Some(1),
             }]
+        );
+    }
+
+    /// Story 47.2 — the Files pane and the commit path must not disagree about
+    /// a file whose name is not valid UTF-8, and the folder must not be silent
+    /// about it.
+    ///
+    /// The owner's report was "one file whose name is not valid UTF-8, which
+    /// probably would not make it to the remote anyway". The second half is
+    /// wrong and this test is where that is written down: git stores path
+    /// bytes and never decodes them, so the file commits like any other. What
+    /// was broken was that no surface ever said the file existed in a form a
+    /// person could act on, and that the two surfaces which *did* see it could
+    /// not be shown to be talking about the same file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_files_pane_and_the_commit_path_agree_about_a_name_neither_can_spell() {
+        use std::os::unix::ffi::OsStringExt;
+
+        // Built from raw bytes. A string literal cannot express this name, and
+        // a test that faked it with valid UTF-8 would pass over the bug.
+        let odd_name = std::ffi::OsString::from_vec(b"doc-\xffepuap.txt".to_vec());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let odd_path = p.local_path.join(&odd_name);
+        if crate::names::create_unspellable(&p.local_path, b"doc-\xffepuap.txt").is_none() {
+            eprintln!("{}", crate::names::UNSPELLABLE_UNAVAILABLE);
+            return;
+        }
+        std::fs::write(&odd_path, b"a scan of a form").expect("write the odd one");
+        std::fs::write(p.local_path.join("ordinary.txt"), b"x").expect("write the ordinary one");
+        engine.upsert_profile(&p).expect("upsert");
+        engine.ensure_repo(&p).expect("adopt");
+
+        // 1. The engine's own answer to "what has this folder not synced yet".
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let engine_paths: Vec<&str> = pending.iter().map(|f| f.path.as_str()).collect();
+        assert!(
+            engine_paths.contains(&"doc-\u{FFFD}epuap.txt"),
+            "the engine must not drop it either; got {engine_paths:?}"
+        );
+
+        // 2. The Files pane, joined to that same answer.
+        let view = crate::browse::PendingView::Known(
+            pending
+                .iter()
+                .map(|f| (f.path.clone(), f.reason.clone()))
+                .collect(),
+        );
+        let crate::browse::BrowseListing::Listed(listed) = crate::browse::browse(
+            &p,
+            "",
+            &ExcludeSet::new(&p.excludes).expect("excludes"),
+            &view,
+            // The path is untracked, so `classify` answers at the waiting rung
+            // and never reaches the ledger. Saying "no rows" is therefore the
+            // honest input as well as the cheap one.
+            &crate::browse::MaterializedView::none(),
+        )
+        .expect("no refusal") else {
+            panic!("expected a listing");
+        };
+        let shown = listed
+            .entries
+            .iter()
+            .find(|e| e.unspellable.is_some())
+            .expect("the pane lists it and marks it");
+
+        // THE AGREEMENT. Not "both surfaces mention something odd" — the same
+        // file, reached the same way, in the same state. `absolute_path` is the
+        // undecoded handle, so this compares bytes, not renderings.
+        assert_eq!(
+            shown.absolute_path,
+            odd_path.canonicalize().expect("canonical"),
+            "the pane's row and the file on disk are the same bytes"
+        );
+        assert!(
+            matches!(
+                shown.sync,
+                crate::browse::EntrySyncStatus::Waiting {
+                    reason: Some(PendingReason::Untracked)
+                }
+            ),
+            "the pane must say what the engine says; got {:?}",
+            shown.sync
+        );
+
+        // 3. The commit path selects the same file, by its real bytes.
+        //
+        // Two passes: the completeness gate needs one observation to open the
+        // settling episode and a second, after the window, to close it. The
+        // first must stage nothing — a file whose name is odd is not a file
+        // that skips the gate.
+        assert!(
+            engine.collect_stable_changes(&p).expect("scan").is_empty(),
+            "the gate applies to this file like any other"
+        );
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        let staged = engine.collect_stable_changes(&p).expect("scan");
+        assert!(
+            staged.added.iter().any(|rela| rela.as_os_str() == odd_name),
+            "the commit walk must stage the real name, not a rendering; got {:?}",
+            staged.added
+        );
+
+        // A `Stable` verdict retires the gate's episode, so the scan above
+        // consumed it and `commit_local`'s own scan would find nothing. One
+        // more observation re-opens it. Spelled out rather than folded away
+        // because the alternative — deleting the assertion above and trusting
+        // the tree check below — would drop the direct evidence that the walk
+        // stages the *real* bytes rather than a rendering that happens to work.
+        assert!(engine.collect_stable_changes(&p).expect("scan").is_empty());
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        // 4. And it lands. The owner's guess that it "would not make it" was
+        //    wrong, so nothing here tries to make it syncable — it already is.
+        engine
+            .commit_local(&p, SyncSource::Manual, None)
+            .expect("a name that is not text is still a file git can carry");
+        let repo = engine.open_repo(&p).expect("open");
+        let tree = repo
+            .head_commit()
+            .expect("a commit exists")
+            .tree()
+            .expect("tree");
+        assert!(
+            tree.iter()
+                .filter_map(std::result::Result::ok)
+                .any(|entry| entry.filename() == b"doc-\xffepuap.txt".as_slice()),
+            "git stores path bytes; the raw name must be in the tree"
+        );
+
+        // 5. Now that it is carried, it is *reported* — which is the whole
+        //    story. Before this, a committed file with an unspellable name was
+        //    invisible: clean status, nothing pending, nothing on any list, and
+        //    the only way to find it was `ls`.
+        let problems = engine.problems(&p.id).await.expect("problems");
+        assert_eq!(
+            problems
+                .unspellable
+                .iter()
+                .map(|n| n.escaped.as_str())
+                .collect::<Vec<_>>(),
+            vec!["doc-\\xffepuap.txt"],
+            "the report must name it byte-exactly, and must not name the ordinary file"
+        );
+        assert_eq!(
+            problems.unspellable[0].display, "doc-\u{FFFD}epuap.txt",
+            "and carry the rendering a person reads in a row"
+        );
+        // Not an error and not a failure: nothing is stuck.
+        assert!(problems.error.is_none(), "a carried file is not a fault");
+        assert!(problems.parked.is_empty());
+
+        // 6. It stays reported once it is old news. This is the case the owner
+        //    actually hit — a file committed long ago, clean in status, that no
+        //    walk would ever mention again.
+        assert!(
+            engine.pending(&p.id).await.expect("pending").is_empty(),
+            "the file is committed, so nothing is pending"
+        );
+        assert_eq!(
+            engine
+                .problems(&p.id)
+                .await
+                .expect("problems")
+                .unspellable
+                .len(),
+            1,
+            "the index is read, not the status walk, so a clean tree still reports"
         );
     }
 
@@ -8243,6 +14330,7 @@ mod tests {
             vec![PendingFile {
                 path: closed.to_owned(),
                 reason: PendingReason::Untracked,
+                size_bytes: Some(b"a segment that closed".len() as u64),
             }],
             "only the finished segment is waiting; the one being written is not a file sync has an opinion about"
         );
@@ -8459,10 +14547,11 @@ mod tests {
         let pending = PendingFile {
             path: "notes/a.md".to_owned(),
             reason: PendingReason::Settling { since_ms: 42 },
+            size_bytes: Some(4_096),
         };
         assert_eq!(
             serde_json::to_string(&pending).expect("serialize"),
-            r#"{"path":"notes/a.md","reason":{"kind":"settling","sinceMs":42}}"#
+            r#"{"path":"notes/a.md","reason":{"kind":"settling","sinceMs":42},"sizeBytes":4096}"#
         );
 
         let report = ProblemReport {
@@ -8475,10 +14564,28 @@ mod tests {
                 last_error: Some("401".to_owned()),
             }],
             conflicts: vec!["a.sync-conflict-x.md".to_owned()],
+            unspellable: vec![
+                crate::names::UnspellableName::of_bytes(b"doc-\xffepuap.txt")
+                    .expect("not valid UTF-8"),
+            ],
         };
         let json = serde_json::to_string(&report).expect("serialize");
         assert!(json.contains(r#""lastError":"401""#), "got: {json}");
         assert!(json.contains(r#""attempts":3"#), "got: {json}");
+        // Both renderings cross the wire: the lossy one is what a row shows,
+        // the escaped one is what makes the report actionable. A frontend given
+        // only `display` could not tell two reported files apart.
+        // `serde_json` writes U+FFFD as the character itself, not as a `\u`
+        // escape, so this has to be a real replacement character rather than
+        // the six letters that spell one.
+        assert!(
+            json.contains("\"display\":\"doc-\u{FFFD}epuap.txt\""),
+            "got: {json}"
+        );
+        assert!(
+            json.contains(r#""escaped":"doc-\\xffepuap.txt""#),
+            "got: {json}"
+        );
 
         let row = ActivityRow {
             ts_ms: 1,
@@ -8568,6 +14675,7 @@ mod tests {
             .publish_while(
                 &p,
                 SyncPhase::UploadingLfs,
+                Some("40-media/clip.mov"),
                 event_rx,
                 |event, transfer_event| {
                     tally.fold(&transfer_event);
@@ -8589,6 +14697,15 @@ mod tests {
         let mut previous_total = 0;
         for event in &published {
             assert_eq!(event.phase, SyncPhase::UploadingLfs);
+            // EVERY frame, not just the first. The name used to be stamped on a
+            // frame published before the transfer began, and the first byte
+            // that moved replaced it with `None` — so the surface that shows
+            // the file being carried showed it for no observable time at all.
+            assert_eq!(
+                event.current.as_deref(),
+                Some("40-media/clip.mov"),
+                "the file being carried must survive its own progress"
+            );
             let total = event
                 .bytes_total
                 .expect("a started object gives the bar a denominator");
@@ -8790,6 +14907,122 @@ mod tests {
             outcome.bytes > 0,
             "a run that received a pack must report the bytes it moved, got {}",
             outcome.bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identical_change_on_both_sides_makes_no_conflict_copy() {
+        // Two devices running the same formatter, or regenerating the same
+        // deterministic file, both list the path in their diff against the
+        // merge base — and the copy that used to produce was byte-identical to
+        // the file beside it. The user could only discover that by opening
+        // both. Changing a path is not the same as disagreeing about it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        engine.upsert_profile(&p).expect("upsert");
+
+        std::fs::write(p.local_path.join("index.md"), b"root").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("publish the shared root");
+
+        // Same path, same resulting bytes, arrived at independently.
+        advance_remote(remote_dir.path(), "index.md", "regenerated");
+        platform.advance_ms(1_000);
+        std::fs::write(p.local_path.join("index.md"), b"regenerated").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("converge");
+        assert!(
+            outcome.conflicts.is_empty(),
+            "identical content is not a conflict, got {:?}",
+            outcome.conflicts
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("index.md")).expect("canonical path"),
+            b"regenerated",
+            "the content both sides agreed on must survive"
+        );
+        assert!(
+            outcome.stale.is_empty(),
+            "nothing was given away, so nothing is stale: {:?}",
+            outcome.stale
+        );
+        let strays: Vec<_> = std::fs::read_dir(&p.local_path)
+            .expect("read the worktree")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".sync-conflict-"))
+            .collect();
+        assert!(strays.is_empty(), "no copy may be left behind: {strays:?}");
+    }
+
+    #[tokio::test]
+    async fn a_regenerable_path_converges_without_a_copy() {
+        // A generated listing that two devices rewrote for two different
+        // reasons genuinely differs — and the local revision is still worth
+        // nothing, because the tool that wrote it rebuilds the right answer
+        // from inputs that are themselves synced. Only a path the user declared
+        // regenerable gets this; keeper never decides an edit is disposable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote_dir = tempfile::tempdir().expect("tempdir");
+        if gix::init_bare(remote_dir.path()).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.remote_url = remote_dir.path().to_string_lossy().into_owned();
+        p.regenerable = vec!["index.md".to_owned()];
+        engine.upsert_profile(&p).expect("upsert");
+
+        std::fs::write(p.local_path.join("index.md"), b"root").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("publish the shared root");
+
+        advance_remote(remote_dir.path(), "index.md", "theirs");
+        platform.advance_ms(1_000);
+        std::fs::write(p.local_path.join("index.md"), b"ours").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("converge");
+        assert!(
+            outcome.conflicts.is_empty(),
+            "a declared-regenerable path must converge without a copy, got {:?}",
+            outcome.conflicts
+        );
+        assert_eq!(
+            outcome.stale,
+            vec!["index.md".to_owned()],
+            "silently is not the same as invisibly: the path is now the other \
+             device's answer and the run has to say so"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("index.md")).expect("canonical path"),
+            b"theirs",
+            "the remote still keeps the canonical path"
         );
     }
 
@@ -9312,6 +15545,90 @@ mod tests {
             Some(now + i64::try_from(crate::profile::CLOSE_WRITE_SETTLE_MS).expect("fits")),
             "one second, not the full settle window"
         );
+    }
+
+    /// A watched folder pays for the directory walk once, then leaves new files
+    /// to the watcher until the sweep falls due.
+    ///
+    /// The directory walk is the expensive half of a status and it is not
+    /// proportional to what changed: measured on the field folder,
+    /// `find . -type f` over 157 490 files takes 996 s, and the Pending poll
+    /// was paying that every five seconds for rows the stability gate already
+    /// held.
+    #[test]
+    fn a_watched_folder_sweeps_for_untracked_once_and_then_stops_walking_the_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let (_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            _tx.clone(),
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        // The first poll of a run always sweeps: nothing was watching while the
+        // process was down.
+        assert_eq!(
+            engine.poll_walk_policy(&p.id),
+            git::repo::WalkPolicy::full(),
+            "the first poll after a start has to look for itself"
+        );
+        assert_eq!(
+            engine.poll_walk_policy(&p.id),
+            git::repo::WalkPolicy::tracked_only(),
+            "and the next one must not walk the tree again five seconds later"
+        );
+
+        // Age the record past the interval: the sweep comes back, so a file the
+        // watcher never announced is still found within the quarter hour.
+        Engine::lock(&engine.untracked_sweep).insert(
+            p.id.clone(),
+            Instant::now()
+                .checked_sub(UNTRACKED_SWEEP_INTERVAL + Duration::from_secs(1))
+                .expect("the test clock is not at the epoch"),
+        );
+        assert_eq!(
+            engine.poll_walk_policy(&p.id),
+            git::repo::WalkPolicy::full(),
+            "a due sweep is what catches an event the backend dropped"
+        );
+    }
+
+    /// With no live watcher there is no second source for a new file, so every
+    /// poll pays.
+    ///
+    /// This is the branch that keeps the cheap path honest: the saving is
+    /// available precisely because something else is watching, and a folder on
+    /// a filesystem that cannot notify (`ProfileWatch::Failed`, or a watcher
+    /// that has not armed yet) gets the old behaviour rather than a quiet gap.
+    #[test]
+    fn an_unwatched_folder_keeps_sweeping_on_every_poll() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        for pass in 1..=3 {
+            assert_eq!(
+                engine.poll_walk_policy(&p.id),
+                git::repo::WalkPolicy::full(),
+                "pass {pass}: an unwatched folder has nothing else to trust"
+            );
+        }
     }
 
     /// The tap is an observer: it sees what the drain saw, and its absence —
@@ -10482,19 +16799,24 @@ mod tests {
             "the recording did not fail — its publication did: {durability:?}"
         );
         assert!(!durability.pushed, "and it is not on the remote");
-        let problem = durability
-            .problem
-            .expect("a refused publication must be able to say why");
-        assert_eq!(
-            Some(problem.clone()),
-            engine.status(&p.id).expect("status").error,
-            "verbatim: the sentence the engine recorded, not a second wording of it"
-        );
+        // No sentence, and that is the answer now (DW-207). This profile is
+        // bidirectional, so being overtaken by the rival is a race rather than
+        // a decision: it comes back as `RemoteMoved`, which is transient, and
+        // `record_failure` deliberately hands no words to a recorder about work
+        // that is about to be retried. The recording is a step behind, not
+        // broken, and saying so in red would be a lie that recurs every time
+        // two machines are awake at once.
         assert!(
-            problem.to_ascii_lowercase().contains("failed to push"),
-            "the reason has to be git's own account of the refused publication — the recording \
-             did not fail — got: {problem}"
+            durability.problem.is_none(),
+            "a race that heals itself must not be reported as a failed publication: {durability:?}"
         );
+        // The reconcile itself runs inline in `reconcile_and_retry_push`, so
+        // there is no queue entry to look for here; that ordering is what
+        // `a_bidirectional_push_reconciles_before_it_retries` pins down. What
+        // this test owns is the durability contract, and all three parts of it
+        // hold: the recording is committed, it is not yet on the remote, and
+        // nobody is told a publication failed.
+        assert!(!durability.verified);
         // The recording itself is untouched by any of it.
         assert!(segment.exists());
     }
@@ -10612,6 +16934,388 @@ mod tests {
             0,
             "reading durability must never publish anything"
         );
+    }
+
+    /// Under `PointerOnly`, a REQUESTED download publishes and a background one
+    /// does not (Story 56.3).
+    ///
+    /// The one decision point the story turns on, asserted directly on the
+    /// completion arm because nothing else can see it. `materialize_landed`
+    /// opens with `lfs_mode != Materialize → return Ok(())`, which is right for
+    /// arrival and fatal for a request: `PointerOnly` is the mode in which
+    /// paths are virtual in the first place, so without the flag asking for a
+    /// file under it would fetch the object into the store, return `Ok`, and
+    /// leave the worktree holding pointer text — a green test over an inert
+    /// feature.
+    ///
+    /// Both directions are asserted in one test on purpose: "it publishes" is
+    /// only half the claim, and a flag that published unconditionally would
+    /// pass the first half while silently retiring `PointerOnly` for everybody.
+    #[test]
+    fn a_requested_download_publishes_under_pointer_only_and_a_background_one_does_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_mode = LfsMode::PointerOnly;
+        engine.upsert_profile(&p).expect("upsert");
+        // A real repository first, before anything writes into `.git`: the
+        // completion arm refreshes the index stat through `open_repo`, and a
+        // `.git` that exists and holds no `HEAD` is the half-made state that
+        // refuses to open. The folder has to be non-empty for adoption to be
+        // the path taken — `open_repo` clones an EMPTY directory, and this
+        // fixture's remote does not resolve — and adoption is `git init` plus a
+        // remote config, never network.
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.ensure_repo(&p).expect("adopt the fixture folder");
+
+        // The state a download leaves behind: the object in this machine's
+        // store, the worktree still holding the pointer git checked out.
+        let content = vec![9u8; 4_096];
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        store.ensure_layout().expect("store layout");
+        let (oid, size) = store
+            .insert_streaming(std::io::Cursor::new(content.clone()))
+            .expect("seed the object");
+        let pointer = lfs::pointer::Pointer::new(oid.clone(), size);
+        let target = p.local_path.join("clip.mp4");
+        std::fs::write(&target, pointer.render()).expect("check out the pointer");
+
+        // The unit itself, in the journal, because the journal is where the
+        // answer is read from: a literal `true` here would assert the
+        // destination and leave the source — `claim_ready` → `promote_unit` →
+        // `unit_urgency` — untested, which is how a request that arrives while
+        // its download is already running got dropped.
+        let unit = WorkKind::LfsDownload {
+            oid: oid.clone(),
+            size,
+        };
+        let unit_id = engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &unit, 1, 1))
+            .expect("queue the download");
+
+        // Arrival policy, unchanged: `PointerOnly` means "leave what arrives as
+        // pointers", and nobody has asked for this one.
+        engine
+            .materialize_landed(&p, &store, &oid, Some("clip.mp4"), Some(unit_id))
+            .expect("a background arrival is not an error");
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            pointer.render().into_bytes(),
+            "a background download under `PointerOnly` still leaves the pointer"
+        );
+
+        // The request arrives — and it arrives against a row that is already
+        // being executed, which is the case `covered_while_running` makes
+        // ordinary and a claim-time snapshot cannot see.
+        engine
+            .with_db(|conn| db::promote_unit(conn, unit_id, 2))
+            .expect("promote the row somebody asked for");
+        engine
+            .materialize_landed(&p, &store, &oid, Some("clip.mp4"), Some(unit_id))
+            .expect("a requested arrival publishes");
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            content,
+            "the path somebody asked for holds the real bytes, which is the \
+             whole point of the verb under the mode that makes paths virtual"
+        );
+
+        // `Disabled` is NOT bypassed: nothing routes the path through the clean
+        // filter there, so real bytes in the worktree would become a new blob
+        // in the next commit.
+        let mut disabled = p.clone();
+        disabled.lfs_mode = LfsMode::Disabled;
+        std::fs::write(&target, pointer.render()).expect("back to the pointer");
+        engine
+            .materialize_landed(&disabled, &store, &oid, Some("clip.mp4"), Some(unit_id))
+            .expect("still not an error");
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            pointer.render().into_bytes(),
+            "a request cannot turn LFS back on for a folder whose owner turned it off"
+        );
+    }
+
+    /// Every path the requested object sits at is published, not just the one
+    /// whose name the row happens to carry (Story 56.3 review).
+    ///
+    /// Two paths holding identical bytes share one oid, so they share one
+    /// download and one journal row — and `label_unit` is first-writer-wins, so
+    /// the row keeps the name of whichever was asked for first. Publishing only
+    /// the label meant the second request reported a unit id and never
+    /// delivered: under `PointerOnly` the whole-tree sweep is switched off, so
+    /// nothing would ever have repaired it.
+    ///
+    /// The background half is asserted in the same test, because "publish
+    /// everything" would retire `PointerOnly`'s arrival policy for duplicated
+    /// content.
+    #[test]
+    fn a_requested_object_publishes_every_path_it_is_committed_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_mode = LfsMode::PointerOnly;
+        engine.upsert_profile(&p).expect("upsert");
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.ensure_repo(&p).expect("adopt the fixture folder");
+
+        let content = vec![7u8; 8_192];
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        store.ensure_layout().expect("store layout");
+        let (oid, size) = store
+            .insert_streaming(std::io::Cursor::new(content.clone()))
+            .expect("seed the object");
+        let pointer = lfs::pointer::Pointer::new(oid.clone(), size);
+        // Both paths hold the same pointer text, and both are committed, so the
+        // index records the same oid twice — which is what makes them one unit.
+        for name in ["clip.mp4", "clip-copy.mp4"] {
+            std::fs::write(p.local_path.join(name), pointer.render()).expect("check out");
+        }
+        let repo = git::repo::open(&p.local_path, false).expect("open");
+        let changes = git::commit::StagedChange {
+            added: vec![
+                PathBuf::from("clip.mp4"),
+                PathBuf::from("clip-copy.mp4"),
+                PathBuf::from("keep.txt"),
+            ],
+            ..Default::default()
+        };
+        let signature = gix::actor::Signature {
+            name: "t".into(),
+            email: "t@example.invalid".into(),
+            time: gix::date::Time::new(1_700_000_000, 0),
+        };
+        let provenance = Provenance::new(
+            &p.name,
+            "dev",
+            "01JDEV",
+            "host",
+            crate::provenance::SyncSource::Cli,
+        );
+        git::commit::stage_and_commit(
+            &repo,
+            &changes,
+            &provenance,
+            &p,
+            &signature,
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit both pointers");
+        drop(repo);
+
+        let unit = WorkKind::LfsDownload {
+            oid: oid.clone(),
+            size,
+        };
+        let unit_id = engine
+            .with_db(|conn| {
+                let id = db::enqueue_unique(conn, &p.id, &unit, 1, 1)?;
+                // The first request names the first path, and the second one
+                // cannot rename it.
+                db::label_unit(conn, id, "clip.mp4")?;
+                db::promote_unit(conn, id, 1)?;
+                Ok(id)
+            })
+            .expect("queue and promote one unit for both paths");
+
+        engine
+            .materialize_landed(&p, &store, &oid, Some("clip.mp4"), Some(unit_id))
+            .expect("publish");
+        assert_eq!(
+            std::fs::read(p.local_path.join("clip.mp4")).expect("read"),
+            content,
+            "the labelled path holds its content"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("clip-copy.mp4")).expect("read"),
+            content,
+            "and so does the path the row could not name — the request was for \
+             this content, and this is where the folder commits it"
+        );
+
+        // The background half: the same fixture, the same object, no promotion.
+        for name in ["clip.mp4", "clip-copy.mp4"] {
+            std::fs::write(p.local_path.join(name), pointer.render()).expect("back to pointers");
+        }
+        let second = engine
+            .with_db(|conn| {
+                let id = db::enqueue(conn, &p.id, &unit, 2, 2)?;
+                db::label_unit(conn, id, "clip.mp4")?;
+                Ok(id)
+            })
+            .expect("queue a background unit");
+        engine
+            .materialize_landed(&p, &store, &oid, Some("clip.mp4"), Some(second))
+            .expect("a background arrival is not an error");
+        assert_eq!(
+            std::fs::read(p.local_path.join("clip.mp4")).expect("read"),
+            pointer.render().into_bytes(),
+            "under `PointerOnly` a background arrival still publishes nothing"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("clip-copy.mp4")).expect("read"),
+            pointer.render().into_bytes(),
+            "and it certainly does not reach for the sibling"
+        );
+    }
+
+    /// Every refusal the door itself produces, on one fixture (Story 56.3
+    /// review).
+    ///
+    /// These were the nine matrix rows nothing exercised: each is a sentence a
+    /// user meets and a branch a refactor can silently invert, and none of them
+    /// needs a committed pointer to reach. Asserted on the refusal's *variant*,
+    /// which is what "a typed error the caller can distinguish" has to mean.
+    #[test]
+    fn the_door_refuses_by_name_before_it_touches_a_worktree() {
+        use lfs::hydrate::ContentRefusal;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        let refusal = |subpath: &str| match engine.materialize_entry(&p.id, subpath) {
+            Err(SyncError::Refused(refusal)) => refusal,
+            other => panic!("expected a refusal for {subpath:?}, got {other:?}"),
+        };
+
+        // Containment, both halves of it, and the root itself.
+        assert!(matches!(
+            refusal("../etc/passwd"),
+            ContentRefusal::Escapes(_)
+        ));
+        assert!(matches!(refusal("/etc/passwd"), ContentRefusal::Escapes(_)));
+        assert!(matches!(refusal(""), ContentRefusal::Escapes(_)));
+        // Refused whatever the folder is doing: the containment answer must not
+        // depend on whether a tick happens to hold the reservation, which is
+        // what putting it after `reserve` did.
+        {
+            let _held = engine.reserve(&p.id).expect("hold the reservation");
+            assert!(matches!(
+                refusal("../etc/passwd"),
+                ContentRefusal::Escapes(_)
+            ));
+            assert!(
+                matches!(
+                    engine.materialize_entry(&p.id, "clip.mp4"),
+                    Err(SyncError::Busy(_))
+                ),
+                "and a path that IS askable answers busy while the folder is"
+            );
+        }
+
+        // A folder with no repository in it has no committed pointer, so there
+        // is nothing to ask for — and no `.git` is created by asking.
+        assert!(matches!(
+            refusal("clip.mp4"),
+            ContentRefusal::NotTracked { .. }
+        ));
+        assert!(
+            !p.local_path.join(".git").exists(),
+            "asking must not make a repository"
+        );
+
+        // Paused: keeper is not writing into this working tree at all, and a
+        // queued unit would never be claimed either.
+        let mut paused = p.clone();
+        paused.enabled = false;
+        engine.upsert_profile(&paused).expect("pause");
+        assert!(matches!(refusal("clip.mp4"), ContentRefusal::Paused { .. }));
+        engine.upsert_profile(&p).expect("resume");
+
+        // LFS off for the folder: real bytes here would become a new blob in
+        // the next commit, so it is refused by the mode's own name.
+        let mut disabled = p.clone();
+        disabled.lfs_mode = LfsMode::Disabled;
+        engine.upsert_profile(&disabled).expect("disable lfs");
+        assert!(matches!(
+            refusal("clip.mp4"),
+            ContentRefusal::LfsDisabled { .. }
+        ));
+        engine.upsert_profile(&p).expect("re-enable lfs");
+
+        // Outside the cone this profile exists to keep away — asserted through
+        // a real repository, because the cone is checked after the index, and
+        // in a SUBDIRECTORY, because git's cone matching (and so
+        // `SparseCone::includes`) always keeps the repository root's own files.
+        let mut coned = p.clone();
+        coned.subpaths = vec!["docs".to_owned()];
+        engine.upsert_profile(&coned).expect("cone");
+        std::fs::write(coned.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.ensure_repo(&coned).expect("adopt");
+        let content = vec![3u8; 2_048];
+        let store = lfs::store::LfsStore::in_git_dir(coned.local_path.join(".git"));
+        store.ensure_layout().expect("store layout");
+        let (oid, size) = store
+            .insert_streaming(std::io::Cursor::new(content))
+            .expect("seed");
+        let pointer = lfs::pointer::Pointer::new(oid, size);
+        std::fs::create_dir_all(coned.local_path.join("media")).expect("zone");
+        std::fs::write(coned.local_path.join("media/clip.mp4"), pointer.render())
+            .expect("write pointer");
+        let repo = git::repo::open(&coned.local_path, false).expect("open");
+        let changes = git::commit::StagedChange {
+            added: vec![PathBuf::from("media/clip.mp4"), PathBuf::from("keep.txt")],
+            ..Default::default()
+        };
+        let signature = gix::actor::Signature {
+            name: "t".into(),
+            email: "t@example.invalid".into(),
+            time: gix::date::Time::new(1_700_000_000, 0),
+        };
+        let provenance = Provenance::new(
+            &coned.name,
+            "dev",
+            "01JDEV",
+            "host",
+            crate::provenance::SyncSource::Cli,
+        );
+        git::commit::stage_and_commit(
+            &repo,
+            &changes,
+            &provenance,
+            &coned,
+            &signature,
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit the pointer");
+        drop(repo);
+        assert!(matches!(
+            match engine.materialize_entry(&coned.id, "media/clip.mp4") {
+                Err(SyncError::Refused(refusal)) => refusal,
+                other => panic!("expected a refusal, got {other:?}"),
+            },
+            ContentRefusal::OutsideSubpaths { .. }
+        ));
+
+        // A plain tracked file has no pointer, and a path in the index that is
+        // gone from the worktree must not be resurrected.
+        engine.upsert_profile(&p).expect("no cone");
+        assert!(matches!(
+            refusal("keep.txt"),
+            ContentRefusal::NotTracked { .. }
+        ));
+        std::fs::remove_file(p.local_path.join("media/clip.mp4")).expect("delete it locally");
+        assert!(matches!(
+            refusal("media/clip.mp4"),
+            ContentRefusal::Missing { .. }
+        ));
+
+        // An unknown profile is a configuration error, not a refusal: the
+        // caller named something that does not exist.
+        assert!(matches!(
+            engine.materialize_entry("01NOSUCHPROFILE", "clip.mp4"),
+            Err(SyncError::Config(_))
+        ));
     }
 }
 

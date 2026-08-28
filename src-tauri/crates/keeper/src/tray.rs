@@ -8,7 +8,7 @@
 //! startup when the persisted setting is on.
 //!
 //! While a screen-recording session is live (Story 18.1), the same single tray
-//! flips to a `recording` rendering: a record-dot icon, a ~1 Hz-refreshed
+//! flips to a `recording` rendering: the mark's `live` glyph, a ~1 Hz-refreshed
 //! disabled status line (`Recording — 12:34 · segment 3, 412 MB`), and **Stop
 //! Recording** / **Open Recordings Folder** items ahead of Show/Quit. The tray
 //! is a pure renderer of the Rust-owned [`RecordingStatusVm`] snapshot (driven
@@ -27,10 +27,24 @@
 //! Tray glue is a shell/OS concern (AD-24) — `keeper-core` only owns the persisted
 //! *mode/flag*. Every step here is best-effort: a tray build failure is logged at `warn`
 //! and the app keeps running (the tray is a convenience, never load-bearing).
+//!
+//! The recording verbs the tray offers are not written here (Story 46.16). They
+//! are a projection of `keeper_core::palette` — the same registry the ⌘K
+//! palette, the ⌘? cheat sheet and the native menu bar render — so their words
+//! and their order are the registry's, and a rename there reaches this surface
+//! too. The tray used to hand-build every label, which is exactly why the
+//! Story 46.5 rename of the start verb reached three surfaces and not this one,
+//! and why the menu bar icon had no way to begin a recording at all. What stays
+//! here is glue: which rendering is being built (`TrayMenu`), what the item id
+//! is, and where the click goes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use keeper_core::palette::{
+    tray_notes_labels, tray_recording_verbs, TrayMenu, TrayNotesLabels, TrayNotesState,
+    RECORDING_OPEN_FOLDER_ID, RECORDING_START_ID, RECORDING_STOP_ID,
+};
 use keeper_core::vm::{
     RecordingDurabilityState, RecordingDurabilityVm, RecordingStatusVm, RecordingUiState,
 };
@@ -47,9 +61,22 @@ const MAIN_WINDOW_LABEL: &str = "main";
 const SHOW_ID: &str = "tray-show";
 /// The menu item id for "Quit".
 const QUIT_ID: &str = "tray-quit";
-/// The menu item id for "Stop Recording" (Story 18.1).
+/// The menu item id for the tray's Stop Recording item (Story 18.1).
+///
+/// A `tray-` id rather than the registry's `recording-stop`, and the difference
+/// is the dispatch: a `tray-*` click is handled here in the shell, a registry id
+/// is forwarded verbatim into the shared `keeper://menu-action` dispatch (see
+/// [`tray_verb_item_id`]). A stop stays local because it is the panic button on
+/// a live capture and must not depend on a responsive webview. The item's
+/// *words* are the registry's all the same (Story 46.16).
 const STOP_ID: &str = "tray-stop-recording";
-/// The menu item id for "Open Recordings Folder" (Story 18.1).
+/// The menu item id for the tray's Open Recordings Folder item (Story 18.1).
+///
+/// Shell-dispatched like [`STOP_ID`], and deliberately so: this reveals the LIVE
+/// session's own folder (`output_path`), where the registry's
+/// `recording-open-folder` reveals the configured destination. The same words
+/// over two different folders — forwarding this one into the shared dispatch
+/// would quietly change which folder opens mid-session.
 const OPEN_FOLDER_ID: &str = "tray-open-recordings-folder";
 /// The menu item id for the disabled elapsed/segment/size line (Story 18.1).
 const STATUS_ID: &str = "tray-recording-status";
@@ -111,11 +138,16 @@ pub struct NotesTray {
     pub hotkey_registered: bool,
 }
 
-/// The retained notes menu items, held so their labels can be mutated.
+/// The retained notes menu items, held so their labels can be mutated, plus the
+/// registry's own word for each of the three verbs.
 ///
 /// `set_text` and `set_enabled` only — never `set_menu` (AD-61). Cloned handles
 /// are cheap and the mutation dispatches to the main thread internally, which is
 /// why the tray lock is never held across one.
+///
+/// `labels` is the projection, taken once when the menu is built and reused on
+/// every paint: the registry is static, and re-projecting per tick would ask the
+/// same question five times a second (Story 47.4, DW-195).
 #[derive(Clone)]
 struct NotesItems {
     new_note: MenuItem<Wry>,
@@ -123,66 +155,93 @@ struct NotesItems {
     journal: MenuItem<Wry>,
     recent: Vec<MenuItem<Wry>>,
     unread: MenuItem<Wry>,
+    labels: TrayNotesLabels,
 }
 
-/// The bundled record-dot menu-bar icon shown while a recording is live (Story
-/// 18.1; template rendering Story 21.4). Decoded per transition via
-/// [`tray_glyph`] — a decode failure just keeps the current icon.
+/// The bundled menu-bar glyph shown while a recording is live (Story 18.1;
+/// template rendering Story 21.4). Decoded per transition via [`tray_glyph`] — a
+/// decode failure just keeps the current icon.
 ///
-/// All three tray glyphs are macOS TEMPLATE images (monochrome black + alpha,
-/// the brand speech-bubble mark from the app icon): the menu bar colors them
-/// white/black per appearance and highlights them natively, so states must
-/// read from glyph SHAPE — bubble outline = idle, filled dot in the bubble =
-/// recording, filled bubble with a punched-out exclamation = error. Off macOS
-/// no tray host recolours anything, so [`tray_glyph`] repaints the same shape
-/// for the panel; the shape-not-colour rule holds on every platform.
-const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-recording-template.png");
-
-/// The bundled error badge shown while a failed session holds the tray (Story
-/// 18.4): the filled brand bubble carrying a punched-out exclamation mark, so
-/// the fault reads at a glance and stays visually distinct from the plain
-/// record dot. Same base dimensions as [`RECORDING_ICON_PNG`]; decoded per
-/// transition via [`Image::from_bytes`] — a decode failure just keeps the
-/// current icon.
-const ERROR_ICON_PNG: &[u8] = include_bytes!("../icons/tray-error-template.png");
-
-/// The idle (presence-only) template glyph — the brand speech-bubble outline.
-/// Replaces the colored app icon so the menu bar stays native (Story 21.4).
-const IDLE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-idle-template.png");
-
-/// The folder-sync glyph set (Story 29.2, AD-51), generated from the idle mark
-/// by `scripts/gen-tray-sync-icons.ts` so the brand outline is identical and
-/// only the interior differs.
+/// EVERY GLYPH BELOW IS THE SAME DRAWING. It is the keeper mark — an accession
+/// tag — and what changes between states is the ink inside its aperture, never
+/// the tag. The tag lands in identical pixels in all ten, which
+/// is the point: macOS centres a status-item image, so a family whose ink sits in
+/// different places would make the mark visibly jump the moment a sync started,
+/// and a person cannot tell a state change from a glitch. The menu bar should
+/// look like one instrument changing its readout.
 ///
-/// Template images again: the menu bar recolours them, so **state must read
-/// from SHAPE, never colour**. Armed is a static cycle in the bubble interior;
-/// the four transfer states carry a mark in the bottom-right corner instead —
-/// an arrow up, an arrow down, both, or circular arrows for work with nothing on
-/// the wire.
+/// The aperture carries the four states the lamp component carries — live, idle,
+/// working, fault — and the sync glyphs extend that vocabulary with the facts
+/// four states cannot hold: direction, paused, warning.
 ///
-/// These four replaced a four-frame rotating ring. The animation said "something
-/// is happening" and nothing about *what*, so a 40 GB upload and a directory scan
-/// drew the same picture; a direction says it without moving, which is also why
-/// the tray no longer advances a frame counter.
-const SYNC_ARMED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-template.png");
-const SYNC_UP_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-up-template.png");
-const SYNC_DOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-down-template.png");
-const SYNC_UPDOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-updown-template.png");
-const SYNC_REFRESH_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-refresh-template.png");
-const SYNC_PAUSED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-paused-template.png");
-const SYNC_WARNING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-warning-template.png");
+/// These are macOS TEMPLATE images: monochrome black + alpha, which the menu bar
+/// recolours per appearance and inverts on highlight, so **state must read from
+/// SHAPE, never colour**. Off macOS no tray host recolours anything, so
+/// [`tray_glyph`] repaints the same shape for the panel; the rule holds
+/// everywhere.
+///
+/// The `@2x` file is what ships into the tray. 44px is the retina size of a 22pt
+/// menu-bar item, so handing the system the denser bitmap lets it downscale by
+/// exactly two. That is the whole reason the artwork is authored on a 44-unit
+/// grid with every coordinate even: 44 is 1:1 here and exactly half at 22px, so
+/// both files in the pair are whole-pixel and neither is a resample.
+/// The `@1x` file beside each one is the other half of the macOS template pair;
+/// `scripts/gen-mark-icons.test.ts` holds the pair to its contract, because
+/// that gate runs on every platform and this crate only builds on macOS.
+///
+/// All of them, and the app icon, are generated from `icons/mark.svg` by
+/// `bun run scripts/gen-mark-icons.ts`. Do not hand-edit the PNGs.
+const RECORDING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-live-template@2x.png");
+
+/// Shown while a failed session holds the tray (Story 18.4): the aperture's
+/// `fault` state, a filled core with a bite taken out of its trailing edge. The
+/// bite is half the core's width because a smaller one is a single pixel at menu
+/// bar size, and a fault nobody can see is not a fault indicator.
+const ERROR_ICON_PNG: &[u8] = include_bytes!("../icons/tray-fault-template@2x.png");
+
+/// The idle (presence-only) glyph: the aperture open and empty. keeper is here
+/// and nothing is happening (Story 21.4).
+const IDLE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-idle-template@2x.png");
+
+/// The folder-sync glyph set (Story 29.2, AD-51).
+///
+/// Armed is the aperture's core drawn hollow — configured, lit, nothing in
+/// flight. Active is the `working` state, a dashed aperture. The transfer states
+/// put an arrow in the aperture, and paused and warning put their own marks
+/// there.
+///
+/// The direction marks replaced a four-frame rotating ring. The animation said
+/// "something is happening" and nothing about *what*, so a 40 GB upload and a
+/// directory scan drew the same picture; a direction says it without moving,
+/// which is why the tray no longer advances a frame counter.
+///
+/// There is deliberately no separate "refresh" glyph any more. Active used to
+/// carry circular arrows meaning "something is happening", which is precisely
+/// what a dashed aperture already says — and at menu-bar size a redundant mark
+/// costs legibility it cannot repay.
+const SYNC_ARMED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-template@2x.png");
+const SYNC_ACTIVE_ICON_PNG: &[u8] = include_bytes!("../icons/tray-working-template@2x.png");
+const SYNC_UP_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-up-template@2x.png");
+const SYNC_DOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-down-template@2x.png");
+const SYNC_UPDOWN_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-updown-template@2x.png");
+const SYNC_PAUSED_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-paused-template@2x.png");
+const SYNC_WARNING_ICON_PNG: &[u8] = include_bytes!("../icons/tray-sync-warning-template@2x.png");
 
 /// The colour the authored glyph is repainted in on every platform that is not
-/// macOS — the keeper mark's bright tone, chosen because it separates from both
-/// a dark and a light panel.
+/// macOS — the accent, lichen, chosen because it separates from both a dark and a
+/// light panel.
+///
+/// This was `#3ecfae` until the identity landed, which is the teal the design
+/// explicitly rejects: it is fintech mint rather than a green, and it was a third
+/// unchosen green living outside the token file where no gate could see it.
 #[cfg(not(target_os = "macos"))]
-const PANEL_GLYPH_RGB: [u8; 3] = [0x3E, 0xCF, 0xAE];
+const PANEL_GLYPH_RGB: [u8; 3] = [0x8F, 0xC6, 0x59];
 
-/// The one-pixel contrast halo grown around the repainted glyph — the mark's
-/// deep tone. On a dark panel it disappears into the background; on a light one
-/// it is what stops the bright mark dissolving into white.
+/// The one-pixel contrast halo grown around the repainted glyph — the workroom's
+/// ground. On a dark panel it disappears into the background; on a light one it
+/// is what stops the bright mark dissolving into white.
 #[cfg(not(target_os = "macos"))]
-const PANEL_HALO_RGB: [u8; 3] = [0x06, 0x23, 0x1C];
+const PANEL_HALO_RGB: [u8; 3] = [0x0D, 0x12, 0x10];
 
 /// How opaque an authored pixel must be to grow a halo. Below this the glyph is
 /// already fading out and an outline would only thicken it.
@@ -394,6 +453,27 @@ fn dismiss_recording_error(app: &AppHandle) {
     let _ = crate::ipc::acknowledge_recording(&state);
 }
 
+/// Start a recording from the tray (Story 46.16) — down the SAME path the native
+/// menu bar's own registry items take.
+///
+/// Raise the window first (the Recording view is where the banner, the meter and
+/// any permission prompt render, and a session started behind a hidden window is
+/// one the user cannot see), then emit the shared `keeper://menu-action` event
+/// with the registry id, which the frontend `use-menu-actions` hook routes into
+/// `dispatchPaletteAction` — the single dispatch table the palette, the cheat
+/// sheet and the menu bar already share.
+///
+/// Deliberately NOT a shell-side start beside [`stop_recording`]: a start carries
+/// the CURRENT capture selections (screen/window, mic, camera), which live in the
+/// frontend stores `startRecordingWithCurrentSelections` reads. A start built
+/// here would have to invent a default selection set — the parallel
+/// implementation this story exists to avoid, and a silent revert to defaults for
+/// the user. The stop is local for the opposite reason (see [`STOP_ID`]).
+fn start_recording(app: &AppHandle) {
+    show_main_window(app);
+    crate::menu::handle_menu_event(app, RECORDING_START_ID);
+}
+
 /// Reveal the current session folder (`output_path`) in the OS file manager
 /// (Story 18.1), via the same opener plugin as the export "Reveal in Finder".
 /// Best-effort: no session folder or a reveal failure is logged, never a panic.
@@ -424,27 +504,81 @@ fn menu_item(app: &AppHandle, id: &str, label: &str, enabled: bool) -> Option<Me
     }
 }
 
+/// The tray's own item id for a projected registry verb.
+///
+/// The id namespace says how the click is dispatched, which is the only rule this
+/// file needs about the projection: a `tray-*` id is handled by the router in
+/// [`build_tray`], and a registry id is forwarded verbatim into the shared
+/// `keeper://menu-action` dispatch every other surface uses. Stop and the folder
+/// reveal keep their shell ids for the reasons on [`STOP_ID`] and
+/// [`OPEN_FOLDER_ID`]; the start verb carries the registry's id because the
+/// registry's own handler is what has to run (see [`start_recording`]). Pure.
+fn tray_verb_item_id(registry_id: &str) -> &str {
+    match registry_id {
+        RECORDING_STOP_ID => STOP_ID,
+        RECORDING_OPEN_FOLDER_ID => OPEN_FOLDER_ID,
+        forwarded => forwarded,
+    }
+}
+
+/// Build the recording verbs one tray rendering offers, or `None` when an item
+/// fails to build (the caller then leaves the tray/menu unchanged, exactly as for
+/// the hand-built items).
+///
+/// Membership, order and labels are all [`tray_recording_verbs`]' — this is the
+/// whole of the glue. An empty vector is the ordinary answer on a build without
+/// the recording capability, and the caller then adds no separator either.
+fn build_recording_verbs(app: &AppHandle, menu: TrayMenu) -> Option<Vec<MenuItem<Wry>>> {
+    tray_recording_verbs(menu, crate::macos_version::recording_supported())
+        .iter()
+        .map(|verb| menu_item(app, tray_verb_item_id(&verb.id), &verb.title, true))
+        .collect()
+}
+
+/// Append a rendering's recording verbs plus the separator that groups them — and
+/// nothing at all when there are none, so a build that cannot record does not
+/// grow a stray separator where the verbs would have been.
+fn add_recording_verbs<'a>(
+    mut builder: MenuBuilder<'a, Wry, AppHandle>,
+    verbs: &'a [MenuItem<Wry>],
+) -> MenuBuilder<'a, Wry, AppHandle> {
+    if verbs.is_empty() {
+        return builder;
+    }
+    for verb in verbs {
+        builder = builder.item(verb);
+    }
+    builder.separator()
+}
+
 /// Build the notes section's items, or `None` when the capability is off.
 ///
-/// Built once per menu and then only mutated (AD-61). Every label starts at its
-/// empty-state wording rather than blank, so a tray built before the first index
-/// publish reads correctly instead of showing five unexplained gaps.
+/// Built once per menu and then only mutated (AD-61). The three verbs start at
+/// the registry's bare word — what a settled vault reads — rather than at an
+/// empty state a tray built before the first index publish has no grounds to
+/// claim, and the recent slots start at their empty marker rather than blank, so
+/// the menu reads correctly instead of showing five unexplained gaps.
+///
+/// The words are [`tray_notes_labels`]', not this file's (Story 47.4, DW-195).
+/// A label spelled here is a label a registry retitle does not reach — which is
+/// what happened to the recording verbs until Story 46.16, and what UX-DR42
+/// forbids across the palette, the cheat sheet, the native menu and the tray.
 fn build_notes_items(app: &AppHandle, enabled: bool) -> Option<NotesItems> {
-    if !enabled {
-        // Omitted at build time on a build where notes is absent, which is
-        // correct — and, because the menu is built once, omitted forever.
-        return None;
-    }
+    // `None` on a build where notes is absent, which is correct — and, because
+    // the menu is built once, omitted forever. The capability gate is the
+    // registry's own, so the tray cannot disagree with the other three surfaces.
+    let labels = tray_notes_labels(enabled)?;
     let recent: Vec<MenuItem<Wry>> = NOTE_RECENT_IDS
         .iter()
         .map(|id| menu_item(app, id, NOTE_EMPTY_SLOT, false))
         .collect::<Option<Vec<_>>>()?;
     Some(NotesItems {
-        new_note: menu_item(app, NOTE_NEW_ID, "New Note", true)?,
-        capture: menu_item(app, NOTE_CAPTURE_ID, "Quick Capture", true)?,
-        journal: menu_item(app, NOTE_JOURNAL_ID, "Today\u{2019}s Journal", true)?,
+        new_note: menu_item(app, NOTE_NEW_ID, &labels.new_note, true)?,
+        capture: menu_item(app, NOTE_CAPTURE_ID, &labels.capture, true)?,
+        journal: menu_item(app, NOTE_JOURNAL_ID, &labels.journal, true)?,
         recent,
         unread: menu_item(app, NOTE_UNREAD_ID, NOTE_NO_UNREAD, false)?,
+        labels,
     })
 }
 
@@ -469,14 +603,23 @@ fn add_notes_section<'a>(
     builder.separator().item(&items.unread).separator()
 }
 
-/// Build the idle tray menu: the notes section, then "Show keeper" + "Quit"
-/// (Story 10.3, Story 36.7).
+/// Build the idle tray menu: the notes section, the projected recording verbs,
+/// then "Show keeper" + "Quit" (Story 10.3, Story 36.7, Story 46.16).
+///
+/// This is the menu the tray is created with, which on Linux is the only menu it
+/// will ever have — and the reason the start verb has to be present here rather
+/// than added on the first tick. On a build that cannot record the projection is
+/// empty and this is the Story 36.7 menu unchanged.
 fn build_idle_menu(app: &AppHandle) -> Option<(Menu<Wry>, Option<NotesItems>)> {
     let notes = build_notes_items(app, notes_capability(app));
+    let verbs = build_recording_verbs(app, TrayMenu::Idle)?;
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
     let builder = add_notes_section(MenuBuilder::new(app), notes.as_ref());
-    match builder.items(&[&show, &quit]).build() {
+    match add_recording_verbs(builder, &verbs)
+        .items(&[&show, &quit])
+        .build()
+    {
         Ok(menu) => Some((menu, notes)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build tray menu");
@@ -498,22 +641,30 @@ fn notes_capability(app: &AppHandle) -> bool {
 
 /// Build the error-hold tray menu (Story 18.4): the disabled
 /// `Recording failed — <reason>` line, then **Show Recording** (raises the
-/// window, where the banner's one-click Restart lives), **Open Recordings
-/// Folder**, and **Dismiss Error** (→ acknowledge), then Quit. The line is
+/// window, where the banner's one-click Restart lives), the projected folder
+/// reveal, and **Dismiss Error** (→ acknowledge), then Quit. The line is
 /// static — a terminal `error` never changes — so no held item is returned.
+///
+/// No start verb, by the decision recorded on `keeper_core::palette`'s
+/// `tray_verb_ids`: the restart over a terminal failure is the banner's, and the
+/// tray never restarts a session itself.
 fn build_error_menu(app: &AppHandle, line: &str) -> Option<Menu<Wry>> {
     let status = menu_item(app, STATUS_ID, line, false)?;
     let show_recording = menu_item(app, SHOW_RECORDING_ID, "Show Recording", true)?;
-    let open = menu_item(app, OPEN_FOLDER_ID, "Open Recordings Folder", true)?;
+    let verbs = build_recording_verbs(app, TrayMenu::Error)?;
     let dismiss = menu_item(app, DISMISS_ERROR_ID, "Dismiss Error", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
-    let menu = MenuBuilder::new(app)
+    // The folder reveal sits INSIDE the action group, between the two tray-owned
+    // items, so the verbs are appended by hand rather than through
+    // `add_recording_verbs`, which groups them with a trailing separator.
+    let mut builder = MenuBuilder::new(app)
         .item(&status)
         .separator()
-        .items(&[&show_recording, &open, &dismiss])
-        .separator()
-        .items(&[&quit])
-        .build();
+        .item(&show_recording);
+    for verb in &verbs {
+        builder = builder.item(verb);
+    }
+    let menu = builder.item(&dismiss).separator().items(&[&quit]).build();
     match menu {
         Ok(menu) => Some(menu),
         Err(error) => {
@@ -524,20 +675,19 @@ fn build_error_menu(app: &AppHandle, line: &str) -> Option<Menu<Wry>> {
 }
 
 /// Build the recording tray menu (Story 18.1): the disabled status `line`, then
-/// Stop Recording + Open Recordings Folder, then the idle Show/Quit pair.
-/// Returns the menu together with the held status item so the ~1 Hz tick can
-/// refresh the line via `set_text`.
+/// the projected session verbs (stop + the folder reveal), then the idle
+/// Show/Quit pair. Returns the menu together with the held status item so the
+/// ~1 Hz tick can refresh the line via `set_text`.
+///
+/// No start verb: there is one session, and a start item that lingered into the
+/// live menu is the bug Story 46.16 tested for in `keeper_core::palette`.
 fn build_recording_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuItem<Wry>)> {
     let status = menu_item(app, STATUS_ID, line, false)?;
-    let stop = menu_item(app, STOP_ID, "Stop Recording", true)?;
-    let open = menu_item(app, OPEN_FOLDER_ID, "Open Recordings Folder", true)?;
+    let verbs = build_recording_verbs(app, TrayMenu::Recording)?;
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
-    let menu = MenuBuilder::new(app)
-        .item(&status)
-        .separator()
-        .items(&[&stop, &open])
-        .separator()
+    let builder = MenuBuilder::new(app).item(&status).separator();
+    let menu = add_recording_verbs(builder, &verbs)
         .items(&[&show, &quit])
         .build();
     match menu {
@@ -568,6 +718,9 @@ fn build_tray(app: &AppHandle) -> Option<(TrayIcon, Option<NotesItems>)> {
             STOP_ID => stop_recording(app),
             OPEN_FOLDER_ID => open_recordings_folder(app),
             DISMISS_ERROR_ID => dismiss_recording_error(app),
+            // Story 46.16: the one tray item whose id is a REGISTRY id, because
+            // its click is forwarded verbatim into the registry's own dispatch.
+            RECORDING_START_ID => start_recording(app),
             // The notes section (Story 36.7). Routed through the same single
             // router, which is registered on the tray rather than on a menu and
             // therefore survives every `set_menu` — so click routing needed no
@@ -821,7 +974,7 @@ fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
 }
 
 /// Render the recording state onto a present tray (Story 18.1): on the
-/// idle→recording transition swap in the record-dot icon + recording menu; on
+/// idle→recording transition swap in the `live` glyph + recording menu; on
 /// every later tick refresh only the disabled status line via `set_text` — no
 /// menu rebuild, no flicker, an open menu stays open.
 fn render_recording(
@@ -838,9 +991,9 @@ fn render_recording(
         }
         return;
     }
-    // idle → recording transition: record-dot icon + recording menu.
+    // idle → recording transition: the live glyph + recording menu.
     if !set_tray_glyph(tray, RECORDING_ICON_PNG) {
-        tracing::warn!("tray: could not install the record-dot glyph");
+        tracing::warn!("tray: could not install the live glyph");
     }
     // A menu build/install failure leaves `status_item` unset, so the next
     // tick simply retries the transition.
@@ -1203,14 +1356,14 @@ mod tests {
         assert_eq!(decide_presence(Failed, false, true, false), RestoreIdle);
     }
 
-    /// Story 18.4: the bundled error badge is a valid PNG that decodes through
-    /// the same `Image::from_bytes` path the tick uses, at the record-dot's
-    /// base dimensions — and it is not byte-identical to the record dot (the
-    /// two states must be distinguishable at a glance).
+    /// Story 18.4: the bundled fault glyph is a valid PNG that decodes through
+    /// the same `Image::from_bytes` path the tick uses, at the live glyph's base
+    /// dimensions — and it is not byte-identical to it (the two states must be
+    /// distinguishable at a glance).
     #[test]
-    fn error_badge_asset_decodes_at_the_record_dot_dimensions() {
-        let error = Image::from_bytes(ERROR_ICON_PNG).expect("tray-error.png decodes");
-        let recording = Image::from_bytes(RECORDING_ICON_PNG).expect("tray-recording.png decodes");
+    fn fault_asset_decodes_at_the_live_glyph_dimensions() {
+        let error = Image::from_bytes(ERROR_ICON_PNG).expect("tray-fault template decodes");
+        let recording = Image::from_bytes(RECORDING_ICON_PNG).expect("tray-live template decodes");
         assert_eq!(error.width(), recording.width());
         assert_eq!(error.height(), recording.height());
         assert_ne!(ERROR_ICON_PNG, RECORDING_ICON_PNG);
@@ -1305,7 +1458,7 @@ mod tests {
             SYNC_UP_ICON_PNG,
             SYNC_DOWN_ICON_PNG,
             SYNC_UPDOWN_ICON_PNG,
-            SYNC_REFRESH_ICON_PNG,
+            SYNC_ACTIVE_ICON_PNG,
             SYNC_PAUSED_ICON_PNG,
             SYNC_WARNING_ICON_PNG,
         ] {
@@ -1510,7 +1663,7 @@ mod tests {
     /// The epic's rule, unchanged: recording wins the icon and sync never forces
     /// presence. Durability is not an input to [`decide_presence`] at all — a
     /// refused push is not a session `error`, so it can neither build a tray, nor
-    /// drop one, nor swap the record dot for the error badge. The reduction is
+    /// drop one, nor swap the live glyph for the fault one. The reduction is
     /// confined to the status line.
     #[test]
     fn a_push_problem_never_changes_presence_or_the_recording_icon() {
@@ -1543,6 +1696,41 @@ mod tests {
             RestoreIdle
         );
     }
+
+    /// The one rule this file keeps about the projection: the id namespace says
+    /// who dispatches the click (Story 46.16). The membership and the words are
+    /// `keeper_core::palette`'s and are tested there, where they compile off
+    /// macOS.
+    #[test]
+    fn the_id_namespace_says_who_dispatches_a_projected_verb() {
+        // Shell-dispatched: a stop must not depend on a responsive webview, and
+        // the tray's reveal opens the live session's folder rather than the
+        // configured destination.
+        assert_eq!(tray_verb_item_id(RECORDING_STOP_ID), STOP_ID);
+        assert_eq!(tray_verb_item_id(RECORDING_OPEN_FOLDER_ID), OPEN_FOLDER_ID);
+        // Forwarded unchanged: the start verb carries the registry id precisely so
+        // the router hands it to the shared `keeper://menu-action` dispatch.
+        assert_eq!(tray_verb_item_id(RECORDING_START_ID), RECORDING_START_ID);
+        // And every verb any rendering can project resolves to an id this file's
+        // router actually handles — a projected verb with a `tray-` id nobody
+        // matches, or a forwarded id that is not the start verb, would be a menu
+        // item that does nothing when clicked.
+        for menu in [
+            TrayMenu::Idle,
+            TrayMenu::Sync,
+            TrayMenu::Recording,
+            TrayMenu::Error,
+        ] {
+            for verb in tray_recording_verbs(menu, true) {
+                let id = tray_verb_item_id(&verb.id);
+                assert!(
+                    id == RECORDING_START_ID || id == STOP_ID || id == OPEN_FOLDER_ID,
+                    "{menu:?} projects {} as {id}, which the tray router does not handle",
+                    verb.id
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,9 +1748,9 @@ const SYNC_STATUS_ID: &str = "tray-sync-status";
 ///
 /// Every state is one still asset, so the glyph is a function of state alone —
 /// the reason this no longer takes a frame. What used to be carried by motion is
-/// now carried by the corner mark, and carried better: an arrow says which way
-/// the bytes are going, where a spinning ring only said that something was.
-/// `Active` — scanning, committing, verifying — gets the circular arrows, which
+/// now carried by the aperture, and carried better: an arrow says which way the
+/// bytes are going, where a spinning ring only said that something was.
+/// `Active` — scanning, committing, verifying — gets the dashed aperture, which
 /// is the same "working" claim without the promise of a transfer.
 fn sync_glyph(state: TraySyncState) -> Option<&'static [u8]> {
     match state {
@@ -1571,7 +1759,7 @@ fn sync_glyph(state: TraySyncState) -> Option<&'static [u8]> {
         TraySyncState::Transferring => Some(SYNC_UPDOWN_ICON_PNG),
         TraySyncState::Uploading => Some(SYNC_UP_ICON_PNG),
         TraySyncState::Downloading => Some(SYNC_DOWN_ICON_PNG),
-        TraySyncState::Active => Some(SYNC_REFRESH_ICON_PNG),
+        TraySyncState::Active => Some(SYNC_ACTIVE_ICON_PNG),
         TraySyncState::Paused => Some(SYNC_PAUSED_ICON_PNG),
         TraySyncState::Armed => Some(SYNC_ARMED_ICON_PNG),
     }
@@ -1709,23 +1897,29 @@ fn dwelled(reported: TraySyncState) -> TraySyncState {
     }
 }
 
-/// Build the sync tray menu: the notes section, a disabled status line, then Show
-/// and Quit.
+/// Build the sync tray menu: the notes section, the projected recording verbs, a
+/// disabled status line, then Show and Quit.
 ///
 /// The notes items are here too, and not only in the idle menu, because this menu
 /// replaces that one on the first sync tick — on macOS, where `set_menu` works.
 /// Omitting them here would make the section vanish the moment a folder started
-/// syncing, which is most of the time.
+/// syncing, which is most of the time. The recording verbs are here for exactly
+/// the same reason (Story 46.16), in the same slot as in the idle menu, so
+/// "New Recording" neither moves nor disappears when a folder starts syncing.
 fn build_sync_menu(
     app: &AppHandle,
     line: &str,
 ) -> Option<(Menu<Wry>, MenuItem<Wry>, Option<NotesItems>)> {
     let notes = build_notes_items(app, notes_capability(app));
+    let verbs = build_recording_verbs(app, TrayMenu::Sync)?;
     let status = menu_item(app, SYNC_STATUS_ID, line, false)?;
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
     let builder = add_notes_section(MenuBuilder::new(app), notes.as_ref());
-    match builder.items(&[&status, &show, &quit]).build() {
+    match add_recording_verbs(builder, &verbs)
+        .items(&[&status, &show, &quit])
+        .build()
+    {
         Ok(menu) => Some((menu, status, notes)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build the sync menu");
@@ -1916,9 +2110,17 @@ fn paint_notes(items: &NotesItems, model: &NotesTray) {
     // With no vault the two create verbs stay ENABLED: choosing them opens
     // Settings → Sync, because the action is achievable and a disabled row that
     // explains nothing is worse than a row that takes you where you need to go.
-    set_label(&items.new_note, &new_note_label(model));
-    set_label(&items.capture, &capture_label(model));
-    set_label(&items.journal, &journal_label(model));
+    // The wording is therefore the only thing carrying the state, and it is
+    // composed in `keeper-core` where it can be tested (Story 47.4, DW-195) —
+    // this file cannot be compiled on two of the three hosts keeper is written
+    // on, so a sentence assembled here is a sentence nobody can check.
+    let labels = items.labels.painted(TrayNotesState {
+        vault: model.vault_id.is_some(),
+        hotkey_registered: model.hotkey_registered,
+    });
+    set_label(&items.new_note, &labels.new_note);
+    set_label(&items.capture, &labels.capture);
+    set_label(&items.journal, &labels.journal);
 
     for (slot, item) in items.recent.iter().enumerate() {
         match model.recent.get(slot) {
@@ -1946,33 +2148,6 @@ fn set_label(item: &MenuItem<Wry>, label: &str) {
 fn set_enabled(item: &MenuItem<Wry>, enabled: bool) {
     if let Err(error) = item.set_enabled(enabled) {
         tracing::warn!(%error, "tray: could not update a notes menu item's state");
-    }
-}
-
-/// `New Note`, or the honest wording when there is nowhere to put one yet.
-fn new_note_label(model: &NotesTray) -> String {
-    if model.vault_id.is_some() {
-        "New Note".to_owned()
-    } else {
-        "New Note\u{2026} (no vault yet)".to_owned()
-    }
-}
-
-/// `Quick Capture`, carrying the registration failure in words when the global
-/// shortcut did not take (UX-DR43): the truth belongs where the user is.
-fn capture_label(model: &NotesTray) -> String {
-    if model.hotkey_registered {
-        "Quick Capture".to_owned()
-    } else {
-        "Quick Capture \u{2014} hotkey unavailable".to_owned()
-    }
-}
-
-fn journal_label(model: &NotesTray) -> String {
-    if model.vault_id.is_some() {
-        "Today\u{2019}s Journal".to_owned()
-    } else {
-        "Today\u{2019}s Journal\u{2026} (no vault yet)".to_owned()
     }
 }
 
@@ -2105,8 +2280,8 @@ mod sync_tray_tests {
     fn working_differs_from_both_armed_and_every_transfer() {
         // Scanning or committing is work, not transfer, so it must not draw as
         // one — but it must still differ from armed, or "busy" and "idle" become
-        // the same picture. Armed is the centred ring; this is the corner
-        // circular arrows.
+        // the same picture. Armed is the hollow core; this is the dashed
+        // aperture.
         let active = SyncGlyphId::of(sync_glyph(TraySyncState::Active).expect("active"));
         for other in [
             TraySyncState::Armed,
@@ -2136,7 +2311,7 @@ mod sync_tray_tests {
             SYNC_UP_ICON_PNG,
             SYNC_DOWN_ICON_PNG,
             SYNC_UPDOWN_ICON_PNG,
-            SYNC_REFRESH_ICON_PNG,
+            SYNC_ACTIVE_ICON_PNG,
         ] {
             let image = Image::from_bytes(bytes).expect("sync glyph decodes");
             assert_eq!(image.width(), idle.width());

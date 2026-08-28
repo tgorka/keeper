@@ -1,7 +1,7 @@
 /**
  * Shared imperative recording control (Story 20.4, FR-48/FR-50).
  *
- * The single entry the palette verbs ("Start Recording" / "Stop Recording") and
+ * The single entry the palette verbs ("New Recording" / "Stop Recording") and
  * the global recording hotkey both route through, so the two reachability
  * surfaces provably behave identically. Start reads the SAME module-level
  * capture stores the Recording view's Start button and the banner's Restart

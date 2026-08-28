@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Datelike, FixedOffset, Local, TimeZone, Timelike};
@@ -34,6 +34,8 @@ use keeper_core::notes::recording_note::{self, NoteStub, SessionFacts};
 use keeper_core::notes::NotesError;
 use keeper_core::oauth::OAuthFlowRegistry;
 use keeper_core::platform::Platform;
+#[cfg(desktop)]
+use keeper_core::platform::SecretCache;
 use keeper_core::recording::path_template::{
     PathTemplate, RelativePath, RenderCtx, DEFAULT_TEMPLATE,
 };
@@ -49,18 +51,19 @@ use keeper_core::recording::{
 use keeper_core::vm::{
     AccountVm, ApprovalDraftVm, BackupStatus, BbctlAvailabilityVm, BbctlProgressVm,
     BridgeDiscoveryVm, BridgeHealthSnapshot, BridgeLoginInput, BridgeLoginVm, BridgeNetworkVm,
-    CapabilitiesVm, ChatNotifyMode, ConnectionStatusBatch, CouplingCaveatVm, DemoBatch,
-    DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm, EncryptionStatusBatch,
-    ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch, IncognitoVm, IpcError,
-    IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot, NewChatResolutionVm,
-    NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch, PaletteMode,
-    PaletteResultsVm, PingVm, Provider, RecordingDestinationKind, RecordingDurabilityState,
-    RecordingDurabilityVm, RecordingFilterVm, RecordingHitVm, RecordingNoteStubVm,
-    RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm, RecordingSettingsVm,
-    RecordingSourcesVm, RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
-    RemoteDraftVm, ResolveSupportVm, RoomListBatch, ScreenRecordingAccess, SearchFilterVm,
-    SearchHitVm, SpacesSnapshot, SyncListSettingsVm, TccPermission, TimelineBatch, TypingBatch,
-    VerificationFlowVm,
+    CapabilitiesVm, ChatNotifyMode, ConfigLayersVm, ConnectionStatusBatch, CouplingCaveatVm,
+    DemoBatch, DockBadgeMode, DraftMirrorBatch, EditVersionVm, EgressEndpointVm,
+    EncryptionStatusBatch, ExportPhase, ExportProgressVm, ExportRequestVm, HotkeyVm, InboxBatch,
+    IncognitoVm, IpcError, IpcErrorCode, MenuSectionVm, NavState, NetworksSnapshot,
+    NewChatResolutionVm, NotificationPermission, NotifyTarget, OutboxVm, PaginationStatusBatch,
+    PaletteMode, PaletteResultsVm, PingVm, Provider, RecordingDestinationKind,
+    RecordingDurabilityState, RecordingDurabilityVm, RecordingFilterVm, RecordingNoteStubVm,
+    RecordingNoteTargetVm, RecordingPathPreviewVm, RecordingPermissionVm, RecordingProfileVm,
+    RecordingSearchVm, RecordingSessionMetaVm, RecordingSettingsVm, RecordingSourcesVm,
+    RecordingStatusVm, RecordingSummaryVm, RecordingTargetVm, RecordingUiState,
+    RecordingVolumeState, RecordingVolumeVm, RemoteDraftVm, ResolveSupportVm, RoomListBatch,
+    ScreenRecordingAccess, SearchFilterVm, SearchHitVm, SpacesSnapshot, SyncListSettingsVm,
+    TccPermission, TimelineBatch, TypingBatch, VerificationFlowVm,
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -616,6 +619,25 @@ pub fn set_badge_app_handle(handle: tauri::AppHandle) {
     let _ = BADGE_APP.set(handle);
 }
 
+/// The one memo in front of this process's login keychain (Story: keychain-prompt
+/// reduction).
+///
+/// Process-wide rather than a field on [`DesktopPlatform`] for two reasons. The
+/// struct is deliberately a unit struct that reaches process state through
+/// write-once globals (the same shape as [`NOTIFY_APP`] and [`BADGE_APP`]). And,
+/// decisively, the shell hands out *fresh* adapters over the very same keychain —
+/// `crate::sync::sync_platform` builds a new `ShellSyncPlatform` per IPC call —
+/// so a per-instance memo would split one keychain across several caches with
+/// several invalidation domains, and a credential corrected through one of them
+/// would keep being spent by another. One keychain, one cache.
+///
+/// Every `Platform` keychain call in this impl goes through it: reads memoized,
+/// writes and deletes invalidating. `ShellSyncPlatform`'s `secret_*` methods
+/// delegate to these three, so the folder-sync engine's credential reads are
+/// covered by this same instance and must NOT gain a second one.
+#[cfg(desktop)]
+static KEYCHAIN_CACHE: LazyLock<SecretCache> = LazyLock::new(SecretCache::new);
+
 /// Concrete [`Platform`] implementation for the desktop shell.
 ///
 /// The data-dir port is fully wired via `dirs`; the remaining ports return
@@ -636,26 +658,49 @@ impl Platform for DesktopPlatform {
     fn keychain_set(&self, key: &str, value: &str) -> Result<(), CoreError> {
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
             .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
-        entry
-            .set_password(value)
-            .map_err(|e| PlatformError::Keychain(format!("could not store secret: {e}")))?;
+        let written = entry.set_password(value);
+        // Invalidate after the attempt and regardless of its outcome: a write that
+        // failed part-way may still have replaced the stored item, and continuing
+        // to hand out the pre-write value would spend a credential the user has
+        // already corrected — a failure strictly worse than the prompt the cache
+        // removes.
+        KEYCHAIN_CACHE.invalidate(key);
+        written.map_err(|e| PlatformError::Keychain(format!("could not store secret: {e}")))?;
         Ok(())
     }
 
+    /// Read a secret, reaching the OS at most once per key per process.
+    ///
+    /// macOS re-evaluates a keychain item's ACL on every read that *returns
+    /// data*, so an unmemoized read is one "keeper wants to use your confidential
+    /// information stored in dev.tgorka.keeper in your keychain" dialog **per
+    /// read** until the item's ACL trusts this exact binary. That is why a machine
+    /// syncing continuously kept being asked all session long: the folder-sync
+    /// credential was read again on every push and every fetch.
     fn keychain_get(&self, key: &str) -> Result<Option<String>, CoreError> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
-            .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
-        match entry.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(PlatformError::Keychain(format!("could not read secret: {e}")).into()),
-        }
+        KEYCHAIN_CACHE.read_through(key, || {
+            let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key).map_err(|e| {
+                PlatformError::Keychain(format!("could not open keychain entry: {e}"))
+            })?;
+            match entry.get_password() {
+                Ok(secret) => Ok(Some(secret)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => {
+                    Err(PlatformError::Keychain(format!("could not read secret: {e}")).into())
+                }
+            }
+        })
     }
 
     fn keychain_delete(&self, key: &str) -> Result<(), CoreError> {
         let entry = keyring::Entry::new(KEYCHAIN_SERVICE, key)
             .map_err(|e| PlatformError::Keychain(format!("could not open keychain entry: {e}")))?;
-        match entry.delete_credential() {
+        let deleted = entry.delete_credential();
+        // Same reasoning as `keychain_set`: drop the memo after the attempt
+        // whatever it reported, so a half-failed delete cannot leave this process
+        // serving a secret that is no longer there.
+        KEYCHAIN_CACHE.invalidate(key);
+        match deleted {
             // Deleting a missing entry is a no-op (rollback safety).
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(PlatformError::Keychain(format!("could not delete secret: {e}")).into()),
@@ -1407,6 +1452,10 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // on iOS is `false` twice over, and the whole surface is then absent
         // rather than disabled (AD-27).
         notes: notes_available(&state),
+        // Sessions (FR-223, AD-107): the same construction as notes — a sessions
+        // root IS a synced folder plus a flag, so the capability is exactly the
+        // notes capability's condition, computed once and shared.
+        sessions: notes_available(&state),
     })
 }
 
@@ -1454,13 +1503,62 @@ pub fn notes_capture_show() -> Result<(), IpcError> {
 /// Mobile twin of `notes_capture_hide`.
 #[cfg(not(desktop))]
 #[tauri::command]
-pub fn notes_capture_hide(
-    commit: bool,
-) -> Result<Option<keeper_core::notes::vm::NoteRefVm>, IpcError> {
-    let _ = commit;
+pub fn notes_capture_hide() -> Result<(), IpcError> {
     Err(to_ipc_error(CoreError::Unsupported(
         "the quick-capture panel is desktop-only".to_owned(),
     )))
+}
+
+/// Mobile twin of `notes_capture_open` (Story 45.15).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_open(target: keeper_core::capture::CaptureTargetVm) -> Result<(), IpcError> {
+    let _ = target;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_close` (Story 45.15).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_close(key: String) -> Result<(), IpcError> {
+    let _ = key;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_set_locked` (Story 45.15).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_set_locked(key: String, locked: bool) -> Result<(), IpcError> {
+    let _ = (key, locked);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_set_always_on_top` (Story 48.4).
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_set_always_on_top(key: String, always_on_top: bool) -> Result<(), IpcError> {
+    let _ = (key, always_on_top);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "the quick-capture panel is desktop-only".to_owned(),
+    )))
+}
+
+/// Mobile twin of `notes_capture_windows` (Story 45.15).
+///
+/// An empty list rather than a refusal, and that is the one twin here that is
+/// not an error: "which capture windows are open?" has a true answer on a
+/// phone — none — and a surface that asks in order to decide whether to offer
+/// something should get it rather than an exception to swallow.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn notes_capture_windows() -> Result<Vec<keeper_core::capture::CaptureWindowVm>, IpcError> {
+    Ok(Vec::new())
 }
 
 /// Mobile twin of `notes_reveal`.
@@ -1635,6 +1733,51 @@ pub fn sync_git_path_set(state: State<'_, AppState>, path: String) -> Result<Syn
             retriable: false,
         })
     }
+}
+
+/// Where every file-set setting came from, and everything wrong with the
+/// settings files (Story 46.7, AD-98).
+///
+/// **This command is the whole of AD-98's second half.** The layer stack makes
+/// a file keep winning; without a surface that says so, the visible effect is a
+/// switch that flips back on its own, which is worse than the destructive
+/// import it replaced — that one at least only lost the file's value once. So
+/// the answer to "where did this value come from?" is a first-class read, not a
+/// debug affordance.
+///
+/// Registered on every platform, like [`sync_git_status`] and unlike the rest
+/// of the sync surface: `~/.keeper/keeper.toml` is read by
+/// [`keeper_core::config`], which has no desktop gate, and a phone that
+/// answered `Command config_layers not found` would force the Settings surface
+/// to special-case a question it can always answer honestly (with an empty
+/// stack).
+///
+/// No `State` parameter, deliberately: the stack is process-global and was
+/// installed at phase one of `setup()`, before `AppState` had anything in it
+/// worth reading. Taking the state would imply this depends on it.
+#[tauri::command]
+pub fn config_layers() -> Result<ConfigLayersVm, IpcError> {
+    let vm = ConfigLayersVm::new(
+        keeper_core::config::overrides(),
+        keeper_core::config::faults(),
+        keeper_core::config::main_folder(),
+    );
+    // The two fault sources meet here and nowhere earlier. AD-40 keeps
+    // `keeper-sync` free of `keeper-core` and `keeper-core` free of
+    // `keeper-sync` (`bun run check:core-sync-free` asserts both edges), so the
+    // shell is the only crate that can see a folder tier's faults and the app
+    // layers' faults at the same time. A user does not care which crate
+    // noticed; one list.
+    #[cfg(desktop)]
+    let vm = vm.with_folder_faults(
+        keeper_sync::profile::folder_faults()
+            .iter()
+            // Fully qualified rather than imported: the only use is inside this
+            // `cfg`, and an import would be an unused-import warning on iOS.
+            .map(|fault| keeper_core::vm::ConfigFaultVm::folder(&fault.path, fault.message.clone()))
+            .collect(),
+    );
+    Ok(vm)
 }
 
 /// Return the data-driven bridge catalog (Story 6.1, FR-42). A one-shot read of
@@ -2313,11 +2456,16 @@ pub fn search_archive(
 /// row's absolute path composed from it, so no frontend surface ever joins a
 /// root to a subfolder (AD-65) and Reveal cannot open a folder the recorder
 /// would not have written to.
+///
+/// Returns the page AND the archive-wide count (Story 44.11): the page has
+/// always stopped at `recordings_fts::DEFAULT_LIMIT`, and a surface that
+/// counted its own array would say "200 sessions" to somebody with nine
+/// thousand.
 #[tauri::command]
 pub fn search_recordings(
     state: State<'_, AppState>,
     filter: RecordingFilterVm,
-) -> Result<Vec<RecordingHitVm>, IpcError> {
+) -> Result<RecordingSearchVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
     let destination_root = effective_destination_dir(&data_dir, &state.platform);
     search_recordings_in(&data_dir, &destination_root, filter)
@@ -2331,9 +2479,13 @@ fn search_recordings_in(
     data_dir: &Path,
     destination_root: &Path,
     filter: RecordingFilterVm,
-) -> Result<Vec<RecordingHitVm>, IpcError> {
+) -> Result<RecordingSearchVm, IpcError> {
     if !keeper_core::archive::db::db_path(data_dir).exists() {
-        return Ok(Vec::new());
+        // No archive is zero sessions, and zero is a number the surface prints.
+        return Ok(RecordingSearchVm {
+            rows: Vec::new(),
+            total: 0,
+        });
     }
     let conn = keeper_core::archive::db::open_readonly_archive_db(data_dir)
         .map_err(CoreError::from)
@@ -2346,6 +2498,64 @@ fn search_recordings_in(
     )
     .map_err(CoreError::from)
     .map_err(to_ipc_error)
+}
+
+/// Everything a recording note's reader can act on, for the session the note
+/// names by id (Story 42.4, FR-142, FR-145, AD-65).
+///
+/// A recording note carries only relative paths — `recording:` and the entries
+/// of `files:` — because FR-145 keeps absolute paths out of a file the user
+/// syncs between machines. That leaves the reader holding text that names a
+/// recording and cannot open it, and AD-65 forbids the surface from making it
+/// openable by joining a root onto it. This command is that join, composed
+/// here from the EFFECTIVE recordings destination (Story 41.2) exactly as
+/// [`search_recordings`] composes a row's, so the two surfaces can never
+/// disagree about where a session is.
+///
+/// **By session id, because that is the handle that survives.** Story 40.4
+/// renames a session's folder and Story 42.1's row follows it, so the index
+/// knows where the recording is NOW while a note written before the rename
+/// still says where it was. The note keeps its own text; the actions follow
+/// the index.
+///
+/// `None` — never an error — for a session no archive row knows, for one whose
+/// folder is not on this machine, and on a first run with no `archive.db` at
+/// all. All three mean the same thing to the person reading the note, and the
+/// surface answers all three by rendering the note's text with no action
+/// attached: an affordance that opens nothing is worse than an absent one.
+#[tauri::command]
+pub fn recording_note_targets(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<Vec<RecordingNoteTargetVm>>, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let destination_root = effective_destination_dir(&data_dir, &state.platform);
+    recording_note_targets_in(&data_dir, &destination_root, &session_id)
+}
+
+/// The whole of [`recording_note_targets`] except the two answers only the app
+/// state can give — [`search_recordings_in`]'s split, and for its reason: the
+/// rules above are then asserted over a temp directory with no Tauri app and
+/// no registry, including the first-run one.
+///
+/// `pub(crate)` because the `keeper-recording://` handler resolves through this
+/// too (Story 42.4): a protocol handler that answered from its own lookup would
+/// be a second opinion on where a session's files are, and the note's actions
+/// and its embedded player would drift apart after a Story 40.4 retitle.
+pub(crate) fn recording_note_targets_in(
+    data_dir: &Path,
+    destination_root: &Path,
+    session_id: &str,
+) -> Result<Option<Vec<RecordingNoteTargetVm>>, IpcError> {
+    if !keeper_core::archive::db::db_path(data_dir).exists() {
+        return Ok(None);
+    }
+    let conn = keeper_core::archive::db::open_readonly_archive_db(data_dir)
+        .map_err(CoreError::from)
+        .map_err(to_ipc_error)?;
+    keeper_core::archive::recordings_fts::session_note_targets(&conn, session_id, destination_root)
+        .map_err(CoreError::from)
+        .map_err(to_ipc_error)
 }
 
 /// Start a background archive export (Story 5.5, FR-35, AD-11).
@@ -4518,10 +4728,17 @@ pub(crate) fn epoch_ms_now() -> u64 {
 /// wedged sidecar resolves a clean error, never a hung poll) and returns the live
 /// [`RecordingSourcesVm`]: real displays plus real applications (name/pid/bundleId
 /// + an optional ≤64px PNG icon data-URI, keeper excluded). Called on a ~3s poll
-/// while the idle setup surface is visible and on window focus. Gated by the
-/// `recording` capability — an unsupported platform answers `Unsupported` with no
-/// spawn. Failures funnel through [`to_ipc_error`]; the picker swallows them to
-/// the prior list (a transient enumeration failure never blanks the picker).
+/// while the idle setup surface is visible and on window focus — but only once
+/// Screen Recording is granted: the picker gates the poll on the pre-flight
+/// verdict, and the sidecar independently skips the `SCShareableContent` leg
+/// behind its non-prompting preflight, because that leg posts the OS permission
+/// prompt. Two layers, one invariant: nothing but the explicit
+/// `request_screen_recording_permission` may ever prompt. An empty `applications`
+/// therefore means "not enumerated or none available", never "denied". Gated by
+/// the `recording` capability — an unsupported platform answers `Unsupported`
+/// with no spawn. Failures funnel through [`to_ipc_error`]; the picker swallows
+/// them to the prior list (a transient enumeration failure never blanks the
+/// picker).
 #[tauri::command]
 pub async fn recording_list_sources(
     state: State<'_, AppState>,
@@ -6109,6 +6326,11 @@ impl RecordingArchiveSession {
 /// session also carries a sync half — the profile's LFS rule is written here,
 /// before the sidecar spawns, and every closed segment is asserted to that
 /// profile from the sink. A plain folder carries none of it.
+///
+/// Story 41.7: when that profile lives on removable media that is not attached,
+/// the start is REFUSED by name ([`destination_volume_refusal`]) before the
+/// recovery pass and before any folder is created. Not a degrade to the plain
+/// folder — see the comment at the call site.
 #[tauri::command]
 // The command mirrors the wire: each optional capture selection + the three
 // optional meta fields arrive as separate IPC args (Tauri flattens the invoke
@@ -6184,6 +6406,18 @@ pub async fn recording_start(
     let destination = effective_recording_destination(&data_dir, &|need| {
         destination_profile_table(&state.platform, need)
     });
+    // Story 41.7, AD-48: the destination is a synced folder on a pendrive that is
+    // not in the port. Refuse — do NOT redirect. Story 41.2's three degrades all
+    // mean "this destination stopped being a destination"; this one means "your
+    // destination is fine and is not here", and a recording that quietly landed
+    // on the boot disk instead would be the exact outcome Epic 41 refuses. The
+    // refusal happens HERE, before the recovery pass (which writes manifests) and
+    // long before `create_dir_all`, so nothing at all is created — and it names
+    // the drive, because an `EPERM` on `/Volumes/merope/tgdrive/recordings` is
+    // not something anyone can act on.
+    if let Some(refusal) = destination_volume_refusal(&destination) {
+        return Err(refusal);
+    }
     let directory = destination.root.clone();
     // Best-effort pre-record recovery of any session a prior crash left stale
     // (Story 17.3, FR-73, AD-37): reconcile every orphaned `recording` manifest
@@ -6305,48 +6539,38 @@ pub async fn recording_start(
     // builds (AD-65): a second `Local::now()` below this line could name a folder
     // in the next minute and make the card's promise false by a hair.
     let now = Local::now();
-    let title = meta_title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_owned);
+    // The folder-name title is the SAME trimmed value the manifest records, read
+    // back off the block below rather than re-derived: a folder named from one
+    // trim rule and a manifest written from another is a session whose name and
+    // whose title disagree, and nothing on screen would show it.
     // Story 21.5 + 22.3: the optional user metadata, trimmed, with blank entries
     // dropped (a custom row needs a NAME; a blank value is legal) — plus the
     // session's immutable identity, which is why the block is now ALWAYS written.
     // It used to be omitted when the user typed nothing, and an omitted block
     // would mean a session with no id at all.
+    //
+    // Story 45.19: those rules moved into `SessionMeta::from_input`, whole and
+    // unchanged, because the editor on the FINISHED session applies the same
+    // form and had nowhere to read them from. Two copies of "is this field
+    // blank" and "where does one tag end" is how a field starts round-tripping
+    // differently depending on which surface last saved it.
     let session_id = mint_session_id(&data_dir)?;
-    let session_meta = {
-        let clean = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        // Story 42.5: one tokenisation, in the tag module, for the one field
-        // whose separator is a comma. What lands in `manifest.json` is still the
-        // user's own text — the canonical form is applied later, by
-        // `RecordingRow::from_manifest`, on the way into the index. The manifest
-        // says what they typed; the row says what it means.
-        let tags = meta_tags
-            .as_deref()
-            .map(keeper_core::notes::tags::split_list)
-            .filter(|list| !list.is_empty());
-        let custom = meta_custom
-            .map(|list| {
-                list.into_iter()
-                    .filter(|f| !f.name.trim().is_empty())
-                    .map(|f| keeper_core::recording::SessionMetaField {
-                        name: f.name.trim().to_owned(),
-                        value: f.value.trim().to_owned(),
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|list| !list.is_empty());
-        keeper_core::recording::SessionMeta {
-            session_id: Some(session_id.clone()),
-            title: clean(meta_title.clone()),
-            participants: clean(meta_participants),
-            note: clean(meta_note),
-            tags,
-            custom,
-        }
-    };
+    let session_meta = keeper_core::recording::SessionMeta::from_input(
+        Some(session_id.clone()),
+        &keeper_core::recording::SessionMetaInput {
+            title: meta_title.as_deref(),
+            participants: meta_participants.as_deref(),
+            note: meta_note.as_deref(),
+            // Story 42.5: one tokenisation, in the tag module, for the one field
+            // whose separator is a comma. What lands in `manifest.json` is still
+            // the user's own text — the canonical form is applied later, by
+            // `RecordingRow::from_manifest`, on the way into the index. The
+            // manifest says what they typed; the row says what it means.
+            tags: meta_tags.as_deref(),
+            custom: meta_custom.as_deref().unwrap_or(&[]),
+        },
+    );
+    let title = session_meta.title.clone();
     let devices = SessionDevices {
         system_audio,
         // Story 19.3: the mic leg is live — the manifest records whether this
@@ -6993,8 +7217,8 @@ pub(crate) fn acknowledge_recording(state: &AppState) -> RecordingStatusVm {
     recording_snapshot(state)
 }
 
-/// One sync profile, reduced to the four facts a recordings destination turns on
-/// (Story 41.2, FR-131).
+/// One sync profile, reduced to the facts a recordings destination turns on
+/// (Story 41.2, FR-131; Story 41.7 added the volume, Story 46.10 the subfolder).
 ///
 /// `keeper-sync`'s `SyncProfile` is a thirty-field type that only exists on
 /// desktop; this is what the destination decision actually asks of it, mapped in
@@ -7012,13 +7236,116 @@ struct DestinationProfileRow {
     /// The synced folder itself. A plain destination anywhere inside it would be
     /// committed by this profile, which is the ambiguity the setter refuses.
     local_path: PathBuf,
-    /// The profile's RESOLVED recordings root
-    /// ([`keeper_sync::SyncProfile::recordings_root`]), or `None` when it does
-    /// not say it holds recordings (Story 41.1's `recordings` block absent).
-    recordings_root: Option<PathBuf>,
+    /// Where this profile's recordings live, or `None` when it does not say it
+    /// holds them (Story 41.1's `recordings` block absent).
+    ///
+    /// **One field and not two** — see [`RecordingsPlace`]. Story 46.10 shipped
+    /// the resolved root and the head it was joined from as two independent
+    /// `Option`s that agreed only by construction; a row that named one without
+    /// the other was representable and a reader consulting the head first would
+    /// have read a head for a folder that holds no recordings (DW-196).
+    recordings: Option<RecordingsPlace>,
     /// Whether watch mode is armed. A paused profile is neither a destination nor
     /// a collision — see [`enclosing_destination_profile`].
     enabled: bool,
+    /// The removable media the folder lives on, and whether it is here right now
+    /// (Story 41.7, AD-48) — `None` for a folder on a disk that is always there.
+    ///
+    /// Removability is the OPTION and the status is inside it, so "not removable,
+    /// but its volume is absent" cannot be written down. Filled by
+    /// [`scan_destination_volume`], which asks `keeper-sync`'s `volume::scan` —
+    /// the one attachment test there is (Story 27.3): a marker at or above the
+    /// folder, never an `exists()` on the mountpoint, which cannot tell an absent
+    /// drive from a foreign one and cannot follow a stick re-mounted elsewhere.
+    volume: Option<DestinationVolume>,
+}
+
+/// Where one profile's recordings live: the resolved root, and the
+/// profile-relative head it was joined from (Story 46.10, collapsed in 47.5).
+///
+/// **The two travel together because they are one fact about one `recordings`
+/// block.** [`destination_profile_row`] is the only place either is built and
+/// it builds both from the same block; making that a single value is what stops
+/// a later reader — or a later fixture — writing down a root with no head, or a
+/// head for a profile that holds no recordings.
+///
+/// **The head is CARRIED, never recovered from the root.** A `strip_prefix` back
+/// out of the resolved root would come back component-normalised, and
+/// `20-media//sessions` and `20-media/sessions` are one root but two different
+/// stored values. Only the stored one may be echoed back to `sync_profile_save`
+/// by the Destination card's edit box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingsPlace {
+    /// The RESOLVED recordings root, exactly as
+    /// [`keeper_sync::SyncProfile::recordings_root`] composes it — asked of
+    /// `keeper-sync` once and never reimplemented here.
+    root: PathBuf,
+    /// The profile-relative subfolder [`Self::root`] was joined FROM, trimmed
+    /// exactly as the join trims, so what the card shows is what the join used.
+    subfolder: String,
+}
+
+impl DestinationProfileRow {
+    /// The resolved recordings root, for the readers that only ask *where*.
+    ///
+    /// Borrowing, so asking the question costs nothing and cannot hand a caller
+    /// a root separated from its head.
+    fn recordings_root(&self) -> Option<&Path> {
+        self.recordings.as_ref().map(|place| place.root.as_path())
+    }
+}
+
+/// A destination profile's removable volume: what it is called, and whether it
+/// is attached (Story 41.7, AD-48).
+///
+/// The shell-side, `keeper-sync`-free shape of `volume::VolumeStatus`, for the
+/// same reason [`DestinationProfileRow`] is the shell-side shape of
+/// `SyncProfile`: the resolution and its refusal stay ordinary total functions
+/// that compile on iOS and are asserted in tests with no engine, no `git` and no
+/// pendrive.
+///
+/// **The STATUS is never cached.** It is re-scanned every time the profile table
+/// is built — every settings read, every destination picker load, every
+/// `recording_start`. A cached `Absent` is the one value that would outlive the
+/// thing it describes: the drive goes back in the port and the app would keep
+/// refusing until something invalidated an entry nobody would think to
+/// invalidate. The scan itself is one `stat` of `.keeper-sync/volume.json` per
+/// ancestor of the folder, which is cheaper than being wrong about a plugged-in
+/// drive. The NAME is remembered, and only the name — see [`VOLUME_NAMES`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DestinationVolume {
+    /// What the volume calls itself: its marker's `label`, which
+    /// `Engine::adopt_volume` set to the mount point's own name ("merope") the
+    /// first time the volume was seen. Never sliced out of `local_path` — the
+    /// mountpoint is the one part of a volume's identity that moves (Story 27.3),
+    /// and a stick re-mounted elsewhere is the same stick with the same name.
+    ///
+    /// `None` when this build has never had the volume's marker in front of it:
+    /// a detached drive carries its own name away with it, and inventing one from
+    /// the path is exactly the guess this field refuses to make. The refusal and
+    /// the card both have an unnamed phrasing for that case.
+    name: Option<String>,
+    /// Whether the volume is here right now.
+    status: DestinationVolumeStatus,
+}
+
+/// Whether a destination's removable volume is attached (Story 41.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DestinationVolumeStatus {
+    /// The volume the profile is bound to is attached. Recording proceeds.
+    Attached,
+    /// No marker at or above the folder: the media is not here
+    /// (`VolumeStatus::Absent`, which maps to `ProfileState::MediaAbsent`).
+    Absent,
+    /// Something is mounted where the profile's volume lives but is not provably
+    /// that volume: a foreign marker (`VolumeStatus::Foreign` — a second stick at
+    /// the first one's mountpoint), or a marker that would not read.
+    ///
+    /// Folded into one state because the two take the SAME action from the person
+    /// holding the drive — look at what is actually plugged in — while `Absent`
+    /// takes a different one. `detail` carries the specific reason into the
+    /// refusal so the sentence is still precise.
+    Unexpected { detail: String },
 }
 
 /// This machine's sync profiles, or the reason there are none to be had.
@@ -7074,6 +7401,16 @@ struct RecordingDestination {
     /// only. Resolved from the id on every read, never cached beside it, which is
     /// what makes a rename show up with the same root.
     profile_name: Option<String>,
+    /// The chosen profile's removable media, under
+    /// [`RecordingDestinationKind::Profile`] only and only when the folder is on
+    /// any (Story 41.7).
+    ///
+    /// Carried on the DECISION rather than looked up again by whoever needs it,
+    /// so the sentence the card prints and the refusal `recording_start` raises
+    /// come from the same scan of the same volume. Read by
+    /// [`destination_volume_refusal`]; every other caller only wants
+    /// [`Self::root`] and is unaffected.
+    volume: Option<DestinationVolume>,
 }
 
 /// The EFFECTIVE recordings destination (Story 41.2): the chosen sync profile's
@@ -7149,6 +7486,9 @@ fn resolve_recording_destination(
         kind: RecordingDestinationKind::Folder,
         profile_id: None,
         profile_name: None,
+        // The plain folder is wherever the owner pointed it; keeper knows of no
+        // volume behind it, and claiming one would be inventing a fact.
+        volume: None,
     };
     let Some(id) = stored_profile_id else {
         // An explicitly chosen folder is an answer; only the absence of BOTH keys
@@ -7189,18 +7529,26 @@ fn resolve_recording_destination(
         );
         return folder;
     }
-    let Some(root) = row.recordings_root else {
+    let Some(place) = row.recordings else {
         tracing::warn!(
             profile = %id,
             "the chosen synced folder no longer says it holds recordings; recording into the plain folder instead"
         );
         return folder;
     };
+    // Story 41.7: an absent volume is NOT a fourth degrade. The three above mean
+    // "this destination is not a destination any more"; a pendrive in a drawer
+    // means "this destination is fine and is not here right now", and quietly
+    // landing a recording somewhere other than where the card said is the one
+    // outcome this epic must not add. So the volume rides along and
+    // `recording_start` refuses on it — the resolution stays total, and the card
+    // keeps naming the folder the owner actually chose.
     RecordingDestination {
-        root,
+        root: place.root,
         kind: RecordingDestinationKind::Profile,
         profile_id: Some(row.id),
         profile_name: Some(row.name),
+        volume: row.volume,
     }
 }
 
@@ -7232,10 +7580,10 @@ fn default_recording_destination(
         }
     };
     let mut flagged = rows.into_iter().filter_map(|row| {
-        let root = row.recordings_root.filter(|_| row.enabled)?;
-        Some((row.id, row.name, root))
+        let root = row.recordings.filter(|_| row.enabled)?.root;
+        Some((row.id, row.name, root, row.volume))
     });
-    let Some((id, name, root)) = flagged.next() else {
+    let Some((id, name, root, volume)) = flagged.next() else {
         return folder;
     };
     if flagged.next().is_some() {
@@ -7248,11 +7596,15 @@ fn default_recording_destination(
         profile = %id,
         "no destination has been chosen and exactly one synced folder holds recordings, so that is where recordings land"
     );
+    // The implicit default carries its volume for the same reason the explicit
+    // choice does: the card states this root, so a recording must land in it or
+    // not happen. An unplugged default is refused, never redirected.
     RecordingDestination {
         root,
         kind: RecordingDestinationKind::Profile,
         profile_id: Some(id),
         profile_name: Some(name),
+        volume,
     }
 }
 
@@ -7265,7 +7617,7 @@ fn default_recording_destination(
 /// recorder resolves to something else would be two destinations. The platform is
 /// threaded in for the engine the resolution may need, exactly as Story 40.4's
 /// `sync_retitled_session` takes one.
-fn effective_destination_dir(data_dir: &Path, platform: &Arc<dyn Platform>) -> PathBuf {
+pub(crate) fn effective_destination_dir(data_dir: &Path, platform: &Arc<dyn Platform>) -> PathBuf {
     effective_recording_destination(data_dir, &|need| destination_profile_table(platform, need))
         .root
 }
@@ -7312,16 +7664,132 @@ fn destination_profile_table(
 
 /// The one place a `SyncProfile` becomes a [`DestinationProfileRow`], so "where
 /// do this profile's recordings live" is asked of `keeper-sync` once
-/// ([`keeper_sync::SyncProfile::recordings_root`]) and never reimplemented.
+/// ([`keeper_sync::SyncProfile::recordings_root`]) and never reimplemented — and,
+/// since Story 41.7, so is "and is that place plugged in".
 #[cfg(desktop)]
 fn destination_profile_row(profile: &keeper_sync::SyncProfile) -> DestinationProfileRow {
     DestinationProfileRow {
         id: profile.id.clone(),
         name: profile.name.clone(),
         local_path: profile.local_path.clone(),
-        recordings_root: profile.recordings_root(),
+        // The root and the head it was composed from, taken from the SAME block
+        // in one expression, so the pair cannot describe two different profiles
+        // and cannot be half-written (Story 46.10, DW-196). The join itself stays
+        // `keeper-sync`'s: `recordings_root()` is the one definition of it.
+        recordings: profile
+            .recordings_root()
+            .zip(profile.recordings.as_ref())
+            .map(|(root, recordings)| RecordingsPlace {
+                root,
+                subfolder: recordings.subfolder.trim().to_owned(),
+            }),
         enabled: profile.enabled,
+        // Only a profile that says it is on removable media is scanned. For every
+        // ordinary folder this is the whole cost of the feature: one boolean.
+        volume: profile.removable.then(|| scan_destination_volume(profile)),
     }
+}
+
+/// Ask `keeper-sync` whether this removable profile's volume is attached (Story
+/// 41.7, AD-48).
+///
+/// Delegates to `volume::scan`, which is the ONLY attachment test in the
+/// codebase and must stay so. The tempting alternative — `local_path.exists()`,
+/// or a probe of the mountpoint — is wrong in both directions Story 27.3 was
+/// written about: it reads a second stick mounted at the first one's mountpoint
+/// as "attached" (and would record a session into a stranger's disk), and it
+/// reads the same stick re-mounted at a different mountpoint as "gone". The
+/// marker travels with the filesystem; the path does not.
+///
+/// Every outcome is a [`DestinationVolume`] rather than an error, because the
+/// caller is building a table that must not fail: an unreadable marker is a
+/// reason to refuse a START, never a reason for the settings pane to fail to
+/// load — which would leave the owner with no way to change the very destination
+/// that broke it.
+#[cfg(desktop)]
+fn scan_destination_volume(profile: &keeper_sync::SyncProfile) -> DestinationVolume {
+    use keeper_sync::volume::{self, VolumeStatus};
+
+    match volume::scan(&profile.local_path, profile.volume_id.as_deref()) {
+        Ok(VolumeStatus::Present { marker }) => DestinationVolume {
+            // The marker is in front of us, so this is the moment — the only
+            // moment — the volume's own name can be learned. Remember it, so the
+            // refusal after it is unplugged can still say "merope".
+            name: remember_volume_name(&marker.volume_id, &marker.label),
+            status: DestinationVolumeStatus::Attached,
+        },
+        Ok(VolumeStatus::Absent) => DestinationVolume {
+            name: recalled_volume_name(profile.volume_id.as_deref()),
+            status: DestinationVolumeStatus::Absent,
+        },
+        Ok(VolumeStatus::Foreign { found_id }) => DestinationVolume {
+            name: recalled_volume_name(profile.volume_id.as_deref()),
+            status: DestinationVolumeStatus::Unexpected {
+                detail: format!("a different volume ({found_id}) is mounted there"),
+            },
+        },
+        Err(error) => DestinationVolume {
+            name: recalled_volume_name(profile.volume_id.as_deref()),
+            status: DestinationVolumeStatus::Unexpected {
+                detail: error.to_string(),
+            },
+        },
+    }
+}
+
+/// Volume ids to the labels their markers carried, learned as they are scanned
+/// (Story 41.7).
+///
+/// **Why this exists.** A volume's name lives in its marker, at its mount root —
+/// so the moment a drive is unplugged, the name goes with it, and the refusal
+/// that most needs to say "merope is not attached" is exactly the one that can no
+/// longer read it. Nothing else persists a label: `SyncProfile` binds a volume by
+/// ULID (deliberately — a label is cosmetic and never matched on), and slicing a
+/// name out of `local_path` is the guess Story 27.3 exists to forbid.
+///
+/// **What it may and may not hold.** Names only. Never a
+/// [`DestinationVolumeStatus`] — memoizing "absent" is the one thing that could
+/// make a replugged drive keep failing, and this map is deliberately incapable of
+/// it. A label is also stable in a way a status is not: `VolumeMarker::ensure`
+/// fills an empty label once and never renames a volume another profile named.
+///
+/// **Lifetime: this process.** Not persisted, not invalidated, not bounded by
+/// time — it is bounded by the number of removable volumes one machine has ever
+/// had attached during one run of the app, which is a handful of short strings.
+/// A restart with the drive already out simply falls back to the unnamed
+/// phrasing, which is honest; the alternative — persisting labels into the
+/// registry — would be a second, staler place a volume is named.
+#[cfg(desktop)]
+static VOLUME_NAMES: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Learn `label` for `volume_id` and hand it back, or hand back what was already
+/// learned when this marker carries no label of its own.
+#[cfg(desktop)]
+fn remember_volume_name(volume_id: &str, label: &str) -> Option<String> {
+    let label = label.trim();
+    let mut names = plain_lock(&VOLUME_NAMES);
+    if label.is_empty() {
+        // A marker minted somewhere nameless. Not a reason to forget a name an
+        // earlier scan of the same volume did learn.
+        return names.get(volume_id).cloned();
+    }
+    // A volume that has been relabelled keeps the newest name its marker gave;
+    // the id, never the label, is what identity is bound to.
+    let known = names.entry(volume_id.to_owned()).or_default();
+    if known.as_str() != label {
+        known.clear();
+        known.push_str(label);
+    }
+    Some(known.clone())
+}
+
+/// What this process last saw the volume `volume_id` call itself — `None` for a
+/// profile bound to no volume yet, or a volume this run has never had attached.
+#[cfg(desktop)]
+fn recalled_volume_name(volume_id: Option<&str>) -> Option<String> {
+    let volume_id = volume_id?;
+    plain_lock(&VOLUME_NAMES).get(volume_id).cloned()
 }
 
 /// The enabled profile whose folder CONTAINS `path`, deepest match first (Story
@@ -7641,6 +8109,37 @@ fn stub_epoch_ms(stamp: &str) -> Option<i64> {
         .map(|at| at.timestamp_millis())
 }
 
+/// The session's files, each relative to the destination root — what the
+/// stub's `files:` list carries, in the same frame as its `recording:` folder.
+///
+/// **The manifest's ledger order, never a sort.** That is the order the session
+/// recorded in, and a sorted list would lift `camera-0000.mov` above the screen
+/// segment it belongs beside.
+///
+/// `manifest.json` is in the list because the session really has one: it is the
+/// file [`SessionManifest::write`] renames its temp over
+/// (`<folder>/manifest.json`, FR-146 — written once at finalize), and the
+/// terminal reconcile has done exactly that before [`write_recording_note_stub`]
+/// composes anything. Nothing else in the folder is named here, because nothing
+/// else is a file this path *knows* is there rather than guesses at.
+///
+/// A file whose path will not express itself relative to the anchor is dropped
+/// rather than written absolute: FR-145 admits no exception, and a note that is
+/// silent about one file is better than a note that is wrong on every machine
+/// but this one.
+#[cfg(desktop)]
+fn stub_files(manifest: &SessionManifest, dest: &StubDestination) -> Vec<String> {
+    let folder = manifest.folder();
+    manifest
+        .segments
+        .iter()
+        .map(|segment| segment.file.trim())
+        .filter(|file| !file.is_empty())
+        .chain(std::iter::once("manifest.json"))
+        .filter_map(|file| relative_session_path(&dest.anchor, &folder.join(file)))
+        .collect()
+}
+
 /// Compose one session's stub from its manifest. Pure but for reading the
 /// manifest it is handed — every byte of IO is in this module's callers.
 #[cfg(desktop)]
@@ -7652,6 +8151,8 @@ fn compose_stub(
     let meta = manifest.meta.as_ref()?;
     let session_id = meta.session_id.as_deref()?;
     let relative_folder = relative_session_path(&dest.anchor, manifest.folder());
+    let file_paths = stub_files(manifest, dest);
+    let files: Vec<&str> = file_paths.iter().map(String::as_str).collect();
     Some(recording_note::compose(
         &SessionFacts {
             session_id,
@@ -7663,6 +8164,7 @@ fn compose_stub(
             participants: meta.participants.as_deref(),
             tags: meta.tags.as_deref().unwrap_or(&[]),
             relative_folder: relative_folder.as_deref(),
+            files: &files,
         },
         taken,
     ))
@@ -8226,6 +8728,138 @@ pub async fn recording_retitle(
     let moved = destination.clone();
     tauri::async_runtime::spawn(async move { sync_retitled_session(platform, moved).await });
     Ok(manifest_summary(&destination, &manifest))
+}
+
+/// A finished session's `meta` block, for the two surfaces that open a form on
+/// it (Story 45.19, FR-197): the editor on the last recording, and "record
+/// another like this" on a recording's note.
+///
+/// `Ok(None)` — never an error — for a folder with no loadable `manifest.json`.
+/// A session whose manifest is missing or unparseable is one keeper can say
+/// nothing about, and the two callers want the same thing from that: the editor
+/// stays shut and the duplicate action is absent, rather than either of them
+/// offering a form that would save into nothing. A load failure is not
+/// actionable by the person reading the card — the recording itself is fine —
+/// so it is logged and not raised.
+///
+/// `async` per AD-34-5: the manifest may be on a slow removable volume.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_session_meta(
+    folder: String,
+) -> Result<Option<RecordingSessionMetaVm>, IpcError> {
+    off_async_runtime(move || -> Option<RecordingSessionMetaVm> {
+        let path = PathBuf::from(folder);
+        match SessionManifest::load(&path) {
+            Ok(manifest) => Some(manifest.meta.unwrap_or_default().to_form_vm()),
+            Err(error) => {
+                tracing::info!(
+                    %error,
+                    "recording meta: no loadable manifest, so the session's details cannot be shown"
+                );
+                None
+            }
+        }
+    })
+    .await
+}
+
+/// Rewrite a finished session's metadata from the "Next session" form (Story
+/// 45.19, FR-197) — every field of it EXCEPT the title.
+///
+/// **The title is [`recording_retitle`]'s and stays there.** Setting one MOVES
+/// the session: Story 40.4 re-renders the path template against the session's
+/// own start instant, renames the folder, repoints the kept status snapshot and
+/// the archive row, and refuses a live session by name. Absolutely none of that
+/// is true of participants, note, tags or custom rows, which are a rewrite of
+/// four keys in a file. One editor collects both and sends each field to the one
+/// command that owns it, so neither becomes a second answer to the other.
+///
+/// Refused for a live session ([`recording_session_live_error`]) by the same
+/// compare-and-set claim the retitle uses, and for the same reason: the driver
+/// and the sidecar hold this manifest open, and a rewrite under them would be
+/// overwritten at the next reconcile at best. A folder with no loadable manifest
+/// is refused too — there is nothing to edit, and creating one here would invent
+/// a session out of a directory.
+///
+/// **The archive row is deliberately not rewritten**, exactly as a retitle does
+/// not rewrite it: Story 42.1's row carries a codec and a frame rate that exist
+/// in no manifest, so rebuilding one from what this edit knows would write nulls
+/// over them, and the row is keyed on the identity this edit never touches. The
+/// consequence is honest and bounded — the recordings browser keeps searching
+/// the tags the session was STARTED with until the index is rebuilt from disk
+/// ([`keeper_core::archive::recordings::rebuild_from_disk`]), which reads the
+/// manifests.
+#[cfg(desktop)]
+#[tauri::command]
+pub async fn recording_meta_update(
+    state: State<'_, AppState>,
+    folder: String,
+    participants: Option<String>,
+    note: Option<String>,
+    tags: Option<String>,
+    custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
+) -> Result<RecordingSessionMetaVm, IpcError> {
+    let reserved = Arc::clone(&state.reserved_recording_folders);
+    // The whole edit goes to the blocking pool as one unit (AD-34-5): a manifest
+    // load and an atomic rewrite, either of which can be on a slow volume.
+    off_async_runtime(move || -> Result<RecordingSessionMetaVm, IpcError> {
+        let path = PathBuf::from(folder);
+        // The claim IS the live check, as in `retitle_session_folder`: `reserve`
+        // reports whether THIS guard inserted the entry, so a folder a live (or
+        // starting) session holds is refused as one indivisible compare-and-set
+        // rather than a `contains` a start could win the instant after it read
+        // `false`. Held across the load and the write, so the orphan-recovery
+        // pass cannot reconcile and rewrite this manifest from under the edit.
+        let claim = LiveFolderReservation::reserve(&reserved, path.clone());
+        if !claim.owned {
+            return Err(recording_session_live_error());
+        }
+        let mut manifest = SessionManifest::load(&path).map_err(|err| to_ipc_error(err.into()))?;
+        manifest.edit_details(&keeper_core::recording::SessionMetaInput {
+            // Not sent, and not defaulted from the form either: `edit_details`
+            // carries the manifest's own title through untouched.
+            title: None,
+            participants: participants.as_deref(),
+            note: note.as_deref(),
+            tags: tags.as_deref(),
+            custom: custom.as_deref().unwrap_or(&[]),
+        });
+        manifest.write().map_err(|err| to_ipc_error(err.into()))?;
+        // Answered from the manifest that was just written, not echoed back from
+        // the request: the editor repaints from this, and the two differ wherever
+        // a rule applied (a trimmed field, a dropped nameless row, a tag line
+        // re-joined from its tokens). Echoing the request would show the user
+        // their own typing and hide what was actually stored.
+        Ok(manifest.meta.unwrap_or_default().to_form_vm())
+    })
+    .await?
+}
+
+/// Mobile stubs for the Story 45.19 commands: recording is a desktop-only
+/// surface, so there is never a session manifest to read or rewrite.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_session_meta(
+    folder: String,
+) -> Result<Option<RecordingSessionMetaVm>, IpcError> {
+    let _ = folder;
+    Ok(None)
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+pub async fn recording_meta_update(
+    folder: String,
+    participants: Option<String>,
+    note: Option<String>,
+    tags: Option<String>,
+    custom: Option<Vec<keeper_core::recording::SessionMetaField>>,
+) -> Result<RecordingSessionMetaVm, IpcError> {
+    let _ = (folder, participants, note, tags, custom);
+    Err(to_ipc_error(CoreError::Unsupported(
+        "recording metadata is desktop-only".to_owned(),
+    )))
 }
 
 /// How deep below a retitled session folder the prime walk descends.
@@ -8898,6 +9532,7 @@ fn read_recording_settings(
         destination_kind: destination.kind,
         destination_profile_id: destination.profile_id,
         destination_profile_name: destination.profile_name,
+        destination_volume: destination.volume.as_ref().map(destination_volume_vm),
         fps: keeper_core::registry::get_recording_fps(data_dir).map_err(to_ipc_error)?,
         codec: keeper_core::registry::get_recording_codec(data_dir).map_err(to_ipc_error)?,
         scale_percent: keeper_core::registry::get_recording_scale_percent(data_dir)
@@ -8943,6 +9578,31 @@ enum DestinationRefusal {
         /// Whether that folder can be chosen as the destination instead.
         offers_recordings: bool,
     },
+    /// The chosen synced folder lives on removable media that is not attached
+    /// (Story 41.7, AD-48). Raised at START, never at the settings write: the
+    /// choice is perfectly good, the drive is simply in a drawer, and refusing to
+    /// let someone choose their pendrive because it is unplugged right now would
+    /// be a worse surface than the one this story is fixing.
+    VolumeAbsent {
+        /// The volume's own name — the actionable half of the sentence, and the
+        /// whole reason `merope is not attached` beats an `EPERM` on a path.
+        /// `None` when this run has never seen the drive and so cannot name it;
+        /// the sentence then describes it instead of guessing at a name.
+        volume: Option<String>,
+        /// The synced folder that lives on it.
+        profile: String,
+    },
+    /// Something is mounted where the chosen synced folder's volume lives, but it
+    /// is not that volume (Story 41.7): a second stick at the same mountpoint, or
+    /// a marker that would not read. `detail` is `keeper-sync`'s own account.
+    VolumeUnexpected {
+        /// The volume the profile expects, when this run has seen it before.
+        volume: Option<String>,
+        /// The synced folder that lives on it.
+        profile: String,
+        /// What was found instead.
+        detail: String,
+    },
 }
 
 impl DestinationRefusal {
@@ -8979,12 +9639,45 @@ impl DestinationRefusal {
             } => format!(
                 "that folder is inside the synced folder \"{profile}\", so recordings there would be committed by it without anything saying so — choose a folder outside it, or let \"{profile}\" say it holds recordings"
             ),
+            Self::VolumeAbsent {
+                volume: Some(volume),
+                profile,
+            } => format!(
+                "\"{volume}\" is not attached, so the synced folder \"{profile}\" is not on this machine right now — plug the drive in, or pick another destination. Nothing was recorded."
+            ),
+            Self::VolumeAbsent {
+                volume: None,
+                profile,
+            } => format!(
+                "the removable drive holding the synced folder \"{profile}\" is not attached — plug it in, or pick another destination. Nothing was recorded."
+            ),
+            Self::VolumeUnexpected {
+                volume: Some(volume),
+                profile,
+                detail,
+            } => format!(
+                "the synced folder \"{profile}\" expects the volume \"{volume}\", but {detail} — check which drive is plugged in, or pick another destination. Nothing was recorded."
+            ),
+            Self::VolumeUnexpected {
+                volume: None,
+                profile,
+                detail,
+            } => format!(
+                "the synced folder \"{profile}\" is not on the removable volume it expects: {detail} — check which drive is plugged in, or pick another destination. Nothing was recorded."
+            ),
         }
     }
 
     /// Only "the synced folders could not be read" can succeed on a retry —
     /// installing a usable `git` changes that answer. Every other refusal is a
     /// statement about the submitted value, and resubmitting it fails the same way.
+    ///
+    /// The two volume refusals (Story 41.7) are deliberately in the second group,
+    /// even though plugging the drive in does change the answer. `retriable` is
+    /// read as "try the identical request again and it may work", and nothing
+    /// keeper does can attach a drive: a retry with the stick still in a drawer
+    /// fails identically, and inviting an automatic one would spin a loop around
+    /// a human action. The message says what the human has to do instead.
     fn retriable(&self) -> bool {
         matches!(self, Self::ProfilesUnreadable)
     }
@@ -8996,6 +9689,65 @@ impl DestinationRefusal {
             account_id: None,
             retriable: self.retriable(),
         }
+    }
+}
+
+/// A scanned volume as the settings VM carries it (Story 41.7).
+///
+/// The `Unexpected` detail stays shell-side: the card says "a different volume is
+/// mounted where yours lives" and the REFUSAL carries `keeper-sync`'s specific
+/// account, because a resting settings pane is not the place for a marker's parse
+/// error but a refused Start absolutely is.
+fn destination_volume_vm(volume: &DestinationVolume) -> RecordingVolumeVm {
+    RecordingVolumeVm {
+        name: volume.name.clone(),
+        state: match volume.status {
+            DestinationVolumeStatus::Attached => RecordingVolumeState::Attached,
+            DestinationVolumeStatus::Absent => RecordingVolumeState::Absent,
+            DestinationVolumeStatus::Unexpected { .. } => RecordingVolumeState::Unexpected,
+        },
+    }
+}
+
+/// Whether a resolved destination's volume forbids starting a recording (Story
+/// 41.7) — `None` when it does not.
+///
+/// The counterpart to [`resolve_recording_destination`]'s deliberate silence: the
+/// resolution stays total and keeps naming the folder the owner chose, and THIS
+/// is where "that folder is not here right now" stops a Start. Called before
+/// anything is created — before the pre-record recovery pass, which writes
+/// manifests, and long before `create_dir_all` — so a refused Start leaves the
+/// filesystem exactly as it found it.
+///
+/// A plain folder has no volume and can never be refused here, which keeps
+/// Story 19.5's destination gate the only judge of an ordinary folder.
+fn destination_volume_refusal(destination: &RecordingDestination) -> Option<IpcError> {
+    let volume = destination.volume.as_ref()?;
+    // A resolved profile destination always carries its name; the fallback keeps
+    // the sentence from being built around an empty pair of quotes if it ever
+    // does not.
+    let profile = destination
+        .profile_name
+        .clone()
+        .or_else(|| volume.name.clone())
+        .unwrap_or_else(|| "this synced folder".to_owned());
+    match &volume.status {
+        DestinationVolumeStatus::Attached => None,
+        DestinationVolumeStatus::Absent => Some(
+            DestinationRefusal::VolumeAbsent {
+                volume: volume.name.clone(),
+                profile,
+            }
+            .into_error(),
+        ),
+        DestinationVolumeStatus::Unexpected { detail } => Some(
+            DestinationRefusal::VolumeUnexpected {
+                volume: volume.name.clone(),
+                profile,
+                detail: detail.clone(),
+            }
+            .into_error(),
+        ),
     }
 }
 
@@ -9053,7 +9805,7 @@ fn destination_choice(
             if !row.enabled {
                 return Err(DestinationRefusal::PausedProfile(row.name.clone()).into_error());
             }
-            if row.recordings_root.is_none() {
+            if row.recordings.is_none() {
                 return Err(DestinationRefusal::NotRecordingsProfile(row.name.clone()).into_error());
             }
             Ok(DestinationChoice::Profile(id.to_owned()))
@@ -9082,7 +9834,7 @@ fn destination_choice(
             };
             let folder = Path::new(submitted);
             match enclosing_destination_profile(&rows, folder) {
-                Some(row) if row.recordings_root.as_deref() == Some(folder) => {
+                Some(row) if row.recordings_root() == Some(folder) => {
                     tracing::info!(
                         profile = %row.id,
                         "recording settings: the chosen folder IS a synced folder's recordings root, so it is stored as that choice"
@@ -9091,7 +9843,7 @@ fn destination_choice(
                 }
                 Some(row) => Err(DestinationRefusal::InsideSyncedFolder {
                     profile: row.name.clone(),
-                    offers_recordings: row.recordings_root.is_some(),
+                    offers_recordings: row.recordings.is_some(),
                 }
                 .into_error()),
                 None => Ok(DestinationChoice::Folder(submitted.to_owned())),
@@ -9144,10 +9896,15 @@ fn destination_profile_vms(table: &DestinationProfileTable) -> Vec<RecordingProf
     rows.iter()
         .filter(|row| row.enabled)
         .filter_map(|row| {
+            // One `?` on one field, because a row that cannot say where its
+            // recordings live is not a destination — and since DW-196 there is
+            // no way for it to name a root without the head beside it.
+            let place = row.recordings.as_ref()?;
             Some(RecordingProfileVm {
                 id: row.id.clone(),
                 name: row.name.clone(),
-                recordings_root: row.recordings_root.as_ref()?.to_string_lossy().into_owned(),
+                recordings_root: place.root.to_string_lossy().into_owned(),
+                subfolder: place.subfolder.clone(),
             })
         })
         .collect()
@@ -9620,6 +10377,57 @@ pub fn menu_bar_presence_set(enabled: bool) -> Result<(), IpcError> {
     let _ = enabled;
     Err(to_ipc_error(CoreError::Unsupported(
         "the menu-bar (tray) presence is desktop-only".to_owned(),
+    )))
+}
+
+/// Read the default fold state of a session's spaces (Story 49.3, FR-276). Reads the
+/// persisted `sessions.spaces_folded` setting (default off — spaces arrive unfolded).
+/// The DEFAULT only: a space somebody folded by hand is remembered in the frontend's
+/// `keeper_session_spaces_fold` cookie and never travels through here. Errors funnel
+/// through [`to_ipc_error`].
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_spaces_folded_get(state: State<'_, AppState>) -> Result<bool, IpcError> {
+    state
+        .accounts
+        .sessions_spaces_folded_get(&state.platform)
+        .map_err(to_ipc_error)
+}
+
+/// Mobile stub for [`sessions_spaces_folded_get`]: the Sessions surface is desktop-only
+/// (`sessions_ipc`'s twins all refuse there), so no space is ever rendered on iOS and
+/// `false` — nothing arrives folded — is the honest answer, whatever a desktop wrote.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_spaces_folded_get() -> Result<bool, IpcError> {
+    Ok(false)
+}
+
+/// Set the default fold state of a session's spaces (Story 49.3, FR-276). Persists into
+/// the `settings` k/v table under `sessions.spaces_folded`. Nothing else moves: spaces
+/// the person folded or unfolded by hand keep their recorded answer, and only the ones
+/// with nothing recorded follow the new value. Errors funnel through [`to_ipc_error`].
+#[cfg(desktop)]
+#[tauri::command]
+pub fn sessions_spaces_folded_set(
+    state: State<'_, AppState>,
+    folded: bool,
+) -> Result<(), IpcError> {
+    state
+        .accounts
+        .sessions_spaces_folded_set(&state.platform, folded)
+        .map_err(to_ipc_error)
+}
+
+/// Mobile stub for [`sessions_spaces_folded_set`]: an honest `Unsupported`
+/// (`retriable: false`) with nothing persisted — the default for a desktop-only surface
+/// must not be changed from a phone that cannot show it.
+#[cfg(not(desktop))]
+#[tauri::command]
+pub fn sessions_spaces_folded_set(folded: bool) -> Result<(), IpcError> {
+    let _ = folded;
+    Err(to_ipc_error(CoreError::Unsupported(
+        "a session's spaces are a desktop-only surface".to_owned(),
     )))
 }
 
@@ -11526,14 +12334,38 @@ mod tests {
     // --- Story 41.2: the destination is one resolved decision --------------
 
     /// An enabled, recordings-flagged profile row rooted at `local`, with the
-    /// default `recordings` subfolder Story 41.1 authored.
+    /// default `recordings` subfolder Story 41.1 authored, on a disk that is
+    /// always there. Story 41.7's rows add a volume with [`removable_row`].
     fn flagged_row(id: &str, name: &str, local: &str) -> DestinationProfileRow {
         DestinationProfileRow {
             id: id.to_owned(),
             name: name.to_owned(),
             local_path: PathBuf::from(local),
-            recordings_root: Some(PathBuf::from(local).join("recordings")),
+            // The root and the head spelled the same way the production join
+            // spells them, because this fixture stands in for a real row.
+            recordings: Some(RecordingsPlace {
+                root: PathBuf::from(local).join("recordings"),
+                subfolder: "recordings".to_owned(),
+            }),
             enabled: true,
+            volume: None,
+        }
+    }
+
+    /// Story 41.7: the same row, on a removable volume in the given state.
+    fn removable_row(
+        id: &str,
+        name: &str,
+        local: &str,
+        volume: Option<&str>,
+        status: DestinationVolumeStatus,
+    ) -> DestinationProfileRow {
+        DestinationProfileRow {
+            volume: Some(DestinationVolume {
+                name: volume.map(str::to_owned),
+                status,
+            }),
+            ..flagged_row(id, name, local)
         }
     }
 
@@ -11636,7 +12468,7 @@ mod tests {
         let plain = plain_answer(&dir);
 
         let mut unflagged = flagged_row("tgd", "tgdrive", "/Volumes/tg");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let mut paused = flagged_row("tgd", "tgdrive", "/Volumes/tg");
         paused.enabled = false;
 
@@ -11727,7 +12559,7 @@ mod tests {
         let before = read_with(&dir, tgdrive_table());
 
         let mut unflagged = flagged_row("tgd", "tgdrive", "/Volumes/tg");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let mut paused = flagged_row("tgd", "tgdrive", "/Volumes/tg");
         paused.enabled = false;
 
@@ -11834,7 +12666,7 @@ mod tests {
         // The same collision with a folder that does NOT hold recordings cannot
         // offer that choice, so it names the other way out instead.
         let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let table = Ok(vec![unflagged]);
         let inside = folder_request(&dir, "/Users/x/work/screencasts");
         let error = write_recording_settings(&dir, &inside, false, &|_| table.clone())
@@ -11978,7 +12810,7 @@ mod tests {
 
         // Exactly one flagged folder, beside decoys that are not destinations.
         let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let mut paused = flagged_row("old", "old stick", "/Volumes/old");
         paused.enabled = false;
         let one = Ok(vec![
@@ -12073,26 +12905,438 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- Story 41.7: a destination that is sometimes not plugged in --------
+
+    /// The resolved DECISION for a hand-built table, which is what the start
+    /// pre-flight judges — `read_with`'s sibling for the half of this story that
+    /// never reaches the VM.
+    fn resolve_with(dir: &Path, table: DestinationProfileTable) -> RecordingDestination {
+        effective_recording_destination(dir, &|_| table.clone())
+    }
+
+    /// A throwaway mount root carrying a real volume marker labelled `label`,
+    /// plus the profile that lives on it — the fixture for every assertion that
+    /// has to go through `volume::scan` rather than a hand-built row.
+    fn mounted_volume(label: &str) -> (PathBuf, keeper_sync::SyncProfile) {
+        let root = std::env::temp_dir().join(format!(
+            "keeper-ipc-volume-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("tgdrive")).expect("create the fake mount root");
+        let marker = keeper_sync::volume::VolumeMarker::new(label, 0);
+        keeper_sync::volume::VolumeMarker::write(&root, &marker).expect("mint the marker");
+
+        let mut profile = keeper_sync::SyncProfile::new(
+            "tgd",
+            "tgdrive",
+            root.join("tgdrive"),
+            "https://example/r.git",
+        );
+        profile.recordings = Some(keeper_sync::profile::RecordingsConfig::default());
+        profile.removable = true;
+        profile.volume_id = Some(marker.volume_id.clone());
+        (root, profile)
+    }
+
+    /// Matrix row "removable destination, attached": it records normally, the
+    /// pre-flight has nothing to say, and the card is handed the volume's own name
+    /// so it can state that this folder is on a drive before Record is pressed.
+    #[test]
+    fn an_attached_removable_destination_records_and_says_it_is_removable() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+        let table = Ok(vec![removable_row(
+            "tgd",
+            "tgdrive",
+            "/Volumes/merope/tgdrive",
+            Some("merope"),
+            DestinationVolumeStatus::Attached,
+        )]);
+
+        let vm = read_with(&dir, table.clone());
+        assert_eq!(vm.destination_kind, RecordingDestinationKind::Profile);
+        assert_eq!(
+            vm.destination_dir, "/Volumes/merope/tgdrive/recordings",
+            "an attached drive is an ordinary destination"
+        );
+        assert_eq!(
+            vm.destination_volume,
+            Some(RecordingVolumeVm {
+                name: Some("merope".to_owned()),
+                state: RecordingVolumeState::Attached,
+            }),
+            "the card must be able to say the folder is on removable media WITHOUT a failure first"
+        );
+        assert!(
+            destination_volume_refusal(&resolve_with(&dir, table)).is_none(),
+            "an attached volume is not a reason to refuse a start"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix rows "removable destination, detached" and "card open while
+    /// detached": the start is REFUSED by the volume's name, and — the hardest
+    /// Never in this story — the destination does NOT quietly become the plain
+    /// folder. The card keeps naming the folder the owner chose and says the drive
+    /// is not attached.
+    #[test]
+    fn a_detached_volume_refuses_the_start_by_name_instead_of_redirecting() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+        let table = Ok(vec![removable_row(
+            "tgd",
+            "tgdrive",
+            "/Volumes/merope/tgdrive",
+            Some("merope"),
+            DestinationVolumeStatus::Absent,
+        )]);
+
+        let vm = read_with(&dir, table.clone());
+        assert_eq!(
+            vm.destination_kind,
+            RecordingDestinationKind::Profile,
+            "an unplugged drive is not a fourth degrade: the destination is still the synced folder"
+        );
+        assert_eq!(
+            vm.destination_dir, "/Volumes/merope/tgdrive/recordings",
+            "the card must not start naming the plain folder behind the owner's back"
+        );
+        assert_ne!(vm.destination_dir, plain_answer(&dir));
+        assert_eq!(
+            vm.destination_volume,
+            Some(RecordingVolumeVm {
+                name: Some("merope".to_owned()),
+                state: RecordingVolumeState::Absent,
+            }),
+            "the card says the drive is not attached without being asked"
+        );
+
+        let error = destination_volume_refusal(&resolve_with(&dir, table))
+            .expect("a start onto an unplugged drive must be refused");
+        assert_eq!(error.code, IpcErrorCode::RecordingDestinationRefused);
+        assert!(
+            !error.retriable,
+            "nothing keeper does can attach a drive, so an automatic retry would only spin"
+        );
+        assert!(
+            error.message.contains("merope") && error.message.contains("not attached"),
+            "the refusal must name the VOLUME — an EPERM on a path is not actionable — got {:?}",
+            error.message
+        );
+        assert!(
+            error.message.contains("tgdrive"),
+            "and the synced folder it belongs to, got {:?}",
+            error.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix row "volume returns": the refusal is a statement about right now,
+    /// not a latch. Nothing is written when the start is refused, so the next one
+    /// after a replug simply works — no re-choosing, no clearing, no relaunch.
+    #[test]
+    fn replugging_the_volume_lets_the_next_start_succeed_with_no_other_action() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+        let detached = Ok(vec![removable_row(
+            "tgd",
+            "tgdrive",
+            "/Volumes/merope/tgdrive",
+            Some("merope"),
+            DestinationVolumeStatus::Absent,
+        )]);
+        let attached = Ok(vec![removable_row(
+            "tgd",
+            "tgdrive",
+            "/Volumes/merope/tgdrive",
+            Some("merope"),
+            DestinationVolumeStatus::Attached,
+        )]);
+
+        assert!(destination_volume_refusal(&resolve_with(&dir, detached)).is_some());
+        assert_eq!(
+            keeper_core::registry::get_recording_destination_profile(&dir).expect("profile key"),
+            Some("tgd".to_owned()),
+            "a refused start is a refusal, not a silent unchoosing"
+        );
+
+        let after = resolve_with(&dir, attached);
+        assert!(
+            destination_volume_refusal(&after).is_none(),
+            "the drive is back; the only action required was plugging it in"
+        );
+        assert_eq!(
+            after.root,
+            PathBuf::from("/Volumes/merope/tgdrive/recordings")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matrix row "non-removable profile": an ordinary synced folder carries no
+    /// volume at all, so there is no removable wording anywhere and nothing this
+    /// story added can refuse a start.
+    #[test]
+    fn a_non_removable_synced_destination_says_nothing_about_drives() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+
+        let vm = read_with(&dir, tgdrive_table());
+        assert_eq!(vm.destination_kind, RecordingDestinationKind::Profile);
+        assert_eq!(
+            vm.destination_volume, None,
+            "a folder on a disk that is always there has no drive to talk about"
+        );
+        assert!(destination_volume_refusal(&resolve_with(&dir, tgdrive_table())).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The regression this story is most able to cause: Story 41.2's three honest
+    /// degrades must STILL degrade, even when the profile they are about happens
+    /// to be on a drive that is also unplugged. Gone, paused and unflagged mean
+    /// "this is not a destination any more" — the folder answer, with a `warn` —
+    /// and none of them may become a hard refusal.
+    #[test]
+    fn the_three_existing_degrades_still_degrade_when_the_volume_is_absent_too() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+        let plain = plain_answer(&dir);
+
+        let absent = || {
+            removable_row(
+                "tgd",
+                "tgdrive",
+                "/Volumes/merope/tgdrive",
+                Some("merope"),
+                DestinationVolumeStatus::Absent,
+            )
+        };
+        let mut unflagged = absent();
+        unflagged.recordings = None;
+        let mut paused = absent();
+        paused.enabled = false;
+
+        for (label, table) in [
+            ("un-flagged behind our back", Ok(vec![unflagged])),
+            ("paused", Ok(vec![paused])),
+            ("deleted", Ok(Vec::new())),
+        ] {
+            let vm = read_with(&dir, table.clone());
+            assert_eq!(
+                vm.destination_kind,
+                RecordingDestinationKind::Folder,
+                "{label}: 41.2's degrade must survive 41.7"
+            );
+            assert_eq!(vm.destination_dir, plain, "{label}");
+            assert_eq!(
+                vm.destination_volume, None,
+                "{label}: the plain folder is not on anyone's pendrive"
+            );
+            assert!(
+                destination_volume_refusal(&resolve_with(&dir, table)).is_none(),
+                "{label}: a degrade is an answer, and this story must not turn it into a failure"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A volume this run has never had in front of it cannot be named, so the
+    /// refusal DESCRIBES it rather than guessing — and in particular never spells
+    /// a name out of the mountpoint, which is the one part of a volume's identity
+    /// that moves (Story 27.3).
+    #[test]
+    fn an_unnamed_volume_is_described_rather_than_guessed_at() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+        let table = Ok(vec![removable_row(
+            "tgd",
+            "tgdrive",
+            "/Volumes/merope/tgdrive",
+            None,
+            DestinationVolumeStatus::Absent,
+        )]);
+
+        let error = destination_volume_refusal(&resolve_with(&dir, table.clone()))
+            .expect("an unplugged drive is refused whether or not it can be named");
+        assert!(
+            error
+                .message
+                .contains("the removable drive holding the synced folder \"tgdrive\""),
+            "with no name to use, the sentence describes the drive, got {:?}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("merope") && !error.message.contains("/Volumes"),
+            "and it never invents one out of the path, got {:?}",
+            error.message
+        );
+        assert_eq!(
+            read_with(&dir, table).destination_volume,
+            Some(RecordingVolumeVm {
+                name: None,
+                state: RecordingVolumeState::Absent,
+            }),
+            "the card is told the name is unknown, not handed a guess"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DIFFERENT volume mounted where the profile's own one lives is refused
+    /// too, and with its own sentence: `Absent` says "plug it in", this says "look
+    /// at what is plugged in". Treating it as absent, or as present, are the two
+    /// mistakes `VolumeStatus::Foreign` exists to prevent.
+    #[test]
+    fn a_foreign_volume_is_refused_with_what_was_found_instead() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+        let table = Ok(vec![removable_row(
+            "tgd",
+            "tgdrive",
+            "/Volumes/merope/tgdrive",
+            Some("merope"),
+            DestinationVolumeStatus::Unexpected {
+                detail: "a different volume (01STRANGER) is mounted there".to_owned(),
+            },
+        )]);
+
+        let error = destination_volume_refusal(&resolve_with(&dir, table.clone()))
+            .expect("a stranger's drive is not this destination");
+        assert!(
+            error.message.contains("merope") && error.message.contains("01STRANGER"),
+            "the refusal names both what was expected and what was found, got {:?}",
+            error.message
+        );
+        assert_eq!(
+            read_with(&dir, table).destination_volume,
+            Some(RecordingVolumeVm {
+                name: Some("merope".to_owned()),
+                state: RecordingVolumeState::Unexpected,
+            }),
+            "the card distinguishes it from a plain absence"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole loop through the REAL mechanism — `volume::scan`, a real marker,
+    /// a real unplug — rather than a hand-built row: the name is learned while the
+    /// drive is attached, survives the unplug so the refusal can still say it, and
+    /// the refusal creates nothing. Then the drive comes back and the next start
+    /// is simply allowed.
+    #[test]
+    fn a_real_unplug_is_named_refused_and_creates_nothing_until_the_drive_returns() {
+        let dir = settings_temp_dir();
+        keeper_core::registry::set_recording_destination_profile(&dir, "tgd")
+            .expect("choose the synced folder");
+        let (root, profile) = mounted_volume("merope");
+        let recordings = profile
+            .recordings_root()
+            .expect("a flagged profile has a root");
+        let table = |profile: &keeper_sync::SyncProfile| -> DestinationProfileTable {
+            Ok(vec![destination_profile_row(profile)])
+        };
+
+        // Attached: the marker is readable, so this is where the name is learned.
+        let attached = resolve_with(&dir, table(&profile));
+        assert_eq!(attached.root, recordings);
+        assert_eq!(
+            attached.volume,
+            Some(DestinationVolume {
+                name: Some("merope".to_owned()),
+                status: DestinationVolumeStatus::Attached,
+            })
+        );
+        assert!(destination_volume_refusal(&attached).is_none());
+
+        // Unplugged: the marker goes with the media, exactly as a yanked pendrive
+        // takes its `.keeper-sync/volume.json` with it.
+        std::fs::remove_dir_all(root.join(keeper_sync::volume::MARKER_DIR)).expect("unplug");
+        let detached = resolve_with(&dir, table(&profile));
+        assert_eq!(
+            detached.volume,
+            Some(DestinationVolume {
+                name: Some("merope".to_owned()),
+                status: DestinationVolumeStatus::Absent,
+            }),
+            "the status is re-scanned but the NAME is remembered, which is what lets the refusal say it"
+        );
+        let error =
+            destination_volume_refusal(&detached).expect("an unplugged drive refuses the start");
+        assert!(error.message.contains("merope"), "{:?}", error.message);
+        assert!(
+            !recordings.exists(),
+            "the refusal must run before anything is created — nothing at all was written"
+        );
+
+        // Replugged: same marker, same volume id, and the next start is allowed
+        // with no other action taken anywhere.
+        let marker = keeper_sync::volume::VolumeMarker {
+            schema_version: keeper_sync::volume::MARKER_VERSION,
+            volume_id: profile.volume_id.clone().expect("bound"),
+            label: "merope".to_owned(),
+            profile_ids: vec![profile.id.clone()],
+            created_ms: 0,
+        };
+        keeper_sync::volume::VolumeMarker::write(&root, &marker).expect("replug");
+        assert!(
+            destination_volume_refusal(&resolve_with(&dir, table(&profile))).is_none(),
+            "plugging the drive back in is the only action a replug needs"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The picker's source: flagged AND enabled only, with the root RESOLVED here
     /// so no surface joins a local path and a subfolder. No engine ⇒ an empty
     /// list, never an error, so the card falls back to today's behaviour.
+    ///
+    /// Story 46.10: the row also carries the HEAD the root was joined from, and a
+    /// multi-segment one is carried verbatim — the Destination card shows and
+    /// edits it, so a truncated or re-normalised head would be a value the card
+    /// could not echo back to `sync_profile_save`.
     #[test]
     fn destination_profiles_lists_only_the_folders_that_hold_recordings() {
         let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
-        unflagged.recordings_root = None;
+        unflagged.recordings = None;
         let mut paused = flagged_row("old", "old stick", "/Volumes/old");
         paused.enabled = false;
+        let mut nested = flagged_row("nest", "nested", "/Volumes/nest");
+        nested.recordings = Some(RecordingsPlace {
+            root: PathBuf::from("/Volumes/nest/40-media/recordings"),
+            subfolder: "40-media/recordings".to_owned(),
+        });
         let table = Ok(vec![
             flagged_row("tgd", "tgdrive", "/Volumes/tg"),
             unflagged,
             paused,
+            nested,
         ]);
 
         let offered = destination_profile_vms(&table);
-        assert_eq!(offered.len(), 1, "only one folder holds recordings");
+        assert_eq!(offered.len(), 2, "only two folders hold recordings");
         assert_eq!(offered[0].id, "tgd");
         assert_eq!(offered[0].name, "tgdrive");
         assert_eq!(offered[0].recordings_root, "/Volumes/tg/recordings");
+        assert_eq!(
+            offered[0].subfolder, "recordings",
+            "the head the root was composed from, beside it"
+        );
+        assert_eq!(
+            offered[1].recordings_root, "/Volumes/nest/40-media/recordings",
+            "a nested head resolves to a nested root"
+        );
+        assert_eq!(
+            offered[1].subfolder, "40-media/recordings",
+            "a multi-segment head is carried whole, not reduced to its last part"
+        );
 
         assert!(
             destination_profile_vms(&Err("git is not available".to_owned())).is_empty(),
@@ -12141,7 +13385,7 @@ mod tests {
         let mut profile =
             keeper_sync::SyncProfile::new("tgd", "tgdrive", "/Volumes/tg", "https://example/r.git");
         assert_eq!(
-            destination_profile_row(&profile).recordings_root,
+            destination_profile_row(&profile).recordings,
             None,
             "a profile that has not said it holds recordings is not a destination"
         );
@@ -12152,11 +13396,31 @@ mod tests {
         assert_eq!(row.name, "tgdrive");
         assert_eq!(row.local_path, PathBuf::from("/Volumes/tg"));
         assert_eq!(
-            row.recordings_root,
+            row.recordings_root().map(Path::to_path_buf),
             profile.recordings_root(),
             "one definition of the recordings root, and it is keeper-sync's"
         );
         assert!(row.enabled);
+        assert_eq!(
+            row.volume, None,
+            "a profile that is not on removable media has no volume to talk about"
+        );
+
+        // The pendrive the field report is about. The folder does not exist on
+        // this machine, so `volume::scan` finds no marker at or above it — which
+        // is precisely what a drive in a drawer looks like. The profile has never
+        // been bound to a volume, so there is no name to recall either, and the
+        // row says so instead of inventing one out of "/Volumes/tg".
+        profile.removable = true;
+        let removable = destination_profile_row(&profile);
+        assert_eq!(
+            removable.volume,
+            Some(DestinationVolume {
+                name: None,
+                status: DestinationVolumeStatus::Absent,
+            }),
+            "a removable profile whose volume is nowhere reads as absent, not as attached"
+        );
     }
 
     /// Story 40.2: the preview is the manual. Titled, untitled and blank-template
@@ -14261,22 +15525,30 @@ mod tests {
 
     /// A destination that resolved to a recordings-flagged profile whose
     /// recordings root is `root`.
+    ///
+    /// `volume: None` is the Story 41.7 answer for "a synced folder on a disk
+    /// that is always there": removability IS the `Option`, so a fixture that
+    /// says `None` is asserting the non-removable case rather than leaving a
+    /// field unset. The removable cases build their own destinations.
     fn profile_destination(root: &Path) -> RecordingDestination {
         RecordingDestination {
             root: root.to_path_buf(),
             kind: RecordingDestinationKind::Profile,
             profile_id: Some("profile-1".to_owned()),
             profile_name: Some("tgdrive".to_owned()),
+            volume: None,
         }
     }
 
-    /// A plain-folder destination — the same root, no profile behind it.
+    /// A plain-folder destination — the same root, no profile behind it, and so
+    /// no volume to be attached or not (Story 41.7).
     fn folder_destination(root: &Path) -> RecordingDestination {
         RecordingDestination {
             root: root.to_path_buf(),
             kind: RecordingDestinationKind::Folder,
             profile_id: None,
             profile_name: None,
+            volume: None,
         }
     }
 
@@ -15467,8 +16739,14 @@ mod tests {
         assert_eq!(fm.as_string("participants"), Some("Ada, Grace"));
         assert_eq!(
             fm.as_list("tags"),
-            Some(vec!["standup".to_owned(), "eng".to_owned()]),
-            "tags are carried as stored — 42.5 owns resolving them"
+            Some(vec![
+                "standup".to_owned(),
+                "eng".to_owned(),
+                "recordings".to_owned()
+            ]),
+            "the session's own tags are carried as stored and keep their order — 42.5 owns \
+             resolving them — and story 43.2 appends the one keeper owns, last, because the \
+             head of a truncated property row should be the tag the writer chose"
         );
         assert_eq!(
             fm.as_string("session"),
@@ -15484,10 +16762,25 @@ mod tests {
         // presence rather than value — the composer's own tests fix the format.
         assert!(fm.as_string("end").is_some(), "the end time is recorded");
         assert!(fm.as_string("duration").is_some());
+        // Story 44.2: the body opens as the recording. Both closed segments are
+        // embedded, in the ledger's order, BELOW the heading — `manifest.json`
+        // is in `files:` and is not embedded. Asserted here as well as in the
+        // composer's own tests because this is the seam that decides what the
+        // paths actually look like: they are whatever `stub_files` made
+        // relative to the anchor, and nothing joined a root back onto them.
         assert_eq!(
             &source[body..],
-            "\n# Weekly sync\n\n",
-            "the body offset is exact and the prose is byte-identical"
+            concat!(
+                "\n# Weekly sync\n",
+                "\n",
+                "![[keeper-rec session/screen-0000.mov]]\n",
+                "![[keeper-rec session/screen-0001.mov]]\n",
+                "\n",
+            ),
+            "the WHOLE body, so nothing can be reordered without failing here: the body \
+             offset is exact, the prose is byte-identical, and the heading is still the \
+             first line. An embed above it would become the note's displayed title, \
+             because `note_title` falls back to the body's first line"
         );
 
         // AC4, at the seam where an absolute path could actually get in: the
@@ -15694,7 +16987,14 @@ mod tests {
             .expect("an untitled session still gets a named stub");
         let (fm, body) = Frontmatter::parse(&source);
         assert_eq!(fm.as_string("title"), Some("2026-01-02"));
-        assert_eq!(&source[body..], "\n# 2026-01-02\n\n");
+        // The whole body, not a substring: the heading must stay the FIRST line,
+        // because `notes_vault::note_title` falls back to it and an embed above
+        // it would become the note's displayed name (story 44.2). The embed is
+        // here because `drive_synthetic_session` closes a real `.mov`.
+        assert_eq!(
+            &source[body..],
+            "\n# 2026-01-02\n\n![[keeper-rec 2026-01-02 10.00.00/screen-0000.mov]]\n\n"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -15797,7 +17097,16 @@ mod tests {
             "the head is keeper's block plus its separator: {head:?}"
         );
         let body = &stub.contents[head.len()..];
-        assert_eq!(body, "# Weekly sync\n\n");
+        // Story 44.2: the one closed segment is embedded under the heading, and
+        // the blank line after it is the line the surface's caret lands on —
+        // `setSelectionRange(value.length, …)` on exactly this string. Which is
+        // why the sentence appended below goes UNDER the recording rather than
+        // shoving it down the page.
+        assert_eq!(
+            body, "# Weekly sync\n\n![[keeper-rec session/screen-0000.mov]]\n\n",
+            "the WHOLE body: heading first, then the recording, then the blank line the \
+             caret lands on. An embed above the heading would become the note's title"
+        );
 
         recording_note_stub_save(folder_arg.clone(), format!("{head}{body}Ship on Friday.\n"))
             .await
@@ -16175,7 +17484,7 @@ mod tests {
     fn browsing_recordings_with_no_archive_yields_no_rows_and_no_error() {
         let data_dir = scan_temp_dir("rec-42-3-no-archive");
 
-        let rows = search_recordings_in(
+        let found = search_recordings_in(
             &data_dir,
             &data_dir.join("Movies"),
             RecordingFilterVm {
@@ -16191,7 +17500,11 @@ mod tests {
         )
         .expect("an absent archive is an empty answer, never an error");
 
-        assert!(rows.is_empty());
+        assert!(found.rows.is_empty());
+        assert_eq!(
+            found.total, 0,
+            "no archive is zero sessions, said as a number (Story 44.11)"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -16220,25 +17533,94 @@ mod tests {
         let missing = search_recordings_in(&data_dir, &destination_root, filter("retrospective"))
             .expect("browse the archive");
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].session_id, "01DEVICE-01STANDUP");
-        assert_eq!(rows[0].duration_ms, Some(60_000));
-        assert_eq!(rows[0].total_bytes, 4_096);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(
+            rows.total, 1,
+            "the count travels with the page (Story 44.11)"
+        );
+        assert_eq!(rows.rows[0].session_id, "01DEVICE-01STANDUP");
+        assert_eq!(rows.rows[0].duration_ms, Some(60_000));
+        assert_eq!(rows.rows[0].total_bytes, 4_096);
         let expected_folder = destination_root.join("2026").join("Standup");
         let expected_file = expected_folder
             .join("screen-0000.mov")
             .to_string_lossy()
             .into_owned();
-        assert_eq!(rows[0].absolute_path, expected_folder.to_string_lossy());
         assert_eq!(
-            rows[0].playable_path.as_deref(),
+            rows.rows[0].absolute_path,
+            expected_folder.to_string_lossy()
+        );
+        assert_eq!(
+            rows.rows[0].playable_path.as_deref(),
             Some(expected_file.as_str())
         );
         assert!(
-            missing.is_empty(),
+            missing.rows.is_empty(),
             "a filter that matches nothing is an empty list, not an error"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- a recording note's file actions (Story 42.4) -----------------------
+
+    /// Story 42.4: the note's reader gets the session folder and every file in
+    /// it, each resolved against the destination root the shell passed in —
+    /// the only place a root and a subfolder are ever joined (AD-65) — and
+    /// only a video is marked as something Preview can open.
+    #[test]
+    fn a_recording_note_resolves_its_session_folder_and_files_against_the_destination_root() {
+        use keeper_core::vm::RecordingNoteTargetKind;
+
+        let base = scan_temp_dir("rec-42-4-targets");
+        let data_dir = base.join("data");
+        let destination_root = base.join("Movies").join("keeper");
+        index_browsable_session(&data_dir, "01DEVICE-01STANDUP", "Standup");
+        let folder = destination_root.join("2026").join("Standup");
+        std::fs::create_dir_all(&folder).expect("the session folder");
+        for name in ["screen-0000.mov", "manifest.json"] {
+            std::fs::write(folder.join(name), b"bytes").expect("a session file");
+        }
+
+        let targets = recording_note_targets_in(&data_dir, &destination_root, "01DEVICE-01STANDUP")
+            .expect("a known session resolves")
+            .expect("a session on disk has targets");
+
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| (target.relative_path.as_str(), target.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("2026/Standup", RecordingNoteTargetKind::Folder),
+                ("2026/Standup/manifest.json", RecordingNoteTargetKind::File),
+                (
+                    "2026/Standup/screen-0000.mov",
+                    RecordingNoteTargetKind::Video
+                ),
+            ]
+        );
+        assert_eq!(
+            targets[0].absolute_path,
+            folder.to_string_lossy(),
+            "Reveal opens the folder the recorder wrote to, composed here and nowhere else"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Story 42.4: a note can outlive the archive that knows its session — a
+    /// fresh install syncing an old vault has the note and no `archive.db` at
+    /// all. That is `None`, not `SQLITE_CANTOPEN`, so the surface renders the
+    /// note's own text and offers nothing that would open nothing.
+    #[test]
+    fn a_recording_note_on_a_machine_with_no_archive_has_no_targets_and_no_error() {
+        let data_dir = scan_temp_dir("rec-42-4-no-archive");
+
+        let targets =
+            recording_note_targets_in(&data_dir, &data_dir.join("Movies"), "01DEVICE-01STANDUP")
+                .expect("an absent archive is an empty answer, never an error");
+
+        assert_eq!(targets, None);
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// Story 42.3, the security-relevant one: a command that opened whatever

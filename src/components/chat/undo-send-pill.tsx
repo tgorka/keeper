@@ -20,7 +20,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HeldSendVm } from "@/lib/ipc/client";
 import { undoHeldSend, useHeldSends } from "@/lib/stores/outbox";
-import { cn } from "@/lib/utils";
 
 /** Whole seconds remaining until `dispatchAtMs`, clamped at 0 (never negative). */
 function secondsLeft(dispatchAtMs: number, now: number): number {
@@ -137,7 +136,7 @@ function PillRow({ row, now, onUndo }: PillRowProps) {
             fill="none"
             stroke="currentColor"
             strokeWidth="2"
-            className="text-held/25"
+            className="text-held/25" /* design-allow opacity: a gauge TRACK, not text — the filled arc carries the count, and a full-strength track reads as a full ring */
           />
           <circle
             cx="10"
@@ -153,13 +152,13 @@ function PillRow({ row, now, onUndo }: PillRowProps) {
           />
         </svg>
         <span
-          className="absolute inset-0 flex items-center justify-center text-[10px] text-held tabular-nums"
+          className="figures absolute inset-0 flex items-center justify-center text-meta text-held"
           aria-hidden="true"
         >
           {remaining}
         </span>
       </span>
-      <span className={cn("text-held text-xs tabular-nums")}>Sending in {remaining}s</span>
+      <span className="figures text-held text-xs">Sending in {remaining}s</span>
       <button
         type="button"
         className="rounded-full font-medium text-held text-xs underline underline-offset-2 hover:no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-held"

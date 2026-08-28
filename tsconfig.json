@@ -26,6 +26,14 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src"],
+  // `dev` and not only `src`: `dev/mock-shell.ts` is a table of fixtures the
+  // real components are rendered against, and a fixture of the WRONG SHAPE is
+  // worse than a missing one — a missing answer falls through to the mock's
+  // own fallback and draws an empty state, while a stale one throws inside a
+  // consumer and blanks the window, so the failure reads as a bug in the
+  // surface being looked at rather than in the harness. Typechecked here
+  // against the same generated bindings the app reads, so the next drift is a
+  // `tsc` error instead of a blank page.
+  "include": ["src", "dev"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

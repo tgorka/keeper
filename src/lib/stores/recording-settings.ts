@@ -126,6 +126,38 @@ export async function ensureRecordingSettingsHydrated(): Promise<void> {
 }
 
 /**
+ * Re-read the effective settings from Rust unconditionally, where
+ * {@link ensureRecordingSettingsHydrated} reads at most once (Story 46.10).
+ *
+ * `ensureRecordingSettingsHydrated` deliberately reads once per app lifetime,
+ * because every later movement of these keys goes through
+ * {@link applyRecordingSettings} and is echoed back. That stopped being the whole
+ * truth when the recordings SUBFOLDER became editable: it is a sync-profile
+ * write, not a settings write, and it moves `destinationDir` — the resolved root
+ * this mirror caches, and the root the session-folder preview is composed
+ * against. Without a re-read the card would keep printing the old absolute path
+ * after a head change it just made itself.
+ *
+ * Best-effort in the same shape as hydration: a failed read keeps the previous
+ * VM rather than blanking a card that is on screen, and never rejects. A read
+ * that lost a race to a settings WRITE is dropped, so an in-flight optimistic
+ * value is never overwritten by an older truth.
+ */
+export async function refreshRecordingSettings(): Promise<void> {
+  const id = writeId;
+  try {
+    const vm = await recordingSettingsGet();
+    if (id === writeId) {
+      lastConfirmed = vm;
+      recordingSettingsStore.getState().setSettings(vm);
+    }
+  } catch {
+    // Keep the value on screen: this read is a refinement of a VM the surface
+    // already has, never its only source.
+  }
+}
+
+/**
  * Persist new recording settings (Story 17.5): optimistic mirror update, then
  * `recordingSettingsSet`; on success the mirror is replaced with the effective
  * (Rust-clamped) VM, on failure it reverts to the prior value — both only when

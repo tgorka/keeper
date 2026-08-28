@@ -40,9 +40,46 @@ bytes = { workspace = true }
 # Already resolved in this crate's own tree via gix-transport and reqwest, so a
 # direct dep adds no new crate. MIT/Apache — passes `cargo deny check`.
 base64 = { workspace = true }
+# Reading back the pattern field of a `.gitattributes` line keeper wrote for a
+# path containing a space (`lfs::stage`). See the workspace manifest for why
+# quoting is mandatory and why this crate rather than a hand-rolled decoder.
+# Adds no new crate: gix-attributes already depends on it.
+gix-quote = { workspace = true }
+# The folder tier: `<folder>/.keeper/keeper.toml` and its `keeper.<host>.toml`
+# sibling, read at profile-load time (`profile::folder`, AD-99/AD-100). Adds no
+# new crate — `keeper-syncd` already resolves it for the daemon's own
+# `[[profile]]` config, and this crate now owns the profile↔TOML mapping the
+# two of them share. MIT/Apache — passes `cargo deny check`.
+toml = { workspace = true }
+
+# The FIRST platform-conditional dependency in this crate, and it is macOS-only
+# on purpose: AD-40 requires `keeper-syncd` to keep linking this crate on a
+# headless Linux server, which a macOS-gated edge does not disturb.
+#
+# `files_write::finder_trash` (Story 46.14, AD-102, NFR-30) sends an
+# out-of-vault delete to the OS trash rather than an `unlink`. On macOS that is
+# `NSFileManager trashItemAtURL:resultingItemURL:error:`, a SAFE objc2 binding —
+# no `unsafe` block, nothing to add to the audited-FFI inventory in
+# `docs/constraints-and-limitations.md`. Everywhere else the freedesktop.org
+# home trash is implemented in the module itself, which is what makes the
+# removal testable on the Linux box this is written on.
+#
+# Adds no new crate and no new crate version: objc2-foundation 0.3 / objc2 0.6
+# are already resolved in the lock via tao/wry/muda, and the `keeper` crate
+# already names them for the iOS backup-exclusion FFI. Only the dependency edge
+# and the `NSFileManager` feature are new. MIT — passes `cargo deny check`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
+
+# `openfiles` raises RLIMIT_NOFILE at startup, because a Finder-launched app
+# inherits launchd's 256 and gitoxide's object store needs more than that.
+# A wrapper rather than `libc` directly: this crate denies `unsafe_code`, and
+# one syscall is not worth an exception to that.
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10"

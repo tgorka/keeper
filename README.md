@@ -1,3 +1,5 @@
+<img src="favicon.png" alt="" width="84" align="right">
+
 # Keeper
 
 An open-source, Beeper-style universal messenger client built on [Matrix](https://matrix.org).
@@ -59,6 +61,18 @@ no Apple credentials), and it blocks PRs on failure. Reproduce it locally from `
 
 ```sh
 cargo check --workspace --target aarch64-apple-ios
+```
+
+### Icons
+
+Every raster the mark ships as is generated from
+`src-tauri/crates/keeper/icons/mark.svg` — the app icon set Tauri bundles, the macOS tray
+templates, the iOS AppIcon set, and the three root files `favicon.svg`, `favicon.png` and
+`favicon.ico` (16/32/48/256, byte-identical to the bundled Windows icon). Do not hand-edit
+them; re-cut the family, which checks its own output:
+
+```sh
+bun run scripts/gen-mark-icons.ts
 ```
 
 ## Credentials

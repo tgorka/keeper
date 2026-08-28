@@ -42,6 +42,35 @@ const MIN_CHAT_QUERY_LEN: usize = 2;
 /// iOS, which is the exact bug FR-122 forbids.
 const NOTES_CATEGORY: &str = "Notes";
 
+/// The sessions verbs' category (Phase 7, FR-251), gated whole like Notes.
+const SESSIONS_CATEGORY: &str = "Sessions";
+
+/// The registry ids of the three Recording verbs (Story 20.4, FR-48), named
+/// because a fourth surface now dispatches on them.
+///
+/// The palette, the ⌘? cheat sheet and the native menu bar all read the id off a
+/// rendered [`MenuItemVm`] and never spell it. The menu-bar tray cannot: it is
+/// built in Rust and has to name the verb it offers (Story 46.16). A title is
+/// allowed to change — Story 46.5 renamed the start verb and three surfaces
+/// changed with it, precisely because they all read this registry — but an id is
+/// the dispatch key `actions.ts` resolves and never does. Naming each once is
+/// what keeps the registry entry, the tray projection and the tray's click
+/// router from holding three copies of one string.
+pub const RECORDING_START_ID: &str = "recording-start";
+pub const RECORDING_STOP_ID: &str = "recording-stop";
+pub const RECORDING_OPEN_FOLDER_ID: &str = "recording-open-folder";
+
+/// The registry ids of the three Notes verbs the menu-bar tray offers (Story
+/// 47.4, DW-195), named for [`RECORDING_START_ID`]'s reason.
+///
+/// The other three notes actions — `notes-open`, `notes-search` and
+/// `notes-switch-vault` — are registered and deliberately absent from the tray,
+/// which is why this is three named ids and not "the Notes category". The tray
+/// is a menu-bar summary, not a second palette.
+pub const NOTES_NEW_ID: &str = "notes-new";
+pub const NOTES_CAPTURE_ID: &str = "notes-capture";
+pub const NOTES_JOURNAL_ID: &str = "notes-journal-today";
+
 /// One lightweight, non-secret projection of a room held in the [`PaletteIndex`]
 /// (Story 9.1). Carries only render + ranking data: the owning account id and hue,
 /// the room id, its display name (with a lowercased copy cached for scoring), the
@@ -470,17 +499,27 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             requires_recording: true,
             toggle_group: None,
         },
-        // --- Recording verbs (Story 20.4, FR-48): capability-gated exactly like
-        // `open-recording` — `requires_recording: true` drops them from every
-        // surface (palette, cheat sheet, native menu) when recording is off
-        // (desktop macOS ≥ 13.0 only). Palette-only (`shortcut: None`): no
-        // single-key verb exists on this surface (UX-DR29). Built inline so the
-        // shared `action` closure keeps `requires_recording: false`.
+        // The Recordings archive (Story 42.3, Story 45.20, FR-198). A SECOND
+        // navigation action beside `open-recording`, not a rename of it: the
+        // capture surface and the browser over what capture produced are two
+        // primary views (`recording` and `recordings`), the sidebar has carried
+        // two entries for them since 42.3, and the menu bar carried one — so
+        // the one surface a person reaches for after recording was the one
+        // surface the menu could not open.
+        //
+        // No shortcut chip: `⌘5` belongs to the capture surface and is bound by
+        // a shipped JS hook. A chip here would either teach a chord that opens
+        // the other view or claim a second one nothing binds, and this registry
+        // is where the cheat sheet learns what to promise.
+        //
+        // `requires_recording`, exactly like `open-recording` and for the same
+        // reason the sidebar gates both on one flag: a browser over recordings
+        // this build cannot make is a puzzle, not a surface.
         PaletteActionVm {
-            id: "recording-start".to_owned(),
-            title: "Start Recording".to_owned(),
-            category: "Recording".to_owned(),
-            keywords: ["record", "capture", "screen", "begin", "go live"]
+            id: "open-recordings".to_owned(),
+            title: "Open Recordings".to_owned(),
+            category: "Navigation".to_owned(),
+            keywords: ["record", "archive", "browse", "sessions", "library"]
                 .iter()
                 .map(|k| (*k).to_owned())
                 .collect(),
@@ -489,8 +528,42 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             requires_recording: true,
             toggle_group: None,
         },
+        // --- Recording verbs (Story 20.4, FR-48): capability-gated exactly like
+        // `open-recording` — `requires_recording: true` drops them from every
+        // surface (palette, cheat sheet, native menu) when recording is off
+        // (desktop macOS ≥ 13.0 only). Palette-only (`shortcut: None`): no
+        // single-key verb exists on this surface (UX-DR29). Built inline so the
+        // shared `action` closure keeps `requires_recording: false`.
+        // Story 46.5: titled "New Recording", not "Start Recording". The owner
+        // searched the palette for "new recording" and found nothing, one
+        // submenu away from "Open Recordings" — which only navigates. "New X"
+        // is this registry's own word for making one (`notes-new` → "New
+        // Note"); "Start Recording" was the outlier, and the outlier is the
+        // one nobody could find. `id`, `category` and the count below are
+        // untouched: moving it out of Recording would break the section, and
+        // the id is what `actions.ts` dispatches on.
+        //
+        // `start` joins the keywords because it just left the title, and `new`
+        // joins it even though the title now carries it — pinning the owner's
+        // word here means the next retitle cannot silently take it away again,
+        // which is precisely how this defect was made.
         PaletteActionVm {
-            id: "recording-stop".to_owned(),
+            id: RECORDING_START_ID.to_owned(),
+            title: "New Recording".to_owned(),
+            category: "Recording".to_owned(),
+            keywords: [
+                "record", "capture", "screen", "new", "start", "begin", "go live",
+            ]
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect(),
+            shortcut: None,
+            requires_open_chat: false,
+            requires_recording: true,
+            toggle_group: None,
+        },
+        PaletteActionVm {
+            id: RECORDING_STOP_ID.to_owned(),
             title: "Stop Recording".to_owned(),
             category: "Recording".to_owned(),
             keywords: ["record", "capture", "end", "finish", "finalize"]
@@ -503,7 +576,7 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             toggle_group: None,
         },
         PaletteActionVm {
-            id: "recording-open-folder".to_owned(),
+            id: RECORDING_OPEN_FOLDER_ID.to_owned(),
             title: "Open Recordings Folder".to_owned(),
             category: "Recording".to_owned(),
             keywords: ["record", "reveal", "finder", "destination", "files"]
@@ -522,7 +595,7 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
         // the bindings the notes surfaces register; they are display-only labels
         // here, as everywhere else in this registry.
         action(
-            "notes-new",
+            NOTES_NEW_ID,
             "New Note",
             NOTES_CATEGORY,
             &["note", "write", "compose", "markdown"],
@@ -530,7 +603,7 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             false,
         ),
         action(
-            "notes-capture",
+            NOTES_CAPTURE_ID,
             "Quick Capture",
             NOTES_CATEGORY,
             &["note", "capture", "scratch", "inbox", "jot"],
@@ -538,7 +611,7 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             false,
         ),
         action(
-            "notes-journal-today",
+            NOTES_JOURNAL_ID,
             "Today's Journal",
             NOTES_CATEGORY,
             &["note", "journal", "daily", "today", "diary"],
@@ -567,6 +640,33 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             NOTES_CATEGORY,
             &["note", "vault", "folder", "change vault"],
             Some("⌘⌥V"),
+            false,
+        ),
+        // --- Sessions (Phase 7, FR-251): gated by category exactly as Notes
+        // is, on the sessions capability — the same construction over the same
+        // sync substrate, so the same absence rule (FR-223).
+        action(
+            "sessions-view",
+            "Sessions",
+            SESSIONS_CATEGORY,
+            &["session", "work", "llm", "agent", "board"],
+            Some("⌘7"),
+            false,
+        ),
+        action(
+            "sessions-new",
+            "New Session",
+            SESSIONS_CATEGORY,
+            &["session", "start", "create", "work"],
+            None,
+            false,
+        ),
+        action(
+            "sessions-log-today",
+            "Log Today in Session",
+            SESSIONS_CATEGORY,
+            &["session", "log", "entry", "journal", "today"],
+            Some("⌘⌥L"),
             false,
         ),
         // --- Global actions (dialogs / commands) ---
@@ -752,6 +852,9 @@ const CATEGORY_ORDER: &[&str] = &[
     // category vanishes with its flag off, so this position only matters on a
     // desktop build that has folder sync.
     NOTES_CATEGORY,
+    // The capability-gated sessions verbs (Phase 7), directly after Notes —
+    // the sibling surface over the same sync substrate (FR-251).
+    SESSIONS_CATEGORY,
     "Chat",
 ];
 
@@ -771,12 +874,19 @@ const CATEGORY_ORDER: &[&str] = &[
 /// registry keeps all three surfaces consistent without any per-platform logic.
 /// `notes` does the same for the whole [`NOTES_CATEGORY`] section (Phase 5,
 /// FR-122): with it off the section is absent from the cheat sheet and the native
-/// menu bar, not greyed out in them.
+/// menu bar, not greyed out in them. The sessions section rides the SAME flag
+/// (Phase 7, FR-223): `CapabilitiesVm.sessions` is computed from the identical
+/// condition as `notes` (sync && desktop), so one gate parameter serves both —
+/// a second boolean here would be two names for one fact until the day the two
+/// capabilities diverge, and that day amends this signature with the AD it
+/// arrives on.
 pub fn registry_sections(recording: bool, notes: bool) -> Vec<MenuSectionVm> {
     let actions: Vec<PaletteActionVm> = palette_actions()
         .into_iter()
         .filter(|action| recording || !action.requires_recording)
-        .filter(|action| notes || action.category != NOTES_CATEGORY)
+        .filter(|action| {
+            notes || (action.category != NOTES_CATEGORY && action.category != SESSIONS_CATEGORY)
+        })
         .collect();
 
     // Preserve first-appearance order of categories, then sort by CATEGORY_ORDER
@@ -835,6 +945,198 @@ pub fn registry_sections(recording: bool, notes: bool) -> Vec<MenuSectionVm> {
             MenuSectionVm { category, items }
         })
         .collect()
+}
+
+/// Which tray rendering is being built (Story 46.16).
+///
+/// The menu-bar tray is not one menu: it swaps a whole menu per state, and a verb
+/// in the wrong one is a defect in both directions. A start verb that lingered
+/// into the live-session menu would offer a second recording; a verb missing from
+/// a rendering that *replaces* the idle menu — the folder-sync one does, on the
+/// first sync tick (Story 29.2) — would silently disappear from the menu bar for
+/// as long as a folder is syncing, which is most of the time.
+///
+/// So membership is a pure function of the rendering, decided and tested here,
+/// rather than four hand-built menus in the shell each remembering what belongs
+/// in it — none of which can be compiled, let alone tested, off macOS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayMenu {
+    /// Presence only (Story 10.3): no live session, no folder syncing.
+    Idle,
+    /// The folder-sync rendering (Story 29.2), which REPLACES the idle menu on
+    /// the first sync tick — so it carries whatever the idle menu carries.
+    Sync,
+    /// A live session (Story 18.1).
+    Recording,
+    /// The hold over a terminal failed session (Story 18.4).
+    Error,
+}
+
+/// The registry ids one tray rendering offers. Membership only — the order the
+/// tray shows them in is the registry's (see [`tray_recording_verbs`]).
+///
+/// - **Idle / Sync**: start, and nothing else. A stop and a folder reveal belong
+///   to a session that exists; the idle tray had no way to begin one at all,
+///   which is the absence Story 46.16 fills.
+/// - **Recording**: stop + the folder reveal (Story 18.1). Not start: there is
+///   one session, and a second start item is the lingering-verb bug.
+/// - **Error**: the folder reveal only. The one-click restart over a terminal
+///   failed session lives on the window's banner, and the tray deliberately
+///   never restarts a session itself (Story 18.4) — a start verb here would be a
+///   second restart path with different words.
+fn tray_verb_ids(menu: TrayMenu) -> &'static [&'static str] {
+    match menu {
+        TrayMenu::Idle | TrayMenu::Sync => &[RECORDING_START_ID],
+        TrayMenu::Recording => &[RECORDING_STOP_ID, RECORDING_OPEN_FOLDER_ID],
+        TrayMenu::Error => &[RECORDING_OPEN_FOLDER_ID],
+    }
+}
+
+/// The recording verbs the menu-bar tray offers in `menu` — the tray's rendering
+/// of the same [`registry_sections`] projection the native menu bar and the ⌘?
+/// cheat sheet render (Story 46.16).
+///
+/// The tray was the one discovery surface that did not project this registry: it
+/// hand-built every label. That is why Story 46.5's rename of the start verb
+/// reached the palette, the cheat sheet and the menu bar in a single edit and
+/// reached the tray not at all — and why the tray had no start verb to rename in
+/// the first place. Membership per rendering is [`tray_verb_ids`]; the ORDER and
+/// the WORDS are the registry's, taken by filtering the projection in place, so
+/// the tray cannot order or word a verb differently from the menu bar.
+///
+/// `recording` is the capability flag (`recording_supported()` in the shell:
+/// desktop macOS ≥ 13 only). With it off every `requires_recording` action is
+/// already gone from the projection, so the tray offers no recording verb at all
+/// — absent, not disabled, exactly as on the other three surfaces (FR-66,
+/// AD-35). Pure — no I/O, no state.
+pub fn tray_recording_verbs(menu: TrayMenu, recording: bool) -> Vec<MenuItemVm> {
+    let wanted = tray_verb_ids(menu);
+    // `notes: false`: no RECORDING verb is a notes action. The tray's notes
+    // section is projected separately by [`tray_notes_labels`], because its
+    // three labels are composed — a suffix per model tick on a base word — and
+    // its items are built once and mutated (AD-61) rather than rebuilt per
+    // menu. A verb that failed to resolve for this or any other reason is
+    // caught by the test that counts what each rendering asks for against what
+    // it gets.
+    registry_sections(recording, false)
+        .into_iter()
+        .flat_map(|section| section.items)
+        .filter(|item| wanted.contains(&item.id.as_str()))
+        .collect()
+}
+
+/// What the tray's notes section knows about the vault when it paints (Story
+/// 47.4, DW-195).
+///
+/// Two bools rather than the shell's `NotesTray`, because this crate cannot see
+/// that type and must not learn to: everything else on it — the five recent
+/// slots, the unread count — is model data the registry has no word for. These
+/// two are the only facts that change a *verb's* wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TrayNotesState {
+    /// A vault is registered, so a create has somewhere to go.
+    pub vault: bool,
+    /// The quick-capture global shortcut registered (UX-DR43).
+    pub hotkey_registered: bool,
+}
+
+/// The three labels the tray's notes section shows, by NAME.
+///
+/// Named fields and not a `Vec`, and that is the whole defence against the one
+/// hazard widening the tray's projection carries. The recording verbs take the
+/// registry's ORDER because they are rebuilt per menu; the notes items are built
+/// once and only mutated (AD-61 — a Linux tray menu cannot be swapped after it
+/// is set), so a positional projection would move a label onto the wrong handle
+/// the day somebody reorders the registry. A field cannot slip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayNotesLabels {
+    pub new_note: String,
+    pub capture: String,
+    pub journal: String,
+}
+
+/// The registry's word for each verb the tray's notes section offers (Story
+/// 47.4, DW-195).
+///
+/// Story 46.16 made the tray project this registry for the RECORDING verbs, so
+/// Story 46.5's rename reached the menu bar. The notes section was left
+/// hand-typed and its three words were spelled twice — and had already drifted:
+/// the tray wrote `Today’s Journal` with a typographic apostrophe against this
+/// registry's `Today's Journal`, two surfaces disagreeing about a title UX-DR42
+/// says is one. The registry wins, verbatim, including the plain apostrophe:
+/// the palette matches keystrokes against this title, and a curly apostrophe
+/// nobody's keyboard types would be a search regression bought for a glyph.
+///
+/// **Only the label.** The tray's own "Open Recordings Folder" reveals the LIVE
+/// session's output path while the registry's verb reveals the CONFIGURED
+/// destination — same words, two different folders — so a projection that
+/// carried anything but words would quietly re-point a verb. This carries
+/// words. The click handlers, the ids the tray dispatches on and the enabled
+/// state are all still the tray's.
+///
+/// `notes` is the capability flag (FR-122). `None` means the tray builds no
+/// notes section, which is the right answer to both of its causes — a build
+/// that ships no notes surface, and a registry that could not answer for one of
+/// its own ids. The second is not a state; it is a bug, and the test below is
+/// what makes it one. Pure — no I/O, no state.
+pub fn tray_notes_labels(notes: bool) -> Option<TrayNotesLabels> {
+    let items = registry_sections(false, notes)
+        .into_iter()
+        .find(|section| section.category == NOTES_CATEGORY)?
+        .items;
+    let title = |id: &str| {
+        items
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.title.clone())
+    };
+    Some(TrayNotesLabels {
+        new_note: title(NOTES_NEW_ID)?,
+        capture: title(NOTES_CAPTURE_ID)?,
+        journal: title(NOTES_JOURNAL_ID)?,
+    })
+}
+
+impl TrayNotesLabels {
+    /// The words for one model tick, composed on the registry's base.
+    ///
+    /// The composition is the tray's own and stays: `new_note_label` returns the
+    /// honest "no vault yet" wording instead of the bare verb, and `capture`
+    /// carries the global-shortcut registration failure (UX-DR43). What changed
+    /// is where the BASE word comes from. It lives here rather than in `tray.rs`
+    /// for AD-56's reason: the shell crate does not build on two of the three
+    /// hosts this repo is written on, so a sentence composed there is prose and
+    /// a sentence composed here is a test.
+    ///
+    /// Both suffixes are appended, never substituted, so a retitle reaches the
+    /// empty state too — the failure mode being avoided is a registry rename
+    /// that fixes three surfaces and leaves the menu bar saying the old word the
+    /// moment a vault is missing.
+    pub fn painted(&self, state: TrayNotesState) -> Self {
+        Self {
+            new_note: no_vault_yet(&self.new_note, state.vault),
+            capture: if state.hotkey_registered {
+                self.capture.clone()
+            } else {
+                format!("{} \u{2014} hotkey unavailable", self.capture)
+            },
+            journal: no_vault_yet(&self.journal, state.vault),
+        }
+    }
+}
+
+/// A create verb with nowhere to create, said out loud.
+///
+/// The two create verbs stay ENABLED without a vault — choosing one opens
+/// Settings → Sync, because the action is achievable and a disabled row that
+/// explains nothing is worse than a row that takes you where you need to go — so
+/// the wording is the only thing that can carry the state.
+fn no_vault_yet(base: &str, vault: bool) -> String {
+    if vault {
+        base.to_owned()
+    } else {
+        format!("{base}\u{2026} (no vault yet)")
+    }
 }
 
 /// Build the collapsed toggle title for a pair into one unambiguous label.
@@ -1036,9 +1338,16 @@ mod tests {
     }
 
     /// Every `requires_recording` action the registry ships — `open-recording`
-    /// (Story 16.3) plus the three recording verbs (Story 20.4, FR-48/FR-66).
-    const RECORDING_ACTION_IDS: [&str; 4] = [
+    /// (Story 16.3), `open-recordings` (Story 45.20) and the three recording
+    /// verbs (Story 20.4, FR-48/FR-66).
+    ///
+    /// The archive entry is in this list rather than in a test of its own so it
+    /// is gated by the same assertions as its four siblings: a navigation entry
+    /// that survived the capability going off would offer a browser over
+    /// recordings the build cannot make.
+    const RECORDING_ACTION_IDS: [&str; 5] = [
         "open-recording",
+        "open-recordings",
         "recording-start",
         "recording-stop",
         "recording-open-folder",
@@ -1121,6 +1430,104 @@ mod tests {
                 "registry projection omits {id} when recording is off"
             );
         }
+    }
+
+    #[test]
+    fn the_start_verb_answers_the_word_people_search_for() {
+        // Story 46.5. The owner went looking for "new recording", found
+        // nothing, and concluded the verb did not exist — it did, titled
+        // "Start Recording", one submenu away from "Open Recordings", which
+        // only navigates.
+        //
+        // Queried, not read off the struct: asserting `title == "New
+        // Recording"` would restate the diff and pass on a title nothing can
+        // find. What was broken is the search, so the search is what is
+        // asserted. "new" and "new recording" both missed under the old title
+        // and both of its old keywords ("begin", "go live") — neither string
+        // is a subsequence of either.
+        let index = sample_index();
+        for needle in ["new", "new recording"] {
+            let hits = index.query(needle, PaletteMode::Action, false, true, false);
+            let ids: Vec<&str> = hits.actions.iter().map(|a| a.id.as_str()).collect();
+            assert!(
+                ids.contains(&"recording-start"),
+                "{needle:?} finds the start verb: {ids:?}"
+            );
+        }
+        // And it is the FIRST answer, not a tail hit under the navigation
+        // entry the owner already found by accident.
+        let top = index.query("new recording", PaletteMode::Action, false, true, false);
+        assert_eq!(
+            top.actions.first().map(|a| a.id.as_str()),
+            Some("recording-start"),
+            "the start verb leads the results: {:?}",
+            top.actions
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        // The word that left the title still finds it: a rename that dropped
+        // "start" from both places would trade one lost vocabulary for another.
+        let by_old_word = index.query("start", PaletteMode::Action, false, true, false);
+        assert!(
+            by_old_word
+                .actions
+                .iter()
+                .any(|a| a.id == "recording-start"),
+            "\"start\" still finds it"
+        );
+        // A rename must not become a re-home: `palette.rs`'s section-count
+        // assertion above is what moving this item to Navigation would break,
+        // and this says out loud that the category is load-bearing.
+        let recording = registry_sections(true, false)
+            .into_iter()
+            .find(|s| s.category == "Recording")
+            .expect("Recording section present");
+        assert!(
+            recording.items.iter().any(|i| i.id == "recording-start"),
+            "the renamed verb stays in the Recording section"
+        );
+    }
+
+    #[test]
+    fn the_archive_entry_is_a_second_navigation_action_beside_the_capture_one() {
+        // Story 45.20: the reported gap was that the menu bar could open the
+        // capture surface and not the archive. Two DISTINCT ids in Navigation,
+        // with two distinct titles, is what closes it — a test that only asked
+        // "is there a recordings entry" would pass on a renamed `open-recording`
+        // and the menu would still have one item where it needs two.
+        let actions = palette_actions();
+        let nav: Vec<(&str, &str)> = actions
+            .iter()
+            .filter(|a| a.category == "Navigation")
+            .map(|a| (a.id.as_str(), a.title.as_str()))
+            .collect();
+        assert!(
+            nav.contains(&("open-recording", "Open Recording")),
+            "the capture surface keeps its entry: {nav:?}"
+        );
+        assert!(
+            nav.contains(&("open-recordings", "Open Recordings")),
+            "the archive gains one: {nav:?}"
+        );
+
+        let archive = actions
+            .iter()
+            .find(|a| a.id == "open-recordings")
+            .expect("open-recordings is registered");
+        // No chip: ⌘5 is the capture surface's and nothing binds a second chord.
+        // A chip here is a promise the cheat sheet would print and no hook keeps.
+        assert_eq!(archive.shortcut, None, "the archive claims no chord");
+        assert!(archive.requires_recording, "gated like every sibling");
+        assert!(!archive.requires_open_chat);
+        assert_eq!(archive.toggle_group, None);
+
+        // Both entries reachable from one search, because "recordings" is what
+        // a person types when they want either.
+        let index = sample_index();
+        let hits = index.query("recordings", PaletteMode::Action, false, true, false);
+        let ids: Vec<&str> = hits.actions.iter().map(|a| a.id.as_str()).collect();
+        assert!(ids.contains(&"open-recordings"), "searchable: {ids:?}");
     }
 
     /// The six notes actions the registry ships (Phase 5, build contract §1).
@@ -1583,5 +1990,323 @@ mod tests {
             cjk_prefix > cjk_mid,
             "CJK prefix ({cjk_prefix}) should beat mid-string ({cjk_mid})"
         );
+    }
+
+    // --- The tray projection (Story 46.16) ---------------------------------
+
+    /// Every tray rendering, so a fifth cannot be added without deciding what it
+    /// offers: a new variant makes this array fail to compile-length-match below.
+    const TRAY_MENUS: [TrayMenu; 4] = [
+        TrayMenu::Idle,
+        TrayMenu::Sync,
+        TrayMenu::Recording,
+        TrayMenu::Error,
+    ];
+
+    fn tray_ids(menu: TrayMenu) -> Vec<String> {
+        tray_recording_verbs(menu, true)
+            .into_iter()
+            .map(|item| item.id)
+            .collect()
+    }
+
+    #[test]
+    fn the_tray_offers_the_start_verb_exactly_where_a_session_can_begin() {
+        // The reported absence: from the menu-bar icon there was no way to begin
+        // a recording in ANY state. It belongs in the two renderings that mean
+        // "no session" — and the sync one is not optional, because it REPLACES
+        // the idle menu on the first sync tick, so a verb only in the idle menu
+        // vanishes for as long as a folder syncs.
+        assert_eq!(tray_ids(TrayMenu::Idle), [RECORDING_START_ID]);
+        assert_eq!(
+            tray_ids(TrayMenu::Sync),
+            [RECORDING_START_ID],
+            "the sync menu replaces the idle one and must carry the same verb"
+        );
+
+        // …and nowhere else. A start item that lingered into a live session
+        // would offer a second recording; one in the error hold would be a
+        // second restart path beside the banner's (Story 18.4).
+        for menu in [TrayMenu::Recording, TrayMenu::Error] {
+            let ids = tray_ids(menu);
+            assert!(
+                !ids.iter().any(|id| id == RECORDING_START_ID),
+                "{menu:?} must not offer a start verb: {ids:?}"
+            );
+        }
+
+        // The session-scoped verbs stay where Story 18.1/18.4 put them, in the
+        // registry's own order (start, stop, folder → filtered in place).
+        assert_eq!(
+            tray_ids(TrayMenu::Recording),
+            [RECORDING_STOP_ID, RECORDING_OPEN_FOLDER_ID]
+        );
+        assert_eq!(tray_ids(TrayMenu::Error), [RECORDING_OPEN_FOLDER_ID]);
+    }
+
+    #[test]
+    fn the_tray_shows_the_registrys_own_words_for_every_verb_it_projects() {
+        // The point of the story. Story 46.5 renamed the start verb in the
+        // registry and three surfaces changed; the tray did not, because it
+        // hand-typed its labels. Asserting the projected title EQUALS the
+        // registry's title — never the literal "New Recording" — is what makes
+        // the tray the fourth surface: a hand-typed label would satisfy a
+        // `== "New Recording"` assertion today and drift on the next rename.
+        let registry = palette_actions();
+        for menu in TRAY_MENUS {
+            for item in tray_recording_verbs(menu, true) {
+                let action = registry
+                    .iter()
+                    .find(|action| action.id == item.id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{menu:?} projects {}, which the registry does not ship",
+                            item.id
+                        )
+                    });
+                assert_eq!(
+                    item.title, action.title,
+                    "{menu:?} shows {}'s registry words",
+                    item.id
+                );
+                // The tray renders `title` alone (its labels carry no chords).
+                // These verbs are palette-only by design (UX-DR29); if one ever
+                // gained a chord, the tray would be dropping it silently.
+                assert_eq!(
+                    item.shortcut, None,
+                    "{} claims a chord the tray's label would drop",
+                    item.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_verb_a_tray_rendering_names_reaches_the_projection() {
+        // A rendering that names an id the registry no longer ships — renamed
+        // away, re-homed out of the projection, deleted — would render a shorter
+        // menu with no error anywhere. The count is the guard.
+        for menu in TRAY_MENUS {
+            assert_eq!(
+                tray_recording_verbs(menu, true).len(),
+                tray_verb_ids(menu).len(),
+                "{menu:?} resolves every id it names"
+            );
+        }
+    }
+
+    #[test]
+    fn no_tray_rendering_projects_a_recording_verb_when_the_capability_is_off() {
+        // Absent, not disabled (FR-66, AD-35): the same gate the palette, the
+        // cheat sheet and the native menu bar apply, which is what makes the
+        // shell's `recording_supported()` check the same check rather than a
+        // second one that could disagree.
+        for menu in TRAY_MENUS {
+            assert!(
+                tray_recording_verbs(menu, false).is_empty(),
+                "{menu:?} offers nothing when recording is off"
+            );
+        }
+    }
+
+    // --- The tray's notes section (Story 47.4, DW-195) ---------------------
+
+    /// The three the tray shows, paired with the field each lands on. Written
+    /// down once so every assertion below reads the same pairing, and so adding
+    /// a fourth is an edit here rather than three edits scattered.
+    fn tray_notes_pairs(labels: &TrayNotesLabels) -> [(&'static str, &str); 3] {
+        [
+            (NOTES_NEW_ID, labels.new_note.as_str()),
+            (NOTES_CAPTURE_ID, labels.capture.as_str()),
+            (NOTES_JOURNAL_ID, labels.journal.as_str()),
+        ]
+    }
+
+    #[test]
+    fn every_label_the_trays_notes_section_shows_is_the_registrys_own_word() {
+        // The point of DW-195, and asserted the way 46.16 asserted its half:
+        // against the registry entry, never against a literal. `assert_eq!(new_note,
+        // "New Note")` would pass today on a hand-typed label and drift on the
+        // next rename, which is the defect rather than the test for it.
+        let registry = palette_actions();
+        let labels = tray_notes_labels(true).expect("the notes section projects");
+        for (id, shown) in tray_notes_pairs(&labels) {
+            let action = registry
+                .iter()
+                .find(|action| action.id == id)
+                .unwrap_or_else(|| panic!("the tray projects {id}, which the registry drops"));
+            assert_eq!(shown, action.title, "{id} shows its registry words");
+            assert_eq!(
+                action.category, NOTES_CATEGORY,
+                "{id} projects out of the section the capability gates"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retitled_notes_verb_reaches_the_tray_in_every_state_it_can_be_in() {
+        // The failure DW-195 names: a rename that reaches the palette, the
+        // cheat sheet and the menu bar and stops at the menu bar icon. Every
+        // composed label has to CONTAIN the registry's word — including the two
+        // empty states, which is where a suffix substituted for the base word
+        // instead of appended to it would hide the old spelling.
+        let labels = tray_notes_labels(true).expect("the notes section projects");
+        for state in [
+            TrayNotesState {
+                vault: true,
+                hotkey_registered: true,
+            },
+            TrayNotesState {
+                vault: false,
+                hotkey_registered: true,
+            },
+            TrayNotesState {
+                vault: true,
+                hotkey_registered: false,
+            },
+            TrayNotesState::default(),
+        ] {
+            let painted = labels.painted(state);
+            for ((id, base), (_, shown)) in tray_notes_pairs(&labels)
+                .into_iter()
+                .zip(tray_notes_pairs(&painted))
+            {
+                assert!(
+                    shown.starts_with(base),
+                    "{id} in {state:?} shows {shown:?}, which does not start with the \
+                     registry's {base:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_empty_states_are_said_in_words_and_only_on_the_verbs_they_are_about() {
+        // UX-DR43 and the no-vault wording, kept exactly as `tray.rs` composed
+        // them before this moved — the words a user reads are the story here,
+        // and a projection that silently dropped a suffix would look like a
+        // working tray that lies about a hotkey that never registered.
+        let labels = tray_notes_labels(true).expect("the notes section projects");
+
+        let settled = labels.painted(TrayNotesState {
+            vault: true,
+            hotkey_registered: true,
+        });
+        assert_eq!(settled, labels, "a settled vault adds nothing at all");
+
+        let no_vault = labels.painted(TrayNotesState {
+            vault: false,
+            hotkey_registered: true,
+        });
+        assert_eq!(
+            no_vault.new_note,
+            format!("{}\u{2026} (no vault yet)", labels.new_note)
+        );
+        assert_eq!(
+            no_vault.journal,
+            format!("{}\u{2026} (no vault yet)", labels.journal)
+        );
+        assert_eq!(
+            no_vault.capture, labels.capture,
+            "capture works without a vault — it is the verb that MAKES one usable"
+        );
+
+        let no_hotkey = labels.painted(TrayNotesState {
+            vault: true,
+            hotkey_registered: false,
+        });
+        assert_eq!(
+            no_hotkey.capture,
+            format!("{} \u{2014} hotkey unavailable", labels.capture)
+        );
+        assert_eq!(no_hotkey.new_note, labels.new_note);
+        assert_eq!(no_hotkey.journal, labels.journal);
+
+        // Both at once: a fresh install with no vault and a chord some other app
+        // already holds. Neither suffix eats the other.
+        let neither = labels.painted(TrayNotesState::default());
+        assert_eq!(
+            neither.capture,
+            format!("{} \u{2014} hotkey unavailable", labels.capture)
+        );
+        assert_eq!(neither.new_note, no_vault.new_note);
+    }
+
+    #[test]
+    fn the_tray_projects_three_notes_verbs_and_not_the_section() {
+        // DW-195's own warning, and 46.16's before it: `notes-open`,
+        // `notes-search` and `notes-switch-vault` are registered and
+        // deliberately absent from the menu bar. A projection that widened to
+        // "the Notes category" would grow the tray by three rows nobody asked
+        // for, silently, on the next registry addition.
+        let section: Vec<String> = registry_sections(false, true)
+            .into_iter()
+            .find(|section| section.category == NOTES_CATEGORY)
+            .expect("the Notes section projects")
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(
+            section.len(),
+            NOTES_ACTION_IDS.len(),
+            "the section is the whole registry's; the tray takes three of it"
+        );
+        for absent in ["notes-open", "notes-search", "notes-switch-vault"] {
+            assert!(
+                section.iter().any(|id| id == absent),
+                "{absent} is registered — this test would be vacuous otherwise"
+            );
+        }
+        let labels = tray_notes_labels(true).expect("the notes section projects");
+        let shown: Vec<&str> = tray_notes_pairs(&labels)
+            .iter()
+            .map(|(_, label)| *label)
+            .collect();
+        for absent in ["Open Note", "Search Notes", "Switch Vault"] {
+            assert!(
+                !shown.contains(&absent),
+                "{absent} reached the tray: {shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tray_builds_no_notes_section_when_the_capability_is_off() {
+        // Absent, not disabled (FR-122), and the same gate the other three
+        // surfaces apply — `registry_sections`' own, not a second one that could
+        // disagree with it.
+        assert_eq!(tray_notes_labels(false), None);
+        assert!(
+            tray_notes_labels(true).is_some(),
+            "…and it is the flag doing it, not an unconditional None"
+        );
+    }
+
+    #[test]
+    fn the_notes_labels_land_on_the_handle_they_belong_to_whatever_the_registry_order() {
+        // The hazard that makes this a struct of named fields rather than a
+        // Vec. The tray's items are built once and only mutated (AD-61), so
+        // their slot order is the TRAY's; a positional projection would move
+        // "Quick Capture" onto the New Note handle the day the registry is
+        // reshuffled. Pinned by matching each field against its own id's title
+        // rather than against position.
+        let registry = palette_actions();
+        let title = |id: &str| {
+            registry
+                .iter()
+                .find(|action| action.id == id)
+                .map(|action| action.title.clone())
+                .unwrap_or_else(|| panic!("{id} is registered"))
+        };
+        let labels = tray_notes_labels(true).expect("the notes section projects");
+        assert_eq!(labels.new_note, title(NOTES_NEW_ID));
+        assert_eq!(labels.capture, title(NOTES_CAPTURE_ID));
+        assert_eq!(labels.journal, title(NOTES_JOURNAL_ID));
+        // And the three are distinct, so a field that read another field's id
+        // could not pass the three assertions above by accident.
+        assert_ne!(labels.new_note, labels.capture);
+        assert_ne!(labels.capture, labels.journal);
+        assert_ne!(labels.new_note, labels.journal);
     }
 }

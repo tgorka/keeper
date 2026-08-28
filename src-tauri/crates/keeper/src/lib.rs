@@ -5,9 +5,22 @@
 // default type-layout recursion depth; raise it as matrix-sdk recommends.
 #![recursion_limit = "256"]
 
+mod build_identity;
+// Desktop only: the copy engine drives `keeper_sync`, which is not a
+// dependency on iOS or Android (see this crate's Cargo.toml), and
+// `AppState.copies` is gated the same way. Its three commands already sit
+// inside the `#[cfg(desktop)]` half of the handler list.
 #[cfg(desktop)]
 mod copy_ipc;
 mod debug_log;
+#[cfg(desktop)]
+#[cfg(target_os = "macos")]
+mod pdf_export;
+// The `keeper-file://` asset scheme (Story 45.7). Desktop-only for the same
+// reason `note_protocol` is: it serves files out of a synced folder, and the
+// folder sync it is rooted in is desktop-only.
+#[cfg(desktop)]
+mod file_protocol;
 #[cfg(desktop)]
 mod hotkey;
 mod ipc;
@@ -27,6 +40,16 @@ mod notes_vault;
 #[cfg(desktop)]
 mod notes_window;
 mod recorder;
+// The `keeper-recording://` asset scheme (Story 42.4). Desktop-only for the same
+// reason `note_protocol` is: it serves the recordings a desktop records into,
+// embedded in notes a desktop syncs.
+#[cfg(desktop)]
+mod recording_protocol;
+#[cfg(desktop)]
+mod sessions_exec;
+mod sessions_ipc;
+#[cfg(desktop)]
+mod sessions_root;
 #[cfg(desktop)]
 mod sync;
 #[cfg(desktop)]
@@ -85,12 +108,28 @@ fn served_as_lfs_filter() -> bool {
 
     // Skipping argv[0]: the parse wants the verb first, and argv[0] is the path
     // git invoked us by.
-    let Some((direction, repo)) = filter::parse_args(std::env::args().skip(1)) else {
+    let Some(invocation) = filter::parse_args(std::env::args().skip(1)) else {
         return false;
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    if let Err(err) = filter::run(&repo, direction, &mut stdin.lock(), &mut stdout.lock()) {
+    let served = match invocation {
+        filter::Invocation::Single { direction, repo } => {
+            filter::run(&repo, direction, &mut stdin.lock(), &mut stdout.lock())
+        }
+        filter::Invocation::Process { repo } => {
+            filter::run_process(&repo, &mut stdin.lock(), &mut stdout.lock())
+        }
+        // Claimed but not implementable by this build — an older binary reached
+        // by a config a newer one wrote. Exiting non-zero and silent on stdout
+        // is the honest answer; opening the GUI here is what git records as a
+        // filter that succeeded and produced nothing (DW-140).
+        filter::Invocation::Unsupported => {
+            eprintln!("keeper: this build cannot serve that lfs filter invocation");
+            std::process::exit(1);
+        }
+    };
+    if let Err(err) = served {
         // stderr, never stdout. git shows this in `GIT_TRACE` and on a required
         // filter's failure, and it is the only channel that is not content.
         eprintln!("keeper: lfs filter failed: {err}");
@@ -103,6 +142,33 @@ fn served_as_lfs_filter() -> bool {
 #[cfg(not(desktop))]
 fn served_as_lfs_filter() -> bool {
     false
+}
+
+/// Whether two paths name the same directory on this machine.
+///
+/// Component equality first, because it is free and answers almost every case
+/// (`Path` already ignores a trailing separator and `.` components). The
+/// `canonicalize` pass behind it exists so a *correct* `mainSyncFolder` is
+/// never reported as wrong: a sync profile's stored `local_path` and the path
+/// the owner typed into `~/.keeper/keeper.toml` routinely differ by a symlink
+/// macOS inserted — `/tmp` is `/private/tmp`, an external volume can be
+/// reached through more than one mount point — and a *false* "your main folder
+/// is not a sync folder" would send someone to fix a file that is already
+/// right. Both sides get the same treatment, and a failure on either side
+/// (a path that vanished between the two calls) falls back to the plain
+/// comparison rather than claiming a match.
+///
+/// Two `stat`-class syscalls at most, on a path already known to exist. Not a
+/// walk: nothing in `setup` may touch a tree before the window is up.
+#[cfg(desktop)]
+fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    matches!(
+        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+        (Ok(left), Ok(right)) if left == right
+    )
 }
 
 /// Application entry point. Registers the plugin set and the typed IPC command
@@ -175,22 +241,113 @@ pub fn run() {
             note_protocol::handle(ctx.app_handle().clone(), &request, responder);
         },
     );
+    // Recording files — the video a recording note embeds — reach the webview
+    // only over this scheme (Story 42.4). A third handler rather than a wider
+    // `keeper-note://`, because that one's vault containment is what makes it
+    // safe and a recording provably lives outside every vault; this one is
+    // contained to the effective recordings destination instead.
+    #[cfg(desktop)]
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        recording_protocol::SCHEME,
+        |ctx, request, responder| {
+            recording_protocol::handle(ctx.app_handle().clone(), &request, responder);
+        },
+    );
+    // Files inside a synced folder — the image, audio or video a panel opens
+    // (Story 45.7), and the PDF a document viewer draws (Story 45.8) — reach
+    // the webview only over this scheme. A fourth handler rather than a wider
+    // `keeper-recording://`, whose root is the recordings destination and which
+    // AD-74 forbids the Files surface from reaching, and rather than a wider
+    // `keeper-note://`, whose root is the notes SUBFOLDER and therefore narrower
+    // than the tree the Files pane browses. This one is contained to the sync
+    // profile's own root, through the same `browse::resolve` the listing uses.
+    #[cfg(desktop)]
+    let builder = builder.register_asynchronous_uri_scheme_protocol(
+        file_protocol::SCHEME,
+        |ctx, request, responder| {
+            file_protocol::handle(ctx.app_handle().clone(), &request, responder);
+        },
+    );
     let builder = builder
         .setup(|app| {
-            // Forward every incoming `keeper://oauth/callback` deep link to the
-            // OAuth-callback registry, which matches it to its in-flight OIDC
-            // flow by the `state` query param (Story 2.2). An unmatched / spurious
-            // callback is ignored inside `resolve`. The registry lives in the
-            // managed `AppState` and is cloned into the `'static` handler.
-            // Boot-time config import + logging init (Stories 22.5/22.6),
-            // first among the setup steps. Order matters: `config.json` is
-            // imported over the settings table BEFORE `debug_log::init` seeds
-            // the debug gate, so a hand-edited `"debug.mode": true` applies to
-            // this very boot; the import outcome is logged AFTER init so the
-            // subscriber exists to carry it (loudly, for the malformed case).
+            // Boot-time settings layers, config import and logging init
+            // (Stories 22.5/22.6, 46.6/46.7) — first among the setup steps, and
+            // for a sharper reason than "it always was".
+            //
+            // **Everything a person edited by hand must be in force before
+            // anything reads a setting**, and the very next call reads one:
+            // `debug_log::init` seeds the on-disk logging gate from
+            // `debug.mode`. A layer installed after it would apply to the NEXT
+            // boot — which is precisely the boot nobody is trying to debug.
+            // Hotkeys (below, ~:290), the tray's `system.menu_bar_presence`
+            // (~:325) and the engine's `sync.git_path` (~:445) are the same
+            // argument one step further out: every one of them is read inside
+            // this `setup`, so every one of them is layered only because the
+            // stack is installed here. Hence, in order:
+            //
+            //   1. `config::load_app_layers` + `config::install` — the TOML
+            //      stack (AD-98/AD-99). `registry::get_setting` consults it
+            //      ahead of the `settings` table, so installing it is what puts
+            //      all ~40 typed getters on layered values at once, each still
+            //      clamping its own value exactly as before.
+            //   2. `install_folder_tier` — AD-101's phase one, not two: the
+            //      folder tier resolves each profile's own `.keeper/*.toml` when
+            //      the profile is READ, so it needs only the host label and
+            //      which folder is main — both known here — and never `sync.db`.
+            //      That is what dissolves the cycle AD-101 predicted.
+            //   3. `import_config_file` — unchanged, and now the LOWEST layer.
+            //      It still writes `config.json`'s keys into the settings rows,
+            //      and a TOML layer setting the same key still wins at read
+            //      time. Ordered after the install only so this reads in
+            //      precedence order; it reads no setting itself.
+            //   4. `debug_log::init` — seeds the gate from the layered view.
+            //
+            // Every outcome is logged AFTER init, so the subscriber exists to
+            // carry it. The faults especially: a settings file that did not
+            // load is invisible by construction, and this is the only record of
+            // it until someone opens Settings.
             if let Ok(data_dir) = app.state::<ipc::AppState>().platform.data_dir() {
+                let host = keeper_core::config::read_host_label();
+                // No `HOME`, no user-global layer — and therefore no main
+                // folder either, since only `~/.keeper/` may name one. Not
+                // `temp_dir()` as a fallback the way `debug_log::app_log_path`
+                // uses one: a log file in `/tmp` is a lost log, but READING
+                // settings out of a world-writable directory would let any
+                // local process choose this app's hotkeys and sync paths.
+                let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                let layers = match home.as_deref() {
+                    Some(home) => keeper_core::config::load_app_layers(home, &host),
+                    None => keeper_core::config::AppLayers::default(),
+                };
+                #[cfg(desktop)]
+                keeper_sync::profile::install_folder_tier(keeper_sync::profile::FolderTier::new(
+                    host,
+                    layers.main_folder.clone(),
+                ));
+                keeper_core::config::install(layers);
                 let imported = keeper_core::registry::import_config_file(&data_dir);
                 debug_log::init(&data_dir);
+                // First, so every line under it can be read as "this build said".
+                build_identity::announce();
+                for fault in keeper_core::config::faults() {
+                    // `Display`, not `summary()`: the log form keeps `toml`'s
+                    // own caret diagram over the offending line, which is the
+                    // only thing that locates a typo. The Settings pane takes
+                    // the one-line form instead.
+                    tracing::error!(fault = %fault, "settings file: this layer was skipped");
+                }
+                let layered: Vec<String> = keeper_core::config::overrides()
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect();
+                if !layered.is_empty() {
+                    tracing::info!(keys = ?layered, "settings: these are set by a file");
+                }
+                if home.is_none() {
+                    tracing::warn!(
+                        "settings: HOME is unset, so no ~/.keeper/*.toml was read this boot"
+                    );
+                }
                 match imported {
                     Ok(keys) if keys.is_empty() => {}
                     Ok(keys) => {
@@ -202,6 +359,11 @@ pub fn run() {
                 }
             }
 
+            // Forward every incoming `keeper://oauth/callback` deep link to the
+            // OAuth-callback registry, which matches it to its in-flight OIDC
+            // flow by the `state` query param (Story 2.2). An unmatched / spurious
+            // callback is ignored inside `resolve`. The registry lives in the
+            // managed `AppState` and is cloned into the `'static` handler.
             let flows = app.state::<ipc::AppState>().oauth_flows.clone();
             app.deep_link().on_open_url(move |event| {
                 for url in event.urls() {
@@ -250,6 +412,56 @@ pub fn run() {
             // and the in-app ⌘⌥K as the two paths that always work.
             #[cfg(desktop)]
             hotkey::install_capture(app.handle());
+
+            // Give the prewarmed capture window the resizability and size its
+            // remembered placement asks for (Story 46.15, FR-192).
+            //
+            // The window is declared `resizable: false` in `tauri.conf.json`
+            // and created before anything has read a setting, so it boots
+            // locked whatever the person last chose. Without this, someone who
+            // unlocked and resized it yesterday finds it today showing an open
+            // padlock, at the size they left it, with edges that do not answer
+            // — the lock reduced to a label.
+            //
+            // Here rather than inside `notes_window::show`, deliberately: the
+            // hotkey path is `set_position` → `show` → `set_focus` and NFR-27's
+            // 300 ms has no room for a sqlite read in front of it. Done once,
+            // at boot, it costs that path nothing and is correct for every
+            // press afterwards.
+            #[cfg(desktop)]
+            {
+                let placement = app
+                    .state::<ipc::AppState>()
+                    .platform
+                    .data_dir()
+                    .and_then(|dir| {
+                        keeper_core::registry::get_capture_placement(
+                            &dir,
+                            keeper_core::capture::DRAFT_CAPTURE_KEY,
+                        )
+                    })
+                    .unwrap_or_else(|error| {
+                        tracing::debug!(
+                            %error,
+                            "notes: no remembered capture placement; the panel boots locked"
+                        );
+                        keeper_core::capture::Placement::default()
+                    });
+                notes_window::adopt_placement(
+                    app.handle(),
+                    keeper_core::capture::DRAFT_CAPTURE_KEY,
+                    placement,
+                );
+                // …and where it was, once, here (Story 47.5, DW-198). Beside
+                // the size rather than inside `adopt_placement`, because that
+                // one also runs on the lock toggle and a padlock click is not a
+                // request to move a window.
+                notes_window::adopt_position(
+                    app.handle(),
+                    keeper_core::capture::DRAFT_CAPTURE_KEY,
+                    placement,
+                );
+            }
 
             // Store the app handle for the desktop notifier port (Story 10.1) so
             // `Platform::notify` can post native notifications from the sync loop, and
@@ -391,6 +603,68 @@ pub fn run() {
                 sync::start_supervisor(std::sync::Arc::clone(&state.platform));
             }
 
+            // AD-101's phase two: the one fact about the layer stack that
+            // could not be checked until the engine existed.
+            //
+            // **`mainSyncFolder` is the hinge of the entire shared layer, and
+            // a wrong one fails silently.** Phase one can prove the path
+            // exists and is a directory; it cannot prove it is a SYNC folder,
+            // because that lives in `sync.db`, which the supervisor above has
+            // just opened. So a typo that happens to name a real directory
+            // reads two files that are not there, finds nothing, and disables
+            // `<main>/.keeper/keeper.toml` and `keeper.<host>.toml` whole —
+            // looking, from outside, exactly like a configuration that works.
+            // That is the worst failure mode this story can have, so it is
+            // checked here and said out loud twice: in the log, and in
+            // Settings through `config::push_fault`.
+            //
+            // It names the fault and changes nothing else. The keys that layer
+            // did apply stay applied: unwinding them at this point would mean
+            // re-seeding the debug gate, the three hotkeys and the tray from a
+            // different stack halfway through boot, which is a worse thing
+            // than a folder that is honestly reported as wrong.
+            #[cfg(desktop)]
+            if let Some(main) = keeper_core::config::main_folder() {
+                // No engine means no usable `git`, which the `git` report
+                // already says far more usefully than a fault blaming the
+                // folder for git's absence would. Nothing to check against.
+                if let Some(engine) = sync::engine_if_open() {
+                    match engine.list_profiles() {
+                        // Disabled profiles count. A paused folder is still a
+                        // sync folder whose `.keeper/*.toml` phase one read off
+                        // the disk, so its layer really is in force and calling
+                        // it missing would be a fault about nothing.
+                        Ok(profiles) => {
+                            if !profiles.iter().any(|p| same_folder(&p.local_path, &main)) {
+                                let fault = keeper_core::config::LayerFault::late(
+                                    keeper_core::config::LayerFaultKind::MainFolderNotAProfile,
+                                    main.clone(),
+                                    "mainSyncFolder names a folder keeper does not sync, so the \
+                                     keeper.toml files inside it were not read. Add that folder \
+                                     in Settings > Sync, or point mainSyncFolder at a folder you \
+                                     already sync.",
+                                );
+                                tracing::error!(
+                                    fault = %fault,
+                                    "settings: the shared layer is not in force"
+                                );
+                                keeper_core::config::push_fault(fault);
+                            }
+                        }
+                        Err(error) => {
+                            // An unreadable profile list is the engine's
+                            // problem, not the folder's. Saying "your main
+                            // folder is wrong" here would send someone to edit
+                            // a file that is fine.
+                            tracing::warn!(
+                                %error,
+                                "settings: could not check mainSyncFolder against the sync folders"
+                            );
+                        }
+                    }
+                }
+            }
+
             // Build the vault registry and tap the engine's watcher (Epic 35,
             // AD-54/AD-56). After the supervisor, because the tap is the engine's
             // and there is nothing to subscribe to before it exists; a machine
@@ -398,6 +672,13 @@ pub fn run() {
             // returns quietly — `CapabilitiesVm.notes` is already false there.
             #[cfg(desktop)]
             notes_vault::start(app.handle());
+
+            // Build the sessions-root registry beside it (Phase 7, AD-107/108):
+            // the same construction over the same engine tap, and the same quiet
+            // return where no engine exists — `CapabilitiesVm.sessions` is
+            // already false there.
+            #[cfg(desktop)]
+            sessions_root::start(app.handle());
 
             Ok(())
         });
@@ -428,6 +709,14 @@ pub fn run() {
                 // `invoke` rejection the frontend would have to special-case.
                 ipc::sync_git_status,
                 ipc::sync_git_path_set,
+                // In the shared body rather than spliced in as a desktop
+                // `$extra` (Story 46.7): `~/.keeper/*.toml` is read by
+                // `keeper_core::config`, which has no desktop gate, so the
+                // question "where did this value come from?" has an honest
+                // answer on every platform. A phone answering "Command
+                // config_layers not found" would force the Settings surface to
+                // special-case a call it can always make.
+                ipc::config_layers,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,
@@ -467,6 +756,7 @@ pub fn run() {
                 ipc::draft_mirror_unsubscribe,
                 ipc::search_archive,
                 ipc::search_recordings,
+                ipc::recording_note_targets,
                 ipc::export_start,
                 ipc::export_cancel,
                 ipc::reveal_path,
@@ -573,6 +863,8 @@ pub fn run() {
                 ipc::launch_at_login_set,
                 ipc::menu_bar_presence_get,
                 ipc::menu_bar_presence_set,
+                ipc::sessions_spaces_folded_get,
+                ipc::sessions_spaces_folded_set,
                 ipc::debug_mode_get,
                 ipc::debug_mode_set,
                 ipc::debug_log_tail,
@@ -598,6 +890,8 @@ pub fn run() {
                 ipc::recording_settings_set,
                 ipc::recording_session_summary,
                 ipc::recording_retitle,
+                ipc::recording_session_meta,
+                ipc::recording_meta_update,
                 ipc::recording_note_stub,
                 ipc::recording_note_stub_save,
                 ipc::recording_note_stub_dismiss,
@@ -622,7 +916,48 @@ pub fn run() {
         sync_ipc::sync_folder_now,
         sync_ipc::sync_verify,
         sync_ipc::sync_rescan,
+        sync_ipc::sync_footprint,
         sync_ipc::sync_open_path,
+        // The Files tab's listing command and its actions (Story 43.8; the text
+        // read added by Story 45.6). Desktop-only with the rest of sync: a build
+        // with no folder sync has no synced folder to browse.
+        sync_ipc::sync_browse,
+        sync_ipc::sync_open_entry,
+        sync_ipc::sync_read_text,
+        sync_ipc::sync_export_pdf,
+        // On-demand hydration for one virtual path (Story 56.3, FR-338).
+        // Beside the read commands because it is the same address — profile id
+        // plus the subpath the listing produced — and desktop-only with the
+        // rest of sync.
+        sync_ipc::sync_materialize_entry,
+        // And the two verbs beside it that the row offers once the content is
+        // here (Story 56.9, FR-343, FR-334): let it go again, and hold it
+        // against being let go. Desktop-only with the rest of sync — `mod
+        // sync_ipc` is itself `#[cfg(desktop)]`, so neither has a
+        // `#[cfg(not(desktop))]` twin to name.
+        sync_ipc::sync_release_entry,
+        sync_ipc::sync_pin_entry,
+        // The document reader (Story 45.8). Returns a bounded projection of a
+        // PDF, DOCX, PPTX or XLSX; the bytes themselves never cross IPC.
+        sync_ipc::sync_read_document,
+        // Export (Story 45.21). Reads inside the profile, writes outside it, so
+        // it is here rather than with the write commands below: it needs no
+        // vault and refuses nothing for being outside one.
+        sync_ipc::sync_export_entry,
+        // And the write half (Story 45.3, AD-89, which retired AD-75). Every
+        // one of these goes through `notes_vault`'s single writer and refuses
+        // anything outside a notes vault; the decisions are in
+        // `keeper_sync::files_write`, and these are the call sites.
+        sync_ipc::sync_write_entry,
+        sync_ipc::sync_delete_plan,
+        sync_ipc::sync_delete_entries,
+        sync_ipc::sync_create_entry,
+        // A file's own properties (Story 50.4, FR-283). Beside the write
+        // commands because they are one question: the same `WriteScope::route`
+        // decides whether a file's properties may be read and whether they may
+        // be written, so a panel is never offered where a write would refuse.
+        sync_ipc::sync_read_frontmatter,
+        sync_ipc::sync_write_frontmatter,
         sync_ipc::sync_subscribe_progress,
         sync_ipc::sync_unsubscribe_progress,
         sync_ipc::sync_activity,
@@ -637,51 +972,125 @@ pub fn run() {
         copy_ipc::copy_start,
         copy_ipc::copy_status,
         copy_ipc::copy_cancel,
+        sessions_ipc::sessions_roots,
+        sessions_ipc::sessions_list,
+        sessions_ipc::sessions_rescan,
+        sessions_ipc::sessions_detail,
+        sessions_ipc::sessions_tree,
+        sessions_ipc::sessions_refs,
+        sessions_ipc::sessions_patterns,
+        sessions_ipc::sessions_create,
+        sessions_ipc::sessions_log_today,
+        sessions_ipc::sessions_migrate_preview,
+        sessions_ipc::sessions_migrate,
+        sessions_ipc::sessions_record_migrate,
+        sessions_ipc::sessions_set_pinned,
+        sessions_ipc::sessions_archive,
+        sessions_ipc::sessions_delete,
+        sessions_ipc::sessions_unarchive,
+        sessions_ipc::sessions_spaces,
+        sessions_ipc::sessions_space_files,
+        sessions_ipc::sessions_space_save,
+        // The repair beside `save`, not beside the reads: it IS a save (Story
+        // 53.4), delegating to the one above it.
+        sessions_ipc::sessions_space_narrow,
+        sessions_ipc::sessions_space_delete,
+        sessions_ipc::sessions_spaces_restore,
+        sessions_ipc::sessions_template_install,
+        sessions_ipc::sessions_template_entries,
+        sessions_ipc::sessions_template_rename,
+        sessions_ipc::sessions_template_file_new,
+        sessions_ipc::sessions_template_dir_new,
+        sessions_ipc::sessions_template_rename_entry,
+        sessions_ipc::sessions_template_delete_entry,
+        sessions_ipc::sessions_file_new,
+        sessions_ipc::sessions_dir_new,
+        sessions_ipc::sessions_file_new_kind,
+        sessions_ipc::sessions_file_delete,
+        sessions_ipc::sessions_file_rename,
+        sessions_ipc::sessions_file_path,
+        sessions_ipc::sessions_task_move,
+        sessions_ipc::sessions_ref_candidates,
+        sessions_ipc::sessions_ref_add,
+        sessions_ipc::sessions_search,
+        sessions_ipc::sessions_search_cancel,
         notes_ipc::notes_vaults,
         notes_ipc::notes_vault_flag,
         notes_ipc::notes_vault_settings_save,
         notes_ipc::notes_vault_active,
         notes_ipc::notes_vault_set_active,
+        notes_ipc::notes_capture_impact,
         notes_ipc::notes_index_rebuild,
         notes_ipc::notes_list,
         notes_ipc::notes_tag_tree,
         notes_ipc::tags_vocabulary,
         notes_ipc::notes_tree,
+        notes_ipc::notes_gallery,
         notes_ipc::notes_spaces,
         notes_ipc::notes_space_save,
         notes_ipc::notes_space_validate,
+        notes_ipc::notes_space_terms,
+        notes_ipc::notes_spaces_restore_defaults,
+        notes_ipc::notes_widget,
+        notes_ipc::notes_widget_move,
         notes_ipc::notes_create,
         notes_ipc::notes_journal_today,
         notes_ipc::notes_templates,
+        notes_ipc::notes_templates_restore_defaults,
         notes_ipc::notes_open,
         notes_ipc::notes_close,
         notes_ipc::notes_buffer_report,
         notes_ipc::notes_save,
         notes_ipc::notes_rename,
         notes_ipc::notes_set_flag,
+        notes_ipc::notes_set_order,
+        notes_ipc::notes_delete_plan,
         notes_ipc::notes_delete,
         notes_ipc::notes_search,
         notes_ipc::notes_link_targets,
+        notes_ipc::notes_resolve_link,
         notes_ipc::notes_backlinks,
+        notes_ipc::notes_forwardlinks,
+        notes_ipc::notes_field_vocabulary,
         notes_ipc::notes_history,
         notes_ipc::notes_diff,
         notes_ipc::notes_mark_read,
+        notes_ipc::notes_restore_revision,
+        notes_ipc::notes_template_update_preview,
+        notes_ipc::notes_template_update_apply,
         notes_ipc::notes_conflicts,
         notes_ipc::notes_resolve_conflict,
         notes_ipc::notes_attachment_paste,
-        notes_ipc::notes_attachment_drop,
-        notes_ipc::notes_capture_buffer,
-        notes_ipc::notes_capture_buffer_save,
-        notes_ipc::notes_capture_commit,
+        notes_ipc::notes_attach_sources,
+        notes_ipc::notes_attach_targets,
+        notes_ipc::notes_body_read,
+        notes_ipc::notes_body_write,
+        notes_ipc::notes_csv_read,
+        notes_ipc::notes_csv_set_cell,
+        notes_ipc::notes_table_from_csv,
+        notes_ipc::notes_csv_from_table,
+        notes_ipc::notes_embed_paths,
+        notes_ipc::notes_embed_read,
+        notes_ipc::notes_embed_write,
+        notes_ipc::notes_capture_draft,
         notes_ipc::notes_subscribe_changes,
         notes_ipc::notes_unsubscribe_changes,
         notes_ipc::notes_subscribe_index,
         notes_ipc::notes_capture_show,
         notes_ipc::notes_capture_hide,
+        notes_ipc::notes_capture_open,
+        notes_ipc::notes_capture_close,
+        notes_ipc::notes_capture_set_locked,
+        notes_ipc::notes_capture_set_always_on_top,
+        notes_ipc::notes_capture_windows,
         notes_ipc::notes_reveal,
         notes_ipc::notes_open_file,
+        // Export (Story 45.21). Desktop-only with the rest of the Files surface
+        // it shares an engine with; iOS has no folder chooser to pick a
+        // destination from and `CapabilitiesVm.notes` is false there.
+        notes_ipc::notes_export,
     );
-    // The notes surface is desktop-only, but the five commands that touch a window
+    // The notes surface is desktop-only, but the commands that touch a window
     // or a file manager have `Unsupported` twins so the handler list is identical
     // on every target and `cargo check --target aarch64-apple-ios` stays green
     // (AD-27, AD-33). The rest of the notes commands are absent on iOS by
@@ -691,6 +1100,11 @@ pub fn run() {
         builder,
         ipc::notes_capture_show,
         ipc::notes_capture_hide,
+        ipc::notes_capture_open,
+        ipc::notes_capture_close,
+        ipc::notes_capture_set_locked,
+        ipc::notes_capture_set_always_on_top,
+        ipc::notes_capture_windows,
         ipc::notes_reveal,
         ipc::notes_open_file,
     );
@@ -720,6 +1134,34 @@ pub fn run() {
                 // anything. `push_on_blur` decides whether it reaches the network.
                 WindowEvent::Focused(false) => notes_vault::flush(),
                 _ => {}
+            }
+            return;
+        }
+        // A capture window losing focus is when its geometry is written down
+        // (Story 45.15, FR-192; the size since Story 46.15). Blur rather than
+        // `Moved`/`Resized`, which fire once per compositor frame during a
+        // gesture; blur rather than only the close button, because a quit, a
+        // crash-free force-quit and a click on another app are all ways a
+        // window's last position and size become final without anybody pressing
+        // anything.
+        //
+        // Since Story 48.2 a *locked* window's blur writes nothing: what it
+        // reports is keeper's own normalised geometry, and merging that over
+        // the row was how a lock followed by one click elsewhere destroyed the
+        // size the person had chosen. `geometry_of` reads who produced the
+        // geometry along with the geometry, and `remember_placement` refuses
+        // it — the rule itself lives in `keeper_core::capture`.
+        if matches!(event, WindowEvent::Focused(false))
+            && keeper_core::capture::is_capture_label(window.label())
+        {
+            let app = window.app_handle();
+            if let Some(key) = notes_window::key_for_label(window.label()) {
+                let live = notes_window::geometry_of(app, &key);
+                notes_ipc::remember_placement(
+                    app.state::<ipc::AppState>().platform.as_ref(),
+                    &key,
+                    live,
+                );
             }
         }
     });

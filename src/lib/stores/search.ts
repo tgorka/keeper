@@ -17,13 +17,36 @@ import { createStore } from "zustand/vanilla";
  */
 export type SearchScope = "global" | "chat";
 
+/**
+ * Which content the surface searches (FR-267).
+ *
+ * Three sources rather than one merged list, because they are three different
+ * searches over three different stores and only the word being looked for is
+ * shared: messages come from the archive, notes from a vault scan, sessions
+ * from a zone scan — and a vault and a zone can never be the same folder, so
+ * there is no single walk that could serve two of them. Merging their results
+ * would also merge their ranking, and a message and a session file have no
+ * common order to be sorted into.
+ *
+ * `"chat"` scope always means `"messages"`: an in-chat search is a search of
+ * that chat.
+ */
+export type SearchSource = "messages" | "notes" | "sessions";
+
 export interface SearchState {
   /** Whether the search overlay is open. */
   isOpen: boolean;
   /** The scope the surface was opened with (meaningful only while open). */
   scope: SearchScope;
-  /** Open the surface with the given scope (global or chat-locked). */
-  open: (scope: SearchScope) => void;
+  /**
+   * Which content the surface is searching. Set when it opens, from the view
+   * the chord was pressed in, and switchable from the surface itself.
+   */
+  source: SearchSource;
+  /** Open the surface with the given scope and source. */
+  open: (scope: SearchScope, source?: SearchSource) => void;
+  /** Switch sources without closing — the query survives the switch. */
+  setSource: (source: SearchSource) => void;
   /** Close the surface; the overlay discards its results on unmount. */
   close: () => void;
 }
@@ -32,7 +55,12 @@ export interface SearchState {
 export const searchStore = createStore<SearchState>()((set) => ({
   isOpen: false,
   scope: "global",
-  open: (scope) => set({ isOpen: true, scope }),
+  source: "messages",
+  open: (scope, source) =>
+    // A chat-locked surface is a message search by construction; anything else
+    // opens on what it was told, defaulting to messages as it always did.
+    set({ isOpen: true, scope, source: scope === "chat" ? "messages" : (source ?? "messages") }),
+  setSource: (source) => set({ source }),
   close: () => set({ isOpen: false }),
 }));
 

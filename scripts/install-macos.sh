@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
 #
-# Build the app on a macOS host and install it into /Applications there.
+# Build the app on a macOS host, SIGN it, and install it into /Applications there.
 #
-# The counterpart of `check-macos.sh`, and for the same reason: the `keeper`
-# shell crate cannot be built on Linux (Tauri needs GTK/glib) and the recording
-# sidecar cannot be built anywhere but macOS (Swift + Xcode). So a Linux
+# The counterpart of `check-macos.sh`, and for the same reason: the recording
+# sidecar is Swift + Xcode, the bundle is a `.app`, and signing needs an
+# identity in a macOS keychain. None of those cross-compile, so a Linux
 # workstation that wants a running Mac app has to build it on the Mac.
+#
+# Note the reason is the BUNDLE, not the shell crate: `cargo build -p keeper`
+# succeeds on Linux (GTK/glib are present in the dev container), which is what
+# makes `bun run dev` and the Rust suite usable there. Only this last mile —
+# sidecar, bundle, signature — is Mac-bound.
+#
+# The build runs inside the Mac's GUI login session, because that is the only
+# session that can reach the signing identity's private key. A Terminal.app
+# window opens on the Mac and its output is streamed back here; it closes when
+# the build succeeds. There is no unsigned path: see the long comment further
+# down for what an ad-hoc install costs.
 #
 # Usage:
 #   scripts/install-macos.sh [host]        # default host: $KEEPER_MACOS_HOST or "hesperia"
 #   KEEPER_MACOS_BUILD_ONLY=1 scripts/install-macos.sh    # bundle, do not install
 #
-# Requirements on the remote: a Rust toolchain, bun, Xcode, rsync — and ~6 GB
-# free, because a release build of matrix-sdk plus gitoxide is not small.
+# Requirements on the remote: a Rust toolchain, bun, Xcode, rsync, a codesigning
+# identity in the login keychain — and ~6 GB free, because a release build of
+# matrix-sdk plus gitoxide is not small. `$APPLE_SIGNING_IDENTITY` picks one when
+# the keychain holds several; with exactly one it is found automatically.
 #
 # Nothing is committed or pushed. The previous bundle is kept beside the new one
 # as `keeper.app.previous` until the next install replaces it.
@@ -65,48 +78,40 @@ say "bun install"
 remote "cd \$HOME/$REMOTE_DIR && $REMOTE_ENV && bun install --frozen-lockfile --ignore-scripts" \
   || fail "bun install"
 
-# `--bundles app` because the dmg is not wanted here, and
-# `createUpdaterArtifacts: false` because the updater tarball is signed with
-# TAURI_SIGNING_PRIVATE_KEY — a release secret this host does not have, and
-# asking for it anyway turns a perfectly good build into a non-zero exit after
-# the bundle is already on disk. `--config` merges in order, so the second one
-# overrides the first.
-say "tauri build --bundles app (sidecar, vite, cargo release)"
-remote "cd \$HOME/$REMOTE_DIR && $REMOTE_ENV && bun run rec:build && bunx tauri build --config src-tauri/crates/keeper/tauri.conf.json --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}' --bundles app" \
-  || fail "app build"
-
-remote "test -d $BUNDLE" || fail "no bundle at $BUNDLE"
-say "built: $(remote "/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' $BUNDLE/Contents/Info.plist") ($(remote "stat -f '%Sm' $BUNDLE/Contents/MacOS/keeper"))"
+# --- Build, sign and install, inside the Mac's GUI login session -----------
+#
+# Everything below happens through `keeper_gui_sh`, and it has to. Signing
+# needs the identity's private key out of the login keychain, which only a
+# process in the user's GUI session can have: over ssh `codesign` fails with
+# `errSecInternalComponent`, `launchctl asuser` needs root, and
+# `security unlock-keychain` needs the password. Telling Terminal.app to do the
+# work needs none of the three.
+#
+# This script used to build over ssh and merely WARN that the result was ad-hoc.
+# The warning was correct and useless: an ad-hoc bundle's designated
+# requirement is a bare cdhash, so every install looked like a brand-new app to
+# macOS, the Screen Recording grant stopped matching, Privacy & Security grew
+# another dead "keeper" row, and every keychain "Always Allow" was void. That
+# ran for weeks. Building unsigned is no longer an option this script offers.
+#
+# The payload is `build-macos-signed.sh`, unchanged and shared with the
+# run-it-on-the-Mac path, so there is one build, one identity lookup, one
+# signature check and one install rather than a second implementation here.
+say "building and signing in the GUI session on $HOST (Terminal.app opens there)"
+GUI_ARGS=""
+if [ -z "${KEEPER_MACOS_BUILD_ONLY:-}" ]; then
+  GUI_ARGS="--install"
+fi
+remote "cd \$HOME/$REMOTE_DIR && . scripts/lib/macos-signing.sh && keeper_gui_sh <<'PAYLOAD'
+set -euo pipefail
+cd \$HOME/$REMOTE_DIR
+$REMOTE_ENV
+bash scripts/build-macos-signed.sh $GUI_ARGS
+PAYLOAD" || fail "signed build"
 
 if [ -n "${KEEPER_MACOS_BUILD_ONLY:-}" ]; then
   say "build only; leaving $DEST alone"
   exit 0
 fi
-
-# Quit-then-replace, not replace-in-place: a running app keeps its old inode, so
-# copying over it leaves the user driving the previous build while the disk says
-# otherwise. /Applications is group-writable by admin, so this needs no sudo.
-say "installing"
-remote "$(cat <<REMOTE
-set -uo pipefail
-if pgrep -f "$DEST/Contents/MacOS/keeper" > /dev/null; then
-  osascript -e 'quit app "keeper"' 2>/dev/null
-  for _ in \$(seq 1 20); do
-    pgrep -f "$DEST/Contents/MacOS/keeper" > /dev/null || break
-    sleep 0.5
-  done
-  pgrep -f "$DEST/Contents/MacOS/keeper" > /dev/null && pkill -f "$DEST/Contents/MacOS/keeper"
-  sleep 1
-fi
-rm -rf "$DEST.previous"
-[ -d "$DEST" ] && mv "$DEST" "$DEST.previous"
-ditto "$BUNDLE" "$DEST" || { [ -d "$DEST.previous" ] && mv "$DEST.previous" "$DEST"; exit 1; }
-# The quarantine bit is for downloads; this bundle was built on this machine.
-xattr -dr com.apple.quarantine "$DEST" 2>/dev/null
-open -a "$DEST"
-sleep 4
-pgrep -f "$DEST/Contents/MacOS/keeper" > /dev/null || { echo "installed but not running"; exit 1; }
-REMOTE
-)" || fail "install"
 
 say "installed and running: $DEST"

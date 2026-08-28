@@ -5,9 +5,21 @@
  */
 export type SyncPendingVm = { path: string, 
 /**
- * `settling` | `untracked` | `modified` | `added` | `deleted`.
+ * `settling` | `untracked` | `modified` | `added` | `deleted` | `incoming`
+ * | `incomingUpdate`.
+ *
+ * The first five are what this machine changed; `incoming` is an LFS
+ * object queued to arrive, which `git status` cannot see and which used to
+ * leave a folder pulling 53 GB reporting nothing as pending at all.
  */
 reason: string, 
+/**
+ * How big the thing waiting is: announced, for an object that has not
+ * arrived; measured off the worktree for one that has not left. `null`
+ * only where there is nothing to measure — a deletion has no file, and a
+ * path that vanished between the walk and the stat has no size to report.
+ */
+sizeBytes: number | null, 
 /**
  * When the quiescence episode began, for `settling` only. The UI renders
  * it as "waiting for writes to stop", not as a countdown: the window

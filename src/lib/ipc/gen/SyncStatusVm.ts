@@ -28,6 +28,12 @@ line: string, filesDone: number, filesTotal: number | null, bytesDone: number, b
  */
 settling: number, 
 /**
+ * Transfers still to be delivered, and their bytes. `line` says both in
+ * words; the numbers are here so a surface can show them without parsing
+ * prose, the same reason `settling` is.
+ */
+queuedFiles: number, queuedBytes: number, 
+/**
  * Sticky, last-write-wins, cleared only by a clean run — the same shape as
  * `RecordingStatusVm::warning` so the banner behaves identically.
  */

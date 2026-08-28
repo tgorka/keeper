@@ -267,6 +267,55 @@ pub enum StoredSession {
     },
 }
 
+/// A persisted `session/<id>` Keychain blob, in flight between the restore scan
+/// and [`crate::account`]'s `activate`.
+///
+/// A newtype rather than a bare `String` because the value now travels inside a
+/// struct and across a function boundary instead of staying a local: a derived
+/// `Debug` on session material is how access tokens reach log files (NFR-26,
+/// AD-53), so this owns a hand-written one. Deliberately not `Serialize` — the
+/// blob must never cross IPC (AD-1, NFR-9); only the sibling [`AccountVm`] may.
+#[derive(Clone)]
+pub struct SessionBlob(String);
+
+impl std::fmt::Debug for SessionBlob {
+    /// Hand-written for the same reason `keeper_sync::credential::AccessToken`'s
+    /// is: a derived `Debug` on a secret is how tokens reach log files (NFR-26).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SessionBlob").field(&"<redacted>").finish()
+    }
+}
+
+impl SessionBlob {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    /// The raw JSON, for the two parsers that must see it
+    /// ([`StoredSession::from_json`] and the legacy-provider inference).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One restorable account: its non-secret [`AccountVm`] plus the
+/// `session/<id>` blob the scan had to read to establish that it *is*
+/// restorable.
+///
+/// The pair exists so the blob can be handed to `activate` rather than read a
+/// second time. Every macOS keychain read that returns data re-evaluates the
+/// item's ACL, so a second read of one item is a second "keeper wants to use
+/// your confidential information" dialog — the scan and the activation were
+/// costing two dialogs per account for one secret.
+pub struct RestorableAccount {
+    /// Non-secret identity, and the only half of this pair that may cross IPC.
+    pub vm: AccountVm,
+    /// The already-read session blob. Public because `activate` lives in a
+    /// sibling module, and safe to expose only because [`SessionBlob`] cannot be
+    /// printed or serialized — it must still never be logged or put in an error.
+    pub session: SessionBlob,
+}
+
 impl StoredSession {
     /// Extract the persistable session from a freshly-authenticated `client`.
     ///
@@ -655,17 +704,39 @@ pub async fn add_account<P: AuthProvider>(
 
 /// Find every persisted account that can be restored on launch (FR-8, AD-20).
 ///
+/// The non-secret projection of [`scan_restorable_accounts`], and what the
+/// `session_restore` IPC command returns: identity only, never the session blob
+/// the scan read to get it (AD-1, NFR-9). Callers that go on to *activate* an
+/// account want [`scan_restorable_accounts`] instead, so the blob is passed on
+/// rather than read a second time.
+pub fn find_restorable_accounts(platform: &dyn Platform) -> Result<Vec<AccountVm>, CoreError> {
+    Ok(scan_restorable_accounts(platform)?
+        .into_iter()
+        .map(|account| account.vm)
+        .collect())
+}
+
+/// Scan for every persisted account that can be restored on launch (FR-8, AD-20),
+/// keeping each one's already-read session blob.
+///
 /// Lists the non-secret registry rows and returns each whose Keychain session
 /// (`session/<id>`) is still present, built as a non-secret [`AccountVm`]
-/// (opaque account id, Matrix user id, homeserver URL, hue index) from its row.
-/// A registry row **without** a Keychain session is *not* restorable — it is
-/// skipped, not fatal, so a half-torn-down account never blocks the others.
-/// Identity only: this does not activate any account or touch the SDK store (the
-/// lazy inbox/room-list subscribe restores each session). A legacy row whose
-/// `hue_index` is still `NULL` is backfilled here so every returned VM carries a
-/// stable hue. Returns accounts in registry (creation) order; the merged inbox
-/// re-orders their rooms by recency.
-pub fn find_restorable_accounts(platform: &dyn Platform) -> Result<Vec<AccountVm>, CoreError> {
+/// (opaque account id, Matrix user id, homeserver URL, hue index) from its row,
+/// paired with the blob itself. A registry row **without** a Keychain session is
+/// *not* restorable — it is skipped, not fatal, so a half-torn-down account never
+/// blocks the others. Identity only: this does not activate any account or touch
+/// the SDK store (the lazy inbox/room-list subscribe restores each session). A
+/// legacy row whose `hue_index` is still `NULL` is backfilled here so every
+/// returned VM carries a stable hue. Returns accounts in registry (creation)
+/// order; the merged inbox re-orders their rooms by recency.
+///
+/// The blob is carried out rather than dropped because reading it is the
+/// expensive part: on macOS every keychain read that returns data re-evaluates
+/// the item's ACL, so letting `activate` re-read the same `session/<id>` costs a
+/// second authorization dialog for a secret this function already holds.
+pub fn scan_restorable_accounts(
+    platform: &dyn Platform,
+) -> Result<Vec<RestorableAccount>, CoreError> {
     let data_dir = platform.data_dir()?;
     let mut restorable = Vec::new();
     for row in registry::list_accounts(&data_dir)? {
@@ -702,12 +773,15 @@ pub fn find_restorable_accounts(platform: &dyn Platform) -> Result<Vec<AccountVm
                 inferred
             }
         };
-        restorable.push(AccountVm {
-            account_id: row.account_id,
-            user_id: row.user_id,
-            homeserver_url: row.homeserver_url,
-            hue_index,
-            provider,
+        restorable.push(RestorableAccount {
+            vm: AccountVm {
+                account_id: row.account_id,
+                user_id: row.user_id,
+                homeserver_url: row.homeserver_url,
+                hue_index,
+                provider,
+            },
+            session: SessionBlob::new(session_json),
         });
     }
     Ok(restorable)

@@ -106,6 +106,16 @@ vi.mock("@/lib/ipc/client", () => ({
     }),
   ),
   syncGitPathSet: vi.fn(),
+  // Settings → Quick capture (Story 45.16). The section hydrates the vault
+  // mirror and, once it has a vault, reads the template list and the
+  // consequence of the configured tag. Mocked here because a module factory
+  // replaces the WHOLE module: an omitted name is `undefined`, and the failure
+  // is a rejected promise nothing renders rather than an error anyone sees.
+  notesVaults: vi.fn(() => Promise.resolve([])),
+  notesVaultActive: vi.fn(() => Promise.resolve(null)),
+  notesTemplates: vi.fn(() => Promise.resolve([])),
+  notesCaptureImpact: vi.fn(() => Promise.resolve([])),
+  notesVaultSettingsSave: vi.fn(),
   capabilities: vi.fn(),
 }));
 
@@ -127,6 +137,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(() => Promise.resolve(null)),
 }));
 
+import { CAPTURE_SECTION_TITLE } from "@/components/notes/capture-settings";
 import {
   SDK_STORE_ENCRYPTED_STATUS,
   SDK_STORE_UNENCRYPTED_STATUS,
@@ -166,6 +177,7 @@ import { accountsStore } from "@/lib/stores/accounts";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { encryptionStatusStore } from "@/lib/stores/encryption-status";
 import { keyBackupStore } from "@/lib/stores/key-backup";
+import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { resetSyncStoreForTest } from "@/lib/stores/sync";
 import { verificationStore } from "@/lib/stores/verification";
 import { wizardStore } from "@/lib/stores/wizard";
@@ -220,6 +232,7 @@ const DESKTOP_CAPABILITIES = {
   recording: false,
   sync: false,
   notes: false,
+  sessions: false,
   overlayTitleBar: false,
 };
 
@@ -937,5 +950,55 @@ describe("SettingsDialog git report placement", () => {
 
     expect(await screen.findByText(SYNC_GIT_TITLE)).toBeInTheDocument();
     expect(screen.getByText(SYNC_SECTION_TITLE)).toBeInTheDocument();
+  });
+});
+
+/**
+ * Settings is the only door a person reaches the quick-capture settings
+ * through, so the section's own suite proves what it does and this proves it is
+ * there at all (Story 45.16, FR-193).
+ */
+describe("SettingsDialog quick capture", () => {
+  afterEach(() => {
+    resetNotesVaultsStoreForTest();
+  });
+
+  it("renders the section once the vault mirror has one", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+    notesVaultsStore.setState({
+      vaults: [
+        {
+          id: "v1",
+          profileId: "v1",
+          name: "Second Brain",
+          subfolder: "notes",
+          root: "/Users/t/Sync/notes",
+          indexed: true,
+          noteCount: 3,
+          unreadCount: 0,
+          captureTemplate: null,
+          captureTag: null,
+          cadence: { commitIdleMs: 2000, pushIntervalMs: 30000, pushOnBlur: true },
+        },
+      ],
+      activeVaultId: "v1",
+      hydrated: true,
+    });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(CAPTURE_SECTION_TITLE)).toBeInTheDocument();
+    expect(screen.getByLabelText("Tag every capture with")).toBeInTheDocument();
+  });
+
+  /** No vault, nothing to configure — absent, never a dead affordance. */
+  it("renders no section at all when no folder is flagged as a vault", async () => {
+    mockPosture.mockResolvedValue(false);
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+    notesVaultsStore.setState({ vaults: [], activeVaultId: null, hydrated: true });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    await screen.findByText(STORAGE_HONESTY_SENTENCE);
+    expect(screen.queryByText(CAPTURE_SECTION_TITLE)).not.toBeInTheDocument();
   });
 });

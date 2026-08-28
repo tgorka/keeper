@@ -51,12 +51,13 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { Lamp } from "@/components/ui/lamp";
 import { useLongPress } from "@/hooks/use-long-press";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useSwipeActions } from "@/hooks/use-swipe-actions";
 import { accountHueVar } from "@/lib/account-hue";
-import { BRIDGE_HEALTH_DOT_CLASS } from "@/lib/bridges";
+import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
 import { formatRoomTimestamp } from "@/lib/format-time";
 import type { ChatNotifyMode, InboxRoomVm } from "@/lib/ipc/client";
 import {
@@ -211,6 +212,11 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
     : showMention
       ? `, ${mentionCount} unread ${mentionCount === 1 ? "mention" : "mentions"}`
       : ", unread";
+  // Same reason, for the bridge health: the row button carries an explicit
+  // `aria-label`, so anything inside it — including the lamp's own word — is
+  // replaced rather than appended. A room that cannot be reached has to say so
+  // in the name, or the lamp is a picture and nothing else.
+  const healthLabel = affectedHealth === null ? "" : `, ${BRIDGE_HEALTH_LABEL[affectedHealth]}`;
 
   // ---- Phone touch idioms (Story 13.6) ------------------------------------
   // Long-press opens the identical ContextMenu above (the non-gesture duplicate
@@ -256,7 +262,7 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
       type="button"
       tabIndex={tabIndex}
       onClick={onRowClick}
-      aria-label={`Conversation with ${room.displayName}${unreadLabel}`}
+      aria-label={`Conversation with ${room.displayName}${unreadLabel}${healthLabel}`}
       aria-current={selected ? "true" : undefined}
       className={cn(
         "relative flex h-16 w-full shrink-0 items-center gap-3 py-0 pr-3 pl-4 text-left",
@@ -276,17 +282,17 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex items-baseline justify-between gap-2">
           <span className="flex min-w-0 items-center gap-1.5">
-            {/* Affected-row health dot (Story 6.5): shown iff this room's
+            {/* Affected-row health lamp (Story 6.5): shown iff this room's
                     (accountId, networkId) session is unhealthy — a persistent,
-                    Rust-authoritative indicator, never re-derived here. */}
+                    Rust-authoritative indicator, never re-derived here. It was
+                    an `aria-hidden` coloured dot, so the one thing marking a
+                    room as unreachable was invisible to a screen reader and
+                    indistinguishable from healthy to a dichromat. */}
             {affectedHealth !== null && (
-              <span
-                aria-hidden="true"
+              <Lamp
+                state={BRIDGE_HEALTH_LAMP[affectedHealth]}
+                label={null}
                 data-testid="bridge-health-dot"
-                className={cn(
-                  "size-2 shrink-0 rounded-full",
-                  BRIDGE_HEALTH_DOT_CLASS[affectedHealth],
-                )}
               />
             )}
             <span className={cn("truncate text-sm", isUnread ? "font-semibold" : "font-medium")}>
@@ -309,8 +315,11 @@ export const ChatRow = forwardRef<HTMLButtonElement, ChatRowProps>(function Chat
               />
             ) : null}
           </span>
+          {/* A column of times read down the list: tabular so a 1 is as wide as
+              a 7 and the column edge does not ripple row to row. Sans, not the
+              register's mono, because this slot also says "Yesterday". */}
           {timestamp !== null && (
-            <span className="shrink-0 text-muted-foreground text-xs">{timestamp}</span>
+            <span className="figures shrink-0 text-muted-foreground text-xs">{timestamp}</span>
           )}
         </div>
         <div className="flex items-center justify-between gap-2">

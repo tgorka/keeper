@@ -26,13 +26,17 @@
 # login keychain holds exactly one codesigning identity. Keychain access needs a
 # GUI login session: run this from Terminal.app on the Mac, not over SSH
 # (codesign fails with `errSecInternalComponent` from a non-GUI session).
+#
+# From a Linux workstation, do not run this over ssh yourself — use
+# `bun run install:macos`, which rsyncs the tree and then dispatches THIS script
+# into the Mac's GUI session for exactly that reason.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-BUNDLE_ID="dev.tgorka.keeper"
+# BUNDLE_ID is resolved from tauri.conf.json below, once the library is sourced.
 APP="src-tauri/target/release/bundle/macos/keeper.app"
 INSTALLED="/Applications/keeper.app"
 
@@ -50,62 +54,37 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 # --- Resolve a stable signing identity -------------------------------------
-if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
-  # `security find-identity` prints `  1) <sha1> "Name"`; keep the quoted names.
-  IDENTITIES="$(security find-identity -v -p codesigning | sed -n 's/^ *[0-9]*) [0-9A-F]* "\(.*\)"$/\1/p')"
-  COUNT="$(printf '%s\n' "$IDENTITIES" | grep -c . || true)"
-  if [ "$COUNT" -eq 0 ]; then
-    cat >&2 <<'EOF'
-error: no codesigning identity found in the login keychain.
+# Identity resolution and the signature check live in lib/macos-signing.sh,
+# because install-macos.sh has to make exactly the same two decisions and a
+# second copy is how they drifted apart the first time.
+. "$SCRIPT_DIR/lib/macos-signing.sh"
 
-Real capture needs a stable signature (see docs/recording.md). Create a free
-Apple Development certificate (Xcode > Settings > Accounts > Manage Certificates
-> + > Apple Development), then re-run. Without one, every rebuild re-prompts for
-Screen Recording and the grant never sticks.
-EOF
-    exit 1
-  fi
-  if [ "$COUNT" -gt 1 ]; then
-    echo "error: multiple codesigning identities found; set APPLE_SIGNING_IDENTITY to one of:" >&2
-    printf '  %s\n' $(printf '%s\n' "$IDENTITIES" | sed 's/^/"/;s/$/"/') >&2
-    exit 1
-  fi
-  APPLE_SIGNING_IDENTITY="$IDENTITIES"
-fi
+BUNDLE_ID="$(keeper_bundle_id)"
+APPLE_SIGNING_IDENTITY="$(keeper_signing_identity)"
 export APPLE_SIGNING_IDENTITY
 echo "==> Signing identity: $APPLE_SIGNING_IDENTITY"
+echo "==> Bundle identifier: $BUNDLE_ID"
 
 # --- Build (sidecar signs itself off the exported identity) ----------------
 # createUpdaterArtifacts is disabled for local builds: the updater's minisign
 # private key is a release-only secret, and without it Tauri fails the build
 # *after* bundling. Merged in as an overlay so the committed config stays clean.
+# Bundles: `app` by default because the install path wants the bundle that goes
+# straight into /Applications, and building the disk image as well adds minutes
+# to every install. `release-macos.sh` needs the dmg and asks for it through
+# `KEEPER_BUNDLES` — this used to be a comment claiming release-macos.sh "owns"
+# the dmg with no way for it to say so, and the release failed at the
+# `[ -f "$DMG" ]` check after a full signed build.
+KEEPER_BUNDLES="${KEEPER_BUNDLES:-app}"
+echo "==> Bundles: $KEEPER_BUNDLES"
 bash "$SCRIPT_DIR/build-keeper-rec.sh"
 bunx tauri build \
   --config src-tauri/crates/keeper/tauri.conf.json \
-  --config '{"bundle":{"createUpdaterArtifacts":false}}'
+  --config '{"bundle":{"createUpdaterArtifacts":false}}' \
+  --bundles "$KEEPER_BUNDLES"
 
 # --- Verify the signature is actually stable -------------------------------
-# A silent fallback to ad-hoc would reintroduce the prompt loop, so treat a
-# cdhash-based requirement as a hard failure rather than shipping it.
-if [ ! -d "$APP" ]; then
-  echo "error: expected bundle not found at $APP" >&2
-  exit 1
-fi
-codesign --verify --strict "$APP"
-DR="$(codesign -d -r- "$APP" 2>/dev/null | sed -n 's/^designated => //p')"
-echo "==> Designated requirement: $DR"
-case "$DR" in
-  *cdhash*)
-    echo "error: bundle is ad-hoc signed (cdhash requirement) — TCC grants will not survive a rebuild." >&2
-    exit 1
-    ;;
-  *"identifier \"$BUNDLE_ID\""*) ;;
-  *)
-    echo "error: unexpected designated requirement; refusing to call this a stable signature." >&2
-    exit 1
-    ;;
-esac
-echo "==> Signature is identity-based and stable across rebuilds."
+keeper_require_stable_signature "$APP"
 
 # --- Optional install ------------------------------------------------------
 if [ "$INSTALL" -eq 1 ]; then
@@ -118,7 +97,11 @@ if [ "$INSTALL" -eq 1 ]; then
   echo "==> Installing to $INSTALLED"
   rm -rf "$INSTALLED"
   cp -R "$APP" "$INSTALLED"
-  echo "==> Installed. Launch with: open -a $INSTALLED"
+  # Relaunch, because this script quit a running app two lines up: leaving the
+  # user with no keeper at all is a worse end state than the one they started
+  # in, and `install-macos.sh` reports the app as running on the strength of it.
+  echo "==> Launching $INSTALLED"
+  open -a "$INSTALLED"
 fi
 
 cat <<EOF

@@ -38,6 +38,8 @@ import {
   SYNC_NAME_LABEL,
   SYNC_PATH_FIXED_NOTE,
   SYNC_POLL_LABEL,
+  SYNC_RECORDINGS_LABEL,
+  SYNC_RECORDINGS_SUBFOLDER_NOTE,
   SYNC_REMOTE_URL_LABEL,
   SYNC_REMOVABLE_LABEL,
   SYNC_SETTLE_LABEL,
@@ -67,7 +69,7 @@ import {
   syncSetCredential,
   syncStatuses,
 } from "@/lib/ipc/client";
-import { resetSyncStoreForTest } from "@/lib/stores/sync";
+import { resetSyncStoreForTest, SYNC_RECORDINGS_SUBFOLDER_LABEL } from "@/lib/stores/sync";
 import { resetSyncDetailStoreForTest, syncDetailStore } from "@/lib/stores/sync-detail";
 
 const mockSave = vi.mocked(syncProfileSave);
@@ -103,6 +105,13 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
     commitSubjectTemplate: "",
     notes: false,
     notesSubfolder: null,
+    recordings: false,
+    // Rust resolves this even for a folder that holds no recordings: it is the
+    // subfolder flagging it would use, and it is why the form keeps no copy of
+    // keeper's default (Story 41.7).
+    recordingsSubfolder: "recordings",
+    sessions: false,
+    sessionsSubfolder: "60-sessions",
     authorOverride: null,
     enabled: true,
     ...over,
@@ -128,7 +137,13 @@ beforeEach(() => {
   mockStatuses.mockResolvedValue([]);
   mockActivity.mockResolvedValue([]);
   mockPending.mockResolvedValue([]);
-  mockProblems.mockResolvedValue({ warning: null, error: null, parked: [], conflicts: [] });
+  mockProblems.mockResolvedValue({
+    warning: null,
+    error: null,
+    parked: [],
+    conflicts: [],
+    unspellable: [],
+  });
   // The default keychain answer: a folder with nothing stored. Every edit form
   // reads this as it opens (Story 34.12), so every test that renders one needs
   // an answer here or the read resolves to nothing at all.
@@ -397,6 +412,10 @@ describe("AddFolderForm editing an existing folder", () => {
         commitSubjectTemplate: "",
         notes: false,
         notesSubfolder: null,
+        recordings: false,
+        recordingsSubfolder: null,
+        sessions: false,
+        sessionsSubfolder: null,
       }),
     );
   });
@@ -732,5 +751,284 @@ describe("AddFolderForm numeric knobs (Story 34.5, AD-34-8)", () => {
     expect(settle).toHaveAttribute("placeholder", "10");
     expect(screen.getByLabelText(SYNC_POLL_LABEL)).toHaveValue(45);
     expect(screen.getByLabelText(SYNC_SUBJECT_LABEL)).toHaveValue("backup {profile}");
+  });
+});
+
+describe("AddFolderForm fractional numbers (Story 52.9, FR-313)", () => {
+  /** Fill the required fields and open the Advanced disclosure. */
+  async function openAdvanced() {
+    await fillRequired();
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+  }
+
+  it("lets the three numeric boxes hold a fraction the browser will accept", async () => {
+    // The measured bug: no `step`, so HTML's implicit step is 1 and 1.5 is a
+    // stepMismatch — which in a real form with a native submit and no
+    // `noValidate` makes WKWebView refuse the save with no message at all.
+    // Typing and submitting proves nothing here: jsdom runs no INTERACTIVE
+    // validation, so a fireEvent submit succeeds against the bug too. The
+    // attribute and the ValidityState jsdom does compute are the honest ones.
+    render(<AddFolderForm />);
+    await openAdvanced();
+
+    for (const label of [SYNC_LFS_THRESHOLD_LABEL, SYNC_SETTLE_LABEL, SYNC_POLL_LABEL]) {
+      const box = screen.getByLabelText(label) as HTMLInputElement;
+      expect(box).toHaveAttribute("step", "any");
+      expect(box).toHaveAttribute("inputmode", "decimal");
+      fireEvent.change(box, { target: { value: "1.5" } });
+      expect(box.validity.stepMismatch).toBe(false);
+      expect(box.checkValidity()).toBe(true);
+    }
+  });
+
+  it("saves 1.5 MB as exactly 1572864 bytes, rounded once", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    fireEvent.change(screen.getByLabelText(SYNC_LFS_THRESHOLD_LABEL), {
+      target: { value: "1.5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    // The exact byte count, not a whole MB: the one rounding on the way out
+    // exists to keep Rust's `u64` integral, never to quantise the ask.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ lfsThresholdBytes: 1_572_864 }),
+      ),
+    );
+  });
+
+  it("takes a fractional wait and cadence as whole milliseconds", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    fireEvent.change(screen.getByLabelText(SYNC_SETTLE_LABEL), { target: { value: "7.5" } });
+    fireEvent.change(screen.getByLabelText(SYNC_POLL_LABEL), { target: { value: "12.5" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ settleMs: 7_500, pollIntervalMs: 12_500 }),
+      ),
+    );
+  });
+
+  it("opens a sub-MB profile at 0.25 and saves an unrelated change from it", async () => {
+    // The worse face of the same bug, and the reason this is not a nicety: the
+    // docs' own 256 KiB example (`docs/sync.md`) renders as 0.25, so before the
+    // `step` the form refused EVERY save on such a profile — including one that
+    // only came to fix the remote URL.
+    const profile = profileVm({ lfsThresholdBytes: 262_144 });
+    mockSave.mockResolvedValue(profile);
+    render(<AddFolderForm profile={profile} />);
+    fireEvent.click(screen.getByTestId(SYNC_ADVANCED_TOGGLE_TESTID));
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p2"));
+
+    const threshold = screen.getByLabelText(SYNC_LFS_THRESHOLD_LABEL) as HTMLInputElement;
+    expect(threshold).toHaveValue(0.25);
+    expect(threshold.checkValidity()).toBe(true);
+
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "git@github.com:alice/notes-2.git" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    // The threshold rides along untouched: a fraction survives the round trip,
+    // so an edit form cannot silently round the user's stored setting up to 1 MB.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "p2",
+          remoteUrl: "git@github.com:alice/notes-2.git",
+          lfsThresholdBytes: 262_144,
+        }),
+      ),
+    );
+  });
+});
+
+describe("AddFolderForm recordings switch (Story 41.7, AD-66)", () => {
+  /** A folder that already holds recordings, as Rust reports it. */
+  function flagged(): SyncProfileVm {
+    return profileVm({
+      id: "p9",
+      name: "tgdrive",
+      localPath: "/Volumes/merope/tgdrive",
+      recordings: true,
+      recordingsSubfolder: "sessions/raw",
+    });
+  }
+
+  it("flags a new folder and leaves the subfolder to keeper", async () => {
+    // The reported bug, at its narrowest: nothing in the app could write a
+    // `recordings` block, so the Recording pane's destination picker — built in
+    // Story 41.2, reading a flag Story 41.1 shipped — had nothing to offer.
+    mockSave.mockResolvedValue(profileVm({ recordings: true }));
+    render(<AddFolderForm />);
+    await fillRequired();
+
+    fireEvent.click(screen.getByLabelText(SYNC_RECORDINGS_LABEL));
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          recordings: true,
+          // Not an empty string and not a guess at keeper's default: the field
+          // is omitted, which is how Rust is told to use its own.
+          recordingsSubfolder: null,
+        }),
+      ),
+    );
+  });
+
+  it("sends a subfolder the owner chose exactly as typed", async () => {
+    mockSave.mockResolvedValue(profileVm({ recordings: true }));
+    render(<AddFolderForm />);
+    await fillRequired();
+    fireEvent.click(screen.getByLabelText(SYNC_RECORDINGS_LABEL));
+
+    fireEvent.change(screen.getByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL), {
+      target: { value: "  media/screen-recordings  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          recordings: true,
+          recordingsSubfolder: "media/screen-recordings",
+        }),
+      ),
+    );
+  });
+
+  it("prefills the subfolder from what Rust resolved, never from a copy of the default", async () => {
+    // The whole reason `SyncProfileVm.recordingsSubfolder` is never null: a
+    // folder that holds no recordings still reports the subfolder flagging it
+    // would use, so the form can show it without spelling `recordings` itself.
+    render(<AddFolderForm profile={profileVm({ recordings: false })} />);
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p2"));
+
+    // Hidden until the switch is on, exactly as the vault subfolder is.
+    expect(screen.queryByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText(SYNC_RECORDINGS_LABEL));
+    expect(screen.getByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL)).toHaveValue("recordings");
+
+    // And the resolved root is stated as a fact about this folder.
+    expect(screen.getByText("/Users/alice/notes/recordings")).toBeInTheDocument();
+  });
+
+  it("opens an already-flagged folder with its switch on and its own subfolder", async () => {
+    render(<AddFolderForm profile={flagged()} />);
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p9"));
+
+    expect(screen.getByLabelText(SYNC_RECORDINGS_LABEL)).toBeChecked();
+    expect(screen.getByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL)).toHaveValue("sessions/raw");
+    expect(screen.getByText("/Volumes/merope/tgdrive/sessions/raw")).toBeInTheDocument();
+    // Keeper's default is not asserted anywhere on a folder that has an answer.
+    expect(screen.queryByText(SYNC_RECORDINGS_SUBFOLDER_NOTE)).not.toBeInTheDocument();
+  });
+
+  it("unflagging asks for the block to be removed, not emptied", async () => {
+    const profile = flagged();
+    mockSave.mockResolvedValue(profileVm({ id: "p9", recordings: false }));
+    render(<AddFolderForm profile={profile} />);
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p9"));
+
+    fireEvent.click(screen.getByLabelText(SYNC_RECORDINGS_LABEL));
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // `false` is what makes Rust drop the block; a subfolder alongside it
+          // would read as "still holds recordings, over here instead".
+          recordings: false,
+          recordingsSubfolder: null,
+        }),
+      ),
+    );
+    // The subfolder field goes with the switch, so nothing on screen still
+    // claims this folder has a recordings root.
+    expect(screen.queryByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL)).not.toBeInTheDocument();
+  });
+
+  it("sends an emptied subfolder on an edit so the shared validator can refuse it", async () => {
+    // On an add form an empty box means "keeper picks". On an edit form it
+    // arrived holding the value in force, so emptying it is deliberate — and the
+    // refusal is the answer, not something to route around.
+    mockSave.mockRejectedValue({
+      code: "internal",
+      message:
+        "invalid sync configuration: recordings subfolder must not be empty: recordings live in a folder inside the profile, never at the profile root",
+    });
+    render(<AddFolderForm profile={flagged()} />);
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p9"));
+
+    fireEvent.change(screen.getByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ recordings: true, recordingsSubfolder: "" }),
+      ),
+    );
+  });
+
+  it("shows each refusal in the validator's own words and corrects nothing", async () => {
+    // These sentences are `RecordingsConfig::validate`'s, verbatim. The form
+    // must not re-implement the rules — a second copy would drift from the one
+    // the engine and `keeper-syncd` enforce — and must not quietly pick a
+    // different subfolder to make the save succeed, which is the failure that
+    // would put someone's recordings in a folder they never named.
+    for (const [typed, refusal] of [
+      [
+        "/tmp",
+        "invalid sync configuration: recordings subfolder must be relative to the profile folder, got /tmp",
+      ],
+      [
+        "../x",
+        "invalid sync configuration: recordings subfolder must not escape the profile folder: ../x",
+      ],
+      [
+        "10-notes/rec",
+        "invalid sync configuration: recordings subfolder 10-notes/rec overlaps notes subfolder 10-notes: one folder cannot be both a vault and a recordings root",
+      ],
+    ] as const) {
+      mockSave.mockRejectedValue({ code: "internal", message: refusal });
+      const view = render(<AddFolderForm profile={flagged()} />);
+      await waitFor(() => expect(mockGetCredential).toHaveBeenCalled());
+
+      fireEvent.change(screen.getByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL), {
+        target: { value: typed },
+      });
+      fireEvent.click(screen.getByRole("button", { name: SYNC_EDIT_SUBMIT_LABEL }));
+
+      expect(await screen.findByText(refusal)).toBeInTheDocument();
+      // What was typed is still what was sent and still what is on screen: the
+      // refusal named a rule, and the field it is about is the one to fix.
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ recordings: true, recordingsSubfolder: typed }),
+      );
+      expect(screen.getByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL)).toHaveValue(typed);
+      view.unmount();
+      // Only the call log: each iteration asserts about its own save.
+      mockSave.mockClear();
+    }
+  });
+
+  it("says keeper picks the subfolder only while there is no stored answer", async () => {
+    render(<AddFolderForm />);
+    await fillRequired();
+    fireEvent.click(screen.getByLabelText(SYNC_RECORDINGS_LABEL));
+
+    // An add form has no profile to have resolved the default, so the box starts
+    // empty and the promise under it is what keeper will do with that.
+    expect(screen.getByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL)).toHaveValue("");
+    expect(screen.getByText(SYNC_RECORDINGS_SUBFOLDER_NOTE)).toBeInTheDocument();
   });
 });

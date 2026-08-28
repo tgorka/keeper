@@ -65,6 +65,11 @@ percent-encoding = { workspace = true }
 # 18.2, `finalize_within`). Test-only feature -- the shipped binary is unchanged.
 tokio = { workspace = true, features = ["test-util"] }
 
+# `file_protocol`'s Range tests build a real vault tree on disk: the protocol
+# handler answers with bytes read through `browse::resolve`, so a fixture that
+# is not a real directory would test the wrong half (Story 45.7).
+tempfile = { workspace = true }
+
 # Desktop-only surfaces (Story 12.2, compile seam): these crates are
 # `#![cfg(not(target_os = "ios"))]`-style desktop plugins, so iOS must never link
 # them. Cargo target tables only understand real target cfgs (never tauri-build's
@@ -111,6 +116,16 @@ keyring = { workspace = true, features = ["linux-native"] }
 # (call sites unchanged); desktop keeps `keyring`. 3.7.0 is already resolved via keyring, so
 # no new crate version is pulled — the only Cargo.lock change is this dependency edge, and
 # the desktop tree / build stay byte-identical.
+# macOS PDF export (the HTML viewer's "Save as PDF"). `createPDF` on the webview
+# that is already drawing the page is the only renderer on this machine whose
+# output a person comparing the two files would accept — see `pdf_export.rs`.
+# Both crates are already in the tree through wry; only the edge is new.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-web-kit = { workspace = true }
+block2 = { workspace = true }
+
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = { workspace = true }
 # iOS backup exclusion (Story 14.7, FR-65). The single audited `#[allow(unsafe_code)]`

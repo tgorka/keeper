@@ -9,7 +9,7 @@ vi.mock("@/lib/ipc/client", () => ({
 
 import { TagTree } from "@/components/notes/tag-tree";
 import { notesTagTree } from "@/lib/ipc/client";
-import { resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
+import { notesFiltersStore, resetNotesFiltersStoreForTest } from "@/lib/stores/notes-filters";
 
 const mockTagTree = vi.mocked(notesTagTree);
 
@@ -85,5 +85,74 @@ describe("TagTree counts", () => {
 
     expect(mockTagTree).not.toHaveBeenCalled();
     expect(container).toBeEmptyDOMElement();
+  });
+});
+
+describe("TagTree tag states", () => {
+  it("cycles a node through include, exclude and off on plain presses", async () => {
+    render(<TagTree vaultId="vault-1" />);
+    const terms = () => notesFiltersStore.getState().tagTerms;
+
+    fireEvent.click(await screen.findByRole("button", { name: "Tag client, 6 items, filter" }));
+    expect(terms()).toEqual([{ tag: "client", term: "include" }]);
+
+    // The second press must reach exclude. A plain press clears the rest of the
+    // bar first, and reading the state after that clear — the obvious way to
+    // write this — would restart the cycle at include forever, leaving exclude
+    // reachable only with the shift key.
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Tag client, 6 items: included. Exclude it instead.",
+      }),
+    );
+    expect(terms()).toEqual([{ tag: "client", term: "exclude" }]);
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Tag client, 6 items: excluded. Stop filtering by it.",
+      }),
+    );
+    expect(terms()).toEqual([]);
+  });
+
+  it("shows an excluded node as excluded without being hovered", async () => {
+    notesFiltersStore.getState().setTagTerm("client", "include");
+    const { rerender } = render(<TagTree vaultId="vault-1" />);
+    const includedClass = (
+      await screen.findByRole("button", {
+        name: "Tag client, 6 items: included. Exclude it instead.",
+      })
+    ).className;
+
+    notesFiltersStore.getState().setTagTerm("client", "exclude");
+    rerender(<TagTree vaultId="vault-1" />);
+
+    const excluded = await screen.findByRole("button", {
+      name: "Tag client, 6 items: excluded. Stop filtering by it.",
+    });
+    // Not `aria-selected`: an excluded node is emphatically not selected, and a
+    // reader arrowing the tree must not be told it is.
+    expect(excluded.closest("[role=treeitem]")).toHaveAttribute("aria-selected", "false");
+    expect(excluded.querySelector("svg")).not.toBeNull();
+    // And it must not look like an included one. A node that reads as selected
+    // while it is removing notes is the exact confusion the sign exists against.
+    expect(excluded.className).not.toBe(includedClass);
+  });
+
+  it("adds to the intersection on a shift press instead of replacing it", async () => {
+    render(<TagTree vaultId="vault-1" />);
+
+    const parent = await screen.findByRole("button", { name: "Tag client, 6 items, filter" });
+    fireEvent.click(parent);
+    fireEvent.click(parent.previousElementSibling as HTMLElement);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Tag client/acme, 5 items, filter" }),
+      { shiftKey: true },
+    );
+
+    expect(notesFiltersStore.getState().tagTerms).toEqual([
+      { tag: "client", term: "include" },
+      { tag: "client/acme", term: "include" },
+    ]);
   });
 });

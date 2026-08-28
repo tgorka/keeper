@@ -90,6 +90,30 @@ export const SYNC_IDLE_POLL_FACTOR = 5;
 /** Last-resort message when a rejection carries no readable one. */
 export const SYNC_UNKNOWN_ERROR = "Sync failed for an unknown reason.";
 
+/**
+ * What a write aimed at a folder that is no longer configured says (Story 46.10).
+ *
+ * Only reachable through {@link setSyncProfileRecordingsSubfolder}, which has to
+ * re-read the profile it is about to re-send: a folder removed from Settings
+ * between the read that showed it and the write is a real race, and it is not the
+ * same thing as a refused value. Worded as a fact about the folder rather than as
+ * a failure, because nothing went wrong — the folder is simply gone.
+ */
+export const SYNC_PROFILE_GONE = "That synced folder is no longer configured.";
+
+/**
+ * The label the recordings subfolder wears on EVERY surface that shows it.
+ *
+ * Two surfaces show it: the folder form in Settings → Sync, which composes a
+ * whole profile, and the Recording pane's Destination card, which edits this one
+ * field on a profile that already exists (Story 46.10). They are deliberately
+ * different controls — the card carries a consequence sentence the add flow has
+ * nothing to warn about — but they are one setting, and a person who found it in
+ * one place has to recognise it in the other. Kept here rather than in either
+ * component so neither imports the other for a string.
+ */
+export const SYNC_RECORDINGS_SUBFOLDER_LABEL = "Recordings subfolder";
+
 export interface SyncState {
   /**
    * The mirrored profiles, or `null` before the first successful load. `null`
@@ -215,6 +239,29 @@ export function isSyncStatusActive(status: SyncStatusVm): boolean {
 }
 
 /**
+ * Can this phase have a transfer rate at all?
+ *
+ * Mirrors `SyncPhase::carries_rate` in `keeper-sync`: only the three legs that
+ * move bytes over a link can. A scan, a commit and a verify move none, so a
+ * rate for them is not "not measured yet" — it is a figure that cannot exist.
+ *
+ * The distinction is what a surface needs to tell "quiet for a tick" from
+ * "never applicable". A transfer that has gone quiet keeps its room reserved so
+ * the row does not jump; a phase that cannot carry a rate is not given room,
+ * because holding a slot open forever prints a separator with nothing after it
+ * — which is what the Scanning line did the moment the walk started reporting.
+ *
+ * Named rather than inlined because the membership list is the contract, not
+ * the comparison: it is the TypeScript half of a Rust `match` that is total by
+ * construction there, and a phase added on one side has to be answered on this
+ * one. Three strings in a `||` at a call site say nothing about which side owns
+ * the list.
+ */
+export function syncPhaseCarriesRate(phase: string): boolean {
+  return phase === "fetching" || phase === "uploadingLfs" || phase === "downloadingLfs";
+}
+
+/**
  * The progress fraction in `[0, 1]`, or `null` when no total is known and the
  * meter must render indeterminate.
  *
@@ -307,6 +354,80 @@ export async function saveSyncProfile(req: SyncProfileReq): Promise<SyncProfileV
   const saved = await syncProfileSave(req);
   await refreshSyncSnapshot();
   return saved;
+}
+
+/**
+ * Move ONE profile's recordings subfolder and leave everything else exactly as
+ * stored (Story 46.10).
+ *
+ * Not a second writer: `sync_profile_save` is the only command that writes a
+ * profile, and this is a named use of it. What it exists for is that the command
+ * takes a WHOLE profile — `parse_req` assigns `name`, `localPath`, `remoteUrl`,
+ * `branch`, `direction`, `lane`, `subpaths`, `excludes`, `removable` and
+ * `lfsMode` unconditionally from the request — so "change the subfolder" has to
+ * be expressed as "re-send this profile with one field different". Doing that
+ * from a component would put a faithful `SyncProfileVm` → `SyncProfileReq`
+ * re-expression next to a recording card, where the next field added to a
+ * profile would be silently dropped by it; here it sits beside the writer, with
+ * the mapping visible in one screen.
+ *
+ * The profile is re-read immediately before the save rather than taken from the
+ * mirror, because a stale mirror would not merely fail — it would write its own
+ * stale `remoteUrl` and `excludes` back over whatever changed since. That
+ * narrows the window to one round trip, which is exactly the window the Sync
+ * form already has, and no narrower window is available: `sync_profile_save`
+ * takes no revision.
+ *
+ * Every `null` below is the AD-34-9 "not expressed" that leaves the stored value
+ * alone, and every one of them is `null` in the VM precisely when the profile
+ * pins nothing — so passing the VM's own value through is the faithful thing
+ * rather than the lazy one.
+ *
+ * Rejects with the Rust {@link IpcError} — an unknown id, or
+ * `RecordingsConfig::validate`'s own sentence for a subfolder it refuses — so
+ * the caller prints the reason beside the field.
+ */
+export async function setSyncProfileRecordingsSubfolder(
+  id: string,
+  subfolder: string,
+): Promise<SyncProfileVm> {
+  const stored = (await syncProfiles()).find((profile) => profile.id === id);
+  if (stored === undefined) {
+    throw new Error(SYNC_PROFILE_GONE);
+  }
+  return await saveSyncProfile({
+    id: stored.id,
+    name: stored.name,
+    localPath: stored.localPath,
+    remoteUrl: stored.remoteUrl,
+    branch: stored.branch,
+    direction: stored.direction,
+    lane: stored.lane,
+    subpaths: stored.subpaths,
+    excludes: stored.excludes,
+    removable: stored.removable,
+    lfsMode: stored.lfsMode,
+    // The VM reports what is PINNED (`null` = "keeper chooses"), which is the
+    // same `null` the request reads as "not expressed" — so an unpinned window
+    // or cadence stays unpinned instead of being frozen at today's default.
+    lfsThresholdBytes: stored.lfsThresholdBytes,
+    settleMs: stored.settleMs,
+    pollIntervalMs: stored.pollIntervalMs,
+    tags: stored.tags,
+    authorOverride: stored.authorOverride,
+    commitSubjectTemplate: stored.commitSubjectTemplate,
+    // The flags ride along unchanged. `notesSubfolder` is `null` for a folder
+    // that is not a vault, which is again the omission rather than a clear.
+    notes: stored.notes,
+    notesSubfolder: stored.notesSubfolder,
+    recordings: stored.recordings,
+    // The one field this call is about. Sent verbatim: Rust trims whitespace and
+    // otherwise refuses rather than corrects, and correcting it here would make
+    // a save succeed against a folder nobody named.
+    recordingsSubfolder: subfolder,
+    sessions: stored.sessions,
+    sessionsSubfolder: stored.sessionsSubfolder,
+  });
 }
 
 /**

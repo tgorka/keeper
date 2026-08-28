@@ -19,6 +19,15 @@
  *     pinned". Each box's placeholder names the number that will be in force,
  *     and a note appears under it when the typed number is not that number
  *     (AD-34-8).
+ *   - The recordings subfolder is the one field whose empty box means two
+ *     different things (Story 41.7). Adding: nobody has answered, so the field
+ *     is omitted and `RecordingsConfig`'s own default stands — this form holds
+ *     no copy of it, and takes the value to prefill from
+ *     `SyncProfileVm.recordingsSubfolder`, which Rust resolves for a folder that
+ *     holds no recordings yet. Editing: the box arrived holding the value in
+ *     force, so an empty one is a deliberate clear and goes as an empty string
+ *     for the shared validator to refuse in its own words. Nothing here
+ *     re-implements those rules or tidies input up to make a save succeed.
  *   - The access token is a second write to a different store (the OS
  *     keychain), keyed by the profile id. Its failure is reported as its own
  *     thing, because the profile is stored by then. An edit form reads it back
@@ -82,6 +91,7 @@ import {
   SYNC_DIRECTIONS,
   SYNC_LFS_MODES,
   SYNC_MIN_POLL_INTERVAL_MS,
+  SYNC_RECORDINGS_SUBFOLDER_LABEL,
   SYNC_REMOVABLE_SETTLE_MS,
   type SyncDirection,
   type SyncLfsMode,
@@ -194,6 +204,61 @@ export const SYNC_NOTES_GUARANTEES = [
   "`.keeper/` holds the index cache and is added to this folder's ignore rules, so it never syncs",
   "keeper never moves a file you did not ask it to move",
 ] as const;
+
+/**
+ * The recordings control (Epic 41, Story 41.7, AD-66).
+ *
+ * The notes-vault control directly above, applied a second time and deliberately
+ * not reinvented: same place in the form, same switch-and-subfolder shape, same
+ * kind of sentence. A second idiom for "this folder also holds X" would make the
+ * third one ambiguous, and this pair is the whole vocabulary the Sync form has
+ * for it.
+ *
+ * This is the switch that was missing. `RecordingsConfig` shipped in Story 41.1
+ * and the Recording pane's destination picker in 41.2, and that picker renders
+ * only when a profile carries a recordings block — so with nothing in the app
+ * able to write one, both were unreachable and the Recording pane offered a
+ * plain folder and nothing else. Reported from the field on a machine holding
+ * two synced folders, both `recordings: null`, one of them already a notes vault
+ * flagged from this very form. That asymmetry was the bug.
+ *
+ * Note what is NOT here: a default subfolder. `SYNC_NOTES_DEFAULT_SUBFOLDER`
+ * above is a second spelling of a Rust constant, one rename away from telling
+ * the user a vault lives somewhere it does not. The recordings default comes off
+ * `SyncProfileVm.recordingsSubfolder`, which Rust resolves to the stored value
+ * or to `RecordingsConfig`'s own default — see {@link formValuesFor}.
+ */
+export const SYNC_RECORDINGS_LABEL = "This folder holds recordings";
+export const SYNC_RECORDINGS_NOTE =
+  "keeper saves recordings into a subfolder of this folder and syncs them with everything else here. A folder flagged this way can be chosen as the destination in Recording.";
+
+/**
+ * Shown only while adding a folder, where no stored profile has resolved the
+ * subfolder yet and the box therefore starts empty. Worded like the advanced
+ * knobs below ("Left empty, keeper picks the wait itself") because it is the
+ * same promise: keeper's own default, not a value this form invented. On an edit
+ * form the box arrives filled in, so emptying it is a deliberate act — and the
+ * shared validator refuses it in its own words rather than quietly restoring
+ * what was there.
+ */
+export const SYNC_RECORDINGS_SUBFOLDER_NOTE = "Left empty, keeper picks the subfolder itself.";
+
+/**
+ * The sessions control (Phase 7, FR-222, AD-107).
+ *
+ * The recordings control directly above, applied a third time and deliberately
+ * not reinvented: same place in the form, same switch-and-subfolder shape, same
+ * kind of sentence — the established vocabulary for "this folder also holds X".
+ *
+ * As with recordings, no default subfolder is spelled here: it comes off
+ * `SyncProfileVm.sessionsSubfolder`, which Rust resolves to the stored value or
+ * to `SessionsConfig`'s own default (`60-sessions`) — see {@link formValuesFor}.
+ */
+export const SYNC_SESSIONS_LABEL = "This folder has sessions";
+export const SYNC_SESSIONS_NOTE =
+  "keeper lists LLM work sessions from a subfolder of this folder — one folder per session, with a README, promoted artifacts and reusable prompts. keeper adopts the layout that is there; it does not create one.";
+export const SYNC_SESSIONS_SUBFOLDER_LABEL = "Sessions subfolder";
+export const SYNC_SESSIONS_SUBFOLDER_NOTE = "Left empty, keeper picks the subfolder itself.";
 
 /**
  * The access-token field (Story 32.7, AD-S7; Story 34.4, AD-34-7; Story 34.12,
@@ -332,6 +397,35 @@ interface SyncFormValues {
   notesVault: boolean;
   /** Where inside the folder the vault lives; only meaningful when flagged. */
   notesSubfolder: string;
+  /**
+   * Whether this folder holds recordings (Story 41.7, AD-66). Unlike the notes
+   * pair above it IS part of `SyncProfileReq`, so it rides the profile save and
+   * needs no second write and no profile id first.
+   */
+  recordings: boolean;
+  /**
+   * Where inside the folder recordings live; only meaningful when flagged.
+   *
+   * Empty means two different things by mode, and both are what the owner meant.
+   * On an add form the box starts empty and nobody has answered yet, so the save
+   * omits the field and Rust's own default stands. On an edit form the box
+   * arrives holding the subfolder in force, so emptying it is deliberate — the
+   * save sends the empty string and `RecordingsConfig::validate` refuses it by
+   * name, which is the answer rather than an obstacle to route around.
+   */
+  recordingsSubfolder: string;
+  /**
+   * Whether this folder holds a sessions zone (FR-222, AD-107). Like the
+   * recordings pair above it IS part of `SyncProfileReq`, so it rides the
+   * profile save and needs no second write and no profile id first.
+   */
+  sessions: boolean;
+  /**
+   * Where inside the folder the sessions zone lives; only meaningful when
+   * flagged. Empty follows the recordings rule exactly: unanswered on an add
+   * (keeper's default stands), a deliberate clear on an edit (refused by name).
+   */
+  sessionsSubfolder: string;
 }
 
 const EMPTY_FORM: SyncFormValues = {
@@ -353,6 +447,14 @@ const EMPTY_FORM: SyncFormValues = {
   token: "",
   notesVault: false,
   notesSubfolder: SYNC_NOTES_DEFAULT_SUBFOLDER,
+  recordings: false,
+  // No default spelled here: keeper owns it, and an add form has no stored
+  // profile to have resolved it yet. The empty box is how this form says
+  // "keeper picks", exactly as the two numeric knobs above do.
+  recordingsSubfolder: "",
+  sessions: false,
+  // Empty for the recordings reason directly above.
+  sessionsSubfolder: "",
 };
 
 /**
@@ -391,6 +493,17 @@ function formValuesFor(profile: SyncProfileVm): SyncFormValues {
     // where "this folder is a vault, and here is its subfolder" actually lives.
     notesVault: false,
     notesSubfolder: SYNC_NOTES_DEFAULT_SUBFOLDER,
+    // Straight off the profile, unlike the notes pair above: `recordings` IS a
+    // field on `SyncProfile`, so the VM carries both the flag and the subfolder
+    // that would be in force — the stored one, or `RecordingsConfig`'s default
+    // for a folder that holds none yet (AD-34-8). That resolved value is why
+    // there is no `SYNC_RECORDINGS_DEFAULT_SUBFOLDER` beside the notes one.
+    recordings: profile.recordings,
+    recordingsSubfolder: profile.recordingsSubfolder,
+    // Straight off the profile, exactly as recordings above: the VM carries the
+    // flag and the subfolder that would be in force (AD-34-8).
+    sessions: profile.sessions,
+    sessionsSubfolder: profile.sessionsSubfolder,
   };
 }
 
@@ -717,6 +830,10 @@ export function AddFolderForm({
     // has landed.
     const notesVault = form.notesVault;
     const notesSubfolder = form.notesSubfolder.trim();
+    const recordings = form.recordings;
+    const recordingsSubfolder = form.recordingsSubfolder.trim();
+    const sessions = form.sessions;
+    const sessionsSubfolder = form.sessionsSubfolder.trim();
     try {
       const saved = await saveSyncProfile({
         // Present updates that profile, absent creates one — the only field
@@ -767,6 +884,29 @@ export function AddFolderForm({
         // Only when the switch is on: the subfolder box is revealed with it, and
         // an unflagged save must not reset a subfolder the user chose earlier.
         notesSubfolder: notesVault ? notesSubfolder : null,
+        // The recordings flag, on the same terms as the vault flag above:
+        // `recordings` IS a field on the profile, so it rides this save and the
+        // folder and its recordings-ness land together. Always expressed, for the
+        // AD-34-9 reason — the switch is on screen, so `null` would be a lie.
+        // `false` REMOVES the block rather than emptying it, which is what takes
+        // the folder back out of the Recording destination picker.
+        recordings,
+        // Unflagged: say nothing, so an unflagged save cannot reset a subfolder
+        // the owner chose earlier. Flagged and empty on an ADD: also nothing, and
+        // keeper's own default stands — this form has no copy of it to send.
+        // Flagged and empty on an EDIT: the box arrived holding the value in
+        // force, so an empty one is a deliberate clear, and it goes as an empty
+        // string for `RecordingsConfig::validate` to refuse in its own words.
+        // Correcting it here to make the save succeed would be this form picking
+        // a folder the owner did not name.
+        recordingsSubfolder:
+          !recordings || (recordingsSubfolder === "" && !editing) ? null : recordingsSubfolder,
+        // The sessions flag, on the recordings block's exact terms (AD-107):
+        // always expressed because the switch is on screen, `false` REMOVES the
+        // block, and the subfolder follows the recordings empty-box rules.
+        sessions,
+        sessionsSubfolder:
+          !sessions || (sessionsSubfolder === "" && !editing) ? null : sessionsSubfolder,
       });
       // `saveSyncProfile` re-reads the profile/status mirror, but the Sync
       // view's three per-folder lists are a *second* mirror on a deliberately
@@ -786,6 +926,11 @@ export function AddFolderForm({
         setStoredNotesSubfolder(notesSubfolder);
         await refreshNoteVaults();
       }
+      // The recordings flag needs no equivalent. There is no recordings mirror:
+      // `recording_destination_profiles` is read by the destination card when it
+      // mounts, so a folder flagged here is offered the next time the Recording
+      // pane is opened, with nothing to keep in step in between.
+
       // The keychain leg, when the decision above says there is one. A second
       // write, to a different store, keyed by the profile id. Its failure is
       // reported as its own thing: the profile is stored by now, and a blanket
@@ -997,6 +1142,91 @@ export function AddFolderForm({
           </ul>
         </>
       )}
+      {/* The recordings flag (AD-66). Beside the notes flag, above Advanced, for
+          the same reason: it is the whole of what makes a folder a recording
+          destination, and it is the one control Stories 41.1 and 41.2 were
+          waiting on. */}
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={`${fieldId}-recordings`}>{SYNC_RECORDINGS_LABEL}</Label>
+        <Switch
+          id={`${fieldId}-recordings`}
+          checked={form.recordings}
+          disabled={disabled || saving}
+          onCheckedChange={(checked) => setForm((live) => ({ ...live, recordings: checked }))}
+        />
+      </div>
+      <p className="text-muted-foreground text-xs">{SYNC_RECORDINGS_NOTE}</p>
+      {form.recordings && (
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-recordings-subfolder`}>
+              {SYNC_RECORDINGS_SUBFOLDER_LABEL}
+            </Label>
+            <Input
+              id={`${fieldId}-recordings-subfolder`}
+              className="w-56"
+              value={form.recordingsSubfolder}
+              disabled={disabled || saving}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, recordingsSubfolder: event.target.value }))
+              }
+            />
+          </div>
+          {/* Only while adding, where the box starts empty because no stored
+              profile has told this form what keeper would pick. */}
+          {!editing && (
+            <p className="text-muted-foreground text-xs">{SYNC_RECORDINGS_SUBFOLDER_NOTE}</p>
+          )}
+          {/* The resolved root, and only ever of what the box actually holds. An
+              emptied box on an edit form previews nothing rather than the stored
+              value it no longer says — that save is about to be refused, and a
+              preview of a path it will not write would be the form disagreeing
+              with itself. */}
+          {form.localPath !== "" && form.recordingsSubfolder.trim() !== "" && (
+            <p className="truncate font-mono text-muted-foreground text-xs">
+              {`${form.localPath}/${form.recordingsSubfolder.trim()}`}
+            </p>
+          )}
+        </>
+      )}
+      {/* The sessions flag (FR-222, AD-107). Third in the "this folder also
+          holds X" row, on the recordings control's exact shape. */}
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={`${fieldId}-sessions`}>{SYNC_SESSIONS_LABEL}</Label>
+        <Switch
+          id={`${fieldId}-sessions`}
+          checked={form.sessions}
+          disabled={disabled || saving}
+          onCheckedChange={(checked) => setForm((live) => ({ ...live, sessions: checked }))}
+        />
+      </div>
+      <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_NOTE}</p>
+      {form.sessions && (
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-sessions-subfolder`}>{SYNC_SESSIONS_SUBFOLDER_LABEL}</Label>
+            <Input
+              id={`${fieldId}-sessions-subfolder`}
+              className="w-56"
+              value={form.sessionsSubfolder}
+              disabled={disabled || saving}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, sessionsSubfolder: event.target.value }))
+              }
+            />
+          </div>
+          {/* Only while adding, for the recordings reason: no stored profile has
+              told this form what keeper would pick. */}
+          {!editing && (
+            <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_SUBFOLDER_NOTE}</p>
+          )}
+          {form.localPath !== "" && form.sessionsSubfolder.trim() !== "" && (
+            <p className="truncate font-mono text-muted-foreground text-xs">
+              {`${form.localPath}/${form.sessionsSubfolder.trim()}`}
+            </p>
+          )}
+        </>
+      )}
       <Button
         type="button"
         variant="ghost"
@@ -1038,10 +1268,25 @@ export function AddFolderForm({
           </div>
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-threshold`}>{SYNC_LFS_THRESHOLD_LABEL}</Label>
+            {/* MB is a scale the user did not choose, so a fraction is ordinary
+                here: keeper's own documented 256 KiB threshold is 0.25 of one.
+                Without a `step` HTML's implicit step is 1, which makes every
+                fraction a stepMismatch — and because this box sits in a real
+                form with a native submit and no `noValidate`, WKWebView refuses
+                the whole save, including one that came to change something else.
+                `step="any"` with `inputMode="decimal"` is the pair
+                `session-space-editor.tsx:566-568` already uses for a fractional
+                box; the integer box beside it there keeps `step="1"`, so the two
+                cases stay distinguishable rather than uniformly loosened.
+                Downstream needs nothing: `pinnedValue` parses with
+                `Number.parseFloat`, and the one rounding at the save keeps the
+                byte count integral for Rust's `u64`. */}
             <Input
               id={`${fieldId}-threshold`}
               type="number"
               min={0}
+              step="any"
+              inputMode="decimal"
               className="w-24"
               placeholder={String(SYNC_DEFAULT_LFS_THRESHOLD_BYTES / 1024 / 1024)}
               value={form.lfsThresholdMb}
@@ -1069,6 +1314,11 @@ export function AddFolderForm({
               id={`${fieldId}-settle`}
               type="number"
               min={0}
+              // Fractional for the same reason as the threshold above: a 7.5 s
+              // window is a legal wait, the save already rounds it to whole
+              // milliseconds, and the implicit step=1 would block the submit.
+              step="any"
+              inputMode="decimal"
               className="w-24"
               // Empty means "keeper picks", so the box shows nothing and the
               // placeholder names what keeper will pick — 10 s on removable
@@ -1098,6 +1348,9 @@ export function AddFolderForm({
               id={`${fieldId}-poll`}
               type="number"
               min={0}
+              // Fractional, as the wait above — the save rounds to whole ms.
+              step="any"
+              inputMode="decimal"
               className="w-24"
               placeholder={String(effectivePollSeconds({ ...form, pollSeconds: "" }))}
               value={form.pollSeconds}

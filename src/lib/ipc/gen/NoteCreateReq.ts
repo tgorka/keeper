@@ -16,4 +16,16 @@ template: string | null,
 /**
  * Destination directory, vault-relative; the vault root when absent.
  */
-dest: string | null, tags: Array<string>, };
+dest: string | null, tags: Array<string>, 
+/**
+ * The id of the space note this create was asked for from, when the ask
+ * came from a space row rather than from the rail (Story 44.6, FR-160).
+ *
+ * The space's **id**, never its query text: the shell reads the space note
+ * and derives what the new note has to carry through
+ * [`crate::notes::seed`], so no surface outside Rust ever parses a query
+ * or decides what `is:pinned` means (AD-58). An id naming no space creates
+ * an ordinary note — a space deleted between the click and the write is
+ * not a reason to lose the thought.
+ */
+space: string | null, };

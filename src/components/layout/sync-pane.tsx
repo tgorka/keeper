@@ -47,24 +47,31 @@
  *     waiting and stops there.
  *
  * It reuses the {@link RecordingPane} outer chrome (`<section>`/`<header>`/
- * `<ScrollArea>`) and its centered content column (UX-DR29) so the non-chat
- * primary views read as one family. The whole surface is capability-gated at
+ * `<ScrollArea>`) so the non-chat primary views read as one family, but not
+ * its centered content column: the body is full-bleed like the Bridges one,
+ * because this surface is lists of repository paths rather than a stack of
+ * setup forms. The forms it does hold keep a measured width of their own. The whole surface is capability-gated at
  * the app-shell / sidebar level: a machine with no usable `git` gets no sync UI
  * at all, never a disabled one.
  */
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowDownToLine,
+  ArrowUpFromLine,
   CircleAlert,
+  CircleArrowDown,
+  CircleArrowUp,
   CircleCheck,
   CircleDashed,
   CircleMinus,
   CirclePlus,
   CircleSlash,
+  Clock,
   FileIcon,
   SquarePen,
   TriangleAlert,
 } from "lucide-react";
-import { type ReactNode, useEffect, useId, useState } from "react";
+import { type ReactNode, useEffect, useId, useMemo, useState } from "react";
 import {
   SYNC_NOW_LABEL,
   SYNC_PAUSE_LABEL,
@@ -111,6 +118,7 @@ import type {
   CopyJobState,
   CopyJobVm,
   SyncActivityVm,
+  SyncFootprintVm,
   SyncOutcomeVm,
   SyncParkedVm,
   SyncPendingVm,
@@ -118,6 +126,7 @@ import type {
   SyncProfileVm,
   SyncStatusVm,
 } from "@/lib/ipc/client";
+import { syncFootprint } from "@/lib/ipc/client";
 import {
   type CopyGroup,
   cancelCopyJob,
@@ -137,6 +146,7 @@ import {
   setSyncProfileEnabled,
   startSyncStatusPolling,
   syncErrorMessage,
+  syncPhaseCarriesRate,
   syncProfileNow,
   useSyncStore,
 } from "@/lib/stores/sync";
@@ -215,6 +225,22 @@ export const SYNC_PARKED_SENTENCE =
 export const SYNC_PARKED_NO_ERROR_SENTENCE = "No error was recorded.";
 
 /**
+ * Unspellable-name copy (Story 47.2, DW-200).
+ *
+ * The sentence has one job that is easy to get wrong: say what keeper WILL NOT
+ * do, so the reader stops waiting for it. keeper carries the file's bytes
+ * perfectly — git stores the raw name — but it cannot address the file from a
+ * pane, because the only rendering a pane can show is lossy and two different
+ * files can share it. That is why every row prints the escaped form beside the
+ * readable one: the escaped form is the one a person can act on.
+ */
+export const SYNC_UNSPELLABLE_TITLE = "Names that are not text";
+export const SYNC_UNSPELLABLE_SENTENCE =
+  "These files have names that are not valid text. keeper syncs them normally — nothing is lost — but it will not open, edit or delete them from this app, because the name it can show you is not the name on disk and two different files can look identical here.";
+export const SYNC_UNSPELLABLE_NOTE =
+  "The second line of each row is the name byte for byte, safe to paste into a terminal. Rename the file there and it will behave like any other.";
+
+/**
  * The fold control's labels.
  *
  * "Show all N" and not "Show more": the unfolded size is a fixed setting, so the
@@ -235,6 +261,90 @@ export const SYNC_FOLD_LESS_LABEL = "Show fewer";
  * two-row Problems list have nothing to say to each other about how much of
  * themselves the user wants to see.
  */
+/** Test id for the footprint line. */
+export const SYNC_FOOTPRINT_TESTID = "sync-folder-footprint";
+
+/**
+ * What this folder costs on disk, and how much of that is a second copy.
+ *
+ * # The question it answers
+ *
+ * "It is 220 GB here and less on the server." Both true: a synced folder holds
+ * the working tree *and* a local LFS cache of the same content, so a folder of
+ * large files is close to twice its own size by design. Without this line the
+ * difference reads as a leak, and somebody goes looking for one.
+ *
+ * # Why no server figure sits beside it
+ *
+ * No generic git request asks a remote how large it is. A host's own API can,
+ * and keeper syncs to plain git — a number that appeared for one host and not
+ * another would be worse than none. What is here instead is the half that
+ * explains the gap without asking anyone: the bytes held locally that the
+ * remote already has.
+ *
+ * # Why it is asked for rather than polled
+ *
+ * It walks a tree that may live on a slow external volume: cheap enough to ask
+ * for while a card is on screen, far too expensive to repeat on the status
+ * poll, which runs when nobody is looking at Sync at all.
+ */
+function SyncFolderFootprint({ profileId }: { profileId: string }): React.ReactElement | null {
+  const [footprint, setFootprint] = useState<SyncFootprintVm | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    // The call is INSIDE the try, not merely awaited in it. Reaching for the
+    // command can throw before any promise exists — a module that failed to
+    // resolve fails at the property access — and a `.catch()` chained onto a
+    // call that never returned has nothing to attach to. That is not
+    // hypothetical: the same shape threw out of a note decoration earlier in
+    // this epic and took the render with it.
+    void (async () => {
+      try {
+        const measured = await syncFootprint(profileId);
+        if (live) {
+          setFootprint(measured);
+        }
+      } catch {
+        // A folder on an unmounted volume cannot be measured, and saying so
+        // here would be a second error message about a fact the card's status
+        // line already carries.
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [profileId]);
+
+  if (footprint === null) {
+    return null;
+  }
+  // Only the parts that are not zero: "0 B of scratch" is a fact nobody needs,
+  // and a row of zeroes teaches a reader to stop reading the line.
+  const parts = [
+    // What the folder tracks, at full size, whether or not the bytes are here.
+    // Worked out from the LFS pointers rather than asked of the server, because
+    // the git protocol has no question that means "how big are you" — and a
+    // number that only appeared for one host would be worse than none.
+    //
+    // Suppressed when it matches what is on disk, which is the ordinary case for
+    // a folder with no large files: saying the same figure twice in one sentence
+    // reads as a bug in the sentence.
+    footprint.content > 0 && footprint.content !== footprint.onDisk
+      ? `${footprint.contentLabel} of content`
+      : null,
+    footprint.reclaimable > 0 ? `${footprint.reclaimableLabel} the server already has` : null,
+    footprint.scratch > 0 ? `${footprint.scratchLabel} scratch` : null,
+  ].filter((part): part is string => part !== null);
+
+  return (
+    <p data-testid={SYNC_FOOTPRINT_TESTID} className="text-muted-foreground text-xs">
+      {footprint.onDiskLabel} on disk
+      {parts.length > 0 ? ` — ${parts.join(", ")}` : null}
+    </p>
+  );
+}
+
 function useFold<T>(rows: readonly T[] | null): {
   visible: readonly T[];
   hidden: number;
@@ -403,12 +513,60 @@ export const SYNC_DELIVERY_STATES: Record<
   abandoned: { icon: CircleSlash, word: SYNC_PARKED_TITLE, tone: "text-destructive" },
 };
 
+/**
+ * Which way a pending row is travelling, as a glyph and a word.
+ *
+ * The list carries both directions now, and a column of paths that does not say
+ * which way each one is going asks the reader to infer it from the sentence at
+ * the far end of the row. The glyph is the same size and tone as the Activity
+ * list's, because the two lists are read in one glance.
+ *
+ * Screen readers get the word, not the arrow: "up" is a shape, not a fact.
+ */
+export const SYNC_PENDING_INBOUND_WORD = "Coming in";
+export const SYNC_PENDING_OUTBOUND_WORD = "Going out";
+
+/**
+ * The glyph a pending row leads with, and the words behind it.
+ *
+ * Two questions in one mark, because a row has space for one: an arrow's
+ * **direction** says which way the file is travelling, and whether it is
+ * **circled** says whether the thing at the other end already exists. A bare
+ * arrow is content nobody has yet; a circled one is a second version of
+ * something that does.
+ *
+ * All four combinations exist. An inbound update is not visible in the
+ * repository — a download is queued only for a path whose worktree holds
+ * pointer text, and that is true of a new file and a new version alike — so it
+ * is read from keeper's own record of what it has materialized here. A file
+ * added upstream a week ago and never fetched is NEW to this machine however
+ * old it is there, which is the question this answers.
+ *
+ * The word is what a screen reader gets. An arrow is a shape, and "up" is not a
+ * fact about a file.
+ */
+export const PENDING_MARKS: Record<string, { icon: typeof FileIcon; word: string }> = {
+  untracked: { icon: ArrowUpFromLine, word: `New file · ${SYNC_PENDING_OUTBOUND_WORD}` },
+  added: { icon: ArrowUpFromLine, word: `New file · ${SYNC_PENDING_OUTBOUND_WORD}` },
+  modified: { icon: CircleArrowUp, word: `Changed · ${SYNC_PENDING_OUTBOUND_WORD}` },
+  deleted: { icon: CircleMinus, word: `Deleted · ${SYNC_PENDING_OUTBOUND_WORD}` },
+  settling: { icon: Clock, word: SYNC_SETTLING_SENTENCE },
+  incoming: { icon: ArrowDownToLine, word: `New file · ${SYNC_PENDING_INBOUND_WORD}` },
+  incomingUpdate: { icon: CircleArrowDown, word: `Changed · ${SYNC_PENDING_INBOUND_WORD}` },
+};
+
+/** Names the row a transfer is moving right now. */
+export const SYNC_PENDING_CURRENT_WORD = "Syncing now";
+
 /** Why a file is waiting, for every reason except `settling` (which is timed). */
 const PENDING_REASONS: Record<string, string> = {
   untracked: "New file, not synced yet",
   added: "Added, not synced yet",
   modified: "Changed, not synced yet",
   deleted: "Deleted, not synced yet",
+  // The only inbound reason, and worded to say so: the four above are things
+  // this machine did, this one is content the remote still holds.
+  incoming: "Waiting to download",
 };
 
 /**
@@ -459,6 +617,10 @@ export function syncPendingReason(pending: SyncPendingVm, now: number = Date.now
       ? SYNC_SETTLING_SENTENCE
       : `${SYNC_SETTLING_SENTENCE} · ${formatSyncWaited(pending.sinceMs, now)} so far`;
   }
+  // No size here any more: every row carries one, and it is rendered in a column
+  // of its own rather than glued onto a sentence which is itself no longer
+  // shown. What this composes now is the row's ACCESSIBLE description; the
+  // glyph is what a sighted reader gets.
   return PENDING_REASONS[pending.reason] ?? pending.reason;
 }
 
@@ -710,11 +872,13 @@ export function SyncPane() {
   return (
     <section
       aria-label="Sync"
-      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background"
+      // Last child of the shell row, so the trailing edge cancels; see
+      // DESIGN.md → Elevation & Depth.
+      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0"
     >
       <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
         <div className="min-w-0">
-          <h1 className="font-heading font-medium text-lg">Sync</h1>
+          <h1 className="font-heading text-title">Sync</h1>
           <p className="text-muted-foreground text-sm">{SYNC_PANE_SUBTITLE}</p>
         </div>
         {profiles !== null && !empty && (
@@ -731,21 +895,41 @@ export function SyncPane() {
         )}
       </header>
 
-      <ScrollArea className="min-h-0 flex-1">
-        {/* Centered single column at content-max-width (UX-DR29), matching the
-            Recording pane rather than the full-bleed Bridges body. */}
-        <div className="mx-auto flex w-full max-w-[720px] flex-col gap-6 p-6">
+      {/* `fitWidth`, because this body is full-bleed: without it Radix's
+          `display: table` viewport sizes to the longest path in the longest
+          list and pushes the row of actions past the window's edge, where the
+          last of them cannot be clicked. */}
+      <ScrollArea fitWidth className="min-h-0 flex-1">
+        {/* Full-bleed, like the Bridges body and unlike the Recording pane.
+            Those two are the app's precedents and this surface belongs to the
+            second one: UX-DR29's centered column is a decision about
+            *Recording*, a stack of setup forms where a measured line length is
+            the point. Sync is lists — Activity, Pending, Problems — whose rows
+            are repository paths four folders deep beside a size and a date. At
+            720px those paths truncate into ellipses while the window sits half
+            empty, which is the one thing a list of paths must not do: the tail
+            of a path is the half that identifies it. */}
+        {/* No gutter and no gap. A card here is not an object floating on a
+            surface — it is a section of the surface, and the folders are the
+            whole content of this pane. Separated by a rule rather than by
+            emptiness, since with the cards meeting edge to edge there is no
+            background left between them to do the separating. Prose and the
+            add form keep their own padding, because a sentence flush against
+            the window frame reads as a mistake. */}
+        <div data-slot="sync-body" className="flex flex-col">
           {readError !== null && (
-            <p role="alert" className="text-destructive text-sm">
+            <p role="alert" className="px-6 pt-4 text-destructive text-sm">
               {readError}
             </p>
           )}
           {/* Only claim "nothing configured" once a read has actually landed —
               before that the list is unknown, not empty. */}
           {profiles === null && (
-            <p className="text-muted-foreground text-sm">{SYNC_PANE_LOADING_SENTENCE}</p>
+            <p className="px-6 pt-4 text-muted-foreground text-sm">{SYNC_PANE_LOADING_SENTENCE}</p>
           )}
-          {empty && <p className="text-muted-foreground text-sm">{SYNC_PANE_EMPTY_SENTENCE}</p>}
+          {empty && (
+            <p className="px-6 pt-4 text-muted-foreground text-sm">{SYNC_PANE_EMPTY_SENTENCE}</p>
+          )}
           {/* Whether it arrived as the empty state or from the header action,
               this is the one add form; see `showAddForm` above for why.
 
@@ -758,7 +942,12 @@ export function SyncPane() {
               reopen it is hidden, so a discard there would leave a user with
               nothing to do and no way to undo it. */}
           {showAddForm && (
-            <Card size="sm">
+            // Capped where the lists are not. A form is read line by line and a
+            // label-and-field pair stretched across a wide window is worse than
+            // one that sits still; the rows below are paths that want every
+            // pixel. Same reasoning as the Recording pane's column, applied to
+            // the part of this surface that is actually a form.
+            <Card size="sm" className="m-6 w-full max-w-[720px]">
               <CardContent>
                 <AddFolderForm
                   onSaved={(_profile, settled) => setAdding(!settled)}
@@ -774,6 +963,9 @@ export function SyncPane() {
               this surface it keeps nothing about. */}
           <Separator />
           <CopyCard />
+          {/* The last card ends where the pane does; without this the surface
+              stops mid-scroll and the background shows through under it. */}
+          <div className="min-h-6 flex-1 bg-card" />
         </div>
       </ScrollArea>
     </section>
@@ -876,24 +1068,37 @@ function SyncProfileCard({
   // than two competing claims. Built as a list for the reason
   // `copyProgressSentence` builds one: a figure that is not known yet drops out
   // and leaves no orphaned separator behind.
-  const flying: string[] = [];
+  //
+  // Kept as two values rather than one joined string because they jitter at
+  // different speeds and only one of them can be given a fixed box: the rate
+  // changes every tick and has a bounded width, the file count changes once
+  // per file and has none.
+  let files: string | null = null;
   if (streamed !== undefined) {
     if (streamed.filesTotal !== null) {
-      flying.push(`${streamed.filesDone}/${streamed.filesTotal} files`);
+      files = `${streamed.filesDone}/${streamed.filesTotal} files`;
     } else if (streamed.filesDone > 0) {
-      flying.push(`${streamed.filesDone} files`);
+      files = `${streamed.filesDone} files`;
     }
   }
   // `null` covers both "too little measured to say" and "nothing is moving";
   // neither is a rate, and printing "0 B/s" for the second would be a claim
   // about an idle wire (AD-34-13).
   const rate = syncLiveRate(status, progress);
-  if (rate !== null) {
-    flying.push(`${formatCopyBytes(rate)}/s`);
-  }
+  const rateText = rate === null ? null : `${formatCopyBytes(rate)}/s`;
+  // A phase that cannot carry a rate is given no room for one: see
+  // `syncPhaseCarriesRate`. Reserving the box for `Scanning` printed a
+  // separator followed by eleven blank characters, which is what the line
+  // looked like on the owner's 155 000-file folder the moment the walk began
+  // reporting its progress.
+  const carriesRate = status !== undefined && syncPhaseCarriesRate(status.phase);
+  const flying = [files, rateText].filter((figure) => figure !== null);
 
   return (
-    <Card size="sm">
+    // Square and edge to edge: this card is a section of the pane, not an
+    // object on it. The rule at the bottom is what separates one folder from
+    // the next now that no background shows between them.
+    <Card size="sm" className="rounded-none border-border border-b">
       <CardHeader>
         {/* Wraps rather than overflowing. The actions used to be `shrink-0` beside
             a `min-w-0` title, which works until there are five of them: the row
@@ -919,9 +1124,11 @@ function SyncProfileCard({
                 </Badge>
               )}
             </div>
-            {/* Verbatim, never recomposed: the tray renders this same sentence. */}
+            {/* Verbatim, never recomposed: the tray renders this same sentence.
+                A sentence, though — so it is set in the room's voice. Mono is
+                for the things below it that line up. */}
             {status !== undefined && (
-              <span className="font-mono text-muted-foreground text-xs">{status.line}</span>
+              <span className="figures text-muted-foreground text-xs">{status.line}</span>
             )}
             {/* Where it lives and where it points, on one line: two stacked
                 muted lines under an already-muted status line read as one grey
@@ -935,8 +1142,13 @@ function SyncProfileCard({
               <span aria-hidden="true">·</span>
               <span className="shrink-0">{syncRemoteHost(profile.remoteUrl)}</span>
             </p>
+            <SyncFolderFootprint profileId={profile.id} />
           </div>
-          <div className="flex flex-wrap items-center justify-end gap-1">
+          {/* `ml-auto` and not merely `justify-end`: the row wraps, and a
+              wrapped line is laid out on its own, so the actions would land at
+              the left edge of the second line — under the folder's name rather
+              than in the corner where they started. */}
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
             <Button
               type="button"
               variant="outline"
@@ -1019,12 +1231,38 @@ function SyncProfileCard({
           />
         )}
         {(current !== null || flying.length > 0) && (
-          // The live detail under the bar: the path being carried, then how far
-          // through the set and how fast. Laid out like the folder's own
-          // path·host line in the header — one truncating span and a shrink-0
-          // tail, so a long path gives way to the figures rather than pushing
-          // them off the card.
+          // The live detail under the bar: how fast and how far through the
+          // set, then the path being carried.
+          //
+          // The figures lead because they are the fixed-width half and the one
+          // that changes every tick: a reader watching a rate should not have
+          // to find it at the end of a path whose length depends on how deep
+          // the file happens to sit. The path truncates into whatever room is
+          // left, which is the same bargain as before — a long path gives way
+          // to the figures rather than pushing them off the card — with the
+          // shrink-0 half now at the front where the eye lands.
           <p className="flex min-w-0 items-baseline gap-1.5 text-muted-foreground text-xs">
+            {files !== null && <span className="figures shrink-0 font-mono">{files}</span>}
+            {files !== null && carriesRate && <span aria-hidden="true">·</span>}
+            {/* A RESERVED box, not merely a monospaced one. Mono fixes the
+                width of a digit and says nothing about how many there are:
+                `2 kB/s` against `294.8 kB/s` is four characters, and at one
+                update a second that would drag everything after it left and
+                right continuously.
+
+                `11ch` is the widest this formatter can produce — `999 bytes/s`,
+                verified across the whole range rather than estimated.
+                Right-aligned so the digits grow leftward into the reserved room
+                and the separator never moves, and held open even when there is
+                no rate: the row must not jump because a folder went quiet for a
+                tick. It stands empty then rather than reading `0 B/s`, which
+                would claim a measurement of an idle wire (AD-34-13). */}
+            {carriesRate && (
+              <span className="figures min-w-[11ch] shrink-0 text-right font-mono">
+                {rateText ?? ""}
+              </span>
+            )}
+            {current !== null && <span aria-hidden="true">·</span>}
             {current !== null && (
               <span className="truncate font-mono" title={current}>
                 {/* Under a moving bar the bare path is unambiguous on screen; to
@@ -1033,10 +1271,6 @@ function SyncProfileCard({
                 {current}
               </span>
             )}
-            {current !== null && flying.length > 0 && <span aria-hidden="true">·</span>}
-            {/* Monospaced so a rate climbing from 4.1 to 12.3 MB/s does not
-                reflow the line it sits on. */}
-            {flying.length > 0 && <span className="shrink-0 font-mono">{flying.join(" · ")}</span>}
           </p>
         )}
         {outcome !== null && (
@@ -1074,7 +1308,9 @@ function SyncProfileCard({
             nothing else on screen would report. */}
         {editing && (
           <AddFolderForm
-            className="border-border border-b pb-5"
+            // Measured for the same reason the add form is: this is a form
+            // inside a card that is now as wide as the window.
+            className="w-full max-w-[720px] border-border border-b pb-5"
             profile={profile}
             onSaved={(_saved, settled) => setEditing(!settled)}
             onCancel={() => setEditing(false)}
@@ -1086,7 +1322,7 @@ function SyncProfileCard({
           busy={busy}
           onRetry={retryUnit}
         />
-        <SyncPendingList profile={profile} rows={detail?.pending ?? null} />
+        <SyncPendingList profile={profile} rows={detail?.pending ?? null} current={current} />
         <SyncProblemsSection
           profile={profile}
           problems={detail?.problems ?? null}
@@ -1142,9 +1378,7 @@ function SyncActivityList({
       {/* The project's group-label treatment (the Bridges / Approvals panes and
           the sidebar groups): a quiet micro-label, so the card's own title
           stays the loudest thing in it. */}
-      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {SYNC_ACTIVITY_TITLE}
-      </h2>
+      <h2 className="label-caps text-faint">{SYNC_ACTIVITY_TITLE}</h2>
       {rows === null ? (
         <p className="text-muted-foreground text-xs">{SYNC_LIST_LOADING_SENTENCE}</p>
       ) : rows.length === 0 ? (
@@ -1174,11 +1408,11 @@ function SyncActivityList({
                     claim the file was empty, and "unknown" is noise on a line
                     already busy answering when. */}
                 {row.sizeBytes !== null && (
-                  <span className="shrink-0 text-muted-foreground text-xs">
+                  <span className="shrink-0 font-mono text-muted-foreground text-xs">
                     {formatCopyBytes(row.sizeBytes)}
                   </span>
                 )}
-                <span className="shrink-0 text-muted-foreground text-xs">
+                <span className="figures shrink-0 text-muted-foreground text-xs">
                   {formatDraftAge(row.tsMs)}
                 </span>
                 <SyncDeliveryMark row={row} busy={busy} onRetry={onRetry} />
@@ -1277,7 +1511,10 @@ function SyncDeliveryMark({
             breaking while it is in fact doing the careful thing. That is the
             same mistake the engine used to make by reporting every deferred
             unit as a missing drive. */}
-        <p className={`font-mono text-xs [overflow-wrap:anywhere] ${state.tone}`}>{row.failure}</p>
+        {/* Sans, not mono: this is a sentence git or LFS wrote, and a sentence
+            set in the register's face is terminal cosplay. The face is for
+            things that line up. */}
+        <p className={`text-xs [overflow-wrap:anywhere] ${state.tone}`}>{row.failure}</p>
         {/* No Retry for a failed row: keeper has not stopped, and a button
             saying otherwise would invite a click that changes nothing. */}
         {row.delivery === "failed" && (
@@ -1305,17 +1542,35 @@ function SyncDeliveryMark({
 function SyncPendingList({
   profile,
   rows,
+  current,
 }: {
   profile: SyncProfileVm;
   rows: SyncPendingVm[] | null;
+  /** The path a transfer is moving right now, from the streamed progress. */
+  current: string | null;
 }) {
   const settling = rows?.some((row) => row.reason === "settling");
-  const fold = useFold(rows);
+  // The row being transferred comes first. Marking it and then leaving it below
+  // the fold is not a mark: this list runs to eighty-odd rows on a folder mid
+  // backlog, and the one thing happening right now was on none of the screens
+  // that reported it missing. Only that row moves; everything else keeps the
+  // order the engine gave it.
+  const ordered = useMemo(() => {
+    if (rows === null || current === null) {
+      return rows;
+    }
+    const at = rows.findIndex((row) => row.path === current);
+    if (at <= 0) {
+      return rows;
+    }
+    const moved = [...rows];
+    const [row] = moved.splice(at, 1);
+    return [row, ...moved];
+  }, [rows, current]);
+  const fold = useFold(ordered);
   return (
     <div className="flex flex-col gap-2">
-      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {SYNC_PENDING_TITLE}
-      </h2>
+      <h2 className="label-caps text-faint">{SYNC_PENDING_TITLE}</h2>
       {rows === null ? (
         <p className="text-muted-foreground text-xs">{SYNC_LIST_LOADING_SENTENCE}</p>
       ) : rows.length === 0 ? (
@@ -1326,16 +1581,54 @@ function SyncPendingList({
             aria-label={`${SYNC_PENDING_TITLE}: ${profile.name}`}
             className="flex flex-col gap-1.5"
           >
-            {fold.visible.map((row) => (
-              <li key={`${row.reason}-${row.path}`} className="flex items-center gap-3">
-                <span className="min-w-0 flex-1 truncate font-mono text-xs" title={row.path}>
-                  {row.path}
-                </span>
-                <span className="shrink-0 text-muted-foreground text-xs">
-                  {syncPendingReason(row)}
-                </span>
-              </li>
-            ))}
+            {fold.visible.map((row) => {
+              const mark = PENDING_MARKS[row.reason];
+              const Mark = mark?.icon ?? FileIcon;
+              // The row the transfer is on right now. Compared by path because
+              // that is what both sides are keyed by; a row that is merely
+              // *next* is not marked, because "in flight" is a fact and "about
+              // to be" is a guess about a queue that reorders.
+              const syncing = current !== null && row.path === current;
+              return (
+                <li
+                  key={`${row.reason}-${row.path}`}
+                  aria-current={syncing ? "true" : undefined}
+                  className={`-mx-1.5 flex items-center gap-3 rounded-sm px-1.5 ${
+                    syncing ? "bg-muted" : ""
+                  }`}
+                >
+                  <Mark aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
+                  {/* The sentence the row no longer shows. A glyph is the whole
+                      answer for a reader who can see it and none of it for one
+                      who cannot. */}
+                  <span className="sr-only">
+                    {/* A settling row is described rather than named: its whole
+                        point is HOW LONG it has been held, which a fixed word
+                        cannot carry and the glyph certainly cannot. */}
+                    {row.reason === "settling" || mark === undefined
+                      ? syncPendingReason(row)
+                      : mark.word}
+                    {syncing ? ` · ${SYNC_PENDING_CURRENT_WORD}` : ""}{" "}
+                  </span>
+                  <span
+                    className={`min-w-0 flex-1 truncate font-mono text-xs ${
+                      syncing ? "text-foreground" : ""
+                    }`}
+                    title={`${row.path} — ${syncPendingReason(row)}`}
+                  >
+                    {row.path}
+                  </span>
+                  {/* A size nobody could measure shows nothing, the same rule
+                      the Activity list follows: "0 B" would claim the file is
+                      empty. */}
+                  {row.sizeBytes !== null && (
+                    <span className="shrink-0 font-mono text-muted-foreground text-xs">
+                      {formatCopyBytes(row.sizeBytes)}
+                    </span>
+                  )}
+                </li>
+              );
+            })}
           </ul>
           <FoldToggle rows={rows} fold={fold} label={`${SYNC_PENDING_TITLE}: ${profile.name}`} />
           {settling && <p className="text-muted-foreground text-xs">{SYNC_SETTLING_NOTE}</p>}
@@ -1373,6 +1666,7 @@ function SyncProblemsSection({
     (problems.error === null &&
       problems.warning === null &&
       problems.parked.length === 0 &&
+      problems.unspellable.length === 0 &&
       problems.conflicts.length === 0)
   ) {
     return null;
@@ -1380,9 +1674,7 @@ function SyncProblemsSection({
 
   return (
     <div className="flex flex-col gap-3">
-      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {SYNC_PROBLEMS_TITLE}
-      </h2>
+      <h2 className="label-caps text-faint">{SYNC_PROBLEMS_TITLE}</h2>
       {/* The split AD-S5 draws, in the two treatments the app already has: an
           error needs a human before the folder can progress, so it gets the
           actionable destructive notice; a warning is passive, so it gets the
@@ -1394,13 +1686,18 @@ function SyncProblemsSection({
       )}
       {problems.warning !== null && (
         <p className="flex items-start gap-1.5 text-held text-xs">
-          <span aria-hidden="true">⚠</span>
+          {/* The tone was a bare ⚠ — an emoji, hidden from assistive tech, so
+              the only thing marking this line as a warning rather than a
+              statement was its amber. The icon carries the shape and the
+              `sr-only` word carries the state, as the delivery marks above do. */}
+          <TriangleAlert aria-hidden="true" className="mt-px size-3.5 shrink-0" />
+          <span className="sr-only">Warning</span>
           {problems.warning}
         </p>
       )}
       {problems.conflicts.length > 0 && (
         <div className="flex flex-col gap-1.5">
-          <h3 className="font-medium text-xs">{SYNC_CONFLICT_TITLE}</h3>
+          <h3 className="font-heading text-sm font-semibold">{SYNC_CONFLICT_TITLE}</h3>
           <p className="text-muted-foreground text-xs">{SYNC_CONFLICT_SENTENCE}</p>
           <ul
             aria-label={`${SYNC_CONFLICT_TITLE}: ${profile.name}`}
@@ -1413,6 +1710,34 @@ function SyncProblemsSection({
             ))}
           </ul>
           <p className="text-muted-foreground text-xs">{SYNC_CONFLICT_NOTE}</p>
+        </div>
+      )}
+      {problems.unspellable.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <h3 className="font-heading text-sm font-semibold">{SYNC_UNSPELLABLE_TITLE}</h3>
+          <p className="text-muted-foreground text-xs">{SYNC_UNSPELLABLE_SENTENCE}</p>
+          <ul
+            aria-label={`${SYNC_UNSPELLABLE_TITLE}: ${profile.name}`}
+            className="flex flex-col gap-1.5"
+          >
+            {/* Keyed on `escaped`, never on `display`: `display` is lossy and
+                non-injective, so two genuinely different files in this list
+                collide on it — which is the defect itself, showing up as a
+                duplicate React key and one row silently not rendering. */}
+            {problems.unspellable.map((name) => (
+              <li key={name.escaped} className="flex min-w-0 flex-col">
+                <span className="truncate font-mono text-xs" title={name.display}>
+                  {name.display}
+                </span>
+                {/* Not truncated and selectable: this is the line a person
+                    copies, and half of a byte-exact name is worse than none. */}
+                <span className="select-all break-all font-mono text-meta text-muted-foreground">
+                  {name.escaped}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <p className="text-muted-foreground text-xs">{SYNC_UNSPELLABLE_NOTE}</p>
         </div>
       )}
       {problems.parked.length > 0 && (
@@ -1446,7 +1771,7 @@ function SyncProblemsSection({
                 <li key={unit.id} className="flex items-start justify-between gap-3">
                   <div className="flex min-w-0 flex-col gap-0.5">
                     <span className="text-xs">{summary}</span>
-                    <span className="font-mono text-destructive text-xs">
+                    <span className="text-destructive text-xs">
                       {unit.lastError ?? SYNC_PARKED_NO_ERROR_SENTENCE}
                     </span>
                   </div>
@@ -1742,9 +2067,7 @@ function CopyReport({ job }: { job: CopyJobVm }) {
   const groups = copyEntryGroups(job.entries);
   return (
     <div className="flex flex-col gap-3" data-testid={COPY_REPORT_TESTID}>
-      <h2 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
-        {COPY_RESULT_TITLE}
-      </h2>
+      <h2 className="label-caps text-faint">{COPY_RESULT_TITLE}</h2>
       {/* The job failing to run at all — never a file that could not be copied,
           which is an entry below and leaves the job finished. */}
       {job.error !== null && (
@@ -1787,7 +2110,7 @@ function CopyReportGroup({ group }: { group: ReturnType<typeof copyEntryGroups>[
   const note = COPY_OUTCOME_NOTES[group.outcome];
   return (
     <div className="flex flex-col gap-1.5">
-      <h3 className="font-medium text-xs">{title}</h3>
+      <h3 className="font-heading text-sm font-semibold">{title}</h3>
       {note !== undefined && <p className="text-muted-foreground text-xs">{note}</p>}
       <ul aria-label={title} className="flex flex-col gap-1">
         {fold.visible.map((entry) => (
@@ -1800,13 +2123,13 @@ function CopyReportGroup({ group }: { group: ReturnType<typeof copyEntryGroups>[
                             destination, and a byte count there would read as
                             how much did. */}
               {group.outcome !== "failed" && (
-                <span className="shrink-0 text-muted-foreground text-xs">
+                <span className="shrink-0 font-mono text-muted-foreground text-xs">
                   {formatCopyBytes(entry.bytes)}
                 </span>
               )}
             </div>
             {entry.reason !== null && (
-              <span className="font-mono text-destructive text-xs">{entry.reason}</span>
+              <span className="text-destructive text-xs">{entry.reason}</span>
             )}
           </li>
         ))}

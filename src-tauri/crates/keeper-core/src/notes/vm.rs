@@ -24,8 +24,14 @@
 //! never cross IPC at all — [`NoteAttachmentVm`] carries a URL for the custom
 //! protocol to serve.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
+
+use crate::notes::index::NoteTagTerm;
+use crate::notes::order::NoteOrder;
+use crate::vm::RecordingNoteTargetKind;
 
 /// One notes-flagged sync profile, with its index state (FR-94, FR-95).
 ///
@@ -56,6 +62,17 @@ pub struct NoteVaultVm {
     /// Notes changed by an agent or another device since this device last
     /// acknowledged them (FR-113).
     pub unread_count: u32,
+    /// The template a quick capture starts from, vault-relative, or `None`
+    /// (Story 45.16, FR-193). Mirrored back so the settings form shows the
+    /// value actually in force rather than the one it last sent (AD-34-8).
+    pub capture_template: Option<String>,
+    /// The tag every quick capture carries, in its canonical form, or `None`.
+    ///
+    /// Canonical rather than as typed, for the same reason: `keeper_core`
+    /// folded `#Quick Capture` to `quick-capture` on the way in, and a form
+    /// still showing the typed spelling would be describing a tag that is not
+    /// in any note.
+    pub capture_tag: Option<String>,
     /// The commit/push cadence in force for this vault.
     pub cadence: NoteCadenceVm,
 }
@@ -114,6 +131,50 @@ pub struct NoteRowVm {
     /// or `changed on hesperia`. Empty when the note has no commit yet — the row
     /// branches on emptiness, never on null.
     pub origin: String,
+    /// Why this row is connected to the note being looked at: the predicates
+    /// the author wrote in the link's attribute block, in the order written.
+    ///
+    /// A predicate is the author's own word for the relationship —
+    /// `schema:about`, `dcterms:source` — and keeper neither invents one nor
+    /// infers one. Empty for every link written without a block, which is
+    /// nearly all of them, and for every row that is not the far end of a link:
+    /// only the two link projections fill this. The forward projection fills it
+    /// for an edge with NO note at the far end as well — a predicate is written
+    /// on the arrow, and the arrow exists whether or not its target does.
+    ///
+    /// A `Vec` and never an `Option<Vec>`. An empty list and "no predicates"
+    /// are the same fact, and shipping two spellings of one fact is how one
+    /// surface ends up branching on `null` while another branches on `.length`.
+    /// This field REPLACED an `Option<String>` carrying the single
+    /// `{reference="cites"}` attribute, which was this same concept with a
+    /// one-per-link ceiling; that legacy value folds in as the first entry, so
+    /// a vault written before the change renders exactly as it did.
+    ///
+    /// **On an inbound row these are the OTHER document's words.** A backlink's
+    /// attribute block was written in the note that points here, not by the
+    /// reader looking at it, so a surface showing them has to say whose words
+    /// they are: nothing in the reader's own file contains the string. The
+    /// index answers this through `IndexSnapshot::backlink_predicates`.
+    pub predicates: Vec<String>,
+    /// The raw link target, for an outbound edge whose target resolves to no
+    /// note. Empty on every other row — the same empty-means-absent spelling
+    /// `origin` and `head_rev` use here, so a surface branches on emptiness and
+    /// never on null.
+    ///
+    /// **Why the row exists at all.** OKF v0.2 §6.1: consumers MUST tolerate
+    /// broken links; a link whose target does not exist in the bundle is not
+    /// malformed, it may simply represent not-yet-written knowledge. A vault is
+    /// written forwards — you link the note you are about to write — so the
+    /// forward projection used to drop precisely the edges a writer most wants
+    /// to see, and the owner read a Linked-to tab showing one of nine targets
+    /// as a broken feature. It was not truncating anything: eight of the nine
+    /// had no note behind them.
+    ///
+    /// It is the label such a row shows, because there is no title to show. A
+    /// surface must not make it clickable as though a note were there, and must
+    /// not offer to create one — nobody asked for that, and inventing it here
+    /// would turn a report into a prompt.
+    pub unresolved_target: String,
     /// The head revision that last touched this note's path: the revision
     /// `unread` was computed against (`head_rev != acknowledged_rev`).
     ///
@@ -123,19 +184,42 @@ pub struct NoteRowVm {
     /// is exactly the failure NFR-30 exists to forbid. Empty when the note has no
     /// commit yet, the same "absent" spelling `origin` uses.
     pub head_rev: String,
+    /// The note's own position, and whether the note said so (Story 44.5,
+    /// AD-81).
+    ///
+    /// The row renders it, which is the whole point of the story: an ordering the
+    /// reader cannot account for reads as randomness, and the cheapest way to
+    /// account for it is to show the number the sort used. `source` is on the row
+    /// because "0 because the note is silent" and "0 because the note says
+    /// `order: soon` and that is not a number" are different sentences, and the
+    /// second one has to be sayable.
+    pub order: NoteOrder,
 }
 
-/// One window of the note list, with the total behind it (FR-103).
+/// One window of the note list, with the counts behind it (FR-103, FR-166).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteListVm {
     /// The rows in this window, in list order.
     pub rows: Vec<NoteRowVm>,
-    /// Total matching notes, so the scrollbar is honest about a window it has not
-    /// been sent.
+    /// How many notes this lens SELECTS, so the scrollbar is honest about a
+    /// window it has not been sent and the count is honest about a vault the
+    /// viewport never rendered (Story 44.11).
+    ///
+    /// Never a count of rendered rows and never a count of the page: it is
+    /// [`crate::notes::counts::Selection::total`], taken over the whole matched
+    /// set before any offset or window.
     pub total: u32,
-    /// Offset of `rows[0]` within the total.
+    /// How many notes the lens MATCHED, before the space's `keeper.limit`
+    /// declined any (Story 44.11, DW-163).
+    ///
+    /// Equal to `total` for every lens with no cap in force, which is every
+    /// list outside a space and every space that sets no limit. When it is
+    /// larger, the surface says both numbers — a cap that quietly shrank a
+    /// count is the same defect as a count of the rendered window.
+    pub matched: u32,
+    /// Offset of `rows[0]` within `total`.
     pub offset: u32,
 }
 
@@ -204,13 +288,269 @@ pub struct NoteSpaceVm {
     pub name: String,
     /// The query source text, exactly as stored.
     pub query: String,
-    /// Presentation, deliberately outside the query grammar, e.g. `modified desc`.
+    /// How this space orders the notes it lists, exactly as stored, e.g.
+    /// `modified desc` (FR-158, Story 44.4). Kept as the file's own text rather
+    /// than as a parsed enum, so a value keeper could not read survives a round
+    /// trip through the editor unrewritten — the same promise the query and the
+    /// icon make. [`crate::notes::sort::read`] is what turns it into an
+    /// ordering, and into the sentence in `warnings` when it cannot.
     pub sort: String,
-    /// Maximum rows the space yields.
+    /// The ordering the list is actually running, as the canonical
+    /// `<key> <dir>` — always one of the ten [`crate::notes::sort`] knows, even
+    /// when `sort` above holds nothing, or holds `bananas`.
+    ///
+    /// It exists so the editor never parses `sort`. A dropdown that had to work
+    /// out for itself what an empty string or an unknown word resolves to would
+    /// be a second copy of the fallback rule, in the language that cannot run
+    /// the tests — and the two copies would disagree the first time the rule
+    /// changed. Rust decides; the form selects what Rust decided; saving sends
+    /// that back.
+    pub sort_effective: String,
+    /// The most notes this space holds — a cap on what it SELECTS, not on what
+    /// a surface renders (Story 44.11, DW-163). Zero is "no cap", which is what
+    /// a space with no `keeper.limit` key sends and what saving zero back
+    /// leaves the file without.
+    ///
+    /// Applied after the sort, so a space capped at twenty keeps the twenty its
+    /// own ordering put first. Not clamped to the list's page size: the page is
+    /// how many rows one read carries, and shrinking a space to fit one would
+    /// drop notes the space genuinely holds.
     pub limit: u32,
+    /// The icon the sidebar draws for this space, as the name of one member of
+    /// the fixed set the editor offers (FR-149, UX-DR55). `None` for a space
+    /// nobody has given one, and — deliberately — also the spelling for a space
+    /// whose stored name is not in that set any more: the *name* survives on
+    /// disk untouched, because keeper rewriting an icon it did not recognise is
+    /// the same class of mistake as rewriting a query term it could not parse.
+    pub icon: Option<String>,
+    /// Which seeded default this space is, when it is one
+    /// ([`crate::notes::default_spaces`], Story 44.3). `None` for every space a
+    /// person or an agent wrote.
+    ///
+    /// It is the identity, not the name: a default is editable like any other
+    /// space, so renaming Recordings to "Sessions" must not stop the empty list
+    /// saying who writes recording notes, and must not make restore offer a
+    /// second copy. Read from `keeper.default`, which only keeper writes and the
+    /// editor never touches.
+    pub default_key: Option<String>,
+    /// The template a note created in this space starts from — a vault-relative
+    /// path, or a bare name inside the template directory (FR-162, Story 44.7).
+    /// `None` for a space that hands out no template, which is most of them.
+    ///
+    /// Carried as the stored text, unresolved: whether the path still names a
+    /// note is a question about the vault at create time, not at render time, so
+    /// the editor shows what the file says and the create path is what reports a
+    /// template that has gone missing.
+    pub template: Option<String>,
+    /// The folder a note created in this space is written to — vault-relative,
+    /// or `None` to let the query answer (Story 44.13).
+    ///
+    /// A `path:` query already implies a folder and still does; this is what a
+    /// `tag:` space has instead, because a tag names a set and never a place.
+    /// Stored as typed, unresolved: whether the folder exists is a question for
+    /// create time, and a space that names one keeper has to make is not an
+    /// error the editor should refuse.
+    pub folder: Option<String>,
+    /// The presentation keys of this space's frontmatter that keeper could not
+    /// read, each already worded as a finished sentence (Story 44.4).
+    ///
+    /// Separate from `error` because the severity is different and so is the
+    /// remedy: a query that does not parse means the space selects **nothing**,
+    /// while an unreadable `sort` or `order` means the space still works and is
+    /// simply not obeying one line of its own file. Both have to be visible —
+    /// frontmatter is hand-edited and agent-edited, so these values will be
+    /// wrong, and a fallback nobody is told about is indistinguishable from
+    /// keeper ignoring what the user wrote.
+    ///
+    /// A list rather than an `Option`, because a file with a bad `sort` usually
+    /// has a bad `order` too — whoever was guessing at one was guessing at both
+    /// — and showing one of the two would send them round the loop twice.
+    pub warnings: Vec<String>,
+    /// Where this space sits in the rail: lower first, ties by name
+    /// (FR-157, AD-81).
+    ///
+    /// Zero for a space nobody has positioned, which is every space that exists
+    /// before this story — so a rail nobody has ordered is still the
+    /// alphabetical rail it was, and the seeded defaults still render Inbox,
+    /// Journal, Pinned, Recordings in the order the deleted fixed rows did.
+    /// Negative is allowed and is how a space floats above that block.
+    ///
+    /// `f64` for the reason a note's own order is one (Story 44.5): `1.5` is how
+    /// a person slots a row between 1 and 2 without renumbering everything under
+    /// it, and an integer would read `1.5` and `1.2` as the same position.
+    pub order: f64,
     /// The parse failure, when the stored query does not parse. A broken space
     /// matches nothing and says so; it never falls back to matching everything.
     pub error: Option<String>,
+}
+
+/// What a deletion is about to remove, in the words the confirmation shows
+/// (Story 45.17, FR-195, UX-DR78).
+///
+/// **Composed in Rust for `FilesDeletePlanVm`'s reason** (Story 45.3): the
+/// sentence has to be built by code that knows what the delete will actually
+/// do, or the dialog promises one thing and the command does another. A
+/// confirmation assembled in TypeScript from a name and a boolean is a second
+/// reading of the removal rule, in the one place a wrong reading costs a file.
+///
+/// One struct for a note and for a space, because a space **is** a note and
+/// [`crate::notes::default_spaces`] is the only thing that makes one special.
+/// Two structs would be two dialogs, and the second one would be the one that
+/// forgot to say where the bytes went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteDeletePlanVm {
+    /// The vault-relative path of the file that moves. Shown under the
+    /// question, because two notes may carry one title and the path is the
+    /// only thing on screen that tells them apart.
+    pub path: String,
+    /// Names the thing. Never a count and never "this item": the whole point
+    /// of a confirmation is that it says what goes.
+    pub question: String,
+    /// What goes, and — for a space — what conspicuously does not.
+    pub consequence: String,
+    /// Where the bytes end up. Never absent: a delete nobody said was
+    /// recoverable is a delete people do not press.
+    pub recovery: String,
+}
+
+/// Where a deleted note's bytes go, said once.
+///
+/// Worded to match `FilesDeletePlanVm`'s own recovery clause, because it is the
+/// same `notes_vault::trash_note` under both and a person who deletes a file in
+/// the Files pane and a note in the Notes pane must not be told two different
+/// stories about whether keeper kept a copy (NFR-30).
+const TRASH_RECOVERY: &str = "keeper moves it into the vault's trash rather than erasing it, and \
+the removal is recorded in this vault's history.";
+
+impl NoteDeletePlanVm {
+    /// The plan for an ordinary note.
+    ///
+    /// The link clause is unconditional and is the honest half of the sentence:
+    /// links resolve through the note's ULID (FR-97), so a wiki-link to a
+    /// deleted note stops resolving whether or not anything currently points at
+    /// it. Counting the backlinks here would mean running the link index inside
+    /// a confirmation, and a count that is right only while nothing else is
+    /// writing is worse than a rule that is always true.
+    pub fn for_note(title: &str, path: &str) -> Self {
+        Self {
+            question: format!("Delete \"{title}\"?"),
+            consequence: format!(
+                "keeper removes {path} from this vault. Links to this note stop resolving."
+            ),
+            recovery: TRASH_RECOVERY.to_owned(),
+            path: path.to_owned(),
+        }
+    }
+
+    /// The plan for a space.
+    ///
+    /// **The sentence exists to answer the question that stops people deleting
+    /// a saved view: does this take the notes with it.** It does not, and a
+    /// confirmation that leaves that unsaid is why unused spaces accumulate.
+    ///
+    /// `default_key` is the field that DRIVES the second clause, not the
+    /// space's name: a seeded Recordings space renamed to "Sessions" is still
+    /// keeper's, and a space of the user's own called "Recordings" is not.
+    /// Partitioning on the name would get both of those backwards.
+    pub fn for_space(name: &str, path: &str, default_key: Option<&str>) -> Self {
+        let mut consequence = format!(
+            "A space is a saved view. Deleting it removes {path} and nothing else — every note \
+             it lists stays where it is."
+        );
+        if default_key.is_some() {
+            // Named because the alternative is a person deleting a default,
+            // seeing it survive a restart, and concluding the delete failed —
+            // and because the way back is a control they can see (FR-156).
+            consequence.push_str(
+                " keeper seeded this space, and will not add it back on its own; \
+                 \"Restore default spaces\" brings it back.",
+            );
+        }
+        Self {
+            question: format!("Delete the space \"{name}\"?"),
+            consequence,
+            recovery: TRASH_RECOVERY.to_owned(),
+            path: path.to_owned(),
+        }
+    }
+}
+
+/// One tag term of a space's query, in the shape the three-state chip holds
+/// (Story 43.3's `TagChip`, field for field).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteSpaceTagVm {
+    /// The tag, already read through the one vocabulary (Story 42.5).
+    pub tag: String,
+    pub term: NoteTagTerm,
+}
+
+/// One `field:` term of a space's query, in the shape a removable chip holds.
+///
+/// **Only `=` and `!=` reach this type**, and that is the whole of its
+/// contract — see [`crate::notes::query::decompose`] for why the four ordered
+/// operators and the negated form stay outside the chip vocabulary. A chip that
+/// could not be re-emitted as the term it came from would be a chip that edits
+/// a query by being read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteSpaceFieldVm {
+    /// The frontmatter key, trimmed — `status` in `field:status=todo`.
+    pub key: String,
+    /// Exactly `"="` or `"!="`, as the query spelled it. A string rather than a
+    /// two-case enum because it is re-emitted verbatim on save and never
+    /// branched on; an enum here would buy a match arm on both sides of the
+    /// wire and change nothing about what is written.
+    pub op: String,
+    /// The compared value, trimmed and unquoted.
+    pub value: String,
+}
+
+/// A space's stored query said in the vocabulary the editor's controls speak,
+/// or the reason it cannot be (FR-149, UX-DR55).
+///
+/// Two variants rather than one struct with a residue list, because the residue
+/// is not extra information about an editable query — it is the fact that the
+/// query is **not** editable through chips. A struct carrying both would let a
+/// caller render three chips out of a four-term query and save it, which is
+/// exactly the silent term-dropping this story exists to refuse. Here that call
+/// site does not compile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum NoteSpaceTermsVm {
+    /// Every term of the query, and the chip vocabulary holds all of them.
+    Chips {
+        /// Tag terms in the order the query wrote them — the order the chip bar
+        /// will show, so an edited space keeps the shape its author gave it.
+        tags: Vec<NoteSpaceTagVm>,
+        /// `is:` flags, verbatim as written. The editor shows them and does not
+        /// let them be cycled (this story widens tags, not lenses), so they are
+        /// carried only so that re-emitting the query cannot lose them.
+        flags: Vec<String>,
+        /// `origin:`'s value, verbatim.
+        origin: Option<String>,
+        /// `text:`'s needle, unquoted — the editor re-quotes it on the way out.
+        text: Option<String>,
+        /// `field:key=value` and `field:key!=value` terms, in written order.
+        ///
+        /// Unlike the three above, a query may hold several: `status` and
+        /// `priority` are different questions, and a board asks both. The bar
+        /// shows one chip per term and removes them one at a time.
+        fields: Vec<NoteSpaceFieldVm>,
+    },
+    /// At least one term is outside the chip vocabulary, so no chip may claim to
+    /// stand for this query. `terms` is the offending source text, verbatim, for
+    /// a surface that has to name what it will not touch.
+    Unrepresentable { terms: Vec<String> },
 }
 
 /// The result of parsing a query without running it — the live underline while
@@ -264,6 +604,15 @@ pub enum NoteBodyBatch {
     Reset {
         /// The revision these bytes are.
         rev: String,
+        /// The note's vault-relative path.
+        ///
+        /// **Added by Story 45.18, and the absence it replaces was load-bearing.**
+        /// `path` reached the editor only through `Renamed` or a completed save,
+        /// so a note that was merely OPENED had none until its first autosave —
+        /// which left the header's path caption blank on open, and would have
+        /// left 45.18's "Show in Files" absent for exactly the case it exists
+        /// for. The value is in hand here anyway; not sending it was the gap.
+        path: String,
         /// The `---` block verbatim — fences and trailing newline included — or
         /// empty when the note has none.
         frontmatter: String,
@@ -313,6 +662,21 @@ pub struct NoteChangeBatch {
     pub vault_id: String,
     /// Ops in order; apply them in sequence.
     pub ops: Vec<NoteListOp>,
+    /// The lens's counts as of this batch, on
+    /// [`NoteListVm::total`]/[`NoteListVm::matched`]'s terms (Story 44.11).
+    ///
+    /// **On the envelope rather than inside `Reset`, and not derived by the
+    /// receiver.** Both numbers are recomputed over the whole matched set for
+    /// every batch this loop sends, so the count on screen is the count Rust
+    /// just took. The frontend used to carry `total` forward itself, adding one
+    /// per `Upsert` of an unseen id and subtracting one per `Remove` — which is
+    /// right only while every change to the matched set also changes the
+    /// window. A note that starts matching a filter three thousand rows below
+    /// the page moves no row and used to move no count, and after Story 44.10
+    /// windowed the list there is no scroll that would have corrected it.
+    pub total: u32,
+    /// How many the lens matched before `keeper.limit` declined any.
+    pub matched: u32,
 }
 
 /// One index-based note-list operation.
@@ -325,13 +689,16 @@ pub struct NoteChangeBatch {
 #[ts(export)]
 pub enum NoteListOp {
     /// Replace the whole window. Opens every subscription.
-    Reset {
-        rows: Vec<NoteRowVm>,
-        /// Total matching notes behind the window.
-        total: u32,
-    },
+    ///
+    /// Carries no count of its own: [`NoteChangeBatch::total`] is the one
+    /// answer, and a second copy on the op that only some batches contain is a
+    /// second copy that goes stale between them.
+    Reset { rows: Vec<NoteRowVm> },
     /// Insert or replace the row at `index`.
-    Upsert { index: u32, row: NoteRowVm },
+    /// Boxed since the row learned to carry a link's predicates: the row is the
+    /// only large variant here, and an enum sized by its largest member costs
+    /// that size on every `Reset` and every `Remove` too.
+    Upsert { index: u32, row: Box<NoteRowVm> },
     /// Drop the row with this note id, wherever it currently sits.
     Remove { id: String },
 }
@@ -422,6 +789,18 @@ pub struct NoteConflictVm {
 /// Only the reference crosses IPC. The bytes were read and written entirely in
 /// Rust, and the webview reaches them through the custom protocol at `url`
 /// (AD-58) rather than through a base64 payload.
+///
+/// **There was a `markdown` field here and Story 45.13 deleted it.** It carried
+/// `![name](attachments/name.png)` — CommonMark's embed — while the attachments
+/// panel wrote `![[attachments/name.png]]`, Obsidian's. Two spellings for one
+/// act, and only the second is decorated by `live-preview.ts`, so an attachment
+/// imported through this VM would have rendered as flat text. It was never
+/// noticed because nothing in the webview has read this field since epic 37:
+/// `notes_attachment_drop` and `notes_attachment_paste` have client wrappers
+/// and no callers. A dead field is not a spare part, it is an untested code
+/// path waiting for its first caller — which is how `NoteCreateReq.dest`
+/// turned out to be an armed data-loss path the moment something set it. The
+/// one spelling now lives in `src/lib/notes/attach.ts` and nowhere else.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -430,8 +809,238 @@ pub struct NoteAttachmentVm {
     pub rel_path: String,
     /// `keeper-note://…` URL the webview can render.
     pub url: String,
-    /// The markdown to splice into the body at the caret.
-    pub markdown: String,
+}
+
+/// One file offered for attaching, resolved to something a note can name
+/// (Story 45.13, FR-188, FR-189).
+///
+/// The three entry points hand over three different kinds of path — a picker's
+/// absolute path, a Files-pane row's absolute path, a recording note's own
+/// relative one — and this is what they all become before any note is touched.
+/// The webview never turns one into the other: it does not know where the vault
+/// is (AD-65) and must never hold an absolute path long enough to write it
+/// (FR-145).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteAttachSourceVm {
+    /// The file's own name, so a refusal can say which file it is about even
+    /// when there is no path to show.
+    pub name: String,
+    /// The vault-relative path a note may name, or `None` when keeper refused
+    /// this source. Exactly one of this and `refusal` is `Some`.
+    pub rel_path: Option<String>,
+    /// Whether keeper had to copy the file into the vault to make it nameable.
+    ///
+    /// Reported rather than inferred, because it is a thing that happened to
+    /// the user's disk and the surface says so. `false` means the file was
+    /// already in the vault and the note names it where it lies — no second
+    /// copy, which is what the dead `notes_attachment_drop` would have made.
+    pub copied: bool,
+    /// Why this source produced no path — a directory, an unreadable file, a
+    /// copy that failed. A finished sentence, worded here on this module's
+    /// standing rule that Rust words what Rust decided.
+    pub refusal: Option<String>,
+}
+
+/// One note offered as somewhere to attach files (Story 45.13, FR-189).
+///
+/// A sibling of [`NoteLinkTargetVm`] rather than a field on it: the wikilink
+/// autocomplete asks "which note do you mean", and this asks "which note should
+/// receive these files", which is a different question with a different answer
+/// for the same note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteAttachTargetVm {
+    pub id: String,
+    pub title: String,
+    pub path: String,
+    /// Of the file names the caller asked about, the ones this note's body
+    /// already embeds — folded to lower case, in no particular order.
+    ///
+    /// **The subset, not the note's whole set, and never the body.** A list
+    /// never ships bodies (AD-58), and shipping every embed of every candidate
+    /// would make the payload a function of how much the vault holds rather
+    /// than of what was asked.
+    pub holds: Vec<String>,
+}
+
+/// A note's body as it is on disk right now (Story 45.13).
+///
+/// The read half of the one read-modify-write a surface can do to a note it has
+/// not opened in the editor. `rev` is what the write must be based on, so a
+/// note that changed underneath is conflict-copied rather than clobbered — the
+/// same guarantee `notes_save` gives the editor, through the same code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteBodyVm {
+    /// Content revision of the whole file these bytes came from.
+    pub rev: String,
+    /// The body, with the frontmatter block removed — the same space
+    /// [`NoteBodyBatch`] and `notes_save` speak in.
+    pub text: String,
+}
+
+/// A CSV attachment projected as a table (Story 44.16, FR-172).
+///
+/// Cells, not bytes: the file's quoting, terminators and byte-order mark stay
+/// in [`crate::notes::csv`], which is the only thing that ever writes them
+/// back. The webview holds displayed values and the coordinates they came from,
+/// so an edit is "row 4, column 2 is now this" rather than a re-serialised
+/// file — the webview cannot reformat what it cannot spell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteCsvVm {
+    /// Vault-relative path of the file that was actually read, which may differ
+    /// from the embed's target: `![[data.csv]]` names a file the shell locates.
+    pub rel_path: String,
+    /// Content revision of the bytes these cells came from. An edit sends it
+    /// back, so a file that changed underneath is refused instead of clobbered.
+    pub rev: String,
+    /// Columns the first record has — the width the table draws.
+    pub columns: u32,
+    /// Records in the whole file, which `rows` may be only the first of.
+    pub total_rows: u32,
+    /// The records this table shows, in file order.
+    pub rows: Vec<NoteCsvRowVm>,
+    /// Finished sentences about anything odd: a ragged row, a quote that never
+    /// closes, a row count that was capped. Empty when there is nothing to say.
+    /// Worded here rather than in the webview, on this module's standing rule.
+    pub notices: Vec<String>,
+    /// The separator the file is actually written with, as a one-character
+    /// string: `","`, `";"`, `"\t"` or `"|"`.
+    ///
+    /// Detected from the bytes ([`crate::notes::csv::detect_delimiter`]), not
+    /// assumed: a European Excel export is semicolon-separated, and keeper drew
+    /// the owner's real attachment as a single column for exactly as long as
+    /// this was a constant comma.
+    ///
+    /// Carried to the webview because the conversion between a table and an
+    /// attachment has to write the file back in its own dialect — a round trip
+    /// that re-emitted commas would silently rewrite every row of a `;` file.
+    /// A one-character string rather than a byte, because that is what survives
+    /// JSON and what a `<select>` of separators would show.
+    pub delimiter: String,
+}
+
+/// One record of a CSV table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteCsvRowVm {
+    /// 0-based index of this record in the **file**, not in `rows`. An edit
+    /// sends this back, so a capped window still names the right record.
+    pub index: u32,
+    /// 1-based line the record starts on, so a notice about it points at
+    /// something the user can find in a text editor.
+    pub line: u32,
+    /// The displayed values, exactly as many as the record has.
+    pub cells: Vec<String>,
+    /// Whether this record's field count differs from `columns`. Shown as odd
+    /// rather than padded or dropped: a table that loses somebody's row is
+    /// worse than a table that admits the row is strange.
+    pub ragged: bool,
+}
+
+/// One folder, listed for a note's gallery block (Story 44.15, FR-171, AD-84).
+///
+/// **Every entry, classified — not only the ones a gallery shows.** The kind is
+/// [`crate::vm::RecordingNoteTargetKind`], decided by the one classifier
+/// (AD-73), and a `File` or a `Folder` crosses the wire with the rest. Which
+/// kinds a gallery renders is the gallery's rule and not the listing's, and
+/// filtering here would make "a non-media file is skipped" a claim no test
+/// outside the Tauri shell can reach.
+///
+/// **Pinning is nowhere in this VM, on purpose.** A pin lives in the NOTE that
+/// holds the block, so two notes over one folder pin different things. A pin
+/// stored beside the photos would be one note editing another note's view, and
+/// there is no field here it could be written into.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteGalleryVm {
+    /// The folder that was listed, relative to the LISTED ROOT — the vault root
+    /// under [`NoteGalleryScope::Vault`] and the synced folder under
+    /// [`NoteGalleryScope::SyncedFolder`]. Echoed back so a reply that arrives
+    /// after the block was retargeted can be discarded rather than rendered
+    /// under the wrong heading.
+    pub folder: String,
+    /// The folder's entries in the listing's own order, or empty when
+    /// `problem` says why there are none.
+    pub items: Vec<NoteGalleryItemVm>,
+    /// Whether the listing cap cut the folder short. Said, never hidden.
+    pub truncated: bool,
+    /// A finished sentence for a folder that could not be listed — missing,
+    /// unreadable, or a path that escapes the vault. Composed in Rust because
+    /// the reason is Rust's: the webview never learns which of the three it
+    /// was, only what to show. `None` when the listing succeeded, including
+    /// when it succeeded and found nothing.
+    pub problem: Option<String>,
+}
+
+/// One entry of a listed gallery folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteGalleryItemVm {
+    /// The entry's own file name, with no path in it — what a tile is labelled.
+    pub name: String,
+    /// The entry's path relative to the LISTED ROOT, `/`-joined — the vault
+    /// root under [`NoteGalleryScope::Vault`], the synced folder under
+    /// [`NoteGalleryScope::SyncedFolder`]. Never an absolute path (FR-145).
+    /// The vault-relative spelling, which is what a pin is written as, is
+    /// `vault_rel_path`.
+    pub rel_path: String,
+    /// The entry's path relative to the VAULT ROOT, or `None` when it lives
+    /// above that root — which only the synced-folder scope can reach.
+    ///
+    /// Presence is the answer to "can this be embedded?". `keeper-note://` and
+    /// [`crate::notes::embed`] are both vault-root-only, so an entry from above
+    /// the vault can be attached as a link and can never render as an embed.
+    /// The value is the path to write, composed here so the webview never
+    /// joins a root and a subpath itself (AD-65) — which is also why this is
+    /// not a bool: a bool would leave the frontend to derive the path it just
+    /// asked permission for.
+    ///
+    /// Always `Some(rel_path.clone())` under [`NoteGalleryScope::Vault`], where
+    /// the listed root IS the vault root.
+    pub vault_rel_path: Option<String>,
+    /// What this entry is, from the one classifier (Story 43.5, AD-73).
+    pub kind: RecordingNoteTargetKind,
+    /// The `keeper-note://…` URL a tile's element loads, composed here so the
+    /// webview never joins a root and a subpath (AD-65). Present for every
+    /// entry the protocol will serve and `None` for the rest — a `File` or a
+    /// `Folder` has no URL because nothing asks for its bytes.
+    pub url: Option<String>,
+}
+
+/// Which root a gallery listing walks (item 10).
+///
+/// The attach picker used to offer the vault only, so a drive whose notes are
+/// one folder of a larger synced tree could not attach anything that lived
+/// beside them — the owner's report is that attaching from a folder must offer
+/// the WHOLE folder, not only the notes part.
+///
+/// A named scope rather than a silently widened default: the vault listing is
+/// what every existing block and every existing caller means, and changing what
+/// they get without them asking would put files above the vault into galleries
+/// that never wanted them. Widening is opt-in, per call, and
+/// [`NoteGalleryItemVm::vault_rel_path`] is how a caller tells the two apart in
+/// the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum NoteGalleryScope {
+    /// The vault root and below — every entry is embeddable. The default, and
+    /// what a listing means when the caller says nothing.
+    #[default]
+    Vault,
+    /// The whole synced folder the vault sits in, so entries beside the notes
+    /// are offered too. Those carry no `vault_rel_path` and are link-only.
+    SyncedFolder,
 }
 
 /// One wikilink autocomplete candidate (FR-108).
@@ -497,15 +1106,28 @@ pub struct NoteIndexProgressVm {
 pub struct NoteQueryReq {
     /// Free text; `None` for no text filter.
     pub text: Option<String>,
-    /// Tag chips, ANDed together.
-    pub tags: Vec<String>,
+    /// The tag chips, keyed by tag and ANDed together (FR-148, UX-DR54).
+    ///
+    /// A map rather than an include list beside an exclude list, because the
+    /// chip that produces these has three states and a tag is in exactly one of
+    /// them: keyed by tag, "include and exclude the same tag" is a request that
+    /// cannot be written down rather than one
+    /// [`IndexEntry::matches_tags`](crate::notes::index::IndexEntry::matches_tags)
+    /// has to resolve by precedence. An off chip is an absent key — a term that
+    /// admits everything has no business on the wire.
+    pub tags: BTreeMap<String, NoteTagTerm>,
     /// When set, the space whose query further narrows the result.
     pub space_id: Option<String>,
     /// `local` | `agent` | `remote` | `device:<label>`.
     pub origin: Option<String>,
     /// `is:` flag names the result must carry.
     pub flags: Vec<String>,
+    /// Where this page starts in the selected set.
     pub offset: u32,
+    /// How many rows this PAGE carries — the transport window, and the only
+    /// limit a caller owns. A space's own `keeper.limit` caps what the space
+    /// selects and is not this (Story 44.11); the page walks over whatever the
+    /// space selected.
     pub limit: u32,
 }
 
@@ -523,6 +1145,35 @@ pub struct NoteCreateReq {
     /// Destination directory, vault-relative; the vault root when absent.
     pub dest: Option<String>,
     pub tags: Vec<String>,
+    /// The id of the space note this create was asked for from, when the ask
+    /// came from a space row rather than from the rail (Story 44.6, FR-160).
+    ///
+    /// The space's **id**, never its query text: the shell reads the space note
+    /// and derives what the new note has to carry through
+    /// [`crate::notes::seed`], so no surface outside Rust ever parses a query
+    /// or decides what `is:pinned` means (AD-58). An id naming no space creates
+    /// an ordinary note — a space deleted between the click and the write is
+    /// not a reason to lose the thought.
+    pub space: Option<String>,
+}
+
+/// What a create produced, and anything the person who asked for it has to be
+/// told (Story 44.6).
+///
+/// `notices` exists because creation can succeed and still not do what the user
+/// meant: a note created in a space whose query no new note can satisfy is in
+/// the vault and not in that space, and a create that returned only a
+/// [`NoteRefVm`] would leave the surface to guess at that — or, worse, to work
+/// it out by parsing the query itself. Each entry is a finished sentence
+/// composed in Rust; an empty list is the ordinary case and renders nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NoteCreateVm {
+    /// The note that now exists.
+    pub note: NoteRefVm,
+    /// Sentences to show beside the list, in the order they were decided.
+    pub notices: Vec<String>,
 }
 
 /// A streamed content search (FR-118).
@@ -534,17 +1185,52 @@ pub struct NoteSearchReq {
     pub limit: u32,
 }
 
-/// Create or update a space (FR-105).
+/// Create or update a space (FR-105, FR-149).
+///
+/// A complete description of the space, not a patch: an update rewrites the
+/// definition wholesale, so a caller that omits a field is saying "this space
+/// has none" rather than "leave it alone". That is the opposite of
+/// [`NoteVaultSettingsReq`]'s rule and it is deliberate — a space is a handful
+/// of values on one form, all of them on screen at once, so "absent means
+/// unchanged" would only be a way for a stale form to resurrect a term the
+/// user deleted.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct NoteSpaceReq {
     /// The space note's id when updating; `None` creates one.
     pub id: Option<String>,
+    /// The space's name. On an update this retitles the note and renames its
+    /// file, so it is the one field here that touches bytes outside the
+    /// `keeper:` key.
     pub name: String,
     pub query: String,
+    /// How the space orders what it lists: `<key> <dir>`, the text
+    /// [`crate::notes::sort::read`] accepts. The editor sends the canonical
+    /// spelling of whatever it had selected, which is the one place a value
+    /// keeper could not read *is* rewritten — the form showed the fallback and
+    /// said why, so pressing Save is a repair the user watched happen rather
+    /// than a rewrite behind their back.
     pub sort: String,
+    /// The selection cap to store, or zero for none. Zero writes no
+    /// `keeper.limit` key at all, on the same rule `icon` and `order` follow: a
+    /// space nobody capped keeps the frontmatter it had rather than growing a
+    /// key to explain a cap it does not have (Story 44.11).
     pub limit: u32,
+    /// The chosen icon's name, or `None` to leave the space without one.
+    pub icon: Option<String>,
+    /// The space's position in the rail. Zero is "unpositioned" and is not
+    /// written to the file, so a space nobody ordered grows no key to explain.
+    pub order: f64,
+    /// The template to hand out, or `None`/empty to leave the space without one.
+    /// An empty string clears the key rather than storing a template whose path
+    /// is nothing.
+    pub template: Option<String>,
+    /// Where notes created in this space are written — vault-relative, or
+    /// `None`/empty to leave the destination to the query (Story 44.13). An
+    /// empty string clears the key rather than storing a folder that names
+    /// nothing.
+    pub folder: Option<String>,
 }
 
 /// Change a vault's settings (FR-120).
@@ -559,6 +1245,13 @@ pub struct NoteVaultSettingsReq {
     pub subfolder: Option<String>,
     pub journal_template: Option<String>,
     pub default_template: Option<String>,
+    /// The template a quick capture starts from. An empty string clears it —
+    /// "the user chose no template" and "the user never touched the field" are
+    /// different requests, and only the first may unset what is stored.
+    pub capture_template: Option<String>,
+    /// The tag every quick capture carries, as typed. keeper folds it to the
+    /// canonical form before storing it, and an empty string clears it.
+    pub capture_tag: Option<String>,
     pub cadence: Option<NoteCadenceVm>,
 }
 
@@ -594,6 +1287,7 @@ mod tests {
     #[test]
     fn a_row_serialises_camel_case_including_the_two_absent_by_empty_string_fields() {
         let row = NoteRowVm {
+            predicates: Vec::new(),
             id: "n1".to_owned(),
             path: "notes/a.md".to_owned(),
             title: "A".to_owned(),
@@ -606,14 +1300,62 @@ mod tests {
             conflict: false,
             origin: String::new(),
             head_rev: String::new(),
+            unresolved_target: String::new(),
+            order: NoteOrder::own(2.5),
         };
         let json = serde_json::to_string(&row).expect("serialize row");
         assert!(json.contains("\"updatedMs\":1700000000000"), "json: {json}");
         assert!(json.contains("\"headRev\":\"\""), "json: {json}");
         assert!(json.contains("\"origin\":\"\""), "json: {json}");
+        // A row that is not the far end of a link carries an EMPTY list, and it
+        // has to reach the webview as `[]`. `null` here would put the panel
+        // back to branching on two spellings of "no predicates", which is the
+        // reason this field is not an `Option<Vec<_>>`.
+        assert!(json.contains("\"predicates\":[]"), "json: {json}");
+        // An ordinary row's target resolved, so this is empty — the same
+        // "absent" spelling as `origin` and `headRev` two lines up, and never
+        // `null`, which would give the panel a second way to spell "no".
+        assert!(json.contains("\"unresolvedTarget\":\"\""), "json: {json}");
+        // The webview switches on this discriminant, so it has to be the
+        // camelCase name and not a Rust variant spelling.
+        assert!(
+            json.contains("\"order\":{\"value\":2.5,\"source\":\"own\"}"),
+            "json: {json}"
+        );
         let back: NoteRowVm = serde_json::from_str(&json).expect("deserialize row");
         assert_eq!(back.id, row.id);
         assert!(back.unread);
+    }
+
+    #[test]
+    fn a_link_row_ships_its_predicates_as_a_list_in_the_order_written() {
+        // The panel names the relationship, so the order the author wrote is the
+        // order the reader sees: `{dcterms:source, schema:about}` is a sentence
+        // about provenance first. Sorting here would be keeper re-wording it.
+        let row = NoteRowVm {
+            predicates: vec!["dcterms:source".to_owned(), "schema:about".to_owned()],
+            id: "n2".to_owned(),
+            path: "notes/b.md".to_owned(),
+            title: "B".to_owned(),
+            snippet: String::new(),
+            tags: Vec::new(),
+            updated_ms: 0,
+            pinned: false,
+            archived: false,
+            unread: false,
+            conflict: false,
+            origin: String::new(),
+            head_rev: String::new(),
+            unresolved_target: String::new(),
+            order: NoteOrder::default(),
+        };
+        let json = serde_json::to_string(&row).expect("serialize row");
+        assert!(
+            json.contains("\"predicates\":[\"dcterms:source\",\"schema:about\"]"),
+            "json: {json}"
+        );
+        let back: NoteRowVm = serde_json::from_str(&json).expect("deserialize row");
+        assert_eq!(back.predicates, row.predicates);
     }
 
     #[test]
@@ -623,6 +1365,7 @@ mod tests {
         // enums the frontend already applies (RoomListOp/TimelineOp/InboxOp).
         let reset = NoteBodyBatch::Reset {
             rev: "r1".to_owned(),
+            path: "inbox/note.md".to_owned(),
             frontmatter: "---\nid: 01AAA\n---\n".to_owned(),
             text: "hello".to_owned(),
             cursor: Some(3),
@@ -683,5 +1426,84 @@ mod tests {
         let json = serde_json::to_string(&check).expect("serialize check");
         assert!(json.contains("\"tokenIndex\":1"), "json: {json}");
         assert!(json.contains("\"span\":[6,16]"), "json: {json}");
+    }
+
+    /// Story 45.17: a confirmation NAMES what goes, and says where it went.
+    ///
+    /// Both halves matter and they fail differently. A confirmation that does
+    /// not name the note is one people cancel out of; one that does not say the
+    /// bytes are recoverable is one they never press at all.
+    #[test]
+    fn a_note_deletion_names_the_note_and_where_its_bytes_go() {
+        let plan = NoteDeletePlanVm::for_note("Standup", "meetings/2026-08-09-standup.md");
+
+        assert!(plan.question.contains("Standup"), "{}", plan.question);
+        assert!(
+            plan.consequence.contains("meetings/2026-08-09-standup.md"),
+            "{}",
+            plan.consequence
+        );
+        assert!(plan.recovery.contains("trash"), "{}", plan.recovery);
+        assert_eq!(plan.path, "meetings/2026-08-09-standup.md");
+    }
+
+    /// A space's confirmation answers the question that stops people deleting a
+    /// saved view: does this take the notes with it. It does not, and the
+    /// sentence has to say so.
+    #[test]
+    fn a_space_deletion_says_the_notes_it_lists_stay() {
+        let plan = NoteDeletePlanVm::for_space("Clients", "spaces/clients.md", None);
+
+        assert!(plan.question.contains("Clients"), "{}", plan.question);
+        assert!(plan.question.contains("space"), "{}", plan.question);
+        assert!(
+            plan.consequence
+                .contains("every note it lists stays where it is"),
+            "{}",
+            plan.consequence
+        );
+        assert!(plan.recovery.contains("trash"), "{}", plan.recovery);
+    }
+
+    /// **The clause is driven by the marker, not by the name.**
+    ///
+    /// A seeded Recordings space renamed to "Sessions" is still keeper's, and a
+    /// space of the user's own called "Recordings" is not — so both are checked
+    /// here, and a composer partitioning on the name would get both backwards.
+    /// The promise it carries is specific: keeper will not add it back, and
+    /// Restore is how you get it.
+    #[test]
+    fn only_a_seeded_space_promises_to_stay_deleted() {
+        // One path in both, so the ONLY difference between the two sentences is
+        // the clause the marker adds. Two paths would have made the comparison
+        // below trivially false, and the test would have been asserting that
+        // two paths differ, which nobody doubts.
+        let path = "spaces/2026-08-09-recordings.md";
+        let renamed = NoteDeletePlanVm::for_space("Sessions", path, Some("recordings"));
+        assert!(
+            renamed.consequence.contains("will not add it back"),
+            "{}",
+            renamed.consequence
+        );
+        assert!(
+            renamed.consequence.contains("Restore default spaces"),
+            "{}",
+            renamed.consequence
+        );
+
+        // A space of the user's own that happens to be called Recordings is
+        // not keeper's, and keeper promises nothing about it.
+        let theirs = NoteDeletePlanVm::for_space("Recordings", path, None);
+        assert!(
+            !theirs.consequence.contains("will not add it back"),
+            "keeper must not promise anything about a space it did not seed: {}",
+            theirs.consequence
+        );
+        assert!(
+            renamed.consequence.starts_with(&theirs.consequence),
+            "the two must differ by exactly the added clause\nseeded: {}\nnot seeded: {}",
+            renamed.consequence,
+            theirs.consequence
+        );
     }
 }

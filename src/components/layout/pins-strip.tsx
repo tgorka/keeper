@@ -4,22 +4,31 @@
  * A horizontal strip of 44 px circular room avatars rendered atop the Inbox view,
  * one per pinned room in the Rust-authoritative order (the {@link pinsRoomsStore}
  * mirror). Clicking an avatar selects the room; a per-avatar context menu offers
- * "Unpin". Native HTML5 drag reorders the avatars — the drop dispatches
- * {@link reorderPins} with the new full order and the authoritative order arrives
+ * "Unpin". Dragging an avatar reorders the strip, and the drop dispatches
+ * {@link reorderPins} with the new full order, whose authoritative answer arrives
  * back over the stream (there is NO optimistic membership/order overlay; only an
- * ephemeral in-component preview during the drag, cleared on drop).
+ * ephemeral in-component preview during the drag, cleared on release).
+ *
+ * **The drag is pointer events, and HTML5 drag is gone (Story 53.1).** For a year
+ * the desktop reorder looked live and was not: WebKit fires no `drop` for a drag
+ * that named nothing, and once Story 52.7 named it, Tauri's own drag-drop handler
+ * still claimed `performDragOperation:` in Rust before WebKit could perform it.
+ * {@link "@/hooks/use-pointer-drag"} carries the source lines and the reason
+ * `dragDropEnabled: false` is not the fix. The phone's long-press-drag was always
+ * pointer-only and always worked; both entries now share that one hook.
  *
  * On the phone tier (Story 13.6) a long-press lifts the pin: dragging while
- * lifted previews a reorder and the drop persists it via {@link reorderPins};
+ * lifted previews a reorder and the release persists it via {@link reorderPins};
  * releasing *without* dragging opens the pin's context menu instead — which,
  * on the phone, also carries "Move up" / "Move down" items as the non-gesture
  * reorder path (disabled while an account filter makes `pins` a partial subset,
- * exactly like the drag). Desktop/tablet renders byte-for-byte as before.
+ * exactly like the drag). On the desktop the press needs no hold, and a press
+ * that does not travel stays the click that selects the room.
  *
  * The strip overflows horizontally (`overflow-x-auto`, no wrap, no growth) so 9+
  * pins scroll rather than wrapping. It is hidden entirely when there are no pins.
  */
-import { type PointerEvent as ReactPointerEvent, useRef, useState } from "react";
+import { useRef } from "react";
 import { RoomAvatar } from "@/components/chat/RoomAvatar";
 import {
   ContextMenu,
@@ -29,13 +38,14 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { type LongPressDetail, useLongPress } from "@/hooks/use-long-press";
+import { usePointerDrag } from "@/hooks/use-pointer-drag";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import type { InboxRoomVm } from "@/lib/ipc/client";
 import { reorderPins, unpinRoom } from "@/lib/ipc/client";
 import type { RoomSelection } from "@/lib/stores/rooms";
 import { cn } from "@/lib/utils";
 
-/** Movement past this distance (px) turns a lifted pin into a drag (Story 13.6). */
+/** Movement past this distance (px) turns a press on a pin into a drag. */
 const LIFT_DRAG_TOLERANCE_PX = 10;
 
 interface PinsStripProps {
@@ -73,28 +83,107 @@ function persistOrder(next: InboxRoomVm[]): void {
   );
 }
 
-export function PinsStrip({ pins, onSelect, selected, reorderable = true }: PinsStripProps) {
-  // Ephemeral drag state: the index being dragged. Cleared on drop/end. The
-  // authoritative order always arrives via the stream — this only styles the
-  // in-flight avatar during the gesture.
-  const [dragIndex, setDragIndex] = useState<number | null>(null);
+/**
+ * The press that a pin's reorder begins with.
+ *
+ * `viaLift` is the phone's long-press entry: there, a press that never moves
+ * opens the pin's menu, where on the desktop it stays a plain click that selects
+ * the room. Both entries feed one state machine
+ * ({@link "@/hooks/use-pointer-drag"}), so the release arithmetic and the stale-
+ * index guards are written once.
+ */
+interface PinPress {
+  /** The pin's index in the authoritative `pins` order. */
+  index: number;
+  viaLift: boolean;
+  /** The pressed avatar, and the point pressed: the menu a stationary lift opens
+   *  has to open on that element, at that point, after the release. */
+  target: HTMLElement;
+  clientX: number;
+  clientY: number;
+}
 
-  // ---- Phone long-press-drag reorder (Story 13.6) --------------------------
+export function PinsStrip({ pins, onSelect, selected, reorderable = true }: PinsStripProps) {
   const { phone } = useShellLayout();
   const listRef = useRef<HTMLUListElement>(null);
-  // The lifted pin (post long-press): its index in `pins`, the tracked pointer,
-  // the press origin, and whether the pointer has actually dragged.
-  const liftRef = useRef<{
-    pointerId: number;
-    index: number;
-    startX: number;
-    startY: number;
-    moved: boolean;
-  } | null>(null);
-  const [liftedIndex, setLiftedIndex] = useState<number | null>(null);
-  // The lifted pin's current preview slot while dragging, or null.
-  const [liftTarget, setLiftTarget] = useState<number | null>(null);
 
+  /**
+   * The slot a release at this x would land in: the nearest avatar's midpoint.
+   *
+   * Measured per call rather than cached at the press, so the strip's own
+   * horizontal scroll — and the preview reorder the drag itself paints — resolve
+   * where the pins are now instead of where they were.
+   */
+  const slotAt = (clientX: number): number | null => {
+    const items = listRef.current?.querySelectorAll("li");
+    if (items === undefined || items.length === 0) {
+      return null;
+    }
+    let nearest = 0;
+    let nearestDist = Number.POSITIVE_INFINITY;
+    items.forEach((item, index) => {
+      const rect = item.getBoundingClientRect();
+      const dist = Math.abs(clientX - (rect.left + rect.width / 2));
+      if (dist < nearestDist) {
+        nearest = index;
+        nearestDist = dist;
+      }
+    });
+    return nearest;
+  };
+
+  /**
+   * The reorder, on both tiers and by pointer only (Story 53.1).
+   *
+   * The HTML5 drag this strip reordered by until now could not work in the real
+   * app: Tauri claims `performDragOperation:` in Rust before WebKit performs it,
+   * so the page's `drop` never fires — see {@link "@/hooks/use-pointer-drag"} for
+   * the source lines. `dragstart` and `dragover` did fire, which is how the
+   * desktop reorder looked live and had been dead since Story 4.3. The phone's
+   * long-press-drag (Story 13.6) was already pointer-only and already worked;
+   * both entries now feed one state machine, so the release arithmetic and the
+   * stale-index guards are written once.
+   */
+  const drag = usePointerDrag<PinPress, number>({
+    slopPx: LIFT_DRAG_TOLERANCE_PX,
+    resolve: slotAt,
+    onRelease: (press, slot, moved) => {
+      if (!moved) {
+        if (press.viaLift) {
+          // A stationary long-press opens the pin's menu — the same menu the
+          // desktop right-click opens. A stationary desktop press is a plain
+          // click, and selecting the room is the click's own business.
+          press.target.dispatchEvent(
+            new MouseEvent("contextmenu", {
+              bubbles: true,
+              cancelable: true,
+              clientX: press.clientX,
+              clientY: press.clientY,
+            }),
+          );
+        }
+        return;
+      }
+      // Guard stale indices against a stream Reset mid-drag: they would splice
+      // the wrong (or an undefined) element and then throw reading `accountId`
+      // of `undefined`. `reorderable` is re-read here and not only at the press,
+      // because an account filter can arrive mid-gesture and a partial order
+      // would corrupt the pins it hides.
+      if (
+        !reorderable ||
+        slot === null ||
+        slot === press.index ||
+        press.index < 0 ||
+        press.index >= pins.length ||
+        slot >= pins.length
+      ) {
+        return;
+      }
+      persistOrder(movePin(pins, press.index, slot));
+    },
+  });
+
+  // ---- Phone long-press entry (Story 13.6) ---------------------------------
   const onPinLift = (detail: LongPressDetail) => {
     const indexAttr = detail.target.closest("[data-pin-index]")?.getAttribute("data-pin-index");
     const index = indexAttr === undefined || indexAttr === null ? Number.NaN : Number(indexAttr);
@@ -114,130 +203,28 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
       );
       return;
     }
-    liftRef.current = {
-      pointerId: detail.pointerId,
-      index,
-      startX: detail.clientX,
-      startY: detail.clientY,
-      moved: false,
-    };
-    setLiftedIndex(index);
-    detail.target.setPointerCapture(detail.pointerId);
+    // Captured at the lift rather than at the slop: by the time the hold has
+    // fired, the gesture is already committed and the pin is already drawn
+    // lifted, so there is no click left to protect.
+    drag.begin(
+      {
+        index,
+        viaLift: true,
+        target: detail.target,
+        clientX: detail.clientX,
+        clientY: detail.clientY,
+      },
+      detail,
+      true,
+    );
   };
 
   const longPress = useLongPress({ onLongPress: phone ? onPinLift : undefined });
-
-  /** Resolve the preview slot for a lifted drag from the pointer's x position. */
-  const liftTargetFor = (clientX: number): number | null => {
-    const items = listRef.current?.querySelectorAll("li");
-    if (items === undefined || items.length === 0) {
-      return null;
-    }
-    let nearest = 0;
-    let nearestDist = Number.POSITIVE_INFINITY;
-    items.forEach((item, index) => {
-      const rect = item.getBoundingClientRect();
-      const mid = rect.left + rect.width / 2;
-      const dist = Math.abs(clientX - mid);
-      if (dist < nearestDist) {
-        nearest = index;
-        nearestDist = dist;
-      }
-    });
-    return nearest;
-  };
-
-  const onLiftPointerMove = (e: ReactPointerEvent<HTMLElement>) => {
-    const lift = liftRef.current;
-    if (lift === null || e.pointerId !== lift.pointerId) {
-      return;
-    }
-    if (
-      !lift.moved &&
-      Math.hypot(e.clientX - lift.startX, e.clientY - lift.startY) <= LIFT_DRAG_TOLERANCE_PX
-    ) {
-      return;
-    }
-    lift.moved = true;
-    setLiftTarget(liftTargetFor(e.clientX));
-  };
-
-  const onLiftPointerUp = (e: ReactPointerEvent<HTMLElement>) => {
-    const lift = liftRef.current;
-    if (lift === null || e.pointerId !== lift.pointerId) {
-      return;
-    }
-    liftRef.current = null;
-    setLiftedIndex(null);
-    setLiftTarget(null);
-    if (!lift.moved) {
-      // A stationary long-press: open the pin's menu at the press point — the
-      // same menu the desktop right-click opens.
-      e.currentTarget.dispatchEvent(
-        new MouseEvent("contextmenu", {
-          bubbles: true,
-          cancelable: true,
-          clientX: e.clientX,
-          clientY: e.clientY,
-        }),
-      );
-      return;
-    }
-    const target = liftTargetFor(e.clientX);
-    // Guard stale indices against a stream Reset mid-drag, mirroring onDrop.
-    if (
-      target === null ||
-      target === lift.index ||
-      lift.index < 0 ||
-      lift.index >= pins.length ||
-      target >= pins.length
-    ) {
-      return;
-    }
-    persistOrder(movePin(pins, lift.index, target));
-  };
-
-  const onLiftPointerCancel = (e: ReactPointerEvent<HTMLElement>) => {
-    const lift = liftRef.current;
-    if (lift === null || e.pointerId !== lift.pointerId) {
-      return;
-    }
-    liftRef.current = null;
-    setLiftedIndex(null);
-    setLiftTarget(null);
-  };
 
   // Hidden entirely when empty (UX-DR4): no strip, no border, no label.
   if (pins.length === 0) {
     return null;
   }
-
-  const onDrop = (targetIndex: number) => {
-    // Ignore no-op drops, and any drop while reorder is disabled (filtered view).
-    if (!reorderable || dragIndex === null || dragIndex === targetIndex) {
-      setDragIndex(null);
-      return;
-    }
-    // Guard against a stream Reset that shrank or replaced `pins` between drag-start
-    // and drop: stale indices would splice the wrong (or an undefined) element and
-    // then throw while reading `accountId` of `undefined`.
-    if (
-      dragIndex < 0 ||
-      dragIndex >= pins.length ||
-      targetIndex < 0 ||
-      targetIndex >= pins.length
-    ) {
-      setDragIndex(null);
-      return;
-    }
-    const next = movePin(pins, dragIndex, targetIndex);
-    setDragIndex(null);
-    if (next === pins) {
-      return;
-    }
-    // Dispatch the authoritative reorder; the stream reflects it back. Best-effort.
-    persistOrder(next);
-  };
 
   // Move a pin one slot without a gesture (the phone menu's Move up/down).
   const moveBy = (index: number, delta: number) => {
@@ -248,28 +235,62 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
     persistOrder(movePin(pins, index, target));
   };
 
-  // While a lifted pin drags, preview the reordered strip; the authoritative
-  // order still arrives over the stream after the drop.
-  const liftPreviewActive =
-    liftedIndex !== null && liftTarget !== null && liftTarget !== liftedIndex;
-  const displayPins = liftPreviewActive ? movePin(pins, liftedIndex, liftTarget) : pins;
-  const liftedDisplayIndex = liftPreviewActive ? liftTarget : liftedIndex;
+  // While a pin drags, preview the reordered strip; the authoritative order still
+  // arrives over the stream after the release. With no HTML5 ghost to lean on,
+  // this preview IS the desktop's drop cue.
+  //
+  // **And it is why the pressed pin does not also translate under the pointer**
+  // (Story 54.1). The board's card gets a `transform` from the drag's live delta
+  // because nothing else moves it: it stays in its column and the delta from the
+  // press origin is exactly where the pointer is. Here the DOM has already moved
+  // the pressed avatar into its target slot, so the same delta would be added on
+  // top of a displacement the reorder already applied — a pin drawn a slot ahead
+  // of the finger, further ahead the further it travelled. Following the finger
+  // from *here* means measuring the element's new rect every step, which is a FLIP
+  // and is not what this epic bought. The strip does take the other half of
+  // Story 54.1: the press cancels its own default (`:328`) and the shared hook
+  // holds the document unselectable for the gesture, which is what the desktop
+  // strip was missing.
+  const pressed = drag.item;
+  const preview =
+    pressed !== null && drag.dragging && drag.over !== null && drag.over !== pressed.index
+      ? { from: pressed.index, to: drag.over }
+      : null;
+  const displayPins = preview === null ? pins : movePin(pins, preview.from, preview.to);
+  // The display slot the pressed pin occupies, for the lifted styling. A phone
+  // lift is drawn lifted from the hold; a desktop press only once it is a drag,
+  // so a plain click never flickers.
+  let liftedDisplayIndex: number | null = null;
+  if (pressed !== null && (pressed.viaLift || drag.dragging)) {
+    liftedDisplayIndex = preview === null ? pressed.index : preview.to;
+  }
 
   return (
     <div className="shrink-0 border-border border-b">
       <ul
         ref={listRef}
         aria-label="Pinned conversations"
+        // The move, the release and the cancel are listened for here and nowhere
+        // else. Before the slop crossing there is no capture, and a press 4 px
+        // from the edge of a 44 px avatar leaves it well before travelling the
+        // 10 px lift tolerance: that move lands on this list, and the avatar sits
+        // below it rather than above, so on the avatar alone nothing would hear it
+        // and the drag would silently never start. Every handler is
+        // `pointerId`-guarded and no-ops with no press in flight.
+        onPointerMove={drag.handlers.onPointerMove}
+        onPointerUp={drag.handlers.onPointerUp}
+        onPointerCancel={drag.handlers.onPointerCancel}
         className="flex flex-nowrap items-center gap-2 overflow-x-auto p-2"
       >
         {displayPins.map((room, index) => {
           const isSelected =
             selected?.roomId === room.roomId && selected?.accountId === room.accountId;
           // The pin's index in the authoritative `pins` order (identical to
-          // `index` unless a lift preview is showing).
-          const pinIndex = liftPreviewActive
-            ? pins.findIndex((p) => p.accountId === room.accountId && p.roomId === room.roomId)
-            : index;
+          // `index` unless a drag preview is showing).
+          const pinIndex =
+            preview === null
+              ? index
+              : pins.findIndex((p) => p.accountId === room.accountId && p.roomId === room.roomId);
           return (
             <li key={`${room.accountId}:${room.roomId}`} className="shrink-0">
               <ContextMenu>
@@ -279,37 +300,74 @@ export function PinsStrip({ pins, onSelect, selected, reorderable = true }: Pins
                     // The lift handler resolves the pressed pin through this
                     // attribute; phone-gated so the desktop DOM stays identical.
                     data-pin-index={phone ? pinIndex : undefined}
-                    draggable={reorderable}
-                    onDragStart={() => reorderable && setDragIndex(pinIndex)}
-                    onDragOver={(e) => e.preventDefault()}
-                    onDrop={() => onDrop(pinIndex)}
-                    onDragEnd={() => setDragIndex(null)}
                     onClick={() => onSelect?.({ accountId: room.accountId, roomId: room.roomId })}
-                    onPointerDown={longPress.onPointerDown}
-                    onPointerMove={(e) => {
-                      longPress.onPointerMove(e);
-                      onLiftPointerMove(e);
+                    onPointerDown={(e) => {
+                      // Every press, ahead of the gates below. A touch drag ends
+                      // with no synthesised click at all, so nothing eats the
+                      // swallow flag the lift set; and the phone gate returns
+                      // before `drag.begin`, which is the other site that clears
+                      // it. Without this the tap after a long-press reorder is
+                      // swallowed and the room does not open until the second.
+                      drag.allowNextClick();
+                      longPress.onPointerDown(e);
+                      // The desktop entry: no hold, and the press becomes a drag
+                      // only past the slop, so a click still selects the room.
+                      // On the phone the long-press above owns the entry — an
+                      // immediate drag there would fight the strip's own scroll.
+                      if (phone || !reorderable || e.button !== 0) {
+                        return;
+                      }
+                      // The press's own default is the selection: a cancelled
+                      // `pointerdown` fires no `mousedown`, so nothing anchors one
+                      // for the following moves to extend across the app
+                      // (Story 54.1; `resizable-columns.tsx:202-203`). `click` is
+                      // not cancelled by it, so the avatar still selects the room,
+                      // and the phone's long-press entry above is untouched — it
+                      // returns before this line and its own suppression is the
+                      // `select-none` below.
+                      e.preventDefault();
+                      drag.begin(
+                        {
+                          index: pinIndex,
+                          viaLift: false,
+                          target: e.currentTarget,
+                          clientX: e.clientX,
+                          clientY: e.clientY,
+                        },
+                        {
+                          pointerId: e.pointerId,
+                          clientX: e.clientX,
+                          clientY: e.clientY,
+                          target: e.currentTarget,
+                        },
+                      );
                     }}
-                    onPointerUp={(e) => {
-                      longPress.onPointerUp(e);
-                      onLiftPointerUp(e);
+                    // The long-press owns these on the avatar: it needs the
+                    // element it is holding. The drag's own move/release/cancel
+                    // are listened for once, on the list (`:270`), because this
+                    // avatar is inside it — a copy here would only re-run the same
+                    // slot hit-test on every move of a live drag.
+                    onPointerMove={longPress.onPointerMove}
+                    onPointerUp={longPress.onPointerUp}
+                    onPointerCancel={longPress.onPointerCancel}
+                    onClickCapture={(e) => {
+                      longPress.onClickCapture(e);
+                      drag.handlers.onClickCapture(e);
                     }}
-                    onPointerCancel={(e) => {
-                      longPress.onPointerCancel(e);
-                      onLiftPointerCancel(e);
-                    }}
-                    onClickCapture={longPress.onClickCapture}
                     title={room.displayName}
                     aria-label={`Pinned conversation with ${room.displayName}`}
                     aria-current={isSelected ? "true" : undefined}
-                    data-dragging={
-                      dragIndex === pinIndex || liftedDisplayIndex === index ? "true" : undefined
-                    }
+                    data-dragging={liftedDisplayIndex === index ? "true" : undefined}
                     className={cn(
                       "rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring data-[dragging=true]:opacity-50",
                       // Phone (Story 13.6): the pin is a long-press/drag target —
-                      // suppress the native callout/selection and let the pointer
-                      // (not native panning) own the gesture.
+                      // suppress the native callout and let the pointer (not
+                      // native panning) own the gesture. Still phone-only after
+                      // Story 54.1: `touch-none` and the callout are WebKit-touch
+                      // affordances, and the desktop's selection is now stopped
+                      // where it is anchored — at the press (`:328`) and on the
+                      // document for the gesture's duration — rather than on one
+                      // element.
                       phone && "touch-callout-none touch-none select-none",
                     )}
                   >

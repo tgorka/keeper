@@ -49,3 +49,9 @@ pre-push:
         fi
     - name: frontend-tests
       run: bun run test
+    - name: design
+      # The Keeper Room identity lives in roughly 4% of the pixels, so it cannot
+      # be defended by review. This recomputes the contrast of every token
+      # against every surface of its own theme and bans the patterns the palette
+      # was cleaned of. It caught a shipped AA failure the first time it ran.
+      run: bun run check:design

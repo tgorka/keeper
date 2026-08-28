@@ -55,6 +55,21 @@ impl SyncPlatform for ShellSyncPlatform {
             .map_err(|err| SyncError::Config(format!("no data directory: {err}")))
     }
 
+    /// This profile's credential, read through the shell's single keychain memo.
+    ///
+    /// There is deliberately no cache here. The engine calls this on every push
+    /// and every fetch, which on macOS used to mean one "keeper wants to use your
+    /// confidential information" dialog per sync operation — the item's ACL is
+    /// re-evaluated on every read that returns data. The fix lives one layer down
+    /// in [`Platform::keychain_get`], which memoizes per key for the process, and
+    /// whose sibling `keychain_set`/`keychain_delete` invalidate the entry so a
+    /// corrected password takes effect without a relaunch.
+    ///
+    /// Delegating rather than memoizing again is the point: the shell builds a
+    /// fresh [`ShellSyncPlatform`] per IPC call ([`sync_platform`]), so a cache
+    /// held *here* would be a second cache over one keychain with its own
+    /// invalidation domain — the engine would keep spending a credential the user
+    /// had already corrected through `sync_set_credential`. Do not add one.
     fn secret_get(&self, key: &str) -> SyncResult<Option<String>> {
         self.platform
             .keychain_get(key)
@@ -282,22 +297,13 @@ pub fn configured_git_path(platform: &dyn Platform) -> Option<String> {
 }
 
 /// This machine's short name, for provenance trailers and conflict filenames.
-pub(crate) fn read_host_label() -> String {
-    let raw = std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .unwrap_or_default();
-    // macOS answers with a Bonjour name (`macbookpro.lan`); the leading label
-    // keeps a commit trailer short.
-    let short = raw.split('.').next().unwrap_or_default().trim();
-    if short.is_empty() {
-        "unknown-host".to_owned()
-    } else {
-        short.to_owned()
-    }
-}
+///
+/// Moved into `keeper-core` in Story 46.6 — the layer stack's per-machine files
+/// are `keeper.<host>.toml`, and that name has to be computable from a crate
+/// that builds on every platform, not from the Tauri shell. Re-exported here so
+/// the callers that already say `crate::sync::read_host_label()` are unchanged
+/// and there is still exactly one definition.
+pub(crate) use keeper_core::config::read_host_label;
 
 /// The process-wide engine, built on first use.
 ///
@@ -520,17 +526,9 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    #[test]
-    fn a_host_label_is_always_produced_and_is_a_short_name() {
-        // Provenance identifies the machine; an empty or dotted label makes
-        // every commit trailer either useless or noisy.
-        let label = read_host_label();
-        assert!(!label.is_empty());
-        assert!(
-            !label.contains('.'),
-            "expected a short label, got {label:?}"
-        );
-    }
+    // `a_host_label_is_always_produced_and_is_a_short_name` moved to
+    // `keeper_core::config` in Story 46.6, with the function. It is the same
+    // assertion, and it now runs on a host that can build the crate it tests.
 
     /// Story 41.5: a `PushPolicy::Window` is an `HH:MM` a person typed on the
     /// clock on their wall, so the offset the engine converts it with has to be

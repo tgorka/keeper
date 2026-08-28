@@ -34,13 +34,71 @@
 //! git hands the filter one file on stdin and reads the replacement from stdout.
 //! Neither direction may write anything else to stdout — not a log line, not a
 //! warning — because every byte is content.
+//!
+//! # Why there is a second, long-running shape (DW-140)
+//!
+//! Registering `clean`/`smudge` is not enough, and the reason is a git config
+//! rule rather than anything about this code: **when `filter.<drv>.process` is
+//! defined, git uses it and ignores `clean`/`smudge` entirely**. `git lfs
+//! install` writes `filter.lfs.process` into `~/.gitconfig`, and a *global*
+//! process driver outranks a *repository-local* clean/smudge pair. So on any
+//! machine where the real git-lfs was ever installed — every developer's — the
+//! filter this module registers was never once invoked. It was not a fallback;
+//! it was dead code.
+//!
+//! What ran instead was git-lfs, which downloads objects itself, and when it
+//! cannot resolve one it dies mid-protocol:
+//!
+//! ```text
+//! error: external filter 'git-lfs filter-process' failed
+//! error: external filter 'git-lfs filter-process' is not available anymore
+//!        although not all paths have been filtered
+//! ```
+//!
+//! Under `filter.lfs.required=false` git swallows that and writes **zero
+//! bytes** — for that path *and every remaining path in the same checkout*. On
+//! 2026-08-16 one object missing from the server turned 122 recordings, 74 GB
+//! of pointers, into 122 empty files in a single fast-forward. The pointers
+//! survived only because nothing committed the worktree before it was noticed.
+//!
+//! Hence [`run_process`]. Owning `filter.lfs.process` is the only way to stop a
+//! globally-installed git-lfs from silently outranking us, and a filter that
+//! answers every path itself is the only way the cascade cannot start.
+//!
+//! ## `required` stays false, deliberately
+//!
+//! The flag was never the hazard on its own. `required=true` makes a failed
+//! smudge a hard error — which, verified on the same repository, leaves the
+//! path **deleted** from the worktree, and a sync engine watching that folder
+//! then commits the deletion. Neither setting is safe while the filter can die
+//! mid-stream; both are safe once it cannot. So the fix is here, not in the
+//! flag: [`run_process`] answers a per-path failure with `status=error` and
+//! **never** exits. git falls back for that one path, the process stays up, and
+//! the next path is filtered normally. `required=false` then keeps doing the
+//! job it was chosen for — a worktree whose keeper binary moved still checks
+//! out, as pointers.
 
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::{BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::error::{Result, SyncError};
+use crate::lfs::pktline::{self, Packet};
 use crate::lfs::pointer::{Pointer, MAX_POINTER_BYTES};
 use crate::lfs::store::LfsStore;
+
+/// What an `lfs …` argument list asks this binary to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invocation {
+    /// One file on stdin, its replacement on stdout, then exit.
+    Single { direction: Direction, repo: PathBuf },
+    /// Stay up and serve git's long-running protocol.
+    Process { repo: PathBuf },
+    /// An `lfs` verb this build does not implement. Claimed so it can be
+    /// refused loudly rather than mistaken for an ordinary launch.
+    Unsupported,
+}
 
 /// Which direction git is asking for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,17 +122,53 @@ pub enum Direction {
 /// Blocking and streaming. Nothing here sizes a buffer from the file — a clean
 /// hashes straight into the store as the bytes arrive (NFR-23), which is the
 /// whole reason LFS exists in this engine.
+/// How much output is gathered before it reaches the pipe.
+///
+/// The smudge path streams a whole object through `std::io::copy`, whose
+/// internal buffer is 8 KiB — and the writer git hands us is
+/// `std::io::Stdout`, a `LineWriter`, which flushes to the last newline in
+/// every write it is given. Binary content has newlines all over it, so
+/// nothing coalesces: a 400 MB video crosses the pipe in ~50 000 writes, each
+/// one waking git to read it. That is where a folder syncing all day spends
+/// its context switches — 8 200 a second, measured, against 3% CPU.
+///
+/// 256 KiB turns those 8 KiB writes into one syscall per buffer. The pipe
+/// itself holds 64 KiB, so the kernel still moves it in pieces; what changes
+/// is how many times *this* process has to ask.
+///
+/// Correctness rests on every response already ending in an explicit `flush`,
+/// which it does — the protocol has to, because git waits on it. Buffering
+/// without that would deadlock rather than merely be slow.
+const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
+
 pub fn run(
     repo: &Path,
     direction: Direction,
     input: &mut impl Read,
     output: &mut impl Write,
 ) -> Result<()> {
+    run_for_path(repo, None, direction, input, output)
+}
+
+/// [`run`], told which worktree file the bytes came from.
+///
+/// The clean direction needs it to avoid copying content the store already
+/// holds: it hashes the stream, and reads the file back only for the objects
+/// that turn out to be missing. See the note in [`clean`]. `None` keeps the
+/// old behaviour, which is what a caller that pipes bytes from nowhere gets.
+pub fn run_for_path(
+    repo: &Path,
+    worktree: Option<&Path>,
+    direction: Direction,
+    input: &mut impl Read,
+    output: &mut impl Write,
+) -> Result<()> {
     let store = LfsStore::in_git_dir(repo.join(".git"));
     store.ensure_layout()?;
+    let mut output = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, output);
     match direction {
-        Direction::Smudge => smudge(&store, repo, input, output),
-        Direction::Clean => clean(&store, repo, input, output),
+        Direction::Smudge => smudge(&store, repo, input, &mut output),
+        Direction::Clean => clean(&store, repo, worktree, input, &mut output),
     }
 }
 
@@ -153,6 +247,7 @@ fn smudge(
 fn clean(
     store: &LfsStore,
     repo: &Path,
+    worktree: Option<&Path>,
     input: &mut impl Read,
     output: &mut impl Write,
 ) -> Result<()> {
@@ -179,12 +274,45 @@ fn clean(
             .map_err(|err| SyncError::io("flush clean output", repo, err));
     }
 
-    // Hashed straight into the object store as it streams, so the object is
-    // already present by the time the pointer naming it is emitted. A crash
-    // between the two costs a re-clean, never a pointer to nothing. `head` is
-    // chained back on rather than re-read: stdin does not rewind, and those first
-    // bytes are as much of the object as any other.
-    let (oid, size) = store.insert_streaming(head.as_slice().chain(input))?;
+    // **Hash first, write only what is missing — when the bytes can be found
+    // again.**
+    //
+    // `insert_streaming` learns the OID by writing a full copy into `tmp/` and
+    // hashing as it goes, so it cannot know the object was already stored until
+    // it has paid for the copy. Almost every clean in a status walk is exactly
+    // that case: keeper stored the object when it committed the pointer, and the
+    // walk is only asking what the file's pointer is. Measured on the field
+    // folder with the volume otherwise quiet, `tmp/` grew at 9.6 MB/s and held
+    // 5.4 GB mid-walk — about 42 minutes of writing per walk for content that
+    // had not changed since the last one.
+    //
+    // The condition is being able to get the bytes back: git names the file in
+    // the request, so when that file is there, the stream can be hashed and
+    // discarded and re-read only for the objects that are genuinely new. When it
+    // is not there — no path in this invocation, `git stash`, a blob that never
+    // was a worktree file — the old streaming insert is the only correct answer,
+    // because the invariant is that a pointer never names an object the store
+    // does not hold.
+    let source = worktree
+        .map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                repo.join(path)
+            }
+        })
+        .filter(|path| path.is_file());
+    let (oid, size) = match source {
+        Some(path) => {
+            let (oid, size) = LfsStore::digest_of(head.as_slice().chain(input))?;
+            if store.contains(&oid, size) {
+                (oid, size)
+            } else {
+                store_object_from_file(store, &path, &oid, size)?
+            }
+        }
+        None => store.insert_streaming(head.as_slice().chain(input))?,
+    };
     let pointer = Pointer::new(oid, size);
     output
         .write_all(pointer.render().as_bytes())
@@ -192,6 +320,586 @@ fn clean(
     output
         .flush()
         .map_err(|err| SyncError::io("flush clean output", repo, err))
+}
+
+/// Put an object the store does not have into it, from the file git read to
+/// produce the stream, and report what was actually stored.
+///
+/// `expected` is the digest of the stream, which is what the caller wants to
+/// publish, so the file is verified against it: nothing is ever stored under a
+/// name it does not have. If the file has changed since git read it, what is
+/// there now is stored instead and the pointer names THAT — git re-cleans on
+/// its next pass, so the index converges, and no pointer is emitted without its
+/// object.
+fn store_object_from_file(
+    store: &LfsStore,
+    path: &Path,
+    expected: &str,
+    expected_size: u64,
+) -> Result<(String, u64)> {
+    let file = std::fs::File::open(path)
+        .map_err(|err| SyncError::io("re-read a file to store its object", path, err))?;
+    match store.insert_verified(expected, file, expected_size) {
+        Ok(()) => Ok((expected.to_owned(), expected_size)),
+        Err(_) => {
+            let again = std::fs::File::open(path)
+                .map_err(|err| SyncError::io("re-read a changed file", path, err))?;
+            store.insert_streaming(again)
+        }
+    }
+}
+
+/// Serve git's long-running filter protocol until the pipe closes (DW-140).
+///
+/// `repo` comes from the registered command line, exactly as it does for the
+/// single-shot verbs: the protocol tells us a `pathname` but never a worktree,
+/// and the object store is the one thing this process cannot guess.
+///
+/// # The shape of the conversation
+///
+/// ```text
+/// git> git-filter-client / version=2 / 0000      handshake
+/// git< git-filter-server / version=2 / 0000
+/// git> capability=clean / capability=smudge / capability=delay / 0000
+/// git< capability=clean / capability=smudge / 0000   (never delay — see below)
+/// git> command=smudge / pathname=a/b.mov / 0000      one file
+/// git> CONTENT… / 0000
+/// git< status=success / 0000
+/// git< FILTERED… / 0000
+/// git< 0000                                      trailing status list
+/// ```
+///
+/// `delay` is not advertised. It buys concurrency for a filter that fetches
+/// over the network, which this one never does — [`smudge`] serves what the
+/// store already holds and passes the pointer through otherwise. Advertising it
+/// would add a whole second state machine for no latency we have.
+///
+/// # Why the request is always drained before the response starts
+///
+/// git writes a file's whole content and only then reads the answer. A filter
+/// that starts answering while the request is still arriving deadlocks the
+/// moment both pipes fill — 64 KiB in, on the pipes macOS gives us. So every
+/// path here consumes its request to the flush packet first. For a `clean` that
+/// costs nothing: the content streams straight into the object store as it
+/// arrives, which is the streaming property NFR-23 asks for. For a `smudge` the
+/// request is a ~130-byte pointer, and the one case where it is not — a blob
+/// committed as raw content before `.gitattributes` existed, which this
+/// repository really does contain — spills to the store's scratch directory
+/// rather than to memory.
+pub fn run_process(repo: &Path, input: &mut impl Read, output: &mut impl Write) -> Result<()> {
+    let store = LfsStore::in_git_dir(repo.join(".git"));
+    store.ensure_layout()?;
+    // The long-running form carries the same content through the same pipe, so
+    // it wants the same buffer. See [`OUTPUT_BUFFER_BYTES`].
+    let mut output = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, output);
+    let output = &mut output;
+
+    if !handshake(input, output)? {
+        return Ok(());
+    }
+
+    while let Some(keys) = pktline::read_text_list(input)? {
+        // An empty list before EOF is not something git sends; treating it as
+        // "nothing to do" beats inventing an error for it.
+        if keys.is_empty() {
+            continue;
+        }
+        let command = value_of(&keys, "command");
+        let direction = match command.as_deref() {
+            Some("clean") => Some(Direction::Clean),
+            Some("smudge") => Some(Direction::Smudge),
+            _ => None,
+        };
+        let Some(direction) = direction else {
+            // A command we never advertised. Refusing this one path keeps the
+            // process alive for the paths we did advertise, which is the whole
+            // discipline this module now runs on.
+            drain(input)?;
+            pktline::write_line(output, "status=error")?;
+            pktline::write_flush(output)?;
+            flush(output)?;
+            continue;
+        };
+        // The guard is armed around the request and disarmed when it answers.
+        // *Between* requests this process is meant to sit idle for as long as
+        // git keeps it alive, so a timer that ran the whole time would kill a
+        // healthy filter waiting for the next file.
+        let serving = RequestGuard::arm(&keys);
+        // What git named for this request. The clean direction reads it back
+        // instead of copying the stream, when the object turns out to be new.
+        let named = value_of(&keys, "pathname").map(PathBuf::from);
+        serve_one(&store, repo, named.as_deref(), direction, input, output)?;
+        drop(serving);
+    }
+    Ok(())
+}
+
+/// How long one clean or smudge may take before the filter gives up on it.
+///
+/// A generous ceiling on honest work: converting a gigabyte of video on an
+/// external disk is minutes, not seconds, and killing that would be a bug. What
+/// this catches is the request that never ends — the parent stops sending, the
+/// filter blocks in `read` on its stdin, and both sides wait forever. That is
+/// not hypothetical: it stalled a vault for four days with no error anywhere.
+const REQUEST_LIMIT: Duration = Duration::from_secs(900);
+
+/// Ends the process if one request never finishes.
+///
+/// # Why exiting is the right answer here
+///
+/// This is a child process with one job. It cannot repair a half-consumed
+/// request — the pipe's position is part of the protocol state, and there is no
+/// packet meaning "let us start over". Exiting closes the pipe, which is a
+/// thing the parent already knows how to interpret: `invoke` fails, the caller
+/// gets an error naming the path, and the pass is retried. A filter that hangs
+/// on instead offers the parent nothing to react to at all.
+struct RequestGuard {
+    done: std::sync::Arc<AtomicBool>,
+}
+
+impl RequestGuard {
+    fn arm(keys: &[String]) -> Self {
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher = std::sync::Arc::clone(&done);
+        // The path, captured now: once this process exits there is nobody left
+        // to ask what it was working on, and "a filter timed out" without a
+        // path is a sentence that starts an investigation instead of ending one.
+        let pathname = value_of(keys, "pathname").unwrap_or_else(|| "<unnamed>".into());
+        std::thread::Builder::new()
+            .name("keeper-filter-watchdog".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let deadline = started + REQUEST_LIMIT;
+                let mut announced = Duration::ZERO;
+                while Instant::now() < deadline {
+                    if watcher.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_secs(5));
+                    // A file that takes minutes says so, by name, once a
+                    // minute. This is the line whose absence turned a stalled
+                    // filter into four days of silence: the parent's log knew
+                    // only that a status pass was running, never on what.
+                    let elapsed = started.elapsed();
+                    if elapsed - announced >= Duration::from_secs(60) {
+                        announced = elapsed;
+                        eprintln!(
+                            "keeper lfs filter: still converting {pathname} after {}s",
+                            elapsed.as_secs()
+                        );
+                    }
+                }
+                if watcher.load(Ordering::Relaxed) {
+                    return;
+                }
+                // `eprintln!`, not `tracing`: this process's stdout is the
+                // protocol and its tracing subscriber belongs to a different
+                // binary's configuration. stderr is what the parent captures.
+                eprintln!(
+                    "keeper lfs filter: no progress on {pathname} for {}s; exiting so the \
+                     caller sees a closed pipe instead of waiting forever",
+                    REQUEST_LIMIT.as_secs()
+                );
+                std::process::exit(75);
+            })
+            .ok();
+        Self { done }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Agree on version 2 and on the capabilities we will actually honour.
+///
+/// Returns `false` when git hung up during the handshake, which is what a
+/// capability probe looks like from in here.
+fn handshake(input: &mut impl Read, output: &mut impl Write) -> Result<bool> {
+    let Some(hello) = pktline::read_text_list(input)? else {
+        return Ok(false);
+    };
+    if !hello.iter().any(|line| line == "git-filter-client") {
+        return Err(SyncError::Git(format!("not a filter handshake: {hello:?}")));
+    }
+    // git offers a set and expects the highest common version back. Version 2
+    // is the only one that has ever existed; saying so explicitly means a
+    // future git that offers 3 gets a definite 2 rather than silence.
+    if !hello.iter().any(|line| line == "version=2") {
+        return Err(SyncError::Git(format!(
+            "no supported filter protocol version in {hello:?}"
+        )));
+    }
+    pktline::write_line(output, "git-filter-server")?;
+    pktline::write_line(output, "version=2")?;
+    pktline::write_flush(output)?;
+    flush(output)?;
+
+    let Some(_offered) = pktline::read_text_list(input)? else {
+        return Ok(false);
+    };
+    pktline::write_line(output, "capability=clean")?;
+    pktline::write_line(output, "capability=smudge")?;
+    pktline::write_flush(output)?;
+    flush(output)?;
+    Ok(true)
+}
+
+/// Filter exactly one file, and never fail the process while doing it.
+///
+/// `pathname` is what git named in the request. The clean direction uses it to
+/// avoid copying content the store already holds — it hashes the stream and
+/// reads the file back only for objects that are genuinely missing.
+fn serve_one(
+    store: &LfsStore,
+    repo: &Path,
+    pathname: Option<&Path>,
+    direction: Direction,
+    input: &mut impl Read,
+    output: &mut impl Write,
+) -> Result<()> {
+    let body = match direction {
+        Direction::Clean => {
+            // The pointer is ~130 bytes however large the content was, so the
+            // answer is always inline.
+            let mut pointer = Vec::with_capacity(MAX_POINTER_BYTES);
+            let mut content = Request::new(input);
+            let outcome = clean(store, repo, pathname, &mut content, &mut pointer);
+            content.drain()?;
+            outcome.map(|()| Body::Inline(pointer))
+        }
+        Direction::Smudge => {
+            let mut content = Request::new(input);
+            let outcome = plan_smudge(store, repo, &mut content);
+            content.drain()?;
+            outcome
+        }
+    };
+
+    let body = match body {
+        Ok(body) => body,
+        Err(err) => {
+            // One path's failure, reported as one path's failure. The process
+            // survives, so git filters the rest of the checkout normally and
+            // falls back to the stored bytes for this one — instead of the
+            // "not all paths have been filtered" cascade that empties files.
+            tracing::warn!(error = %err, "lfs filter: refusing one path");
+            pktline::write_line(output, "status=error")?;
+            pktline::write_flush(output)?;
+            return flush(output);
+        }
+    };
+
+    pktline::write_line(output, "status=success")?;
+    pktline::write_flush(output)?;
+    let outcome = write_body(&body, output);
+    // The trailing list is where a failure that only became visible mid-stream
+    // is reported; git's own documentation shows exactly this exchange.
+    pktline::write_flush(output)?;
+    match outcome {
+        Ok(()) => pktline::write_flush(output)?,
+        Err(err) => {
+            tracing::warn!(error = %err, "lfs filter: a body failed mid-stream");
+            pktline::write_line(output, "status=error")?;
+            pktline::write_flush(output)?;
+        }
+    }
+    flush(output)
+}
+
+/// What a served path answers with, chosen without holding it in memory.
+enum Body {
+    /// Small enough to have been built already: a pointer, either direction.
+    Inline(Vec<u8>),
+    /// Stream this file back. Either an object from the store, or the spill of
+    /// a request that turned out not to be a pointer at all.
+    File(PathBuf),
+    /// A spill this process owns and must delete once it has been sent.
+    Spill(PathBuf),
+}
+
+/// Decide what a smudge answers, reading only a bounded prefix of the request.
+fn plan_smudge(
+    store: &LfsStore,
+    repo: &Path,
+    content: &mut Request<'_, impl Read>,
+) -> Result<Body> {
+    let mut head = Vec::with_capacity(MAX_POINTER_BYTES);
+    Read::by_ref(content)
+        .take(MAX_POINTER_BYTES as u64 + 1)
+        .read_to_end(&mut head)
+        .map_err(|err| SyncError::io("read smudge request", repo, err))?;
+
+    if head.len() <= MAX_POINTER_BYTES {
+        if let Some(pointer) = Pointer::parse(&head) {
+            return Ok(if store.contains(&pointer.oid, pointer.size) {
+                Body::File(store.object_path(&pointer.oid))
+            } else {
+                // The object we do not hold. Passing the pointer through is
+                // what keeps a partial fetch usable, and — unlike an empty
+                // file — it is a state the clean filter turns back into itself.
+                Body::Inline(head)
+            });
+        }
+        // Not a pointer, and it all fits: hand the bytes straight back.
+        return Ok(Body::Inline(head));
+    }
+
+    // Over the pointer ceiling: a blob committed as raw content. Rare, and
+    // degenerate — it is the case LFS exists to prevent — but this repository
+    // has real ones from before `.gitattributes` was written, so it has to
+    // work. Spilling keeps memory bounded whatever the size.
+    let path = store
+        .tmp_dir()
+        .join(format!("smudge-{}.spill", std::process::id()));
+    let mut spill = std::fs::File::create(&path)
+        .map_err(|err| SyncError::io("create smudge spill", &path, err))?;
+    spill
+        .write_all(&head)
+        .map_err(|err| SyncError::io("write smudge spill", &path, err))?;
+    std::io::copy(content, &mut spill)
+        .map_err(|err| SyncError::io("spill smudge request", &path, err))?;
+    Ok(Body::Spill(path))
+}
+
+/// Send a body as content packets.
+fn write_body(body: &Body, output: &mut impl Write) -> Result<()> {
+    match body {
+        Body::Inline(bytes) => {
+            for chunk in bytes.chunks(pktline::MAX_DATA) {
+                pktline::write_data(output, chunk)?;
+            }
+            Ok(())
+        }
+        Body::File(path) | Body::Spill(path) => {
+            let file = std::fs::File::open(path)
+                .map_err(|err| SyncError::io("open lfs object", path, err));
+            let result = file.and_then(|mut file| {
+                let mut buffer = vec![0u8; pktline::MAX_DATA];
+                loop {
+                    let read = file
+                        .read(&mut buffer)
+                        .map_err(|err| SyncError::io("stream lfs object", path, err))?;
+                    if read == 0 {
+                        return Ok(());
+                    }
+                    pktline::write_data(output, &buffer[..read])?;
+                }
+            });
+            if let Body::Spill(path) = body {
+                // Best effort: a leftover spill costs disk, and failing the
+                // path because the cleanup failed would trade a small leak for
+                // a checkout that does not happen.
+                let _ = std::fs::remove_file(path);
+            }
+            result
+        }
+    }
+}
+
+/// The content list of one request, as a [`Read`] that stops at its flush.
+///
+/// This is what lets [`clean`] and the smudge planner stay ordinary readers of
+/// a stream, unaware that the stream is packetized — and therefore stay the
+/// same code the single-shot path uses and the existing tests cover.
+struct Request<'a, R: Read> {
+    input: &'a mut R,
+    /// Bytes of the current packet not yet handed out.
+    pending: Vec<u8>,
+    cursor: usize,
+    done: bool,
+}
+
+impl<'a, R: Read> Request<'a, R> {
+    fn new(input: &'a mut R) -> Self {
+        Self {
+            input,
+            pending: Vec::new(),
+            cursor: 0,
+            done: false,
+        }
+    }
+
+    /// Consume whatever is left of this request.
+    ///
+    /// Mandatory, not tidiness: a reader that stops early — [`smudge`] does,
+    /// the moment it has the pointer — leaves packets in the pipe that the next
+    /// command would parse as its own, and the protocol never recovers.
+    fn drain(&mut self) -> Result<()> {
+        while !self.done {
+            // Discarding first is what makes this terminate. [`Self::fill`] is a
+            // no-op while buffered bytes remain unread — that is what keeps it
+            // cheap on the `read` path — so draining without dropping them spins
+            // forever on the first packet the reader did not consume. Which is
+            // every drain that has anything to do.
+            self.pending.clear();
+            self.cursor = 0;
+            self.fill()?;
+        }
+        Ok(())
+    }
+
+    /// Pull the next packet in, marking the request finished at its flush.
+    fn fill(&mut self) -> Result<()> {
+        if self.done || self.cursor < self.pending.len() {
+            return Ok(());
+        }
+        match pktline::read(self.input)? {
+            Packet::Data(bytes) => {
+                self.pending = bytes;
+                self.cursor = 0;
+            }
+            Packet::Flush => self.done = true,
+            Packet::Eof => {
+                return Err(SyncError::Git(
+                    "the filter's request ended without a flush".into(),
+                ))
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for Request<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.cursor < self.pending.len() {
+                let take = (self.pending.len() - self.cursor).min(out.len());
+                out[..take].copy_from_slice(&self.pending[self.cursor..self.cursor + take]);
+                self.cursor += take;
+                return Ok(take);
+            }
+            if self.done {
+                return Ok(0);
+            }
+            self.fill()
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
+    }
+}
+
+/// Read and discard one content list, for a command we are not going to serve.
+fn drain(input: &mut impl Read) -> Result<()> {
+    Request::new(input).drain()
+}
+
+/// Push what we have written out to git, which is blocked reading it.
+fn flush(output: &mut impl Write) -> Result<()> {
+    output
+        .flush()
+        .map_err(|err| SyncError::Git(format!("could not flush the filter response: {err}")))
+}
+
+/// The value of one `key=value` metadata line.
+fn value_of(keys: &[String], key: &str) -> Option<String> {
+    keys.iter()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .map(str::to_owned)
+}
+
+/// How long the probe waits for a binary to say it is a filter.
+///
+/// Generous for a local process that only has to echo two lines, and short
+/// enough that a binary which answers by opening a window instead — an older
+/// build, reached through a config a newer one wrote — costs a startup pause
+/// rather than a hang.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Does `program` actually serve `lfs filter-process`?
+///
+/// # Why this is asked rather than assumed
+///
+/// Registering `filter.lfs.process` is not a hint — it is a promise, and
+/// gitoxide collects on it hard: `maybe_launch_process` fails *before* any
+/// driver leniency is consulted, so a driver that cannot be launched fails
+/// `status` outright whatever `filter.lfs.required` says. Nothing then commits,
+/// the index is never rewritten, and the same entry is re-read on the next pass
+/// forever. DW-206 measured that state in the field: 90 430 identical log lines,
+/// unclearable by restart or reinstall.
+///
+/// [`crate::engine::Engine::open`] registers `std::env::current_exe()`, which is
+/// the app in a desktop run and the daemon in a CLI one — both of which serve
+/// this. But "whatever executable linked the engine" has been wrong before:
+/// DW-121 is the record of the app binary being registered for two verbs it did
+/// not implement, silently, for months. A test harness, a benchmark, a future
+/// CLI — each is an executable that can link `Engine` without ever having heard
+/// of a filter, and under a `process` driver that mistake is no longer silent,
+/// it is fatal to the folder.
+///
+/// So the promise is verified before it is made: one handshake against a
+/// throwaway repository, once per engine. A binary that answers correctly gets
+/// the `process` key; anything else — wrong output, a crash, a hang, a GUI —
+/// gets the single-shot pair alone, which degrades to pointer text instead of
+/// wedging the folder.
+pub fn serves_process(program: &Path) -> bool {
+    use std::process::{Command, Stdio};
+
+    let Ok(probe) = tempfile::tempdir() else {
+        return false;
+    };
+    let Ok(mut child) = Command::new(program)
+        .arg("lfs")
+        .arg("filter-process")
+        .arg("--repo")
+        .arg(probe.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // Never inherited: a probe that printed to keeper's stderr would put a
+        // filter's diagnostics in the app log every time an engine opens.
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    // The conversation runs on a thread so a binary that never answers costs a
+    // timeout rather than the process it was spawned from.
+    let (Some(mut stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        let _ = child.kill();
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let spoken = (|| -> Result<bool> {
+            pktline::write_line(&mut stdin, "git-filter-client")?;
+            pktline::write_line(&mut stdin, "version=2")?;
+            pktline::write_flush(&mut stdin)?;
+            stdin
+                .flush()
+                .map_err(|err| SyncError::Git(format!("could not probe the filter: {err}")))?;
+            let hello = pktline::read_text_list(&mut stdout)?.unwrap_or_default();
+            if !hello.iter().any(|line| line == "git-filter-server")
+                || !hello.iter().any(|line| line == "version=2")
+            {
+                return Ok(false);
+            }
+            // The client's own capability offer. The server reads this list
+            // before it answers with its own, exactly as git does, so a probe
+            // that skips it hangs the handshake and reads nothing.
+            pktline::write_line(&mut stdin, "capability=clean")?;
+            pktline::write_line(&mut stdin, "capability=smudge")?;
+            pktline::write_flush(&mut stdin)?;
+            stdin
+                .flush()
+                .map_err(|err| SyncError::Git(format!("could not probe the filter: {err}")))?;
+            let capabilities = pktline::read_text_list(&mut stdout)?.unwrap_or_default();
+            // Dropping stdin ends the child's loop cleanly, which is the same
+            // shutdown git performs.
+            drop(stdin);
+            Ok(capabilities.iter().any(|line| line == "capability=clean")
+                && capabilities.iter().any(|line| line == "capability=smudge"))
+        })();
+        let _ = tx.send(spoken.unwrap_or(false));
+    });
+
+    let answered = rx.recv_timeout(PROBE_TIMEOUT).unwrap_or(false);
+    // Unconditional: a child that answered has already been told to stop by the
+    // dropped stdin, and one that hung has to be stopped by us.
+    let _ = child.kill();
+    let _ = child.wait();
+    answered
 }
 
 /// Parse the filter invocation out of a raw argument list, if it is one.
@@ -209,15 +917,27 @@ fn clean(
 /// The accepted shape is what that writer produces:
 ///
 /// ```text
-/// <exe> lfs clean  --repo <dir> [<path>]
-/// <exe> lfs smudge --repo <dir> [<path>]
+/// <exe> lfs clean          --repo <dir> [<path>]
+/// <exe> lfs smudge         --repo <dir> [<path>]
+/// <exe> lfs filter-process --repo <dir>
 /// ```
 ///
 /// `<path>` is git's `%f`, advisory only: the object is addressed by digest, and
 /// the path is not consulted for anything. It is accepted so the registered
 /// command line can keep carrying it, because it is what makes a failing filter
 /// legible in a `GIT_TRACE` log.
-pub fn parse_args<I, S>(args: I) -> Option<(Direction, std::path::PathBuf)>
+///
+/// # Why an unrecognised `lfs` verb is not `None`
+///
+/// `None` means "ordinary launch", and for the app binary that means *show the
+/// GUI*. A GUI that opens on `lfs filter-process` writes nothing to stdout and
+/// exits when the single-instance guard sees the app already running — which
+/// git, under `required=false`, records as a successful filter that produced
+/// zero bytes. That is the exact mechanism that emptied 122 files, reached by
+/// running an older binary against a config a newer one wrote. So anything
+/// beginning with `lfs` is claimed here, and an unknown verb is reported as
+/// [`Invocation::Unsupported`] for the caller to fail loudly on.
+pub fn parse_args<I, S>(args: I) -> Option<Invocation>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -226,10 +946,13 @@ where
     if args.next().as_deref() != Some("lfs") {
         return None;
     }
-    let direction = match args.next().as_deref() {
-        Some("clean") => Direction::Clean,
-        Some("smudge") => Direction::Smudge,
-        _ => return None,
+    let verb = args.next();
+    let direction = match verb.as_deref() {
+        Some("clean") => Some(Direction::Clean),
+        Some("smudge") => Some(Direction::Smudge),
+        Some("filter-process") => None,
+        // `lfs` alone, or a verb from a future build. Claimed, not run.
+        _ => return Some(Invocation::Unsupported),
     };
     // `--repo` is required and may be followed by the advisory path in either
     // order, so the list is scanned rather than read positionally.
@@ -246,8 +969,16 @@ where
             _ => {}
         }
     }
-    repo.filter(|value| !value.is_empty())
-        .map(|value| (direction, std::path::PathBuf::from(value)))
+    // A direction with no repository is not actionable — the object store
+    // location is the one thing a filter cannot guess — but it is still an
+    // `lfs` invocation, so it is refused rather than mistaken for a launch.
+    let Some(repo) = repo.filter(|value| !value.is_empty()).map(PathBuf::from) else {
+        return Some(Invocation::Unsupported);
+    };
+    Some(match direction {
+        Some(direction) => Invocation::Single { direction, repo },
+        None => Invocation::Process { repo },
+    })
 }
 
 #[cfg(test)]
@@ -281,24 +1012,37 @@ mod tests {
     /// does nothing, which is the defect this module exists to end.
     #[test]
     fn the_registered_command_line_is_recognised() {
-        let (direction, repo) =
-            parse_args(["lfs", "clean", "--repo", "/w/folder", "notes/a.bin"]).expect("a clean");
-        assert_eq!(direction, Direction::Clean);
-        assert_eq!(repo, Path::new("/w/folder"));
-
-        let (direction, repo) =
-            parse_args(["lfs", "smudge", "--repo", "/w/folder", "notes/a.bin"]).expect("a smudge");
-        assert_eq!(direction, Direction::Smudge);
-        assert_eq!(repo, Path::new("/w/folder"));
+        assert_eq!(
+            parse_args(["lfs", "clean", "--repo", "/w/folder", "notes/a.bin"]).expect("a clean"),
+            Invocation::Single {
+                direction: Direction::Clean,
+                repo: PathBuf::from("/w/folder")
+            }
+        );
+        assert_eq!(
+            parse_args(["lfs", "smudge", "--repo", "/w/folder", "notes/a.bin"]).expect("a smudge"),
+            Invocation::Single {
+                direction: Direction::Smudge,
+                repo: PathBuf::from("/w/folder")
+            }
+        );
+        // The process form carries no `%f`: the protocol names each path itself.
+        assert_eq!(
+            parse_args(["lfs", "filter-process", "--repo", "/w/folder"]).expect("a process"),
+            Invocation::Process {
+                repo: PathBuf::from("/w/folder")
+            }
+        );
 
         // git may hand `%f` over with no path when it has none to give, and a
         // `--repo=` spelling is the same request.
         assert!(parse_args(["lfs", "clean", "--repo", "/w"]).is_some());
         assert_eq!(
-            parse_args(["lfs", "clean", "--repo=/w"])
-                .expect("joined form")
-                .1,
-            Path::new("/w")
+            parse_args(["lfs", "clean", "--repo=/w"]).expect("joined form"),
+            Invocation::Single {
+                direction: Direction::Clean,
+                repo: PathBuf::from("/w")
+            }
         );
     }
 
@@ -310,18 +1054,333 @@ mod tests {
             // What Finder and older macOS actually pass.
             vec!["-psn_0_774République"],
             vec!["--flag"],
-            // The right verb, no direction.
-            vec!["lfs"],
-            vec!["lfs", "explode", "--repo", "/w"],
-            // A direction with no repository is not actionable: the object store
-            // location is the one thing the filter cannot guess.
-            vec!["lfs", "clean"],
-            vec!["lfs", "clean", "--repo", ""],
             // Not the first argument.
             vec!["serve", "lfs", "clean", "--repo", "/w"],
         ] {
             assert!(parse_args(argv.clone()).is_none(), "{argv:?}");
         }
+    }
+
+    /// The regression that emptied 122 files, in miniature: an `lfs` argv this
+    /// build cannot serve must be *claimed and refused*, never mistaken for a
+    /// launch. Returning `None` here sends the app binary into its GUI path,
+    /// where it writes nothing to stdout and exits — which git, under
+    /// `required=false`, records as a filter that succeeded with zero bytes.
+    #[test]
+    fn an_lfs_verb_this_build_cannot_serve_is_claimed_not_ignored() {
+        for argv in [
+            // The right verb, no direction.
+            vec!["lfs"],
+            // A verb from some future build, reached by running an older binary
+            // against a config a newer one wrote.
+            vec!["lfs", "explode", "--repo", "/w"],
+            vec!["lfs", "filter-process-v3", "--repo", "/w"],
+            // A direction with no repository is not actionable: the object store
+            // location is the one thing the filter cannot guess.
+            vec!["lfs", "clean"],
+            vec!["lfs", "clean", "--repo", ""],
+            vec!["lfs", "filter-process"],
+        ] {
+            assert_eq!(
+                parse_args(argv.clone()),
+                Some(Invocation::Unsupported),
+                "{argv:?}"
+            );
+        }
+    }
+
+    /// One request as git would send it: metadata list, then the content list.
+    fn request(command: &str, pathname: &str, content: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        pktline::write_line(&mut wire, &format!("command={command}")).expect("command");
+        pktline::write_line(&mut wire, &format!("pathname={pathname}")).expect("pathname");
+        pktline::write_flush(&mut wire).expect("flush");
+        for chunk in content.chunks(pktline::MAX_DATA) {
+            pktline::write_data(&mut wire, chunk).expect("content");
+        }
+        pktline::write_flush(&mut wire).expect("flush");
+        wire
+    }
+
+    /// The handshake git opens with, up to and including its capability offer.
+    fn hello() -> Vec<u8> {
+        let mut wire = Vec::new();
+        pktline::write_line(&mut wire, "git-filter-client").expect("client");
+        pktline::write_line(&mut wire, "version=2").expect("version");
+        pktline::write_flush(&mut wire).expect("flush");
+        for capability in ["capability=clean", "capability=smudge", "capability=delay"] {
+            pktline::write_line(&mut wire, capability).expect("capability");
+        }
+        pktline::write_flush(&mut wire).expect("flush");
+        wire
+    }
+
+    /// One served path, as it comes back off the wire.
+    #[derive(Debug)]
+    struct Answer {
+        status: Vec<String>,
+        body: Vec<u8>,
+        /// The trailing list, where a mid-stream failure is reported.
+        trailer: Vec<String>,
+    }
+
+    /// Read the server side of a whole conversation back.
+    fn replies(wire: &[u8]) -> Vec<Answer> {
+        let mut wire = wire;
+        // The two handshake lists.
+        pktline::read_text_list(&mut wire).expect("server hello");
+        pktline::read_text_list(&mut wire).expect("server capabilities");
+
+        let mut answers = Vec::new();
+        while let Some(status) = pktline::read_text_list(&mut wire).expect("status") {
+            if status.is_empty() {
+                break;
+            }
+            let mut body = Vec::new();
+            // An error status is sent *instead* of a body, so there is nothing
+            // to read before the next command's status list.
+            if status.iter().all(|line| line != "status=error") {
+                loop {
+                    match pktline::read(&mut wire).expect("body") {
+                        Packet::Data(bytes) => body.extend_from_slice(&bytes),
+                        Packet::Flush => break,
+                        Packet::Eof => break,
+                    }
+                }
+            }
+            let trailer = if status.iter().any(|line| line == "status=error") {
+                Vec::new()
+            } else {
+                pktline::read_text_list(&mut wire)
+                    .expect("trailer")
+                    .unwrap_or_default()
+            };
+            answers.push(Answer {
+                status,
+                body,
+                trailer,
+            });
+        }
+        answers
+    }
+
+    /// Version 2, and only the capabilities this filter actually honours —
+    /// `delay` is offered by git and deliberately not taken.
+    #[test]
+    fn the_handshake_agrees_on_version_two_and_refuses_delay() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut out = Vec::new();
+        run_process(dir.path(), &mut hello().as_slice(), &mut out).expect("handshake");
+
+        let mut wire = out.as_slice();
+        assert_eq!(
+            pktline::read_text_list(&mut wire).expect("hello"),
+            Some(vec!["git-filter-server".to_owned(), "version=2".to_owned()])
+        );
+        assert_eq!(
+            pktline::read_text_list(&mut wire).expect("capabilities"),
+            Some(vec![
+                "capability=clean".to_owned(),
+                "capability=smudge".to_owned()
+            ])
+        );
+    }
+
+    /// The regression this whole module was rewritten for. An object the store
+    /// does not hold must come back as its **pointer** — never as the zero
+    /// bytes a dying `git-lfs filter-process` leaves behind, and never as a
+    /// failure that takes the rest of the checkout with it.
+    #[test]
+    fn a_smudge_without_the_object_answers_with_the_pointer_not_emptiness() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        let pointer = Pointer::new(
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
+            4,
+        )
+        .render();
+
+        let mut script = hello();
+        script.extend(request("smudge", "a/big.mov", pointer.as_bytes()));
+        let mut out = Vec::new();
+        run_process(dir.path(), &mut script.as_slice(), &mut out).expect("served");
+
+        let answers = replies(&out);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].status, vec!["status=success".to_owned()]);
+        assert_eq!(answers[0].body, pointer.as_bytes());
+        assert!(!answers[0].body.is_empty(), "never zero bytes");
+    }
+
+    #[test]
+    fn a_smudge_serves_the_object_the_store_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        // Several packets' worth, so the framing loop is exercised.
+        let payload = vec![7u8; pktline::MAX_DATA * 2 + 11];
+        let (oid, size) = store
+            .insert_streaming(payload.as_slice())
+            .expect("insert the object");
+        let pointer = Pointer::new(oid, size).render();
+
+        let mut script = hello();
+        script.extend(request("smudge", "a/big.mov", pointer.as_bytes()));
+        let mut out = Vec::new();
+        run_process(dir.path(), &mut script.as_slice(), &mut out).expect("served");
+
+        let answers = replies(&out);
+        assert_eq!(answers[0].status, vec!["status=success".to_owned()]);
+        assert_eq!(answers[0].body, payload);
+        assert!(answers[0].trailer.is_empty(), "no mid-stream failure");
+    }
+
+    /// A writer that answers "how many times did this process have to ask the
+    /// kernel", which is the question behind the energy figure.
+    struct CountingWriter {
+        inner: Vec<u8>,
+        writes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.inner.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The object crosses the pipe in buffers, not in `io::copy`'s 8 KiB
+    /// mouthfuls.
+    ///
+    /// Every one of those is a syscall and a wake for git on the other end, and
+    /// the writer it hands us — `Stdout`, a `LineWriter` — coalesces none of
+    /// them, because binary content has newlines all through it and a
+    /// `LineWriter` flushes to the last one in every write it is given. A
+    /// folder syncing all day was measured at 8 200 context switches a second
+    /// against 3% CPU; this is where they were going.
+    #[test]
+    fn a_served_object_reaches_the_pipe_in_buffers_not_in_mouthfuls() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        // Comfortably larger than the output buffer, so the ratio is the thing
+        // being measured rather than a rounding artefact.
+        let payload = vec![9u8; OUTPUT_BUFFER_BYTES * 4];
+        let (oid, size) = store
+            .insert_streaming(payload.as_slice())
+            .expect("insert the object");
+        let pointer = Pointer::new(oid, size).render();
+
+        let mut script = hello();
+        script.extend(request("smudge", "a/big.mov", pointer.as_bytes()));
+        let mut out = CountingWriter {
+            inner: Vec::new(),
+            writes: 0,
+        };
+        run_process(dir.path(), &mut script.as_slice(), &mut out).expect("served");
+
+        // What the payload alone would cost unbuffered, at `io::copy`'s buffer.
+        let unbuffered = payload.len() / 8_192;
+        assert!(
+            out.writes < unbuffered / 4,
+            "expected buffering to cut the writes well below {unbuffered}, got {}",
+            out.writes
+        );
+
+        // And the bytes are still all there, in order — a buffer that lost or
+        // reordered content would be a far worse bargain than the syscalls.
+        let answers = replies(&out.inner);
+        assert_eq!(answers[0].status, vec!["status=success".to_owned()]);
+        assert_eq!(answers[0].body, payload);
+    }
+
+    #[test]
+    fn a_clean_over_the_protocol_stores_the_object_and_answers_with_its_pointer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        let payload = vec![3u8; pktline::MAX_DATA + 5];
+
+        let mut script = hello();
+        script.extend(request("clean", "a/big.mov", &payload));
+        let mut out = Vec::new();
+        run_process(dir.path(), &mut script.as_slice(), &mut out).expect("served");
+
+        let answers = replies(&out);
+        assert_eq!(answers[0].status, vec!["status=success".to_owned()]);
+        let pointer = Pointer::parse(&answers[0].body).expect("a pointer came back");
+        assert_eq!(pointer.size, payload.len() as u64);
+        assert!(
+            store.contains(&pointer.oid, pointer.size),
+            "the object is in the store before the pointer naming it was emitted"
+        );
+    }
+
+    /// The property that makes `required=false` safe again: one path's refusal
+    /// is one path's refusal. git's own failure mode — "is not available
+    /// anymore although not all paths have been filtered" — is a *process* that
+    /// died, and every path after it is what gets emptied. So the test that
+    /// matters is not that the bad path fails, it is that the next one does not.
+    #[test]
+    fn a_refused_path_does_not_take_the_rest_of_the_checkout_with_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        let payload = b"the next path still works".to_vec();
+        let (oid, size) = store
+            .insert_streaming(payload.as_slice())
+            .expect("insert the object");
+        let good = Pointer::new(oid, size).render();
+
+        let mut script = hello();
+        // A command we never advertised — the shape of an argv a future git
+        // sends and this build does not implement.
+        script.extend(request("transmogrify", "a/one.mov", b"whatever"));
+        script.extend(request("smudge", "a/two.mov", good.as_bytes()));
+        let mut out = Vec::new();
+        run_process(dir.path(), &mut script.as_slice(), &mut out).expect("the process survived");
+
+        let answers = replies(&out);
+        assert_eq!(answers.len(), 2, "both paths were answered");
+        assert_eq!(answers[0].status, vec!["status=error".to_owned()]);
+        assert_eq!(answers[1].status, vec!["status=success".to_owned()]);
+        assert_eq!(answers[1].body, payload, "the good path is intact");
+    }
+
+    /// A smudge stops reading the moment it has the pointer, which leaves the
+    /// rest of that request's packets in the pipe. Anything left there is read
+    /// as the *next* command's metadata and the conversation never recovers —
+    /// so the drain is load-bearing, and this proves it by serving a second
+    /// path after a request that carried trailing bytes.
+    #[test]
+    fn a_request_the_filter_stopped_reading_is_still_drained() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        let (oid, size) = store
+            .insert_streaming(b"served".as_slice())
+            .expect("insert");
+        let pointer = Pointer::new(oid, size).render();
+
+        // A pointer followed by bytes the smudge will never look at.
+        let mut padded = pointer.as_bytes().to_vec();
+        padded.extend_from_slice(&vec![0u8; 5_000]);
+
+        let mut script = hello();
+        script.extend(request("smudge", "a/one.mov", &padded));
+        script.extend(request("smudge", "a/two.mov", pointer.as_bytes()));
+        let mut out = Vec::new();
+        run_process(dir.path(), &mut script.as_slice(), &mut out).expect("served");
+
+        let answers = replies(&out);
+        assert_eq!(answers.len(), 2, "the second command was still understood");
+        assert_eq!(answers[1].body, b"served");
     }
 
     #[test]
@@ -345,6 +1404,116 @@ mod tests {
         assert_eq!(
             std::fs::read(store.object_path(&pointer.oid)).expect("read back"),
             payload
+        );
+    }
+
+    /// A clean whose object is already stored writes nothing at all.
+    ///
+    /// This is the walk cost on a large folder: keeper stored the object when it
+    /// committed the pointer, and every later walk asks the same file the same
+    /// question. `insert_streaming` cannot answer without writing, because it
+    /// learns the digest by writing — so it copied the content into `tmp/` and
+    /// discovered afterwards that the object was there. Measured on the field
+    /// folder with the volume otherwise quiet: `tmp/` at 5.4 GB mid-walk,
+    /// growing 9.6 MB/s, which is ~42 minutes of writing per walk for content
+    /// that had not changed.
+    ///
+    /// The discriminator is `tmp/` made unwritable: the old path needs a temp
+    /// file there and fails, the new one never asks for one.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_whose_object_is_already_stored_writes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let payload = vec![7u8; 300_000];
+        let store = LfsStore::in_git_dir(repo.join(".git"));
+        store.ensure_layout().expect("layout");
+        let (oid, size) = store
+            .insert_streaming(payload.as_slice())
+            .expect("the object is stored, as it would be after a commit");
+        let before = stored_objects(&store);
+
+        // The worktree file git would have read, and a scratch directory that
+        // refuses to hold a copy of it.
+        std::fs::write(repo.join("clip.mov"), &payload).expect("worktree file");
+        std::fs::set_permissions(store.tmp_dir(), std::fs::Permissions::from_mode(0o500))
+            .expect("seal tmp");
+
+        let mut out = Vec::new();
+        let outcome = run_for_path(
+            repo,
+            Some(Path::new("clip.mov")),
+            Direction::Clean,
+            &mut payload.as_slice(),
+            &mut out,
+        );
+        std::fs::set_permissions(store.tmp_dir(), std::fs::Permissions::from_mode(0o700))
+            .expect("unseal tmp");
+        outcome.expect("a clean of stored content must not need scratch space");
+
+        let pointer = Pointer::parse(&out).expect("the output is a pointer");
+        assert_eq!((pointer.oid.as_str(), pointer.size), (oid.as_str(), size));
+        assert_eq!(
+            stored_objects(&store),
+            before,
+            "nothing new should have been written"
+        );
+    }
+
+    /// New content is read back from the worktree file and stored under the
+    /// digest the stream had.
+    #[test]
+    fn a_clean_of_new_content_stores_it_from_the_file_git_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let payload = vec![3u8; 300_000];
+        std::fs::write(repo.join("fresh.mov"), &payload).expect("worktree file");
+
+        let mut out = Vec::new();
+        run_for_path(
+            repo,
+            Some(Path::new("fresh.mov")),
+            Direction::Clean,
+            &mut payload.as_slice(),
+            &mut out,
+        )
+        .expect("clean");
+
+        let pointer = Pointer::parse(&out).expect("the output is a pointer");
+        let store = LfsStore::in_git_dir(repo.join(".git"));
+        assert!(
+            store.contains(&pointer.oid, pointer.size),
+            "a pointer may never name an object the store does not hold"
+        );
+        assert_eq!(pointer.size, payload.len() as u64);
+    }
+
+    /// And when there is no file to read back, the streaming insert is still
+    /// what answers — the invariant is that a pointer never names an object the
+    /// store does not hold, whatever the invocation could not tell us.
+    #[test]
+    fn a_clean_with_no_file_to_read_back_still_stores_from_the_stream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let payload = vec![5u8; 300_000];
+
+        let mut out = Vec::new();
+        run_for_path(
+            repo,
+            Some(Path::new("gone.mov")),
+            Direction::Clean,
+            &mut payload.as_slice(),
+            &mut out,
+        )
+        .expect("a missing worktree file is not a reason to refuse");
+
+        let pointer = Pointer::parse(&out).expect("the output is a pointer");
+        let store = LfsStore::in_git_dir(repo.join(".git"));
+        assert!(
+            store.contains(&pointer.oid, pointer.size),
+            "the stream was the only source, so it had to be written"
         );
     }
 

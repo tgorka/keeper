@@ -1,12 +1,17 @@
 //! Regression: `gix::status` MUST accept a POINTER blob paired with the
 //! worktree file's stat data as "unchanged".
 //!
-//! This is the hinge the whole LFS design turns on, and it is why keeper needs
-//! no `filter.lfs.process` subprocess. Real git+LFS works exactly
-//! this way: the blob is a ~130-byte pointer, the worktree holds gigabytes, and
-//! `git status` is fast and clean because the index caches the WORKTREE's stat
-//! and the stat matches. If gix honours the same shortcut we need no filter
-//! subprocess; if it re-hashes, every LFS file reads as permanently modified.
+//! This is the hinge the whole LFS design turns on, and it is why keeper's own
+//! staging path invokes no filter. Real git+LFS works exactly this way: the
+//! blob is a ~130-byte pointer, the worktree holds gigabytes, and `git status`
+//! is fast and clean because the index caches the WORKTREE's stat and the stat
+//! matches. If gix honours the same shortcut keeper needs no filter on this
+//! path; if it re-hashes, every LFS file reads as permanently modified.
+//!
+//! It does **not** follow that no `filter.lfs.process` need be registered. That
+//! inference held for keeper's own git and was read as holding for every git,
+//! which let a globally-installed git-lfs answer for keeper's repositories
+//! instead — see `keeper_sync::lfs::filter` for what that cost (DW-140).
 use gix::index::{entry::Flags, entry::Mode, entry::Stat, State};
 use keeper_sync::git;
 use keeper_sync::lfs::pointer::Pointer;

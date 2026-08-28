@@ -6,6 +6,17 @@ vi.mock("@/lib/ipc/client", () => ({
   recordingPathPreview: vi.fn(),
   recordingSettingsGet: vi.fn(),
   recordingSettingsSet: vi.fn(),
+  // Story 46.10: the head is a PROFILE write, so the card reaches the same
+  // `sync_profile_save` the folder form uses — through `@/lib/stores/sync`,
+  // which reads the whole command surface of that store off this module.
+  syncProfiles: vi.fn(),
+  syncProfileSave: vi.fn(),
+  syncProfileRemove: vi.fn(),
+  syncProfileSetEnabled: vi.fn(),
+  syncStatuses: vi.fn(),
+  syncFolderNow: vi.fn(),
+  syncRescan: vi.fn(),
+  syncVerify: vi.fn(),
 }));
 
 // The OS-native directory picker (the export-dialog mock pattern).
@@ -24,35 +35,57 @@ import {
   DESTINATION_NEXT_SESSION_NOTE,
   DESTINATION_PATH_TESTID,
   DESTINATION_PROFILE_SELECT_TESTID,
+  DESTINATION_SUBFOLDER_CONSEQUENCE_TESTID,
+  DESTINATION_SUBFOLDER_FAULT_TESTID,
+  DESTINATION_SUBFOLDER_SAVE_TESTID,
+  DESTINATION_SUBFOLDER_TRAVELS_TESTID,
   DESTINATION_SYNCED_NOTE_TESTID,
   DESTINATION_TEMPLATE_FAULT_TESTID,
+  DESTINATION_TEMPLATE_LOCAL_NOTE,
+  DESTINATION_TEMPLATE_LOCAL_TESTID,
   DESTINATION_TEMPLATE_PREVIEW_TESTID,
   DESTINATION_TEMPLATE_SAVE_TESTID,
   DESTINATION_TEMPLATE_TESTID,
+  DESTINATION_VOLUME_NOTE_TESTID,
+  destinationSubfolderConsequence,
+  destinationSubfolderTravelsNote,
   destinationSyncedNote,
+  destinationVolumeNote,
   RecordingDestinationControls,
 } from "@/components/recording/recording-destination-controls";
 import type {
   RecordingPathPreviewVm,
   RecordingProfileVm,
   RecordingSettingsVm,
+  SyncProfileVm,
 } from "@/lib/ipc/client";
 import {
   recordingDestinationProfiles,
   recordingPathPreview,
   recordingSettingsGet,
   recordingSettingsSet,
+  syncProfileSave,
+  syncProfiles,
+  syncStatuses,
 } from "@/lib/ipc/client";
 import { recordingMetaStore } from "@/lib/stores/recording-meta";
 import {
   RECORDING_PATH_TEMPLATE_DEFAULT,
   resetRecordingSettingsForTest,
 } from "@/lib/stores/recording-settings";
+import {
+  resetSyncStoreForTest,
+  SYNC_PROFILE_GONE,
+  SYNC_RECORDINGS_SUBFOLDER_LABEL,
+} from "@/lib/stores/sync";
 
 const mockGet = vi.mocked(recordingSettingsGet);
 const mockSet = vi.mocked(recordingSettingsSet);
 const mockPreview = vi.mocked(recordingPathPreview);
 const mockProfiles = vi.mocked(recordingDestinationProfiles);
+const mockSyncProfiles = vi.mocked(syncProfiles);
+const mockSyncSave = vi.mocked(syncProfileSave);
+const mockSyncStatuses = vi.mocked(syncStatuses);
 
 const DEFAULTS: RecordingSettingsVm = {
   segmentMb: 500,
@@ -61,6 +94,7 @@ const DEFAULTS: RecordingSettingsVm = {
   destinationKind: "folder",
   destinationProfileId: null,
   destinationProfileName: null,
+  destinationVolume: null,
   fps: 30,
   codec: "h264",
   scalePercent: 100,
@@ -69,11 +103,62 @@ const DEFAULTS: RecordingSettingsVm = {
 };
 
 /** Two recordings-flagged synced folders. `recordingsRoot` is Rust-resolved —
- * the card never composes one — so the fixture states it outright. */
+ * the card never composes one — so the fixture states it outright, and Story
+ * 46.10's `subfolder` is the head that root was joined FROM. `Attic backup`'s is
+ * two segments deep, which is valid today and always has been. */
 const PROFILES: RecordingProfileVm[] = [
-  { id: "tgdrive", name: "tgdrive", recordingsRoot: "/Users/alice/tgdrive/recordings" },
-  { id: "attic", name: "Attic backup", recordingsRoot: "/Volumes/Attic/keeper/recordings" },
+  {
+    id: "tgdrive",
+    name: "tgdrive",
+    recordingsRoot: "/Users/alice/tgdrive/recordings",
+    subfolder: "recordings",
+  },
+  {
+    id: "attic",
+    name: "Attic backup",
+    recordingsRoot: "/Volumes/Attic/keeper/recordings",
+    subfolder: "keeper/recordings",
+  },
 ];
+
+/**
+ * `tgdrive` as `sync_profiles` reports it — the row a head write has to re-send
+ * unchanged apart from one field (Story 46.10).
+ *
+ * Everything on it is load-bearing for that test: the pinned `settleMs` and the
+ * UNPINNED `pollIntervalMs` are the pair that proves the re-expression carries
+ * "keeper chooses" through as `null` rather than freezing it at today's default,
+ * and `notes: false` with `notesSubfolder: null` is the omission that must not
+ * turn into a clear.
+ */
+const STORED_TGDRIVE: SyncProfileVm = {
+  id: "tgdrive",
+  name: "tgdrive",
+  localPath: "/Users/alice/tgdrive",
+  remoteUrl: "git@example.com:alice/tgdrive.git",
+  branch: "main",
+  direction: "bidirectional",
+  lane: "main",
+  subpaths: [],
+  excludes: ["*.tmp"],
+  removable: false,
+  lfsMode: "materialize",
+  lfsThresholdBytes: 4 * 1024 * 1024,
+  settleMs: 7_000,
+  effectiveSettleMs: 7_000,
+  pollIntervalMs: null,
+  effectivePollIntervalMs: 15_000,
+  tags: ["laptop"],
+  commitSubjectTemplate: "",
+  authorOverride: null,
+  enabled: true,
+  notes: false,
+  notesSubfolder: null,
+  recordings: true,
+  recordingsSubfolder: "recordings",
+  sessions: false,
+  sessionsSubfolder: "60-sessions",
+};
 
 /** The settings VM Rust echoes once `tgdrive` is the destination: the kind
  * flips, the id and name are carried, and `destinationDir` is the RESOLVED
@@ -84,6 +169,20 @@ const SYNCED: RecordingSettingsVm = {
   destinationKind: "profile",
   destinationProfileId: "tgdrive",
   destinationProfileName: "tgdrive",
+};
+
+/** Story 41.7: the same synced destination, on the pendrive the field report is
+ * about. Rust re-scans the volume on every settings read, so the fixtures differ
+ * only in the state the card is handed. */
+const SYNCED_ON_ATTACHED_DRIVE: RecordingSettingsVm = {
+  ...SYNCED,
+  destinationDir: "/Volumes/merope/tgdrive/recordings",
+  destinationVolume: { name: "merope", state: "attached" },
+};
+
+const SYNCED_ON_DETACHED_DRIVE: RecordingSettingsVm = {
+  ...SYNCED_ON_ATTACHED_DRIVE,
+  destinationVolume: { name: "merope", state: "absent" },
 };
 
 /** What Rust renders for the default template with no session title (the
@@ -113,6 +212,20 @@ beforeEach(() => {
   mockProfiles.mockReset();
   // No flagged profile is the default world: today's card.
   mockProfiles.mockResolvedValue([]);
+  // The head's write path (Story 46.10) is `sync_profile_save`, reached through
+  // the sync store, whose mirror is a module singleton like every other one here.
+  resetSyncStoreForTest();
+  mockSyncProfiles.mockReset();
+  mockSyncProfiles.mockResolvedValue([STORED_TGDRIVE]);
+  mockSyncSave.mockReset();
+  mockSyncSave.mockImplementation((req) =>
+    Promise.resolve({
+      ...STORED_TGDRIVE,
+      recordingsSubfolder: req.recordingsSubfolder ?? STORED_TGDRIVE.recordingsSubfolder,
+    }),
+  );
+  mockSyncStatuses.mockReset();
+  mockSyncStatuses.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -528,6 +641,108 @@ describe("RecordingDestinationControls", () => {
     expect(mockSet).not.toHaveBeenCalled();
   });
 
+  it("says a synced destination is on removable media before Record is pressed", async () => {
+    // Matrix row "removable destination, attached". Nothing has failed and
+    // nothing has been asked; the card volunteers that this folder lives on a
+    // drive, which is the whole point of putting it here rather than in an error.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED_ON_ATTACHED_DRIVE);
+    render(<RecordingDestinationControls />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent(
+        destinationVolumeNote({ name: "merope", state: "attached" }),
+      ),
+    );
+    expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent("merope");
+    // The consequence sentence is a different fact and stays put beside it.
+    expect(screen.getByTestId(DESTINATION_SYNCED_NOTE_TESTID)).toHaveTextContent(
+      destinationSyncedNote("tgdrive"),
+    );
+  });
+
+  it("says the drive is not attached, unprompted, while still naming the chosen folder", async () => {
+    // Matrix row "removable destination, detached, card open". Rust does NOT
+    // degrade to the plain folder here, so the card must keep naming the synced
+    // root — and say why a recording would not start.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED_ON_DETACHED_DRIVE);
+    render(<RecordingDestinationControls />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent(
+        destinationVolumeNote({ name: "merope", state: "absent" }),
+      ),
+    );
+    expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent("isn't attached");
+    expect(screen.getByTestId(DESTINATION_PATH_TESTID)).toHaveTextContent(
+      "/Volumes/merope/tgdrive/recordings",
+    );
+    expect(screen.getByTestId(DESTINATION_PATH_TESTID)).not.toHaveTextContent(
+      "/Users/alice/Movies/keeper",
+    );
+    expect(mockSet).not.toHaveBeenCalled();
+  });
+
+  it("says nothing about drives for a synced folder that is not on removable media", async () => {
+    // Matrix row "non-removable profile": no removable wording ANYWHERE. A
+    // sentence about drives on an ordinary folder is noise that teaches people
+    // to stop reading this card.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED);
+    render(<RecordingDestinationControls />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_SYNCED_NOTE_TESTID)).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId(DESTINATION_VOLUME_NOTE_TESTID)).not.toBeInTheDocument();
+    expect(screen.queryByText(/removable/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/attached/i)).not.toBeInTheDocument();
+  });
+
+  it("describes an unnamed drive rather than inventing a name for it", async () => {
+    // A drive that has been out since launch cannot be named: its name lives in
+    // a marker on the drive. The card says so instead of slicing "merope" out of
+    // the mountpoint, which is the guess Story 27.3 exists to forbid.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue({
+      ...SYNCED_ON_DETACHED_DRIVE,
+      destinationVolume: { name: null, state: "absent" },
+    });
+    render(<RecordingDestinationControls />);
+
+    const note = await screen.findByTestId(DESTINATION_VOLUME_NOTE_TESTID);
+    expect(note).toHaveTextContent("This folder's drive isn't attached");
+    expect(note).not.toHaveTextContent("merope");
+  });
+
+  it("stops saying the drive is missing once it comes back", async () => {
+    // Matrix row "volume returns": the card is a live read of a re-scanned
+    // state, not a latch that something has to clear.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED_ON_DETACHED_DRIVE);
+    const { unmount } = render(<RecordingDestinationControls />);
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent(
+        "isn't attached",
+      ),
+    );
+
+    unmount();
+    resetRecordingSettingsForTest();
+    mockGet.mockResolvedValue(SYNCED_ON_ATTACHED_DRIVE);
+    render(<RecordingDestinationControls />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).toHaveTextContent(
+        destinationVolumeNote({ name: "merope", state: "attached" }),
+      ),
+    );
+    expect(screen.getByTestId(DESTINATION_VOLUME_NOTE_TESTID)).not.toHaveTextContent(
+      "isn't attached",
+    );
+  });
+
   it("switches the destination between two synced folders through the picker", async () => {
     mockProfiles.mockResolvedValue(PROFILES);
     mockGet.mockResolvedValue(SYNCED);
@@ -679,5 +894,242 @@ describe("RecordingDestinationControls", () => {
     expect(screen.getByTestId(DESTINATION_SYNCED_NOTE_TESTID)).toHaveTextContent(
       destinationSyncedNote("tgdrive"),
     );
+  });
+
+  // --- Story 46.10: the whole path, in one place ---------------------------
+
+  it("shows the head and the tail as two settings and says which one travels", async () => {
+    // The owner's report was "I cannot choose the subfolder". They could — in
+    // Settings → Sync, three screens from where recording is configured. Both
+    // halves are now here, and the card's job is that nobody mistakes one for the
+    // other: the head belongs to the folder and reaches every machine syncing it,
+    // the tail belongs to this Mac.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED);
+    render(<RecordingDestinationControls />);
+
+    const headField = await screen.findByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL);
+    await waitFor(() => expect(headField).toHaveValue("recordings"));
+    // Two fields, not one merged box, and the tail is untouched by the head.
+    expect(screen.getByTestId(DESTINATION_TEMPLATE_TESTID)).toHaveValue(
+      RECORDING_PATH_TEMPLATE_DEFAULT,
+    );
+    expect(headField).not.toBe(screen.getByTestId(DESTINATION_TEMPLATE_TESTID));
+
+    // The head travels, and a nested one is allowed — which is most of what was
+    // actually asked for, so the card states it rather than leaving it to be
+    // discovered by a refused save that never comes.
+    expect(screen.getByTestId(DESTINATION_SUBFOLDER_TRAVELS_TESTID)).toHaveTextContent(
+      destinationSubfolderTravelsNote("tgdrive"),
+    );
+    expect(screen.getByTestId(DESTINATION_SUBFOLDER_TRAVELS_TESTID)).toHaveTextContent(
+      "40-media/recordings",
+    );
+    // …and the tail does not travel, said in the same breath.
+    expect(screen.getByTestId(DESTINATION_TEMPLATE_LOCAL_TESTID)).toHaveTextContent(
+      DESTINATION_TEMPLATE_LOCAL_NOTE,
+    );
+    // Nothing has been written by merely looking at the card.
+    expect(mockSyncSave).not.toHaveBeenCalled();
+    expect(mockSet).not.toHaveBeenCalled();
+  });
+
+  it("seeds the head from the folder in force and follows the picker to another one", async () => {
+    // Two folders with different heads. Switching folders must retype the box:
+    // the head is a fact about the folder, not about the card.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED);
+    render(<RecordingDestinationControls />);
+    const headField = await screen.findByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL);
+    await waitFor(() => expect(headField).toHaveValue("recordings"));
+
+    // A typed-but-unsaved head, then a different folder: the typed text is about
+    // the folder that just left the screen, so it must not be offered as an edit
+    // of the new one.
+    fireEvent.change(headField, { target: { value: "typed-for-tgdrive" } });
+    expect(screen.getByTestId(DESTINATION_SUBFOLDER_CONSEQUENCE_TESTID)).toBeInTheDocument();
+
+    mockSet.mockResolvedValue({
+      ...SYNCED,
+      destinationDir: "/Volumes/Attic/keeper/recordings",
+      destinationProfileId: "attic",
+      destinationProfileName: "Attic backup",
+    });
+    // The Radix select opens by keyboard here: jsdom has no real pointer stack.
+    fireEvent.keyDown(screen.getByTestId(DESTINATION_PROFILE_SELECT_TESTID), { key: "Enter" });
+    fireEvent.keyDown(await screen.findByRole("option", { name: "Attic backup" }), {
+      key: "Enter",
+    });
+
+    await waitFor(() => expect(headField).toHaveValue("keeper/recordings"));
+    expect(screen.queryByTestId(DESTINATION_SUBFOLDER_CONSEQUENCE_TESTID)).not.toBeInTheDocument();
+  });
+
+  it("says what a head change costs BEFORE it is written, naming the folder left behind", async () => {
+    // The most important sentence in this story. Changing the subfolder moves no
+    // files: everything already recorded stays under the old head, drops out of
+    // the recordings browser at the next rebuild, and its note stubs' embeds stop
+    // resolving. That has to be readable on the way to the button.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED);
+    render(<RecordingDestinationControls />);
+    const headField = await screen.findByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL);
+    await waitFor(() => expect(headField).toHaveValue("recordings"));
+
+    // Resting: no consequence, because nothing is pending.
+    expect(screen.queryByTestId(DESTINATION_SUBFOLDER_CONSEQUENCE_TESTID)).not.toBeInTheDocument();
+
+    fireEvent.change(headField, { target: { value: "40-media/recordings" } });
+
+    // Present from the first keystroke, naming the OLD head — the place the
+    // orphaned sessions can actually be found — and BEFORE any write.
+    expect(screen.getByTestId(DESTINATION_SUBFOLDER_CONSEQUENCE_TESTID)).toHaveTextContent(
+      destinationSubfolderConsequence("recordings"),
+    );
+    expect(mockSyncSave).not.toHaveBeenCalled();
+
+    // Typing it back is not a change, so the sentence goes away rather than
+    // latching until something clears it.
+    fireEvent.change(headField, { target: { value: "recordings" } });
+    expect(screen.queryByTestId(DESTINATION_SUBFOLDER_CONSEQUENCE_TESTID)).not.toBeInTheDocument();
+  });
+
+  it("writes the head through the profile writer, re-sending everything else as stored", async () => {
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED);
+    render(<RecordingDestinationControls />);
+    const headField = await screen.findByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL);
+    await waitFor(() => expect(headField).toHaveValue("recordings"));
+
+    fireEvent.change(headField, { target: { value: "40-media/recordings" } });
+    // Rust's answer once it has stored the new head, and the resolved root it
+    // moves with it.
+    mockSyncProfiles.mockResolvedValue([
+      { ...STORED_TGDRIVE, recordingsSubfolder: "40-media/recordings" },
+    ]);
+    mockProfiles.mockResolvedValue([
+      {
+        ...PROFILES[0],
+        recordingsRoot: "/Users/alice/tgdrive/40-media/recordings",
+        subfolder: "40-media/recordings",
+      },
+      PROFILES[1],
+    ]);
+    mockGet.mockResolvedValue({
+      ...SYNCED,
+      destinationDir: "/Users/alice/tgdrive/40-media/recordings",
+    });
+    fireEvent.click(screen.getByTestId(DESTINATION_SUBFOLDER_SAVE_TESTID));
+
+    // ONE writer: `sync_profile_save`, the same command the folder form calls.
+    // Every field is the stored one, so nothing this card never showed is
+    // clobbered — including the UNPINNED cadence, which stays `null` ("keeper
+    // chooses") rather than being frozen at today's number.
+    await waitFor(() =>
+      expect(mockSyncSave).toHaveBeenCalledWith({
+        id: "tgdrive",
+        name: "tgdrive",
+        localPath: "/Users/alice/tgdrive",
+        remoteUrl: "git@example.com:alice/tgdrive.git",
+        branch: "main",
+        direction: "bidirectional",
+        lane: "main",
+        subpaths: [],
+        excludes: ["*.tmp"],
+        removable: false,
+        lfsMode: "materialize",
+        lfsThresholdBytes: 4 * 1024 * 1024,
+        settleMs: 7_000,
+        pollIntervalMs: null,
+        tags: ["laptop"],
+        authorOverride: null,
+        commitSubjectTemplate: "",
+        notes: false,
+        notesSubfolder: null,
+        recordings: true,
+        recordingsSubfolder: "40-media/recordings",
+        sessions: false,
+        sessionsSubfolder: "60-sessions",
+      }),
+    );
+    // A profile write, not a settings write: nothing about the recording settings
+    // moved, so `recording_settings_set` must not have been called at all.
+    expect(mockSet).not.toHaveBeenCalled();
+
+    // Both lines the head composes are re-read, so the card stops printing the
+    // path it just stopped using.
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_PATH_TESTID)).toHaveTextContent(
+        "/Users/alice/tgdrive/40-media/recordings",
+      ),
+    );
+    await waitFor(() => expect(headField).toHaveValue("40-media/recordings"));
+    // The change landed, so the consequence has nothing left to warn about.
+    expect(screen.queryByTestId(DESTINATION_SUBFOLDER_CONSEQUENCE_TESTID)).not.toBeInTheDocument();
+  });
+
+  it("prints the validator's refusal beside the head and keeps the typed text", async () => {
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED);
+    render(<RecordingDestinationControls />);
+    const headField = await screen.findByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL);
+    await waitFor(() => expect(headField).toHaveValue("recordings"));
+
+    // `RecordingsConfig::validate`'s own sentence for an escaping head, verbatim.
+    const reason = "recordings subfolder must not escape the profile folder: ../elsewhere";
+    mockSyncSave.mockRejectedValue({ code: "internal", message: reason, retriable: false });
+    fireEvent.change(headField, { target: { value: "../elsewhere" } });
+    fireEvent.click(screen.getByTestId(DESTINATION_SUBFOLDER_SAVE_TESTID));
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_SUBFOLDER_FAULT_TESTID)).toHaveTextContent(reason),
+    );
+    // The refused text stays, so it can be corrected rather than retyped, and it
+    // is NOT printed in the template's fault slot — two writes, two verdicts.
+    expect(headField).toHaveValue("../elsewhere");
+    expect(screen.queryByTestId(DESTINATION_TEMPLATE_FAULT_TESTID)).not.toBeInTheDocument();
+
+    // A refusal is a verdict on the text, so editing it withdraws the verdict.
+    fireEvent.change(headField, { target: { value: "40-media" } });
+    expect(screen.queryByTestId(DESTINATION_SUBFOLDER_FAULT_TESTID)).not.toBeInTheDocument();
+  });
+
+  it("says the folder is gone rather than writing into a profile that vanished", async () => {
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(SYNCED);
+    render(<RecordingDestinationControls />);
+    const headField = await screen.findByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL);
+    await waitFor(() => expect(headField).toHaveValue("recordings"));
+
+    // Removed from Settings → Sync between the read that showed it and this write.
+    mockSyncProfiles.mockResolvedValue([]);
+    fireEvent.change(headField, { target: { value: "40-media" } });
+    fireEvent.click(screen.getByTestId(DESTINATION_SUBFOLDER_SAVE_TESTID));
+
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_SUBFOLDER_FAULT_TESTID)).toHaveTextContent(
+        SYNC_PROFILE_GONE,
+      ),
+    );
+    // Nothing was sent: a profile that is not there is not one to re-express.
+    expect(mockSyncSave).not.toHaveBeenCalled();
+  });
+
+  it("offers no head at all for a plain folder, which has no profile to carry one", async () => {
+    // A plain destination has one part, not two — and nothing about it travels, so
+    // neither half of the pair's copy belongs on the card either.
+    mockProfiles.mockResolvedValue(PROFILES);
+    mockGet.mockResolvedValue(DEFAULTS);
+    render(<RecordingDestinationControls />);
+    await waitFor(() =>
+      expect(screen.getByTestId(DESTINATION_PATH_TESTID)).toHaveTextContent(
+        "/Users/alice/Movies/keeper",
+      ),
+    );
+
+    expect(screen.queryByLabelText(SYNC_RECORDINGS_SUBFOLDER_LABEL)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(DESTINATION_SUBFOLDER_SAVE_TESTID)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(DESTINATION_SUBFOLDER_TRAVELS_TESTID)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(DESTINATION_TEMPLATE_LOCAL_TESTID)).not.toBeInTheDocument();
   });
 });
