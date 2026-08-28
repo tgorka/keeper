@@ -4510,6 +4510,24 @@ impl Engine {
         self.with_db(|conn| db::outstanding_count(conn, &profile.id, WorkKind::LFS_UPLOAD))
     }
 
+    /// Whether an object of this size is one the remote can receive.
+    ///
+    /// Zero is the case that stops a folder. `e3b0c442…b855` is the SHA-256 of
+    /// nothing, and an LFS batch request for a zero-byte object comes back with
+    /// no upload action — so a unit for one never completes and never fails,
+    /// while `lfs_uploads_outstanding` counts it and `do_push` refuses to
+    /// publish behind it. Measured on the field folder: one empty file staged
+    /// 2026-08-27 19:49 under a `*.py filter=lfs` rule, three attempts, and a
+    /// push deferred nineteen times, so nothing was published for the rest of
+    /// the day.
+    ///
+    /// Nothing is lost by skipping it: writing no bytes is what put the empty
+    /// object in the local store, so the pointer already names something that
+    /// exists on both sides.
+    fn upload_is_needed(size: u64) -> bool {
+        size > 0
+    }
+
     /// Of the uploads this profile owes, how many are still being attempted?
     ///
     /// [`Self::lfs_uploads_outstanding`] counts a parked upload, and must: it
@@ -5166,7 +5184,26 @@ impl Engine {
         // unit that has to deliver it, and those ids do not exist until here.
         let now = self.platform.now_ms();
         let mut lfs_units: HashMap<PathBuf, i64> = HashMap::with_capacity(staging.uploads.len());
+        // An empty object needs no upload, and enqueuing one stops the folder.
+        //
+        // `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` is
+        // the SHA-256 of nothing, and an LFS server has nothing to receive for
+        // it: the batch request for a zero-byte object comes back with no upload
+        // action, so the unit never completes and never fails. Meanwhile
+        // `lfs_uploads_outstanding` counts it, and the push is held behind it.
+        //
+        // Measured on the field folder: one empty `.py` under
+        // `python2.7/`, enqueued 2026-08-27 19:49, three attempts, and a push
+        // deferred nineteen times behind it — the folder had published nothing
+        // since, while every pass reported "holding the push … objects=1".
+        //
+        // The object is already in the local store (writing nothing is what put
+        // it there), so the pointer names something that exists; there is simply
+        // no transfer to make.
         for object in &staging.uploads {
+            if !Self::upload_is_needed(object.size) {
+                continue;
+            }
             let unit = WorkKind::LfsUpload {
                 oid: object.oid.clone(),
                 size: object.size,
@@ -7963,6 +8000,11 @@ impl Engine {
             };
             if !have {
                 report.unrecoverable.push(object.clone());
+                continue;
+            }
+            // Nothing to transfer for an empty object, and a unit for one is
+            // never completable: see [`Self::upload_is_needed`].
+            if !Self::upload_is_needed(object.size) {
                 continue;
             }
             let unit = WorkKind::LfsUpload {
@@ -13469,6 +13511,24 @@ mod tests {
             !err.to_string().contains("localhost"),
             "the failure must name the derivation, not a fabricated host: {err}"
         );
+    }
+
+    /// The rule that keeps an empty object out of the journal.
+    ///
+    /// Asserted here rather than through a commit because the routing that
+    /// produced it in the field is an attribute rule inherited from one
+    /// oversized sibling, and a fixture that reproduces the routing proves the
+    /// routing rather than this. What must hold is the decision: an object with
+    /// no bytes is not something the remote can receive, and a unit for one
+    /// holds the push forever.
+    #[test]
+    fn an_empty_object_is_never_worth_an_upload_unit() {
+        assert!(
+            !Engine::upload_is_needed(0),
+            "the digest of nothing has no transfer, and a unit for it never completes"
+        );
+        assert!(Engine::upload_is_needed(1));
+        assert!(Engine::upload_is_needed(300_000));
     }
 
     /// A folder held behind an abandoned upload is stopped, not syncing
