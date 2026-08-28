@@ -4822,3 +4822,27 @@ status: open
     "is it still tracked" question costs nothing extra there and cannot be asked cheaply
     anywhere else.
 
+
+- source_spec: spec-56-14-the-surface-side-deferred-sweep
+  summary: CI's own runners flake roughly one test per run, in a different file each time, and three separate names have now been observed failing on branches that do not touch them.
+  evidence: |
+    On the epic-56 follow-up stack: `files-pane.test.tsx > re-reads a remembered
+    folder once when Refresh rescues a failed first list` failed on #285, whose
+    diff touches no frontend file at all (`git diff main..feat/56-11 -- src/` is
+    empty) and which passed on rerun; `find-panel.test.tsx > shows a query that
+    arrived from somewhere other than these fields` and
+    `keeper-core/tests/recordings_search_perf.rs::recording_search_p95_under_50ms_at_10k_sessions`
+    both failed on #288, whose diff touches neither `src/components/notes` nor
+    `keeper-core/tests`. The perf test is machine-scaled and also failed once on
+    the macOS gate host before passing on an immediate rerun (74.98 ms against a
+    64.36 ms scaled budget, worst shape "sub-trigram LIKE fallback" at 145 ms).
+    Locally all three pass. This is CI-runner contention, not three defects, and
+    the right fix is a decision about the runner size or about how a
+    machine-scaled budget absorbs a noisy neighbour - not a retry around the
+    assertions.
+  status: open
+  keep: |
+    Becomes worth doing when a flake blocks a merge train rather than costing one
+    rerun, or when the same test name repeats. A per-test retry would hide the
+    signal that the runners are oversubscribed, so the honest first step is to
+    measure how often it happens across a week of runs.
