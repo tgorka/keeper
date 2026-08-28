@@ -2,10 +2,10 @@
 title: 'Story 41.6: Durability You Can Read'
 type: 'feature'
 created: '2026-08-07'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: '69f3a22'
-final_revision: ''
+final_revision: '5cb8ed986bd371ccc2de2be56bb317d135f229fc'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

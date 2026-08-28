@@ -2,10 +2,10 @@
 title: 'Story 41.5: Committed at Close, Pushed on Policy'
 type: 'feature'
 created: '2026-08-07'
-status: 'review'
+status: 'done'
 blocking_condition: ''
 baseline_revision: 'd5d2169'
-final_revision: ''
+final_revision: 'a9e8d0f406c3e091d42ae688b08a84918084fd46'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

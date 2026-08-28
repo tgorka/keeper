@@ -2,8 +2,10 @@
 title: 'The tray glyph stops repainting itself'
 type: 'bugfix'
 created: '2026-07-28'
-status: 'review'
+status: 'done'
 baseline_revision: '5c40a22'
+final_revision: '1ef0854eb2eda88a9036f7c5aa74e7216623decf'
+
 ---
 
 <intent-contract>
