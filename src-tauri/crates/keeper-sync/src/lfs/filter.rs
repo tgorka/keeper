@@ -875,6 +875,15 @@ pub fn serves_process(program: &Path) -> bool {
             {
                 return Ok(false);
             }
+            // The client's own capability offer. The server reads this list
+            // before it answers with its own, exactly as git does, so a probe
+            // that skips it hangs the handshake and reads nothing.
+            pktline::write_line(&mut stdin, "capability=clean")?;
+            pktline::write_line(&mut stdin, "capability=smudge")?;
+            pktline::write_flush(&mut stdin)?;
+            stdin
+                .flush()
+                .map_err(|err| SyncError::Git(format!("could not probe the filter: {err}")))?;
             let capabilities = pktline::read_text_list(&mut stdout)?.unwrap_or_default();
             // Dropping stdin ends the child's loop cleanly, which is the same
             // shutdown git performs.
