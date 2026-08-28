@@ -256,6 +256,36 @@ impl LfsStore {
             .unwrap_or(false)
     }
 
+    /// The OID and size a stream would have, without keeping a byte of it.
+    ///
+    /// The clean direction asks two questions of a file — "what is its pointer"
+    /// and "is its object stored" — and only the second one needs the bytes.
+    /// [`LfsStore::insert_streaming`] cannot tell them apart: the OID is the
+    /// *result* of writing, so it writes a full copy into `tmp/` first and
+    /// learns afterwards that the object was already there.
+    ///
+    /// On a folder whose objects are almost all stored already, that copy is
+    /// the dominant cost of a status walk. Measured on the field folder over a
+    /// quiet volume: `tmp/` grew at 9.6 MB/s and stood at 5.4 GB mid-walk, so
+    /// the 24.2 GB of pointer content a walk re-reads costs about 42 minutes of
+    /// writing — every walk, for content that never changed.
+    pub fn digest_of(mut reader: impl Read) -> Result<(String, u64)> {
+        let mut hasher = Sha256::new();
+        let mut size: u64 = 0;
+        let mut buf = vec![0u8; HASH_CHUNK_BYTES];
+        loop {
+            let read = reader.read(&mut buf).map_err(|err| {
+                SyncError::io("read lfs source", std::path::Path::new("<stream>"), err)
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+            size += read as u64;
+        }
+        Ok((hex::encode(hasher.finalize()), size))
+    }
+
     /// Hash `reader` into the store and publish it under the digest it turns
     /// out to have.
     ///

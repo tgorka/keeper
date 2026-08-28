@@ -152,6 +152,14 @@ pub fn stage_and_commit(
     // An owned copy of the index: `index_or_empty` hands out a shared snapshot,
     // and for a repository that has never been staged it still carries the path
     // the index has to be written to.
+    //
+    // The snapshot cannot go stale under a pass that writes the index between
+    // the walk and this line — and one does now, `git::repo::persist_observed_stats`,
+    // saving the stat data the walk observed. `Repository::try_index` goes
+    // through `gix_fs::SharedFileSnapshotMut::recent_snapshot`, which
+    // revalidates against the file and reloads when it has changed, so this
+    // reads what is on disk. Measured rather than assumed: forcing the cached
+    // path with `open_index` removed leaves the written stats intact.
     let shared = repo.index_or_empty().map_err(|err| {
         SyncError::Git(format!(
             "could not read the index: {}",
