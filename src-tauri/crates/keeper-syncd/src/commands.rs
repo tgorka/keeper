@@ -296,11 +296,14 @@ pub enum Command {
     /// Ask for one virtual path's content (FR-338).
     ///
     /// Publishes the file inline when this machine already holds the object,
-    /// and otherwise queues the transfer and says so — the running daemon
-    /// delivers it, because this verb has no event loop to wait on. A path
-    /// whose worktree bytes are neither the committed pointer nor the content
-    /// it names is **refused by name** and left exactly as it is: keeper does
-    /// not overwrite a local modification.
+    /// and otherwise **fetches it before returning**: the verb performs its own
+    /// transfer, because the person or the cron entry that ran it is who the
+    /// bytes are for. Story 56.13 changed that — it used to queue the work and
+    /// exit `0`, which read as success on a machine where nothing was draining
+    /// the queue. The exit code follows the requested unit's own standing, so a
+    /// wrapper can act on it. A path whose worktree bytes are neither the
+    /// committed pointer nor the content it names is **refused by name** and
+    /// left exactly as it is: keeper does not overwrite a local modification.
     Materialize {
         /// Profile id or name. Required: materializing is a write, and "all
         /// folders" is not a thing anybody means by it.
