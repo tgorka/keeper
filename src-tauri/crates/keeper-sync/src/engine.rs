@@ -886,6 +886,15 @@ pub struct Engine {
     /// a persisted timestamp would let a restart skip the one sweep it most
     /// needs. See [`UNTRACKED_SWEEP_INTERVAL`].
     untracked_sweep: Mutex<HashMap<String, Instant>>,
+
+    /// Profiles whose watcher has named a path the index does not carry.
+    ///
+    /// The directory scan exists to find files git has never seen, and this is
+    /// the only signal that says one may be there. A tracked file being written
+    /// sets the ordinary wake and is answered by the index-only walk; without
+    /// the distinction every write cost a full-tree `lstat` — 996 s on the
+    /// folder this was written for. Cleared by the walk that answers it.
+    untracked_appeared: Mutex<HashSet<String>>,
 }
 
 /// A profile's in-flight full-tree walk, released when this is dropped.
@@ -1022,6 +1031,7 @@ impl Engine {
             repair_memo: Mutex::new(HashMap::new()),
             walking: Mutex::new(std::collections::HashSet::new()),
             untracked_sweep: Mutex::new(HashMap::new()),
+            untracked_appeared: Mutex::new(HashSet::new()),
         };
         engine.seed_status()?;
         Ok(engine)
@@ -1091,7 +1101,14 @@ impl Engine {
     /// to find twelve modified files, which the index-only question answers in
     /// under two seconds.
     fn commit_walk_policy(&self, profile: &SyncProfile) -> git::repo::WalkPolicy {
-        if self.watch_wake_pending(&profile.id) {
+        // The precise question, not the ordinary wake: a tracked file being
+        // written sets that too, and the index-only walk answers it in
+        // milliseconds. Only a path the index does not carry needs the scan.
+        //
+        // Consumed rather than merely read — the scan this grants is the one
+        // that answers it, and a flag left set makes every later pass pay again
+        // for one file that appeared once.
+        if Self::lock(&self.untracked_appeared).remove(&profile.id) {
             Self::lock(&self.untracked_sweep).insert(profile.id.clone(), Instant::now());
             return git::repo::WalkPolicy::full();
         }
@@ -2092,6 +2109,20 @@ impl Engine {
         let tap = self.watch_tap.get();
         let mut tapped: Vec<PathBuf> = Vec::new();
         let mut wake = false;
+        // Whether any surviving event named a path the index does not carry.
+        //
+        // This is what decides whether the next commit pass owes a directory
+        // scan. A tracked file being written is answered by the index-only
+        // walk in milliseconds; only a path git has never seen needs the scan
+        // that costs 996 s of `lstat` on this folder. Treating every event as
+        // "something new appeared" is what left the scan in the common case —
+        // measured at `elapsed_ms=608838` for twelve modified files.
+        //
+        // The index is read once for the batch, not once per event, and only
+        // when there is a surviving event to ask about.
+        let mut appeared = false;
+        let index = None::<gix::worktree::Index>;
+        let mut index = index;
         {
             let mut gates = Self::lock(&self.gates);
             let gate = self.ensure_gate(&mut gates, profile)?;
@@ -2102,6 +2133,23 @@ impl Engine {
                 wake = true;
                 if close_write {
                     gate.note_close_write(&path);
+                }
+                if !appeared {
+                    if index.is_none() {
+                        index = self
+                            .open_repo(profile)
+                            .ok()
+                            .and_then(|repo| repo.index_or_empty().ok());
+                    }
+                    appeared = match (&index, path.strip_prefix(&profile.local_path)) {
+                        (Some(index), Ok(rela)) => {
+                            let key = gix::path::into_bstr(rela);
+                            index.entry_index_by_path(key.as_ref()).is_err()
+                        }
+                        // No index to ask, or a path outside the folder: assume
+                        // the scan is owed rather than skip a new file.
+                        _ => true,
+                    };
                 }
                 // Only the tap wants a path beyond this point, so an untapped
                 // engine — every daemon, every other test — moves each survivor
@@ -2124,6 +2172,9 @@ impl Engine {
         // nothing.
         if wake {
             self.note_watch_wake(&profile.id);
+        }
+        if appeared {
+            Self::lock(&self.untracked_appeared).insert(profile.id.clone());
         }
         Ok(())
     }
@@ -15692,11 +15743,79 @@ mod tests {
             "nothing has happened since, so the scan buys nothing"
         );
 
+        // An ordinary wake is not enough, and must not be: a tracked file
+        // being written is what the index-only walk answers in milliseconds.
         engine.note_watch_wake(&p.id);
         assert_eq!(
             engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only(),
+            "a write to a tracked file does not need the whole tree walked"
+        );
+
+        // A path the index does not carry is the one thing only a scan finds.
+        Engine::lock(&engine.untracked_appeared).insert(p.id.clone());
+        assert_eq!(
+            engine.commit_walk_policy(&p),
             git::repo::WalkPolicy::full(),
-            "a wake means a file may have appeared, and only a scan finds it"
+            "a path git has never seen is what the scan exists for"
+        );
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only(),
+            "and the scan that answered it consumes the signal"
+        );
+    }
+
+    /// The signal is set by a path the index does not carry, and only by that.
+    #[test]
+    fn a_write_to_a_tracked_file_does_not_ask_for_a_directory_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("tracked.txt"), b"one").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        commit_after_settling(&engine, &platform, &p);
+
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            tx.clone(),
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        // A tracked path: the index carries it, so no scan is owed.
+        tx.send(WatchEvent {
+            path: p.local_path.join("tracked.txt"),
+            close_write: true,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            !Engine::lock(&engine.untracked_appeared).contains(&p.id),
+            "a write to a file git already carries needs no directory scan"
+        );
+
+        // A path the index has never seen: only a scan finds it.
+        let fresh = p.local_path.join("appeared.txt");
+        std::fs::write(&fresh, b"new").expect("write");
+        tx.send(WatchEvent {
+            path: fresh,
+            close_write: true,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            Engine::lock(&engine.untracked_appeared).contains(&p.id),
+            "a path git has never seen is exactly what the scan exists for"
         );
     }
 
