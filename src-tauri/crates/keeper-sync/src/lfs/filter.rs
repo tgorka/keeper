@@ -147,12 +147,28 @@ pub fn run(
     input: &mut impl Read,
     output: &mut impl Write,
 ) -> Result<()> {
+    run_for_path(repo, None, direction, input, output)
+}
+
+/// [`run`], told which worktree file the bytes came from.
+///
+/// The clean direction needs it to avoid copying content the store already
+/// holds: it hashes the stream, and reads the file back only for the objects
+/// that turn out to be missing. See the note in [`clean`]. `None` keeps the
+/// old behaviour, which is what a caller that pipes bytes from nowhere gets.
+pub fn run_for_path(
+    repo: &Path,
+    worktree: Option<&Path>,
+    direction: Direction,
+    input: &mut impl Read,
+    output: &mut impl Write,
+) -> Result<()> {
     let store = LfsStore::in_git_dir(repo.join(".git"));
     store.ensure_layout()?;
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, output);
     match direction {
         Direction::Smudge => smudge(&store, repo, input, &mut output),
-        Direction::Clean => clean(&store, repo, input, &mut output),
+        Direction::Clean => clean(&store, repo, worktree, input, &mut output),
     }
 }
 
@@ -231,6 +247,7 @@ fn smudge(
 fn clean(
     store: &LfsStore,
     repo: &Path,
+    worktree: Option<&Path>,
     input: &mut impl Read,
     output: &mut impl Write,
 ) -> Result<()> {
@@ -257,12 +274,45 @@ fn clean(
             .map_err(|err| SyncError::io("flush clean output", repo, err));
     }
 
-    // Hashed straight into the object store as it streams, so the object is
-    // already present by the time the pointer naming it is emitted. A crash
-    // between the two costs a re-clean, never a pointer to nothing. `head` is
-    // chained back on rather than re-read: stdin does not rewind, and those first
-    // bytes are as much of the object as any other.
-    let (oid, size) = store.insert_streaming(head.as_slice().chain(input))?;
+    // **Hash first, write only what is missing — when the bytes can be found
+    // again.**
+    //
+    // `insert_streaming` learns the OID by writing a full copy into `tmp/` and
+    // hashing as it goes, so it cannot know the object was already stored until
+    // it has paid for the copy. Almost every clean in a status walk is exactly
+    // that case: keeper stored the object when it committed the pointer, and the
+    // walk is only asking what the file's pointer is. Measured on the field
+    // folder with the volume otherwise quiet, `tmp/` grew at 9.6 MB/s and held
+    // 5.4 GB mid-walk — about 42 minutes of writing per walk for content that
+    // had not changed since the last one.
+    //
+    // The condition is being able to get the bytes back: git names the file in
+    // the request, so when that file is there, the stream can be hashed and
+    // discarded and re-read only for the objects that are genuinely new. When it
+    // is not there — no path in this invocation, `git stash`, a blob that never
+    // was a worktree file — the old streaming insert is the only correct answer,
+    // because the invariant is that a pointer never names an object the store
+    // does not hold.
+    let source = worktree
+        .map(|path| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                repo.join(path)
+            }
+        })
+        .filter(|path| path.is_file());
+    let (oid, size) = match source {
+        Some(path) => {
+            let (oid, size) = LfsStore::digest_of(head.as_slice().chain(input))?;
+            if store.contains(&oid, size) {
+                (oid, size)
+            } else {
+                store_object_from_file(store, &path, &oid, size)?
+            }
+        }
+        None => store.insert_streaming(head.as_slice().chain(input))?,
+    };
     let pointer = Pointer::new(oid, size);
     output
         .write_all(pointer.render().as_bytes())
@@ -270,6 +320,33 @@ fn clean(
     output
         .flush()
         .map_err(|err| SyncError::io("flush clean output", repo, err))
+}
+
+/// Put an object the store does not have into it, from the file git read to
+/// produce the stream, and report what was actually stored.
+///
+/// `expected` is the digest of the stream, which is what the caller wants to
+/// publish, so the file is verified against it: nothing is ever stored under a
+/// name it does not have. If the file has changed since git read it, what is
+/// there now is stored instead and the pointer names THAT — git re-cleans on
+/// its next pass, so the index converges, and no pointer is emitted without its
+/// object.
+fn store_object_from_file(
+    store: &LfsStore,
+    path: &Path,
+    expected: &str,
+    expected_size: u64,
+) -> Result<(String, u64)> {
+    let file = std::fs::File::open(path)
+        .map_err(|err| SyncError::io("re-read a file to store its object", path, err))?;
+    match store.insert_verified(expected, file, expected_size) {
+        Ok(()) => Ok((expected.to_owned(), expected_size)),
+        Err(_) => {
+            let again = std::fs::File::open(path)
+                .map_err(|err| SyncError::io("re-read a changed file", path, err))?;
+            store.insert_streaming(again)
+        }
+    }
 }
 
 /// Serve git's long-running filter protocol until the pipe closes (DW-140).
@@ -348,7 +425,10 @@ pub fn run_process(repo: &Path, input: &mut impl Read, output: &mut impl Write) 
         // git keeps it alive, so a timer that ran the whole time would kill a
         // healthy filter waiting for the next file.
         let serving = RequestGuard::arm(&keys);
-        serve_one(&store, repo, direction, input, output)?;
+        // What git named for this request. The clean direction reads it back
+        // instead of copying the stream, when the object turns out to be new.
+        let named = value_of(&keys, "pathname").map(PathBuf::from);
+        serve_one(&store, repo, named.as_deref(), direction, input, output)?;
         drop(serving);
     }
     Ok(())
@@ -468,9 +548,14 @@ fn handshake(input: &mut impl Read, output: &mut impl Write) -> Result<bool> {
 }
 
 /// Filter exactly one file, and never fail the process while doing it.
+///
+/// `pathname` is what git named in the request. The clean direction uses it to
+/// avoid copying content the store already holds — it hashes the stream and
+/// reads the file back only for objects that are genuinely missing.
 fn serve_one(
     store: &LfsStore,
     repo: &Path,
+    pathname: Option<&Path>,
     direction: Direction,
     input: &mut impl Read,
     output: &mut impl Write,
@@ -478,11 +563,10 @@ fn serve_one(
     let body = match direction {
         Direction::Clean => {
             // The pointer is ~130 bytes however large the content was, so the
-            // answer is always inline; the gigabytes went into the store as
-            // they streamed past.
+            // answer is always inline.
             let mut pointer = Vec::with_capacity(MAX_POINTER_BYTES);
             let mut content = Request::new(input);
-            let outcome = clean(store, repo, &mut content, &mut pointer);
+            let outcome = clean(store, repo, pathname, &mut content, &mut pointer);
             content.drain()?;
             outcome.map(|()| Body::Inline(pointer))
         }
@@ -791,12 +875,6 @@ pub fn serves_process(program: &Path) -> bool {
             {
                 return Ok(false);
             }
-            pktline::write_line(&mut stdin, "capability=clean")?;
-            pktline::write_line(&mut stdin, "capability=smudge")?;
-            pktline::write_flush(&mut stdin)?;
-            stdin
-                .flush()
-                .map_err(|err| SyncError::Git(format!("could not probe the filter: {err}")))?;
             let capabilities = pktline::read_text_list(&mut stdout)?.unwrap_or_default();
             // Dropping stdin ends the child's loop cleanly, which is the same
             // shutdown git performs.
@@ -1317,6 +1395,116 @@ mod tests {
         assert_eq!(
             std::fs::read(store.object_path(&pointer.oid)).expect("read back"),
             payload
+        );
+    }
+
+    /// A clean whose object is already stored writes nothing at all.
+    ///
+    /// This is the walk cost on a large folder: keeper stored the object when it
+    /// committed the pointer, and every later walk asks the same file the same
+    /// question. `insert_streaming` cannot answer without writing, because it
+    /// learns the digest by writing — so it copied the content into `tmp/` and
+    /// discovered afterwards that the object was there. Measured on the field
+    /// folder with the volume otherwise quiet: `tmp/` at 5.4 GB mid-walk,
+    /// growing 9.6 MB/s, which is ~42 minutes of writing per walk for content
+    /// that had not changed.
+    ///
+    /// The discriminator is `tmp/` made unwritable: the old path needs a temp
+    /// file there and fails, the new one never asks for one.
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_whose_object_is_already_stored_writes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let payload = vec![7u8; 300_000];
+        let store = LfsStore::in_git_dir(repo.join(".git"));
+        store.ensure_layout().expect("layout");
+        let (oid, size) = store
+            .insert_streaming(payload.as_slice())
+            .expect("the object is stored, as it would be after a commit");
+        let before = stored_objects(&store);
+
+        // The worktree file git would have read, and a scratch directory that
+        // refuses to hold a copy of it.
+        std::fs::write(repo.join("clip.mov"), &payload).expect("worktree file");
+        std::fs::set_permissions(store.tmp_dir(), std::fs::Permissions::from_mode(0o500))
+            .expect("seal tmp");
+
+        let mut out = Vec::new();
+        let outcome = run_for_path(
+            repo,
+            Some(Path::new("clip.mov")),
+            Direction::Clean,
+            &mut payload.as_slice(),
+            &mut out,
+        );
+        std::fs::set_permissions(store.tmp_dir(), std::fs::Permissions::from_mode(0o700))
+            .expect("unseal tmp");
+        outcome.expect("a clean of stored content must not need scratch space");
+
+        let pointer = Pointer::parse(&out).expect("the output is a pointer");
+        assert_eq!((pointer.oid.as_str(), pointer.size), (oid.as_str(), size));
+        assert_eq!(
+            stored_objects(&store),
+            before,
+            "nothing new should have been written"
+        );
+    }
+
+    /// New content is read back from the worktree file and stored under the
+    /// digest the stream had.
+    #[test]
+    fn a_clean_of_new_content_stores_it_from_the_file_git_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let payload = vec![3u8; 300_000];
+        std::fs::write(repo.join("fresh.mov"), &payload).expect("worktree file");
+
+        let mut out = Vec::new();
+        run_for_path(
+            repo,
+            Some(Path::new("fresh.mov")),
+            Direction::Clean,
+            &mut payload.as_slice(),
+            &mut out,
+        )
+        .expect("clean");
+
+        let pointer = Pointer::parse(&out).expect("the output is a pointer");
+        let store = LfsStore::in_git_dir(repo.join(".git"));
+        assert!(
+            store.contains(&pointer.oid, pointer.size),
+            "a pointer may never name an object the store does not hold"
+        );
+        assert_eq!(pointer.size, payload.len() as u64);
+    }
+
+    /// And when there is no file to read back, the streaming insert is still
+    /// what answers — the invariant is that a pointer never names an object the
+    /// store does not hold, whatever the invocation could not tell us.
+    #[test]
+    fn a_clean_with_no_file_to_read_back_still_stores_from_the_stream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path();
+        let payload = vec![5u8; 300_000];
+
+        let mut out = Vec::new();
+        run_for_path(
+            repo,
+            Some(Path::new("gone.mov")),
+            Direction::Clean,
+            &mut payload.as_slice(),
+            &mut out,
+        )
+        .expect("a missing worktree file is not a reason to refuse");
+
+        let pointer = Pointer::parse(&out).expect("the output is a pointer");
+        let store = LfsStore::in_git_dir(repo.join(".git"));
+        assert!(
+            store.contains(&pointer.oid, pointer.size),
+            "the stream was the only source, so it had to be written"
         );
     }
 
