@@ -66,17 +66,52 @@ const REF_LOCK_POLL: Duration = Duration::from_millis(25);
 /// Pass `trust_full` for a repository the engine put there itself — including
 /// one on removable media owned by another uid. See the module docs: without it
 /// gitoxide discards repo-local filter configuration without saying so.
+///
+/// **This door does housekeeping.** It deletes an `index.lock` older than
+/// [`STALE_INDEX_LOCK`], polls for and clears abandoned loose-ref locks, and
+/// rewrites the merged configuration to drop a foreign `filter.lfs.process`
+/// (the DW-140 and DW-206 guards). Every one of those is a repair, and every
+/// leg that goes on to WRITE wants them. A caller that only means to read
+/// should use [`open_read_only`] instead.
 pub fn open(path: &Path, trust_full: bool) -> Result<gix::Repository> {
-    let mut options = gix::open::Options::default();
-    if trust_full {
-        options = options.with(gix::sec::Trust::Full);
-    }
-    let mut repo = gix::open_opts(path, options)
-        .map_err(|err| SyncError::Git(format!("open failed: {}", super::fetch::flatten(&err))))?;
+    let mut repo = open_read_only(path, trust_full)?;
     release_stale_index_lock(repo.git_dir());
     release_stale_ref_locks(repo.git_dir());
     drop_foreign_lfs_driver(&mut repo)?;
     Ok(repo)
+}
+
+/// Open a managed repository **without repairing anything** (Story 56.14).
+///
+/// [`open`] minus its three housekeeping calls, and nothing else: the same
+/// `trust_full` semantics, the same error text, the same `gix::open_opts`.
+///
+/// # Why a second door rather than a flag
+///
+/// Because the difference is a promise to the rest of the machine, not a
+/// tuning knob. `Engine::verify` is the one pass that takes no per-profile
+/// reservation, so it is the likeliest of all of them to be running beside a
+/// keeper commit or a person's own `git` — and the repairs are exactly the
+/// operations that are dangerous next to a live writer: deleting an
+/// `index.lock` that is 61 seconds old and genuinely held, or committing a
+/// config snapshot while another process is editing `.git/config`. A check
+/// that repairs what it is checking is not a check.
+///
+/// The cost dropped with them is not incidental either:
+/// [`release_stale_ref_locks`] walks all of `refs/` and polls for up to
+/// [`STALE_REF_LOCK`] per lock it finds.
+///
+/// **A caller that will write must not use this.** Reading an index, a tree or
+/// a blob needs none of the three; staging, committing, fetching and pushing
+/// all do, and `drop_foreign_lfs_driver` in particular is what stops another
+/// installation's LFS filter from reaching this checkout.
+pub fn open_read_only(path: &Path, trust_full: bool) -> Result<gix::Repository> {
+    let mut options = gix::open::Options::default();
+    if trust_full {
+        options = options.with(gix::sec::Trust::Full);
+    }
+    gix::open_opts(path, options)
+        .map_err(|err| SyncError::Git(format!("open failed: {}", super::fetch::flatten(&err))))
 }
 
 /// Remove every `filter "lfs"` driver that is not this repository's own from the
@@ -3741,6 +3776,64 @@ mod tests {
 
         let repo = open(dir.path(), true).expect("open");
         assert_eq!(repo.git_dir_trust(), gix::sec::Trust::Full);
+    }
+
+    /// Age a file by `by`, so the sweep's own threshold decides.
+    ///
+    /// `std::fs::FileTimes` rather than a new dev-dependency or a shelled-out
+    /// `touch`, whose date syntax differs between GNU and BSD and would make
+    /// this test pass on Linux and fail on the macOS host.
+    fn backdate(path: &Path, by: Duration) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open the lock to set its times");
+        let when = SystemTime::now() - by;
+        file.set_times(std::fs::FileTimes::new().set_modified(when))
+            .expect("backdate the mtime");
+    }
+
+    /// [`open_read_only`] repairs nothing, and the stale-`index.lock` sweep is
+    /// the half of that promise you can see from outside (Story 56.14).
+    ///
+    /// `Engine::verify` is the one pass that takes no per-profile reservation,
+    /// so it is the likeliest of them all to be running beside a keeper commit
+    /// or beside a person's own `git` — and deleting an `index.lock` that is
+    /// genuinely held is exactly the repair that is dangerous next to a live
+    /// writer. A check that repairs what it is checking is not a check.
+    /// Without the read-only door, `verify` opened through [`open`] and did all
+    /// three repairs: the index lock, the loose-ref locks, and the config
+    /// rewrite that drops a foreign LFS driver.
+    ///
+    /// Without the fix `open_read_only` *is* `open`, so the first assertion
+    /// reads a file that is no longer there — the lock is deleted by the very
+    /// call that promised to touch nothing. The second half is the positive
+    /// control: the same lock, aged the same way, IS removed by `open`, which
+    /// is what stops the first half passing merely because the lock was too
+    /// young for the threshold to fire.
+    #[test]
+    fn open_read_only_leaves_a_stale_index_lock_that_open_would_remove() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        gix::init(dir.path()).expect("init");
+        let lock = dir.path().join(".git").join("index.lock");
+        std::fs::write(&lock, b"").expect("plant an index lock");
+        // Comfortably past the threshold, so a coarse filesystem clock cannot
+        // put the fixture on the wrong side of the decision.
+        backdate(&lock, STALE_INDEX_LOCK + Duration::from_secs(60));
+
+        let _read_only = open_read_only(dir.path(), true).expect("open read-only");
+        assert!(
+            lock.exists(),
+            "the read-only door must repair nothing, and a lock well past \
+             STALE_INDEX_LOCK is the repair that is easiest to see"
+        );
+
+        let _repaired = open(dir.path(), true).expect("open");
+        assert!(
+            !lock.exists(),
+            "the writing door still sweeps it, or the assertion above proves \
+             only that the lock was too young"
+        );
     }
 
     #[test]

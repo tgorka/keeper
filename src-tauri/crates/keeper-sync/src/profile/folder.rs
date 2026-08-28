@@ -262,11 +262,32 @@ impl FolderTier {
     /// Read this profile's folder files and layer them onto it.
     ///
     /// Never fails and never touches the disk beyond opening the two files. A
-    /// file that is missing says nothing; a file that is broken, or that says
-    /// something a folder may not, is dropped **whole** and reported — a layer
-    /// half-applied is a configuration nobody can reason about, and the
-    /// alternative to dropping it is deciding on the user's behalf which half
-    /// of their file they meant.
+    /// file that is missing says nothing.
+    ///
+    /// # A broken file loses the keys it got wrong, and only those (Story 56.14)
+    ///
+    /// A file that says something a folder may not, or that trips
+    /// [`SyncProfile::validate`], used to be dropped **whole** — the argument
+    /// being that a layer half-applied is a configuration nobody can reason
+    /// about. What that missed is which half the person can see: one misspelled
+    /// top-level key, or one out-of-range number, silently discarded every other
+    /// key in the file, so a `releaseTtlMs` or an `excludes` list the author had
+    /// spelled perfectly simply did not take, on every clone that read the
+    /// file, with the stored row's value quietly in force instead. That is the
+    /// "reads the file and ignores it" failure, not a conservative one — and the
+    /// data-loss direction was already closed separately, because
+    /// [`folder_config_is_faulted`] makes the release sweep decline a folder
+    /// whose layer is faulted whatever this returns.
+    ///
+    /// So a layer that fails is retried key by key through the same [`overlay`]
+    /// — the identical rule table, the identical `validate`, the identical
+    /// unobserved-key check, no second code path — and each key stands or falls
+    /// on its own. The fault is still recorded, naming every key that fell and
+    /// why.
+    ///
+    /// **A layer with no problems is not retried and behaves exactly as before.**
+    /// The retry costs one `validate` per `[folder]` key and is paid only by a
+    /// file that was going to be discarded entirely.
     pub fn apply(&self, profile: &SyncProfile) -> FolderOutcome {
         let is_main = self.is_main(&profile.local_path);
         let mut current = profile.clone();
@@ -282,13 +303,40 @@ impl FolderTier {
                     continue;
                 }
             };
-            match overlay(&current, &text, is_main) {
+            let table = match toml::from_str::<toml::Table>(&text) {
+                Ok(table) => table,
+                // `toml`'s Display carries the line, the column and the
+                // offending input. Do not flatten it — it is the whole
+                // diagnosis. And there is nothing to salvage: a file that does
+                // not parse has no keys to try one at a time.
+                Err(err) => {
+                    faults.push(FolderFault::new(
+                        &path,
+                        format!("is not readable as TOML\n{err}"),
+                    ));
+                    continue;
+                }
+            };
+            match overlay(&current, &table, is_main) {
                 Ok(None) => {}
                 Ok(Some(applied)) => {
                     current = applied.profile;
                     owned.extend(applied.keys);
                 }
-                Err(problems) => faults.push(FolderFault::new(&path, problems.join("; "))),
+                Err(problems) => {
+                    let salvage = salvage_keys(&current, &table, is_main);
+                    if let Some(applied) = salvage.applied {
+                        current = applied.profile;
+                        owned.extend(applied.keys);
+                    }
+                    // The whole-layer problems, because they are the ones
+                    // written for a person to read, plus whatever the per-key
+                    // retry could attribute more precisely and the first pass
+                    // could not.
+                    let mut said = problems;
+                    said.extend(salvage.problems);
+                    faults.push(FolderFault::new(&path, said.join("; ")));
+                }
             }
         }
         FolderOutcome {
@@ -299,32 +347,105 @@ impl FolderTier {
     }
 }
 
+/// What a per-key retry of a failed layer managed to keep, and what it could
+/// not.
+struct Salvage {
+    applied: Option<Applied>,
+    problems: Vec<String>,
+}
+
+/// Retry one failed layer's `[folder]` keys one at a time (Story 56.14).
+///
+/// Every key goes through [`overlay`] on its own, against the profile as the
+/// keys before it left it, so each one meets the same rule table, the same
+/// `SyncProfile::validate` and the same unobserved-key check it would have met
+/// in the whole layer. Nothing about what is permitted changes; only how much
+/// of a bad file survives.
+///
+/// # Order
+///
+/// `toml::Table` is sorted, so keys are tried alphabetically. That is
+/// deterministic — the same file gives the same answer on every clone, which is
+/// the property that matters — and it happens to be the order `validate`'s
+/// cross-field rules want: `notes` before `recordings` before `sessions` is
+/// exactly the sequence its overlap checks are written in.
+///
+/// Keys outside `[folder]` are not retried. They are not profile fields, they
+/// were already reported by the whole-layer pass, and the whole point of this
+/// retry is that a misspelled top-level key must stop taking `[folder]` with
+/// it.
+fn salvage_keys(profile: &SyncProfile, table: &toml::Table, is_main: bool) -> Salvage {
+    let Some(fields) = table
+        .iter()
+        .find(|(key, _)| canonical_key(key) == "folder")
+        .and_then(|(_, value)| value.as_table())
+    else {
+        return Salvage {
+            applied: None,
+            problems: Vec::new(),
+        };
+    };
+
+    let mut current = profile.clone();
+    let mut keys = BTreeSet::new();
+    let mut problems = Vec::new();
+    for (key, value) in fields {
+        let mut one = toml::Table::new();
+        let mut folder = toml::Table::new();
+        folder.insert(key.clone(), value.clone());
+        one.insert("folder".to_owned(), toml::Value::Table(folder));
+        match overlay(&current, &one, is_main) {
+            // Nothing to say — an empty nested table, which the whole-layer
+            // pass would also have skipped.
+            Ok(None) => {}
+            Ok(Some(applied)) => {
+                current = applied.profile;
+                keys.extend(applied.keys);
+            }
+            Err(mut said) => problems.append(&mut said),
+        }
+    }
+
+    if keys.is_empty() {
+        return Salvage {
+            applied: None,
+            // Every key failed, so the whole-layer pass already said all of
+            // this. Repeating it would print each problem twice.
+            problems: Vec::new(),
+        };
+    }
+    Salvage {
+        applied: Some(Applied {
+            profile: current,
+            keys,
+        }),
+        problems,
+    }
+}
+
 /// One layer, applied.
 struct Applied {
     profile: SyncProfile,
     keys: BTreeSet<String>,
 }
 
-/// Apply one folder file's text to `profile`.
+/// Apply one folder file's parsed `[folder]` table to `profile`.
 ///
-/// `Ok(None)` when the file has nothing to say. `Err` carries every problem in
+/// `Ok(None)` when the table has nothing to say. `Err` carries every problem in
 /// it, each a full sentence naming the key and the rule; the caller prefixes
 /// the file.
+///
+/// Takes the parsed table rather than the text so [`salvage_keys`] can hand it
+/// one key at a time without re-serializing: the retry has to meet every guard
+/// in here identically, which a second entry point would not guarantee.
 fn overlay(
     profile: &SyncProfile,
-    text: &str,
+    table: &toml::Table,
     is_main: bool,
 ) -> std::result::Result<Option<Applied>, Vec<String>> {
-    let table: toml::Table = match toml::from_str(text) {
-        Ok(table) => table,
-        // `toml`'s Display carries the line, the column and the offending
-        // input. Do not flatten it — it is the whole diagnosis.
-        Err(err) => return Err(vec![format!("is not readable as TOML\n{err}")]),
-    };
-
     let mut problems = Vec::new();
     let mut requested = None;
-    for (key, value) in &table {
+    for (key, value) in table {
         match canonical_key(key).as_str() {
             "folder" => requested = Some(value),
             // The main folder's `[settings]` belongs to keeper-core's layer
@@ -740,6 +861,7 @@ mod tests {
     use super::*;
     use crate::profile::{
         DEFAULT_JOURNAL_TEMPLATE, DEFAULT_LFS_THRESHOLD_BYTES, DEFAULT_RELEASE_TTL_MS,
+        MIN_RELEASE_TTL_MS,
     };
 
     fn profile(root: &Path) -> SyncProfile {
@@ -828,11 +950,13 @@ mod tests {
     }
 
     /// `localPath` specifically: the refusal is not cosmetic, the profile must
-    /// still point where this machine mounted the folder.
+    /// still point where this machine mounted the folder — and since Story
+    /// 56.14 the refused key falls alone instead of taking the legal key beside
+    /// it down with it.
     #[test]
-    fn a_refused_layer_leaves_the_stored_profile_exactly_as_it_was() {
+    fn a_refused_local_path_falls_alone_and_cannot_move_the_folder() {
         let (dir, outcome) = applied(
-            "[folder]\nlocalPath = \"/somewhere/else\"\ntags = [\"kept-out\"]\n",
+            "[folder]\nlocalPath = \"/somewhere/else\"\ntags = [\"work\"]\n",
             &tier(),
         );
         assert_eq!(
@@ -841,10 +965,15 @@ mod tests {
             "the folder cannot move itself"
         );
         assert!(
-            outcome.profile.tags.is_empty(),
-            "a layer with a refused key is dropped whole, not half-applied"
+            !outcome.owned.contains("localPath"),
+            "and a key the tier refused is never owned: {:?}",
+            outcome.owned
         );
-        assert!(outcome.owned.is_empty());
+        assert_eq!(
+            outcome.profile.tags,
+            vec!["work".to_owned()],
+            "while the key beside it stands on its own"
+        );
     }
 
     /// A repository may declare how long its own content stays (Story 56.5,
@@ -898,10 +1027,11 @@ mod tests {
             fault.message
         );
         assert!(fault.path.ends_with(".keeper/keeper.toml"));
-        assert!(
-            outcome.profile.tags.is_empty(),
-            "the `[folder]` half goes with it, so the file is fixed rather than \
-             half-honoured"
+        assert_eq!(
+            outcome.profile.tags,
+            vec!["work".to_owned()],
+            "while the `[folder]` half no longer goes down with a top-level key \
+             it has nothing to do with (Story 56.14)"
         );
     }
 
@@ -1108,6 +1238,114 @@ subfolder = "60-sessions"
         assert!(outcome.profile.tags.is_empty());
     }
 
+    /// A layer that trips one rule keeps the keys it got right (Story 56.14).
+    ///
+    /// Both refusal paths, because they leave [`overlay`] from different
+    /// places: the rule table's `may not set`, and `SyncProfile::validate`'s
+    /// own sentence. Without the fix `overlay` returned `Err` for the whole
+    /// layer, so `outcome.profile` was the stored row untouched — `branch`
+    /// still read `main` and `excludes` still read empty — and a key the author
+    /// had spelled perfectly silently did not take, on every clone that read
+    /// the file.
+    #[test]
+    fn a_layer_that_trips_one_rule_keeps_the_keys_it_got_right() {
+        // The rule table's refusal: `branch` is repository policy and
+        // `localPath` is where this clone mounted the folder, and only the
+        // first is a folder file's to state.
+        let (dir, outcome) = applied(
+            "[folder]\nbranch = \"trunk\"\nlocalPath = \"/somewhere/else\"\n",
+            &tier(),
+        );
+        assert_eq!(
+            outcome.profile.branch, "trunk",
+            "the key that stands on its own is in force"
+        );
+        assert!(
+            outcome.owned.contains("branch"),
+            "and is owned, so the surface disables its control rather than \
+             offering an edit that reverts: {:?}",
+            outcome.owned
+        );
+        assert_eq!(
+            outcome.profile.local_path,
+            dir.path(),
+            "while the refused key changed nothing"
+        );
+        assert!(
+            !outcome.owned.contains("localPath"),
+            "and is not owned: {:?}",
+            outcome.owned
+        );
+        let fault = only_fault(&outcome);
+        assert!(
+            fault.message.contains("localPath"),
+            "the fault still names the key that fell: {}",
+            fault.message
+        );
+
+        // `SyncProfile::validate`'s refusal, one level deeper than the rule
+        // table: a non-zero TTL below the floor is one somebody typed, and it
+        // falls without taking the `excludes` list with it.
+        let (_dir, outcome) = applied(
+            "[folder]\nexcludes = [\"*.psd\"]\nreleaseTtlMs = 500\n",
+            &tier(),
+        );
+        assert_eq!(
+            outcome.profile.excludes,
+            vec!["*.psd".to_owned()],
+            "the well-formed key is in force"
+        );
+        assert!(
+            outcome.owned.contains("excludes"),
+            "and owned: {:?}",
+            outcome.owned
+        );
+        assert_eq!(
+            outcome.profile.release_ttl_ms, DEFAULT_RELEASE_TTL_MS,
+            "the out-of-range one is not, so the stored row's value stands"
+        );
+        assert!(
+            !outcome.owned.contains("releaseTtlMs"),
+            "nor is it owned: {:?}",
+            outcome.owned
+        );
+        let fault = only_fault(&outcome);
+        assert!(
+            fault.message.contains(&MIN_RELEASE_TTL_MS.to_string())
+                && fault.message.contains("500"),
+            "the fault names the floor and the value that missed it: {}",
+            fault.message
+        );
+    }
+
+    /// A layer with no problems is not retried and behaves exactly as it did
+    /// before the salvage existed (Story 56.14).
+    ///
+    /// Without the fix this test passes identically, which is the point of it:
+    /// it pins the untouched path, so the retry stays confined to the failure
+    /// arm rather than quietly becoming the way every profile read applies its
+    /// folder file — one `SyncProfile::validate` per key, on every read, paid
+    /// by files that have nothing wrong with them.
+    #[test]
+    fn a_layer_with_no_problems_applies_whole_and_reports_nothing() {
+        let (_dir, outcome) = applied(
+            "[folder]\nbranch = \"trunk\"\nexcludes = [\"*.psd\"]\nreleaseTtlMs = 3600000\n",
+            &tier(),
+        );
+        assert!(outcome.faults.is_empty(), "{:?}", outcome.faults);
+        assert_eq!(outcome.profile.branch, "trunk");
+        assert_eq!(outcome.profile.excludes, vec!["*.psd".to_owned()]);
+        assert_eq!(outcome.profile.release_ttl_ms, 3_600_000);
+        let expected: BTreeSet<String> = ["branch", "excludes", "releaseTtlMs"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            outcome.owned, expected,
+            "every key the file set is owned, and nothing else"
+        );
+    }
+
     /// No file at all is the ordinary case and says nothing.
     #[test]
     fn a_folder_with_no_file_is_untouched() {
@@ -1259,10 +1497,10 @@ subfolder = "60-sessions"
     ///
     /// The shape that matters is a repository which committed
     /// `releaseTtlMs = 0` — "never release my content" — beside one mistyped
-    /// key. A layer is dropped whole, so the retention the repository asked for
-    /// stops applying and the profile's own 24 h default takes over: a typo in a
-    /// file that travels between clones would otherwise turn "keep everything"
-    /// into "delete after a day" on every machine that reads it.
+    /// key. Since Story 56.14 that retention is salvaged from the broken layer
+    /// rather than discarded with it, but the fault is still recorded, and the
+    /// fault is what the sweep reads: a caller that deletes bytes may not take
+    /// its permissive default from a file its own reader could not agree with.
     #[test]
     fn a_broken_file_makes_this_folders_config_read_as_faulted() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1281,10 +1519,9 @@ subfolder = "60-sessions"
         assert_eq!(only_fault(&outcome).path, file, "the fault names this file");
         assert_eq!(
             outcome.profile.effective_release_ttl_ms(),
-            Some(DEFAULT_RELEASE_TTL_MS),
-            "the committed `releaseTtlMs = 0` went down with the layer, and what \
-             survived is a default that deletes — which is exactly why the sweep \
-             may not read it"
+            None,
+            "the committed `releaseTtlMs = 0` survives the mistyped key beside \
+             it, and the fault below is what holds the sweep closed"
         );
 
         assert!(
@@ -1410,9 +1647,10 @@ subfolder = "60-sessions"
         );
     }
 
-    /// A key the overlay refused is not owned, and neither is the legal key
-    /// beside it: a layer is dropped **whole**, so nothing it named is in force
-    /// and everything it named is still the table's to edit.
+    /// A key the overlay refused is not owned — and since Story 56.14 the legal
+    /// key beside it is, because a layer is no longer dropped whole: what the
+    /// file could not say is still the table's to edit, and what it could say
+    /// is the file's.
     ///
     /// Two layers, because the refusal is per-file and the answer must say so —
     /// a version that gave up on the first refusal would drop the machine
@@ -1442,15 +1680,14 @@ subfolder = "60-sessions"
             "a folder file may not set a machine-local key, so it cannot own \
              one: {owned:?}"
         );
-        assert!(
-            !owned.contains("virtualOverBytes"),
-            "nor the allowed key that shared its refused layer: {owned:?}"
-        );
-        let expected: BTreeSet<String> =
-            ["virtualPatterns"].into_iter().map(str::to_owned).collect();
+        let expected: BTreeSet<String> = ["virtualOverBytes", "virtualPatterns"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
         assert_eq!(
             owned, expected,
-            "and one refused file says nothing about the other"
+            "the allowed key that shared the refused layer is kept, and one \
+             refused file still says nothing about the other"
         );
     }
 

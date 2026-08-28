@@ -400,6 +400,151 @@ async fn a_reader_holding_the_file_open_still_sees_the_content() {
     );
 }
 
+/// A release that gives back nothing reports nothing (Story 56.14).
+///
+/// `rename(2)` replaces ONE directory entry. With a second name on the same
+/// inode the content stays on the disk under that name, so the release is still
+/// correct and still worth doing — the caller asked for THIS name to hold its
+/// pointer, and it now does — and yet not a byte came back.
+///
+/// Without the fix `size_bytes` is the committed pointer's size, so
+/// `keeper-syncd`'s `released 4.0 MB` and Story 56.5's sweep-wide reclaimed
+/// total over-count by the whole file, once per link, while the content is
+/// still sitting on the disk under the other name.
+///
+/// The link count is deliberately **not** a guard, and the first assertion is
+/// what says so: refusing a hard-linked path would be a new refusal for a
+/// request that succeeds. Only the figure changes, to the one that is true.
+///
+/// The sibling name lives in a SECOND temporary directory rather than beside
+/// the file: a link inside the worktree would be an untracked path, and then
+/// `git status` would have an opinion about the fixture instead of about the
+/// release.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_released_hard_linked_file_reports_no_bytes_reclaimed() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let Some((engine, platform)) = engine_for(root, remote.path(), data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let blob = committed_blob(root);
+    let target = root.join("clip.mp4");
+    // Outside the worktree, and on the same filesystem: both directories come
+    // from this machine's one temporary directory, so the link is makeable.
+    let elsewhere = tempfile::tempdir().expect("a directory outside the worktree");
+    let sibling = elsewhere.path().join("clip.mp4.backup");
+    std::fs::hard_link(&target, &sibling)
+        .expect("both temporary directories are on one filesystem, so a hard link is possible");
+
+    let done = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect("a link count is not a guard: the release still happens");
+
+    assert_eq!(done.oid, pointer.oid);
+    assert_eq!(
+        done.size_bytes, 0,
+        "the inode survives under the other name, so this release reclaimed \
+         nothing — and the honest figure is the reclaimed one"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("read the released file"),
+        blob,
+        "the release itself is unchanged: byte for byte the blob git committed"
+    );
+    assert_eq!(
+        std::fs::read(&sibling).expect("read the hard-linked sibling"),
+        content,
+        "and the bytes this release did not reclaim are exactly where they were"
+    );
+    assert!(
+        ledger_paths(&platform).is_empty(),
+        "the ledger no longer claims this machine holds the content under this name"
+    );
+}
+
+/// A filesystem remote whose repository ALSO commits a `.lfsconfig` naming no
+/// addressable LFS server can still release (Story 56.14).
+///
+/// The `.lfsconfig` precedence is unchanged: a file that names a server is
+/// still asked first, and that server's answer still decides. What the fix adds
+/// is the case where there is no server to ask — the remote's own object store
+/// is then asked instead, which is a genuine, size-verified, per-object answer,
+/// and it is fail-closed the same way.
+///
+/// Without the fix the file alone sends this profile past the filesystem-remote
+/// branch, `lfs_access` then refuses to derive an endpoint from a path remote,
+/// and every candidate refuses `UnprovenOnRemote` forever — so such a folder
+/// could never release anything at all, on any pass, having already paid a
+/// whole-file hash to get there.
+///
+/// The file is **committed**, and committed before the fixture's own pointer,
+/// because that is the shape a real checkout has: an owner who set an LFS
+/// option once and replicates it to every peer.
+#[tokio::test]
+async fn a_committed_lfsconfig_naming_no_server_still_releases_from_a_path_remote() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+
+    // A perfectly ordinary transfer setting and NO `lfs.url`: the file is in
+    // force, and there is nothing in it any endpoint can be derived from.
+    std::fs::write(
+        root.join(".lfsconfig"),
+        "[lfs]\n\tconcurrenttransfers = 3\n",
+    )
+    .expect("write a .lfsconfig that names no LFS server");
+    {
+        let repo = git::repo::open(root, false).expect("open the fixture repository");
+        commit(
+            &repo,
+            remote.path(),
+            &git::commit::StagedChange {
+                added: vec![PathBuf::from(".lfsconfig")],
+                ..Default::default()
+            },
+        );
+    }
+
+    let (pointer, _content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let Some((engine, platform)) = engine_for(root, remote.path(), data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let blob = committed_blob(root);
+    let done = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect("no server to ask, so the remote's own store is asked — and it holds the object");
+
+    assert_eq!(done.oid, pointer.oid);
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read the released file"),
+        blob,
+        "byte for byte the blob git committed"
+    );
+    assert!(
+        ledger_paths(&platform).is_empty(),
+        "and the ledger no longer claims this machine holds the content"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The refusals that need the worktree read
 // ---------------------------------------------------------------------------

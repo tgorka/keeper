@@ -1214,6 +1214,32 @@ impl SyncProfile {
                 "unknown commit subject placeholder {{{unknown}}}; keeper knows {known}"
             )));
         }
+        // Refused here for the reason above it (Story 56.14): the box the
+        // person typed into is the only place a bad glob can be shown to them.
+        //
+        // `VirtualPolicy::compile` states that a malformed pattern is "a hard
+        // `SyncError::Config` naming its source … never a silently dropped
+        // pattern" (FR-329), and until this story `validate` never compiled the
+        // list — so `scans/[` was saveable, and the folder then failed its next
+        // sync, its next verify and its next release with a config error the
+        // person could not connect to what they typed. Before the Settings form
+        // grew these controls the field was reachable only from a daemon config
+        // or a hand-edited TOML, where the next command says the same thing
+        // immediately; the form is what made the distance matter.
+        //
+        // The whole list, and the entry's own text in the message, because a
+        // list is what the field holds and "one of these is wrong" is not
+        // actionable. `PatternSet::anchored` is what `compile` itself calls, so
+        // this cannot accept something `compile` will later refuse — and it is
+        // the only glob field checked here: `excludes` and `lfsNever` predate
+        // this and are validated where they are compiled, and widening the bar
+        // under a stored profile that already carries one would refuse to LOAD
+        // a folder that works today.
+        //
+        // It does not refuse an empty list — that is the documented spelling of
+        // "this machine says nothing" — nor a list of only `!` protections,
+        // which is a policy about exceptions and now compiles as one.
+        crate::lfs::virtual_policy::check_patterns(&self.virtual_patterns)?;
         if let Some(notes) = &self.notes {
             notes.validate()?;
         }
@@ -1541,6 +1567,42 @@ mod tests {
         assert!(
             err.to_string().contains("{Profile}"),
             "the message must name the placeholder: {err}"
+        );
+    }
+
+    /// A malformed `virtualPatterns` glob is refused at the box the person
+    /// typed it into, and the message quotes the entry (Story 56.14, FR-329).
+    ///
+    /// Without the fix `validate` never compiled the list, so this reads
+    /// `Ok(())`: the Settings form accepted a glob the engine refuses at run
+    /// time, nowhere near the field, and the folder then failed its next sync,
+    /// its next verify and its next release with a config error the person
+    /// could not connect to what they had typed.
+    #[test]
+    fn a_malformed_virtual_pattern_is_refused_where_the_person_typed_it() {
+        let mut p = profile();
+        p.virtual_patterns = vec!["scans/[".to_owned()];
+        let err = p
+            .validate()
+            .expect_err("an unclosed character class must not be saveable");
+        assert!(
+            err.to_string().contains("scans/["),
+            "the message must quote the entry so the form can render it under \
+             the field: {err}"
+        );
+
+        // Both of these are things the form legitimately sends, and refusing
+        // either would make the field unusable for the shapes it exists for.
+        p.virtual_patterns = Vec::new();
+        assert!(
+            p.validate().is_ok(),
+            "an empty list is the documented spelling of `this machine says \
+             nothing`"
+        );
+        p.virtual_patterns = vec!["!30-masters/**".to_owned()];
+        assert!(
+            p.validate().is_ok(),
+            "and a list of only protections is a policy about exceptions"
         );
     }
 

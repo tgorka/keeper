@@ -51,6 +51,20 @@ fn origin_and_clone(root: &Path) -> (PathBuf, PathBuf) {
     let work = root.join("work");
     std::fs::create_dir_all(&work).expect("work directory");
     run(root, &["init", "-q", "-b", "main", "work"]);
+    // Hermetic against the host's own git config. A global `core.hooksPath`
+    // (this box has one: `~/.config/git/hooks`) makes every repo-local
+    // `.git/hooks/*` inert, so the sanity check below would find nothing to
+    // block the plain push and the test would pass while proving nothing.
+    // A repository-local `core.hooksPath` outranks the global one, so pointing
+    // it at this repository's own hooks directory restores git's default
+    // behaviour whatever the host believes. It is also the honest fixture for
+    // this defect: the field incident was a repository whose hooks git *did*
+    // intend to run. keeper still overrides it, because `GitCli` passes
+    // `-c core.hooksPath=<sentinel>` on the command line, which outranks
+    // repo-local config in turn — so nothing here softens the real assertion.
+    let hooks = work.join(".git").join("hooks");
+    let hooks_arg = hooks.to_str().expect("a tempdir path is UTF-8");
+    run(&work, &["config", "core.hooksPath", hooks_arg]);
     let origin_arg = origin.to_str().expect("a tempdir path is UTF-8");
     run(&work, &["remote", "add", "origin", origin_arg]);
     std::fs::write(work.join("a.txt"), b"one\n").expect("write");

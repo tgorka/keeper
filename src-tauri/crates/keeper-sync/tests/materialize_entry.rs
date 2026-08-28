@@ -178,6 +178,31 @@ fn download_rows(platform: &TestPlatform) -> Vec<(i64, Option<String>, Option<i6
     rows.map(|row| row.expect("row")).collect()
 }
 
+/// A second connection to the very `sync.db` the engine wrote — [`download_rows`]'
+/// approach, for the other table this file now has claims about.
+fn ledger_conn(platform: &TestPlatform) -> rusqlite::Connection {
+    db::open(&platform.data_dir().expect("data dir")).expect("open sync.db")
+}
+
+/// Every `materialized` row this profile still holds, whole.
+///
+/// The rows rather than the paths, because the claims below are about the two
+/// clocks — `at_ms` and `last_used_ms` — and which arm of
+/// `db::observe_materialized` moved which.
+fn ledger_rows(platform: &TestPlatform) -> Vec<db::MaterializedRow> {
+    db::materialized_rows(&ledger_conn(platform), "01JMATERIALIZE").expect("read the ledger")
+}
+
+/// The one `materialized` row for `path`, or a failure naming what is there
+/// instead.
+fn ledger_row(platform: &TestPlatform, path: &str) -> db::MaterializedRow {
+    let rows = ledger_rows(platform);
+    rows.iter()
+        .find(|row| row.path == path)
+        .unwrap_or_else(|| panic!("the ledger must hold a row for {path}; it holds {rows:?}"))
+        .clone()
+}
+
 /// The object is here, so the content is published inline — and the path reads
 /// clean afterwards.
 ///
@@ -268,6 +293,106 @@ fn an_object_already_in_the_store_is_published_and_the_tree_stays_clean() {
         "",
         "the real `git status` reports nothing about a materialized LFS path: \
          pointer blob, worktree stat, clean status"
+    );
+}
+
+/// The already-held answer records that **this machine holds the content**, and
+/// records it as a *use* rather than as an arrival (Story 56.14, FR-334).
+///
+/// Without the fix this arm returned before any ledger write, so
+/// `db::materialized_rows` — the release sweep's whole candidate list — reads
+/// **no row at all** for the one path a human explicitly named: no candidate,
+/// no recorded use, and therefore a path the release clocks cannot see. The
+/// first `ledger_row` call below finds nothing and panics.
+///
+/// # Why the fixture publishes nothing first
+///
+/// [`an_object_already_in_the_store_is_published_and_the_tree_stays_clean`]
+/// reaches this arm too, but only on its *second* call — after the publish arm
+/// has already written a row through `db::remember_materialized`. An assertion
+/// there cannot tell "this arm wrote the row" from "the previous call did", so
+/// the row here has to be one nothing else could have written: the worktree
+/// holds four mebibytes of real content that keeper never published, which is
+/// `hydrate::plan`'s documented same-length tie and exactly the state a manual
+/// `git lfs pull`, a pendrive copy or a second profile sharing the store leaves
+/// behind.
+///
+/// # Why `observe_materialized` and not `remember_materialized`
+///
+/// This arm does not know *when* the content landed — it found it there — so it
+/// must not claim it landed now. `at_ms` standing still across the second call
+/// while `last_used_ms` moves is that distinction, asserted: a
+/// `remember_materialized` here would push `at_ms` forward on every read and no
+/// TTL measured from it could ever mature.
+#[test]
+fn the_already_held_answer_records_the_use_without_restarting_the_arrival_clock() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let pointer = seed(root);
+    // Real content of exactly the committed pointer's length, standing where the
+    // pointer text was: `hydrate::plan`'s length tie, and the shape `git lfs
+    // pull` leaves. Nothing keeper does wrote this, so nothing but the arm under
+    // test can account for a ledger row afterwards.
+    std::fs::write(root.join("clip.mp4"), vec![9u8; CONTENT_BYTES as usize])
+        .expect("plant content keeper never published");
+
+    let data = tempfile::tempdir().expect("data dir");
+    let Some((engine, platform)) = engine_for(root, data.path()) else {
+        return;
+    };
+    assert!(
+        ledger_rows(&platform).is_empty(),
+        "the fixture must start with an empty ledger, or the row below proves nothing"
+    );
+    let landed = platform.now_ms();
+
+    let held = engine
+        .materialize_entry("01JMATERIALIZE", "clip.mp4")
+        .expect("the content is here, so this cannot refuse");
+    assert_eq!(
+        held.outcome,
+        MaterializeOutcome::AlreadyMaterialized,
+        "content of the committed pointer's own length is already here"
+    );
+    assert_eq!(held.oid, pointer.oid);
+    assert_eq!(held.unit_id, None);
+
+    let first = ledger_row(&platform, "clip.mp4");
+    assert_eq!(
+        first.at_ms, landed,
+        "the arm that found the content writes the row the sweep needs"
+    );
+    assert_eq!(
+        first.last_used_ms,
+        Some(landed),
+        "and stamps the use clock, because somebody just asked for this path"
+    );
+
+    // A minute later, and the same question again.
+    platform.advance_ms(60_000);
+    let again = engine
+        .materialize_entry("01JMATERIALIZE", "clip.mp4")
+        .expect("asking twice is not an error");
+    assert_eq!(again.outcome, MaterializeOutcome::AlreadyMaterialized);
+
+    let second = ledger_row(&platform, "clip.mp4");
+    assert_eq!(
+        second.at_ms, first.at_ms,
+        "`at_ms` is when content for this path last LANDED, and nothing landed: \
+         a writer that moved it would restart every TTL the sweep measures from it"
+    );
+    assert_eq!(
+        second.last_used_ms,
+        Some(landed + 60_000),
+        "`last_used_ms` is when it was last read through keeper, and it just was"
+    );
+    assert_eq!(
+        ledger_rows(&platform).len(),
+        1,
+        "one path, one row: the conflict arm updates rather than inserting"
     );
 }
 
@@ -443,6 +568,22 @@ fn enqueue_download(platform: &TestPlatform, oid: &str, size: u64) -> i64 {
     .expect("queue a background download")
 }
 
+/// Name a queued unit, the way `materialize_pending` names the rows it queues.
+///
+/// [`enqueue_download`]'s companion rather than an argument to it, for
+/// `db::label_unit`'s own reason: the label says which path a transfer will
+/// deliver, and `materialize_landed` defers to the next whole-tree sweep for an
+/// unlabelled row. A claim about what a drained download PUBLISHES is therefore
+/// a claim about a labelled row.
+///
+/// `Engine::backfill_labels` would name it too, and that is exactly why the
+/// fixture does not lean on it: it runs at most **once per profile per
+/// process**, so any earlier drain in the same test would leave the row
+/// nameless and quietly turn the assertion below into one about nothing.
+fn label_download(platform: &TestPlatform, unit: i64, path: &str) {
+    db::label_unit(&ledger_conn(platform), unit, path).expect("name the queued unit");
+}
+
 /// One `Push` unit, queued the way a local edit queues one.
 fn enqueue_push(platform: &TestPlatform) -> i64 {
     let conn = db::open(&platform.data_dir().expect("data dir")).expect("open sync.db");
@@ -536,6 +677,116 @@ async fn a_one_shot_request_drains_what_it_queued_and_lands_the_bytes() {
         porcelain(root),
         "",
         "and the path the drain published reads clean"
+    );
+}
+
+/// A queued download the local store can already satisfy is published **without
+/// a transfer** (Story 56.14).
+///
+/// Without the fix that row went on to read `.lfsconfig`, resolve an endpoint
+/// and spend a batch round trip re-downloading content already on this disk. A
+/// pending `LfsDownload` row outlives its reason routinely: the bytes arrive by
+/// a pendrive copy, by a second profile sharing this store, by a manual `git lfs
+/// pull`, or by `materialize_entry`'s own inline publish, which publishes
+/// straight from the store and leaves the covering row standing. On a metered or
+/// slow link that is exactly the transfer the request verb exists to avoid.
+///
+/// # What the assertion proves, and what it does not
+///
+/// `held.mp4`'s object is in **this machine's** store and in no remote store
+/// anywhere, so a real download of it cannot succeed: `lfs::local::transfer`
+/// from a filesystem remote that does not hold the object fails, and without the
+/// gate the unit parks with the worktree still holding pointer text. So the
+/// assertion that `held.mp4` holds its four mebibytes — and that its row is gone
+/// rather than rescheduled — can only be satisfied by a publish that skipped the
+/// download leg. That is the whole claim.
+///
+/// It does **not** prove anything about the HTTP path: this fixture's remote is a
+/// filesystem store, so what a regression here would have spent is
+/// `copy_lfs_object`'s file copy rather than an endpoint resolution and a batch
+/// POST. The gate is common to both — it precedes the `.lfsconfig` read — and
+/// this is the arrangement in which "a transfer would have failed" is a fact
+/// rather than a count somebody has to trust.
+///
+/// # Why the drain is driven by a request for a *different* path
+///
+/// A request for `held.mp4` itself would never reach the transfer leg:
+/// `materialize_held` finds the object in the store and publishes inline, which
+/// is the arm [`an_object_already_in_the_store_is_published_and_the_tree_stays_clean`]
+/// covers. So the fixture asks for `clip.mp4`, whose object really is only
+/// upstream, and `held.mp4`'s background row is claimed in the same batch — which
+/// is also how the defect was reached in production, one row among many.
+#[tokio::test]
+async fn a_queued_download_the_store_already_holds_costs_no_transfer() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let remote = tempfile::tempdir().expect("remote");
+    let data = tempfile::tempdir().expect("data dir");
+    let root = work.path();
+    let Some((engine, platform, requested)) =
+        remote_fixture(root, remote.path(), data.path(), true)
+    else {
+        return;
+    };
+
+    // A second tracked path whose object is in THIS machine's store and nowhere
+    // else. Distinct filler bytes, so the assertion below cannot be satisfied by
+    // `clip.mp4`'s content arriving at the wrong path.
+    let local = LfsStore::in_git_dir(root.join(".git"));
+    let (oid, size) = local
+        .insert_streaming(std::io::Cursor::new(vec![7u8; CONTENT_BYTES as usize]))
+        .expect("insert the object into THIS machine's store");
+    let held = Pointer::new(oid, size);
+    std::fs::write(root.join("held.mp4"), held.render()).expect("check out the pointer");
+    commit(
+        &git::repo::open(root, false).expect("open the fixture repository"),
+        &git::commit::StagedChange {
+            added: vec![std::path::PathBuf::from("held.mp4")],
+            ..Default::default()
+        },
+    );
+    assert!(
+        !LfsStore::in_git_dir(remote.path()).contains(&held.oid, held.size),
+        "the remote must NOT hold this object: a transfer that could succeed \
+         would make the assertion below pass either way"
+    );
+
+    // Queued as a background scan queues one — no urgency — and named, because
+    // `materialize_landed` defers an unlabelled row to the next whole-tree sweep
+    // and a claim about what a drain publishes has to be a claim about a row that
+    // says which path it is for.
+    let unit = enqueue_download(&platform, &held.oid, held.size);
+    label_download(&platform, unit, "held.mp4");
+
+    let done = engine
+        .materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli)
+        .await
+        .expect("the remote holds the requested object");
+    assert_eq!(
+        done.outcome,
+        MaterializeOutcome::Materialized,
+        "the requested path is the drain's reason for running at all"
+    );
+    assert_eq!(done.oid, requested.oid);
+
+    assert_eq!(
+        std::fs::read(root.join("held.mp4")).expect("read the published file"),
+        vec![7u8; CONTENT_BYTES as usize],
+        "the background row was satisfied out of the store it was already in — \
+         a real download of this object cannot succeed anywhere in this fixture"
+    );
+    assert!(
+        download_rows(&platform).is_empty(),
+        "and both rows are gone: `db::complete` deletes a drained unit, so the \
+         work is retired rather than parked behind a backoff"
+    );
+
+    // The real `git` binary agrees about both published paths, deciding on the
+    // stat rather than on a content comparison — see `stamp_index_forward`.
+    stamp_index_forward(root);
+    assert_eq!(
+        porcelain(root),
+        "",
+        "and neither published path reads modified"
     );
 }
 

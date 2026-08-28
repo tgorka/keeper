@@ -383,16 +383,34 @@ mod tests {
     /// directories exactly as `PATH` is. Follows `keeper-syncd`'s
     /// `find_executable` fixtures: a script, a mode, a temp dir.
     ///
-    /// Writing a program and then running it is racy in a multithreaded
-    /// process, so see [`settled`] for what the tests do about it.
+    /// The script is written under a scratch name, given its mode, and only
+    /// then `rename`d onto the path a probe will execute. `rename(2)` binds a
+    /// *fresh* inode to that name, and no descriptor anywhere holds it open, so
+    /// the exec path is never the file some concurrent `fork` inherited a write
+    /// handle to. Writing straight to the exec path — or truncating and
+    /// rewriting it in place — leaves the executed inode and the written inode
+    /// the same one, which is precisely the `ETXTBSY` window [`settled`]
+    /// describes; a rename closes the window rather than waiting it out.
     fn fake_git(root: &Path, dir: &str, body: &str, mode: u32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+
         let bin = root.join(dir);
         std::fs::create_dir_all(&bin).expect("fixture dir");
         let program = bin.join("git");
-        std::fs::write(&program, body).expect("fixture script");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode))
+        // Unique per call, so two fixtures never share a staging name.
+        let staging = bin.join(format!(
+            ".git.staging.{}",
+            NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        // `fs::write` opens, writes and closes before it returns: the write
+        // handle is gone by the time the mode and the rename land.
+        std::fs::write(&staging, body).expect("fixture script");
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(mode))
             .expect("fixture mode");
+        std::fs::rename(&staging, &program).expect("publish the fixture");
         program
     }
 

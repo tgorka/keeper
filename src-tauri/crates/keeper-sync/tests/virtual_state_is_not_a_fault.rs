@@ -428,6 +428,25 @@ async fn a_thousand_authorized_virtual_paths_are_not_a_fault() {
 
 /// One pointer the policy does not authorize, standing in the same folder as a
 /// thousand it does, is the **only** row reported.
+///
+/// # Why this one folder is `LfsMode::Materialize` (Story 56.14)
+///
+/// Because the per-path policy is the ONLY thing that can authorize a path in
+/// that mode, which is what this test is about. This file's `profile` helper
+/// builds a `PointerOnly` folder, and since story 56.14 that mode is itself a
+/// folder-wide authorization in `Engine::verify` — every tracked path in a
+/// pointer-only folder may hold nothing but its pointer, which is the whole
+/// meaning of the mode and is already how `materialize_pending`,
+/// `release_mode_gate` and `release_path_gate` treat it. So under the helper's
+/// own profile there is no such thing as an unauthorized path and this test had
+/// nothing left to assert.
+///
+/// `Materialize` is also the more valuable configuration to pin: it is the
+/// default, and it is the one story 56.10 made the policy load-bearing for.
+/// The three facts the mode does NOT supply — the index carrying the committed
+/// pointer, the object being genuinely absent, and the remote still holding it
+/// — are asserted by the sibling tests below and by
+/// `a_truncated_object_is_damage_even_in_a_pointer_only_folder`.
 #[tokio::test]
 async fn the_unauthorized_path_is_the_only_row_reported() {
     let work = tempfile::tempdir().expect("tempdir");
@@ -438,7 +457,9 @@ async fn the_unauthorized_path_is_the_only_row_reported() {
     };
     let lost = add_unauthorized(root, remote.path());
     let data = tempfile::tempdir().expect("data dir");
-    let engine = engine_for(root, remote.path(), data.path());
+    let mut asking = profile(root, remote.path());
+    asking.lfs_mode = LfsMode::Materialize;
+    let engine = engine_with(asking, data.path());
 
     let report = engine.verify(PROFILE_ID).await.expect("verify");
 
@@ -731,6 +752,112 @@ async fn an_object_present_at_the_wrong_length_stays_reported() {
         "a short blob under the right name is not an absent object"
     );
     assert_eq!(report.virtual_paths, 3);
+}
+
+/// A folder whose `lfsMode` is `pointerOnly` excuses its absent objects with no
+/// policy of any kind (Story 56.14).
+///
+/// The mode is the third way a folder can say "these bytes are deliberately
+/// elsewhere", and it says it about every tracked path at once — its own doc
+/// calls it leaving content as a pointer on purpose, and both arrival arms
+/// `continue` past the publish for it. Having to restate the whole folder as a
+/// per-path policy was the only spelling of "yes, I meant it" the product
+/// offered.
+///
+/// Without the fix `excusable` is false here, because this folder's policy tier
+/// is `Unset`: `indexed` is then never read, `committed` is false for every
+/// path, and verify produces the same wall of `LFS object <oid> is missing
+/// locally` rows story 56.6 existed to end — for the one configuration whose
+/// whole purpose is leaving content as a pointer.
+///
+/// The fixture's committed `.keepervirtual` is REMOVED from the worktree, which
+/// is the copy `VirtualPolicy::compile` reads: left standing, the pattern file
+/// would earn the excuse on its own and the mode would prove nothing.
+#[tokio::test]
+async fn a_pointer_only_folder_excuses_its_pointers_with_no_policy_at_all() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    let remote = tempfile::tempdir().expect("remote");
+    let Some(seeded) = seed(root, remote.path(), 4) else {
+        return;
+    };
+    std::fs::remove_file(root.join(VIRTUAL_PATTERN_FILE)).expect("leave no pattern file standing");
+
+    let mut pointers_only = profile(root, remote.path());
+    pointers_only.lfs_mode = LfsMode::PointerOnly;
+    assert!(
+        pointers_only.virtual_patterns.is_empty(),
+        "the mode has to be the only thing authorizing anything, or this test \
+         asserts nothing about it"
+    );
+
+    let data = tempfile::tempdir().expect("data dir");
+    let engine = engine_with(pointers_only, data.path());
+    let report = engine.verify(PROFILE_ID).await.expect("verify");
+
+    assert_eq!(
+        report.bad,
+        Vec::<(String, String)>::new(),
+        "the designed state of every path in this folder is not damage"
+    );
+    assert_eq!(
+        report.virtual_paths,
+        seeded.virtual_paths.len() as u64,
+        "and every excused path is counted, through the very field a policy \
+         would have incremented"
+    );
+}
+
+/// ...and the mode replaces exactly **one** of the four facts.
+///
+/// A truncated object is damage, not a virtual path. `LfsStore::contains` is
+/// length-verified precisely because a `kill -9` during a write, or a
+/// half-restored backup, leaves a correctly-named file holding a prefix of the
+/// content. The mode answers the policy question — may this path's content stay
+/// away — and nothing else, so `committed`, `absent` and `elsewhere` are still
+/// earned per path in a `pointerOnly` folder with no policy at all.
+///
+/// Without the fix the `bad` assertion here passes for the wrong reason: a
+/// policy-free `pointerOnly` folder is not excusable at all, so all four paths
+/// are reported and the truncated one is merely lost in the wall. It is the
+/// `virtual_paths` assertion that tells the two apart — it reads `0` without
+/// the fix.
+#[tokio::test]
+async fn a_truncated_object_is_damage_even_in_a_pointer_only_folder() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    let remote = tempfile::tempdir().expect("remote");
+    let Some(seeded) = seed(root, remote.path(), 4) else {
+        return;
+    };
+    std::fs::remove_file(root.join(VIRTUAL_PATTERN_FILE)).expect("leave no pattern file standing");
+
+    let truncated = seeded.pointers[1].clone();
+    let object = LfsStore::in_git_dir(root.join(".git")).object_path(&truncated.oid);
+    std::fs::create_dir_all(object.parent().expect("the shard directories")).expect("shards");
+    std::fs::write(&object, b"a prefix of the content and nothing more").expect("truncate");
+
+    let mut pointers_only = profile(root, remote.path());
+    pointers_only.lfs_mode = LfsMode::PointerOnly;
+
+    let data = tempfile::tempdir().expect("data dir");
+    let engine = engine_with(pointers_only, data.path());
+    let report = engine.verify(PROFILE_ID).await.expect("verify");
+
+    assert_eq!(
+        report.bad,
+        vec![(
+            seeded.virtual_paths[1].clone(),
+            format!("LFS object {} is missing locally", truncated.oid)
+        )],
+        "a short blob under the right name is not an absent object, whatever the \
+         folder's mode says about the rest of it"
+    );
+    assert_eq!(
+        report.virtual_paths, 3,
+        "the other three are excused by the mode, so the excuse is live and the \
+         row above is a fact this folder still earned"
+    );
 }
 
 // ---------------------------------------------------------------------------
