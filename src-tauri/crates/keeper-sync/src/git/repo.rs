@@ -1228,6 +1228,31 @@ impl gix::progress::Progress for ScannedEntries {
     fn message(&self, _level: gix::progress::MessageLevel, _message: String) {}
 }
 
+/// Bytes sitting in the LFS scratch directory right now.
+///
+/// A conversion in flight is a temp file growing in here, so a total that
+/// changes between two looks means the filter is working. Summed rather than
+/// counted because one file growing is the case that matters, and a count would
+/// stay at 1 for the entire 550 s it takes.
+///
+/// Errors are silence, not zero-and-panic: an unreadable or absent scratch
+/// directory means this signal has nothing to say, and the other two decide.
+/// The cost is one `read_dir` per poll over a directory that holds a handful of
+/// entries, against a poll measured in seconds.
+fn scratch_bytes(dir: Option<&Path>) -> u64 {
+    let Some(dir) = dir else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 /// Abandons a status walk that has stopped making progress.
 ///
 /// # Why a watchdog and not a total timeout
@@ -1240,11 +1265,30 @@ impl gix::progress::Progress for ScannedEntries {
 ///
 /// # What counts as progress
 ///
-/// Two signals, either of which resets the clock: an item coming out of the
-/// walk, and gix's own count of index entries compared (see
-/// [`ScannedEntries`]). The second is load-bearing — a walk with nothing left
-/// to report is still working, and for most of a large clean tree that is the
-/// only signal there is.
+/// Three signals, any of which resets the clock: an item coming out of the
+/// walk, gix's own count of index entries compared (see [`ScannedEntries`]),
+/// and bytes accumulating in the LFS scratch directory.
+///
+/// The second is load-bearing for a clean tree — a walk with nothing left to
+/// report is still working, and for most of a large index that is the only
+/// signal there is.
+///
+/// The third is load-bearing for ONE BIG FILE, and it is the reason this guard
+/// stopped killing walks on a folder full of video. gix increments its entry
+/// counter *after* the conversion an entry needed, so a single 5 GB file
+/// streaming through the filter moves neither of the first two signals for its
+/// whole duration. Measured on the field folder 2026-08-28: five entries of
+/// 4.3-5.3 GB each, ~9.6 MB/s on that USB volume, so 450-550 s per file with a
+/// 600 s limit — and under any competing load, every pass died on them. Eight
+/// consecutive walks were abandoned "after 46 entries and 1450s", each having
+/// done 850 s of honest work first, and because the pass never completed the
+/// objects were never published and the folder never drained.
+///
+/// Watching the scratch bytes is not a proxy for that work; it IS that work.
+/// keeper's filter writes the object it is hashing into `.git/lfs/tmp` before
+/// renaming it into the store, so the byte total moving means the conversion is
+/// moving. A deadlocked filter writes nothing, which is the distinction the
+/// first two signals cannot make and this one can.
 ///
 /// # Why it interrupts rather than just reporting
 ///
@@ -1263,11 +1307,13 @@ impl StatusWatchdog {
         interrupt: std::sync::Arc<AtomicBool>,
         heartbeat: std::sync::Arc<AtomicU64>,
         scanned: gix::progress::StepShared,
+        scratch: Option<PathBuf>,
     ) -> Self {
         Self::arm_with(
             interrupt,
             heartbeat,
             scanned,
+            scratch,
             WATCHDOG_POLL,
             STATUS_SILENCE_LIMIT,
         )
@@ -1280,6 +1326,7 @@ impl StatusWatchdog {
         interrupt: std::sync::Arc<AtomicBool>,
         heartbeat: std::sync::Arc<AtomicU64>,
         scanned: gix::progress::StepShared,
+        scratch: Option<PathBuf>,
         poll: Duration,
         limit: Duration,
     ) -> Self {
@@ -1295,6 +1342,7 @@ impl StatusWatchdog {
             .spawn(move || {
                 let mut last_beat = 0u64;
                 let mut last_scan = 0usize;
+                let mut last_moved = scratch_bytes(scratch.as_deref());
                 let mut quiet = Duration::ZERO;
                 loop {
                     std::thread::sleep(poll);
@@ -1307,13 +1355,13 @@ impl StatusWatchdog {
                         return;
                     }
                     let scan = watcher_scanned.load(Ordering::Relaxed);
-                    // Either signal is progress. The second one is the reason
-                    // this guard stopped killing healthy walks: a pass whose
-                    // dirty entries are exhausted emits nothing for the rest of
-                    // the index while comparing tens of thousands of files.
-                    if beat != last_beat || scan != last_scan {
+                    let moved = scratch_bytes(scratch.as_deref());
+                    // Any signal is progress. The second is why a clean tree's
+                    // quiet pass survives; the third is why a 5 GB file does.
+                    if beat != last_beat || scan != last_scan || moved != last_moved {
                         last_beat = beat;
                         last_scan = scan;
+                        last_moved = moved;
                         quiet = Duration::ZERO;
                         continue;
                     }
@@ -1322,6 +1370,7 @@ impl StatusWatchdog {
                         tracing::error!(
                             items = beat,
                             scanned = scan,
+                            scratch_bytes = moved,
                             silent_for_s = quiet.as_secs(),
                             "the status walk stopped making progress; abandoning it"
                         );
@@ -1334,6 +1383,7 @@ impl StatusWatchdog {
                         tracing::info!(
                             items = beat,
                             scanned = scan,
+                            scratch_bytes = moved,
                             silent_for_s = quiet.as_secs(),
                             "the status walk is still working on one file"
                         );
@@ -1665,10 +1715,15 @@ fn status_paths_excluding(
     // so a pass with nothing left to report still counts as alive. See
     // `ScannedEntries` for the 61 healthy walks that were killed without it.
     let scanned: gix::progress::StepShared = std::sync::Arc::new(AtomicUsize::new(0));
+    // Where keeper's own filter writes what it is hashing. The walk's third
+    // liveness signal, and the only one that moves while one 5 GB entry
+    // converts: see [`StatusWatchdog`].
+    let scratch = crate::lfs::store::LfsStore::in_git_dir(repo.git_dir()).tmp_dir();
     let watchdog = StatusWatchdog::arm(
         std::sync::Arc::clone(&interrupt),
         std::sync::Arc::clone(&heartbeat),
         std::sync::Arc::clone(&scanned),
+        Some(scratch),
     );
 
     let platform = repo
@@ -2507,6 +2562,7 @@ mod tests {
             Arc::clone(&interrupt),
             Arc::clone(&heartbeat),
             scan_counter(),
+            None,
             FAST_POLL,
             FAST_LIMIT,
         );
@@ -2533,6 +2589,78 @@ mod tests {
     /// entries ran out, roughly 1 400 s before the pass would have finished,
     /// and the guard read that as a deadlocked filter. Nothing beats here at
     /// all — only gix's own count of entries compared moves.
+    /// One 5 GB file converting is not a stall (2026-08-28).
+    ///
+    /// The field shape this exists for: the walk reaches a 4.3-5.3 GB LFS entry,
+    /// keeper's filter streams it at ~9.6 MB/s, and for the 450-550 s that takes
+    /// gix emits nothing and increments no entry counter, because it counts an
+    /// entry *after* its conversion. Eight consecutive passes on that folder
+    /// were abandoned with 600 s of "silence" while the filter was writing the
+    /// whole time, so the objects never published and the folder never drained.
+    ///
+    /// Here the only thing moving is bytes in the scratch directory — no beats,
+    /// no scans, exactly as production looked.
+    #[test]
+    fn a_filter_streaming_one_huge_file_is_not_a_stall() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scratch = dir.path().join("lfs-tmp");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        let blob = scratch.join("keeper-lfs-abc123");
+        std::fs::write(&blob, b"").expect("open the scratch file");
+
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let _watchdog = StatusWatchdog::arm_with(
+            Arc::clone(&interrupt),
+            Arc::clone(&heartbeat),
+            scan_counter(),
+            Some(scratch.clone()),
+            FAST_POLL,
+            FAST_LIMIT,
+        );
+
+        // Several times the silence limit, spent only growing the temp file.
+        let until = Instant::now() + FAST_LIMIT * 4;
+        let mut written = 0u64;
+        while Instant::now() < until {
+            written += 1;
+            std::fs::write(&blob, vec![b'x'; written as usize * 512]).expect("grow the scratch");
+            std::thread::sleep(FAST_POLL / 2);
+        }
+
+        assert!(
+            !interrupt.load(Ordering::Relaxed),
+            "a filter writing bytes is working, however long one file takes"
+        );
+    }
+
+    /// And the guard still fires when the scratch directory is there but nothing
+    /// is being written into it — a filter that deadlocked rather than one that
+    /// is slow. Same fixture as the test above, minus the writing.
+    #[test]
+    fn a_dead_filter_with_a_scratch_dir_is_still_interrupted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scratch = dir.path().join("lfs-tmp");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        std::fs::write(scratch.join("keeper-lfs-abc123"), vec![b'x'; 4096]).expect("scratch file");
+
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let _watchdog = StatusWatchdog::arm_with(
+            Arc::clone(&interrupt),
+            Arc::new(AtomicU64::new(0)),
+            scan_counter(),
+            Some(scratch),
+            FAST_POLL,
+            FAST_LIMIT,
+        );
+
+        std::thread::sleep(FAST_LIMIT * 3);
+        assert!(
+            interrupt.load(Ordering::Relaxed),
+            "a scratch file that stopped growing is a stalled filter, not work"
+        );
+    }
+
     #[test]
     fn a_walk_that_only_scans_is_never_interrupted() {
         let interrupt = Arc::new(AtomicBool::new(false));
@@ -2541,6 +2669,7 @@ mod tests {
             Arc::clone(&interrupt),
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&scanned),
+            None,
             FAST_POLL,
             FAST_LIMIT,
         );
@@ -2608,6 +2737,7 @@ mod tests {
             Arc::clone(&interrupt),
             Arc::clone(&heartbeat),
             scan_counter(),
+            None,
             FAST_POLL,
             FAST_LIMIT,
         );
@@ -2634,6 +2764,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
             scan_counter(),
+            None,
         );
         assert_eq!(watchdog.beat(), 1);
         assert_eq!(watchdog.beat(), 2);
@@ -2695,6 +2826,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(19)),
             scan_counter(),
+            None,
             FAST_POLL,
             Duration::from_secs(3600),
         );
@@ -2726,6 +2858,7 @@ mod tests {
                 Arc::new(AtomicBool::new(false)),
                 Arc::clone(&heartbeat),
                 scan_counter(),
+                None,
             );
         }
         assert_eq!(
@@ -2747,6 +2880,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(0)),
             Arc::clone(&scanned),
+            None,
         );
         let message = watchdog.silence_error(4_217).to_string();
 
