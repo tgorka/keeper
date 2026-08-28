@@ -35,6 +35,15 @@
 //! completes and then hangs, and `serve_one_batch` for the one test that needs
 //! the server to actually answer. No name is ever resolved, so no resolver —
 //! hijacking, blackholing or otherwise — can change what these tests observe.
+//!
+//! **Two of these tests drive the platform's REAL answer** (Story 56.11). Every
+//! other test here injects the open-file word through [`TestPlatform`], which
+//! proves what the engine does with it; the pair at the foot of the file wraps
+//! that fixture so `open_file_state` alone comes from
+//! `keeper_sync::platform::probe_open_file_state` and a real
+//! [`std::fs::File`] — so what is under test there is the actual machine's
+//! answer reaching the actual rename, rather than the trait plumbing a second
+//! time.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -505,7 +514,8 @@ async fn a_file_the_machine_says_is_open_is_refused() {
 }
 
 /// The machine cannot tell whether it is open, so the content stays — the answer
-/// every real host gives today, and the one that makes this verb fail-closed.
+/// a platform that cannot see a descriptor table gives, and the one that makes
+/// this verb fail-closed.
 #[tokio::test]
 async fn a_machine_that_cannot_tell_refuses_rather_than_guessing() {
     let work = tempfile::tempdir().expect("tempdir");
@@ -521,8 +531,11 @@ async fn a_machine_that_cannot_tell_refuses_rather_than_guessing() {
         return;
     };
     // What `SyncPlatform::open_file_state`'s own body answers, and therefore
-    // what `LinuxPlatform` and the Tauri shell answer: there is no race-free
-    // primitive available, so the trait says so instead of guessing (AD-125).
+    // what macOS and Windows answer: no descriptor table this crate can read,
+    // so the trait says so instead of guessing (AD-125). Injected here rather
+    // than probed, because the point of this test is the ENGINE's response to
+    // the word — the real probe drives the engine in the two tests at the foot
+    // of this file.
     platform.set_open_file_state(OpenFileState::Unknown);
 
     let err = engine
@@ -1840,5 +1853,254 @@ async fn a_pin_that_lands_while_the_proof_is_in_flight_still_stops_the_release()
         ledger_paths(&platform),
         vec!["clip.mp4".to_owned()],
         "and so is the row that carries the pin"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The release, driven by the machine's REAL open-file answer (Story 56.11)
+// ---------------------------------------------------------------------------
+
+/// [`TestPlatform`] in every respect except the one answer under test.
+///
+/// The fixture's injected clock, data directory, secrets and git binary all
+/// stay: this test needs a `sync.db` under a temporary directory and a
+/// deterministic `now_ms` exactly as much as every other test in this file
+/// does. What it must **not** inherit is the injected `open_file_state`, which
+/// is what the other refusal tests here deliberately drive — asserting against
+/// that word proves the engine branches on it, and proves nothing at all about
+/// whether this machine can produce it.
+///
+/// So one method is replaced with `keeper_sync::platform::probe_open_file_state`
+/// and the rest are delegated verbatim. That makes the two tests below the only
+/// place in the tree where the REAL probe drives the REAL engine over a real
+/// repository and a real descriptor — the claim the acceptance criteria for
+/// Story 56.11 are written against.
+///
+/// Every method is spelled out rather than derived: the port's two *provided*
+/// methods (`utc_offset_minutes` and `open_file_state`) would otherwise silently
+/// fall through to the trait's own bodies, and for `utc_offset_minutes` that
+/// means reading the machine's real time zone into a fixture that is UTC
+/// everywhere else.
+///
+/// Gated to `target_os = "linux"` with the two tests it exists for: it is dead
+/// code on a target where the probe answers `Unknown`, and dead code is a
+/// warning the workspace treats as an error.
+#[cfg(target_os = "linux")]
+struct RealOpenPlatform(Arc<TestPlatform>);
+
+#[cfg(target_os = "linux")]
+impl SyncPlatform for RealOpenPlatform {
+    fn data_dir(&self) -> Result<PathBuf, SyncError> {
+        self.0.data_dir()
+    }
+
+    fn secret_get(&self, key: &str) -> Result<Option<String>, SyncError> {
+        self.0.secret_get(key)
+    }
+
+    fn secret_set(&self, key: &str, value: &str) -> Result<(), SyncError> {
+        self.0.secret_set(key, value)
+    }
+
+    fn secret_delete(&self, key: &str) -> Result<(), SyncError> {
+        self.0.secret_delete(key)
+    }
+
+    fn notify(&self, title: &str, body: &str) {
+        self.0.notify(title, body);
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.0.now_ms()
+    }
+
+    fn utc_offset_minutes(&self) -> i32 {
+        self.0.utc_offset_minutes()
+    }
+
+    /// The one method that is not the fixture's: the machine's own answer.
+    fn open_file_state(&self, path: &Path) -> OpenFileState {
+        keeper_sync::platform::probe_open_file_state(path)
+    }
+
+    fn free_space(&self, path: &Path) -> Option<u64> {
+        self.0.free_space(path)
+    }
+
+    fn git_program(&self) -> Result<PathBuf, SyncError> {
+        self.0.git_program()
+    }
+
+    fn host_label(&self) -> String {
+        self.0.host_label()
+    }
+}
+
+/// [`engine_with`], with the platform wrapped so `open_file_state` is real.
+///
+/// Returns the inner [`TestPlatform`], because that is the handle
+/// [`ledger_conn`] and [`remember`] need — the ledger this test inspects lives
+/// under the fixture's data directory, not the wrapper's.
+#[cfg(target_os = "linux")]
+fn engine_with_the_real_open_answer(
+    profile: SyncProfile,
+    data: &Path,
+) -> Option<(Engine, Arc<TestPlatform>)> {
+    let fixture = Arc::new(TestPlatform::new(data));
+    let platform = Arc::new(RealOpenPlatform(Arc::clone(&fixture)));
+    let engine = Engine::open(platform as Arc<dyn SyncPlatform>).ok()?;
+    engine
+        .upsert_profile(&profile)
+        .expect("register the profile");
+    Some((engine, fixture))
+}
+
+/// Whether this host publishes a readable process table at all.
+///
+/// The same capability skip [`init_repo`] is for, and for the same reason: on a
+/// Linux box whose `/proc` is masked or mounted `hidepid=1` the probe correctly
+/// answers `Unknown`, the release correctly refuses `OpenUnknown`, and the two
+/// tests below have nothing falsifiable to say. Phrased as two `read_dir` calls
+/// against the host — never as a question put to the code under test, which
+/// would let a probe that had stopped working skip its own tests.
+#[cfg(target_os = "linux")]
+fn procfs_is_readable() -> bool {
+    std::fs::read_dir("/proc").is_ok() && std::fs::read_dir("/proc/self/fd").is_ok()
+}
+
+/// A real descriptor on the real file makes the real release refuse.
+///
+/// The acceptance criterion of Story 56.11, and the assertion no injected
+/// answer can make: nothing in this test tells the engine the file is open.
+/// `probe_open_file_state` walks this machine's `/proc`, finds this test's own
+/// descriptor on that inode, and the engine refuses on its own — after having
+/// already paid the hash and the remote proof, because the open-file question
+/// is deliberately last.
+///
+/// Fails with the `Open` return removed from the walk, and that mutation is the
+/// proof that it is the probe rather than some other guard doing the refusing.
+///
+/// `target_os = "linux"` rather than `unix`: the probe answers `Unknown` on
+/// every other target today, and there the release would refuse
+/// `OpenUnknown` — a pass for the wrong reason, which is worse than no test.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_real_descriptor_makes_a_real_release_refuse() {
+    if !procfs_is_readable() {
+        return;
+    }
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let Some((engine, platform)) =
+        engine_with_the_real_open_answer(profile(root, remote.path()), data.path())
+    else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let target = root.join("clip.mp4");
+    let reader = std::fs::File::open(&target).expect("a real reader gets there first");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("this very process holds a descriptor on that inode");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::Open { path }) if path == "clip.mp4"
+        ),
+        "`Open`, not `OpenUnknown`: the machine answered rather than shrugged: {err}"
+    );
+
+    assert_eq!(
+        std::fs::read(&target).expect("read"),
+        content,
+        "and the four mebibytes are still here, byte for byte"
+    );
+    assert_eq!(
+        ledger_paths(&platform),
+        vec!["clip.mp4".to_owned()],
+        "the ledger row survives, because nothing was released"
+    );
+
+    // Held across the whole call on purpose — a descriptor dropped early would
+    // let the probe answer `Closed` and the release succeed.
+    drop(reader);
+}
+
+/// With nothing holding it, the real answer lets the release actually happen.
+///
+/// The other half of the acceptance criterion, and the half that would have been
+/// unreachable on every host before this story: end to end through the engine,
+/// with no injected word anywhere, the release publishes the committed blob.
+///
+/// Four assertions for four different bugs, mirroring
+/// `a_release_publishes_the_committed_blob_and_the_tree_stays_clean` — the bytes
+/// (a re-rendered pointer would differ), the inode (a `set_len` would not change
+/// it), the ledger (a stale row invites Story 56.5's sweep to release it again)
+/// and the real `git status` (without the one-path `refresh_index_stat` the
+/// entry's cached stat still describes four mebibytes forever).
+///
+/// `target_os = "linux"` for its sibling's reason: on a target that answers
+/// `Unknown` this test would fail, because the release would correctly refuse.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn with_nothing_holding_it_the_release_actually_happens() {
+    if !procfs_is_readable() {
+        return;
+    }
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, _content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let Some((engine, platform)) =
+        engine_with_the_real_open_answer(profile(root, remote.path()), data.path())
+    else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let target = root.join("clip.mp4");
+    let blob = committed_blob(root);
+    let before = inode(&target);
+
+    engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect("nothing holds it, the remote provably serves it: this must succeed");
+
+    assert_eq!(
+        std::fs::read(&target).expect("read the released file"),
+        blob,
+        "byte for byte the blob git committed — not a re-rendering of it"
+    );
+    assert_ne!(
+        inode(&target),
+        before,
+        "the inode changed, which is what a rename does and a truncation does not"
+    );
+    assert!(
+        ledger_paths(&platform).is_empty(),
+        "the ledger no longer claims this machine holds the content"
+    );
+
+    stamp_index_forward(root);
+    assert_eq!(
+        porcelain(root),
+        "",
+        "and the real git binary agrees the tree is clean"
     );
 }

@@ -166,12 +166,14 @@ pub enum ContentRefusal {
     /// This machine cannot say whether the file is open, so it is left alone.
     ///
     /// [`crate::platform::SyncPlatform::open_file_state`]'s default, and the
-    /// answer every real host gives today: there is no race-free primitive
-    /// available to this crate, and an `lsof`-shaped snapshot is refused by
-    /// name (AD-125). Its own variant rather than folded into [`Self::Open`]
-    /// because the two say different things to the person reading the sentence
-    /// — "close it and ask again" versus "keeper cannot tell yet" — and only
-    /// one of them is something they can act on.
+    /// answer a platform that cannot see a descriptor table still gives —
+    /// macOS and Windows today. Linux answers for real (Story 56.11), and every
+    /// blind spot in that walk lands here too: no procfs, a `/proc/<pid>` that
+    /// cannot be entered, a procfs that does not show keeper itself, a target
+    /// that cannot be stat'ed. Its own variant rather than folded into
+    /// [`Self::Open`] because the two say different things to the person
+    /// reading the sentence — "close it and ask again" versus "keeper cannot
+    /// tell yet" — and only one of them is something they can act on.
     OpenUnknown {
         /// The subpath as asked for, verbatim.
         path: String,

@@ -846,20 +846,66 @@ shortcut is a **filesystem remote's own** object store, proved per object, and
 only where no `.lfsconfig` names a server to ask instead.
 
 **Where the operating system cannot answer "is this file open" without racing,
-keeper refuses rather than guesses.** `open_file_state` returns
-`OpenFileState::Unknown` by default, and that default is the honest answer: no
-shipping platform overrides it — not the Linux daemon's, not the desktop shell's
-on macOS or Windows. On Linux the only answer available to a crate that carries
-no `libc` and denies `unsafe` is a `/proc/*/fd` scan, which is a snapshot and so
-TOCTOU by construction, and which cannot read the descriptor table of a process
-owned by another uid — so it would answer *closed* for exactly the reader most
-likely to be there. macOS has no equivalent at all. The consequence is stated in
-§13 and repeated here so this chapter cannot be read as a promise: **a
-`pointerOnly` folder gets as far as the open-file question, and on every real
-host today both `dehydrate` and the release sweep answer it *cannot tell* and
-refuse.** An ordinary folder never reaches that question — its mode refuses
-first. The release path is exercised in tests, and a platform that can answer
-race-free will make it live for the folders whose mode allows it.
+keeper refuses rather than guesses.** On **Linux** it can be asked, and keeper
+asks it: `/proc/<pid>/fd` is read in-process — no `lsof`, no process spawn, no
+new dependency, no `libc` — and a descriptor is matched to the target by
+**device and inode identity**, taken by `stat`ing the magic link so procfs
+resolves it straight to the open file's inode. That is the kernel's own answer
+rather than a parsed text snapshot, and it is why a deleted-but-open file's
+` (deleted)` suffix, another mount namespace's path prefix, a hardlink and a
+`..` or symlink spelling of the same path are all non-issues. Both hosts answer
+the same way from the same code: the `keeper-syncd` daemon, and the desktop app
+when it runs on Linux.
+
+On Linux, `closed` therefore means something exact: **no process whose
+descriptor table keeper is permitted to read holds this file open.** `/proc/<pid>/fd`
+is readable only by the process's own user, so a program running as another
+user — root included — is a blind spot, and that narrowing is stated here rather
+than discovered. It is an accepted cost with a reason. Demanding *total*
+completeness would make the answer *cannot tell* on every Linux machine that has
+ever booted, because pid 1 alone guarantees an unreadable table — which is the
+refuse-everything outcome this whole section used to describe. And this
+particular refusal is not what the no-data-loss guarantee rests on: the content
+proof and the per-object remote proof are. A release is a `rename(2)` and never
+a truncation, so a program that already has the file open finishes reading it
+undisturbed; the harm from a missed opener is that its *next* open reads ~130
+bytes of pointer text, and the content it wanted comes back by asking for that
+path again — materialized from the server whose ability to serve that exact
+object was proved a moment earlier, in the same release. Not from the local
+store: `lfsPruneLocal` is on by default and releases the store copy precisely
+when the worktree holds the content, so a materialized path is exactly the state
+in which there may be no local copy left to fall back on.
+
+Every blind spot that is not that narrowing **refuses**, and the list is short
+and deliberate: no procfs at all, or one with no resolvable `/proc/self`, so
+keeper cannot even establish whose process table it is reading; a `/proc/<pid>`
+keeper cannot enter, where it cannot tell "somebody else's process" from "a
+process hidden from us" — the `hidepid=1` shape, on which keeper therefore
+refuses **every** release, correctly, because it can see that processes exist
+about which it knows nothing; a descriptor table that stopped enumerating
+part-way, because a table that was not finished was not examined; and a target
+that cannot be `stat`ed. Each of those answers *cannot tell*, which is
+`OpenUnknown`, which declines.
+
+`hidepid=2` is **not** on that list, and the distinction is worth stating
+because the intuitive reading is the wrong one. That setting makes other users'
+`/proc/<pid>` directories invisible rather than merely unreadable, so an
+unprivileged keeper enumerates only its own user's processes — and reads every
+one of them in full. So it answers *closed* there, and that answer sits inside
+the sentence above rather than contradicting it: what disappeared from the
+listing is exactly the set whose descriptor tables keeper was never allowed to
+read.
+
+**On macOS and Windows the answer is still *cannot tell*, so both `dehydrate`
+and the release sweep still refuse `OpenUnknown` there.** macOS publishes no
+`/proc`, and the only routes to its per-process descriptor list are a wrapper
+crate that drags a libclang build dependency into every release build, or
+hand-written foreign-function calls whose answer struct is not declared by the
+`libc` crate and would have to be laid out by hand — in the one crate that
+cannot be built on the machine this was developed on, where a wrong layout reads
+the wrong bytes in silence. `lsof` is refused by name. So the honest answer
+there is the refusing one, and it is recorded rather than guessed. An ordinary
+folder never reaches the question at all — its mode refuses first.
 
 When a release does go through it publishes with a `rename(2)` and never a
 truncation. The pointer is written to a sibling temporary file, given the
@@ -1378,12 +1424,14 @@ afford. Nothing is lost for good either — the note is rewritten the next time
 that path's content lands, and an index entry left stale is repaired by asking
 to release the path again.
 
-**Today it refuses on every real host**, and that is deliberate rather than
-broken: keeper has no way to ask this operating system whether a file is open
-without racing, and guessing is the one guess that deletes somebody's only
-copy — so the answer is "cannot tell" and the release declines. A platform that
-can answer race-free will make the verb live; until then it is exercised only
-in tests.
+**On Linux it goes through; on macOS and Windows it still refuses**, and that
+split is deliberate rather than broken. Linux publishes every process's open
+descriptors in a directory keeper can read, so keeper asks the kernel by inode
+identity and gets a real answer — see "What a release refuses to do" above for
+what *closed* claims there and the one narrowing it carries. macOS and Windows
+give keeper no way to ask the question without racing, and guessing is the one
+guess that deletes somebody's only copy, so the answer there is "cannot tell"
+and the release declines.
 
 ### Letting go on its own: `releaseTtlMs`, `pin` and `unpin`
 
@@ -1392,8 +1440,8 @@ content whose retention window has run out, without anybody asking, and it runs
 every one of the refusals above unchanged — the same hash of the actual bytes,
 the same per-object question to the server taken at the moment of the deletion,
 the same fail-closed answer when this machine cannot tell whether a file is
-open. It is not a privileged caller, so **on a real host today it refuses
-exactly as `dehydrate` does**, for the same reason.
+open. It is not a privileged caller, so **it releases where `dehydrate` releases
+and refuses where `dehydrate` refuses**, for the same reasons.
 
 Which clock applies to a path is decided by where its content came from, and it
 is recorded rather than guessed:
@@ -1650,17 +1698,21 @@ with the sentences and glyphs that carry them, `pin`/`unpin`, and — in a
 folder in the default `materialize` mode answers with a word and no instant, so
 no row counts there: a counting row needs `lfsMode = pointerOnly`, a non-zero
 `releaseTtlMs`, an unpinned row and, for content this clone authored, a
-`synced_at_ms` that is not NULL. Two parts are not reachable at runtime:
+`synced_at_ms` that is not NULL. One part is not reachable at runtime, and one
+is reachable on Linux only:
 
 - **§12 progress and warnings.** These are engine-side and correct — the tray
   decision, the status line and the warning onset logic are implemented and
   tested — but the desktop app surfaces that render them are not wired up.
-- **Releasing content (§9).** `dehydrate` and the release sweep are implemented
-  and covered by tests, but a folder only reaches the open-file question when its
-  `lfsMode` is `pointerOnly` — the default `materialize` mode refuses before it —
-  and no shipping platform can answer whether a file is open without racing, so
-  both refuse on every real host today. Nothing releases content on a production
-  machine until a platform can answer that question race-free.
+- **Releasing content (§9), on macOS and Windows.** `dehydrate` and the release
+  sweep are implemented, covered by tests, and **live on Linux**: the daemon and
+  the desktop app there both answer the open-file question from `/proc` by inode
+  identity, so a `pointerOnly` folder really does release. Two conditions still
+  gate it — a folder reaches the open-file question only when its `lfsMode` is
+  `pointerOnly`, because the default `materialize` mode refuses before it, and
+  macOS and Windows cannot answer that question without racing, so both refuse
+  `OpenUnknown` there. Nothing releases content on a macOS or Windows machine
+  until that platform can answer the question.
 
 ## 18. Measured envelopes
 

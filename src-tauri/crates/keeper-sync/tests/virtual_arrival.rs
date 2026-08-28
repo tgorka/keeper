@@ -760,9 +760,10 @@ async fn the_profile_wide_modes_are_unchanged_by_a_policy() {
 /// *pull* can install it — and every unit queued before this story shipped
 /// delivers under whatever policy is configured afterwards.
 ///
-/// Nothing would reverse it either: the release sweep needs a TTL, a window,
-/// remote proof and a platform that can say the file is closed, and the trait
-/// default refuses on every real host (AD-125). So the delivery arm has to ask.
+/// Nothing would reverse it reliably either: the release sweep needs a TTL, a
+/// window, remote proof and a platform that can say the file is closed — and
+/// on macOS and Windows that last one is still `Unknown`, which refuses
+/// (AD-125). So the delivery arm has to ask.
 ///
 /// The unit is written straight into the journal, which is exactly the state
 /// under test — a row that outlived the policy that queued it — and it makes the

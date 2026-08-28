@@ -717,8 +717,9 @@ pub struct Engine {
     /// and with more at stake. [`RELEASE_BUDGET_OBJECTS`] counts ATTEMPTS, and
     /// the candidate list is re-derived in the same `ORDER BY path` order every
     /// pass — so a prefix that refuses identically every time (32 paths the
-    /// owner edited in place; or, on every real host today, simply the first 32,
-    /// because `open_file_state` defaults to `Unknown`) meant paths 33..n were
+    /// owner edited in place; or, on a platform that cannot answer the
+    /// open-file question — macOS, Windows — simply the first 32, because
+    /// `open_file_state` answers `Unknown` there) meant paths 33..n were
     /// never attempted once, and the promise that a later pass takes the
     /// remainder was false.
     ///
@@ -5994,8 +5995,8 @@ impl Engine {
         // before this story shipped delivers under whatever policy is
         // configured afterwards. Nothing reverses either one: the release sweep
         // needs a TTL, a window, remote proof and a platform that can say the
-        // file is closed, and the trait default refuses on every real host today
-        // (AD-125).
+        // file is closed — which Linux now answers and macOS and Windows still
+        // do not, where the `Unknown` answer refuses (AD-125).
         //
         // **A requested delivery is exempt for its labelled path only.** That
         // path is a human's explicit authorization and outranks the policy
@@ -6606,9 +6607,11 @@ impl Engine {
     /// [`Self::release_resolved`] body — the same content-identity hash, the
     /// same per-object remote proof taken at the moment of deletion, the same
     /// fail-closed `open_file_state`, the same double pin read. A stored
-    /// `synced_at_ms` selected the candidate; it authorized nothing. On a real
-    /// host today every one of these therefore refuses `OpenUnknown`, which is
-    /// 56.4's recorded and deliberate consequence.
+    /// `synced_at_ms` selected the candidate; it authorized nothing. On a
+    /// platform that cannot answer the open-file question — macOS, Windows —
+    /// every one of these therefore refuses `OpenUnknown`, which is 56.4's
+    /// recorded and deliberate consequence; on Linux the answer is real since
+    /// Story 56.11 and the sweep reaches the rename.
     ///
     /// # A refusal is not a failure, and neither is it always silent
     ///
@@ -6660,8 +6663,9 @@ impl Engine {
     /// [`Self::release_cursor`] load-bearing rather than a nicety. Re-derived
     /// from the top in the same `ORDER BY path` order every pass, a prefix of
     /// candidates that refuses the same way every time — 32 paths the owner
-    /// edited in place, or on every real host today simply the first 32, since
-    /// `open_file_state` defaults to `Unknown` and `release_resolved` refuses
+    /// edited in place, or on a platform that cannot answer the open-file
+    /// question (macOS, Windows) simply the first 32, since `open_file_state`
+    /// answers `Unknown` there and `release_resolved` refuses
     /// `OpenUnknown` — meant paths 33..n were never attempted once. Both
     /// [`RELEASE_BUDGET_OBJECTS`]' own doc and `docs/sync.md` promise the next
     /// pass takes the remainder; the rotation is what makes that true.
@@ -7721,7 +7725,10 @@ impl Engine {
     ///    memo Story 56.5's sweep selects candidates by — authorizes
     ///    *eligibility* and never a deletion; NFR-40 rests on this line.
     /// 6. **`Open` / `OpenUnknown`**, last, because it is the answer most
-    ///    likely to have changed while the steps above ran.
+    ///    likely to have changed while the steps above ran. Real on Linux since
+    ///    Story 56.11 — [`crate::platform::probe_open_file_state`] reads
+    ///    `/proc/<pid>/fd` by inode identity — and still `Unknown`, and so
+    ///    still a refusal, on a platform that cannot look.
     /// 7. **`Pinned`, again**, immediately before the deletion. NFR-40 puts the
     ///    authorization at the moment of the deletion, and step 3 happened
     ///    before a whole-file hash and a round trip — the two slowest things
@@ -7894,8 +7901,10 @@ impl Engine {
             OpenFileState::Open => {
                 return Err(SyncError::Refused(ContentRefusal::Open { path }));
             }
-            // The trait default, and therefore the answer on every real host
-            // today. Fail-closed is the whole point (AD-125).
+            // Answered for real on Linux since Story 56.11
+            // ([`crate::platform::probe_open_file_state`]), so this arm is now
+            // reached on macOS and Windows — and by any platform that has not
+            // opted in. Fail-closed is still the whole point (AD-125).
             OpenFileState::Unknown => {
                 return Err(SyncError::Refused(ContentRefusal::OpenUnknown { path }));
             }

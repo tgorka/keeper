@@ -27,7 +27,7 @@ use keeper_core::platform::Platform;
 use keeper_core::vm::NotifyTarget;
 use keeper_sync::engine::Engine;
 use keeper_sync::git::resolve::{GitRequest, GitResolution};
-use keeper_sync::{Result as SyncResult, SyncError, SyncPlatform, SyncProfile};
+use keeper_sync::{OpenFileState, Result as SyncResult, SyncError, SyncPlatform, SyncProfile};
 
 /// Bridges the engine's port onto the shell's existing [`Platform`].
 ///
@@ -124,6 +124,32 @@ impl SyncPlatform for ShellSyncPlatform {
         // session folder and stamps every manifest — so this is that same
         // answer, not a second one.
         chrono::Local::now().offset().local_minus_utc() / 60
+    }
+
+    /// Whether anything on this machine currently has `path` open (Story
+    /// 56.11).
+    ///
+    /// Overridden rather than left to the port's default for
+    /// [`Self::utc_offset_minutes`]'s reason above: the default is the honest
+    /// *refusal*, and the app is the host that can do better on one of the two
+    /// desktops it ships to. On a Linux desktop this delegation is exactly what
+    /// makes the Files pane's Release action and the TTL sweep reach the rename
+    /// instead of answering `OpenUnknown`; on macOS the shared probe answers
+    /// `Unknown`, so the app keeps refusing there — honestly, and with the
+    /// reason recorded in `docs/sync.md` and in deferred work rather than
+    /// papered over with a guess (AD-125).
+    ///
+    /// The same probe as `keeper-syncd`'s `LinuxPlatform`, deliberately: a
+    /// person may run the daemon and the app over one folder on one machine,
+    /// and two implementations of "is this file open" would be two answers to
+    /// one question about one inode.
+    ///
+    /// **NOTE for anyone changing this:** this crate cannot be compiled on the
+    /// Linux development host at all, so this method's only gate is the macOS
+    /// build. The logic it delegates to is unit-tested in `keeper-sync`, which
+    /// is where any change to the answer belongs.
+    fn open_file_state(&self, path: &Path) -> OpenFileState {
+        keeper_sync::platform::probe_open_file_state(path)
     }
 
     fn free_space(&self, path: &Path) -> Option<u64> {

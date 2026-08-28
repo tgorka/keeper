@@ -24,7 +24,7 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use keeper_sync::{GitRequest, Result, SyncError, SyncPlatform};
+use keeper_sync::{GitRequest, OpenFileState, Result, SyncError, SyncPlatform};
 
 /// The per-application segment appended to each XDG base directory.
 pub const APP_DIR: &str = "keeper-sync";
@@ -430,6 +430,45 @@ impl SyncPlatform for LinuxPlatform {
         None
     }
 
+    /// Whether anything on this machine currently has `path` open (Story
+    /// 56.11).
+    ///
+    /// **This is the platform that can answer it.** AD-52 makes `keeper-syncd`
+    /// a Linux-first daemon, and Linux is the target where the kernel publishes
+    /// every process's descriptor table in a directory `std` can read. So the
+    /// port's `Unknown` default — the answer that refuses, and the answer this
+    /// daemon gave until now — is overridden here rather than left in place.
+    ///
+    /// The answer comes from `/proc/<pid>/fd` matched by **device + inode
+    /// identity**, in-process: no `lsof` spawn (AD-125 refuses one by name),
+    /// no `libc`, no new dependency, nothing added for `free_space`'s note
+    /// above to be inconsistent with. The shared walk lives in `keeper-sync`
+    /// ([`keeper_sync::platform::probe_open_file_state`]) rather than here
+    /// because the app implements the same override with the same call, and two
+    /// hosts must not disagree about one folder.
+    ///
+    /// **The one narrowing, stated:** `/proc/<pid>/fd` is mode `0500`, so a
+    /// process owned by another uid — root included — has a descriptor table
+    /// this daemon cannot read. `Closed` therefore claims "no process whose
+    /// descriptor table this process is permitted to read holds this inode
+    /// open". Every blind spot that is *not* that — no procfs, no resolvable
+    /// `/proc/self`, an unenterable `/proc/<pid>` (a `hidepid=1` mount, where
+    /// this daemon therefore refuses every release), a descriptor table that
+    /// stopped enumerating part-way, a target that cannot be stat'ed — answers
+    /// `Unknown` and still refuses. A `hidepid=2` mount is not one of them and
+    /// the walk's own doc says why.
+    ///
+    /// **This method compiles on macOS**, where `keeper-syncd` is also built
+    /// and tested, and there the shared probe answers `Unknown`. That is why
+    /// this crate's test for it is Linux-only.
+    ///
+    /// This is the override that ends the `OpenUnknown` refusal Story 56.4
+    /// recorded: `keeper-syncd dehydrate` and Story 56.5's TTL sweep now reach
+    /// the rename on this host instead of declining every candidate.
+    fn open_file_state(&self, path: &Path) -> OpenFileState {
+        keeper_sync::platform::probe_open_file_state(path)
+    }
+
     fn git_program(&self) -> Result<PathBuf> {
         self.git_resolution().program()
     }
@@ -815,5 +854,47 @@ mod tests {
         let now = platform.now_ms();
         assert!(now > 1_577_836_800_000, "{now}");
         assert!(now < 4_102_444_800_000, "{now}");
+    }
+
+    /// The daemon answers the open-file question for real (Story 56.11).
+    ///
+    /// Fails for the state this crate shipped in until now: the port's
+    /// `Unknown` default, which made `keeper-syncd dehydrate` and the TTL sweep
+    /// refuse `OpenUnknown` on the very platform AD-52 built this binary for.
+    /// Both halves in one test, so a probe stuck on either answer is caught —
+    /// `Open` while a real descriptor is alive, `Closed` once it is dropped.
+    ///
+    /// `#[cfg(target_os = "linux")]`, and not decoration: the macOS gate runs
+    /// `cargo test --workspace` (`scripts/check-macos.sh`), this crate builds
+    /// for `aarch64-apple-darwin` in the release workflow, and there the shared
+    /// probe answers `Unknown` — so an ungated version of this test would fail
+    /// the macOS gate for a reason that is the documented, correct behaviour.
+    /// A Linux host with no readable process table skips for the reason
+    /// `keeper-sync`'s own probe tests state.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_daemon_answers_the_open_file_question() {
+        if std::fs::read_dir("/proc/self/fd").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("temp dir");
+        let platform = platform_at(root.path());
+
+        let target = root.path().join("clip.mp4");
+        std::fs::write(&target, b"the content a reader is part-way through").expect("write");
+
+        let held = std::fs::File::open(&target).expect("hold a real descriptor");
+        assert_eq!(
+            platform.open_file_state(&target),
+            OpenFileState::Open,
+            "the override is wired up, so the release refuses while somebody reads"
+        );
+
+        drop(held);
+        assert_eq!(
+            platform.open_file_state(&target),
+            OpenFileState::Closed,
+            "and the daemon may release once nothing holds it"
+        );
     }
 }
