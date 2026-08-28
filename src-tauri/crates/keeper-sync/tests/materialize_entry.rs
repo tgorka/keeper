@@ -332,6 +332,390 @@ fn an_absent_object_is_queued_once_however_many_times_it_is_asked_for() {
     );
 }
 
+/// The fixture profile with a **filesystem** remote, so an LFS download is
+/// `lfs::local`'s real file copy and no server exists anywhere.
+///
+/// Derived from [`profile`] rather than respelled, so the threshold and every
+/// other setting the tests above depend on stay one definition.
+fn remote_profile(root: &Path, remote: &Path) -> SyncProfile {
+    let mut p = profile(root);
+    p.remote_url = remote.to_string_lossy().into_owned();
+    p
+}
+
+/// Point the fixture's `origin` at the bare remote, as a real clone's would be.
+///
+/// The transfer leg reads `profile.remote_url` and not git's config, so this is
+/// fidelity rather than a dependency — but `open_repo` opens the repository
+/// production would, and a repository with no remote is not one.
+fn add_origin(root: &Path, remote: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["remote", "add", "origin"])
+        .arg(remote)
+        .current_dir(root)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// The state a clone under a virtualization policy really arrives in: the
+/// pointer committed as the index's blob and standing in the worktree, and the
+/// object itself in the **remote's** store and nowhere else.
+///
+/// [`seed`]'s sibling, and the difference is the whole point: that one starts
+/// with the object already local, so nothing has to be fetched to satisfy a
+/// request. Only this one can say whether a fetch ever happens.
+fn seed_remote_only(root: &Path, remote: &Path) -> Pointer {
+    let store = LfsStore::in_git_dir(remote);
+    store.ensure_layout().expect("the remote's store layout");
+    let (oid, size) = store
+        .insert_streaming(std::io::Cursor::new(vec![9u8; CONTENT_BYTES as usize]))
+        .expect("seed the remote's own LFS store");
+    let pointer = Pointer::new(oid, size);
+    std::fs::write(root.join("clip.mp4"), pointer.render()).expect("check out the pointer");
+
+    let repo = git::repo::open(root, false).expect("open the fixture repository");
+    commit(
+        &repo,
+        &git::commit::StagedChange {
+            added: vec![std::path::PathBuf::from("clip.mp4")],
+            ..Default::default()
+        },
+    );
+    pointer
+}
+
+/// Repository, bare filesystem remote, engine and the committed pointer — or
+/// `None` on a machine with no usable `git` (AD-41).
+///
+/// `seed_remote` decides whether the remote's store actually holds the object,
+/// which is the one difference between the two claims below.
+fn remote_fixture(
+    root: &Path,
+    remote: &Path,
+    data: &Path,
+    seed_remote: bool,
+) -> Option<(Engine, Arc<TestPlatform>, Pointer)> {
+    if gix::init_bare(remote).is_err() {
+        return None;
+    }
+    if !init_repo(root) || !add_origin(root, remote) {
+        return None;
+    }
+    let pointer = seed_remote_only(root, remote);
+    if !seed_remote {
+        let store = LfsStore::in_git_dir(remote);
+        std::fs::remove_file(store.object_path(&pointer.oid)).expect("empty the remote's store");
+    }
+    let platform = Arc::new(TestPlatform::new(data));
+    let engine = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>).ok()?;
+    engine
+        .upsert_profile(&remote_profile(root, remote))
+        .expect("register the profile");
+    Some((engine, platform, pointer))
+}
+
+/// `Engine::CLAIM_LIMIT`, which is private. Restated here rather than exported:
+/// what the test needs is "more background rows than one batch can hold", and a
+/// value that drifts *upwards* in the engine only weakens the fixture into
+/// asserting the same thing the count-based loop would already satisfy, which
+/// is a false pass this comment is the guard against.
+const CLAIM_LIMIT: u8 = 16;
+
+/// One `lfsDownload` unit for `oid`, queued straight into the journal as a
+/// background scan would have queued it: no label and no urgency.
+///
+/// Written through a second connection to the very file the engine reads, which
+/// is `download_rows`' approach and for its reason — going through the engine
+/// would mean going through the request verb, which promotes.
+fn enqueue_download(platform: &TestPlatform, oid: &str, size: u64) -> i64 {
+    let conn = db::open(&platform.data_dir().expect("data dir")).expect("open sync.db");
+    db::enqueue(
+        &conn,
+        "01JMATERIALIZE",
+        &db::WorkKind::LfsDownload {
+            oid: oid.to_owned(),
+            size,
+        },
+        0,
+        0,
+    )
+    .expect("queue a background download")
+}
+
+/// One `Push` unit, queued the way a local edit queues one.
+fn enqueue_push(platform: &TestPlatform) -> i64 {
+    let conn = db::open(&platform.data_dir().expect("data dir")).expect("open sync.db");
+    db::enqueue(&conn, "01JMATERIALIZE", &db::WorkKind::Push, 0, 0).expect("queue a push")
+}
+
+/// One unit's `state` and `not_before_ms`, or `None` when the row is gone.
+///
+/// The pair is what says whether a row was left alone: a state of `pending`
+/// with `not_before_ms` in the future is a row waiting out a backoff, and the
+/// same state with `not_before_ms` at or before now is a row somebody promoted.
+///
+/// `None` rather than a panic, because "the row is gone" is itself a claim a
+/// test needs to be able to phrase: `db::complete` is the only thing that
+/// deletes one, so a vanished row means somebody ran the work.
+fn unit_schedule(platform: &TestPlatform, unit: i64) -> Option<(String, i64)> {
+    let conn = db::open(&platform.data_dir().expect("data dir")).expect("open sync.db");
+    conn.query_row(
+        "SELECT state, not_before_ms FROM journal WHERE id = ?1",
+        [unit],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+    )
+    .ok()
+}
+
+/// A one-shot request with **no supervisor anywhere** leaves the real bytes on
+/// disk, and the path reads clean afterwards.
+///
+/// This is the defect an end-to-end run of the shipped `keeper-syncd` binary
+/// found and every test above missed. Each of those asserts what the *request*
+/// left behind — one row, labelled, marked urgent — and none of them asks
+/// whether a process with no event loop behind it ever delivers anything. It
+/// does not: `keeper-syncd materialize` printed `queued`, exited `0`, and left
+/// ~130 bytes of pointer text on disk. For the person or the cron entry this
+/// verb exists for, that is a no-op wearing a success message.
+///
+/// So the claim is about the *content*, not about the journal: the assertion
+/// reads the worktree file and compares every byte, and `git status` decides
+/// the second half. Nothing here can pass on a queued row.
+#[tokio::test]
+async fn a_one_shot_request_drains_what_it_queued_and_lands_the_bytes() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let remote = tempfile::tempdir().expect("remote");
+    let data = tempfile::tempdir().expect("data dir");
+    let root = work.path();
+    let Some((engine, platform, pointer)) = remote_fixture(root, remote.path(), data.path(), true)
+    else {
+        return;
+    };
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        pointer.render().into_bytes(),
+        "the fixture starts with the pointer on disk and the object only upstream"
+    );
+
+    let done = engine
+        .materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli)
+        .await
+        .expect("the remote holds the object, so the request can be satisfied");
+
+    assert_eq!(
+        done.outcome,
+        MaterializeOutcome::Materialized,
+        "a one-shot invocation must report what it DID, and it did deliver"
+    );
+    assert_eq!(done.oid, pointer.oid);
+    assert_eq!(done.size_bytes, CONTENT_BYTES);
+    assert_eq!(
+        done.unit_id, None,
+        "`Materialization::unit_id` names the row that WILL deliver the content, \
+         and after a successful drain there is no such row — `db::complete` \
+         deleted it. A consumer that polls on the field's presence, which is what \
+         the `--json` document's key set invites, would wait forever"
+    );
+
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read the published file"),
+        vec![9u8; CONTENT_BYTES as usize],
+        "the worktree holds the real content, not a promise about it"
+    );
+    assert!(
+        download_rows(&platform).is_empty(),
+        "and the unit is gone: `db::complete` deletes a drained row, so a later \
+         pass has nothing left to owe"
+    );
+
+    // The real `git` binary agrees, deciding on the stat rather than on a
+    // content comparison — see `stamp_index_forward`.
+    stamp_index_forward(root);
+    assert_eq!(
+        porcelain(root),
+        "",
+        "and the path the drain published reads clean"
+    );
+}
+
+/// A transfer that genuinely cannot land **terminates**, is reported as still
+/// queued, and does not have its backoff cancelled on the way out.
+///
+/// Two claims, both about what the loop does when it cannot win.
+///
+/// *It stops.* The anti-spin guard is `sync_once`'s: drain until the profile's
+/// outstanding-download count stops *decreasing*, never merely until it is
+/// zero. A remote with no object makes no progress, so the loop ends. The await
+/// is wrapped in a `timeout` deliberately: a regression here would otherwise
+/// hang the whole suite and report as a runner timeout instead of as this claim
+/// breaking.
+///
+/// *It writes nothing on the way to reporting.* The second `materialize_held`
+/// pass runs in observing mode, so it does not re-enter `enqueue_unique` and
+/// `promote_unit`. Asserted through `not_before_ms`, which `reschedule_after`
+/// pushed into the future and `promote_unit` would pull back to now — with the
+/// re-asking version of this code the row is immediately claimable again, so a
+/// cron `materialize` resets the backoff on every invocation and hammers a dead
+/// remote at the cron cadence with `Requested` urgency ahead of background work.
+#[tokio::test]
+async fn a_transfer_that_cannot_land_stops_without_cancelling_its_own_backoff() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let remote = tempfile::tempdir().expect("remote");
+    let data = tempfile::tempdir().expect("data dir");
+    let root = work.path();
+    let Some((engine, platform, pointer)) = remote_fixture(root, remote.path(), data.path(), false)
+    else {
+        return;
+    };
+
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        engine.materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli),
+    )
+    .await
+    .expect("the drain loop must terminate on a transfer that cannot land")
+    .expect("a transfer that did not land is an outcome, not a raised error");
+
+    assert_eq!(
+        done.outcome,
+        MaterializeOutcome::Queued,
+        "nothing was delivered, so nothing may be reported as delivered"
+    );
+    let unit = done.unit_id.expect("and the unit that owes it is named");
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        pointer.render().into_bytes(),
+        "and the pointer is untouched"
+    );
+
+    let rows = download_rows(&platform);
+    assert_eq!(
+        rows.len(),
+        1,
+        "one row for one object, and the reporting pass added none: {rows:?}"
+    );
+    assert_eq!(
+        rows[0].0, unit,
+        "and it is the row the caller was told about"
+    );
+    let (state, not_before) =
+        unit_schedule(&platform, unit).expect("the row that could not land is still there");
+    assert_eq!(state, "pending", "a transient transfer failure retries");
+    assert!(
+        not_before > platform.now_ms(),
+        "the backoff `reschedule_after` earned must survive the reporting pass; \
+         `promote_unit` would have pulled it back to now (state={state}, \
+         not_before={not_before})"
+    );
+}
+
+/// The drain stops when **the requested unit** is settled, not when the folder
+/// owes no more downloads.
+///
+/// The defect this was written against, found by review before it shipped: the
+/// loop's only exit was the profile's whole outstanding-download count, and
+/// `materialize_pending` queues one row per unfetched pointer after every pull.
+/// With `CLAIM_LIMIT` at 16, the requested row completes on the first pass while
+/// the count merely falls by sixteen — a strict decrease — so the loop kept
+/// going until the entire backlog was fetched. `materialize photos one.jpg`
+/// downloaded the folder, holding the reservation throughout.
+///
+/// So the fixture queues **more background downloads than one batch can hold**,
+/// which is the only arrangement that can tell the two loops apart: with the
+/// per-unit exit some background rows are still there afterwards, and with the
+/// count-based exit none are.
+#[tokio::test]
+async fn one_request_does_not_drain_the_folders_whole_download_backlog() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let remote = tempfile::tempdir().expect("remote");
+    let data = tempfile::tempdir().expect("data dir");
+    let root = work.path();
+    let Some((engine, platform, pointer)) = remote_fixture(root, remote.path(), data.path(), true)
+    else {
+        return;
+    };
+
+    // Two batches' worth of background transfers, each a real object the remote
+    // can serve, so every one of them WOULD succeed if the loop reached it.
+    // Tiny, because their bytes are irrelevant — only their rows are.
+    let store = LfsStore::in_git_dir(remote.path());
+    let mut background = Vec::new();
+    for byte in 0u8..(2 * CLAIM_LIMIT) {
+        let (oid, size) = store
+            .insert_streaming(std::io::Cursor::new(vec![byte; 64]))
+            .expect("seed one background object");
+        background.push(enqueue_download(&platform, &oid, size));
+    }
+
+    let done = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        engine.materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli),
+    )
+    .await
+    .expect("the drain must not run the folder's whole queue")
+    .expect("the remote holds the requested object");
+
+    assert_eq!(done.outcome, MaterializeOutcome::Materialized);
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        vec![9u8; CONTENT_BYTES as usize],
+        "the path that was asked for holds its content"
+    );
+
+    let left: Vec<i64> = download_rows(&platform)
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .filter(|id| background.contains(id))
+        .collect();
+    assert!(
+        !left.is_empty(),
+        "the request was satisfied on the first pass, so the loop had no reason \
+         to claim a second batch; {} background rows were queued and none \
+         survived, which is the whole-backlog drain",
+        background.len()
+    );
+    assert_eq!(pointer.size, CONTENT_BYTES);
+}
+
+/// The drain runs **downloads only**, so this verb cannot commit, publish or
+/// open a pull request on its way to fetching one file.
+///
+/// `Engine::execute` dispatches whatever kind it is handed, and the general
+/// `drain_journal` claims by profile and state with no kind predicate. A `Push`
+/// is queued on every local edit and a rejected push queues a `Pull`, so an
+/// unnarrowed drain here would make a verb documented as "fetch one path's
+/// content" merge the remote and publish the branch — and a `Pull` drained that
+/// way can move the very pointer the request is about, under the observing pass
+/// that follows.
+#[tokio::test]
+async fn the_request_drains_transfers_and_leaves_every_other_kind_alone() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let remote = tempfile::tempdir().expect("remote");
+    let data = tempfile::tempdir().expect("data dir");
+    let root = work.path();
+    let Some((engine, platform, _pointer)) = remote_fixture(root, remote.path(), data.path(), true)
+    else {
+        return;
+    };
+    let push = enqueue_push(&platform);
+
+    let done = engine
+        .materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli)
+        .await
+        .expect("the remote holds the requested object");
+    assert_eq!(done.outcome, MaterializeOutcome::Materialized);
+
+    assert_eq!(
+        unit_schedule(&platform, push),
+        Some(("pending".to_owned(), 0)),
+        "the push is exactly as this verb found it: still pending, still at its \
+         original schedule, and above all still THERE — `db::complete` is the \
+         only thing that deletes a row, so a vanished push is a push this verb \
+         performed"
+    );
+}
+
 /// A file the user has edited is refused by type, and its bytes are untouched.
 #[test]
 fn a_locally_modified_file_is_refused_and_nothing_is_written_or_queued() {

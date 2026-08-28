@@ -1030,7 +1030,7 @@ declines to do; releasing by hand is here today, as `dehydrate` and as the
 | verb | what it does |
 | --- | --- |
 | `ls-files [profile] [--remote]` | what this clone actually holds, per LFS path; `--remote` adds the per-object question to the server |
-| `materialize <profile> <subpath>` | fetch one path's content, or queue the transfer that will |
+| `materialize <profile> <subpath>` | fetch one path's content, waiting for the transfer if the object is not here yet |
 | `dehydrate <profile> <subpath>` | release one path's content, leaving the committed pointer |
 | `pin <profile> <subpath>` | keep one path's content whatever the sweep says |
 | `unpin <profile> <subpath>` | withdraw that instruction |
@@ -1039,9 +1039,11 @@ Two behaviours worth knowing before you script either of the first two.
 `ls-files --remote` propagates the audit error, so a server that cannot be asked
 fails the whole read-only command — and because the JSON document is printed once
 after the loop, `--json --remote` then emits no document at all; missing objects,
-by contrast, are reported and leave the exit code alone. And `materialize`'s
-queued transfer is delivered by a running `keeper-syncd watch` or by the app,
-never by the command itself, so on a host with no daemon running nothing arrives.
+by contrast, are reported and leave the exit code alone. And `materialize` on the
+**command line** does not hand its transfer to anybody else: it drains what it
+queued before it returns, and exits non-zero if the bytes did not arrive. The
+**app's** door still queues and returns, because the app's own engine is the
+supervisor that will deliver it and a UI must not block on a four-gigabyte fetch.
 
 `--json` is a **global** flag and works on either side of the subcommand. §13
 carries the wording contract — the lines each verb prints and the JSON field
@@ -1372,23 +1374,56 @@ Each row carries the size and object id the **pointer** names — never the ~130
 bytes of pointer text a virtual path occupies on disk — plus a modification time
 and, once a path has been materialized, what the ledger recorded about it. The
 global `--json` flag makes the output a stable document whose field names are the
-contract. Remote presence is **absent unless you ask**: `--remote` adds the same
-batch round trip `verify --remote` makes, because whether the server holds an
-object cannot be known without asking it, and a listing that implied it did
-would be guessing about the one thing worth being sure of.
+contract. The byte count is `sizeBytes`, and it is a **number for every row**,
+`virtual`, `materialized` and `absent` alike: the pointer is the source in all
+three cases, so there is no state in which it can be `null`. (Note that
+`remote.missing[]`, which only `--remote` produces, is a different kind of
+record and spells its own byte count `size`.) Remote presence is **absent unless
+you ask**: `--remote` adds the same batch round trip `verify --remote` makes,
+because whether the server holds an object cannot be known without asking it,
+and a listing that implied it did would be guessing about the one thing worth
+being sure of.
 
 `materialize` is the verb that asks for one of those paths by name. If this
 machine already holds the object it is published straight into the worktree and
 the line says `materialized`; if the worktree already had the content the line
-says `already materialized` and nothing is written; if the object is not here
-the transfer is **queued** and the line names the journal unit that will deliver
-it. This command has no event loop and does not wait, so a queued object arrives
-only once `keeper-syncd watch` (or the app) reaches it on a later pass — and not
-at all if no daemon is running. Asking twice returns the same unit rather than
-queueing a second download of the same bytes; a requested unit is claimed ahead
-of background work in the same tick, though never as the *whole* tick, so the
-push that backs up your local edits still runs. Two paths committed with
-identical content share one download, and a request publishes every one of them.
+says `already materialized` and nothing is written; if the object is not here the
+transfer is queued **and this command performs it before returning**, then
+reports `materialized`. So a plain `keeper-syncd materialize` on a host with no
+daemon anywhere still leaves the content on disk — which is what makes it usable
+from a cron entry or a script, the same caller `sync --once` exists for. A run
+that reports `materialized` is a run whose bytes are on disk, and its `--json`
+document carries **no `unitId`**: the field names the row that *will* deliver
+the content, and after a successful fetch there is no such row.
+
+It waits for **your** transfer and nothing else. The wait ends the moment the
+journal row for the object you asked for is settled, so a request for one small
+file does not ride along behind the rest of a folder's download backlog; a queue
+making no progress at all also ends it, so a transfer that genuinely cannot land
+stops instead of spinning. And only transfers are performed — this verb never
+commits, merges, pushes or opens a pull request on the way to fetching a file,
+however much of that is sitting ready in the folder's queue.
+
+A run that did not deliver **exits non-zero** and prints no materialization
+document, so under `--json` stdout carries exactly one document per invocation:
+the materialization, or the failure envelope. The sentence says which of four
+things happened to the transfer, because they are not the same problem: another
+keeper process is performing it right now (ask again shortly — nothing is
+wrong); it will be retried, with the last recorded failure quoted; keeper has
+**given up** on it, with the reason, and asking again queues a fresh attempt —
+no `watch` daemon will ever pick a parked row up; or it finished and the content
+is somehow not on disk, which asking again fixes.
+
+Asking twice returns the same unit rather than queueing a second download of the
+same bytes; a requested unit is claimed ahead of background work in the same
+tick, though never as the *whole* tick, so the push that backs up your local
+edits still runs. Two paths committed with identical content share one download,
+and a request publishes every one of them.
+
+The **app's** door is deliberately the other shape: it queues, returns
+immediately and lets the app's own engine — which is the supervisor — deliver on
+its next tick, because a UI must not block on a four-gigabyte transfer. One
+engine function per shape, and no policy in either caller.
 
 A path whose bytes on disk are neither the committed pointer nor the content it
 names is **refused by name** and left exactly as it is: keeper does not

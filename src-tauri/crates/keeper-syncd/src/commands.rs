@@ -29,9 +29,12 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use keeper_sync::db::UnitStanding;
 use keeper_sync::engine::{Engine, VerifyReport};
 use keeper_sync::lfs::audit::RemoteAudit;
-use keeper_sync::lfs::hydrate::{ContentRefusal, Materialization, Pin, Release};
+use keeper_sync::lfs::hydrate::{
+    ContentRefusal, Materialization, MaterializeOutcome, Pin, Release,
+};
 use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
@@ -642,7 +645,7 @@ pub async fn run(
         }
         Command::Materialize { profile, subpath } => {
             let engine = engine_for(&platform, config)?;
-            cmd_materialize(&printer, &engine, &profile, &subpath)
+            cmd_materialize(&printer, &engine, &profile, &subpath).await
         }
         Command::Dehydrate { profile, subpath } => {
             let engine = engine_for(&platform, config)?;
@@ -1526,24 +1529,17 @@ async fn cmd_ls_files(
 /// same variant, so one enum still decides what happened and each surface
 /// spells it the way its reader expects.
 fn materialize_lines(profile_name: &str, done: &Materialization) -> Vec<String> {
-    let mut lines = vec![format!(
+    // One line, and only one. The second line this used to carry promised a
+    // supervisor the process does not have; now that the verb performs the
+    // transfer itself, everything a `queued` outcome still needs to say depends
+    // on where the journal row stands, and [`undelivered`] is the one place that
+    // reads it — a half-sentence here would be a second, weaker copy.
+    vec![format!(
         "{profile_name}: {outcome}  {size}  {path}",
         outcome = done.outcome,
         size = format_bytes(done.size_bytes),
         path = done.path,
-    )];
-    if let Some(unit) = done.unit_id {
-        // Said out loud because this verb does NOT wait: `keeper-syncd` has no
-        // event subscription, so the object is delivered by the supervisor —
-        // and by the supervisor's own next pass, since this process's `wake_now`
-        // reaches only its own engine. An operator with no daemon running would
-        // otherwise wait for something that is never going to happen.
-        lines.push(format!(
-            "  queued as unit {unit}; a running `keeper-syncd watch` fetches it \
-             on its next pass"
-        ));
-    }
-    lines
+    )]
 }
 
 /// One materialization as the `--json` document carries it.
@@ -1571,20 +1567,103 @@ fn materialize_json(profile: &SyncProfile, done: &Materialization) -> serde_json
     entry
 }
 
-/// Ask for one path's content in one folder.
+/// The sentence a run that did **not** deliver has to end on, or `None` when it
+/// did.
 ///
-/// [`Engine::materialize_entry`] holds every decision — containment, the mode,
-/// the index, the cone, whether the bytes on disk may be replaced, and whether
-/// the object is here or has to be fetched. This function selects the profile
-/// and prints; adding any policy here would be the second implementation AD-52
-/// exists to prevent.
+/// Pure, and separate from [`cmd_materialize`] for the reason
+/// [`materialize_json`] gives about its own absent keys: the branch that
+/// decides whether this invocation kept its promise is the whole contract of a
+/// one-shot verb, and it belongs somewhere a test can call it rather than in an
+/// `if` around an `await`.
+///
+/// # Four "not delivered"s, and only one of them is a fault
+///
+/// `standing` is where the journal row this run queued actually stands
+/// ([`UnitStanding`]), and the four answers want four different sentences.
+/// Collapsing them into "it is still owed; see the logs" was wrong in two
+/// directions at once: it sent an operator to start a `keeper-syncd watch` for a
+/// **parked** row no watcher will ever claim, and it reported a **healthy**
+/// transfer another keeper process was performing as this run's failure — which
+/// for a cron wrapper is an alert on a folder that is working.
+///
+/// A recorded reason is quoted as the **last recorded** failure rather than as
+/// this run's, because `db::claim_ready` does not clear `last_error` and this
+/// run may never have attempted the row: `claim_ready` keeps one slot back for
+/// background work and can bump the youngest requested row out of a full batch.
+fn undelivered(
+    profile_name: &str,
+    done: &Materialization,
+    standing: &UnitStanding,
+) -> Option<String> {
+    if done.outcome != MaterializeOutcome::Queued {
+        return None;
+    }
+    let unit = match done.unit_id {
+        Some(unit) => format!("unit {unit}"),
+        None => "the queued unit".to_owned(),
+    };
+    let because = |reason: &Option<String>| match reason {
+        Some(reason) => format!("last recorded failure: {reason}"),
+        None => "nothing recorded against it — see `keeper-syncd logs`".to_owned(),
+    };
+    let tail = match standing {
+        UnitStanding::InFlight => {
+            "another keeper process is transferring it right now; ask again once it finishes"
+                .to_owned()
+        }
+        UnitStanding::Parked { reason } => format!(
+            "keeper has given up on {unit} ({}); asking again queues a fresh attempt",
+            because(reason)
+        ),
+        UnitStanding::Waiting { reason } => {
+            format!("{unit} is still owed ({})", because(reason))
+        }
+        // The row is gone, which is what completing does, and yet the content
+        // is not here: the object was fetched and something removed it again
+        // before this pass looked — `lfs_prune_local` is the one thing that
+        // deletes a store copy on purpose. Worth its own sentence, because
+        // "asking again" really is the remedy and nothing is broken.
+        UnitStanding::Settled => {
+            format!("{unit} finished, but the content is not on disk; ask again to fetch it")
+        }
+    };
+    Some(format!(
+        "{profile_name}: {path} was not delivered — {tail}",
+        path = done.path,
+    ))
+}
+
+/// Ask for one path's content in one folder, and wait for it.
+///
+/// [`Engine::materialize_entry_now`] holds every decision — containment, the
+/// mode, the index, the cone, whether the bytes on disk may be replaced,
+/// whether the object is here or has to be fetched, and the bounded drain that
+/// fetches it. This function selects the profile and prints; adding any policy
+/// here would be the second implementation AD-52 exists to prevent.
+///
+/// # Why this door waits and the app's does not
+///
+/// `Engine::materialize_entry` — the queueing verb — is right for the app,
+/// whose engine *is* the supervisor that will drain the row. It is wrong here:
+/// this process exits, so a queued row it reported as a success would be
+/// delivered by nobody. That is the defect an end-to-end run of this binary
+/// found, and `sync --once` is documented as the cron entry point for exactly
+/// the same kind of caller.
+///
+/// # A run that did not deliver exits non-zero, and prints one document
+///
+/// The `--json` form is emitted only on the paths that delivered, so stdout
+/// carries exactly one JSON document per invocation: the materialization on
+/// success, or `main`'s failure envelope — with the reason and the exit code in
+/// it — when the bytes are not here. Two documents would break the consumer
+/// this flag exists for.
 ///
 /// A required profile, resolved through [`select`] so a mistyped name is
 /// refused with the alternatives named rather than silently addressing a
 /// different folder. `select` returns a list because its other callers accept
 /// `None` for "every profile"; this verb writes to one worktree, so it takes
 /// the one match and prints its document exactly once.
-fn cmd_materialize(
+async fn cmd_materialize(
     printer: &Printer,
     engine: &Engine,
     wanted: &str,
@@ -1606,7 +1685,8 @@ fn cmd_materialize(
     };
 
     let done = engine
-        .materialize_entry(&profile.id, subpath)
+        .materialize_entry_now(&profile.id, subpath, SyncSource::Cli)
+        .await
         .map_err(|err| {
             // `Busy` is `EXIT_OK` for `sync --once`, where losing a race did no
             // wrong and a `Restart=on-failure` unit must not fire for it. This verb
@@ -1622,6 +1702,17 @@ fn cmd_materialize(
         })?;
     for line in materialize_lines(&profile.name, &done) {
         printer.line(line);
+    }
+    // Before the document, so a run that delivered nothing prints no
+    // materialization at all — see this function's doc.
+    let standing = done
+        .unit_id
+        .map(|unit| engine.unit_standing(unit))
+        // No unit means nothing was ever queued, so no outcome that reaches
+        // here can be `Queued` and `undelivered` will not read this.
+        .unwrap_or(UnitStanding::Waiting { reason: None });
+    if let Some(failure) = undelivered(&profile.name, &done, &standing) {
+        return Err(CliError::Operational(failure));
     }
     printer.json(&materialize_json(profile, &done));
     Ok(())
@@ -2460,7 +2551,6 @@ mod tests {
     use super::*;
     use clap::error::ErrorKind;
     use clap::CommandFactory as _;
-    use keeper_sync::lfs::hydrate::MaterializeOutcome;
 
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
@@ -3273,19 +3363,113 @@ mod tests {
             already[0]
         );
 
-        // A queued outcome says who will deliver it, because this verb does not
-        // wait and an operator with no daemon running would otherwise wait for
-        // something that cannot happen.
-        let queued = materialize_lines(
-            "Field",
-            &materialization(MaterializeOutcome::Queued, Some(42)),
+        // One line whatever happened. The second line this used to carry
+        // promised a `keeper-syncd watch` that would deliver the transfer, and
+        // that promise is the defect this story removed: a queued outcome's
+        // remaining sentence depends on where the journal row stands and belongs
+        // to `undelivered`, which is the only thing that reads it.
+        for outcome in [
+            MaterializeOutcome::Materialized,
+            MaterializeOutcome::AlreadyMaterialized,
+            MaterializeOutcome::Queued,
+        ] {
+            let lines = materialize_lines("Field", &materialization(outcome, Some(42)));
+            assert_eq!(lines.len(), 1, "{outcome:?}: {lines:?}");
+            assert!(
+                !lines[0].contains("watch"),
+                "no surface may promise a supervisor this process does not have: {}",
+                lines[0]
+            );
+        }
+    }
+
+    /// Only a queued outcome is a failed run, and each of the four places its
+    /// journal row can stand gets its own sentence (Story 56.13).
+    ///
+    /// This is the branch that decides `$?` for the cron entry this verb exists
+    /// for. Before the drain existed the verb exited `0` on `queued`, which is
+    /// the whole defect: a no-op wearing a success message.
+    ///
+    /// The four arms are not decoration. Two of them were single-handedly wrong
+    /// before review: a **parked** row sent the operator to start a watcher that
+    /// will never claim it, and a row another keeper process was **transferring**
+    /// was reported as this run's failure — an alert on a healthy folder.
+    #[test]
+    fn only_an_undelivered_run_is_a_failure_and_each_standing_says_its_own_thing() {
+        let waiting = UnitStanding::Waiting { reason: None };
+        assert_eq!(
+            undelivered(
+                "Field",
+                &materialization(MaterializeOutcome::Materialized, None),
+                &waiting
+            ),
+            None,
+            "the bytes are here, whoever carried them"
         );
-        assert_eq!(queued.len(), 2, "{queued:?}");
-        assert!(queued[0].contains("queued"), "{}", queued[0]);
+        assert_eq!(
+            undelivered(
+                "Field",
+                &materialization(MaterializeOutcome::AlreadyMaterialized, None),
+                &waiting
+            ),
+            None
+        );
+
+        let queued = materialization(MaterializeOutcome::Queued, Some(42));
+        let say = |standing: &UnitStanding| {
+            undelivered("Field", &queued, standing)
+                .expect("a queued outcome is a run that did not do what was asked")
+        };
+
+        let quoted = say(&UnitStanding::Waiting {
+            reason: Some("remote storage quota exceeded for git.example".to_owned()),
+        });
+        assert!(quoted.contains("40-media/clip.mp4"), "{quoted}");
+        assert!(quoted.contains("unit 42"), "{quoted}");
         assert!(
-            queued[1].contains("unit 42") && queued[1].contains("watch"),
-            "{}",
-            queued[1]
+            quoted.contains("remote storage quota exceeded for git.example"),
+            "the journal's reason is the only place the transfer's own error \
+             survives a drain: {quoted}"
+        );
+        assert!(
+            quoted.contains("last recorded"),
+            "and it is qualified, because `claim_ready` does not clear \
+             `last_error` and this run may never have attempted the row: {quoted}"
+        );
+
+        let bare = say(&waiting);
+        assert!(
+            bare.contains("keeper-syncd logs"),
+            "a run with no recorded reason must still say where to look: {bare}"
+        );
+
+        let elsewhere = say(&UnitStanding::InFlight);
+        assert!(
+            elsewhere.contains("another keeper process") && elsewhere.contains("ask again"),
+            "a transfer somebody else is performing is not this run's failure: {elsewhere}"
+        );
+        assert!(
+            !elsewhere.contains("failure"),
+            "and must not be described as one: {elsewhere}"
+        );
+
+        let dead = say(&UnitStanding::Parked {
+            reason: Some("git.example rejected the access token".to_owned()),
+        });
+        assert!(
+            dead.contains("given up") && dead.contains("rejected the access token"),
+            "{dead}"
+        );
+        assert!(
+            !dead.contains("watch"),
+            "nothing claims a parked row, so no watcher can help: {dead}"
+        );
+
+        let vanished = say(&UnitStanding::Settled);
+        assert!(
+            vanished.contains("finished") && vanished.contains("not on disk"),
+            "a completed row over absent content is its own state — the prune \
+             raced the pass — and 'ask again' really is the remedy: {vanished}"
         );
     }
 

@@ -446,6 +446,71 @@ pub fn unit_urgency(conn: &Connection, id: i64) -> Result<Urgency> {
     Ok(Urgency::from_level(level.flatten().unwrap_or(0)))
 }
 
+/// Where one journal unit stands, and why (Story 56.13).
+///
+/// The question a **one-shot** caller has to answer after draining: the drain
+/// swallows a transfer's own error into the row (`Engine::reschedule_after`
+/// writes `last_error` and returns `Ok`), which is right for a supervisor and
+/// useless to a process that is about to tell its caller whether the bytes
+/// arrived. Four answers, and each of them is a different sentence:
+///
+/// * [`UnitStanding::Settled`] — the row is gone, which is the only thing
+///   [`complete`] does, so the work succeeded.
+/// * [`UnitStanding::Waiting`] — `pending` or `deferred`: something will try
+///   again. `reason` is the last recorded failure, which may predate this run.
+/// * [`UnitStanding::InFlight`] — `running`: somebody has claimed it and is
+///   attempting it *now*. For a caller that has just finished its own drain
+///   that somebody is necessarily **another process**, and it is the difference
+///   between "this failed" and "this is happening without you".
+/// * [`UnitStanding::Parked`] — given up on. `claim_ready` never offers a
+///   parked row, so nothing retries it until a human does.
+///
+/// An unreadable `state` is reported as `Waiting`, the answer that claims least:
+/// it neither promises the work is done nor accuses it of having stopped.
+pub fn unit_standing(conn: &Connection, id: i64) -> Result<UnitStanding> {
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT state, last_error FROM journal WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((state, reason)) = row else {
+        return Ok(UnitStanding::Settled);
+    };
+    Ok(match state.as_str() {
+        "running" => UnitStanding::InFlight,
+        "parked" => UnitStanding::Parked { reason },
+        _ => UnitStanding::Waiting { reason },
+    })
+}
+
+/// Where one journal unit stands. See [`unit_standing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitStanding {
+    /// The row is gone: the work succeeded.
+    Settled,
+    /// Something will attempt it again, and this is the last thing that went
+    /// wrong — possibly on an earlier attempt than the caller's own.
+    Waiting { reason: Option<String> },
+    /// Claimed and being attempted right now, by somebody else.
+    InFlight,
+    /// Given up on, and nothing retries it until a human unparks it.
+    Parked { reason: Option<String> },
+}
+
+impl UnitStanding {
+    /// Whether waiting longer could still change the answer.
+    ///
+    /// The drain loop's primary exit: `Settled` is the answer, and `Parked` and
+    /// `InFlight` are answers this process cannot improve on — one because
+    /// nothing will retry it, the other because another process owns the
+    /// attempt and `claim_ready` will not offer a `running` row twice.
+    pub fn worth_waiting_for(&self) -> bool {
+        matches!(self, Self::Waiting { .. })
+    }
+}
+
 /// Every download this profile is still waiting for: its name, object and size.
 ///
 /// Downloads only. An upload is also unfinished work, but the path it carries
@@ -1185,6 +1250,12 @@ impl WorkKind {
     pub const PUSH: &'static str = "push";
     /// The `kind` column spelling for one LFS object upload. Same reason.
     pub const LFS_UPLOAD: &'static str = "lfsUpload";
+    /// The `kind` column spelling for one LFS object download. Same reason —
+    /// [`crate::engine::Engine::materialize_entry_now`] drains until this
+    /// profile owes no more of them, and it has no `WorkKind` value to ask
+    /// with because the object it is waiting for may already be gone from the
+    /// journal.
+    pub const LFS_DOWNLOAD: &'static str = "lfsDownload";
     /// The `kind` column spelling for a pull. Same reason — a rejected push
     /// queues one and has to be able to assert it did (DW-207).
     pub const PULL: &'static str = "pull";
@@ -1215,7 +1286,7 @@ impl WorkKind {
             Self::Pull => Self::PULL,
             Self::Push => Self::PUSH,
             Self::LfsUpload { .. } => Self::LFS_UPLOAD,
-            Self::LfsDownload { .. } => "lfsDownload",
+            Self::LfsDownload { .. } => Self::LFS_DOWNLOAD,
             Self::OpenPullRequest { .. } => "openPullRequest",
             Self::Verify => "verify",
         }
@@ -1432,14 +1503,50 @@ pub fn claim_ready(
     now_ms: i64,
     limit: u32,
 ) -> Result<Vec<WorkItem>> {
+    claim(conn, profile_id, now_ms, limit, None)
+}
+
+/// [`claim_ready`] narrowed to one `kind` (Story 56.13).
+///
+/// For a caller that is draining to satisfy **one request** rather than to move
+/// the folder along: `keeper-syncd materialize` waits for its own transfer, and
+/// a verb documented as "fetch one path's content" must not commit, merge,
+/// publish a branch or open a pull request on the way. `claim_ready` selects on
+/// `profile_id` and `state` alone, so without this the whole ready queue rides
+/// along — and a `Pull` drained that way can move the very pointer the request
+/// is about.
+///
+/// Every other property is `claim_ready`'s, including the background-slot
+/// carve-out: within one kind it still stops a full batch of requested work
+/// from starving the oldest background row.
+pub fn claim_ready_of_kind(
+    conn: &Connection,
+    profile_id: &str,
+    now_ms: i64,
+    limit: u32,
+    kind: &str,
+) -> Result<Vec<WorkItem>> {
+    claim(conn, profile_id, now_ms, limit, Some(kind))
+}
+
+/// The claim both doors above run. `kind` of `None` means every kind.
+fn claim(
+    conn: &Connection,
+    profile_id: &str,
+    now_ms: i64,
+    limit: u32,
+    kind: Option<&str>,
+) -> Result<Vec<WorkItem>> {
     let mut rows = ready_rows(
         conn,
         "SELECT id, payload, attempts, last_error, label, urgency FROM journal
          WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
+           AND (?4 IS NULL OR kind = ?4)
          ORDER BY COALESCE(urgency, 0) DESC, id LIMIT ?3",
         profile_id,
         now_ms,
         limit,
+        kind,
     )?;
     // Only when the batch is full AND holds nothing but requested work: with a
     // spare slot the background row was claimed by the statement above anyway,
@@ -1453,10 +1560,12 @@ pub fn claim_ready(
             "SELECT id, payload, attempts, last_error, label, urgency FROM journal
              WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
                AND COALESCE(urgency, 0) = 0
+               AND (?4 IS NULL OR kind = ?4)
              ORDER BY id LIMIT ?3",
             profile_id,
             now_ms,
             1,
+            kind,
         )?;
         if let Some(oldest) = background.into_iter().next() {
             // The youngest requested row, which is the last one: it keeps its
@@ -1518,9 +1627,13 @@ fn ready_rows(
     profile_id: &str,
     now_ms: i64,
     limit: u32,
+    kind: Option<&str>,
 ) -> Result<Vec<ReadyRow>> {
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map((profile_id, now_ms, limit), |r| {
+    // `?4` is bound whether or not the statement narrows on it: `(?4 IS NULL OR
+    // kind = ?4)` is how one projection serves both doors, and two spellings of
+    // six column indices is what this helper exists to prevent.
+    let rows = stmt.query_map((profile_id, now_ms, limit, kind), |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,

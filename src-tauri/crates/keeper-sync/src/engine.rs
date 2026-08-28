@@ -625,6 +625,27 @@ enum ProfileWatch {
 /// second is 30 files out of 155 000, so the line moves visibly.
 const WALK_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Whether one materialize request may **queue** the object it needs, or is
+/// only **observing** whether it arrived (Story 56.13).
+///
+/// [`Engine::materialize_held`] runs the same checks and the same publish under
+/// both, and the difference is confined to what it does when the local store
+/// does not hold the object. [`Engine::materialize_entry_now`] needs both in one
+/// invocation: it asks once, drains, and then looks again — and looking must
+/// write nothing, because re-asking on the way to *reporting* a failure inserts
+/// a duplicate row for a `parked` unit (`db::enqueue_unique` does not count one
+/// as cover) and pulls a fresh backoff back to now (`db::promote_unit`), so a
+/// cron entry against a dead remote would grow the journal without bound while
+/// hammering the remote at the cron cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhenAbsent {
+    /// Queue the transfer, label it, mark it urgent and wake the supervisor.
+    Queue,
+    /// Write nothing; report [`lfs::hydrate::MaterializeOutcome::Queued`] with
+    /// no unit, and let the caller name the row it already queued.
+    Report,
+}
+
 pub struct Engine {
     platform: Arc<dyn SyncPlatform>,
     /// Single connection behind a mutex. `sync.db` is small and every access is
@@ -3180,6 +3201,39 @@ impl Engine {
         scan_when_idle: bool,
         source: SyncSource,
     ) -> Result<()> {
+        self.drain(profile, None, scan_when_idle, source).await
+    }
+
+    /// [`Self::drain_journal`] narrowed to one journal kind (Story 56.13).
+    ///
+    /// For a caller draining to satisfy **one request** rather than to move the
+    /// folder along. `keeper-syncd materialize` waits for its own transfer, and
+    /// a verb sold as "fetch one path's content" must not commit, merge,
+    /// publish a branch or open a pull request on the way there — `execute`
+    /// dispatches every kind it is handed, and a `Pull` drained that way can
+    /// move the very pointer the request is about.
+    ///
+    /// `scan_when_idle` is not offered: a scan is a whole-tree question, and a
+    /// caller narrow enough to want one kind is by definition not asking it.
+    ///
+    /// The caller owns the profile reservation.
+    async fn drain_kind(
+        &self,
+        profile: &SyncProfile,
+        kind: &str,
+        source: SyncSource,
+    ) -> Result<()> {
+        self.drain(profile, Some(kind), false, source).await
+    }
+
+    /// The drain both doors above run. `only` of `None` means every kind.
+    async fn drain(
+        &self,
+        profile: &SyncProfile,
+        only: Option<&str>,
+        scan_when_idle: bool,
+        source: SyncSource,
+    ) -> Result<()> {
         let now = self.platform.now_ms();
         // Before a single unit is claimed, and on every drain: deferred work
         // waits on a condition rather than a clock, so the condition has to be
@@ -3189,7 +3243,10 @@ impl Engine {
         // Before claiming, because a unit claimed without a name reports the
         // folder for the whole transfer — an hour, on a slow link.
         self.backfill_labels(profile);
-        let claimed = self.with_db(|conn| db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT))?;
+        let claimed = self.with_db(|conn| match only {
+            Some(kind) => db::claim_ready_of_kind(conn, &profile.id, now, CLAIM_LIMIT, kind),
+            None => db::claim_ready(conn, &profile.id, now, CLAIM_LIMIT),
+        })?;
         if claimed.is_empty() {
             if scan_when_idle {
                 self.scan_and_enqueue(profile, source)?;
@@ -7377,6 +7434,16 @@ impl Engine {
     /// A cross-process lock is a change to every one-shot verb, not to this
     /// one (recorded in `deferred-work.md`).
     ///
+    /// # This one queues and returns; its sibling waits
+    ///
+    /// [`Self::materialize_entry_now`] is the same request followed by the
+    /// drain that satisfies it, and it exists because a process with no
+    /// supervisor behind it cannot be told to come back later. This function
+    /// keeps the queue-and-return shape for the caller that genuinely has a
+    /// supervisor — the app, whose engine IS the one that will drain the row on
+    /// its next tick, and which must not block a UI thread on a four-gigabyte
+    /// transfer.
+    ///
     /// Blocking, like every other repository caller: a `gix::Repository` is
     /// neither `Send` nor cheap to hold, so each open is scoped to a block and
     /// never spans an await point.
@@ -7385,7 +7452,33 @@ impl Engine {
         id: &str,
         subpath: &str,
     ) -> Result<lfs::hydrate::Materialization> {
-        use lfs::hydrate::{ContentRefusal, Materialization, MaterializeOutcome, Plan};
+        let (profile, rela, path) = self.materialize_request(id, subpath)?;
+        let _reservation = self
+            .reserve(&profile.id)
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        // Queueing, always: this door's whole contract is that the supervisor
+        // delivers what it did not find here.
+        self.materialize_held(&profile, &rela, path, WhenAbsent::Queue)
+    }
+
+    /// Everything a materialize request settles **before** it needs the
+    /// folder to itself: which profile, which path, and whether it may be
+    /// asked for at all.
+    ///
+    /// Split out so that [`Self::materialize_entry`] and
+    /// [`Self::materialize_entry_now`] can share one reservation each rather
+    /// than taking two — `reserve` is not re-entrant, so a wrapper that
+    /// reserved and then called the other verb would refuse itself as busy.
+    ///
+    /// Returns the repository-relative path twice over: as the `Path` every
+    /// index and worktree call wants, and as the `/`-joined `String` every
+    /// report and ledger row is keyed by.
+    fn materialize_request(
+        &self,
+        id: &str,
+        subpath: &str,
+    ) -> Result<(SyncProfile, PathBuf, String)> {
+        use lfs::hydrate::ContentRefusal;
 
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
             return Err(SyncError::Config(format!("no such sync profile: {id}")));
@@ -7441,10 +7534,33 @@ impl Engine {
         if !self.volume_ready(&profile)? {
             return Err(SyncError::MediaAbsent);
         }
+        Ok((profile, rela, path))
+    }
 
-        let _reservation = self
-            .reserve(&profile.id)
-            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+    /// The whole of a materialize request that needs the folder to itself.
+    ///
+    /// The caller owns the profile reservation, which is the point of the
+    /// split: [`Self::materialize_entry_now`] runs this, drains, and runs it
+    /// again under one reservation, so the second call re-asks the only
+    /// question a drain can have changed — what the worktree and the store hold
+    /// *now* — through the same publish path rather than a second copy of it.
+    ///
+    /// `absent` is what makes that second call safe. See [`WhenAbsent`]: the
+    /// observing mode writes nothing to the journal, because re-queueing on the
+    /// way to *reporting* a failure duplicates a parked row and cancels the
+    /// backoff the same run just earned.
+    ///
+    /// `rela` and `path` are [`Self::materialize_request`]'s two spellings of
+    /// the same path; `path` is consumed because every answer carries it.
+    fn materialize_held(
+        &self,
+        profile: &SyncProfile,
+        rela: &Path,
+        path: String,
+        absent: WhenAbsent,
+    ) -> Result<lfs::hydrate::Materialization> {
+        use lfs::hydrate::{ContentRefusal, Materialization, MaterializeOutcome, Plan};
+
         // Before the disk, because it needs none. A listing deliberately
         // ignores the mode; a write must not — see
         // [`ContentRefusal::LfsDisabled`].
@@ -7464,7 +7580,7 @@ impl Engine {
             // `open_repo` states (AD-48); the difference is that this opens what
             // is there and never makes one.
             let repo = git::repo::open(&profile.local_path, profile.removable)?;
-            lfs::stage::indexed_pointer(&repo, &rela)
+            lfs::stage::indexed_pointer(&repo, rela)
         };
         let Some(indexed) = indexed else {
             // A plain tracked file and a path git does not track land here
@@ -7473,11 +7589,11 @@ impl Engine {
         };
         // The same cone `materialize_landed` applies, so a request cannot reach
         // content the profile exists to keep away (Story 27.2).
-        if !SparseCone::new(&profile.subpaths).includes(&rela) {
+        if !SparseCone::new(&profile.subpaths).includes(rela) {
             return Err(SyncError::Refused(ContentRefusal::OutsideSubpaths { path }));
         }
 
-        let smudge = match lfs::hydrate::plan(&profile.local_path, &rela, &indexed)
+        let smudge = match lfs::hydrate::plan(&profile.local_path, rela, &indexed)
             .map_err(SyncError::Refused)?
         {
             Plan::AlreadyHeld => {
@@ -7491,7 +7607,7 @@ impl Engine {
                 // and cannot be repaired by asking for it again.
                 {
                     let repo = git::repo::open(&profile.local_path, profile.removable)?;
-                    git::repo::refresh_index_stat(&repo, std::slice::from_ref(&rela))?;
+                    git::repo::refresh_index_stat(&repo, &[rela.to_path_buf()])?;
                 }
                 return Ok(Materialization {
                     path,
@@ -7509,6 +7625,23 @@ impl Engine {
         // writing to answer a question.
         let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
         if !store.contains(&indexed.oid, indexed.size) {
+            if absent == WhenAbsent::Report {
+                // Observing, not asking. A second request on the way to
+                // *reporting* that the first one did not land would insert a
+                // duplicate row (`enqueue_unique` does not count a `parked` row
+                // as cover) and would pull a fresh backoff back to now
+                // (`promote_unit`), so a cron entry against a dead remote would
+                // both grow the journal without bound and hammer the remote at
+                // the cron cadence. The caller already holds the unit it queued
+                // and reports that one.
+                return Ok(Materialization {
+                    path,
+                    oid: indexed.oid,
+                    size_bytes: indexed.size,
+                    outcome: MaterializeOutcome::Queued,
+                    unit_id: None,
+                });
+            }
             // The object is not here. The journal is the queue, and
             // `enqueue_unique` returns whatever unit already covers this work —
             // so a repeat request is one row and one download, and a request for
@@ -7532,11 +7665,10 @@ impl Engine {
                 db::promote_unit(conn, unit_id, now)?;
                 Ok(unit_id)
             })?;
-            // The supervisor claims it, not this call: `keeper-syncd` has no
-            // event loop to wait on and draining inline would make urgency
-            // pointless. In this process that collapses the wait to the next
-            // tick; from the CLI, whose engine is its own, the running daemon
-            // picks the row up on its own next pass instead.
+            // Nothing here claims the row. Who does depends on the door: the
+            // app's engine IS the supervisor, so this collapses the wait to its
+            // next tick, and [`Self::materialize_entry_now`] drains it before
+            // returning for the one-shot CLI that has no supervisor at all.
             self.wake_now(&profile.id);
             tracing::info!(
                 profile = profile.name,
@@ -7556,7 +7688,7 @@ impl Engine {
         // One frame of the phase the queued branch already publishes, so a
         // local copy of a four-gigabyte object is not silent. No new phase, no
         // new field, no new channel.
-        let mut event = self.progress(&profile, SyncPhase::DownloadingLfs);
+        let mut event = self.progress(profile, SyncPhase::DownloadingLfs);
         event.current = Some(path.clone());
         self.publish(event);
 
@@ -7596,6 +7728,217 @@ impl Engine {
             outcome: MaterializeOutcome::Materialized,
             unit_id: None,
         })
+    }
+
+    /// Ask for one path's content **and wait for it** (Story 56.13).
+    ///
+    /// [`Self::materialize_entry`] with the drain that satisfies it, for the
+    /// caller that has no supervisor behind it. An end-to-end run of the
+    /// shipped `keeper-syncd` binary is what earned this: the verb printed
+    /// `queued  4.0 MB  scans/big.bin`, exited `0`, and left ~130 bytes of
+    /// pointer text on disk, because a one-shot process is not the daemon its
+    /// own output was telling the operator to rely on. For the cron entry this
+    /// verb exists for that is a no-op wearing a success message.
+    ///
+    /// # `Ok` is a report, not a promise
+    ///
+    /// [`lfs::hydrate::MaterializeOutcome::Queued`] still comes back when the
+    /// transfer did not land, and it is still `Ok`: the request was legitimate,
+    /// the row is in the journal, and a later pass may well deliver it. What
+    /// changed is that it now means "this call did **not** put the bytes here",
+    /// which is a fact the caller must be able to act on — `keeper-syncd`
+    /// turns it into a non-zero exit, and the app never sees it because the app
+    /// calls the queueing verb.
+    ///
+    /// # The drain waits for the requested unit, and nothing else
+    ///
+    /// The primary exit is [`db::UnitStanding`] on the very row this request
+    /// queued: `Settled` means [`db::complete`] deleted it, which is the only
+    /// thing that deletes one, so the bytes arrived. `Parked` and `InFlight`
+    /// are answers this process cannot improve on — nothing retries a parked
+    /// row until a human unparks it, and `claim_ready` never offers a `running`
+    /// row, so a second pass would claim nothing.
+    ///
+    /// It must **not** be the profile's outstanding-download count. That count
+    /// is the whole folder's, `materialize_pending` queues one row per
+    /// unfetched pointer after every pull, and `CLAIM_LIMIT` is 16 — so the
+    /// requested row completes on the first pass while the count merely falls
+    /// by sixteen, and a strictly-decreasing loop then keeps going until the
+    /// entire backlog is fetched. `keeper-syncd materialize photos one.jpg`
+    /// would download the folder, holding the reservation throughout.
+    /// [`Self::sync_once`]'s identical loop is bounded that way for the
+    /// opposite reason: that verb IS supposed to do the folder's work.
+    ///
+    /// The strictly-decreasing count survives as the **anti-spin guard**, for
+    /// the one case that needs it: `claim_ready` keeps a slot back for the
+    /// oldest background row, which can bump the youngest requested row out of
+    /// a full batch, so a pass that did not attempt this row is possible and
+    /// waiting one more pass is right — while a queue making no progress at all
+    /// stops the loop rather than spinning on it.
+    ///
+    /// # Downloads only
+    ///
+    /// [`Self::drain_kind`], not [`Self::drain_journal`]: `execute` dispatches
+    /// every kind it is handed, so an unnarrowed drain would let a verb sold as
+    /// "fetch one path's content" commit, merge, publish the branch and open a
+    /// pull request — and a `Pull` drained here can move the committed pointer
+    /// the request is about, under the observation below.
+    ///
+    /// # One reservation, and one honest limit
+    ///
+    /// The request and its drain run under a single [`Self::reserve`], so no
+    /// second `Busy` window is opened between queueing and draining, and
+    /// `drain_kind`'s requirement that the caller own the reservation is met.
+    /// In-process — the app, or any future supervisor sharing this engine — a
+    /// pass already holding the folder answers [`SyncError::Busy`] before
+    /// anything is queued.
+    ///
+    /// Across processes it cannot, for the reason [`Self::materialize_entry`]
+    /// states out loud: the reservation is an in-process map, so this never
+    /// sees a running `keeper-syncd watch`. Draining anyway is safe rather than
+    /// merely tolerated. `db::claim_ready` flips a row to `running`, so the
+    /// worst case is the same immutable, content-addressed bytes fetched twice
+    /// — [`lfs::store::LfsStore`] publishes by rename once the digest and the
+    /// length match, and [`lfs::stage::materialize`] publishes the worktree
+    /// file the same way. The cost of losing that race is bandwidth, and it
+    /// cannot corrupt. The *other* half of that race — the daemon claimed the
+    /// row first, so this process can do nothing but watch — is what
+    /// `InFlight` exists to report honestly instead of calling a healthy
+    /// transfer a failure.
+    ///
+    /// # The second pass observes; it never asks again
+    ///
+    /// [`Self::materialize_held`] is called a second time with
+    /// [`WhenAbsent::Report`], so it is the same publish path rather than a
+    /// second copy of it and it re-asks the only question the drain can have
+    /// changed — what the worktree and the store hold *now* — while writing
+    /// nothing to the journal. Normally [`Self::materialize_landed`] has
+    /// already published the labelled path (it is the arm that outranks the
+    /// virtualization policy for a requested unit and re-stats the index), so
+    /// the second call answers `AlreadyMaterialized`; if the object reached the
+    /// store without being published, the second call publishes it.
+    ///
+    /// Either way **this** invocation delivered the content, so the outcome is
+    /// `Materialized` — `AlreadyMaterialized` means "the worktree already held
+    /// it before you asked", which a consumer would read as a cache hit. Its
+    /// `unit_id` is `None`, honouring
+    /// [`lfs::hydrate::Materialization::unit_id`]'s own contract: the field
+    /// names the row that *will* deliver the content, and after a successful
+    /// drain there is no such row — `db::complete` deleted it, and a consumer
+    /// that polls on the field's presence would wait forever.
+    ///
+    /// `volume_ready` is re-asked before that pass. It is
+    /// [`Self::materialize_request`]'s guard and it runs once, while the
+    /// `.git`-existence test it exists to precede runs twice; a removable drive
+    /// unplugged mid-transfer would otherwise be reported as
+    /// `ContentRefusal::NotTracked` — "your file is not tracked by git" —
+    /// rather than as the absence AD-48 requires.
+    pub async fn materialize_entry_now(
+        &self,
+        id: &str,
+        subpath: &str,
+        source: SyncSource,
+    ) -> Result<lfs::hydrate::Materialization> {
+        use lfs::hydrate::MaterializeOutcome;
+
+        let (profile, rela, path) = self.materialize_request(id, subpath)?;
+        let _reservation = self
+            .reserve(&profile.id)
+            .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+
+        let queued = self.materialize_held(&profile, &rela, path.clone(), WhenAbsent::Queue)?;
+        let (MaterializeOutcome::Queued, Some(unit)) = (queued.outcome, queued.unit_id) else {
+            return Ok(queued);
+        };
+
+        let mut previous = u32::MAX;
+        loop {
+            // A bookkeeping failure inside the drain must not discard a
+            // delivery that already happened: `db::complete` runs *after*
+            // `materialize_landed` published the worktree file, so a
+            // `SQLITE_BUSY` there — most likely precisely when a `watch` daemon
+            // is writing the same file, which this verb tolerates running
+            // alongside — would otherwise report a failed run over content that
+            // is on disk. Stop draining and let the observation below decide.
+            if let Err(err) = self
+                .drain_kind(&profile, WorkKind::LFS_DOWNLOAD, source)
+                .await
+            {
+                tracing::warn!(
+                    profile = profile.name,
+                    unit,
+                    error = %err,
+                    "the drain could not finish; reporting what is on disk"
+                );
+                break;
+            }
+            if !self
+                .with_db(|conn| db::unit_standing(conn, unit))?
+                .worth_waiting_for()
+            {
+                break;
+            }
+            let outstanding = self.lfs_downloads_outstanding(&profile)?;
+            if outstanding == 0 || outstanding >= previous {
+                break;
+            }
+            previous = outstanding;
+        }
+
+        // See this function's doc: the guard that precedes the `.git` test runs
+        // in `materialize_request`, and the `.git` test is about to run again.
+        if !self.volume_ready(&profile)? {
+            return Err(SyncError::MediaAbsent);
+        }
+        let settled = self.materialize_held(&profile, &rela, path, WhenAbsent::Report)?;
+        if settled.outcome == MaterializeOutcome::Queued {
+            tracing::warn!(
+                profile = profile.name,
+                path = settled.path,
+                unit,
+                "the requested transfer did not land in this run"
+            );
+            // The unit this invocation queued, not one the observation minted:
+            // `WhenAbsent::Report` mints none, and the row that recorded the
+            // failure is the row the caller has to be told about.
+            return Ok(lfs::hydrate::Materialization {
+                unit_id: Some(unit),
+                ..settled
+            });
+        }
+        Ok(lfs::hydrate::Materialization {
+            outcome: MaterializeOutcome::Materialized,
+            unit_id: None,
+            ..settled
+        })
+    }
+
+    /// Of the downloads this profile owes, how many are still outstanding?
+    ///
+    /// [`Self::lfs_uploads_outstanding`]'s mirror and it counts the same way —
+    /// parked rows included — for a different reason. There it answers whether
+    /// publishing is safe; here it is only the anti-spin guard for
+    /// [`Self::materialize_entry_now`]'s loop, and a parked download that
+    /// stopped being retried is exactly the row whose count must not fall, so
+    /// the loop stops instead of spinning on it.
+    fn lfs_downloads_outstanding(&self, profile: &SyncProfile) -> Result<u32> {
+        self.with_db(|conn| db::outstanding_count(conn, &profile.id, WorkKind::LFS_DOWNLOAD))
+    }
+
+    /// Where one journal unit stands, best effort (Story 56.13).
+    ///
+    /// [`db::unit_standing`] for a caller outside this crate — `keeper-syncd`
+    /// phrases its failure from it, because "nothing will retry this",
+    /// "something is transferring it right now" and "it will be tried again"
+    /// are three different sentences and only one of them should send an
+    /// operator to start a daemon.
+    ///
+    /// A journal that cannot be read reads `Waiting` with no reason: the caller
+    /// is already reporting a failure and must not lose that report to a second
+    /// one.
+    pub fn unit_standing(&self, unit: i64) -> db::UnitStanding {
+        self.with_db(|conn| db::unit_standing(conn, unit))
+            .unwrap_or(db::UnitStanding::Waiting { reason: None })
     }
 
     /// Release one path's content back to the pointer this folder committed
