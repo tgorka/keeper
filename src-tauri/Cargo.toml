@@ -146,9 +146,43 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 # 0.13 the Beeper client already uses, so no second TLS stack is linked.
 # Push, worktree mutation, sparse-checkout patterns and gc are NOT implemented
 # upstream and are not planned (issue #306 closed NOT_PLANNED 2026-07-22);
-# those four shell out to the `git` binary via `keeper_sync::git::cli`.
+# those four shell out to the `git` binary via `keeper_sync::git::cli`. See
+# `docs/upstream/gitoxide-feature-gaps.md` for what each one needs.
 # MIT OR Apache-2.0 — passes `cargo deny check`.
-gix = { version = "0.86", default-features = false, features = [
+#
+# **A fork pin, for one fix: `process` filters are reaped.**
+#
+# `filter.lfs.process` names a long-running helper and gitoxide starts one per
+# pipeline; upstream never stops one. `gix_filter::driver::State::shutdown` is
+# the only code in the gitoxide workspace that waits a filter child, it has no
+# caller outside gix-filter's own tests, and it takes `self` by value so
+# `State` could not reap on `Drop`. `impl Clone for State` then resets
+# `running`, so every per-thread clone `index_as_worktree` makes owns and
+# abandons children of its own. Measured on the shipped bundle: 274 zombies
+# plus 32 live helpers for one folder after 10h29m, against a
+# `kern.maxprocperuid` of 2666 — a four-day fuse to a host that cannot
+# `fork()`. The alternative was the single-shot `clean`/`smudge` pair, which
+# gitoxide does wait on and which buffers each file twice over (RSS measured
+# oscillating 72-465 MB on a folder of video); see
+# `docs/upstream/gitoxide-filter-process-leak.md`.
+#
+# The branch is `tgorka/gitoxide` — `State::shutdown_mut` plus `impl Drop for
+# State`, filed upstream as tgorka/gitoxide#1 (lifecycle tests) and #2 (the
+# fix) — cherry-picked onto the `gix-filter-v0.33.0` release tag. That tag is
+# also where `gix` 0.86.0 and `gix-quote` 0.7.2 were published, so every crate
+# in this tree is the same code crates.io serves, plus the `Drop`.
+#
+# It is a git source rather than a `[patch.crates-io]` entry on gix-filter
+# alone, and it has to be: a patched gix-filter keeps its intra-repo path deps,
+# so `gix-hash` would enter the tree twice — once from the registry with `sha1`
+# on, once from git without it — and the build fails inside gix-hash with the
+# non-exhaustive matches the note above describes.
+#
+# Retire this the moment the fix is released upstream: restore
+# `version = "0.86"` (or later), drop the `git`/`branch` keys here and on
+# `gix-quote`, and re-run the reaping proof in
+# `docs/upstream/gitoxide-filter-process-leak.md`.
+gix = { git = "https://github.com/tgorka/gitoxide", branch = "keeper/gix-filter-0.33-reap", default-features = false, features = [
     "sha1",
     "blocking-http-transport-reqwest-rust-tls",
     "credentials",
@@ -223,7 +257,11 @@ base64 = "0.22"
 # `ansi_c::undo`. Already resolved in the lock as gix-attributes' own
 # dependency, so a direct dep pulls no new crate. MIT OR Apache-2.0 — passes
 # `cargo deny check`.
-gix-quote = "0.7.2"
+#
+# Same git source as `gix` above, so `gix-attributes`' unquoting and keeper's
+# own read-back are one copy of one crate rather than two builds of 0.7.2 from
+# two sources.
+gix-quote = { git = "https://github.com/tgorka/gitoxide", branch = "keeper/gix-filter-0.33-reap" }
 # ---------------------------------------------------------------------------
 # Document rendering (Story 45.8, FR-181, FR-182). Consumed by `keeper-core`
 # only: DOCX, PPTX and XLSX are a ZIP of XML, so keeper parses them in Rust and
@@ -271,3 +309,4 @@ quick-xml = "0.39"
 # reqwest already pulls into `keeper-core`, so the direct edge adds no package
 # to Cargo.lock. MIT OR Apache-2.0 — passes `cargo deny check`.
 flate2 = "1"
+

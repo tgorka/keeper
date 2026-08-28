@@ -26,6 +26,18 @@ fn main() {
             keeper_sync::lfs::filter::run(&repo, direction, &mut stdin.lock(), &mut stdout.lock())
         }
         keeper_sync::lfs::filter::Invocation::Process { repo } => {
+            // A launch record, so a test can name the child gitoxide started
+            // without racing it: by the time the walk returns the process is
+            // meant to be gone, and "gone" is only checkable against a pid.
+            // Appended, because one pipeline may launch several.
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(repo.join(".git").join("filter-process-pids"))
+            {
+                let _ = writeln!(file, "{}", std::process::id());
+            }
             keeper_sync::lfs::filter::run_process(&repo, &mut stdin.lock(), &mut stdout.lock())
         }
         keeper_sync::lfs::filter::Invocation::Unsupported => {
