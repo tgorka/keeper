@@ -367,18 +367,34 @@ const REPAIR_BATCH: usize = 500;
 /// index over successive passes.
 const REPAIR_WINDOW: usize = 5_000;
 
-/// The most repair-backlog paths one Pending poll names.
+/// The most rows one Pending poll puts in its list, per source.
 ///
-/// A cap on the LIST, not on the work: [`REPAIR_WINDOW`] already bounds what
-/// the probe examines. This bounds what crosses the IPC boundary and lands in
-/// a virtualized list — the folder this was written for has tens of thousands
-/// of them, and a poll that serialized 37 500 rows every five seconds would be
-/// its own kind of permanent load. Larger than the list the pane renders, so
-/// scrolling never runs out of rows before the sweep converts them.
-const PENDING_REPAIR_CAP: usize = 500;
+/// A cap on the LIST, not on the truth. The headline count — "N waiting to
+/// sync, M waiting for writes to stop" — is computed separately from indexed
+/// `COUNT(*)`s (see [`crate::progress::status_line`]), so bounding the list
+/// hides no work from the user.
+///
+/// It bounds two things that were both unbounded, and both measured on the
+/// same folder:
+///
+/// * the repair backlog, ~37 500 paths, where [`REPAIR_WINDOW`] already bounds
+///   the probe and this bounds what crosses the IPC boundary;
+/// * the settling rows, **128 483** of them, where the poll used to `stat`
+///   every single one — 128 483 blocking syscalls on a USB volume, per poll.
+///
+/// Larger than the list the pane renders, so scrolling never runs out of rows
+/// before the engine converts or releases them.
+const PENDING_LIST_CAP: usize = 500;
 
 /// How often the supervisor wakes when nothing else prompts it.
 const TICK_MS: u64 = 1_000;
+
+/// How long a repair-backlog probe stays good enough to answer a poll with.
+///
+/// Longer than the pane's five-second poll by enough that a probe costing
+/// seconds is amortized rather than repeated, and far shorter than the hours a
+/// backlog of tens of thousands takes to drain. See [`Engine::repair_memo`].
+const REPAIR_MEMO_TTL: Duration = Duration::from_secs(30);
 
 /// How often a folder's transfer scratch is swept.
 ///
@@ -808,6 +824,57 @@ pub struct Engine {
     /// the inconsistencies deeper in the tree. Wraps at the end; see
     /// [`REPAIR_WINDOW`].
     repair_cursor: Mutex<HashMap<String, usize>>,
+    /// The last repair-backlog probe per profile, and when it was taken.
+    ///
+    /// The probe is cheap next to the walk it replaces and expensive next to
+    /// nothing: it opens the repository and materializes every tracked path
+    /// before examining a window of them. Measured on a 155 662-entry folder,
+    /// 3 to 21 seconds. The Pending pane polls every five seconds, so running
+    /// it per poll meant the answer was never ready when the next question
+    /// arrived — the pane sat on "Loading folders…" and the allocator churned
+    /// a six-figure path list on a loop.
+    ///
+    /// A backlog of tens of thousands does not change meaningfully inside
+    /// [`REPAIR_MEMO_TTL`], and the sweep that drains it publishes its own
+    /// progress, so a slightly old answer here is honest.
+    repair_memo: Mutex<HashMap<String, (Instant, Vec<PathBuf>)>>,
+
+    /// Profiles with a full-tree status walk in flight.
+    ///
+    /// Measured on hesperia's `tgdrive`: **two** concurrent walks of the same
+    /// 155 662-entry USB folder, in 26 of 26 one-second samples over seven
+    /// minutes — two `keeper-status-watchdog` threads, two
+    /// `gix::status::index_worktree::producer`s, two `index_as_worktree`
+    /// scopes. Nothing bounded it: the commit leg and every Pending poll each
+    /// called `status_paths_reported` directly, and a walk of that folder takes
+    /// 72 minutes, so a five-second poll only had to reach the walk branch once
+    /// to leave a second full-tree pass running for over an hour beside the
+    /// first.
+    ///
+    /// Two walks of one tree are not twice the work — they are twice the work
+    /// plus the seek contention of interleaving them on one external volume.
+    /// The claim is `try`-only on both legs: nobody waits for a walk, because a
+    /// caller that waits 72 minutes for a UI poll is the bug in a new place.
+    walking: Mutex<std::collections::HashSet<String>>,
+}
+
+/// A profile's in-flight full-tree walk, released when this is dropped.
+///
+/// A `Drop` guard rather than a matching pair of calls, because the walk it
+/// covers can end four ways — completion, the watchdog's abandonment, an
+/// unreadable-tree error, or a panic on a worker — and three of those do not
+/// come back to the line that made the claim. A leaked claim is a folder that
+/// never walks again, which is a far worse failure than the duplicate walk this
+/// removes.
+struct WalkClaim<'a> {
+    walking: &'a Mutex<std::collections::HashSet<String>>,
+    profile_id: String,
+}
+
+impl Drop for WalkClaim<'_> {
+    fn drop(&mut self) {
+        Engine::lock(self.walking).remove(&self.profile_id);
+    }
 }
 
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
@@ -922,9 +989,30 @@ impl Engine {
             counters: Mutex::new(HashMap::new()),
             walk_report_interval: WALK_REPORT_INTERVAL,
             repair_cursor: Mutex::new(HashMap::new()),
+            repair_memo: Mutex::new(HashMap::new()),
+            walking: Mutex::new(std::collections::HashSet::new()),
         };
         engine.seed_status()?;
         Ok(engine)
+    }
+
+    /// Claim the one full-tree walk this profile is allowed to have running.
+    ///
+    /// `None` means somebody else is already walking this folder. There is no
+    /// waiting variant on purpose: the two callers are a commit pass and a UI
+    /// poll, and on a folder whose walk takes over an hour, a caller that
+    /// queued behind one would be indistinguishable from the freeze this
+    /// exists to remove. Both legs have a correct answer for "not now" — the
+    /// commit pass defers to the supervisor's next tick, and the poll answers
+    /// from the index and the gate, which is what it does anyway whenever a
+    /// repair backlog exists.
+    fn claim_walk(&self, profile_id: &str) -> Option<WalkClaim<'_>> {
+        Self::lock(&self.walking)
+            .insert(profile_id.to_owned())
+            .then(|| WalkClaim {
+                walking: &self.walking,
+                profile_id: profile_id.to_owned(),
+            })
     }
 
     /// Report a walk's progress on every item, for tests.
@@ -4147,6 +4235,26 @@ impl Engine {
         Ok(converged)
     }
 
+    /// The last repair-backlog probe for this profile, if it is still fresh.
+    ///
+    /// `None` means "ask again", not "there is no backlog" — the two are
+    /// different answers and conflating them would make a poll during the TTL
+    /// claim a folder is clean.
+    fn remembered_repair(&self, profile_id: &str) -> Option<Vec<PathBuf>> {
+        Self::lock(&self.repair_memo)
+            .get(profile_id)
+            .filter(|(taken, _)| taken.elapsed() < REPAIR_MEMO_TTL)
+            .map(|(_, found)| found.clone())
+    }
+
+    /// Remember a probe, including an empty one: "this folder has no backlog"
+    /// is exactly as expensive to establish as the opposite and exactly as
+    /// worth not re-establishing five seconds later.
+    fn remember_repair(&self, profile_id: &str, found: &[PathBuf]) {
+        Self::lock(&self.repair_memo)
+            .insert(profile_id.to_owned(), (Instant::now(), found.to_vec()));
+    }
+
     /// A bounded batch of paths whose committed blob contradicts their
     /// attributes, or `None` when there are none.
     ///
@@ -4600,6 +4708,18 @@ impl Engine {
     /// or enqueues the push.
     fn collect_stable_changes(&self, profile: &SyncProfile) -> Result<git::commit::StagedChange> {
         let repo = self.open_repo(profile)?;
+        // One walk per folder. If a Pending poll is already inside one, this
+        // pass has nothing to add by starting a second: it would read the same
+        // tree, reach the same verdicts, and halve the throughput of the walk
+        // already running. Staging nothing is an outcome this caller already
+        // handles on every quiet pass, and the supervisor's next tick retries.
+        let Some(_claim) = self.claim_walk(&profile.id) else {
+            tracing::info!(
+                profile = %profile.name,
+                "a status walk is already in flight; deferring this pass to the next tick"
+            );
+            return Ok(git::commit::StagedChange::default());
+        };
         // A walk that takes longer than a second says so, on the surface the
         // owner is looking at. Before this, the one step that can run for ten
         // minutes on a 155 000-file folder published nothing at all, so the pane
@@ -4607,13 +4727,15 @@ impl Engine {
         // way to tell work from a wedge. Fast folders still report nothing: the
         // pacing lives in `git::repo`, and DW-116's flipping glyph stays fixed.
         let status = {
-            let report = |seen: u64, entries: u64| {
+            let report = |scanned: u64, entries: u64| {
                 let mut event = self.progress(profile, SyncPhase::Scanning);
-                event.files_done = seen;
-                // `seen` counts untracked paths the index never had, so it can
-                // pass `entries`; a denominator below the numerator would render
-                // a bar past its end. Say the count alone in that case.
-                event.files_total = (entries >= seen).then_some(entries);
+                event.files_done = scanned;
+                // Both counts are index entries now (see [`git::repo::WalkReport`]),
+                // so the numerator can no longer overrun the denominator and
+                // the bar cannot render past its end. A zero denominator is
+                // still not a denominator: an index the walk could not read
+                // bounds nothing, and the count alone is the honest answer.
+                event.files_total = (entries > 0).then_some(entries);
                 self.publish(event);
             };
             git::repo::status_paths_reported(&repo, Some(&report), self.walk_report_interval)?
@@ -7981,35 +8103,60 @@ impl Engine {
 
         // Settling paths are absolute in `file_state` (that is what the gate
         // samples), and everything the user sees must be repository-relative.
+        //
+        // **Bounded, and off the runtime.** This loop used to `stat` every row
+        // the gate held, inline in an async fn. On the folder this was written
+        // for the gate holds 128 483 of them, so one Pending poll made 128 483
+        // blocking syscalls on a USB volume from a tokio worker — which is why
+        // the Pending list never arrived AND why Activity, a single indexed
+        // query, appeared to hang beside it: they share the runtime, and the
+        // frontend renders the three legs together.
+        //
+        // Capping the LIST does not cost the count. "N waiting for writes to
+        // stop" comes from `status.settling`, a `COUNT(*)`; see
+        // [`crate::progress::status_line`]. What is bounded here is how many
+        // rows cross the IPC boundary and get a size measured.
         let settling = self.with_db(|conn| db::load_file_state(conn, profile_id))?;
-        let mut out: Vec<PendingFile> = Vec::with_capacity(settling.len());
-        let mut named: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(settling.len());
-        for (path, entry) in settling {
-            let relative = path.strip_prefix(&profile.local_path).unwrap_or(&path);
-            // A row written before a pattern was added to the profile: the gate
-            // will drop it on the next walk, and until then it must not be
-            // shown.
-            if excludes.is_excluded(relative) {
-                continue;
-            }
-            let relative = relative.to_string_lossy().into_owned();
-            if named.insert(relative.clone()) {
-                // `path` here is absolute — the gate stores it that way, which
-                // is the whole reason `relative` is derived above.
-                let size_bytes = std::fs::metadata(&path)
-                    .ok()
-                    .filter(|m| m.is_file())
-                    .map(|m| m.len());
-                out.push(PendingFile {
-                    path: relative,
-                    reason: PendingReason::Settling {
-                        since_ms: entry.pending_since_ms,
-                    },
-                    size_bytes,
-                });
-            }
-        }
+        let local_path = profile.local_path.clone();
+        let filter = excludes.clone();
+        let (mut out, mut named) = tokio::task::spawn_blocking(
+            move || -> (Vec<PendingFile>, std::collections::HashSet<String>) {
+                let mut out: Vec<PendingFile> = Vec::new();
+                let mut named: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (path, entry) in settling {
+                    if out.len() >= PENDING_LIST_CAP {
+                        break;
+                    }
+                    let relative = path.strip_prefix(&local_path).unwrap_or(&path);
+                    // A row written before a pattern was added to the profile:
+                    // the gate will drop it on the next walk, and until then it
+                    // must not be shown.
+                    if filter.is_excluded(relative) {
+                        continue;
+                    }
+                    let relative = relative.to_string_lossy().into_owned();
+                    if named.insert(relative.clone()) {
+                        // `path` here is absolute — the gate stores it that
+                        // way, which is the whole reason `relative` is derived
+                        // above.
+                        let size_bytes = std::fs::metadata(&path)
+                            .ok()
+                            .filter(|m| m.is_file())
+                            .map(|m| m.len());
+                        out.push(PendingFile {
+                            path: relative,
+                            reason: PendingReason::Settling {
+                                since_ms: entry.pending_since_ms,
+                            },
+                            size_bytes,
+                        });
+                    }
+                }
+                (out, named)
+            },
+        )
+        .await
+        .map_err(|err| SyncError::Journal(format!("pending settling scan failed: {err}")))?;
 
         // A folder that is not a repository yet has nothing git can classify,
         // and materializing one is a clone — far too much for a poll. The
@@ -8037,34 +8184,43 @@ impl Engine {
         // advanced, because moving it here would make the sweep skip the work
         // it is the only leg that can do.
         let repair = if is_repository {
-            let repo_path = profile.local_path.clone();
-            let removable = profile.removable;
-            let filtered = profile.lfs_mode != LfsMode::Disabled;
-            let from = Self::lock(&self.repair_cursor)
-                .get(&profile.id)
-                .copied()
-                .unwrap_or(0);
-            tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
-                if !filtered {
-                    return Vec::new();
+            match self.remembered_repair(&profile.id) {
+                Some(remembered) => remembered,
+                None => {
+                    let repo_path = profile.local_path.clone();
+                    let removable = profile.removable;
+                    let filtered = profile.lfs_mode != LfsMode::Disabled;
+                    let from = Self::lock(&self.repair_cursor)
+                        .get(&profile.id)
+                        .copied()
+                        .unwrap_or(0);
+                    let found = tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
+                        if !filtered {
+                            return Vec::new();
+                        }
+                        let Ok(repo) = git::repo::open(&repo_path, removable) else {
+                            return Vec::new();
+                        };
+                        let Ok(tracked) = git::repo::tracked_paths(&repo) else {
+                            return Vec::new();
+                        };
+                        lfs::stage::mismatched_filtered_paths(
+                            &repo,
+                            &tracked,
+                            from,
+                            REPAIR_WINDOW,
+                            PENDING_LIST_CAP,
+                        )
+                        .0
+                    })
+                    .await
+                    .map_err(|err| {
+                        SyncError::Journal(format!("pending repair probe failed: {err}"))
+                    })?;
+                    self.remember_repair(&profile.id, &found);
+                    found
                 }
-                let Ok(repo) = git::repo::open(&repo_path, removable) else {
-                    return Vec::new();
-                };
-                let Ok(tracked) = git::repo::tracked_paths(&repo) else {
-                    return Vec::new();
-                };
-                lfs::stage::mismatched_filtered_paths(
-                    &repo,
-                    &tracked,
-                    from,
-                    REPAIR_WINDOW,
-                    PENDING_REPAIR_CAP,
-                )
-                .0
-            })
-            .await
-            .map_err(|err| SyncError::Journal(format!("pending repair probe failed: {err}")))?
+            }
         } else {
             Vec::new()
         };
@@ -8085,7 +8241,18 @@ impl Engine {
             }
         }
 
-        if is_repository && repair.is_empty() {
+        // The same one-walk-per-folder claim the commit leg takes, and the
+        // reason the claim exists: this branch is reached from a five-second UI
+        // poll, so without it a folder whose walk runs for over an hour ends up
+        // with a second full-tree pass beside the first — measured, two at once
+        // for as long as anyone watched. Losing the claim costs the poll only
+        // the untracked rows; the settling rows and the repair backlog above
+        // are already assembled, and the walk that does hold the claim is
+        // computing the same verdicts for the commit path anyway.
+        let walk_claim = (is_repository && repair.is_empty())
+            .then(|| self.claim_walk(profile_id))
+            .flatten();
+        if walk_claim.is_some() {
             let repo_path = profile.local_path.clone();
             let removable = profile.removable;
             let filter = excludes.clone();
@@ -8152,10 +8319,11 @@ impl Engine {
             // branch at RANDOM, so a walk that finished before the first drain
             // could take the handle's branch and discard every queued report.
             // On Linux the timing hid it; the same test failed on the Mac.
-            while let Some((seen, entries)) = rx.recv().await {
+            while let Some((scanned, entries)) = rx.recv().await {
                 let mut event = self.progress(&profile, SyncPhase::Scanning);
-                event.files_done = seen;
-                event.files_total = (entries >= seen).then_some(entries);
+                event.files_done = scanned;
+                // Index entries on both sides; see [`git::repo::WalkReport`].
+                event.files_total = (entries > 0).then_some(entries);
                 self.publish(event);
             }
             let (status, untracked, deleted_sizes) = task
@@ -10337,6 +10505,192 @@ mod tests {
         );
     }
 
+    /// The probe answers a poll; it must not BE the poll.
+    ///
+    /// It opens the repository and materializes every tracked path before it
+    /// examines a window of them — 3 to 21 seconds on the 155 662-entry folder
+    /// this was written for. The pane asks every five seconds, so running it
+    /// per poll put the answer permanently behind the next question: the pane
+    /// sat on "Loading folders…" and the allocator churned a six-figure path
+    /// list on a loop, which is a regression the first version of this shortcut
+    /// shipped with.
+    ///
+    /// Asserted on the memo's own timestamp rather than on timing, because a
+    /// wall-clock assertion under load is a flake and this is a question about
+    /// whether work happened at all.
+    #[tokio::test]
+    async fn a_second_pending_poll_reuses_the_probe_instead_of_repeating_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        let first = engine.pending(&p.id).await.expect("pending");
+        let taken = Engine::lock(&engine.repair_memo)
+            .get(&p.id)
+            .map(|(at, _)| *at)
+            .expect("the first poll has to leave an answer behind");
+
+        let second = engine.pending(&p.id).await.expect("pending");
+        let taken_again = Engine::lock(&engine.repair_memo)
+            .get(&p.id)
+            .map(|(at, _)| *at)
+            .expect("still memoized");
+
+        assert_eq!(
+            taken, taken_again,
+            "the second poll re-ran a probe it already had the answer to"
+        );
+        assert_eq!(first, second, "and it must be the same answer");
+    }
+
+    /// The Pending list is bounded, and the count it sits under is not.
+    ///
+    /// The gate on the folder this was written for held **128 483** rows, and
+    /// this poll used to `stat` every one of them, inline in an async fn. That
+    /// is 128 483 blocking syscalls on a USB volume per poll, from a tokio
+    /// worker — so the Pending list never arrived, and Activity, a single
+    /// indexed query, appeared to hang beside it because the frontend renders
+    /// the three legs together.
+    ///
+    /// Both halves are asserted: the list stops at [`PENDING_LIST_CAP`], and
+    /// the count behind "N waiting for writes to stop" still reports every row,
+    /// because it comes from a `COUNT(*)` and not from this list.
+    #[tokio::test]
+    async fn a_pending_poll_bounds_its_settling_list_without_understating_the_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        // More rows than the cap, each a real file so the stat that used to be
+        // unbounded has something to measure.
+        let held = PENDING_LIST_CAP + 25;
+        let mut rows = Vec::with_capacity(held);
+        for i in 0..held {
+            let name = format!("held-{i:05}.bin");
+            let absolute = p.local_path.join(&name);
+            std::fs::write(&absolute, b"still writing").expect("write");
+            rows.push((
+                absolute,
+                crate::stability::PersistedEntry {
+                    sample: crate::stability::FileSample {
+                        size: 13,
+                        mtime_ns: 1,
+                        ctime_ns: 1,
+                        inode: i as u64 + 1,
+                    },
+                    unchanged_since_ms: 1,
+                    pending_since_ms: 1,
+                    close_write: false,
+                },
+            ));
+        }
+        engine
+            .with_db(|conn| db::save_file_state(conn, &p.id, &rows))
+            .expect("seed the gate");
+
+        let pending = engine.pending(&p.id).await.expect("pending");
+        let settling = pending
+            .iter()
+            .filter(|row| matches!(row.reason, PendingReason::Settling { .. }))
+            .count();
+        assert_eq!(
+            settling, PENDING_LIST_CAP,
+            "the list is what is bounded, and it has to be bounded exactly"
+        );
+
+        assert_eq!(
+            engine
+                .with_db(|conn| db::load_file_state(conn, &p.id))
+                .expect("gate rows")
+                .len(),
+            held,
+            "the gate still holds every row — the cap bounds what the poll \
+             RENDERS, and the count behind \"N waiting for writes to stop\" is \
+             taken from this state, not from the list (see \
+             `crate::progress::status_line`). A cap that also shrank the state \
+             would be a lie about how much work is waiting"
+        );
+    }
+
+    /// One full-tree walk per folder, and the loser keeps working.
+    ///
+    /// Measured on hesperia: two concurrent walks of the same 155 662-entry USB
+    /// folder in 26 of 26 samples over seven minutes — the commit leg and a
+    /// five-second Pending poll, each calling the walk directly, on a tree
+    /// whose walk takes 72 minutes. Two walks of one tree are twice the work
+    /// plus the seek contention of interleaving them.
+    ///
+    /// Both halves matter. Losing the race must not raise an error and must not
+    /// stall: `collect_stable_changes` stages nothing and lets the supervisor
+    /// retry, which is the same outcome as any quiet pass.
+    #[test]
+    fn only_one_status_walk_runs_against_a_folder_at_a_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        std::fs::write(p.local_path.join("work.txt"), b"x").expect("write");
+        // Open the settle episode and age it out, so the folder really does
+        // hold something a walk would stage. Without this the assertion below
+        // passes for the wrong reason - a freshly written file is held by the
+        // stability gate whether the walk ran or not - and deleting the claim
+        // leaves the test green.
+        engine
+            .collect_stable_changes(&p)
+            .expect("the first pass opens the episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+
+        let held = engine.claim_walk(&p.id).expect("the first claim is free");
+        assert!(
+            engine.claim_walk(&p.id).is_none(),
+            "a second walk was allowed against a folder already being walked"
+        );
+        // A different folder is a different tree; the claim is per profile, not
+        // a global lock on walking.
+        assert!(
+            engine.claim_walk("another-profile").is_some(),
+            "the claim locked out an unrelated folder"
+        );
+
+        // The commit leg's answer to losing: nothing staged, no error.
+        let deferred = engine
+            .collect_stable_changes(&p)
+            .expect("a deferred pass is not a failure");
+        assert!(
+            deferred.added.is_empty()
+                && deferred.modified.is_empty()
+                && deferred.deleted.is_empty(),
+            "a pass that could not walk reported changes it never looked for: {deferred:?}"
+        );
+
+        // The claim is released, so the next pass is not locked out for the
+        // life of the process - and that pass finds the work the deferred one
+        // stayed silent about, which is what makes the silence above a
+        // consequence of the claim and not of an empty folder.
+        drop(held);
+        let ran = engine
+            .collect_stable_changes(&p)
+            .expect("the released folder walks");
+        assert_eq!(
+            ran.added,
+            vec![PathBuf::from("work.txt")],
+            "the folder had stageable work all along: {ran:?}"
+        );
+    }
+
     /// The maintenance guarantee: an operation that takes time SAYS SO.
     ///
     /// The field report this exists for: "pending took very long; if keeper has
@@ -10347,11 +10701,12 @@ mod tests {
     /// sync` - a fact about the queue, while the work itself was invisible and
     /// indistinguishable from a wedge.
     ///
-    /// Simulating "slow" is done by reporting on every item rather than by
-    /// making a disk slow: what has to stay true is that the *counts reach the
-    /// surface the owner reads*, and a test that waited out real seconds to
-    /// prove it would be a test nobody runs. The silent-when-fast half is
-    /// `git::repo`'s `a_walk_that_finishes_immediately_reports_no_progress`.
+    /// Simulating "slow" is done with a folder big enough to outlast a report
+    /// tick rather than by making a disk slow: what has to stay true is that
+    /// the *counts reach the surface the owner reads*, and a test that waited
+    /// out real seconds to prove it would be a test nobody runs. The
+    /// silent-when-fast half is `git::repo`'s
+    /// `a_walk_that_finishes_immediately_reports_no_progress`.
     #[test]
     fn a_long_running_walk_reports_its_progress_where_the_owner_can_see_it() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10362,9 +10717,22 @@ mod tests {
         engine.report_every_walk_item();
         let p = adoptable(dir.path());
         std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
+        // A committed body the walk has to compare its way through. Progress is
+        // published off a clock now (see `git::repo::WalkReport`), so a folder
+        // that finishes inside one tick proves nothing about a folder that runs
+        // for an hour, which is the case this exists for.
+        const COMMITTED: usize = 400;
+        for i in 0..COMMITTED {
+            std::fs::write(p.local_path.join(format!("base-{i:05}.txt")), b"x").expect("write");
+        }
         engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(
+            commit_after_settling(&engine, &platform, &p),
+            COMMITTED as u64
+        );
 
-        // Enough files that a report carries a count worth reading.
+        // And work on top, so the second scan below has something to hand the
+        // commit and the walk is a real one rather than a no-op.
         for i in 0..8 {
             std::fs::write(p.local_path.join(format!("file-{i}.txt")), b"content").expect("write");
         }
@@ -10393,20 +10761,26 @@ mod tests {
         );
         let counts: Vec<u64> = walking.iter().map(|event| event.files_done).collect();
         // It counts up, so a watcher can tell movement from a freeze - within a
-        // walk. Each walk is its own operation and starts again at one, which is
-        // what a restart back to 1 in this stream is.
+        // walk. Each walk is its own operation and starts again, which is what a
+        // drop back to a smaller number in this stream is.
         assert!(
             counts
                 .windows(2)
-                .all(|pair| pair[1] > pair[0] || pair[1] == 1),
+                .all(|pair| pair[1] >= pair[0] || pair[1] <= COMMITTED as u64),
             "a count moved backwards without restarting: {counts:?}"
         );
-        // And it reaches every item the walk produced: eight untracked files,
-        // so a report that stopped at two would mean the pane freezes part way.
+        // And it reaches the index it is drawn against: a report that stopped
+        // part way is a pane that freezes part way.
         assert_eq!(
             counts.iter().copied().max(),
-            Some(8),
+            Some(COMMITTED as u64),
             "the report has to follow the walk to its end: {counts:?}"
+        );
+        assert!(
+            walking
+                .iter()
+                .all(|event| event.files_total == Some(COMMITTED as u64)),
+            "the denominator is the index entry count: {walking:?}"
         );
         // And the line the owner actually reads names the step and the numbers,
         // rather than only what is queued behind it.
@@ -11981,12 +12355,19 @@ mod tests {
         let p = adoptable(dir.path());
         // The seed ignores itself, so the first commit needs a file of its own.
         std::fs::write(p.local_path.join(".gitignore"), b".gitignore\n").expect("seed");
-        std::fs::write(p.local_path.join("committed.txt"), b"already here").expect("write");
+        // Four hundred of them, because progress is published off a clock
+        // now: a seven-file walk finishes inside the first tick and a test
+        // built on one would be asserting that the clock is fast, not that the
+        // poll reports. See `git::repo::WalkReport`.
+        for i in 0..400 {
+            std::fs::write(p.local_path.join(format!("committed-{i:05}.txt")), b"x")
+                .expect("write");
+        }
         engine.upsert_profile(&p).expect("upsert");
         // `pending` only walks a folder that is already a repository - the
         // first sync is what adopts it - so the fixture commits once before
         // there is anything for a poll to find.
-        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 400);
         for i in 0..6 {
             std::fs::write(p.local_path.join(format!("waiting-{i}.txt")), b"x").expect("write");
         }
@@ -12011,10 +12392,15 @@ mod tests {
             "the Pending poll walked and said nothing: {:?}",
             Engine::lock(&published).clone()
         );
+        // Non-decreasing, not strictly increasing: progress is published off a
+        // clock now, so a tick that lands between two comparisons honestly
+        // repeats the figure rather than inventing movement. The macOS gate
+        // caught this with `[120, 140, 193, 292, 346, 375, 400, 400]` — a walk
+        // that had reached the end of the index and said so twice.
         assert!(
             counts
                 .windows(2)
-                .all(|pair| pair[1] > pair[0] || pair[1] == 1),
+                .all(|pair| pair[1] >= pair[0] || pair[1] <= 1),
             "a count moved backwards without restarting: {counts:?}"
         );
     }

@@ -764,6 +764,23 @@ describe("FilesPane keyboard navigation", () => {
     render(<FilesPane />);
   }
 
+  /**
+   * Focus the first row with the SECOND row already on screen.
+   *
+   * Every motion key below is relative to the set of visible rows, so that set
+   * has to be settled before the key — and the two profile rows do not
+   * necessarily land in one commit. Under a full-suite load the second one can
+   * arrive a commit later, and an `End` that gets there first honestly finds
+   * `Vault` to be the last visible row and stays put. No `waitFor` after the
+   * fact can rescue that: the key was already delivered and handled, and
+   * nothing re-fires it. This is the macOS CI failure `expected 'Vault' to be
+   * 'Field'` on the Home/End guard.
+   */
+  async function focusFirstRowOfTwo(): Promise<void> {
+    (await screen.findByRole("treeitem", { name: "Vault" })).focus();
+    await screen.findByRole("treeitem", { name: "Field" });
+  }
+
   it("puts exactly one row in the tab order and moves it with focus", async () => {
     mountVault();
     const tree = await screen.findByRole("tree", { name: FILES_TREE_LABEL });
@@ -776,7 +793,7 @@ describe("FilesPane keyboard navigation", () => {
     // must not be two hundred Tab presses.
     expect(rows()).toEqual(["0", "-1"]);
 
-    (await screen.findByRole("treeitem", { name: "Vault" })).focus();
+    await focusFirstRowOfTwo();
     await press("ArrowDown");
     expect(focusedName()).toBe("Field");
     expect(rows()).toEqual(["-1", "0"]);
@@ -784,7 +801,7 @@ describe("FilesPane keyboard navigation", () => {
 
   it("steps down and up one visible row at a time", async () => {
     mountVault();
-    (await screen.findByRole("treeitem", { name: "Vault" })).focus();
+    await focusFirstRowOfTwo();
 
     await press("ArrowDown");
     expect(focusedName()).toBe("Field");
@@ -797,7 +814,7 @@ describe("FilesPane keyboard navigation", () => {
 
   it("jumps to the first and last visible rows with Home and End", async () => {
     mountVault();
-    (await screen.findByRole("treeitem", { name: "Vault" })).focus();
+    await focusFirstRowOfTwo();
 
     // `waitFor`, not a bare read. Moving focus goes through a React commit and
     // a `focus()` call, and under a full-suite load those land a tick after the

@@ -76,9 +76,6 @@ pub fn open(path: &Path, trust_full: bool) -> Result<gix::Repository> {
     release_stale_index_lock(repo.git_dir());
     release_stale_ref_locks(repo.git_dir());
     drop_foreign_lfs_driver(&mut repo)?;
-    // Strictly after the drop: it decides WHICH `filter "lfs"` sections remain,
-    // and this one takes a key out of whichever ones did.
-    use_single_shot_lfs_filter(&mut repo)?;
     Ok(repo)
 }
 
@@ -191,92 +188,6 @@ fn has_foreign_lfs_driver(repo: &gix::Repository) -> bool {
 /// still has no business naming the `lfs` driver for a folder keeper manages.
 fn is_repository_scope(meta: &gix::config::file::Metadata) -> bool {
     meta.source.kind() == gix::config::source::Kind::Repository
-}
-
-/// Take the long-running `process` driver out of THIS handle's `lfs` filter,
-/// leaving the one on disk for everybody else.
-///
-/// # The processes this stops leaking
-///
-/// `filter.lfs.process` names a long-running helper, and gitoxide starts one per
-/// pipeline. It never stops one. `gix_filter::driver::State::shutdown` is the
-/// only function in gitoxide that `wait`s a filter child, and it has no caller
-/// anywhere in the workspace outside gix-filter's own test; `State` has no
-/// `Drop`, and `shutdown` takes `self` by value so it could not have one. The
-/// pipeline `gix::status` uses is built inside `index_worktree_status`, moved
-/// into `gix_status`, and dropped — the helper's pipes close, it exits, and
-/// nobody reaps it.
-///
-/// Field measurement, one machine, 10 h 29 m of uptime: **274 zombie children**
-/// owned by keeper plus 32 live helpers for a single folder, against a
-/// `kern.maxprocperuid` of 2 666. Roughly 26 an hour is a four-day fuse to the
-/// point where nothing on the machine can `fork` — which is what a browser
-/// failing to open a tab looks like from the outside.
-///
-/// It cannot be fixed where it happens: `Repository::status` accepts no pipeline
-/// and hands none back, in gix 0.86 or 0.87.1. What is in keeper's gift is which
-/// driver gitoxide *picks*. With `process` gone, `extract_driver` falls back to
-/// the `clean`/`smudge` pair [`enforce_local_config_with_filter`] writes beside
-/// it — single-file drivers, which gitoxide **does** wait on
-/// (`gix_filter::driver::apply` calls `child.wait()` on the success and the
-/// failure path alike). No zombies, no pool.
-///
-/// # Why the key stays on disk
-///
-/// Because there it is load-bearing, for a different git (DW-140). A human
-/// running `git add` in a synced folder has to reach keeper's filter, and git
-/// prefers a `process` driver over a `clean`/`smudge` pair *whatever scope each
-/// was defined in* — so deleting the local `process` key from the FILE would
-/// hand the folder straight back to the `filter.lfs.process` that
-/// `git lfs install` leaves in `~/.gitconfig`. This surgery is on the merged
-/// snapshot this `Repository` handle holds, exactly like
-/// [`drop_foreign_lfs_driver`]'s, and nothing on disk is touched.
-///
-/// # What it costs
-///
-/// One `fork`+`exec` per filtered file instead of one per pass. Measured against
-/// the shipped bundle on a real folder: process startup is 5-10 ms warm, beside
-/// the 60-250 ms of hashing and storing that both forms pay anyway. A pass that
-/// filters 38 000 files spends a few minutes more on spawns — against a walk
-/// that was taking 72 minutes and wedging itself on its own helper pool.
-pub fn use_single_shot_lfs_filter(repo: &mut gix::Repository) -> Result<()> {
-    // Read first, for `drop_foreign_lfs_driver`'s reason: committing a snapshot
-    // re-reads every value and clears the repository's caches, and a folder
-    // whose filter was registered without `serves_process` has no key here.
-    if repo
-        .config_snapshot()
-        .string("filter.lfs.process")
-        .is_none()
-    {
-        return Ok(());
-    }
-    let mut snapshot = repo.config_snapshot_mut();
-    // Collected first so the immutable borrow ends before the section is taken
-    // mutably. Several `[filter "lfs"]` sections in one file are legal.
-    let ids: Vec<_> = snapshot
-        .sections_and_ids()
-        .filter(|(section, _)| {
-            section.header().name() == "filter"
-                && section
-                    .header()
-                    .subsection_name()
-                    .is_some_and(|name| name == "lfs")
-        })
-        .map(|(_, id)| id)
-        .collect();
-    for id in ids {
-        if let Some(mut section) = snapshot.section_mut_by_id(id) {
-            // A loop rather than one call: `remove` takes the last match and a
-            // section may legally carry the key more than once.
-            while section.remove("process").is_some() {}
-        }
-    }
-    snapshot.commit().map_err(|err| {
-        SyncError::Git(format!(
-            "could not switch the lfs filter to its single-shot form: {err}"
-        ))
-    })?;
-    Ok(())
 }
 
 /// Remove an `index.lock` left behind by a process that was killed.
@@ -1510,14 +1421,109 @@ const STATUS_THREAD_LIMIT: usize = 4;
 /// core" is what deadlocked 55 conversions against a smaller filter pool.
 const _: () = assert!(STATUS_THREAD_LIMIT >= 1 && STATUS_THREAD_LIMIT <= 8);
 
-/// What a walk in progress can say about itself: items produced, and the number
-/// of index entries that bounds them.
+/// What a walk in progress can say about itself: index entries compared, and
+/// the number of index entries there are.
 ///
-/// The count is not a percentage and the denominator is not exact — a walk also
-/// emits untracked paths the index has never heard of, so `seen` can pass
-/// `entries`. It is the honest pair the walk actually holds, and it is what
-/// turns ten silent minutes into "checked 41 000 of 155 000 files".
-pub type WalkReport<'a> = &'a dyn Fn(u64, u64);
+/// **Both numbers count the same thing**, which is the whole point and was not
+/// true before. The numerator used to be items *emitted* — a walk's changed
+/// paths — against a denominator of index entries. On a folder mid-LFS
+/// migration that reads as `9113/155662` and creeps, because it is measuring
+/// how many differences have been found, not how far the walk has got; and it
+/// stops dead for the whole of any stretch where the walk finds nothing, which
+/// on a mostly clean tree is most of the pass.
+///
+/// `scanned` is what gix itself counts through the index (see `ScannedEntries`),
+/// so the pair is monotonic, bounded by its own denominator, and moves at the
+/// rate the walk is actually working. It is what turns ten silent minutes into
+/// "checked 41 000 of 155 000 files" and means it.
+///
+/// `Sync`, because the ticker that publishes it runs beside the walk rather
+/// than inside it — see `status_paths_excluding`.
+pub type WalkReport<'a> = &'a (dyn Fn(u64, u64) + Sync);
+
+/// File one walked item into the bucket that describes what has to happen.
+///
+/// Lifted out of the loop so the loop can live inside a `thread::scope` without
+/// eighty lines of match arms moving one indent to the right; the classification
+/// is unchanged.
+fn push_item(out: &mut RepoStatus, item: gix::status::Item) {
+    use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
+
+    match item {
+        Item::TreeIndex(change) => match change {
+            gix::diff::index::Change::Addition { location, .. } => {
+                out.added.push(to_path(location.as_ref()));
+            }
+            gix::diff::index::Change::Deletion { location, .. } => {
+                out.deleted.push(to_path(location.as_ref()));
+            }
+            gix::diff::index::Change::Modification { location, .. } => {
+                out.modified.push(to_path(location.as_ref()));
+            }
+            // A rename is a deletion at the source fused with an addition at
+            // the destination; keeping both keeps the two vectors a faithful
+            // description of what the tree has to become.
+            gix::diff::index::Change::Rewrite {
+                source_location,
+                location,
+                ..
+            } => {
+                out.deleted.push(to_path(source_location.as_ref()));
+                out.added.push(to_path(location.as_ref()));
+            }
+        },
+        Item::IndexWorktree(WorktreeItem::Modification {
+            rela_path, status, ..
+        }) => match status {
+            index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
+                out.deleted.push(to_path(rela_path.as_ref()));
+            }
+            index_as_worktree::EntryStatus::Change(_) => {
+                out.modified.push(to_path(rela_path.as_ref()));
+            }
+            // A conflicted entry is a divergence the merge machinery never
+            // produces here (AD-43 makes conflict copies instead), and
+            // `NeedsUpdate` / `IntentToAdd` mean the content is unchanged.
+            _ => {}
+        },
+        Item::IndexWorktree(WorktreeItem::DirectoryContents { entry, .. }) => {
+            if entry.status == gix::dir::entry::Status::Untracked {
+                out.untracked.push(to_path(entry.rela_path.as_ref()));
+            }
+        }
+        Item::IndexWorktree(WorktreeItem::Rewrite {
+            source,
+            dirwalk_entry,
+            ..
+        }) => {
+            out.deleted.push(to_path(source.rela_path()));
+            out.added.push(to_path(dirwalk_entry.rela_path.as_ref()));
+        }
+    }
+}
+
+/// Whether a finished walk still owes one closing progress report.
+///
+/// Two rules meet here, and they pull in opposite directions.
+///
+/// A walk that never reached its first tick must stay silent: publishing the
+/// scanning phase on every poll of an idle folder is what made the menu-bar
+/// glyph flip once a second, and the report exists for the ten-minute walk, not
+/// the ten-millisecond one. That is the `spoke` half — a ticker that did speak
+/// must not leave the last figure it happened to catch as the final word, or
+/// the bar stops short of its own end (the macOS gate saw `[198, 382, 296,
+/// 392]` against a denominator of 400).
+///
+/// A ZERO interval is the opposite case and always owes the report. It means
+/// "report every item", which the ticker cannot deliver: it sleeps a clamped
+/// millisecond before its first look, and a small walk has already set `done`
+/// by then. Without this arm every caller of `Engine::report_every_walk_item`
+/// is racing its own fixture — `a_pending_poll_publishes_the_progress_of_its_own_walk`
+/// failed on the macOS gate for exactly this reason while passing on Linux,
+/// with an empty event stream and a walk that had genuinely run.
+fn owes_closing_report(spoke: bool, interval: Duration) -> bool {
+    spoke || interval.is_zero()
+}
 
 /// The walk, with the pace its caller reports at.
 ///
@@ -1535,8 +1541,6 @@ fn status_paths_excluding(
     report: Option<WalkReport<'_>>,
     interval: Duration,
 ) -> Result<RepoStatus> {
-    use gix::status::{index_worktree::Item as WorktreeItem, plumbing::index_as_worktree, Item};
-
     // `flatten`, not `{err}`: a status that trips over one unreadable tracked
     // file reports "IO error while writing blob or reading file metadata or
     // changing filetype" in its top frame, and the errno that says *why* —
@@ -1593,84 +1597,87 @@ fn status_paths_excluding(
         .map(|index| index.entries().len() as u64)
         .unwrap_or(0);
 
-    let mut last_report = Instant::now();
-
+    // Progress comes off a clock, not off the items.
+    //
+    // It used to be published from inside this loop, which meant it could only
+    // move when the walk *emitted* something. A pass whose dirty entries run
+    // out part-way then compares tens of thousands of clean files in complete
+    // silence — the same stretch that used to get healthy walks killed — and
+    // the pane froze on whatever number the last emission left behind. This is
+    // also why the number the owner saw was items emitted rather than entries
+    // compared: inside the loop, the emission count was the only one that was
+    // guaranteed to have moved.
+    //
+    // Scoped, so the ticker can borrow the caller's reporter rather than
+    // forcing every call site through an `Arc`. It wakes on a short slice so
+    // the scope's join never adds a report interval to the end of a fast walk:
+    // `neuradrive` finishes in 150 ms and runs every few seconds.
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    // Whether the ticker ever spoke, which is one half of
+    // [`owes_closing_report`] - the rule that decides whether this walk still
+    // owes a final figure when it returns.
+    let spoke = std::sync::Arc::new(AtomicBool::new(false));
     let mut out = RepoStatus::default();
-    for item in iter {
-        // Before the item is inspected: a walk that is producing anything at
-        // all is alive, whatever the item turns out to be. The heartbeat is the
-        // count, so there is no second counter to keep in step with it.
-        let seen = watchdog.beat();
+    let walked = std::thread::scope(|scope| -> Result<RepoStatus> {
         if let Some(report) = report {
-            // Paced, not per item: see `WALK_REPORT_INTERVAL`. Checked after the
-            // beat so the count reported is one the walk has really reached.
-            if last_report.elapsed() >= interval {
-                last_report = Instant::now();
-                report(seen, entries);
+            let ticking = std::sync::Arc::clone(&scanned);
+            let ticking_done = std::sync::Arc::clone(&done);
+            let ticking_spoke = std::sync::Arc::clone(&spoke);
+            scope.spawn(move || {
+                // The wake is short so the scope's join never adds a report
+                // interval to the end of a fast walk, and it never exceeds the
+                // interval itself so a test can ask for a millisecond cadence
+                // and get one.
+                let slice = interval.clamp(Duration::from_millis(1), Duration::from_millis(20));
+                let mut waited = Duration::ZERO;
+                loop {
+                    std::thread::sleep(slice);
+                    if ticking_done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    waited += slice;
+                    if waited >= interval {
+                        waited = Duration::ZERO;
+                        ticking_spoke.store(true, Ordering::Relaxed);
+                        report(ticking.load(Ordering::Relaxed) as u64, entries);
+                    }
+                }
+            });
+        }
+        // `done` is set on every exit from the walk, including the error one:
+        // a ticker left running would hold the scope open forever.
+        let walked = (|| -> Result<()> {
+            for item in iter {
+                // Before the item is inspected: a walk that is producing
+                // anything at all is alive, whatever the item turns out to be.
+                // The heartbeat is the count, so there is no second counter to
+                // keep in step with it.
+                let seen = watchdog.beat();
+                let item = item.map_err(|err| {
+                    // An interrupt usually ends the iterator rather than
+                    // surfacing here, which is why the real guard is after the
+                    // loop — but if it ever does surface, the reason the walk
+                    // stopped is the useful sentence, not gix's inner error.
+                    if interrupt.load(Ordering::Relaxed) {
+                        return watchdog.silence_error(seen);
+                    }
+                    SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err)))
+                })?;
+                push_item(&mut out, item);
+            }
+            Ok(())
+        })();
+        done.store(true, Ordering::Relaxed);
+        // The closing figure, from this thread now the ticker has been told to
+        // stop, so there is exactly one last report and no race for it.
+        if let Some(report) = report {
+            if owes_closing_report(spoke.load(Ordering::Relaxed), interval) {
+                report(scanned.load(Ordering::Relaxed) as u64, entries);
             }
         }
-        let item = item.map_err(|err| {
-            // An interrupt usually ends the iterator rather than surfacing
-            // here, which is why the real guard is after the loop — but if it
-            // ever does surface, the reason the walk stopped is the useful
-            // sentence, not gix's inner error.
-            if interrupt.load(Ordering::Relaxed) {
-                return watchdog.silence_error(seen);
-            }
-            SyncError::Git(format!("status failed: {}", super::fetch::flatten(&err)))
-        })?;
-        match item {
-            Item::TreeIndex(change) => match change {
-                gix::diff::index::Change::Addition { location, .. } => {
-                    out.added.push(to_path(location.as_ref()));
-                }
-                gix::diff::index::Change::Deletion { location, .. } => {
-                    out.deleted.push(to_path(location.as_ref()));
-                }
-                gix::diff::index::Change::Modification { location, .. } => {
-                    out.modified.push(to_path(location.as_ref()));
-                }
-                // A rename is a deletion at the source fused with an addition
-                // at the destination; keeping both keeps the two vectors a
-                // faithful description of what the tree has to become.
-                gix::diff::index::Change::Rewrite {
-                    source_location,
-                    location,
-                    ..
-                } => {
-                    out.deleted.push(to_path(source_location.as_ref()));
-                    out.added.push(to_path(location.as_ref()));
-                }
-            },
-            Item::IndexWorktree(WorktreeItem::Modification {
-                rela_path, status, ..
-            }) => match status {
-                index_as_worktree::EntryStatus::Change(index_as_worktree::Change::Removed) => {
-                    out.deleted.push(to_path(rela_path.as_ref()));
-                }
-                index_as_worktree::EntryStatus::Change(_) => {
-                    out.modified.push(to_path(rela_path.as_ref()));
-                }
-                // A conflicted entry is a divergence the merge machinery never
-                // produces here (AD-43 makes conflict copies instead), and
-                // `NeedsUpdate` / `IntentToAdd` mean the content is unchanged.
-                _ => {}
-            },
-            Item::IndexWorktree(WorktreeItem::DirectoryContents { entry, .. }) => {
-                if entry.status == gix::dir::entry::Status::Untracked {
-                    out.untracked.push(to_path(entry.rela_path.as_ref()));
-                }
-            }
-            Item::IndexWorktree(WorktreeItem::Rewrite {
-                source,
-                dirwalk_entry,
-                ..
-            }) => {
-                out.deleted.push(to_path(source.rela_path()));
-                out.added.push(to_path(dirwalk_entry.rela_path.as_ref()));
-            }
-        }
-    }
+        walked.map(|()| std::mem::take(&mut out))
+    })?;
+    let mut out = walked;
 
     for bucket in [
         &mut out.added,
@@ -3076,12 +3083,6 @@ mod tests {
     /// used to register alone. Writing a local `process` key is the only way to
     /// win that comparison, and it is the whole reason this registration
     /// exists.
-    ///
-    /// Read off the FILE, not through [`open`]: the reader is a `git` keeper
-    /// does not run, and keeper's own handles deliberately no longer see this
-    /// key (see [`use_single_shot_lfs_filter`]). Parsed rather than grepped, so
-    /// the assertion is about the registration and not about how the encoder
-    /// escapes the quotes around a program path.
     #[test]
     fn the_filter_registration_claims_the_key_that_actually_takes_effect() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3094,10 +3095,13 @@ mod tests {
         )
         .expect("enforce");
 
-        let on_disk = read_config(&dir.path().join(".git/config"), gix::config::Source::Local)
-            .expect("read the file a plain git would read");
-        let process = on_disk
-            .raw_value("filter.lfs.process")
+        // Read back through gix rather than off the raw file: the on-disk form
+        // escapes the quotes around the program path, and asserting on that
+        // spelling would test the encoder instead of the registration.
+        let reopened = open(dir.path(), true).expect("reopen");
+        let snapshot = reopened.config_snapshot();
+        let process = snapshot
+            .string("filter.lfs.process")
             .expect("the long-running form must be registered, not only clean/smudge")
             .to_string();
         assert_eq!(
@@ -3109,120 +3113,14 @@ mod tests {
         // No `%f`: the protocol names each path in-band, and a stray
         // placeholder would arrive as an argument the filter never asked for.
         assert!(!process.contains("%f"), "{process}");
-        // The single-shot pair stays: it costs one line, it is what a git old
-        // enough to lack process filters would use — and since
-        // `use_single_shot_lfs_filter` it is also the only driver keeper's own
-        // handles have left.
-        let snapshot = open(dir.path(), true).expect("reopen");
-        let snapshot = snapshot.config_snapshot();
+        // The single-shot pair stays: it costs one line and is what a git old
+        // enough to lack process filters would use.
         assert!(snapshot
             .string("filter.lfs.clean")
             .is_some_and(|value| value.to_string().contains("lfs clean")));
         assert!(snapshot
             .string("filter.lfs.smudge")
             .is_some_and(|value| value.to_string().contains("lfs smudge")));
-    }
-
-    /// keeper's own handle must not carry the key that spawns a helper it can
-    /// never reap — and the file must keep it anyway.
-    ///
-    /// Both halves are the test. Leaving it in the handle is the process leak
-    /// (274 zombies in ten hours on one machine); taking it out of the file
-    /// hands the folder back to `git lfs install`'s global driver the next time
-    /// a human types `git add` there. Nothing else in the codebase asserts that
-    /// a handle and its own `.git/config` deliberately disagree.
-    #[test]
-    fn the_process_driver_is_dropped_from_the_handle_and_kept_on_disk() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let repo = gix::init(dir.path()).expect("init");
-        enforce_local_config_with_filter(
-            &repo,
-            Some(Path::new("/Applications/keeper.app/keeper")),
-            true,
-        )
-        .expect("enforce");
-
-        let reopened = open(dir.path(), true).expect("reopen");
-        assert!(
-            reopened
-                .config_snapshot()
-                .string("filter.lfs.process")
-                .is_none(),
-            "gitoxide starts one long-running helper per pipeline and waits on \
-             none of them; the only way not to leak is not to name one"
-        );
-
-        let on_disk = read_config(&dir.path().join(".git/config"), gix::config::Source::Local)
-            .expect("read config");
-        assert!(
-            on_disk.raw_value("filter.lfs.process").is_ok(),
-            "the key is load-bearing for the git a human runs by hand (DW-140)"
-        );
-    }
-
-    /// Dropping `process` must not leave the handle with NO driver.
-    ///
-    /// That failure mode is silent and much worse than the leak: with no driver
-    /// at all gitoxide compares a worktree file against its own pointer blob,
-    /// every LFS-tracked path reads as modified, and the folder commits its
-    /// content raw. The fallback pair is the whole reason this is safe.
-    #[test]
-    fn dropping_the_process_driver_leaves_the_single_shot_pair_in_place() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let repo = gix::init(dir.path()).expect("init");
-        enforce_local_config_with_filter(
-            &repo,
-            Some(Path::new("/Applications/keeper.app/keeper")),
-            true,
-        )
-        .expect("enforce");
-
-        let reopened = open(dir.path(), true).expect("reopen");
-        let drivers = gix::filter::Pipeline::options(&reopened)
-            .expect("filter options")
-            .drivers;
-        let lfs = drivers
-            .iter()
-            .find(|driver| driver.name == "lfs")
-            .expect("the driver gitoxide will actually use");
-        assert!(
-            lfs.process.is_none(),
-            "this is the handle gitoxide filters through: {:?}",
-            lfs.process
-        );
-        assert!(
-            lfs.clean.is_some(),
-            "clean is the fallback that must survive"
-        );
-        assert!(
-            lfs.smudge.is_some(),
-            "smudge is the fallback that must survive"
-        );
-    }
-
-    /// A folder registered without the process form is untouched, and pays
-    /// nothing: no snapshot commit, no cache clear, on every open.
-    #[test]
-    fn a_folder_with_no_process_driver_is_left_exactly_as_it_was() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let repo = gix::init(dir.path()).expect("init");
-        enforce_local_config_with_filter(
-            &repo,
-            Some(Path::new("/Applications/keeper.app/keeper")),
-            false,
-        )
-        .expect("enforce");
-        let before = std::fs::read_to_string(dir.path().join(".git/config")).expect("read");
-
-        let reopened = open(dir.path(), true).expect("reopen");
-        let snapshot = reopened.config_snapshot();
-        assert!(snapshot.string("filter.lfs.process").is_none());
-        assert!(snapshot.string("filter.lfs.clean").is_some());
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join(".git/config")).expect("read"),
-            before,
-            "an in-memory surgery that rewrote the file would be a different bug"
-        );
     }
 
     #[test]
@@ -3270,14 +3168,10 @@ mod tests {
         enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), true)
             .expect("enforce");
 
-        // Off the file, not through `open`: keeper's own handles deliberately
-        // no longer carry this key (see `use_single_shot_lfs_filter`), and the
-        // reader this registration exists for is the `git` binary, which reads
-        // the file.
-        let on_disk = read_config(&dir.path().join(".git/config"), gix::config::Source::Local)
-            .expect("read config");
-        let process = on_disk
-            .raw_value("filter.lfs.process")
+        let reopened = open(dir.path(), true).expect("reopen");
+        let config = reopened.config_snapshot();
+        let process = config
+            .string("filter.lfs.process")
             .expect("keeper's own driver must occupy the slot")
             .to_string();
         assert!(
@@ -3292,11 +3186,6 @@ mod tests {
         // beside a survivor in another section.
         let text = std::fs::read_to_string(dir.path().join(".git/config")).expect("read config");
         assert_eq!(text.matches("process = ").count(), 1, "{text}");
-        // These two ARE read through keeper's own handle: they are what it
-        // filters with once `use_single_shot_lfs_filter` has taken `process`
-        // out of the way.
-        let reopened = open(dir.path(), true).expect("reopen");
-        let config = reopened.config_snapshot();
         assert!(
             config
                 .string("filter.lfs.clean")
@@ -3375,15 +3264,7 @@ mod tests {
         let repo = gix::init(dir.path()).expect("init");
         enforce_local_config_with_filter(&repo, Some(std::path::Path::new("/opt/keeper")), true)
             .expect("enforce");
-        // Opened WITHOUT keeper's own surgeries. The subject here is
-        // `drop_foreign_lfs_driver` filtering on SCOPE, and `open` would also
-        // run `use_single_shot_lfs_filter`, which removes the key under test
-        // for an entirely different reason.
-        let mut repo = gix::open_opts(
-            dir.path(),
-            gix::open::Options::default().with(gix::sec::Trust::Full),
-        )
-        .expect("open");
+        let mut repo = open(dir.path(), true).expect("reopen");
 
         let foreign = gix::config::File::from_bytes_owned(
             &mut b"[filter \"lfs\"]\n\tprocess = git-lfs filter-process\n".to_vec(),
@@ -3603,37 +3484,210 @@ mod tests {
         );
     }
 
-    /// And a walk that does take time reports the pair the UI renders.
+    /// And a ZERO interval reports even when the walk beats the ticker to it.
     ///
-    /// The interval is forced to zero rather than waited out - the behaviour
-    /// under test is what the numbers *are*, and a test that slept a second per
-    /// item to prove it would be a test nobody runs.
+    /// Same fixture as the silence guard above, so the two differ in exactly
+    /// one input: the interval. `Duration::ZERO` is what
+    /// `Engine::report_every_walk_item` asks for, and the ticker cannot serve
+    /// it — it sleeps a clamped millisecond before its first look, by which
+    /// time a two-file walk has finished and set `done`. Every engine-level
+    /// test that subscribes to `Scanning` progress rests on this closing
+    /// report; without it those tests assert that the machine is slow.
     #[test]
-    fn a_slow_walk_reports_items_against_the_index_size() {
+    fn a_zero_interval_walk_reports_its_closing_figure() {
         let (dir, repo) = repo_with_two_files();
         std::fs::write(dir.path().join("c.txt"), "untracked").expect("write");
+        std::fs::write(dir.path().join("a.txt"), "alpha-changed").expect("modify");
         let seen = std::sync::Mutex::new(Vec::new());
         let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
 
+        status_paths_reported(&repo, Some(&report), Duration::ZERO).expect("status");
+        let seen = seen.lock().expect("lock").clone();
+        let last = seen.last().copied().expect("a zero interval reports");
+        assert!(
+            last.0 > 0 && last.1 > 0,
+            "the closing report is the pair the UI renders: {seen:?}"
+        );
+        assert_eq!(
+            last.1, 2,
+            "the denominator is the index entry count: {seen:?}"
+        );
+    }
+
+    /// The rule itself, which is where the mutation is detectable.
+    ///
+    /// The walk above cannot carry this claim on its own: whether a two-entry
+    /// walk beats the ticker's first millisecond is a property of the machine,
+    /// so on a slow enough box it passes with the closing report deleted. This
+    /// is the same rule with the timing removed.
+    #[test]
+    fn the_closing_report_is_owed_when_the_ticker_was_silent_only_at_zero() {
+        assert!(
+            owes_closing_report(true, Duration::from_secs(1)),
+            "a ticker that spoke must not leave a mid-walk figure as the final word"
+        );
+        assert!(
+            !owes_closing_report(false, Duration::from_secs(1)),
+            "a paced walk that stayed under one interval must stay silent"
+        );
+        assert!(
+            owes_closing_report(false, Duration::ZERO),
+            "report-every-item cannot depend on the ticker winning a race"
+        );
+        assert!(owes_closing_report(true, Duration::ZERO));
+    }
+
+    /// And a walk that does take time reports the pair the UI renders.
+    ///
+    /// The fixture is the failure, not a convenience: 3 000 committed files
+    /// that are all **clean**, plus one untracked path. The walk therefore
+    /// emits exactly one item and compares 3 000 index entries.
+    ///
+    /// Against that, the two candidate designs give opposite answers:
+    ///
+    /// * published from inside the item loop, counting emissions — **one**
+    ///   report, reading `1`, for the whole pass. That is what the owner was
+    ///   looking at when a 155 662-entry folder sat on `9113/155662`.
+    /// * published off a clock, counting entries — a report per interval,
+    ///   climbing to 3 000, which is what the walk is actually doing.
+    #[test]
+    fn a_slow_walk_reports_index_entries_compared_not_items_emitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let mut added = Vec::with_capacity(3_000);
+        for i in 0..3_000 {
+            let name = format!("f{i:05}.txt");
+            std::fs::write(dir.path().join(&name), b"x").expect("write");
+            added.push(PathBuf::from(name));
+        }
+        stage_and_commit(
+            &repo,
+            &StagedChange {
+                added,
+                ..StagedChange::default()
+            },
+            &provenance(),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
+        let repo = gix::open(dir.path()).expect("reopen");
+        // The one emission. Everything else the walk touches is clean, so a
+        // reporter tied to emissions has nothing further to say.
+        std::fs::write(dir.path().join("untracked.txt"), "u").expect("write");
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+
+        // ZERO, not a millisecond cadence: whether a 3 000-entry walk outlasts
+        // a tick is a property of the machine, and this test is about WHAT is
+        // counted, not about whether the clock got a turn. At ZERO the closing
+        // report is owed unconditionally, so the assertions below run on every
+        // machine — and an emissions-based numerator still fails them.
         status_paths_excluding(&repo, &[], Some(&report), Duration::ZERO).expect("status");
 
         let seen = seen.lock().expect("lock").clone();
         assert!(
             !seen.is_empty(),
-            "an item was produced and nothing was said"
+            "3 000 entries were compared and the walk said nothing"
         );
-        // The count is the walk's own, and it counts up.
-        assert_eq!(seen.first().map(|pair| pair.0), Some(1));
+        // The denominator is the index, which holds the committed files and not
+        // the untracked one.
         assert!(
-            seen.windows(2).all(|pair| pair[1].0 > pair[0].0),
-            "the count never walks backwards: {seen:?}"
+            seen.iter().all(|pair| pair.1 == 3_000),
+            "the denominator is the index entry count: {:?}",
+            &seen[..seen.len().min(8)]
         );
-        // The denominator is the index, which holds the two committed files -
-        // and not the untracked third, which is exactly why `seen` may pass it.
+        // Drawn against that denominator, so it can never pass it. An emission
+        // count could: the untracked path is emitted and is not an index entry.
         assert!(
-            seen.iter().all(|pair| pair.1 == 2),
-            "the denominator is the index entry count: {seen:?}"
+            seen.iter().all(|pair| pair.0 <= pair.1),
+            "the numerator overran its own denominator: {:?}",
+            &seen[..seen.len().min(8)]
         );
+        // Counts up. Not *strictly*: a tick that lands between two comparisons
+        // honestly repeats the figure rather than inventing movement.
+        assert!(
+            seen.windows(2).all(|pair| pair[1].0 >= pair[0].0),
+            "the count walked backwards: {:?}",
+            &seen[..seen.len().min(8)]
+        );
+        // The regression, stated as a number: one emission happened, so a
+        // loop-driven reporter could not have got past it.
+        let reached = seen.iter().map(|pair| pair.0).max().unwrap_or(0);
+        assert!(
+            reached > 1,
+            "the count never got past the single emitted item ({reached}), which \
+             is exactly the freeze this reports off a clock to avoid: {:?}",
+            &seen[..seen.len().min(8)]
+        );
+    }
+
+    /// A walk that reported at all reports where it stopped.
+    ///
+    /// The ticker fires on its own cadence, so the walk almost never ends on
+    /// one: whatever figure the last tick happened to catch would otherwise be
+    /// the final word, and the pane would sit a few thousand entries short of
+    /// the end with no way to tell "finished" from "stalled near the end". The
+    /// macOS gate saw exactly that — `[198, 382, 296, 392]` against a
+    /// denominator of 400.
+    ///
+    /// **The claim is conditional on purpose.** How many ticks an 8 000-entry
+    /// walk outlasts is a property of the machine, not of this code: the same
+    /// fixture produced four reports on Linux and fewer than two on the macOS
+    /// gate, where the walk finished inside a single 5 ms slice. Demanding a
+    /// tick count is how the previous revision of this test failed CI while
+    /// the behaviour it guards was correct. What must hold on every machine is
+    /// that the LAST word is the denominator whenever there was a word at all;
+    /// `the_closing_report_is_owed_when_the_ticker_was_silent_only_at_zero`
+    /// carries the rule itself, with the clock taken out.
+    #[test]
+    fn a_walk_that_reported_says_where_it_stopped() {
+        const ENTRIES: usize = 8_000;
+        const CADENCE: Duration = Duration::from_millis(1);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let mut added = Vec::with_capacity(ENTRIES);
+        for i in 0..ENTRIES {
+            let name = format!("f{i:05}.txt");
+            std::fs::write(dir.path().join(&name), b"x").expect("write");
+            added.push(PathBuf::from(name));
+        }
+        stage_and_commit(
+            &repo,
+            &StagedChange {
+                added,
+                ..StagedChange::default()
+            },
+            &provenance(),
+            &profile(dir.path()),
+            &signature(),
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit")
+        .expect("a non-empty commit");
+        let repo = gix::open(dir.path()).expect("reopen");
+
+        let seen = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
+        status_paths_excluding(&repo, &[], Some(&report), CADENCE).expect("status");
+
+        let seen = seen.lock().expect("lock").clone();
+        assert!(
+            seen.windows(2).all(|pair| pair[1].0 >= pair[0].0),
+            "the count walked backwards: {seen:?}"
+        );
+        if let Some(last) = seen.last().copied() {
+            assert_eq!(
+                last,
+                (ENTRIES as u64, ENTRIES as u64),
+                "the walk compared every entry and its last word said otherwise: {seen:?}"
+            );
+        }
     }
 
     #[test]
