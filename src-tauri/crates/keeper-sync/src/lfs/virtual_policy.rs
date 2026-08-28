@@ -272,6 +272,27 @@ impl VirtualPolicy {
     pub fn tier(&self) -> VirtualPolicyTier {
         self.tier
     }
+
+    /// Whether **any** path could be answered [`Virtualization::Virtual`] at
+    /// all.
+    ///
+    /// Distinct from [`Self::tier`], and the distinction is load-bearing rather
+    /// than pedantic. `tier` answers *which list decided what may stay away*,
+    /// and it is `Unset` only when no source said anything — but a source that
+    /// consists of nothing but `!` protections **does** say something, so a
+    /// committed `.keepervirtual` holding only `!30-masters/**` compiles to an
+    /// empty permissive set and a tier of
+    /// [`VirtualPolicyTier::PatternFile`]. A caller asking "is there any point
+    /// consulting me?" — [`crate::engine`]'s release gate is the one that must,
+    /// because the alternative is opening the repository and reading the index
+    /// once per candidate row to be told no — has to ask this, not the tier.
+    ///
+    /// It answers about the permissive half only. A protection cannot make a
+    /// path virtual, so a policy that authorizes nothing answers `Materialize`
+    /// for every path however many protections it carries.
+    pub fn authorizes_anything(&self) -> bool {
+        !self.patterns.is_empty()
+    }
 }
 
 /// Whether a leading `#` starts a remark in this source.
@@ -776,6 +797,45 @@ mod tests {
             policy.resolve(Path::new("90-stored/disk.img"), 10_000_000),
             Virtualization::Materialize,
             "the stored row is the base the file overrides, not a merge partner"
+        );
+    }
+
+    /// A policy made of nothing but protections is **in force** and authorizes
+    /// **nothing** — and the two questions have to be asked separately (Story
+    /// 56.10).
+    ///
+    /// A repository owner pre-protecting a zone before authorizing any is an
+    /// ordinary thing to commit, and `tier` says `PatternFile` for it, quite
+    /// correctly: a list did decide what may stay away, and the answer was
+    /// "nothing". A caller that read the tier as "there is something here worth
+    /// asking about" would open the repository and parse the index once per
+    /// candidate row on every sync of that folder, forever, to be told no.
+    #[test]
+    fn a_policy_of_only_protections_is_in_force_and_authorizes_nothing() {
+        let dir = worktree(Some("!30-masters/**\n"));
+        let policy = VirtualPolicy::compile(&profile(dir.path())).expect("compiles");
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::PatternFile,
+            "a `!` line is a source saying something"
+        );
+        assert!(
+            !policy.authorizes_anything(),
+            "...and it authorizes nothing, which is the question a caller has to ask"
+        );
+        for path in ["30-masters/a.mp4", "40-media/a.mp4", "a.mp4"] {
+            assert_eq!(
+                policy.resolve(Path::new(path), 10_000_000),
+                Virtualization::Materialize,
+                "{path}: nothing may stay away under a policy with no permissive line"
+            );
+        }
+
+        let named = worktree(Some("40-media/**\n!40-media/keep.mp4\n"));
+        let policy = VirtualPolicy::compile(&profile(named.path())).expect("compiles");
+        assert!(
+            policy.authorizes_anything(),
+            "one permissive line is what makes the policy worth consulting"
         );
     }
 

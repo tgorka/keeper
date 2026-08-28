@@ -216,21 +216,41 @@ pub enum ContentRefusal {
     /// This folder keeps every object it holds, so releasing one path's
     /// content would be undone.
     ///
-    /// A folder in the default mode re-materializes any path whose worktree
-    /// holds a pointer as soon as the next pass reaches it, copying the
-    /// content back from this machine's object store or queueing a download of
-    /// it. Removing one path's content there does not reclaim anything: it
-    /// costs the folder a fetch and gets the bytes back. So the release only
-    /// means something in a folder that is *meant* to hold pointers, and the
-    /// answer for a folder that keeps everything is to say so rather than to
-    /// do the work twice.
+    /// A folder in the default mode with **no virtualization policy at all**
+    /// re-materializes any path whose worktree holds a pointer as soon as the
+    /// next pass reaches it, copying the content back from this machine's object
+    /// store or queueing a download of it. Removing one path's content there
+    /// does not reclaim anything: it costs the folder a fetch and gets the bytes
+    /// back. So the release only means something where something is authorized
+    /// to stay away, and the answer for a folder that authorizes nothing is to
+    /// say so rather than to do the work twice.
     ///
     /// Carries the profile's **name**, like [`Self::Paused`] and
     /// [`Self::LfsDisabled`]: this is a fact about the folder, not about the
-    /// path that was asked for.
+    /// path that was asked for. Since Story 56.10 that is why it is no longer
+    /// the whole story — a folder that authorizes *some* paths refuses the rest
+    /// with [`Self::NotVirtual`], which is a fact about a path and names a
+    /// different thing to change.
     AlwaysMaterializes {
         /// The profile's name — the folder's setting is the thing to change.
         profile: String,
+    },
+    /// This folder authorizes some paths' content to stay away, and this path is
+    /// not one of them (Story 56.10, AD-122).
+    ///
+    /// Separate from [`Self::AlwaysMaterializes`] because the two send a person
+    /// to two different places, and sharing one sentence sent them to the wrong
+    /// one. That variant's text says the *folder* keeps its content and offers
+    /// the profile-wide `pointerOnly` lever as the remedy — false of a folder
+    /// that already virtualizes a zone, and the remedy is a hammer that makes
+    /// every path in the folder releasable at once, which is exactly the choice
+    /// a per-path policy exists to avoid having to make.
+    ///
+    /// Carries the **path**, because that is what the answer is about, and its
+    /// sentence names the pattern list as the thing to add a line to.
+    NotVirtual {
+        /// The subpath as asked for, verbatim.
+        path: String,
     },
     /// The path holds only its pointer here, so the bytes a caller asked to
     /// read are not on this machine.
@@ -338,6 +358,12 @@ impl std::fmt::Display for ContentRefusal {
                 "\"{profile}\" keeps its content on this machine, so letting one file go here \
                  would be undone the next time keeper looks at the folder; set the folder to \
                  keep pointers only if that is what you want"
+            ),
+            Self::NotVirtual { path } => write!(
+                f,
+                "nothing says the content of \"{path}\" may live only on the server, so keeper \
+                 would fetch it straight back; add a line covering it to this folder's \
+                 `.keepervirtual` if you want its content to stay away"
             ),
             Self::ContentNotHere { path } => write!(
                 f,
@@ -731,6 +757,9 @@ mod tests {
                 path: "40-media/clip.mp4".to_owned(),
             },
             ContentRefusal::AlreadyPointer {
+                path: "40-media/clip.mp4".to_owned(),
+            },
+            ContentRefusal::NotVirtual {
                 path: "40-media/clip.mp4".to_owned(),
             },
             ContentRefusal::ContentNotHere {

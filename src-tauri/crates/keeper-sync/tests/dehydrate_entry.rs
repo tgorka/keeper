@@ -780,6 +780,295 @@ async fn a_folder_that_keeps_everything_is_refused_by_name() {
     );
 }
 
+/// ...and the same folder **does** release a path its virtualization policy
+/// authorizes (Story 56.10, AD-122, AD-123).
+///
+/// This is the sentence the test above could not have: `release_mode_gate`
+/// returned `Ok` for `LfsMode::PointerOnly` and nothing else, so on a folder in
+/// the mode every profile starts in there was no path at all — pinned, unpinned,
+/// pattern-matched or not — that this verb would let go. Story 56.5's whole TTL
+/// sweep was therefore dead in production, and `dehydrate_entry`'s own doc named
+/// this story as the one that lifts it.
+///
+/// The refusal was never about the folder. It was about the *disagreement*: in
+/// the default mode `materialize_pending` re-materialized any pointer inside the
+/// cone on the next pass, so a release gave back nothing and cost a fetch. Once
+/// the arrival path consults the same policy, the two verbs agree about this
+/// path and the release is real — which the second sync below is what proves.
+///
+/// The policy arrives on the **profile** tier here rather than as a committed
+/// `.keepervirtual`, because that tier overrides the file (AD-122) and because a
+/// file written but not committed would leave `git status` holding an untracked
+/// entry, and the clean-status assertion is the point.
+/// `tests/release_sweep.rs` exercises the committed file.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_folder_that_keeps_everything_releases_what_its_policy_authorizes() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut keeps = profile(root, remote.path());
+    keeps.lfs_mode = LfsMode::Materialize;
+    keeps.virtual_patterns = vec!["*.mp4".to_owned()];
+    let Some((engine, platform)) = engine_with(keeps, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let blob = committed_blob(root);
+    let target = root.join("clip.mp4");
+    assert_eq!(
+        std::fs::read(&target).expect("read"),
+        content,
+        "the fixture starts materialized, or there is nothing to release"
+    );
+
+    let done = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect("the policy authorizes this path, so the mode is no longer the answer");
+
+    assert_eq!(done.oid, pointer.oid);
+    assert_eq!(
+        std::fs::read(&target).expect("read the released file"),
+        blob,
+        "byte for byte the blob git committed"
+    );
+    assert!(
+        ledger_paths(&platform).is_empty(),
+        "and the ledger no longer claims this machine holds the content"
+    );
+    stamp_index_forward(root);
+    assert_eq!(
+        porcelain(root),
+        "",
+        "a released path reads clean in the default mode too"
+    );
+}
+
+/// A folder whose policy says *something* still refuses a path the policy does
+/// not name — with its own sentence (Story 56.10).
+///
+/// The gate lifted for a **path**, not for a folder. A single boolean — "does
+/// this folder have a policy at all" — would have made every path in a folder
+/// with one pattern releasable, which is `git-lfs#3092`'s shape read backwards:
+/// a pattern list deciding something about content it never mentions.
+///
+/// And the sentence is asserted, not just the variant. `AlwaysMaterializes`
+/// tells the reader the *folder* keeps its content and offers `pointerOnly` as
+/// the remedy — false of a folder that already virtualizes a zone, and a remedy
+/// that makes every path in it releasable at once, which is the choice a
+/// per-path policy exists to avoid having to make. So this refusal is
+/// `NotVirtual`, it names the path, and it names the file to add a line to.
+#[tokio::test]
+async fn a_policy_that_does_not_name_the_path_is_still_refused_by_name() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut keeps = profile(root, remote.path());
+    keeps.lfs_mode = LfsMode::Materialize;
+    // A real policy, in force, naming a zone this path is not in.
+    keeps.virtual_patterns = vec!["scans/**".to_owned()];
+    let Some((engine, platform)) = engine_with(keeps, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("nothing authorizes this path's content to stay away");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::NotVirtual { path })
+                if path == "clip.mp4"
+        ),
+        "got: {err}"
+    );
+    let sentence = format!("{err}");
+    assert!(
+        sentence.contains("clip.mp4") && sentence.contains(".keepervirtual"),
+        "the sentence must name the path and the file to edit, not the folder's \
+         mode: {sentence}"
+    );
+    assert!(
+        !sentence.contains("pointers only"),
+        "and it must not offer the profile-wide lever this story exists to \
+         replace: {sentence}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        content,
+        "nothing was written"
+    );
+    assert_eq!(
+        ledger_paths(&platform),
+        vec!["clip.mp4".to_owned()],
+        "and the ledger still says what is true"
+    );
+}
+
+/// A policy cannot lift [`LfsMode::Disabled`] (Story 56.10).
+///
+/// Nothing routes through the clean filter in that mode, so real bytes in the
+/// worktree become an ordinary git blob on the next commit and there are no LFS
+/// pointers for a policy to have an opinion about. The gate is exhaustive over
+/// the mode for exactly this reason: the permissive arm had to be named rather
+/// than inherited.
+#[tokio::test]
+async fn large_file_support_off_refuses_though_the_policy_authorizes() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut off = profile(root, remote.path());
+    off.lfs_mode = LfsMode::Disabled;
+    off.virtual_patterns = vec!["*.mp4".to_owned()];
+    let Some((engine, platform)) = engine_with(off, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("large-file support is off, so there is nothing to release into");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::LfsDisabled { profile })
+                if profile == "media"
+        ),
+        "the refusal must name the mode, not the policy; got: {err}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        content,
+        "nothing was written"
+    );
+}
+
+/// A policy made only of protections authorizes nothing, and the folder is
+/// refused before a path is even resolved (Story 56.10).
+///
+/// Committing `!30-masters/**` before authorizing any zone is an ordinary
+/// defensive thing for a repository owner to write, and it puts a policy *in
+/// force* while leaving its permissive set empty. Gating the folder on which
+/// tier spoke rather than on whether anything is authorized would let such a
+/// folder arm a release window and spend a whole budget of repository opens and
+/// index reads on every sync, forever, to be refused per path — which is
+/// precisely the cheap decline the folder gate exists to keep.
+///
+/// The refusal is the folder's, `AlwaysMaterializes`, because that is what is
+/// true: nothing in this folder may stay away.
+#[tokio::test]
+async fn a_policy_of_only_protections_is_refused_as_a_folder_that_keeps_everything() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut keeps = profile(root, remote.path());
+    keeps.lfs_mode = LfsMode::Materialize;
+    keeps.virtual_patterns = vec!["!30-masters/**".to_owned()];
+    let Some((engine, platform)) = engine_with(keeps, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("a policy with no permissive line authorizes nothing");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::AlwaysMaterializes { profile })
+                if profile == "media"
+        ),
+        "the folder's own refusal, not the path's; got: {err}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        content,
+        "nothing was written"
+    );
+}
+
+/// A fault in `.keepervirtual` does not displace the mode's own answer (Story
+/// 56.10, FR-329).
+///
+/// `.keepervirtual` is entirely inert for a folder with large-file support off:
+/// nothing routes through the clean filter there, so there is no pointer for a
+/// policy to have an opinion about — which is the reason the `Disabled` arm is
+/// named rather than inherited. A caller that compiled the policy before asking
+/// the mode answered a request about such a folder with a configuration error
+/// quoting a pattern line, sending the owner to a file that has no bearing on
+/// their folder at all. The mode is asked first, and no policy is read.
+#[tokio::test]
+async fn a_broken_policy_does_not_displace_the_large_file_support_refusal() {
+    let work = tempfile::tempdir().expect("tempdir");
+    let root = work.path();
+    if !init_repo(root) {
+        return;
+    }
+    let remote = tempfile::tempdir().expect("remote");
+    let (_pointer, content) = seed(root, remote.path());
+    std::fs::write(
+        root.join(keeper_sync::lfs::virtual_policy::VIRTUAL_PATTERN_FILE),
+        "[unclosed\n",
+    )
+    .expect("write a policy that cannot compile");
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut off = profile(root, remote.path());
+    off.lfs_mode = LfsMode::Disabled;
+    let Some((engine, platform)) = engine_with(off, data.path()) else {
+        return;
+    };
+    remember(&platform, "clip.mp4");
+
+    let err = engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("large-file support is off");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(ContentRefusal::LfsDisabled { profile })
+                if profile == "media"
+        ),
+        "the mode is the accurate answer here, and no policy was read; got: {err}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("clip.mp4")).expect("read"),
+        content,
+        "nothing was written"
+    );
+}
+
 /// Asking again about an already-released path **repairs** its index entry.
 ///
 /// The state this covers is real: `stage::dehydrate` renames the pointer into

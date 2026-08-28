@@ -3508,6 +3508,7 @@ mod tests {
             ContentRefusal::NotTracked { path: path.clone() },
             ContentRefusal::OutsideSubpaths { path: path.clone() },
             ContentRefusal::LocallyModified { path: path.clone() },
+            ContentRefusal::NotVirtual { path: path.clone() },
             ContentRefusal::ContentNotHere { path },
             ContentRefusal::Paused {
                 profile: "docs".to_owned(),

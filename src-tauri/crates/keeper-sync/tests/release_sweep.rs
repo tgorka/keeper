@@ -151,6 +151,32 @@ fn porcelain(root: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// [`porcelain`] narrowed to one pathspec.
+///
+/// Needed by exactly one test, and for a reason worth writing down rather than
+/// hiding behind a wider assertion. [`seed`] writes a path's content and its
+/// index stat inside the same wall second, which no real arrival does, so
+/// keeper's own status walk meets those entries as racily-clean, classifies
+/// them modified and persists a **zeroed** stat size for them
+/// (`git::repo::persist_observed_stats`). A path the test then releases is
+/// re-stat'd on its way through the release and reads clean; a path the test
+/// deliberately leaves materialized keeps the zeroed stat, so `git status`
+/// distrusts it, hashes the content and reports ` M`. In production keeper's
+/// committer repairs that on the next pass — this fixture excludes `*.mp4`
+/// from the committer on purpose, which is what leaves it standing.
+///
+/// So the claim is made about the path the release touched, which is the path
+/// the claim is about: pointer blob, worktree stat, clean status. Widening it
+/// would be asserting something about the fixture instead.
+fn porcelain_of(root: &Path, pathspec: &str) -> String {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--", pathspec])
+        .current_dir(root)
+        .output()
+        .expect("git status");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
 /// Put `names` into the state a materialized LFS path is really in: the
 /// **pointer** committed as the index's blob, the **content** in the worktree,
 /// and the entry's stat describing the content.
@@ -1455,4 +1481,293 @@ async fn a_surface_is_told_the_instant_the_sweep_would_use_and_a_pin_replaces_it
         "a pinned row has no deadline to draw, at any age"
     );
     assert_eq!(pinned.hold(), Some("Pinned"));
+}
+
+// ---------------------------------------------------------------------------
+// The mode gate, and the policy that lifts it per path (Story 56.10)
+// ---------------------------------------------------------------------------
+
+/// The sweep releases a path the folder's **committed** policy authorizes, in
+/// the mode every folder starts in (Story 56.10, FR-328, FR-335, AD-122,
+/// AD-123).
+///
+/// Everything else in this file runs on [`LfsMode::PointerOnly`], because that
+/// was the only mode `release_mode_gate` returned `Ok` for — so 56.5's sweep,
+/// on a default folder, declined before it read a clock and released nothing,
+/// ever. A user who set `releaseTtlMs` and never touched `lfsMode` had a TTL
+/// that did nothing at all.
+///
+/// Four claims in one pass, and each fails for a different bug:
+///
+/// * the **authorized** path is released — the gate lifts;
+/// * the **unauthorized** path beside it is untouched — the gate lifted for a
+///   path, not for a folder;
+/// * `git status` still reads clean past [`stamp_index_forward`] — the released
+///   entry's stat was repaired, in a mode this had never run in;
+/// * a **second** sync leaves the released path a pointer — which is the whole
+///   reason the refusal existed. Before this story `materialize_pending` would
+///   have copied the object straight back out of the store on the next pass, so
+///   the release and the arrival would have fought forever. Now they read the
+///   same policy.
+///
+/// The policy is the committed `.keepervirtual` here rather than the profile
+/// tier, which `tests/dehydrate_entry.rs` uses: both tiers reach the same
+/// compiled answer and both are worth having under a real sync. It is written
+/// before the window-opening sync, so keeper's own committer picks it up and
+/// the tree is clean before anything is asserted.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_default_mode_folder_releases_only_what_its_policy_authorizes() {
+    let Some(f) = fixture(&["zone/clip.mp4", "keep/manual.mp4"], |p| {
+        p.lfs_mode = LfsMode::Materialize;
+    })
+    .await
+    else {
+        return;
+    };
+    std::fs::write(
+        f.root
+            .join(keeper_sync::lfs::virtual_policy::VIRTUAL_PATTERN_FILE),
+        "zone/**\n",
+    )
+    .expect("commit the repository's own answer");
+
+    f.open_the_release_window().await;
+
+    let used_at = f.platform.now_ms();
+    f.arrived("zone/clip.mp4", used_at);
+    f.arrived("keep/manual.mp4", used_at);
+
+    let blob = committed_blob(&f.root, "zone/clip.mp4");
+    let authorized = f.path("zone/clip.mp4");
+    let before = inode(&authorized);
+
+    f.platform.advance_ms(TTL_MS as i64);
+    assert_eq!(
+        candidates(&f.platform, f.platform.now_ms()),
+        vec!["keep/manual.mp4".to_owned(), "zone/clip.mp4".to_owned()],
+        "the clock makes both rows candidates: the policy is what decides \
+         between them, and it decides inside the chain that deletes"
+    );
+
+    f.sync().await;
+
+    assert_eq!(
+        std::fs::read(&authorized).expect("read the released file"),
+        blob,
+        "byte for byte the blob git committed"
+    );
+    assert_ne!(inode(&authorized), before, "a rename, not a truncation");
+    assert_eq!(
+        std::fs::read(f.path("keep/manual.mp4")).expect("read"),
+        f.content("keep/manual.mp4"),
+        "and the path nothing authorized keeps its content: the mode gate lifted \
+         for a path, not for the folder"
+    );
+    assert_eq!(
+        ledger_paths(&f.platform),
+        vec!["keep/manual.mp4".to_owned()],
+        "only the released row is retracted"
+    );
+
+    stamp_index_forward(&f.root);
+    assert_eq!(
+        porcelain_of(&f.root, "zone/clip.mp4"),
+        "",
+        "and the real git binary calls the released path clean — the one-path \
+         re-stat happened, in a mode this had never run in. Scoped to that path: \
+         see `porcelain_of` for what the fixture does to the other one's stat"
+    );
+
+    // The reason the refusal existed, now settled: the arrival path reads the
+    // same policy, so the next pass leaves the pointer where the sweep put it
+    // instead of publishing the object back over it.
+    f.skip_the_look_window();
+    f.sync().await;
+    assert_eq!(
+        std::fs::read(&authorized).expect("read"),
+        blob,
+        "the arrival sweep and the release sweep agree about this path"
+    );
+}
+
+/// ...and with no policy at all, the same folder releases nothing.
+///
+/// The other half of the gate, and the one that keeps every folder that never
+/// heard of `virtualPatterns` behaving exactly as it did: the mode gate refuses
+/// the folder before a clock is read, so a default folder with a TTL and no
+/// policy is not silently put on one by this story.
+#[tokio::test]
+async fn a_default_mode_folder_with_no_policy_releases_nothing() {
+    let Some(f) = fixture(&["zone/clip.mp4"], |p| {
+        p.lfs_mode = LfsMode::Materialize;
+    })
+    .await
+    else {
+        return;
+    };
+    f.open_the_release_window().await;
+    f.arrived("zone/clip.mp4", f.platform.now_ms());
+
+    f.platform.advance_ms(TTL_MS as i64);
+    assert_eq!(
+        candidates(&f.platform, f.platform.now_ms()),
+        vec!["zone/clip.mp4".to_owned()],
+        "the clock says yes, so what keeps the content is the gate and nothing else"
+    );
+
+    f.sync().await;
+
+    assert_eq!(
+        std::fs::read(f.path("zone/clip.mp4")).expect("read"),
+        f.content("zone/clip.mp4"),
+        "nothing authorized this content to stay away, so it stays here"
+    );
+    assert_eq!(ledger_paths(&f.platform), vec!["zone/clip.mp4".to_owned()]);
+}
+
+/// One pass releases the authorized path even when a whole budget of
+/// unauthorized candidates sorts ahead of it (Story 56.10).
+///
+/// This is the shape a default-mode folder actually has: the `materialized`
+/// ledger holds a row for every path this clone ever hydrated, while the policy
+/// names one narrow zone. The clock makes all of them candidates, the window
+/// takes [`RELEASE_BUDGET_OBJECTS`] attempts in `ORDER BY path` cursor order, and
+/// every attempt costs a repository open and an index read before the per-path
+/// gate can refuse it — so with the policy asked only inside `release_resolved`
+/// the pass spends its whole budget in `aaa/` and never reaches `zone/`.
+/// `RELEASE_BUDGET_BYTES` makes it worse rather than better: the accumulator
+/// counts refused attempts too, so a few large unauthorized rows can end a pass
+/// outright.
+///
+/// The fixture is sized **from** the constant, so raising the budget cannot
+/// quietly turn "more unauthorized candidates than a pass allows" into "fewer".
+/// The claim is a release in ONE pass, which is what makes it about the
+/// pre-filter rather than about the cursor eventually rotating around.
+#[tokio::test]
+async fn one_pass_releases_the_authorized_path_past_a_budget_of_refusals() {
+    // Every one of these sorts before `zone/`, so they are what the window
+    // takes first.
+    let crowd: Vec<String> = (0..=RELEASE_BUDGET_OBJECTS)
+        .map(|n| format!("aaa/{n:03}.mp4"))
+        .collect();
+    let mut names: Vec<&str> = crowd.iter().map(String::as_str).collect();
+    names.push("zone/clip.mp4");
+
+    let Some(f) = fixture(&names, |p| {
+        p.lfs_mode = LfsMode::Materialize;
+    })
+    .await
+    else {
+        return;
+    };
+    std::fs::write(
+        f.root
+            .join(keeper_sync::lfs::virtual_policy::VIRTUAL_PATTERN_FILE),
+        "zone/**\n",
+    )
+    .expect("commit the repository's own answer");
+
+    f.open_the_release_window().await;
+
+    let landed = f.platform.now_ms();
+    for name in &names {
+        f.arrived(name, landed);
+    }
+
+    let blob = committed_blob(&f.root, "zone/clip.mp4");
+    f.platform.advance_ms(TTL_MS as i64);
+    assert!(
+        candidates(&f.platform, f.platform.now_ms()).len() > RELEASE_BUDGET_OBJECTS,
+        "the clock alone makes more candidates than one pass may attempt, which \
+         is the whole premise"
+    );
+
+    f.sync().await;
+
+    assert_eq!(
+        std::fs::read(f.path("zone/clip.mp4")).expect("read"),
+        blob,
+        "the one authorized path is released in the first pass: the budget is \
+         spent on rows the folder can actually release, not on being refused"
+    );
+    for name in &crowd {
+        assert_eq!(
+            std::fs::read(f.path(name)).expect("read"),
+            f.content(name),
+            "{name}: and nothing unauthorized was touched"
+        );
+    }
+}
+
+/// A ledger row that recorded no size draws the clock the sweep will honour, not
+/// the folder's "kept" (Story 56.10).
+///
+/// Every `materialized` row written before Story 56.5 has `size_bytes` `NULL`,
+/// because `db::note_arrival` is the first writer of that column. Read as zero,
+/// such a row falls under any `virtualOverBytes` floor and the surface says *this
+/// folder is set to keep large-file content* — while the sweep, which asks the
+/// committed pointer for the honest size, releases that very path. Of the two
+/// ways to be wrong here only one is safe: promising a release that is refused
+/// disappoints, promising the content is kept and then losing it from the
+/// worktree surprises. So an absent size means unknown, and clears the floor.
+#[tokio::test]
+async fn a_row_with_no_recorded_size_is_shown_the_clock_the_sweep_will_use() {
+    let Some(f) = fixture(&["zone/clip.mp4"], |p| {
+        p.lfs_mode = LfsMode::Materialize;
+        // A floor above nothing and below the fixture's own content, so a row
+        // read at zero would be under it and the committed pointer is over it.
+        p.virtual_over_bytes = CONTENT_BYTES / 2;
+    })
+    .await
+    else {
+        return;
+    };
+    std::fs::write(
+        f.root
+            .join(keeper_sync::lfs::virtual_policy::VIRTUAL_PATTERN_FILE),
+        "zone/**\n",
+    )
+    .expect("commit the repository's own answer");
+    f.open_the_release_window().await;
+
+    // A row exactly as a keeper that had never heard of Story 56.5 wrote it:
+    // the materialization clock and nothing else.
+    let landed = f.platform.now_ms();
+    db::remember_materialized(
+        &ledger_conn(&f.platform),
+        PROFILE_ID,
+        "zone/clip.mp4",
+        landed,
+    )
+    .expect("record the materialization");
+    assert!(
+        ledger_rows(&f.platform)
+            .iter()
+            .all(|row| row.size_bytes.is_none()),
+        "the fixture's whole premise: no size was recorded"
+    );
+
+    let schedules = f
+        .engine
+        .release_schedules(PROFILE_ID)
+        .expect("the profile is registered");
+    assert_eq!(
+        schedules.get("zone/clip.mp4"),
+        Some(&ReleaseSchedule::Due {
+            at_ms: landed + TTL_MS as i64
+        }),
+        "an absent size is unknown, not zero: the row is shown the clock, because \
+         that is the clock the sweep is about to honour"
+    );
+
+    // And it really is: the same folder, one TTL later, releases it.
+    f.platform.advance_ms(TTL_MS as i64);
+    f.sync().await;
+    assert_eq!(
+        std::fs::read(f.path("zone/clip.mp4")).expect("read"),
+        committed_blob(&f.root, "zone/clip.mp4"),
+        "which is the half that makes the surface's answer true rather than \
+         merely optimistic"
+    );
 }
