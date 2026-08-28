@@ -445,6 +445,51 @@ describe("SyncSection needs-attention notice", () => {
     expect(await screen.findByText("Read 1 file.")).toBeInTheDocument();
   });
 
+  /**
+   * Story 56.14: the check is reachable on a HEALTHY folder, which is the only
+   * folder its counts were added for.
+   *
+   * Fails before the button moved out of the needs-attention alert: `Check files`
+   * rendered only inside `{status?.needsAttention === true && …}`, so the one
+   * number that separates "nothing was wrong" from "nothing was wrong AND N are
+   * away on purpose" could be read only on a folder keeper had already flagged.
+   * A healthy virtual folder — the ordinary case, and the case story 56.12's
+   * counts exist for — could never show it.
+   *
+   * The default `statusVm` is healthy (`needsAttention: false`), and the
+   * no-alert test below pins that, so this is the same folder that renders no
+   * alert at all.
+   */
+  it("offers the check on a healthy folder and reports its counts there", async () => {
+    mockVerify.mockResolvedValue({ checked: 812, virtualPaths: 118, problems: [] });
+    render(<SyncSection open />);
+
+    const button = await screen.findByRole("button", { name: SYNC_VERIFY_LABEL });
+    // One control, not two: moved rather than duplicated, so a needs-attention
+    // folder does not grow a second button with the same label.
+    expect(screen.getAllByRole("button", { name: SYNC_VERIFY_LABEL })).toHaveLength(1);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(button);
+
+    expect(
+      await screen.findByText("Read 812 files. 118 kept away on purpose."),
+    ).toBeInTheDocument();
+    expect(screen.getByText(SYNC_VERIFY_CLEAN_SENTENCE)).toBeInTheDocument();
+  });
+
+  /** And still exactly one on a folder that IS flagged — the alert kept its
+   *  sentence and lost its inline action. */
+  it("keeps exactly one check control on a flagged folder", async () => {
+    mockStatuses.mockResolvedValue([
+      statusVm({ needsAttention: true, error: "content does not match" }),
+    ]);
+    render(<SyncSection open />);
+
+    await screen.findByText("content does not match");
+    expect(screen.getAllByRole("button", { name: SYNC_VERIFY_LABEL })).toHaveLength(1);
+  });
+
   it("does not render an alert for a healthy profile", async () => {
     render(<SyncSection open />);
 

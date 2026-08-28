@@ -326,8 +326,15 @@ export function SessionTree({
           const sizeId = entry.size === null ? null : `session-size-${key}`;
           const ageId = entry.mtimeMs > 0 ? `session-age-${key}` : null;
           const lockId = entry.locked === null ? null : `session-lock-${key}`;
+          // The sync mark, for the same reason and by the same mechanism (story
+          // 56.14). It renders unconditionally below and carries Rust's sentence
+          // as its own accessible name, which is exactly the shape the paragraph
+          // above describes as visible-and-unspeakable: the mark looked wired
+          // because it HAD a name, and the row's `aria-label` meant no one ever
+          // heard it. Unconditional id, because the mark is unconditional.
+          const syncId = `session-sync-${key}`;
           const describedBy =
-            [sizeId, ageId, lockId].filter((id) => id !== null).join(" ") || undefined;
+            [sizeId, ageId, syncId, lockId].filter((id) => id !== null).join(" ") || undefined;
           // What the menu may offer about THIS row (Story 52.8). Rename writes a
           // frontmatter `title:` and Rust re-derives the filename from it, so it
           // is a verb only a markdown file has: the registry answers which those
@@ -437,7 +444,7 @@ export function SessionTree({
                   {formatDraftAge(entry.mtimeMs, nowMs)}
                 </span>
               )}
-              <SyncStatusMark sync={entry.sync} />
+              <SyncStatusMark id={syncId} sync={entry.sync} />
 
               {/* The row's other verbs. Icon-only and revealed on hover or
                   focus — the tree is narrow, and a session's rows are read far

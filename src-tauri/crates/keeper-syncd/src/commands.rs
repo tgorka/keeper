@@ -734,6 +734,28 @@ fn reconcile(engine: &Engine, config: &DaemonConfig) -> SyncResult<()> {
 ///
 /// Accepts an id or a name, because an operator reads names in `list` output
 /// and will type those.
+///
+/// **An exact id match wins outright** (story 56.14). This used to be one
+/// `filter` over `id == wanted || name == wanted` with no precedence, and the
+/// consequence was not a cosmetic one: a selector that is one folder's id and a
+/// different folder's name matched BOTH, so the single-profile destructure in
+/// `cmd_materialize`, `cmd_dehydrate`, `cmd_pin` and `cmd_unpin` failed and every
+/// one of those verbs refused — permanently, for both folders — with
+/// "`{wanted}` matches 2 folders; name the one you mean by its id", advising the
+/// one thing that could not work, because the id was what was ambiguous. Neither
+/// folder could be materialized, released, pinned or unpinned by any spelling
+/// until someone renamed one of them.
+///
+/// Asking the id first fixes that and makes the surviving message TRUE: ids are
+/// the primary key of the profile row, so an id match is always exactly one
+/// folder, and the only ambiguity left is two folders sharing a NAME — for which
+/// "name the one you mean by its id" is the correct instruction.
+///
+/// The precedence is the safe direction as well as the unambiguous one. An id is
+/// keeper's own opaque identifier, so a person typing one is naming a specific
+/// row; a name is a label they chose and may reuse. Resolving to the id can
+/// therefore never address a folder the caller did not name, whereas preferring
+/// the name could.
 fn select<'a>(
     profiles: &'a [SyncProfile],
     wanted: Option<&str>,
@@ -741,9 +763,12 @@ fn select<'a>(
     let Some(wanted) = wanted else {
         return Ok(profiles.iter().collect());
     };
+    if let Some(by_id) = profiles.iter().find(|profile| profile.id == wanted) {
+        return Ok(vec![by_id]);
+    }
     let matched: Vec<&SyncProfile> = profiles
         .iter()
-        .filter(|profile| profile.id == wanted || profile.name == wanted)
+        .filter(|profile| profile.name == wanted)
         .collect();
     if matched.is_empty() {
         let known = profiles
@@ -2995,6 +3020,72 @@ mod tests {
         assert!(message.contains("nope"), "{message}");
         assert!(message.contains("docs"), "must list what exists: {message}");
         assert_eq!(err.exit_code(), EXIT_CONFIG);
+    }
+
+    /// Story 56.14: a selector that is one folder's id and a different folder's
+    /// name resolves to the folder whose ID it is, and to exactly one folder.
+    ///
+    /// Fails without the precedence in [`select`]: the old
+    /// `id == wanted || name == wanted` filter matched both rows, so the
+    /// single-profile destructure in `cmd_materialize`, `cmd_dehydrate`, `cmd_pin`
+    /// and `cmd_unpin` failed and all four verbs refused for BOTH folders, for
+    /// ever, telling the caller to name the one they meant by its id — which is
+    /// what they had just typed.
+    #[test]
+    fn an_id_that_is_also_another_folders_name_resolves_to_the_id() {
+        // `archive`'s id is literally `media`, which is `media`'s name. Contrived
+        // to type and not at all contrived to HAVE: ids come from the config file
+        // and an operator writing `id = "media"` for the folder holding media is
+        // doing the obvious thing.
+        let media = SyncProfile::new("01MEDIA", "media", "/srv/media", "https://x/m.git");
+        let archive = SyncProfile::new("media", "archive", "/srv/archive", "https://x/a.git");
+        let profiles = vec![media.clone(), archive.clone()];
+
+        let matched = select(&profiles, Some("media")).expect("an id match is never ambiguous");
+        assert_eq!(
+            matched,
+            vec![&archive],
+            "the id owns the selector; the folder merely NAMED `media` does not answer for it"
+        );
+
+        // Declaration order must not decide it either, so the same collision the
+        // other way round.
+        let reversed = vec![archive.clone(), media.clone()];
+        assert_eq!(
+            select(&reversed, Some("media")).expect("still unambiguous"),
+            vec![&archive]
+        );
+
+        // And the other folder is still reachable by everything that identifies
+        // it — its own id, and its name, which nothing else claims as an id.
+        assert_eq!(
+            select(&profiles, Some("01MEDIA")).expect("by id"),
+            vec![&media]
+        );
+        assert_eq!(
+            select(&profiles, Some("archive")).expect("by name"),
+            vec![&archive]
+        );
+    }
+
+    /// The ambiguity that is left after story 56.14, and the reason the message
+    /// the single-path verbs raise for it is now TRUE: two folders may share a
+    /// name, and then naming one by its id is exactly the way out.
+    #[test]
+    fn two_folders_sharing_a_name_still_both_match_that_name() {
+        let one = SyncProfile::new("01ONE", "media", "/srv/one", "https://x/1.git");
+        let two = SyncProfile::new("01TWO", "media", "/srv/two", "https://x/2.git");
+        let profiles = vec![one.clone(), two.clone()];
+
+        assert_eq!(
+            select(&profiles, Some("media")).expect("a name is not required to be unique"),
+            vec![&one, &two],
+            "a read verb takes both listings; a write verb refuses and asks for an id"
+        );
+        assert_eq!(
+            select(&profiles, Some("01TWO")).expect("and the id is the way out"),
+            vec![&two]
+        );
     }
 
     #[test]

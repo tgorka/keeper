@@ -23,7 +23,7 @@
  */
 import { useEffect, useState } from "react";
 import { AddFolderForm, SYNC_ADD_TITLE, SYNC_EDIT_TITLE } from "@/components/sync/add-folder-form";
-import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -97,7 +97,9 @@ export const SYNC_REMOVE_LABEL = "Remove";
  */
 export const SYNC_OPEN_PATH_LABEL = "Reveal in Finder";
 
-/** The needs-attention alert's inline action: re-check the folder's contents. */
+/** Every folder card's action: re-check the folder's contents. On the card's own
+ *  action row since story 56.14, not inside the needs-attention alert — the
+ *  counts it reports are exactly what a HEALTHY folder needs to show. */
 export const SYNC_VERIFY_LABEL = "Check files";
 
 /**
@@ -555,6 +557,34 @@ function SyncProfileRow({
           >
             {SYNC_NOW_LABEL}
           </Button>
+          {/* Story 56.14: on EVERY folder, healthy or not.
+
+              It used to live only inside the needs-attention alert below, which
+              made the two counts story 56.12 added unreachable in exactly the
+              case they were added for: `syncVerifyCountSentence`'s own argument
+              is that "nothing was wrong" is also what a check over an empty
+              folder reports, so the number that separates them — how many paths
+              were excused because their content is away on purpose — could only
+              be seen on a folder keeper had already flagged. A healthy virtual
+              folder, the ordinary case, could never show it.
+
+              Moved rather than duplicated. Two controls with one label in one
+              card is two things to keep in step and a reader wondering whether
+              they do the same thing; the alert keeps its sentence, and the
+              report still renders under it either way. */}
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={busy}
+            onClick={() => {
+              void run(async () => {
+                setVerified(await verifySyncProfile(profile.id));
+              });
+            }}
+          >
+            {SYNC_VERIFY_LABEL}
+          </Button>
           <Button
             type="button"
             variant="outline"
@@ -610,25 +640,14 @@ function SyncProfileRow({
         // Persistent and non-modal, the ConversationHealthBanner shape: this
         // condition needs a human, so there is no dismiss control — it clears
         // when the profile recovers, not when it is waved away.
+        //
+        // No inline action since story 56.14: `Check files` was here and nowhere
+        // else, which put the counts out of reach of every healthy folder. It is
+        // now in the card's own action row above, one line up and always present.
         <Alert role="alert" variant="destructive" className="mt-1">
           <AlertDescription>
             {status.error ?? status.warning ?? SYNC_ATTENTION_FALLBACK_SENTENCE}
           </AlertDescription>
-          <AlertAction>
-            <Button
-              type="button"
-              variant="outline"
-              size="xs"
-              disabled={busy}
-              onClick={() => {
-                void run(async () => {
-                  setVerified(await verifySyncProfile(profile.id));
-                });
-              }}
-            >
-              {SYNC_VERIFY_LABEL}
-            </Button>
-          </AlertAction>
         </Alert>
       )}
       {verified !== null && (

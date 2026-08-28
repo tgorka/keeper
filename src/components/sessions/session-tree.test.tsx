@@ -326,6 +326,15 @@ describe("SessionTree", () => {
     const mark = within(locked).getByTestId(FILES_SYNC_MARK_TESTID);
     expect(mark).toHaveAttribute("data-sync-status", "excluded");
     expect(mark).toHaveAccessibleName("workspace/ is excluded by the zone's own pattern.");
+    // Story 56.14: and the row NAMES it, so the sentence is actually spoken. The
+    // row sets `aria-label`, which replaces its subtree's contribution to its own
+    // name — so before the id wiring the mark was correct, named, and silent, and
+    // every assertion above still passed.
+    expect(mark.id).not.toBe("");
+    expect((locked.getAttribute("aria-describedby") ?? "").split(" ")).toContain(mark.id);
+    expect(locked).toHaveAccessibleDescription(
+      expect.stringContaining("workspace/ is excluded by the zone's own pattern."),
+    );
   });
 
   it("describes a row by its size and age without putting either in its name", () => {

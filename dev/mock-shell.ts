@@ -29,6 +29,15 @@
  * and wrong in the app, this file is wrong — it is a viewing aid, never
  * evidence.
  *
+ * **It boots into the shell** (story 56.14). Until then it did not: `App` reads
+ * `encryption_posture` on mount and `session_restore` before that, and neither
+ * was answered here — so every `bun run dev` stopped on the first-run at-rest
+ * encryption card, and the Files pane, the folder settings and every other
+ * surface this file has fixtures for were unreachable without a real install on
+ * a Mac. That is the exact round trip the paragraphs above say this file exists
+ * to end, and it was still there. See the two answers at the head of `ANSWERS`
+ * for what they claim and, deliberately, what they do not.
+ *
  * **Dev only, and structurally so.** The import is behind `import.meta.env.DEV`
  * in `main.tsx`, so Rollup drops the whole module from a production build; there
  * is no runtime flag to get wrong. It also refuses to install when a real shell
@@ -37,6 +46,7 @@
 
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
+  AccountVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
@@ -265,6 +275,13 @@ const RELEASE_DUE_SENTENCE =
   "keeper lets this content go on the first sync after the time runs out; the copy stays here until then";
 const RELEASE_PINNED_SENTENCE =
   "This path is pinned, so keeper keeps its content on this computer until the pin is lifted";
+/** `ReleaseSchedule::ModeKeeps` — one of the two causes whose word is `Kept` and
+ *  whose Release `Engine::dehydrate_entry` refuses on the mode gate, which is why
+ *  the pane withholds the button for it (story 56.14). Verbatim, like the two
+ *  above: the whole point of the withheld button is that this sentence is what
+ *  explains it instead. */
+const RELEASE_MODE_KEEPS_SENTENCE =
+  "This folder is set to keep large-file content on this computer, so nothing is released on a clock";
 
 /** A folder tree with the depth and the awkward names a real drive has. */
 const ENTRIES: FilesEntryVm[] = [
@@ -328,6 +345,20 @@ const ENTRIES: FilesEntryVm[] = [
     { status: "materialized", detail: MATERIALIZED_SENTENCE },
     null,
     { releasesAfterMs: null, hold: "Pinned", detail: RELEASE_PINNED_SENTENCE },
+  ),
+  // The row whose Release the pane WITHHOLDS (story 56.14): the folder's mode
+  // keeps large-file content, so `Engine::dehydrate_entry` refuses on the mode
+  // gate before anything else runs. Its word is `Kept`, which is what the pane
+  // reads; a `releaseTtlMs = 0` row would say `Manual` and keep the button,
+  // because that one releases on request. Here so the withheld state can be
+  // LOOKED at — the two rows above it both offer Release, so without this one the
+  // gate has nothing on screen to show.
+  lfsEntry(
+    "raw-2026-08.tiff",
+    { bytes: 268_435_456, label: "268 MB" },
+    { status: "materialized", detail: MATERIALIZED_SENTENCE },
+    null,
+    { releasesAfterMs: null, hold: "Kept", detail: RELEASE_MODE_KEEPS_SENTENCE },
   ),
 ];
 
@@ -984,6 +1015,65 @@ const CSV_ROWS = [
 const ANSWERS: Record<string, unknown> = {
   app_ping: "ok",
   capabilities: { notes: true, recording: true, sync: true, chat: true },
+  // ---------------------------------------------------------------------------
+  // The two answers that decide WHICH screen boots (`src/App.tsx`
+  // `renderContent`). Without them every `bun run dev` stopped at the first-run
+  // at-rest-encryption card and the shell — Files, folder settings, notes,
+  // sessions, every pane below — was unreachable without a real install on a
+  // Mac, which is the exact round trip this file exists to end. Both fell
+  // through to `fallback`, whose `null` is the WORST answer for each of them:
+  // `session_restore` → `null` makes `useSessionRestore`'s `accounts.length`
+  // throw (caught, so zero accounts), and `encryption_posture` → `null` is
+  // spelled "unchosen", which is precisely the card.
+  //
+  // These are harness fixtures, not a signed-in user: nothing here is a real
+  // account, a real homeserver or a real posture, and no Keychain or SDK session
+  // exists behind them. Anything that needs actual Matrix state (the timeline,
+  // room list, crypto) is answered elsewhere in this table or falls through.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * One restored account, so `hasAccount` is true and `App` mounts `<AppShell />`
+   * instead of the encryption card or the login screen. Shape from
+   * `src/lib/ipc/gen/AccountVm.ts`, annotated `satisfies` for the reason
+   * `sync_profiles` states: `dev/` is inside `tsconfig.json`'s `include`, so a
+   * field added in Rust breaks the typecheck here rather than blanking a window
+   * at run time.
+   *
+   * Exactly ONE account. A second would exercise the account switcher and the
+   * per-account hue bar, which is tempting — but it also changes what the
+   * merged inbox and the filter chips render, and a viewing aid should show the
+   * ordinary case unless asked. The `hueIndex` is deliberately not 0 so the
+   * 3 px chat-row edge bar is visible rather than defaulting invisibly.
+   */
+  session_restore: [
+    {
+      accountId: "01J8ACCOUNTMOCKAAAAAAAAAAA",
+      userId: "@harness:example.org",
+      homeserverUrl: "https://matrix.example.org",
+      hueIndex: 3,
+      provider: "password",
+    },
+  ] satisfies AccountVm[],
+
+  /**
+   * Chosen-OFF, i.e. `false` and not `null`.
+   *
+   * `null` means "the user has never answered", which is what raises the
+   * first-run card; `false` means "answered, FileVault only" — the honest
+   * default and the same value `App`'s own read-failure path falls back to
+   * (`App.tsx`: "treat the posture as chosen-off so the user is never trapped
+   * before login"). Off rather than on because a harness that claims at-rest
+   * encryption is enabled would render passphrase state no fixture here can
+   * back.
+   *
+   * Load-bearing even though `session_restore` above already opens the shell:
+   * the posture is read unconditionally on mount, and a hand-driven
+   * `clear()`/sign-out under the mock shell must land on the login screen
+   * rather than back on the card.
+   */
+  encryption_posture: false,
+
   notes_vaults: [
     {
       id: "v1",

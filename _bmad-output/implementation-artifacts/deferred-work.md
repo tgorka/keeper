@@ -3490,7 +3490,23 @@ status: open
 - source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
   summary: `.keepervirtual` and the virtualization keys have no user-facing documentation; only `keeper-syncd`'s annotated `[[profile]]` template describes them.
   evidence: The daemon template gained both keys in this story, because the daemon accepts them the moment `SyncProfile` carries them and an operator setting a byte-affecting policy blind is the same failure one step earlier than the typo the module hard-refuses. The committed file is the artifact a whole team meets, and it is documented nowhere. Epic 56 assigns the chapter to story 56.8 (`docs/sync.md` grows a virtual-files section, last of all), which is where it belongs — recorded here so the file name, the `!` protection rule and the union-across-tiers behaviour are not left to be rediscovered from the source.
-  status: open
+  status: stale 2026-08-28 (story 56.14)
+  resolution: |
+    No longer true. Story 56.8 wrote the chapter this entry says does not exist, which is
+    exactly where this entry predicted it would land ("Epic 56 assigns the chapter to story
+    56.8"). `docs/sync.md` §9 "How a path becomes virtual" opens: "The policy lives in
+    **`.keepervirtual`** at the repository root, committed like any other file and read from
+    the **worktree**, never from `HEAD`" — and then documents the whole gitignore dialect
+    (basename, leading `/`, trailing `/`, `!` protections, `\!`/`\#` escapes), the
+    protection-wins-unconditionally departure, the wholesale-replacement rule for a
+    higher-tier positive list, the never-virtual control files, `virtualOverBytes` as an
+    inclusive size floor defaulting to `0`, the four-tier precedence chain
+    (`.keepervirtual` < stored profile row < `<folder>/.keeper/keeper.toml` <
+    `<folder>/.keeper/keeper.<host>.toml`), and the quoted-pattern refusal with its source
+    name. Story 56.12 then made all three keys typeable in the app — see the entry below
+    about `virtualPatterns`/`virtualOverBytes`/`releaseTtlMs` having no UI, also stale — so
+    the keys are documented AND reachable, and the daemon template is no longer the only
+    artifact that describes them.
 
 - source_spec: spec-56-1-a-policy-that-says-which-files-may-stay-away
   summary: The shared gitignore dialect has no spelling for "root-anchored, single segment" outside the virtualization lists.
@@ -3550,7 +3566,20 @@ status: open
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: A selector that is one profile's id and another profile's name makes both folders permanently unreleasable, and the refusal advises the one thing that cannot work.
   evidence: `select` filters `profile.id == wanted || profile.name == wanted` with no precedence, so both match, the single-profile destructure fails, and the message is "`{wanted}` matches 2 folders; name the one you mean by its id" — while the id is precisely what is ambiguous. Pre-existing and shared by every verb that calls `select` (`materialize`, `ls-files`, `pause`, `resume`, `verify`), and the fix — prefer an exact id match before filtering by name — changes the selector for all of them, which is why it is not made inside a story whose surface is one deleting verb. Nothing makes a profile name unique, so the collision is reachable by a user who names a folder after another folder's ULID.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `select` (`keeper-syncd/src/commands.rs`) now asks for an exact id FIRST and only filters
+    by name when nothing owns that id, so an id match is always exactly one folder and the
+    collision cannot arise. That also makes the surviving message TRUE: the only ambiguity
+    left is two folders sharing a NAME, for which "name the one you mean by its id" is the
+    correct instruction. Precedence rather than the reverse because an id is keeper's own
+    opaque key — resolving to it can never address a folder the caller did not name, whereas
+    preferring the name could. Tests (both fail without the change):
+    `an_id_that_is_also_another_folders_name_resolves_to_the_id`, which also asserts
+    declaration order does not decide it, and
+    `two_folders_sharing_a_name_still_both_match_that_name`, which pins the ambiguity that
+    remains. Applies to every caller of `select` — `materialize`, `dehydrate`, `pin`,
+    `unpin`, `ls-files`, `pause`, `resume`, `verify`, `status` — as the entry said it would.
 
 - source_spec: spec-56-4-a-release-that-refuses-five-times-before-it-deletes
   summary: `lfs::stage::dehydrate`'s post-create cleanup paths are structurally verified but not exercised, because none of them can be forced from a fixture without stubbing the filesystem.
@@ -3590,7 +3619,19 @@ status: open
 - source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
   summary: `VerifyReport::virtual_paths` reaches `keeper-syncd` and nothing else, so the desktop surface cannot tell a clean folder from one where ten thousand paths were excused.
   evidence: `sync_verify` (`keeper/src/sync_ipc.rs`) flattens only `report.bad` into `Vec<String>`, so the Settings pane renders `SYNC_VERIFY_CLEAN_SENTENCE` and nothing else after a pass that excused most of the folder. The field's own doc says a row nobody reports anywhere is indistinguishable from a check that stopped running, and that guarantee is honoured on the CLI alone. Carrying the count to the app needs a wire type and a generated binding, which story 56.6 declared a non-goal (`git status --porcelain -- src/lib/ipc/gen` must stay empty) because 56.7 owns the row states and 56.9 owns the surface that reads them. The sentence was reworded so it no longer promises what the pass does not check, which is the honest half of the fix; the count itself belongs with the states.
-  status: open
+  status: stale 2026-08-28 (story 56.14)
+  resolution: |
+    No longer true; story 56.12 carried the count to the app. `src/lib/ipc/gen/SyncVerifyVm.ts`
+    is now `{ checked: number, virtualPaths: number, problems: Array<string> }` and its own doc
+    says `virtual_paths` "is the number that turns 'nothing was wrong' into 'nothing was wrong
+    AND N are away on purpose'". `settings/sync-section.tsx` renders it —
+    `syncVerifyCountSentence(verified.checked, verified.virtualPaths)` — beside
+    `SYNC_VERIFY_CLEAN_SENTENCE` rather than instead of it, and
+    `sync-section.test.tsx > says how many paths a clean check excused on purpose` asserts
+    "Read 12 files. 5 kept away on purpose." So the wire type and the generated binding this
+    entry called a non-goal both exist. Note the SECOND half of the same complaint was still
+    live and is fixed separately in this story: the counts were reachable only from a folder
+    keeper had already flagged (see the story-56.12 entry below about the verify counts).
 
 - source_spec: spec-56-6-the-checks-stop-calling-the-normal-state-a-fault
   summary: `Engine::verify` is no longer strictly read-only for a folder that carries a virtualization policy: it opens the repository, which can clear a stale `index.lock` and rewrite `.git/config`.
@@ -3620,7 +3661,21 @@ status: open
 - source_spec: spec-56-7-the-row-says-what-it-is-and-what-a-delete-will-do
   summary: The Files row's sync mark is not in the row's `aria-describedby`, so the sentence naming a file's sync state — including the three new virtual states — is never announced while a screen reader navigates the tree.
   evidence: The row carries `aria-label={node.name}`, and `files-pane.tsx`'s own comment states the rule this creates: "aria-label on the row replaces its subtree's contribution to the name, so a size or a vault marker rendered only as a child would be on screen and absent from the accessibility tree entirely". `countId`, `sizeId`, the new `mtimeId` and `roleId` are all in the list; `<SyncStatusMark>` has no id and is in none of them. Pre-existing — `session-tree.tsx` carries the identical omission under the identical comment, and the mark has had its own `aria-label` and `title` since 44.17, so it is reachable by direct inspection and only unreachable during row navigation. Story 56.7's tests query the mark element directly and cannot see this. The fix is a `syncId` in both trees, exactly as `mtimeId` was added, and it belongs in one pass over both surfaces rather than half-applied here.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `SyncStatusMark` gained an optional `id`, and BOTH callers now name it in their row's
+    `aria-describedby`: `files-pane.tsx` (`syncId`, in the list beside `countId`, `sizeId`,
+    `mtimeId`, `releaseId` and `roleId`) and `sessions/session-tree.tsx`, which this entry
+    correctly said carried the identical omission. The prop is optional rather than required
+    because the fact it repairs belongs to the ROW, not to the mark — and because a required
+    prop would force an id to exist without ever forcing a row to name it, which is the wrong
+    guard. Tests (each fails without the wiring, and every pre-existing assertion passed
+    WITH the defect because `toHaveAccessibleName` reads the mark directly):
+    `files-pane.test.tsx > names each row's sync mark in the row's own description`, asserted
+    over all eight sync states plus the profile root that must name none, and
+    `session-tree.test.tsx > carries the Files tab's own sync mark and sentence`, extended to
+    assert the row's `aria-describedby` contains the mark's id and that the row's accessible
+    DESCRIPTION now contains the sentence.
 
 - source_spec: spec-56-7-the-row-says-what-it-is-and-what-a-delete-will-do
   summary: A queued LFS download over a path whose worktree still holds the real bytes reads `Waiting` and says the content is still on the remote, while the bytes are on this disk.
@@ -3635,17 +3690,59 @@ status: open
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: The Files row offers Release on a pinned row and on a folder whose LFS mode releases nothing, where the wire already carries Rust's word saying the request will be refused.
   evidence: `files-pane.tsx` gates Release and Pin on `entry.sync.status === "materialized"` and on nothing else, though the same row is holding `release.hold`. `Engine::dehydrate_entry` refuses a pinned path (`ContentRefusal::Pinned`) and refuses on the mode gate (`AlwaysMaterializes` / `LfsDisabled`), so for `hold === "Pinned"` and for both mode causes the press is a guaranteed red `role="alert"` from a control the pane had the information to withhold. Deliberately not fixed here for two reasons that pull the other way: epic 56's own acceptance criterion is that a materialized row offers Release and Pin, unconditionally; and on every host today `SyncPlatform::open_file_state` answers `Unknown`, so EVERY manual release already refuses with `OpenUnknown` — which story 56.4 recorded as its deliberate consequence — so a "hide the verb when it will refuse" rule would hide it always. The honest fix is a disabled-with-a-reason affordance, which needs `FilesRowAction` to grow a `disabled` field and both render sites to learn it, and which should land with the platform's real open-file answer rather than before it. `hold === "Not sent"` is NOT in this class: `dehydrate_entry` takes its remote proof fresh, so a row whose `synced_at_ms` memo was never written may still release.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `files-pane.tsx` now withholds Release when `release.hold` is `Pinned` or `Kept` —
+    `FILES_RELEASE_REFUSED_HOLDS` — leaving it on `Manual`, `Not sent` and a live countdown.
+    Both of the entry's two stated reasons for deferring are answered rather than waved:
+    (1) the wire had no way to say "refused", and it still has none — a `releasable` field on
+    `FilesReleaseVm` is impossible on this host because the struct literal is composed in
+    `keeper/src/sync_ipc.rs`, which does not build here — so instead `ReleaseSchedule::hold`
+    gained one word (see the `Kept` entry below); (2) the pane must not distinguish the three
+    `Kept` causes by their SENTENCE, and it does not: it reads the token, so a rewording in
+    Rust cannot silently re-enable the button. Pin is deliberately NOT gated — it is
+    idempotent in Rust and sends only `true`, and these are the rows most likely to want it.
+    Withheld rather than disabled, the pane's standing convention: the release cell on the
+    same row draws the word and speaks Rust's sentence, which explains more than a disabled
+    button's tooltip. Test: `files-pane.test.tsx > withholds Release exactly where Rust's
+    word says the request cannot succeed` — all five words in one tree, both the cluster and
+    the right-click menu, and it fails without the gate.
 
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: `ReleaseSchedule::hold()` renders the word "Kept" for a row whose Release works and for a row whose Release cannot, and nothing beside the button distinguishes them.
   evidence: `Indefinite` (the folder's `releaseTtlMs` is `0`) and the two mode causes all answer `"Kept"`. But `dehydrate_entry` has no TTL check anywhere — its gates are containment, tracking, subpaths, stat, pointer identity, size, the pin and content identity — so a `releaseTtlMs = 0` row releases on request, while a mode-gated row is refused. The sentences differ and are what a reader gets from the tooltip and the `sr-only` phrase, so nothing is misstated; what is missing is a word that separates "no automatic clock, but you may still ask" from "this folder does not release at all". Worth a distinct word rather than a longer sentence, and worth deciding together with the deferred disabled-verb affordance above, since the two answer the same question from opposite sides.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    The word this entry says is missing now exists. `ReleaseSchedule::instant_or_words`
+    (`keeper-sync/src/engine.rs`) answers `Err("Manual")` for `Indefinite` on its own arm and
+    keeps `Err("Kept")` for `ModeKeeps | LfsOff`, so the word now separates the row whose
+    Release WORKS from the two whose Release cannot. No new variant, no sentence changed, and
+    the `releases_after_ms().is_some() == hold().is_none()` pairing is untouched — it is still
+    one `Result` away in one function. Six characters, so it still fits the `w-16` cell beside
+    `Pinned` and `23 hr`. The engine edit was made by the sibling agent `EngineSweep` at this
+    story's request over `hub`, because `keeper-sync` is that agent's file; every consumer of
+    the word was updated here (`files-pane.tsx`'s gate, `files-pane.test.tsx`,
+    `dev/mock-shell.ts`'s new `hold: "Kept"` row). Tests:
+    `release_schedule_pairs_an_instant_with_words_exactly_one_way` in `keeper-sync` pins the
+    word and carries a note saying the Files pane's gate branches on `Kept` meaning
+    refuse-certain, and `files-pane.test.tsx > draws a word, no digit and no timer for a row
+    on no clock` now runs over all FIVE words, including the `Manual`/`Kept` split.
 
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: `sync_browse` now scans the profile's whole `materialized` table twice for one directory listing — once for the marks and once for the deadlines.
   evidence: `sync_ipc::sync_browse` reads `engine.materialized_paths(&id)` for `browse::MaterializedView` and then `engine.release_schedules(&id)` for the countdown; both are unfiltered scans of the same table for the same profile (`db::materialized_paths`, `db::materialized_rows`), and the first read's own comment already calls itself "an unfiltered scan of everything this profile has ever hydrated, paid on every folder expansion". The keys `release_schedules` returns are exactly the keys `materialized_paths` returns, so one read could feed both views. Not folded in this story because it changes the failure coupling deliberately established by 56.7: a schedules read that fails currently costs the rows their countdown only, while a shared read would also cost them their `Materialized` mark, and the fix lands in the one crate that cannot be compiled on this host. It should be taken together with the cone-scoped reader already deferred by 56.7, which would make both reads cheap rather than making one of them disappear.
   status: open
+  keep: |
+    Kept, and blocked rather than merely deferred (story 56.14). The double scan is real and
+    the fix the entry proposes is the right one, but the caller is `sync_ipc::sync_browse` in
+    `src-tauri/crates/keeper/**` — the Tauri shell crate, which cannot be compiled on this
+    host, so a change there could not be built or verified and would leave the tree in a
+    state nobody could check. The engine half is available: `EngineSweep` is adding a
+    cone-filtered `materialized` read in `keeper-sync` for the sibling entry about
+    `Engine::materialized_paths`, so the primitive this fix needs will exist. What would have
+    to change for this to become worth doing: a story that can build the shell crate — i.e.
+    one running on macOS, or after `keeper` links on Linux — at which point it is a two-line
+    edit in `sync_browse` to take one filtered read instead of two unfiltered ones.
 
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: `Engine::dehydrate_entry` hashes the whole file to prove content identity while it is an `async fn`, so awaiting it from a Tauri command blocks a runtime worker for the length of a multi-gigabyte read.
@@ -3655,17 +3752,62 @@ status: open
 - source_spec: spec-56-9-the-button-and-the-time-you-have-left
   summary: A second Files row verb pressed before the first resolves clears the first's refusal sentence and can replace it with "the folder is already syncing".
   evidence: `runRowVerb` calls `setWriteError(null)` before every attempt and there is one `writeError` slot for the pane, so two presses in flight together end with whichever rejected last — and the engine's per-profile reservation means the second is likely to reject `Busy` rather than on its own merits, so the sentence the person reads is about contention rather than about their file. The three verbs the pane already had share the same single sink and the same absence of an in-flight guard, so this is the shape of the surface rather than something 56.9 introduced; what 56.9 changed is that these verbs now REPORT rather than swallow, which is what makes the collision visible. The fix is one in-flight ref per pane (or per row) and a decision about whether a press during flight should queue, replace or be ignored — a small design question worth asking once for all six verbs.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `runRowVerb` (`files-pane.tsx`) now chains each attempt onto the previous one and clears
+    the sink per BURST rather than per press. Both halves of the defect are closed, and the
+    second is the one that mattered: because the verbs no longer overlap, the engine's
+    per-profile reservation cannot produce the `SyncError::Busy` this entry describes, so the
+    sentence a person reads is about their own file and never about keeper's contention with
+    itself. Nothing is dropped and nothing is silently ignored — a guard that swallowed the
+    second press was rejected for that reason — both verbs run, in press order, each against
+    a folder the previous one has finished with. Refusals within one burst accumulate as
+    joined sentences, the shape `requestDelete`'s multi-path receipt already uses; a new
+    burst (a press arriving with nothing in flight) still discards the previous one's
+    sentences, which is correct. The chain link never rejects, so one refusal cannot strand
+    every later press. Tests, both of which pin the in-flight window with a hanging mock
+    rather than relying on how many microtasks `act` drains:
+    `files-pane.test.tsx > keeps the first verb's refusal and does not run the second beside
+    it` (asserts the second invoke has NOT happened while the first is in flight, which is
+    what makes the `Busy` unreachable rather than merely unlikely) and
+    `> shows both sentences when two verbs in one burst are refused`.
 
 - source_spec: spec-56-8-a-virtual-files-chapter
   summary: `docs/sync.md` §13 says an `ls-files` row carries a modification time and what the ledger recorded, but the human row prints only state, size, path, oid and `[pinned]` — those four fields exist only under `--json`.
   evidence: `keeper-syncd/src/commands.rs:1395-1401` formats the human row as `"  {state:<12}  {size:>9}  {path}  {oid}{pinned}"` and nothing else, while `mtimeMs`, `materializedAtMs`, `lastUsedMs` and `syncedAtMs` appear only in the serialized `LfsFile` (`keeper-sync/src/lfs/listing.rs:109`). The claim at `docs/sync.md:1274-1276` ("plus a modification time and, once a path has been materialized, what the ledger recorded about it") therefore describes the JSON document while sitting in a paragraph about the printed rows, and an operator reading it will run the verb without `--json` and not find them. Pre-existing: written by story 56.2, surfaced while writing §9. Not fixed here because the honest repair is a choice between two changes of different size — reword the sentence to name `--json`, or print an mtime column in the human row, which is a behaviour change a docs branch must not make.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `docs/sync.md` §13 now separates the two renderings instead of describing one while
+    sitting in a paragraph about the other. It states outright that the printed row and the
+    `--json` document do not carry the same fields, shows a real transcript of the count line
+    plus two rows (with the object id in FULL, which is what `ls_files_lines` prints), and
+    says in its own paragraph that a modification time and the ledger facts exist only under
+    `--json`, naming them: `mtimeMs`, `materializedAtMs`, `lastUsedMs`, `syncedAtMs`. The
+    entry offered two repairs of different size and asked for a decision; the decision is to
+    correct the DOCUMENT rather than to widen the printed row, because the row is already four
+    columns of which one is a 64-character oid, and four more fields would make it unreadable
+    at any terminal width — the operator who wants them has `--json`, which is what the
+    paragraph now says. Also fixed while there: the paragraph noted the old claim explicitly
+    ("This paragraph used to claim the printed row carried a modification time. It never
+    has."), so a reader who remembers the wrong version is not left doubting the new one.
 
 - source_spec: spec-56-8-a-virtual-files-chapter
   summary: `docs/sync.md` §13 states "Every other refusal exits `1`" for `dehydrate`, but an unknown or ambiguous profile selector on the same verb exits `2`.
   evidence: `sync_exit_code` (`keeper-syncd/src/commands.rs:127-176`) maps `SyncError::Refused(_)` to `EXIT_FAILURE = 1` and `SyncError::Config(_)` to `EXIT_CONFIG = 2`, and the profile resolver raises `Config` for both "no such profile" and "`{wanted}` matches {n} folders; name the one you mean by its id" — reachable on `materialize`, `dehydrate`, `pin` and `unpin`. The sentence at `docs/sync.md:1318` is true of every refusal and false of the selector error beside it, so a script that branches on `1` versus non-zero mis-reads a typo'd profile name as a refusal. Pre-existing: written by story 56.4, surfaced while auditing §9's exit-code claims against §13. Not fixed here because the exit-code contract belongs to §13 and this branch is scoped to §9 plus the sentences epic 56 falsified.
-  status: open
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    `docs/sync.md` §13 now carries its own paragraph on the selector, headed "The profile
+    selector is not a refusal, and does not exit `1`": a first argument that names no folder,
+    or that names two folders sharing one name, is a configuration error and exits **`2`** —
+    before any release gate is consulted, and on `materialize`, `dehydrate`, `pin` and `unpin`
+    alike. It spells out the consequence this entry named: a script branching on `1` versus
+    non-zero mis-reads a typo'd folder name as a refusal unless it separates the two. The
+    "Every other refusal exits `1`" sentence is left standing because it is TRUE of refusals;
+    what was missing was that the selector error is not one. Verified against
+    `sync_exit_code`, which maps `SyncError::Refused` to `EXIT_FAILURE` and
+    `SyncError::Config` to `EXIT_CONFIG` with no `_` arm. The paragraph also records the
+    narrowing story 56.14's `select` fix bought: an id always resolves to exactly one folder,
+    so a `2` from an existing folder now means two folders share a name.
 
 - source_spec: `spec-56-10-the-policy-decides-what-arrives`
   summary: A `virtualPatterns` list consisting only of `!` protection lines sets `overrides = true` and discards the repository's committed permissive list wholesale, so a machine restating one exception silently switches the whole folder's virtualization off.
@@ -3680,7 +3822,22 @@ status: open
 - source_spec: `spec-56-10-the-policy-decides-what-arrives`
   summary: `virtualPatterns`, `virtualOverBytes` and `releaseTtlMs` still have no UI anywhere, so the policy story 56.10 made load-bearing can only be configured by editing `.keepervirtual` or a folder TOML by hand.
   evidence: A repo-wide grep for those three keys finds them only in `keeper-sync`, in `keeper/src/sync_ipc.rs`'s `PRESERVED` set, and in test files; no form control, no `SyncProfileReq` field, no `ConfigTierVm` surface. AD-132 requires that a surface showing the policy also show which tier is in force, because a TOML layer outranks the form and keeps winning on every read, and `PRESERVED` means no request can express these fields today — so the UI story is a `SyncProfileReq` change plus a tier display, not a form field. Deliberately out of story 56.10's scope, which is the engine half; recorded because the owner's report was that the feature is invisible in the app, and the engine being correct is only half of that.
-  status: open
+  status: stale 2026-08-28 (story 56.14)
+  resolution: |
+    No longer true; story 56.12 built the surface. All three keys have form controls in
+    `src/components/sync/add-folder-form.tsx`: `SYNC_VIRTUAL_PATTERNS_LABEL` ("Files that may
+    stay away"), `SYNC_VIRTUAL_OVER_LABEL` ("Only files at or above (MB)") and
+    `SYNC_RELEASE_TTL_LABEL` ("Give local copies back after (hours)"), seeded from the profile
+    at `:576-578` and sent at `:977-988`. The entry's two specific claims are both falsified:
+    (1) `PRESERVED` no longer means no request can express them — `SyncProfileReq` carries
+    `virtualPatterns: Array<string> | null`, `virtualOverBytes` and `releaseTtlMs: number |
+    null` (`src/lib/ipc/gen/SyncProfileReq.ts:32,47`); and (2) AD-132's tier requirement is
+    met — each control is `disabled` when `folderOwned.has(<key>)` and renders
+    `syncFolderOwnedNote(<key>)` beside it, asserted by
+    `add-folder-form.test.tsx > … folder-owned …` which also proves the save omits the key.
+    The `releaseTtlMs = 0` case even has its own on-screen note (`SYNC_RELEASE_NEVER_NOTE`).
+    Story 56.14 added the missing symmetric note for the size floor — see the story-56.12
+    entry below about the size-floor box.
 
 - source_spec: spec-56-11-is-this-file-open-answered-for-real
   summary: macOS cannot answer "is this file open", so the app's Release button and the TTL sweep still refuse `OpenUnknown` on the platform keeper is built for first.
@@ -3706,6 +3863,20 @@ status: open
   summary: `sync_release_entry`'s doc comment in the shell crate still tells the reader that no platform can answer the open-file question, "which is every host today" — false since story 56.11 for Linux, and it is the doc on the command the Files pane's Release action calls.
   evidence: `src-tauri/crates/keeper/src/sync_ipc.rs:2518-2519` reads "On a host whose platform cannot answer \"is this file open\" race-free — which is every host today — the honest answer is `ContentRefusal::OpenUnknown`". `ShellSyncPlatform::open_file_state` now delegates to `keeper_sync::platform::probe_open_file_state`, so on Linux the command reaches the rename and that sentence is true only of macOS and Windows. Not fixed in story 56.11 because `sync_ipc.rs` is owned by a concurrent story in the same worktree and a drive-by doc edit there would collide; the coordinator confirmed it is being carried into that story's brief. Doc comment only, no behaviour.
   status: open
+  keep: |
+    Kept, and the blocker is unchanged and now permanent for this branch (story 56.14). The
+    file is `src-tauri/crates/keeper/src/sync_ipc.rs`, the Tauri shell crate, which cannot be
+    compiled on this host — so neither agent on story 56.14 may touch it, for the same reason
+    the concurrent story could not: an edit nobody can build is worse than a stale comment.
+    The exact symbol and the exact false sentence, so the next person needs no search:
+    `sync_release_entry`'s doc comment reads "On a host whose platform cannot answer \"is this
+    file open\" race-free — which is every host today — the honest answer is
+    `ContentRefusal::OpenUnknown`". Since story 56.11 that is true of macOS and Windows only:
+    `ShellSyncPlatform::open_file_state` delegates to
+    `keeper_sync::platform::probe_open_file_state`, whose Linux arm reads `/proc/<pid>/fd`. The
+    replacement sentence should say exactly that. Doc comment only, no behaviour, and
+    `docs/sync.md` §9 and §13 already state the per-platform split correctly, so no user-facing
+    document is wrong — only the comment on the command.
 
 - source_spec: spec-56-11-is-this-file-open-answered-for-real
   summary: Two of the ten fail-closed guards in the `/proc` walk cannot be reached by any test this repository can write — the `Err` dirent arms of the two `read_dir` iterators — and are therefore present but unproven.
@@ -3715,10 +3886,36 @@ status: open
 - source_spec: spec-56-12-drive-settings-for-virtual-files
   summary: On the ADD path the folder-owned key set is always empty, so a folder that already ships a `.keeper/keeper.toml` gets every Advanced control rendered as editable and its first save silently discarded — which is the canonical AD-132 scenario, not an edge case.
   evidence: `add-folder-form.tsx` derives `folderOwned` from `profile?.folderOwned ?? []`, and an add form has no profile. By the time Save is pressed the form DOES have a chosen `localPath`, so the answer is knowable — but `SyncProfileVm.folderOwned` is minted by `SyncProfileVm::from`, which needs a stored profile. `profile::as_stored(incoming, None)` then restores the TYPE DEFAULT rather than the file's value, and the add branch blanks the form afterwards, so the person cannot even see what was dropped. The fix is a per-path question the form can ask before its first save — a `sync_folder_owned_fields(localPath)` command over `keeper_sync::profile::folder::owned_fields` against a synthetic profile — which is a new IPC command and outside a story that added none.
+  status: open
+  keep: |
+    Kept, and blocked on the shell crate (story 56.14). The entry is right that this is the
+    canonical AD-132 scenario rather than an edge case, and right about the fix: a
+    `sync_folder_owned_fields(localPath)` command over
+    `keeper_sync::profile::folder::owned_fields` against a synthetic profile, asked by the form
+    before its first save. It cannot be built here. A new `#[tauri::command]` lives in
+    `src-tauri/crates/keeper/src/sync_ipc.rs` and must be registered in that crate's handler
+    list, and the shell crate does not compile on this host — and `SyncProfileVm` itself is
+    defined in that same file, so there is no keeper-core seam to put it behind either. What
+    would have to change: a story that can build `keeper`, at which point the form change is
+    small (call the command when `localPath` is chosen, seed `folderOwned` from the answer,
+    and render the same disabled controls plus `syncFolderOwnedNote` the EDIT path already
+    renders — the whole UI half already exists and is tested).
 
 - source_spec: spec-56-12-drive-settings-for-virtual-files
   summary: `branch`, `excludes` and `tags` are folder-ownable and have BARE slots on `SyncProfileReq`, so a form that disables them still re-sends the in-force value and makes `profile::as_stored` log a shadowed-change warning on every save of such a folder.
   evidence: `as_stored` (`profile/folder.rs`) compares the incoming value against the TABLE row and pushes any difference into `shadowed` before its `tracing::warn!`. For an owned key the in-force value differs from the table value by definition — that is what "owned" means — so the warning fires for a change nobody could make, which poisons the one diagnostic this mechanism has. The data is safe (the value is restored). Every other ownable key the form renders (`lfsThresholdBytes`, `commitSubjectTemplate`, `notes`, `recordings`, `sessions`, and the three virtualization keys) has an `Option` slot and is omitted correctly. Fixing these three means widening three bare request fields to `Option`, which moves them across the EXPRESSED/PRESERVED classification and needs the guard test re-argued.
+  status: open
+  keep: |
+    Kept, and blocked on the shell crate (story 56.14). `SyncProfileReq` is defined in
+    `src-tauri/crates/keeper/src/sync_ipc.rs:648`, not in `keeper-core` — so widening `branch`,
+    `excludes` and `tags` to `Option` is a change to a crate that cannot be compiled on this
+    host, and it also moves those three fields across the EXPRESSED/PRESERVED classification
+    that the same file owns. Recorded rather than attempted because the DATA is safe: the
+    value is restored, and what is damaged is only the `shadowed` diagnostic, which fires for
+    a change nobody could make. What would have to change for it to become worth doing: a
+    story that can build `keeper` AND is willing to re-decide the EXPRESSED/PRESERVED split
+    for three fields at once — the two are not separable, which is why this is a decision and
+    not a chore.
 
 - source_spec: spec-56-12-drive-settings-for-virtual-files
   summary: `SyncProfile::validate` still does not compile `virtual_patterns`, so the form now accepts a malformed glob that the engine will refuse at run time, nowhere near the box.
@@ -3727,14 +3924,57 @@ status: open
 - source_spec: spec-56-12-drive-settings-for-virtual-files
   summary: `SyncProfileVm.folder_owned` re-derives the folder overlay that `db::list_profiles` computed and threw away one line earlier, so the value and its ownership flag are read at two different instants and can disagree.
   evidence: `db::list_profiles` calls `profile::in_force`, which runs `FolderTier::apply` and discards `FolderOutcome::owned`; `SyncProfileVm::from` then calls `profile::owned_fields`, running `apply` a second time. Besides the duplicated TOML parse and `validate` per layer, the two reads can straddle an edit of the file: if the key vanishes between them the VM carries the FILE's value with `folderOwned` not naming it, so the control renders editable holding a value the person never chose, and the next save writes it into the table as a deliberate choice. `owned_fields`' own doc calls that "the wrong direction to be wrong in". The fix is to thread `FolderOutcome` (or just `owned`) out of `in_force` and `db::list_profiles` instead of asking twice.
+  status: open
+  keep: |
+    Kept, and blocked in a way worth stating precisely, because the obvious fix is a dead end
+    (story 56.14). Threading `FolderOutcome` out of `profile::in_force` and `db::list_profiles`
+    would land in `SyncProfileVm::from`, and `SyncProfileVm` is defined in
+    `src-tauri/crates/keeper/src/sync_ipc.rs:76` — the shell crate, which cannot be compiled on
+    this host. So the keeper-sync signature change has nowhere to arrive: it would break the
+    only consumer and leave the tree uncompilable for the very agent who could not fix it. The
+    sibling agent offered to make the keeper-sync half and was asked NOT to, for that reason.
+    The design stands as the entry states it — thread `owned` out of `in_force` rather than
+    running `FolderTier::apply` a second time — and it also removes a duplicated TOML parse and
+    a `validate` per layer. What would have to change: a story that can build `keeper`.
 
 - source_spec: spec-56-12-drive-settings-for-virtual-files
   summary: The verify counts are only reachable from a folder keeper has already flagged as needing attention, so a healthy virtual folder can never show them.
   evidence: `sync-section.tsx` renders the "Check files" button inside `{status?.needsAttention === true && <Alert>…}`. `syncVerifyCountSentence`'s own argument is that "nothing was wrong" is also what a folder with nothing in it reports — precisely the healthy case the button cannot be pressed in. The per-folder footprint sentence does carry the same two counts on every folder card, so the story's visibility claim is met; this is about the second surface. Moving or duplicating the check action onto a healthy row is a Settings-pane layout decision, not a counts change.
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    The check action moved out of the needs-attention alert and onto every folder card's own
+    action row, beside Sync now / Pause / Edit / Remove (`settings/sync-section.tsx`). So a
+    healthy folder can press it, which is exactly the case `syncVerifyCountSentence`'s own
+    argument is about: "nothing was wrong" is also what a check over an empty folder reports,
+    and the count that separates them was reachable only from a folder keeper had already
+    flagged. MOVED rather than duplicated — two controls with one label in one card is two
+    things to keep in step and a reader wondering whether they do the same thing; the alert
+    keeps its sentence and the report still renders under it either way. The entry called this
+    a Settings-pane layout decision, and that is what it was: the decision is that a check is
+    a property of the folder, not of the fault. Tests:
+    `sync-section.test.tsx > offers the check on a healthy folder and reports its counts there`
+    (fails before the move — the button did not exist on a healthy card — and also asserts
+    there is exactly ONE such control, so the duplication that was rejected cannot creep back)
+    and `> keeps exactly one check control on a flagged folder`.
 
 - source_spec: spec-56-12-drive-settings-for-virtual-files
   summary: The size-floor box silently means "no floor" for any input `pinnedValue` cannot read, with nothing on screen, while the release box beside it explains both of its coercions.
   evidence: `add-folder-form.tsx` maps `pinnedValue(form.virtualOverMb) === null` to `0`, and `0` is not a neutral fallback — it is the documented instruction that every matched file may stay away. The release box next to it renders `SYNC_RELEASE_NEVER_NOTE` for its zero and an in-force note for its substitutions; this one renders only its static note. The seeded value is always a number so the common case is unaffected, which is why it was not fixed here, but the asymmetry between two adjacent boxes with the same failure shape is unexplained.
+  status: fixed 2026-08-28 (story 56.14)
+  resolution: |
+    The size-floor box now renders `SYNC_VIRTUAL_OVER_NONE_NOTE` — "No size floor right now:
+    every matched file may stay away, however small it is." — whenever its content does not
+    read as a positive number, which is exactly the `pinnedValue(...) === null` that sends `0`.
+    The condition is `pinnedValue`'s own answer and not a second test, so what the note claims
+    and what the save sends cannot come apart. That closes the asymmetry the entry names: the
+    release box beside it explains both of its coercions and this one explained neither, while
+    `0` here is not a neutral fallback but the documented instruction that every matched file
+    may stay away — the WIDEST setting the field has, and the one nothing was said about. The
+    entry noted the seeded value is always a number so the common case is unaffected; that is
+    still true and the note is still right for it, because a fresh form's seeded `0` DOES mean
+    no floor. Test: `add-folder-form.test.tsx > says when the size floor is off, for every
+    input that means off` — a blank field, a typed `0` and a half-typed `1e`, then a real floor
+    that must take the note away again, then a save asserted to carry `virtualOverBytes: 0`.
 
 - source_spec: `spec-56-13-what-the-end-to-end-run-found.md`
   summary: A profile whose repository has an **unborn HEAD** — a brand-new folder added against an empty remote — commits nothing and reports `0 file(s)` on every pass, forever, so the folder never starts syncing at all.

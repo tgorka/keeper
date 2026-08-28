@@ -137,8 +137,27 @@ const MARK_TONE: Record<FilesSyncStatusVm, string> = {
  * always carried is reported unsupported. The other way out was two return
  * branches, which is two copies of the same mark to keep in step — the thing
  * this component exists to have exactly one of.
+ *
+ * **`id` is how the sentence gets SPOKEN** (story 56.14). The mark carries its
+ * sentence as its own accessible name, which makes it look present in an
+ * accessibility tree dump and is silent in the one place it matters: a row that
+ * sets `aria-label` replaces its subtree's contribution to its own name, so a
+ * reader moving down the Files tree hears the file name and nothing about where
+ * its bytes are — including all three of story 56.7's virtual states, which is
+ * the whole distinction that story exists to draw. Both callers had the defect
+ * and both now pass an `id` their row names in `aria-describedby`
+ * (`files-pane.tsx`, `sessions/session-tree.tsx`), which is the mechanism each
+ * already used for its size, its date and its lock reason.
+ *
+ * The prop stays OPTIONAL rather than required, because the fact it fixes is a
+ * property of the ROW and not of the mark: a future caller whose row does not
+ * replace its own name has nothing to repair, and making the id mandatory would
+ * make such a caller invent an id nothing references. A required prop would also
+ * be the wrong guard — it forces an id to exist, never that a row names it — so
+ * what actually holds this is one test per caller asserting the row's
+ * `aria-describedby` contains the mark's id.
  */
-export function SyncStatusMark({ sync }: { sync: FilesEntrySyncVm }) {
+export function SyncStatusMark({ id, sync }: { id?: string; sync: FilesEntrySyncVm }) {
   const Icon = MARK_ICON[sync.status];
   const label = sync.detail ?? FILES_SYNC_MARK_LABEL[sync.status];
   const indeterminate = sync.status === "materializing";
@@ -148,6 +167,7 @@ export function SyncStatusMark({ sync }: { sync: FilesEntrySyncVm }) {
   };
   return (
     <span
+      id={id}
       {...semantics}
       title={label}
       data-testid={FILES_SYNC_MARK_TESTID}

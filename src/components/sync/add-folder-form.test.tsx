@@ -58,6 +58,7 @@ import {
   SYNC_TOKEN_SHOW_LABEL,
   SYNC_TOKEN_UNREADABLE_NOTE,
   SYNC_VIRTUAL_OVER_LABEL,
+  SYNC_VIRTUAL_OVER_NONE_NOTE,
   SYNC_VIRTUAL_PATTERNS_LABEL,
   syncFolderOwnedNote,
   syncInForceNote,
@@ -1122,6 +1123,49 @@ describe("AddFolderForm virtual-file controls (Story 56.12)", () => {
 
     fireEvent.change(screen.getByLabelText(SYNC_RELEASE_TTL_LABEL), { target: { value: "6" } });
     expect(screen.queryByText(syncReleaseInForceNote(24))).not.toBeInTheDocument();
+  });
+
+  /**
+   * Story 56.14: the size-floor box says when its content means "no floor".
+   *
+   * Fails before `SYNC_VIRTUAL_OVER_NONE_NOTE` was rendered. `0` is not a neutral
+   * fallback for this field — it is the documented instruction that every matched
+   * file may stay away, which is the widest setting it has — and anything
+   * `pinnedValue` cannot read as a positive number silently became it with
+   * nothing on screen, while the release box one line down explained both of its
+   * own coercions.
+   *
+   * Three inputs, because the failure is a CLASS and not the empty box: a blank
+   * field, a typed zero, and a half-typed number that parses to nothing. Each
+   * must show the note AND send `0`, so the sentence and the wire cannot drift.
+   */
+  it("says when the size floor is off, for every input that means off", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    const floor = screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL);
+
+    // The seeded value is keeper's own `0`, so the note is there from the start:
+    // a fresh form DOES mean no floor, and the previous silence made the widest
+    // setting in the field the one nothing was said about.
+    expect(screen.getByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).toBeInTheDocument();
+
+    for (const value of ["", "0", "1e"]) {
+      fireEvent.change(floor, { target: { value } });
+      expect(screen.getByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).toBeInTheDocument();
+    }
+
+    // A real floor takes it away again — otherwise the note would be furniture.
+    fireEvent.change(floor, { target: { value: "8" } });
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).not.toBeInTheDocument();
+
+    // And the note tells the truth about what is sent: the same `=== null` that
+    // renders it is what sends `0`.
+    fireEvent.change(floor, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ virtualOverBytes: 0 })),
+    );
   });
 
   it("seeds an edit form from the policy in force and saves it back unchanged", async () => {

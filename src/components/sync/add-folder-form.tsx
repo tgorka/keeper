@@ -192,6 +192,25 @@ export const SYNC_RELEASE_TTL_NOTE =
 export const SYNC_RELEASE_NEVER_NOTE =
   "keeper will not release anything in this folder: every file stays here once its content arrives.";
 
+/**
+ * The line under the SIZE-FLOOR box when its content means "no floor" (story
+ * 56.14).
+ *
+ * The box's coercion was silent, and `0` is not a neutral fallback here — it is
+ * the documented instruction that every matched file may stay away, which is the
+ * widest setting the field has. Anything `pinnedValue` cannot read as a positive
+ * number lands on it: a blank box, a typed `0`, a minus sign, a half-typed
+ * `1e`. Meanwhile the release box beside it explains BOTH of its coercions, so
+ * two adjacent boxes with the same failure shape behaved differently for no
+ * reason a reader could see.
+ *
+ * Worded as the consequence rather than as the parse ("no size floor" and what
+ * that does), because the person reading it is looking at their own files and
+ * did not type a number they thought was invalid.
+ */
+export const SYNC_VIRTUAL_OVER_NONE_NOTE =
+  "No size floor right now: every matched file may stay away, however small it is.";
+
 /** The line under the release box when Rust will refuse the window outright. */
 export const SYNC_RELEASE_OUT_OF_RANGE_NOTE =
   "keeper refuses a window under a minute or over ten years rather than rounding it, so this save will come back with an error. Use 0 to switch releasing off.";
@@ -1547,6 +1566,16 @@ export function AddFolderForm({
             />
           </div>
           <p className="text-muted-foreground text-xs">{SYNC_VIRTUAL_OVER_NOTE}</p>
+          {/* The coercion, said out loud — {@link SYNC_VIRTUAL_OVER_NONE_NOTE}.
+              The condition is `pinnedValue`'s own answer and not a separate test,
+              so what the note claims and what the save sends cannot come apart:
+              the same `=== null` that puts this line on screen is what sends `0`.
+              Rendered even when the folder's file owns the key, because the
+              value in force is still no floor and the person is still looking at
+              it. */}
+          {pinnedValue(form.virtualOverMb) === null && (
+            <p className="text-muted-foreground text-xs">{SYNC_VIRTUAL_OVER_NONE_NOTE}</p>
+          )}
           {folderOwned.has("virtualOverBytes") && (
             <p className="text-muted-foreground text-xs">
               {syncFolderOwnedNote("virtualOverBytes")}

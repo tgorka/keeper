@@ -325,15 +325,24 @@ The policy in force is read from the `.keepervirtual` standing in the
 **worktree**, never from `HEAD`, and a `virtualPatterns` list on the profile or
 in a folder TOML layer above it replaces the file's list wholesale — so what is
 in force may be neither committed nor in that file at all. (Protections, the
-`!` lines, are the union of every source and are never dropped.) A folder with
-no policy at all, and a folder whose `lfsMode` is `disabled`, excuse nothing.
+`!` lines, are the union of every source and are never dropped.)
+
+Two folders excuse nothing whatever else is true: one whose `lfsMode` is
+`disabled`, and one with no policy at all — **unless** its `lfsMode` is
+`pointerOnly`, which is itself the folder saying every tracked path may keep its
+pointer. A `pointerOnly` folder therefore needs no `.keepervirtual` and no
+`virtualPatterns` to have its absent objects excused. That is the only fact the
+mode replaces; a `pointerOnly` folder earns the other three per path exactly as
+every other folder does, and its excused paths are counted in the same
+`virtualPaths` number.
 
 An excuse needs every fact that is free, and misses none of them:
 
 - the **index** carries a pointer for that path whose oid and size are the ones
   on disk, which is what tells a checkout's committed pointer from a
   pointer-shaped file somebody saved by hand;
-- the **policy** answers that the path may stay away;
+- the path is **authorized** to stay away — either the policy says so, or the
+  folder's `lfsMode` is `pointerOnly`, which says so for the whole folder;
 - the object is genuinely **absent** from this machine's store rather than
   sitting there truncated;
 - and where the folder's remote is a **directory this machine can see**, that
@@ -842,8 +851,15 @@ failure, a refused batch, a repository the credential cannot see — collapses t
 store copy cannot be a precondition: `lfsPruneLocal` deletes the store object
 precisely when the worktree holds the content (§8), so a rule that leaned on the
 store would be leaning on the thing the other feature removes. The one local
-shortcut is a **filesystem remote's own** object store, proved per object, and
-only where no `.lfsconfig` names a server to ask instead.
+shortcut is a **filesystem remote's own** object store, proved per object.
+
+`.lfsconfig` still outranks it: a repository that names an LFS server has settled
+where the question goes, and that server's answer decides. The store is asked
+when there is no server keeper can actually address — either no `.lfsconfig` at
+all, or one whose named endpoint cannot be reached from a path remote. Before
+this, such a folder refused `UnprovenOnRemote` for ever and could never release
+anything. It is still fail-closed in the direction that matters: a store that
+does not hold the object at exactly that size keeps the local copy.
 
 **Where the operating system cannot answer "is this file open" without racing,
 keeper refuses rather than guesses.** On **Linux** it can be asked, and keeper
@@ -1370,19 +1386,73 @@ keeper-syncd logs
 ```
 
 `ls-files` answers "what does this clone actually hold" for LFS-tracked paths.
-Each row carries the size and object id the **pointer** names — never the ~130
-bytes of pointer text a virtual path occupies on disk — plus a modification time
-and, once a path has been materialized, what the ledger recorded about it. The
-global `--json` flag makes the output a stable document whose field names are the
-contract. The byte count is `sizeBytes`, and it is a **number for every row**,
-`virtual`, `materialized` and `absent` alike: the pointer is the source in all
-three cases, so there is no state in which it can be `null`. (Note that
-`remote.missing[]`, which only `--remote` produces, is a different kind of
-record and spells its own byte count `size`.) Remote presence is **absent unless
-you ask**: `--remote` adds the same batch round trip `verify --remote` makes,
-because whether the server holds an object cannot be known without asking it,
-and a listing that implied it did would be guessing about the one thing worth
-being sure of.
+
+**The printed row and the `--json` document do not carry the same fields**, and
+the difference matters if you are reading one and scripting the other. The
+printed form is a count line followed by one row per path, and a row is four
+columns — the state, the size, the path, and the object id — with `[pinned]`
+after it when the path is pinned:
+
+```
+tgdrive: 2 LFS path(s) — 1 virtual, 1 materialized, 0 absent
+  materialized     4.0 MB  40-media/clip.mp4  3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea
+  virtual        128.0 MB  scans/2019/box-7.tiff  9b2c1f04a7e5d3018f6b24cc90ae71d5386f0b4e2c7a915d68f3410b7d33ae10  [pinned]
+```
+
+The object id is printed **in full** rather than abbreviated: it is the handle
+`verify`, the store and every later verb take, and a prefix somebody has to
+expand by hand is not a handle. Every row's size and object id are the ones the
+**pointer** names — never the ~130 bytes of pointer text a virtual path occupies
+on disk.
+
+A **modification time**, and what the ledger recorded about a path once it has
+been materialized, exist only under `--json`: they are `mtimeMs`,
+`materializedAtMs`, `lastUsedMs` and `syncedAtMs`, and no `keeper-syncd ls-files`
+invocation without `--json` prints any of them. (This paragraph used to claim the
+printed row carried a modification time. It never has.)
+
+The global `--json` flag makes the output a stable document whose field names are
+the contract. The byte count on a listing row is `sizeBytes`, and it is a
+**number for every row**, `virtual`, `materialized` and `absent` alike: the
+pointer is the source in all three cases, so there is no state in which it can be
+`null`.
+
+**One document, two spellings of "byte count", deliberately named here so you do
+not find out by reading a `null`.** A listing row spells it `sizeBytes`; a
+`remote.missing[]` entry — and a `repair.unrecoverable[]` entry beside it —
+spells it `size`. Both kinds of record carry a `path`, so a consumer that walks
+every object with a `path` key and reads `.size` gets a number for half of them
+and `null` for the other half. This is not confined to `ls-files --remote --json`:
+`verify --json` nests the same audit under each folder's `remote` key, so the
+asymmetry is in that document too. Renaming either field would break a published
+contract, so it stays and is documented rather than quietly corrected — read
+`sizeBytes` on a listing row and `size` on an audit entry.
+
+Remote presence is **absent unless you ask**: `--remote` adds the same batch
+round trip `verify --remote` makes, because whether the server holds an object
+cannot be known without asking it, and a listing that implied it did would be
+guessing about the one thing worth being sure of.
+
+**A present `remote` key does not prove a server was asked, and this matters if
+you are monitoring.** `remote.missing == []` means *nothing keeper could ask
+reported this object missing* — not *the server confirmed every object*. Three
+folders produce a fully-formed, intact-looking audit with no round trip at all:
+one whose `lfsMode` is `disabled`, one with no LFS-tracked pointers, and one whose
+remote is a filesystem path with no `.lfsconfig` naming a server — for which there
+is no server in the picture at all, and the peer's own `verify` is the answer. All
+three are by design (see §8's division of labour and §9's note on the
+filesystem-remote shortcut), and all three mean a wrapper reading an empty
+`missing` list as "every object is safely on a server" is wrong about exactly the
+folders where it would most like to be right.
+
+**No field distinguishes them, and `checked` is not that field.** The first two
+cases report `checked: 0`, which looks like the discriminator until you meet the
+third: a filesystem remote counts every tracked path into `checked` and then
+returns without asking anything. So a monitor that needs "a server said yes" has
+to know the folder's `lfsMode` and the shape of its `remoteUrl`, both of which
+`keeper-syncd list --json` reports on the profile row (the human `list` line
+carries the remote but not the mode). Recorded rather than papered over: adding a
+flag would change a published `--json` contract.
 
 `materialize` is the verb that asks for one of those paths by name. If this
 machine already holds the object it is published straight into the worktree and
@@ -1436,7 +1506,15 @@ script can tell "you have the file" from "ask again".
 
 `dehydrate` is `materialize` pointing the other way: it removes one path's
 content and leaves the pointer the folder committed, byte for byte. The line
-says `released` with the size you got back. It is the one verb here that can
+says `released` with the bytes this machine **no longer holds** — which is not
+always the size of the file. A release is a `rename(2)`, and `rename(2)` replaces
+one directory entry: a file with more than one hard link still has its content on
+disk under the other name, so nothing was reclaimed and the figure is `0 B`
+(`sizeBytes: 0` under `--json`). That is a real, successful release — the pointer
+IS at that path afterwards — and the log line names the link count. On a platform
+with no hard-link count the figure is the pointer's size.
+
+It is the one verb here that can
 destroy data, so it refuses before it writes anything — the folder **keeps
 every object it holds**, which is what a folder does unless you set it to keep
 pointers only, and a release there would be undone on the next pass; the file
@@ -1450,6 +1528,16 @@ invisible repository — is also a refusal; the path is **pinned**; or it was
 `alreadyPointer`, with no `oid` and no `sizeBytes`). Every other refusal exits
 `1` and changes nothing on disk. The release is a rename, so a program already
 reading the file finishes reading it.
+
+**The profile selector is not a refusal, and does not exit `1`.** A first
+argument that names no folder, or that names two folders sharing one name, is a
+configuration error and exits **`2`** — before any of the gates above is
+consulted, and on `materialize`, `dehydrate`, `pin` and `unpin` alike. So a
+script that reads `1` as "keeper declined" and anything non-zero as "keeper
+declined" will read a typo'd folder name as a refusal unless it separates the
+two. An id always resolves to exactly one folder (it is the profile row's
+primary key), so `2` from an existing folder means two of your folders share a
+name and you should name the one you mean by its id.
 
 Once the content is gone the release **succeeded**, even if keeper could not
 finish writing down that it happened: a locked database or a busy `.git` is
