@@ -1383,17 +1383,53 @@ pub fn delete_profile(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn set_profile_runtime(
-    conn: &Connection,
-    id: &str,
-    state: &str,
-    last_error: Option<&str>,
-) -> Result<()> {
+/// Record the sentence a person reads beside this folder, or clear it
+/// (Story 56.15).
+///
+/// # This column had no writer at all
+///
+/// `profiles.last_error` has existed since the schema was written and nothing
+/// ever set it: [`set_profile_state`] writes `state` only, and the sole
+/// function that touched `last_error` — a `set_profile_runtime` this replaces
+/// — had no callers in any crate. So the column was `NULL` for every profile
+/// in every state, which is exactly what the owner's `sync.db` was measured
+/// holding for a folder whose first clone had died three minutes in:
+/// `state = 'idle'`, `last_error = NULL`, and no other record anywhere that
+/// anything had gone wrong.
+///
+/// Split from [`set_profile_state`] rather than folded into it because they
+/// answer different questions and change at different moments: a folder can
+/// go `Syncing → Watching` a hundred times while one error stands, and a
+/// state write that also cleared the error would erase the reason on the very
+/// next tick.
+pub fn set_profile_error(conn: &Connection, id: &str, last_error: Option<&str>) -> Result<()> {
     conn.execute(
-        "UPDATE profiles SET state = ?2, last_error = ?3 WHERE id = ?1",
-        (id, state, last_error),
+        "UPDATE profiles SET last_error = ?2 WHERE id = ?1",
+        (id, last_error),
     )?;
     Ok(())
+}
+
+/// Whether this profile owns a journal unit that is claimable right now.
+///
+/// One indexed lookup on `journal_ready` (`state, not_before_ms`), stopping at
+/// the first row: the question is "is there work due", never "how much".
+///
+/// Exists so an offline profile's tick can be paced by the queue rather than
+/// by a clock of its own — see `Engine::remote_within_reach`. A unit that
+/// failed on the network is rescheduled with the engine's backoff, so "a unit
+/// is due" is precisely "the backoff says try the remote again now".
+pub fn has_ready_unit(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM journal
+              WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
+              LIMIT 1",
+            (profile_id, now_ms),
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,6 +1443,16 @@ pub fn set_profile_runtime(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum WorkKind {
+    /// Make this folder's working copy exist: clone it, adopt it, or finish a
+    /// checkout that stopped part-way (Story 56.15).
+    ///
+    /// Journaled, where the rest of `open_repo` is not, because it is the one
+    /// piece of repository setup that can fail *after* touching the network
+    /// and must be retried on a backoff rather than on the scan cadence. A
+    /// profile whose first clone never finished is not idle and has no tree to
+    /// scan, so `scan_is_due` — which decides whether a walk is worth its cost
+    /// — is the wrong authority for whether it is retried at all.
+    Checkout,
     /// Fetch from the remote and apply what is fast-forwardable.
     Pull,
     /// Stage, commit and push local changes.
@@ -1436,6 +1482,10 @@ impl WorkKind {
     /// The `kind` column spelling for a pull. Same reason — a rejected push
     /// queues one and has to be able to assert it did (DW-207).
     pub const PULL: &'static str = "pull";
+    /// The `kind` column spelling for a checkout. Same reason —
+    /// [`crate::engine::Engine::tick_profile`] drains this kind ALONE for a
+    /// folder with no working copy, and has to name it to do that.
+    pub const CHECKOUT: &'static str = "checkout";
 
     /// Whether an identical unit ALREADY RUNNING covers this work.
     ///
@@ -1453,7 +1503,14 @@ impl WorkKind {
     /// The visible symptom is a queue that never shrinks; the invisible one is
     /// the same bytes fetched twice.
     pub fn covered_while_running(&self) -> bool {
-        matches!(self, Self::LfsUpload { .. } | Self::LfsDownload { .. })
+        matches!(
+            self,
+            // A clone of a 16 GB folder runs for minutes and is idempotent:
+            // the second unit could only clone what the first one is cloning,
+            // and queueing one per tick would put an hour of duplicate rows
+            // behind a single running checkout.
+            Self::Checkout | Self::LfsUpload { .. } | Self::LfsDownload { .. }
+        )
     }
 
     /// Discriminant used as the journal's `kind` column, so a row can be
@@ -1461,6 +1518,7 @@ impl WorkKind {
     pub fn tag(&self) -> &'static str {
         match self {
             Self::Pull => Self::PULL,
+            Self::Checkout => Self::CHECKOUT,
             Self::Push => Self::PUSH,
             Self::LfsUpload { .. } => Self::LFS_UPLOAD,
             Self::LfsDownload { .. } => Self::LFS_DOWNLOAD,

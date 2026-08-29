@@ -147,6 +147,16 @@ pub struct EngineCounters {
     /// engine did, and an unreachable remote must not make it read as though
     /// the policy never fired.
     pub pushes: u64,
+    /// Full-tree status walks STARTED for this profile, counted at the one
+    /// door every one of them goes through ([`Engine::claim_walk`]).
+    ///
+    /// Counted because the walk is the single most expensive thing the engine
+    /// does — measured on the owner's folder, 4.3 s of tree diff per pass at a
+    /// two-second cadence — and "did this tick walk?" is otherwise only
+    /// answerable by reading a log line, which is not an assertion. A gate
+    /// that stops a walk can therefore be pinned by a test that counts ZERO
+    /// rather than by one that eyeballs `status walk finished`.
+    pub status_walks: u64,
 }
 
 /// How safe one recorded file already is, read locally (Story 41.6, FR-138).
@@ -1069,13 +1079,24 @@ impl Engine {
     /// commit pass defers to the supervisor's next tick, and the poll answers
     /// from the index and the gate, which is what it does anyway whenever a
     /// repair backlog exists.
+    ///
+    /// It is also where [`EngineCounters::status_walks`] is counted, because
+    /// this is the one door every full-tree walk in the engine goes through
+    /// and a claim that is granted is always spent: both callers walk
+    /// immediately afterwards. Counting here rather than at the two call sites
+    /// means a gate added in front of either cannot be tested against a
+    /// counter that was never reached.
     fn claim_walk(&self, profile_id: &str) -> Option<WalkClaim<'_>> {
-        Self::lock(&self.walking)
-            .insert(profile_id.to_owned())
-            .then(|| WalkClaim {
-                walking: &self.walking,
-                profile_id: profile_id.to_owned(),
-            })
+        if !Self::lock(&self.walking).insert(profile_id.to_owned()) {
+            return None;
+        }
+        self.bump_counters(profile_id, |counters| {
+            counters.status_walks = counters.status_walks.saturating_add(1);
+        });
+        Some(WalkClaim {
+            walking: &self.walking,
+            profile_id: profile_id.to_owned(),
+        })
     }
 
     /// What a Pending poll asks of the walk it is about to run.
@@ -1502,6 +1523,34 @@ impl Engine {
         }
     }
 
+    /// The state word this profile is currently wearing, if the engine holds a
+    /// snapshot for it at all.
+    fn state_of(&self, profile_id: &str) -> Option<ProfileState> {
+        Self::lock(&self.status).get(profile_id).map(|s| s.state)
+    }
+
+    /// Record — or retire — the sentence a person reads beside this folder,
+    /// on **both** surfaces that carry it (Story 56.15).
+    ///
+    /// The in-process snapshot is what the app polls; `profiles.last_error` is
+    /// what survives the process, and what `keeper-syncd status` and a fresh
+    /// launch read. Before this the two were not two: nothing anywhere wrote
+    /// the column (see [`db::set_profile_error`]), so a folder that had
+    /// stopped could only say so for as long as the process that noticed
+    /// stayed up — and the owner's `sync.db` was found with `last_error = NULL`
+    /// beside a repository that had been broken for a day.
+    ///
+    /// Best-effort on the durable half, like [`Self::set_state`]: failing to
+    /// record a problem must never become a second problem.
+    fn set_error(&self, profile_id: &str, error: Option<&str>) {
+        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
+            snapshot.error = error.map(str::to_owned);
+        }
+        if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, error)) {
+            tracing::debug!(error = %err, "could not persist the sync profile's error");
+        }
+    }
+
     /// Record a sticky warning and notify exactly once per onset (Story 29.6).
     ///
     /// **Onset means `None → Some` on the snapshot's `warning` — the presence
@@ -1582,10 +1631,23 @@ impl Engine {
     /// field is what re-arms it, so a cleared-then-recurring problem notifies
     /// again (Story 29.6's second acceptance clause) without a separate
     /// "already notified" flag that a future caller could forget to clear here.
+    ///
+    /// The durable half of the error goes with it, and **only when there was
+    /// one**: this runs after every successful unit, so an unconditional
+    /// `UPDATE` would put a write on the journal's hot path to clear a column
+    /// that is already `NULL` on every healthy folder.
     fn clear_warning(&self, profile_id: &str) {
-        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
-            snapshot.warning = None;
-            snapshot.error = None;
+        let had_error = match Self::lock(&self.status).get_mut(profile_id) {
+            Some(snapshot) => {
+                snapshot.warning = None;
+                snapshot.error.take().is_some()
+            }
+            None => false,
+        };
+        if had_error {
+            if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, None)) {
+                tracing::debug!(error = %err, "could not retire the sync profile's error");
+            }
         }
     }
 
@@ -1690,10 +1752,132 @@ impl Engine {
         self.ensure_watcher(profile);
         self.fold_watch_events(profile)?;
 
+        // Before anything reads this folder's tree, because a folder whose
+        // first copy was never made HAS no tree to read (Story 56.15). One
+        // kind is drained and the tick ends: `WorkKind::Checkout` is the only
+        // work such a profile can do, and everything else in a tick — the
+        // scan, `commit_local`, `do_pull`'s clean-tree commit — walks a
+        // repository whose empty index makes every tracked path read as
+        // deleted.
+        //
+        // The journal is deliberately what paces this, not `scan_is_due`. A
+        // profile that has never completed a clone is not idle, so the gate
+        // that exists to decide whether a WALK is worth its cost is the wrong
+        // authority for whether the clone is retried at all; and the unit's
+        // own `reschedule_after` backoff is the engine's existing discipline
+        // for "the remote was not there, try again later" — no second timer.
+        if self.first_checkout_is_unfinished(profile) {
+            self.enqueue_first_checkout(profile)?;
+            return self
+                .drain_kind(profile, WorkKind::CHECKOUT, SyncSource::Watch)
+                .await;
+        }
+
+        // The volume gate's other half, and the same sentence for the same
+        // reason: `Ok(false)` means "skip this profile, nothing is wrong".
+        if !self.remote_within_reach(profile)? {
+            return Ok(());
+        }
+
         let scan = self.scan_due(profile);
         // The supervisor's own pass. Nobody asked for this one — the clock
         // did — so it is the only genuinely `Watch` caller (AD-34-12).
         self.drain_journal(profile, scan, SyncSource::Watch).await
+    }
+
+    /// Whether this profile's first working copy has still not been made
+    /// (Story 56.15).
+    ///
+    /// Two shapes, one meaning:
+    ///
+    /// * **No repository at all.** `.git` is absent, so the clone (or the
+    ///   adoption of an existing folder) has not happened or did not survive.
+    /// * **A checkout that stopped.** `HEAD` holds a tree and the index holds
+    ///   nothing — see [`git::repo::checkout_is_unfinished`] for why git never
+    ///   leaves a repository there, and for what the status walk does with it.
+    ///
+    /// Asked on **every tick of every profile**, so the healthy answer has to
+    /// be nearly free: one `exists()` plus a 12-byte read of the index header
+    /// ([`git::repo::index_entry_count`]). Only a folder that fails that screen
+    /// pays for a repository open.
+    ///
+    /// Not a `Result`. A repository this cannot look at is a condition the
+    /// ordinary legs report properly, with their own words, and answering
+    /// "false" hands it straight to them — where raising here would replace
+    /// every one of those sentences with this one.
+    fn first_checkout_is_unfinished(&self, profile: &SyncProfile) -> bool {
+        let git_dir = profile.local_path.join(".git");
+        if !git_dir.exists() {
+            return true;
+        }
+        if git::repo::index_entry_count(&git_dir) > 0 {
+            return false;
+        }
+        match self.open_repo(profile) {
+            Ok(repo) => git::repo::checkout_is_unfinished(&repo).unwrap_or(false),
+            Err(err) => {
+                tracing::debug!(
+                    profile = profile.name,
+                    error = %err,
+                    "could not tell whether this folder's first copy finished"
+                );
+                false
+            }
+        }
+    }
+
+    /// Queue the one unit such a profile can act on, if it does not already
+    /// own one.
+    ///
+    /// `enqueue_unique` plus [`db::WorkKind::covered_while_running`] is what
+    /// keeps a 16 GB clone from collecting one duplicate row per tick for the
+    /// whole time it runs.
+    fn enqueue_first_checkout(&self, profile: &SyncProfile) -> Result<()> {
+        let now = self.platform.now_ms();
+        self.with_db(|conn| {
+            db::enqueue_unique(conn, &profile.id, &WorkKind::Checkout, now, now).map(drop)
+        })
+    }
+
+    /// Whether this tick may spend the folder's tree on a remote that is not
+    /// answering (Story 56.15, D2).
+    ///
+    /// `Ok(false)` means "skip this profile, nothing is wrong" —
+    /// [`Self::volume_ready`]'s contract, deliberately word for word, because
+    /// this is the same decision about the other half of what a sync needs.
+    ///
+    /// # What this is for
+    ///
+    /// Measured on the owner's machine: an `offline` profile publishing one
+    /// `status walk finished … elapsed_ms=4274 … deleted=155625` line every two
+    /// seconds, for ever. The walk is the single most expensive thing the
+    /// engine does and it was being bought at 0.5 Hz by a folder that could
+    /// not publish a byte.
+    ///
+    /// # Why the queue and not a clock
+    ///
+    /// AD-49 makes `Offline` a state rather than a failure, and the state is
+    /// *sticky*: nothing in the supervisor's tick clears it except work
+    /// succeeding. A gate that read the word alone would therefore be a trap —
+    /// a folder that went offline with an empty queue could never walk again,
+    /// so nothing would ever be enqueued, so nothing would ever succeed, so the
+    /// word would never change.
+    ///
+    /// The journal closes that loop, and it closes it without a second timer.
+    /// `Offline` is only ever written by a transient network failure, and a
+    /// transient failure re-queues its own unit through
+    /// [`Self::reschedule_after`]'s backoff — so **the row that made the
+    /// profile offline is the row that will clear it**, and "a unit is due" is
+    /// exactly "the backoff says try the remote again now". A first clone that
+    /// died on the network is the one case where no such row would exist, and
+    /// [`Self::enqueue_first_checkout`] writes one *above this gate* precisely
+    /// so that it does.
+    fn remote_within_reach(&self, profile: &SyncProfile) -> Result<bool> {
+        if self.state_of(&profile.id) != Some(ProfileState::Offline) {
+            return Ok(true);
+        }
+        let now = self.platform.now_ms();
+        self.with_db(|conn| db::has_ready_unit(conn, &profile.id, now))
     }
 
     /// Whether this profile's tree may be walked on this tick, arming the next
@@ -3455,16 +3639,12 @@ impl Engine {
                     // could see. A folder that has failed this many times in a
                     // row is not idle, and the sentence belongs beside it.
                     self.set_state(&profile.id, ProfileState::NeedsAttention);
-                    if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
-                        snapshot.error = Some(err.to_string());
-                    }
+                    self.set_error(&profile.id, Some(&err.to_string()));
                 }
             }
             Retriability::Permanent => {
                 self.set_state(&profile.id, ProfileState::NeedsAttention);
-                if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
-                    snapshot.error = Some(err.to_string());
-                }
+                self.set_error(&profile.id, Some(&err.to_string()));
                 if err.needs_user_action() {
                     self.warn(&profile.id, &profile.name, err.to_string());
                 }
@@ -3675,6 +3855,7 @@ impl Engine {
         source: SyncSource,
     ) -> Result<()> {
         match kind {
+            WorkKind::Checkout => self.do_checkout(profile).await,
             // The conflict copies are already recorded and warned about;
             // a journaled pull has no caller to hand them back to.
             WorkKind::Pull => {
@@ -3698,6 +3879,92 @@ impl Engine {
             WorkKind::OpenPullRequest { branch } => self.do_open_pr(profile, branch).await,
             WorkKind::Verify => self.verify(&profile.id).await.map(drop),
         }
+    }
+
+    /// Make this folder's working copy exist, and say so plainly when it
+    /// cannot (Story 56.15).
+    ///
+    /// The unit behind [`WorkKind::Checkout`]. Two shapes reach it and it
+    /// handles both with the machinery that already exists:
+    /// [`Self::open_repo`] clones an empty destination, adopts a non-empty one
+    /// and is idempotent once `.git` is there, and
+    /// [`git::repo::restore_missing_checkout`] finishes a checkout that
+    /// stopped, writing only what is missing.
+    ///
+    /// # Why the failure is stated here rather than left to `record_failure`
+    ///
+    /// Because the retriability of the *cause* decides the state word, and for
+    /// the cause that actually happened — the network going away three minutes
+    /// into a 16 GB clone — that word is `Offline`, whose arm records no error
+    /// at all. AD-49 is right about an ordinary folder: offline is a state, not
+    /// a failure, because local git keeps working. It is wrong about this one,
+    /// because there is no local git here: the folder holds nothing, can do
+    /// nothing, and will keep saying "idle, no error" while its owner waits for
+    /// a download that never starts. That is the exact row measured in the
+    /// owner's `sync.db`.
+    ///
+    /// So the fact is written to both surfaces before the error is returned,
+    /// and the error is returned unchanged in kind so
+    /// [`Self::reschedule_after`] still applies the ordinary backoff. The
+    /// `warn` — the sticky banner and the one native toast — is deliberately
+    /// NOT raised here: a blip during a first clone is ordinary, and
+    /// `record_failure`'s existing run-of-failures threshold is what decides a
+    /// folder has stopped rather than stumbled.
+    async fn do_checkout(&self, profile: &SyncProfile) -> Result<()> {
+        match self.finish_first_checkout(profile) {
+            Ok(()) => {
+                // `drain`'s success path calls `clear_warning`, which retires
+                // the sentence on both surfaces. Nothing to do but succeed.
+                Ok(())
+            }
+            Err(cause) => {
+                let stated = match cause {
+                    // Already the right sentence, from the repair itself.
+                    known @ SyncError::CheckoutUnfinished { .. } => known,
+                    other => SyncError::CheckoutUnfinished {
+                        path: profile.local_path.clone(),
+                        detail: format!("keeper could not make it: {other}"),
+                    },
+                };
+                self.set_state(&profile.id, ProfileState::NeedsAttention);
+                self.set_error(&profile.id, Some(&stated.to_string()));
+                Err(stated)
+            }
+        }
+    }
+
+    /// The blocking half of [`Self::do_checkout`].
+    ///
+    /// Split out so the error handling above reads as the one decision it is,
+    /// and so both exits from the repair — "there was nothing to finish" and
+    /// "it could not be finished" — are visible side by side.
+    fn finish_first_checkout(&self, profile: &SyncProfile) -> Result<()> {
+        let repo = self.open_repo(profile)?;
+        if !git::repo::checkout_is_unfinished(&repo)? {
+            // The clone or the adoption above was the whole job.
+            return Ok(());
+        }
+        tracing::warn!(
+            profile = profile.name,
+            "this folder has commits but no index: finishing the checkout that stopped"
+        );
+        let repair = git::repo::restore_missing_checkout(&repo, &self.interrupt)?;
+        if let Some(reason) = repair.unfinished {
+            return Err(SyncError::CheckoutUnfinished {
+                path: profile.local_path.clone(),
+                detail: format!(
+                    "It has commits but an empty index, and keeper could not finish it: \
+                     {reason}. Nothing was deleted and nothing on disk was overwritten."
+                ),
+            });
+        }
+        tracing::info!(
+            profile = profile.name,
+            restored = repair.restored,
+            kept = repair.kept,
+            "finished the interrupted checkout"
+        );
+        Ok(())
     }
 
     /// Record that a pass finished without error.
@@ -4918,6 +5185,27 @@ impl Engine {
     /// or enqueues the push.
     fn collect_stable_changes(&self, profile: &SyncProfile) -> Result<git::commit::StagedChange> {
         let repo = self.open_repo(profile)?;
+        // Refused before the walk, not after it (Story 56.15).
+        //
+        // `git::commit::stage_and_commit` is where the refusal is a
+        // GUARANTEE — it sits at the one place a commit is made and no caller
+        // can route around it. This one is here for the cost: a walk of a
+        // repository with an empty index diffs `HEAD`'s whole tree against
+        // nothing and emits one deletion per tracked path, which on the folder
+        // this was written for is 4.3 s and 155 625 emitted items to reach a
+        // conclusion that is already known from two integers. Reaching the
+        // inner guard would mean paying that on every pass while the repair
+        // ran.
+        if git::repo::checkout_is_unfinished(&repo)? {
+            return Err(SyncError::CheckoutUnfinished {
+                path: profile.local_path.clone(),
+                detail: "It has commits but an empty index, so a walk of it would report \
+                         every tracked file as deleted. Nothing was scanned and nothing was \
+                         committed. keeper restores the missing files from the last commit \
+                         on its next pass."
+                    .to_owned(),
+            });
+        }
         // One walk per folder. If a Pending poll is already inside one, this
         // pass has nothing to add by starting a second: it would read the same
         // tree, reach the same verdicts, and halve the throughput of the walk
@@ -18722,6 +19010,277 @@ mod tests {
             engine.materialize_entry("01NOSUCHPROFILE", "clip.mp4"),
             Err(SyncError::Config(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 56.15: a clone that stopped says so
+    // -----------------------------------------------------------------------
+
+    /// The profile row's own `last_error` column, which is what
+    /// `keeper-syncd status` and a fresh app launch read — as opposed to the
+    /// in-process snapshot, which dies with the process that made it.
+    fn stored_last_error(engine: &Engine, id: &str) -> Option<String> {
+        engine
+            .with_db(|conn| {
+                conn.query_row(
+                    "SELECT last_error FROM profiles WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(SyncError::from)
+            })
+            .expect("the profile row is readable")
+    }
+
+    /// How many journal rows of one kind this profile owns.
+    fn units_of_kind(engine: &Engine, id: &str, kind: &str) -> u32 {
+        engine
+            .with_db(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM journal WHERE profile_id = ?1 AND kind = ?2",
+                    (id, kind),
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(SyncError::from)
+            })
+            .expect("the journal is readable") as u32
+    }
+
+    /// A folder with two committed files and a clean tree, which is what an
+    /// interrupted first clone was *supposed* to leave behind.
+    fn committed_fixture(
+        engine: &Engine,
+        platform: &TestPlatform,
+        dir: &Path,
+    ) -> (SyncProfile, gix::hash::ObjectId) {
+        let p = adoptable(dir);
+        std::fs::write(p.local_path.join("a.txt"), b"alpha").expect("write a");
+        std::fs::write(p.local_path.join("b.txt"), b"beta").expect("write b");
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("the first pass opens the settle window");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit the fixture"),
+            2,
+            "the fixture must actually have a commit for the guard to be about"
+        );
+        let repo = engine.open_repo(&p).expect("open");
+        let head = git::repo::head_commit_id(&repo)
+            .expect("head")
+            .expect("the fixture has a commit");
+        drop(repo);
+        (p, head)
+    }
+
+    /// Put the repository into the exact state the owner's `/Users/tgorka/tgdrive`
+    /// was measured in: `HEAD` holds a tree, the index holds nothing, and the
+    /// worktree files the checkout never got to are absent.
+    fn interrupt_the_checkout(p: &SyncProfile, remove_worktree: bool) {
+        std::fs::remove_file(p.local_path.join(".git/index")).expect("drop the index");
+        if remove_worktree {
+            for name in ["a.txt", "b.txt"] {
+                std::fs::remove_file(p.local_path.join(name)).expect("drop the worktree file");
+            }
+        }
+    }
+
+    /// D1. A first clone that stopped mid-checkout must say so where a human
+    /// and the UI can read it, and the next tick must re-drive it.
+    ///
+    /// Measured on the owner's machine (0.8.23, 2026-08-29 07:31): the clone
+    /// log line, then silence — `profiles.state = 'idle'`, `last_error = NULL`,
+    /// zero journal rows, and a `.git` whose index holds nothing while `HEAD`
+    /// holds 155 625 paths. Nothing recorded the failure and nothing retried.
+    #[tokio::test]
+    async fn an_interrupted_first_clone_says_so_and_is_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, head) = committed_fixture(&engine, &platform, dir.path());
+        interrupt_the_checkout(&p, true);
+
+        // A directory where `HEAD` holds a file: the repair collides with
+        // something it may never overwrite, so it cannot finish. That is the
+        // half of this behaviour that has to be *recorded* rather than fixed.
+        std::fs::create_dir(p.local_path.join("a.txt")).expect("block one path");
+
+        engine.tick_profile(&p).await.expect("a tick never raises");
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_ne!(
+            snapshot.state,
+            ProfileState::Idle,
+            "a folder with no working copy is not idle"
+        );
+        let shown = snapshot
+            .error
+            .expect("a clone that did not finish must leave an error the UI can read");
+        assert!(
+            shown.contains("never finished"),
+            "the sentence must name what happened, got: {shown}"
+        );
+        assert_eq!(
+            stored_last_error(&engine, &p.id).as_deref(),
+            Some(shown.as_str()),
+            "and it must be in the profile row, not only in this process"
+        );
+        assert_eq!(
+            units_of_kind(&engine, &p.id, "checkout"),
+            1,
+            "the retry is a journal unit, so it rides the engine's own backoff"
+        );
+        assert_eq!(
+            git::repo::head_commit_id(&engine.open_repo(&p).expect("open")).expect("head"),
+            Some(head),
+            "nothing may be committed out of a half-made checkout"
+        );
+
+        // Unblock it and let the backoff elapse. The next tick finishes the
+        // job: the files come back from the commit that already exists here,
+        // and nothing is deleted to do it.
+        std::fs::remove_dir(p.local_path.join("a.txt")).expect("unblock");
+        platform.advance_ms(60_000);
+        engine.tick_profile(&p).await.expect("the retry tick");
+
+        assert_eq!(
+            std::fs::read(p.local_path.join("a.txt")).expect("a.txt is back"),
+            b"alpha",
+            "the retry restores what the interrupted checkout never wrote"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("b.txt")).expect("b.txt is back"),
+            b"beta"
+        );
+        let repo = engine.open_repo(&p).expect("open");
+        assert!(
+            !git::repo::index_is_unpopulated(&repo).expect("index"),
+            "and it leaves an index, or the very next walk reads a mass deletion"
+        );
+        assert_eq!(
+            git::repo::head_commit_id(&repo).expect("head"),
+            Some(head),
+            "a repair commits nothing"
+        );
+        drop(repo);
+        assert_eq!(
+            stored_last_error(&engine, &p.id),
+            None,
+            "and the folder stops claiming to be broken once it is not"
+        );
+    }
+
+    /// D1. A repository with commits on `HEAD` and an empty index is a broken
+    /// checkout, never a user deleting everything — and keeper must refuse it
+    /// without staging a single deletion.
+    ///
+    /// The assertion that matters is the ABSENCE of a commit. A returned error
+    /// proves nothing on its own: `stage_and_commit` writes the index before it
+    /// writes the commit, so a guard placed one line too late would still have
+    /// staged 155 625 removals by the time it raised.
+    #[tokio::test]
+    async fn an_empty_index_is_refused_and_stages_no_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, head) = committed_fixture(&engine, &platform, dir.path());
+        // The worktree files STAY. This is the owner's folder: 16 GB on disk,
+        // an empty index, and `git status` reading every tracked path as `D`.
+        interrupt_the_checkout(&p, false);
+
+        let walks_before = engine.counters(&p.id).status_walks;
+        let err = engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect_err("keeper must not commit out of an empty index");
+        let said = err.to_string();
+        assert!(
+            said.contains("never finished") && said.contains("empty"),
+            "the refusal has to name what happened, got: {said}"
+        );
+
+        let repo = engine.open_repo(&p).expect("open");
+        assert_eq!(
+            git::repo::head_commit_id(&repo).expect("head"),
+            Some(head),
+            "NO COMMIT: the whole point. A deletion of every tracked path must \
+             never reach the object database"
+        );
+        drop(repo);
+        assert!(
+            p.local_path.join("a.txt").exists() && p.local_path.join("b.txt").exists(),
+            "and nothing on disk is touched"
+        );
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            walks_before,
+            "the refusal is taken before the walk: on the owner's folder that \
+             walk is 4.3 s of tree diff producing 155 625 deletions"
+        );
+    }
+
+    /// D2. A profile the engine has marked offline pays for no status walk.
+    ///
+    /// Counted, not eyeballed: the owner's log carried one
+    /// `status walk finished … elapsed_ms=4274 deleted=155625` line every two
+    /// seconds, for ever, on a folder nothing could publish.
+    #[tokio::test]
+    async fn an_offline_profile_walks_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, _head) = committed_fixture(&engine, &platform, dir.path());
+
+        // The only thing in the engine that produces `Offline`: a transient
+        // network failure (AD-49).
+        engine.record_failure(
+            &p,
+            &SyncError::Network {
+                host: "git.invalid".to_owned(),
+                reason: "no route to host".to_owned(),
+            },
+        );
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+
+        let before = engine.counters(&p.id).status_walks;
+        engine.tick_profile(&p).await.expect("a tick never raises");
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            before,
+            "an offline folder must not buy a full-tree walk it can do nothing with"
+        );
+    }
+
+    /// D2's other half. A folder that is merely idle — nothing queued, nothing
+    /// wrong, remote reachable as far as anything knows — still walks exactly
+    /// as it did before, or the gate above has turned sync off.
+    #[tokio::test]
+    async fn an_idle_online_profile_still_walks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, _head) = committed_fixture(&engine, &platform, dir.path());
+
+        let before = engine.counters(&p.id).status_walks;
+        engine.tick_profile(&p).await.expect("a tick never raises");
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            before + 1,
+            "the ordinary tick of an ordinary folder walks once"
+        );
     }
 }
 

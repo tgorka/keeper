@@ -146,6 +146,12 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         // `EXIT_CONFIG` — nothing about the configuration is wrong when keeper
         // declines to overwrite a file the user edited.
         SyncError::Refused(_) => EXIT_FAILURE,
+        // A one-shot run against a folder whose working copy was never made
+        // did nothing it was asked to do, so `$?` has to say so — and
+        // `Restart=on-failure` is exactly right here: the repair is mechanical
+        // and the next run attempts it. Never `EXIT_CONFIG`: the configuration
+        // is fine, the checkout is not.
+        SyncError::CheckoutUnfinished { .. } => EXIT_FAILURE,
         SyncError::GitCommand { .. }
         | SyncError::Network { .. }
         | SyncError::Auth { .. }

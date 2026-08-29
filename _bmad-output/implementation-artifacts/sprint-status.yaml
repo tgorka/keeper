@@ -941,6 +941,14 @@ development_status:
   56-12-drive-settings-for-virtual-files: review
   56-13-what-the-end-to-end-run-found: review
   56-14-the-deferred-work-sweep: review
+  # -- 2026-08-29, from the owner's 0.8.23 install (hesperia) ----------------
+  # He added a folder with virtual files configured and nothing downloaded.
+  # Two engine-level defects, shipping as ONE pull request with 56.16:
+  #   56.15 a clone that stopped now says so, is retried on the journal's own
+  #         backoff, and a repository with commits and an EMPTY INDEX is
+  #         refused instead of being read as 155 625 deletions. An offline
+  #         profile buys no status walk.
+  56-15-a-clone-that-stopped-says-so: review
   epic-56-retrospective: optional
 
   # -- EPIC 57, 2026-08-22: scheduled tasks ----------------------------------
