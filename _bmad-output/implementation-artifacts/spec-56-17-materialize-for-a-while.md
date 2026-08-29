@@ -5,6 +5,7 @@ created: '2026-08-29'
 status: 'done' # draft | ready-for-dev | in-progress | in-review | done | blocked
 baseline_revision: 'c8c5c45'
 review_loop_iteration: 0
+final_revision: '830deba'
 followup_review_recommended: false
 context: []
 warnings: ['oversized']
