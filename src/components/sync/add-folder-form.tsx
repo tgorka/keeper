@@ -191,7 +191,7 @@ export const SYNC_RELEASE_NEVER_NOTE =
   "keeper will not release anything in this folder: every file stays here once its content arrives.";
 
 /**
- * The three lines under the SIZE-FLOOR box, of which exactly one is on screen
+ * The four lines under the SIZE-FLOOR box, of which exactly one is on screen
  * and true (stories 56.14 and 56.16).
  *
  * The box carried ONE unconditional note — "A matched file smaller than this is
@@ -199,28 +199,46 @@ export const SYNC_RELEASE_NEVER_NOTE =
  * owner's own configuration matched nothing at all. He saved
  * `virtualPatterns: []` with a 1 MiB floor, which can only mean "don't fetch the
  * big files", and the form talked to him about matched files while all 16 GB
- * downloaded. Rust now reads a floor with no patterns as the selector, so the
- * three states the pair of boxes can be in each get their own sentence, chosen
- * by {@link syncVirtualOverNote} from the predicates the save itself uses.
+ * downloaded. Rust now reads a floor with no permissive line in force as the
+ * selector, so each state the pair of boxes can be in gets its own sentence,
+ * chosen by {@link syncVirtualOverNote} from the predicates the save itself
+ * uses.
+ *
+ * Four states and not three because the patterns box holds a LIST and Rust
+ * splits every list in half: a `!` line protects, everything else authorizes,
+ * and only the authorizing half can take the decision away from the floor
+ * (story 56.14). A box holding nothing but protections is therefore in the
+ * WIDEST state rather than the narrowest, which is the one reading a sentence
+ * chosen by list length gets exactly backwards.
  *
  * This one is the line when the box's content means "no floor" (story 56.14).
  *
  * The box's coercion was silent, and `0` is not a neutral fallback here — it is
  * the documented instruction that nothing stays away for being large, which
- * anything `pinnedValue` cannot read as a positive number lands on: a blank box,
- * a typed `0`, a minus sign, a half-typed `1e`. Meanwhile the release box beside
+ * anything {@link syncVirtualOverBytes} rounds to zero lands on: a blank box, a
+ * typed `0`, a minus sign, a half-typed `1e`. Meanwhile the release box beside
  * it explains BOTH of its coercions, so two adjacent boxes with the same failure
  * shape behaved differently for no reason a reader could see.
  *
  * Worded as the consequence rather than as the parse, because the person reading
  * it is looking at their own files and did not type a number they thought was
  * invalid. 56.16 changed the consequence and so the words: with no floor, a file
- * stays away only if a pattern names it, and the widest reading of the old
+ * stays away only if a list names it, and the widest reading of the old
  * sentence — "every matched file may stay away" — was a promise about matches
  * under a form where there might be none.
+ *
+ * It names no single control as the one that can do the naming, and that is a
+ * correction rather than vagueness. The sentence said "a pattern above names
+ * it", meaning the box directly overhead — but with that box empty, which is
+ * the state this note is most often read in, the thing deciding is the
+ * committed `.keepervirtual`, exactly as {@link SYNC_VIRTUAL_PATTERNS_NOTE} one
+ * control higher says in the same breath. Two adjacent notes contradicted each
+ * other in the default state of every folder the form seeds, and a person whose
+ * files are absent because of a policy that travelled with the repository was
+ * pointed at an empty box as the only possible cause.
  */
 export const SYNC_VIRTUAL_OVER_NONE_NOTE =
-  "No size limit, so a file stays away only if a pattern above names it — and with no patterns anywhere, this folder keeps every file's content on this computer.";
+  "No size limit, so nothing stays away just for being large: only the list in force — this box, or the folder's own committed .keepervirtual — decides, whatever a file's size.";
 
 /**
  * The line when the floor is the only thing selecting anything (story 56.16).
@@ -229,9 +247,34 @@ export const SYNC_VIRTUAL_OVER_NONE_NOTE =
  * the committed `.keepervirtual` because that file outranks this box and can
  * narrow the floor's reach to a list — a person told the size "decides on its
  * own" would otherwise be surprised by a folder that obeys its own file.
+ *
+ * "every file keeper tracks" and not "every file". The floor only ever reaches
+ * a path that already holds LFS pointer text, and `lfs::stage` routes a file
+ * through LFS only at or above the threshold box above. With the threshold at
+ * 10 MB and this box at 1, every file in between is a plain git blob that can
+ * never become a placeholder, and the unqualified promise was false for the
+ * whole band. The qualifier ties the claim to the control that decides it;
+ * {@link SYNC_VIRTUAL_OVER_BELOW_LFS_NOTE} says the rest out loud.
  */
 export const SYNC_VIRTUAL_OVER_ALONE_NOTE =
-  "Nothing is named above, so this size decides on its own: every file at least this big stays away as a placeholder until you open it, unless the folder ships its own .keepervirtual naming a narrower list.";
+  "Nothing is named above, so this size decides on its own: every file keeper tracks that is at least this big stays away as a placeholder until you open it, unless the folder ships its own .keepervirtual naming a narrower list.";
+
+/**
+ * The line for a box holding only protections beside a real floor (story 56.16).
+ *
+ * The state {@link syncVirtualPositivePatterns} exists to find: entries in the
+ * box, none of them authorizing anything. Rust unions the protections into
+ * whatever zone is in force and leaves the floor selecting, so this reads as
+ * "the floor decides, minus those" — the opposite of the matched line, which is
+ * what a length test rendered here.
+ *
+ * An entry Rust drops as punctuation — a bare `!`, a lone `/` — lands under
+ * this sentence too, and the first clause then overstates a typo. The clause
+ * that matters survives it: a dropped entry names nothing, so "except the ones
+ * those entries name" excepts nothing and the floor really does decide alone.
+ */
+export const SYNC_VIRTUAL_OVER_PROTECTED_ONLY_NOTE =
+  "Every entry above starts with !, so each one protects a file rather than choosing one: this size decides on its own, and every file keeper tracks that is at least this big stays away except the ones those entries name.";
 
 /**
  * The line when patterns select and the floor merely holds the small ones back
@@ -241,18 +284,36 @@ export const SYNC_VIRTUAL_OVER_MATCHED_NOTE =
   "Of the files named above, only those at least this big stay away; a smaller one is downloaded anyway, because fetching it later costs more than keeping it.";
 
 /**
- * The extra line for the band between the two size knobs (story 56.16).
+ * The two lines for how the floor sits against the LFS threshold (story 56.16),
+ * of which {@link syncVirtualOverBandNote} shows at most one.
  *
- * Gated on `lfsMode === "materialize"` because that is the only mode with such a
- * band: it is the mode that both routes a file through LFS and keeps its content
- * on this machine, so a file above the LFS threshold and below the floor is
- * uploaded and kept. `pointerOnly` keeps no content to begin with and `disabled`
- * tracks nothing through LFS at all, so under either of those this sentence
- * would describe a state the folder cannot be in — and a note that claims a
- * band a mode does not have is the same class of lie as the one this story fixes.
+ * Both are gated on `lfsMode === "materialize"` because that is the only mode
+ * either sentence describes: it is the mode that both routes a file through LFS
+ * and keeps its content on this machine. `pointerOnly` keeps no content to begin
+ * with and `disabled` tracks nothing through LFS at all, so under either of
+ * those these would describe a state the folder cannot be in — and a note that
+ * claims a band a mode does not have is the same class of lie as the one this
+ * story fixes.
+ *
+ * This one is the ordering where the floor is the higher of the two: a file
+ * between them is uploaded and also kept.
  */
 export const SYNC_VIRTUAL_OVER_ABOVE_LFS_NOTE =
   "A file between the two sizes — big enough for keeper to track, too small to stay away — is uploaded to the server and also kept on this computer.";
+
+/**
+ * The other ordering, and the one that was missing (story 56.16).
+ *
+ * Only the ordering above had a line, which is the ordering in which the floor's
+ * own sentence is already true. In the inverse one the floor is below the
+ * threshold and reaches nothing under it, so the floor's promise stops short of
+ * where it appears to reach — the box says 1 MB and the tracking size says 10,
+ * and the 9 MB in between are plain git blobs kept forever. That is the ordering
+ * a person lands in by lowering this box to make MORE stay away, so it is the
+ * one that needed saying.
+ */
+export const SYNC_VIRTUAL_OVER_BELOW_LFS_NOTE =
+  "This size is below the tracking size above, so the tracking size is what decides: a file smaller than that is stored in git and always kept on this computer, whatever this box says.";
 
 /** The line under the release box when Rust will refuse the window outright. */
 export const SYNC_RELEASE_OUT_OF_RANGE_NOTE =
@@ -760,48 +821,141 @@ function splitSyncList(raw: string): string[] {
 }
 
 /**
- * Which of the three floor sentences is true for what the two boxes hold now.
+ * The permissive half of what the patterns box holds — a mirror of Rust's
+ * `Parsed::of` and `anchor_line` (stories 56.14 and 56.16).
  *
- * Reuses {@link pinnedValue} and {@link splitSyncList} — the very two functions
- * the save runs over these same two boxes — and that is the point rather than
- * thrift: the sentence on screen and the value on the wire are then decided by
- * one reading of the form, so they cannot drift. Their drifting IS the defect
- * this replaces. The old note described a pattern match while the save sent a
- * floor with no pattern beside it, and nothing in the file tied the two
- * readings together.
+ * `keeper-sync/src/lfs/virtual_policy.rs` is the authority and this is a
+ * deliberate copy of its reading. Rust splits every policy source in two: a `!`
+ * line PROTECTS a path and everything under it, anything else AUTHORIZES one to
+ * stay away, and only the authorizing half decides whether a list is in force
+ * at all — a box of nothing but protections overrides no committed list and
+ * leaves the floor selecting on its own, with those entries unioned in as
+ * exceptions.
  *
- * Pure and exported so the three states can be asserted directly as well as
- * through the form: three mutually exclusive sentences are exactly the shape
- * that renders two of itself.
+ * The duplication buys the one thing these notes exist for. Deciding the
+ * sentence on the list's LENGTH — which is what this replaces — put
+ * `!30-masters` beside a 1 MiB floor under "Of the files named above, only
+ * those at least this big stay away", when Rust reads that same row as the
+ * WIDEST state there is: the floor selects, every tracked file at or above it
+ * stays away, and the named zone is the single exception. Both halves of the
+ * sentence were inverted, on a row the edit form seeds straight out of
+ * `profile.virtualPatterns`, and which is verbatim the fixture of Rust's own
+ * `a_profile_protection_still_wins_over_a_floor_that_selects_on_its_own`. The
+ * alternative to a mirror here is not less code; it is a sentence that
+ * contradicts the engine underneath it.
+ *
+ * Three rules, each one Rust's:
+ *
+ * * `\!` and `\#` escape a filename that really begins with `!` or `#`, so an
+ *   escaped entry is POSITIVE — without the rule those two filenames would be
+ *   unnameable.
+ * * An unescaped leading `!` is a protection and never authorizes.
+ * * `anchor_line` answers nothing for punctuation with no pattern behind it —
+ *   a bare `!`, `/` or `!/` — and the entry is dropped whole rather than
+ *   counted as the source having spoken. It strips ONE leading and ONE
+ *   trailing `/`, which is why the check below does the same instead of
+ *   stripping every slash.
+ *
+ * `#` is NOT a comment in this box. The profile list reaches Rust as a TOML
+ * array, parsed with `Comments::Literal`, so a leading `#` there is the first
+ * character of a path.
  */
-export function syncVirtualOverNote(virtualOverMb: string, virtualPatterns: string): string {
-  if (pinnedValue(virtualOverMb) === null) {
-    return SYNC_VIRTUAL_OVER_NONE_NOTE;
-  }
-  return splitSyncList(virtualPatterns).length === 0
-    ? SYNC_VIRTUAL_OVER_ALONE_NOTE
-    : SYNC_VIRTUAL_OVER_MATCHED_NOTE;
+function syncVirtualPositivePatterns(raw: string): string[] {
+  return splitSyncList(raw).filter((entry) => {
+    const escaped = entry.startsWith("\\!") || entry.startsWith("\\#");
+    if (!escaped && entry.startsWith("!")) {
+      return false;
+    }
+    const body = escaped ? entry.slice(1) : entry;
+    return body.replace(/^\//, "").replace(/\/$/, "") !== "";
+  });
 }
 
 /**
- * Whether a file can land between the two size knobs — LFS-tracked and still
- * kept here — so {@link SYNC_VIRTUAL_OVER_ABOVE_LFS_NOTE} has something to
- * describe.
+ * The byte count the save sends for the size floor, and therefore the only
+ * honest input to the sentence under the box (story 56.16).
+ *
+ * The note branched on `pinnedValue(virtualOverMb) === null`, which is true of a
+ * blank box and false of `0.0000001`. That value rounds to zero bytes on the
+ * wire, so Rust's `floor_selects` is false and nothing stays away at all, while
+ * the form claimed "this size decides on its own" — the helper's own guarantee
+ * inverted by a number the box's `step="any"` invites. It is the silent
+ * coercion story 56.14's none-note closed, one order of magnitude further down:
+ * `pinnedValue` stops at "not positive", and the rounding into Rust's `u64` is a
+ * second floor underneath it that nothing on screen accounted for.
+ *
+ * The fix is not to send something else — a sub-byte floor genuinely is no floor
+ * — but to make the save and the note read one function rather than one field.
+ */
+function syncVirtualOverBytes(virtualOverMb: string): number {
+  const pinned = pinnedValue(virtualOverMb);
+  return pinned === null ? 0 : Math.round(pinned * 1024 * 1024);
+}
+
+/** The LFS threshold the save sends, in bytes — keeper's own when nothing is pinned. */
+function syncLfsThresholdBytes(lfsThresholdMb: string): number {
+  const pinned = pinnedValue(lfsThresholdMb);
+  return pinned === null ? SYNC_DEFAULT_LFS_THRESHOLD_BYTES : Math.round(pinned * 1024 * 1024);
+}
+
+/**
+ * Which of the four floor sentences is true for what the two boxes hold now.
+ *
+ * Reuses {@link syncVirtualOverBytes} and {@link syncVirtualPositivePatterns} —
+ * the byte count the save puts on the wire and Rust's own reading of the list —
+ * and that is the point rather than thrift: the sentence on screen and the
+ * policy the engine compiles are then decided by one reading of the form, so
+ * they cannot drift. Their drifting IS the defect this replaces, twice over. The
+ * old note described a pattern match while the save sent a floor with no pattern
+ * beside it; the first repair then described a match whenever the box held any
+ * entry at all, including a `!` line that authorizes nothing.
+ *
+ * The order matters. A positive entry is the only thing that takes the decision
+ * away from the floor, so it is tested first; what is left is a box that is
+ * empty and one that holds only protections, which differ in nothing but
+ * whether there are exceptions to mention.
+ *
+ * Pure and exported so the four states can be asserted directly as well as
+ * through the form: four mutually exclusive sentences are exactly the shape that
+ * renders two of itself.
+ */
+export function syncVirtualOverNote(virtualOverMb: string, virtualPatterns: string): string {
+  if (syncVirtualOverBytes(virtualOverMb) === 0) {
+    return SYNC_VIRTUAL_OVER_NONE_NOTE;
+  }
+  if (syncVirtualPositivePatterns(virtualPatterns).length > 0) {
+    return SYNC_VIRTUAL_OVER_MATCHED_NOTE;
+  }
+  return splitSyncList(virtualPatterns).length === 0
+    ? SYNC_VIRTUAL_OVER_ALONE_NOTE
+    : SYNC_VIRTUAL_OVER_PROTECTED_ONLY_NOTE;
+}
+
+/**
+ * How the floor sits against the LFS threshold, as the line that says so — or
+ * `null` when neither ordering has anything to report (story 56.16).
+ *
+ * ONE function returning WHICH line, not a boolean per line. The two orderings
+ * are a partition of the same comparison, so a pair of independent predicates
+ * could render both sentences at once or neither, and one of those two failures
+ * is precisely what shipped: only `thresholdBytes < floorBytes` had a line, the
+ * ordering in which the floor's own sentence is already true, and the inverse —
+ * the one where the floor promises more than LFS will ever hand it — had none.
  *
  * Takes the whole form for `effectiveSettleSeconds`'s reason: the answer depends
  * on three controls at once, and reading them one at a time at the call site is
- * how a condition and the sentence it gates come apart. The threshold in force
- * when the box is blank is keeper's own default, which is what the save sends
- * for it.
+ * how a condition and the sentence it gates come apart. Compared in the bytes
+ * both boxes are saved as, so the comparison cannot disagree with the wire about
+ * which of the two is larger.
  */
-function syncVirtualOverBandShown(form: SyncFormValues): boolean {
-  const floorMb = pinnedValue(form.virtualOverMb);
-  if (form.lfsMode !== "materialize" || floorMb === null) {
-    return false;
+function syncVirtualOverBandNote(form: SyncFormValues): string | null {
+  const floorBytes = syncVirtualOverBytes(form.virtualOverMb);
+  if (form.lfsMode !== "materialize" || floorBytes === 0) {
+    return null;
   }
-  const thresholdMb =
-    pinnedValue(form.lfsThresholdMb) ?? SYNC_DEFAULT_LFS_THRESHOLD_BYTES / 1024 / 1024;
-  return thresholdMb < floorMb;
+  return syncLfsThresholdBytes(form.lfsThresholdMb) < floorBytes
+    ? SYNC_VIRTUAL_OVER_ABOVE_LFS_NOTE
+    : SYNC_VIRTUAL_OVER_BELOW_LFS_NOTE;
 }
 
 /**
@@ -953,6 +1107,9 @@ export function AddFolderForm({
   // Several folders can have an edit form open at once, so the name carries the
   // one it belongs to. A folder being added has no name of its own yet.
   const title = profile === undefined ? SYNC_ADD_TITLE : `${SYNC_EDIT_TITLE}: ${profile.name}`;
+  // Read once: the JSX below both tests it and prints it, and calling the
+  // helper twice is how a gate and the sentence it gates come apart.
+  const virtualOverBandNote = syncVirtualOverBandNote(form);
 
   /**
    * Read the stored token into the field as the edit form opens (Story 34.12).
@@ -1071,7 +1228,6 @@ export function AddFolderForm({
     // documented default is not a hard-coded user opinion either — a stored
     // value equal to the default is exactly how `effective_settle_ms` encodes
     // "nothing pinned here", so a removable folder still gets its longer window.
-    const thresholdMb = pinnedValue(form.lfsThresholdMb);
     const settle = pinnedValue(form.settleSeconds);
     const poll = pinnedValue(form.pollSeconds);
     // The three virtualization knobs. Each is sent as the omission when this
@@ -1084,12 +1240,9 @@ export function AddFolderForm({
     const virtualPatterns = folderOwned.has("virtualPatterns")
       ? null
       : splitSyncList(form.virtualPatterns);
-    const virtualOverMb = pinnedValue(form.virtualOverMb);
     const virtualOverBytes = folderOwned.has("virtualOverBytes")
       ? null
-      : virtualOverMb === null
-        ? 0
-        : Math.round(virtualOverMb * 1024 * 1024);
+      : syncVirtualOverBytes(form.virtualOverMb);
     const releaseTtlMs = folderOwned.has("releaseTtlMs")
       ? null
       : releaseTtlMsFor(form.releaseHours);
@@ -1147,9 +1300,7 @@ export function AddFolderForm({
         // change and is recorded as deferred work.
         lfsThresholdBytes: folderOwned.has("lfsThresholdBytes")
           ? null
-          : thresholdMb === null
-            ? SYNC_DEFAULT_LFS_THRESHOLD_BYTES
-            : Math.round(thresholdMb * 1024 * 1024),
+          : syncLfsThresholdBytes(form.lfsThresholdMb),
         virtualPatterns,
         virtualOverBytes,
         releaseTtlMs,
@@ -1654,19 +1805,21 @@ export function AddFolderForm({
             />
           </div>
           {/* Exactly one floor sentence, chosen by {@link syncVirtualOverNote}
-              from the same two predicates the save runs — so what this claims
-              and what the wire carries cannot come apart. It was two <p>s: an
-              unconditional line about matched files plus the no-floor line, so a
-              blank box showed both and the pair contradicted itself, while the
-              owner's floor-with-no-patterns state had no true sentence at all.
-              Rendered even when the folder's file owns the key, because the
-              value is still in force and a person still has to be told what it
-              does. */}
+              from the same readings of the two boxes the save runs — so what
+              this claims and what the wire carries cannot come apart. It was
+              two <p>s: an unconditional line about matched files plus the
+              no-floor line, so a blank box showed both and the pair
+              contradicted itself, while the owner's floor-with-no-patterns
+              state had no true sentence at all. Rendered even when the folder's
+              file owns the key, because the value is still in force and a
+              person still has to be told what it does. */}
           <p className="text-muted-foreground text-xs">
             {syncVirtualOverNote(form.virtualOverMb, form.virtualPatterns)}
           </p>
-          {syncVirtualOverBandShown(form) && (
-            <p className="text-muted-foreground text-xs">{SYNC_VIRTUAL_OVER_ABOVE_LFS_NOTE}</p>
+          {/* And at most one band line. The two orderings come out of a single
+              comparison for the same reason the floor sentence does. */}
+          {virtualOverBandNote !== null && (
+            <p className="text-muted-foreground text-xs">{virtualOverBandNote}</p>
           )}
           {folderOwned.has("virtualOverBytes") && (
             <p className="text-muted-foreground text-xs">

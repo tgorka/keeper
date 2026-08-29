@@ -2,7 +2,7 @@
 title: 'A floor on its own means something'
 type: 'bugfix'
 created: '2026-08-29'
-status: 'in-progress'
+status: 'in-review'
 review_loop_iteration: 0
 baseline_revision: '84abf87'
 followup_review_recommended: false
@@ -96,20 +96,20 @@ not: `virtual_over_bytes` already exists on both, so `EXPRESSED`/`PRESERVED` and
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `virtual_policy.rs` -- write the seven failing tests FIRST and record their pre-fix text.
-- [ ] `virtual_policy.rs` -- add `VirtualPolicyTier::SizeFloor`; compute
+- [x] `virtual_policy.rs` -- write the seven failing tests FIRST and record their pre-fix text.
+- [x] `virtual_policy.rs` -- add `VirtualPolicyTier::SizeFloor`; compute
   `floor_selects = patterns.is_empty() && profile.virtual_over_bytes > 0` in `compile` and store
   it; make `resolve` answer `Virtual` on it after the protection and control-file gates; make
   `authorizes_anything` include it -- the floor is what says something, so it must participate in
   whether the tier says anything at all.
-- [ ] `virtual_policy.rs` -- mutate the new condition away and record each test's failure.
-- [ ] `profile/mod.rs` + `sync_ipc.rs` -- correct the three "a matched path" doc comments -- the
+- [x] `virtual_policy.rs` -- mutate the new condition away and record each test's failure.
+- [x] `profile/mod.rs` + `sync_ipc.rs` -- correct the three "a matched path" doc comments -- the
   field's contract changed and its own documentation was the first place the lie lived.
-- [ ] `add-folder-form.tsx` -- `syncVirtualOverNote(floor, patterns)` plus the three constants and
+- [x] `add-folder-form.tsx` -- `syncVirtualOverNote(floor, patterns)` plus the three constants and
   the between-thresholds line -- the note said a match was required when no match ever happens.
-- [ ] `add-folder-form.test.tsx` -- assert each of the three sentences over the real component.
-- [ ] `dev/mock-shell.ts` -- add the floor-only profile.
-- [ ] `docs/sync.md` -- §9's floor paragraph and precedence; drop the pre-56.14 claim that a
+- [x] `add-folder-form.test.tsx` -- assert each of the three sentences over the real component.
+- [x] `dev/mock-shell.ts` -- add the floor-only profile.
+- [x] `docs/sync.md` -- §9's floor paragraph and precedence; drop the pre-56.14 claim that a
   `!`-only list installs an empty positive list.
 
 **Acceptance Criteria:**
@@ -119,15 +119,129 @@ not: `virtual_over_bytes` already exists on both, so `EXPRESSED`/`PRESERVED` and
   the answer is `Materialize`.
 - Given a floor of `0` and no pattern anywhere, when the policy compiles, then `tier()` is
   `Unset` and no path of any size resolves `Virtual`.
-- Given the form in each of the three states, when Advanced is open, then exactly one floor
-  sentence is on screen and it is the true one.
+- Given the form in each of the FOUR states — no floor; a floor with nothing named; a floor with
+  only `!` protections named; a floor with a positive pattern named — when Advanced is open, then
+  exactly one floor sentence is on screen, it is the true one, and the other three are absent.
+  (Amended from three states in review pass 1: a protections-only box authorizes nothing, so it
+  is a fourth state and not an instance of the fourth.)
+- Given a floor beside the LFS tracking size, when either sits above the other, then the line
+  naming which of the two actually decides is on screen, and never both lines at once.
+- Given a path with no named component — `""`, `"."` — when a floor-only policy resolves it, then
+  the answer is `Materialize`.
 - Given `cargo clippy -D warnings` over the three buildable crates, when it runs, then it is
   clean; Rust tests at or above 3579 passed / 0 failed; frontend green; typecheck clean; lint at
   baseline.
 
 ## Spec Change Log
 
+### 2026-08-29 — review pass 1 amendments (sections outside `<intent-contract>` only)
+
+**Triggering findings.** The two reviewers agreed on three defects whose root cause was this
+spec's own prescription rather than the implementation's reading of it, and one whose root cause
+was an under-stated consequence in the Design Notes:
+
+1. This spec pinned the form's state predicate as `splitSyncList(virtualPatterns).length === 0`.
+   That is the SAVE's predicate, not story 56.14's permissive-half predicate that Rust decides
+   the same question on — so a patterns box holding only `!30-masters` rendered the *narrowest*
+   sentence while the wire put the folder in the *widest* state. Verbatim the fixture of this
+   story's own Rust test `a_profile_protection_still_wins_over_a_floor_that_selects_on_its_own`.
+   Amended: the predicate counts POSITIVE entries, mirroring `Parsed::of` plus `anchor_line`, and
+   a fourth state (protections only, floor selecting the rest) gets its own sentence.
+2. This spec pinned the between-thresholds note's gate as `threshold < floor` — the ordering in
+   which the ALONE sentence is already true — and left the inverse ordering, the one where it is
+   false, unguarded. Amended: one helper returns which of two lines to show, so the two orderings
+   can neither both render nor both vanish, and the ALONE/PROTECTED-ONLY sentences claim only
+   about files "keeper tracks".
+3. This spec's Design Notes enumerated the engine's policy consumers as `tier()` and
+   `authorizes_anything()` and stopped there. It never reached `release_mode_gate`, which is the
+   function `authorizes_anything()` actually gates, and which decides whether a whole
+   `LfsMode::Materialize` folder is refused with `AlwaysMaterializes`. So the change also arms
+   the release sweep for a floor-only folder. Amended: recorded below as intended behaviour with
+   its argument, and stated in `authorizes_anything`'s own doc and in `docs/sync.md` §9.
+4. Same shape for `tier()`: a floor-only folder moves `Unset` → `SizeFloor`, so `verify` stops
+   calling its absent objects faults. Amended: stated in the code and the docs.
+
+**Known-bad state avoided.** A form that tells a person their folder is in the narrowest
+virtualization state while the engine puts it in the widest — the exact screen-versus-wire drift
+the helper was introduced to make impossible — and a story that ships a release-sweep arming
+while its own spec asserts nothing in it can lead to a deletion.
+
+**Why patch and not a `bad_spec` loopback.** Findings 1 and 2 are spec-caused, and the workflow
+prefers `bad_spec` when in doubt. Taken here they would revert ~900 lines of executed-green Rust
+(45 passed / 0 failed in `lfs::virtual_policy`) whose correctness no reviewer disputed, to
+re-derive it identically, because two TypeScript predicates were wrong by one clause each and
+both have exactly one correct form with no design freedom left. The spec is amended so a
+re-derivation would produce the corrected predicates, and the corrections are applied as patches.
+That is recorded as a deliberate judgement, not an oversight.
+
+**KEEP instructions — must survive any re-derivation.**
+- `floor_selects` computed from the EFFECTIVE permissive set, after 56.14 precedence has run.
+  Both reviewers independently confirmed this is what stops the floor widening a zone some source
+  already named. Never compute it from `profile.virtual_patterns` directly.
+- `VirtualPolicyTier::SizeFloor` as a distinct variant. A regression that stopped the floor
+  selecting cannot pass an assertion that names it; reusing `Profile` would let it.
+- The order of `resolve`'s gates: frame, control file, size, `never`, then the floor. Both
+  reviewers checked it and it is what keeps AD-123 intact.
+- `a_floor_of_zero_with_no_patterns_still_says_nothing` and
+  `a_floor_never_widens_a_zone_a_pattern_file_already_named`. Neither can fail against the absent
+  fix; each kills a specific plausible WRONG fix, and that is why they are worth their lines.
+
+**Behaviour this story does change, stated because the first draft did not.** Making
+`authorizes_anything()` true for a floor-only policy arms `engine.rs::release_mode_gate`, so such
+a folder's local content becomes eligible for release past its `releaseTtlMs`. That is the point
+rather than a side effect: the owner's request is that `tgdrive-light` stop holding 16 GB, and a
+folder that may never let go can never become light. AD-123 is untouched because every individual
+deletion still proves its case per object — the committed-pointer identity hash, `remote_serves`
+at the moment of deletion, the pin read taken twice, and the fail-closed open-file probe. The
+only folders whose behaviour changes are those carrying a positive floor and no permissive
+pattern from any source: precisely the folders whose floor was a dead control, and `0` is the
+default, so a positive floor is always something a person typed.
+
 ## Review Triage Log
+
+### 2026-08-29 — Review pass 1
+- intent_gap: 0
+- bad_spec: 0 (2 spec-caused findings amended in the Spec Change Log and patched in place rather
+  than looped back — the judgement is argued there)
+- patch: 10: (high 3, medium 6, low 1)
+- defer: 1: (medium 1)
+- reject: 0
+- addressed_findings:
+  - `[high]` `[patch]` `syncVirtualOverNote` chose its sentence on list length, so a
+    protections-only patterns box rendered the narrowest sentence over the widest state — now
+    decided on the positive half via `syncVirtualPositivePatterns`, mirroring `Parsed::of` and
+    `anchor_line`, with a fourth sentence for that state and a test quoting the Rust fixture.
+  - `[high]` `[patch]` `SYNC_VIRTUAL_OVER_ALONE_NOTE` promised virtualization for files below
+    `lfsThresholdBytes`, and the corrective band line was gated on the one ordering where the
+    promise was already true — both sentences now claim only about files keeper tracks, and one
+    helper returns which of two band lines to show, both fenced by tests.
+  - `[high]` `[patch]` `authorizes_anything()` arms `release_mode_gate`, so a floor-only folder's
+    content becomes release-eligible; the story asserted the opposite. Stated in the function's
+    doc, in `docs/sync.md` §9 and in this spec, with the argument for why it is intended.
+  - `[medium]` `[patch]` A floor-only folder moves `tier()` from `Unset` to `SizeFloor`, so
+    `verify` stops reporting its absent objects as faults — stated at the `SizeFloor` variant and
+    in `docs/sync.md`.
+  - `[medium]` `[patch]` `is_inside_the_repository` admitted `""` and `"."`; `resolve`'s new
+    `floor_selects ||` short-circuited ahead of `PatternSet::matches`'s empty-candidate guard, so
+    the repository root itself resolved `Virtual` under a floor-only policy. Now requires a
+    `Component::Normal`, with the test `a_path_with_no_components_is_not_selected_by_a_floor`.
+  - `[medium]` `[patch]` `docs/sync.md`'s release-gate paragraph claimed only `pointerOnly` may
+    let content go and `materialize` always refuses `AlwaysMaterializes` — false against
+    `release_mode_gate` since 56.10, and load-bearing as of this story. Corrected.
+  - `[medium]` `[patch]` `docs/sync.md` claimed `verify` is the policy's only consumer. Corrected.
+  - `[medium]` `[patch]` The zero-floor claim was unscoped in §9 and in the §3 table ("nothing
+    stays away", "the folder is not consulted at all") — false whenever a pattern is in force.
+    Scoped to what a zero floor is actually silent about.
+  - `[medium]` `[patch]` `SYNC_VIRTUAL_OVER_NONE_NOTE` said a file stays away "only if a pattern
+    above names it", contradicting the patterns note one control higher in the default state of
+    every seeded folder. Reworded source-agnostically.
+  - `[low]` `[patch]` The note branched on the raw MB parse while the save sends
+    `Math.round(mb * 1024 * 1024)`, so a floor under ~5e-7 MB rendered "this size decides on its
+    own" while the wire carried `0`. The branch now reads the rounded byte count.
+  - `[medium]` `[defer]` Gating the floor sentences on `lfsMode` beyond the tracking-threshold
+    wording: under `pointerOnly` every tracked file stays away whatever its size, so the floor is
+    not the operative control at all. Recorded in the ledger; the residual imprecision is now the
+    same class as the pre-existing patterns-note wording rather than a stronger new claim.
 
 ## Design Notes
 

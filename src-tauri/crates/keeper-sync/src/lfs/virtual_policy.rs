@@ -125,6 +125,19 @@ pub enum VirtualPolicyTier {
     /// that list is empty in this state — so a regression that stopped the
     /// floor selecting could still pass a `Profile` assertion while nothing
     /// stayed away at all. It cannot pass one that names this.
+    ///
+    /// Reaching this variant also changes what [`crate::engine`]'s `verify`
+    /// calls a fault: it excuses an absent object whenever the tier is anything
+    /// but `Unset`, so a folder whose only control is the floor stops reporting
+    /// every absent object as missing content and starts counting those above
+    /// the floor as virtual. That is the answer the owner asked for — under the
+    /// old reading his floor selected nothing, so absent content in that folder
+    /// really was unexplained — and it is also, stated plainly, a signal going
+    /// quiet: anybody who set a floor while the setting was inert loses the
+    /// fault report that would have told them content had gone missing for some
+    /// other reason. The trade is narrow by construction, because the floor's
+    /// default is `0` and a zero floor never reaches this variant: only a
+    /// folder where a person typed a positive floor is affected at all.
     SizeFloor,
 }
 
@@ -364,6 +377,25 @@ impl VirtualPolicy {
     /// anything. The floor has to participate here: it is what says something
     /// in that state, and a gate that asked only about patterns would skip
     /// precisely the folder whose only control is the floor.
+    ///
+    /// Answering yes is not only a cost question, and counting the floor is
+    /// where that stops being a detail. `engine::release_mode_gate` refuses a
+    /// whole `LfsMode::Materialize` folder with
+    /// `ContentRefusal::AlwaysMaterializes` when this answers false, so
+    /// including the floor here **arms the release sweep** — the pass that
+    /// removes local content — for folders that were exempt from it before.
+    /// That is the point rather than a side effect: a folder that may never let
+    /// go of a byte can never become light, and light is what `tgdrive-light`
+    /// was named and configured for. What the sweep gains is permission to
+    /// consider the folder, never permission to delete — every individual
+    /// deletion is still gated by its own per-object proof (the committed
+    /// pointer's identity hash, `remote_serves` re-checked at the moment of
+    /// deletion, the pin read taken twice, the fail-closed open-file probe), so
+    /// AD-123 is exactly where it was. And the folders whose behaviour moves
+    /// are precisely those with a positive floor and no permissive pattern from
+    /// any source: folders whose floor was until now a dead control, typed
+    /// deliberately by a person, since the default is `0` and `0` never makes
+    /// `floor_selects` true.
     pub fn authorizes_anything(&self) -> bool {
         self.floor_selects || !self.patterns.is_empty()
     }
@@ -547,11 +579,35 @@ fn anchor_line(body: &str) -> Option<String> {
 /// silently drops a root component — so `/home/u/tgdrive/a.mp4` would be matched
 /// as `home/u/tgdrive/a.mp4` and a basename pattern would answer `Virtual` for
 /// a file this repository does not contain.
+///
+/// A path with no `Normal` component at all — `""`, `"."` — is the third
+/// violation of the same frame, and the one Story 56.16 made reachable. Both
+/// are relative and neither carries a `..`, so they used to pass this guard,
+/// and they still answered `Materialize` only because `exclude::match_string`
+/// renders both to the empty string and `PatternSet::matches` refuses an empty
+/// candidate. A floor that selects on its own short-circuits ahead of the
+/// pattern set, so under a floor-only policy the repository root itself
+/// answered `Virtual`. Requiring one named component is the fix, and it belongs
+/// here rather than downstream: `engine`'s release scan reaches `resolve` with a
+/// ledger-supplied `Path::new(&row.path)` whose contents this module does not
+/// get to choose, and the module's own stated position is that a precondition
+/// only warned about in a comment is one a caller breaks.
 fn is_inside_the_repository(rela: &Path) -> bool {
-    rela.is_relative()
-        && !rela
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
+    if !rela.is_relative() {
+        return false;
+    }
+    // One walk, because both remaining answers come from the same components: a
+    // `..` anywhere leaves the frame, and a path that never names anything is
+    // not a path inside it.
+    let mut names_something = false;
+    for part in rela.components() {
+        match part {
+            Component::ParentDir => return false,
+            Component::Normal(_) => names_something = true,
+            _ => {}
+        }
+    }
+    names_something
 }
 
 /// Files whose own bytes carry the rules, and which therefore may never be
@@ -1802,6 +1858,45 @@ mod tests {
                 Virtualization::Materialize,
                 "{outside} is outside the frame the policy is written against, \
                  and a floor-only policy has no pattern to reject it for"
+            );
+        }
+    }
+
+    /// A path that names nothing is not a path a floor may select (Story
+    /// 56.16).
+    ///
+    /// `""` and `"."` are relative and carry no `..`, so the frame guard used
+    /// to admit them, and they resolved `Materialize` only by accident:
+    /// `exclude::match_string` renders both to the empty string and
+    /// `PatternSet::matches` refuses an empty candidate. `resolve`'s
+    /// `floor_selects ||` short-circuits ahead of the pattern set, so under a
+    /// floor-only policy both answered `Virtual` — the repository root itself
+    /// classified as releasable. No byte is deleted today, because
+    /// `release_target` refuses an empty subpath further down, but the
+    /// classification is already wrong at the point it is made, and leaning on
+    /// a downstream guard is exactly what this module refuses to do: the
+    /// consumers that reach `resolve` do it with a ledger-supplied
+    /// `Path::new(&row.path)`, whose contents this module does not get to
+    /// choose.
+    #[test]
+    fn a_path_with_no_components_is_not_selected_by_a_floor() {
+        let dir = worktree(None);
+        let mut p = profile(dir.path());
+        p.virtual_over_bytes = 1024 * 1024;
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::SizeFloor,
+            "the fixture really is a floor-only policy, or the assertions below \
+             would pass with nothing selecting anything at all"
+        );
+
+        for nothing in ["", "."] {
+            assert_eq!(
+                policy.resolve(Path::new(nothing), 4 * 1024 * 1024),
+                Virtualization::Materialize,
+                "{nothing:?} names no file in the repository, so there is \
+                 nothing here for a floor to authorize"
             );
         }
     }

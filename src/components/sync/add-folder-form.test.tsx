@@ -57,10 +57,13 @@ import {
   SYNC_TOKEN_READ_FAILED_PREFIX,
   SYNC_TOKEN_SHOW_LABEL,
   SYNC_TOKEN_UNREADABLE_NOTE,
+  SYNC_VIRTUAL_OVER_ABOVE_LFS_NOTE,
   SYNC_VIRTUAL_OVER_ALONE_NOTE,
+  SYNC_VIRTUAL_OVER_BELOW_LFS_NOTE,
   SYNC_VIRTUAL_OVER_LABEL,
   SYNC_VIRTUAL_OVER_MATCHED_NOTE,
   SYNC_VIRTUAL_OVER_NONE_NOTE,
+  SYNC_VIRTUAL_OVER_PROTECTED_ONLY_NOTE,
   SYNC_VIRTUAL_PATTERNS_LABEL,
   syncFolderOwnedNote,
   syncInForceNote,
@@ -1176,7 +1179,7 @@ describe("AddFolderForm virtual-file controls (Story 56.12)", () => {
   });
 
   /**
-   * Story 56.16: the floor's note is true in each of the three states, and only
+   * Story 56.16: the floor's note is true in each of the four states, and only
    * one of them is on screen at a time.
    *
    * The owner saved
@@ -1187,36 +1190,141 @@ describe("AddFolderForm virtual-file controls (Story 56.12)", () => {
    * beside `SYNC_VIRTUAL_OVER_NONE_NOTE`, so a blank box showed BOTH: two
    * sentences, one of them false, under one control.
    *
-   * Each state therefore asserts the absence of the other two and not merely the
-   * presence of its own. A note pair that can render two contradictory sentences
-   * is the defect's own shape, and a test that only looked for the right one
-   * would not have caught it before either.
+   * Four states because the patterns box holds a list Rust splits in half, and
+   * the first repair of this note counted the whole list. A box holding only
+   * `!` protections authorizes nothing, so the floor still selects and those
+   * entries are the exceptions — the WIDEST state — while a length test called
+   * it the narrowest and printed the matched sentence with both of its halves
+   * inverted.
+   *
+   * Each state therefore asserts the absence of the other three and not merely
+   * the presence of its own. A note set that can render two contradictory
+   * sentences is the defect's own shape, and a test that only looked for the
+   * right one would not have caught it before either.
    */
-  it("the floor's note is true in each of the three states", async () => {
+  it("the floor's note is true in each of the four states", async () => {
     render(<AddFolderForm />);
     await openAdvanced();
     const floor = screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL);
     const patterns = screen.getByLabelText(SYNC_VIRTUAL_PATTERNS_LABEL);
+    // Exclusivity is asserted mechanically rather than state by state, so a
+    // fifth sentence added later cannot quietly render beside a fourth.
+    const floorNotes = [
+      SYNC_VIRTUAL_OVER_NONE_NOTE,
+      SYNC_VIRTUAL_OVER_ALONE_NOTE,
+      SYNC_VIRTUAL_OVER_PROTECTED_ONLY_NOTE,
+      SYNC_VIRTUAL_OVER_MATCHED_NOTE,
+    ];
+    const onlyNote = (expected: string) => {
+      for (const note of floorNotes) {
+        if (note === expected) {
+          expect(screen.getByText(note)).toBeInTheDocument();
+        } else {
+          expect(screen.queryByText(note)).not.toBeInTheDocument();
+        }
+      }
+    };
 
     // (1) Nothing named, no floor: nothing stays away at all.
     fireEvent.change(patterns, { target: { value: "" } });
     fireEvent.change(floor, { target: { value: "" } });
-    expect(screen.getByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).toBeInTheDocument();
-    expect(screen.queryByText(SYNC_VIRTUAL_OVER_ALONE_NOTE)).not.toBeInTheDocument();
-    expect(screen.queryByText(SYNC_VIRTUAL_OVER_MATCHED_NOTE)).not.toBeInTheDocument();
+    onlyNote(SYNC_VIRTUAL_OVER_NONE_NOTE);
 
     // (2) The owner's state: nothing named, a real floor — the floor decides.
     fireEvent.change(floor, { target: { value: "1" } });
-    expect(screen.getByText(SYNC_VIRTUAL_OVER_ALONE_NOTE)).toBeInTheDocument();
-    expect(screen.queryByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).not.toBeInTheDocument();
-    expect(screen.queryByText(SYNC_VIRTUAL_OVER_MATCHED_NOTE)).not.toBeInTheDocument();
+    onlyNote(SYNC_VIRTUAL_OVER_ALONE_NOTE);
 
-    // (3) Patterns named and a floor: the field's original job, and the only
+    // (3) Only a protection beside that floor. This row is verbatim the fixture
+    // of Rust's own
+    // `a_profile_protection_still_wins_over_a_floor_that_selects_on_its_own`,
+    // and the edit form seeds exactly it out of
+    // `profile.virtualPatterns.join(", ")` — so what is compared here is two
+    // readings of one saved profile, which is the whole reason the form mirrors
+    // Rust's split instead of counting entries.
+    fireEvent.change(patterns, { target: { value: "!30-masters" } });
+    onlyNote(SYNC_VIRTUAL_OVER_PROTECTED_ONLY_NOTE);
+
+    // (4) Patterns named and a floor: the field's original job, and the only
     // state the old unconditional sentence was ever true in.
     fireEvent.change(patterns, { target: { value: "scans/**" } });
-    expect(screen.getByText(SYNC_VIRTUAL_OVER_MATCHED_NOTE)).toBeInTheDocument();
-    expect(screen.queryByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).not.toBeInTheDocument();
+    onlyNote(SYNC_VIRTUAL_OVER_MATCHED_NOTE);
+
+    // And the escape, which is the one place a leading `!` still authorizes: a
+    // file whose name really begins with `!` is named `\!` in both Rust and this
+    // box, so reading the `!` alone would file a positive pattern as a
+    // protection and print (3) over a folder in state (4).
+    fireEvent.change(patterns, { target: { value: "\\!30-masters" } });
+    onlyNote(SYNC_VIRTUAL_OVER_MATCHED_NOTE);
+  });
+
+  /**
+   * Story 56.16: a floor that rounds to nothing is no floor, on screen as well
+   * as on the wire.
+   *
+   * `pinnedValue` accepts any finite positive number and the box's `step="any"`
+   * invites one, but the save rounds MB into a `u64` of bytes. `0.0000001`
+   * therefore reached Rust as `virtual_over_bytes: 0` — `floor_selects` false,
+   * nothing staying away anywhere — under a sentence saying "this size decides
+   * on its own". Same silent-coercion class as the one story 56.14 closed for
+   * the blank box, one order of magnitude further down, and the reason the note
+   * now branches on the byte count the save computes rather than on the field.
+   */
+  it("treats a floor that rounds to zero bytes as no floor at all", async () => {
+    mockSave.mockResolvedValue(profileVm({ id: "p9", name: "notes" }));
+    render(<AddFolderForm />);
+    await openAdvanced();
+    fireEvent.change(screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL), {
+      target: { value: "0.0000001" },
+    });
+
+    expect(screen.getByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).toBeInTheDocument();
     expect(screen.queryByText(SYNC_VIRTUAL_OVER_ALONE_NOTE)).not.toBeInTheDocument();
+    // The band lines read the same byte count, so a floor that is not there
+    // cannot be described as sitting above or below the tracking size either.
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_ABOVE_LFS_NOTE)).not.toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_BELOW_LFS_NOTE)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ virtualOverBytes: 0 })),
+    );
+  });
+
+  /**
+   * Story 56.16: both orderings of the floor against the LFS tracking size are
+   * described, and never at once.
+   *
+   * Only `threshold < floor` had a line — the ordering in which the floor's own
+   * sentence is already true. The inverse is the one where it is false: the
+   * floor only ever reaches a path LFS already tracks, so with tracking at 10 MB
+   * and the floor at 1, everything between them is a plain git blob kept here
+   * forever while the note promised that every file that big stays away. That is
+   * also the ordering a person lands in by LOWERING the floor to make more stay
+   * away, and nothing exercised either line before this.
+   */
+  it("says which of the floor and the tracking size is actually deciding", async () => {
+    render(<AddFolderForm />);
+    await openAdvanced();
+    const floor = screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL);
+    const threshold = screen.getByLabelText(SYNC_LFS_THRESHOLD_LABEL);
+
+    // Floor under the tracking size: tracking decides, and the floor's own
+    // sentence is the one that needs the correction.
+    fireEvent.change(threshold, { target: { value: "10" } });
+    fireEvent.change(floor, { target: { value: "1" } });
+    expect(screen.getByText(SYNC_VIRTUAL_OVER_BELOW_LFS_NOTE)).toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_ABOVE_LFS_NOTE)).not.toBeInTheDocument();
+
+    // Floor over it — keeper's own 256 KiB tracking size — and there is a band
+    // of files that are uploaded and also kept.
+    fireEvent.change(threshold, { target: { value: "0.25" } });
+    expect(screen.getByText(SYNC_VIRTUAL_OVER_ABOVE_LFS_NOTE)).toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_BELOW_LFS_NOTE)).not.toBeInTheDocument();
+
+    // No floor at all is neither: there is no ordering to report.
+    fireEvent.change(floor, { target: { value: "0" } });
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_ABOVE_LFS_NOTE)).not.toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_BELOW_LFS_NOTE)).not.toBeInTheDocument();
   });
 
   it("seeds an edit form from the policy in force and saves it back unchanged", async () => {

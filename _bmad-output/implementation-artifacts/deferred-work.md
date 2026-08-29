@@ -4846,3 +4846,8 @@ status: open
     rerun, or when the same test name repeats. A per-test retry would hide the
     signal that the runners are oversubscribed, so the honest first step is to
     measure how often it happens across a week of runs.
+
+- source_spec: `spec-56-16-a-floor-on-its-own-means-something`
+  summary: The three floor sentences in the folder form are not gated on `lfsMode`, so under `pointerOnly` they describe a control that folder never consults and under `disabled` they describe a state it cannot be in.
+  evidence: `syncVirtualOverNote` reads only the floor box and the patterns box. Under `LfsMode::PointerOnly` `engine::release_mode_gate` returns `Ok(None)` without compiling a policy at all and the arrival path never asks the floor, so every tracked file stays away whatever its size — the ALONE and PROTECTED-ONLY sentences are then wrong in the opposite direction from usual, promising a floor that is not consulted. Under `Disabled` nothing is routed through LFS, so no file in the folder can ever be a placeholder. Story 56.16 narrowed the worst of this by tying both new sentences to files "keeper tracks", which makes the `disabled` reading vacuous rather than false, so what remains is the same class of imprecision the pre-existing `SYNC_VIRTUAL_PATTERNS_NOTE` already carries — and the `Large files` select sits directly above both controls. Deferred rather than done because the honest fix is a mode-scoped sentence for all three virtual controls at once (patterns, floor, release window), decided together, not a fourth conditional bolted onto the floor box; `syncVirtualOverBandShown` already reads `form.lfsMode`, so the machinery is present when that story is written.
+  status: open

@@ -74,12 +74,12 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `excludes` | Extra exclusion globs on top of the built-in set |
 | `removable` | The folder lives on removable media (see §6) |
 | `volumeId` | Which volume it is bound to. Written by keeper, not by you (§6) |
-| `lfsMode` | `materialize` (**default**), `pointerOnly`, or `disabled`; releasing content needs `pointerOnly` (§9) |
+| `lfsMode` | `materialize` (**default**), `pointerOnly`, or `disabled`; `disabled` never lets content go, `pointerOnly` always may, and `materialize` may for whatever its virtualization policy authorizes (§9) |
 | `lfsThresholdBytes` | Files at or above this are tracked through LFS (default 4 MiB) |
 | `lfsNever` | Globs that never go through LFS, whatever their size (default none) |
 | `lfsPruneLocal` | Release local LFS objects once the remote holds them (default **true**) |
-| `virtualPatterns` | Paths whose absent content `verify` will not call a fault (default none; see §9) |
-| `virtualOverBytes` | Size floor for that policy, inclusive — and, with no permissive pattern in force from any source, the selector itself; `0` means no floor and nothing stays away (default `0`; see §9) |
+| `virtualPatterns` | Paths whose content may stay on the server: not fetched on arrival, releasable, and not a fault when absent (default none; see §9) |
+| `virtualOverBytes` | Size floor for that policy, inclusive — and, with no permissive pattern in force from any source, the selector itself; `0` is no floor, so nothing stays away *for being large* — it decides nothing about a folder that named patterns (default `0`; see §9) |
 | `releaseTtlMs` | How long content may stay after its release clock last moved; `0` disables (default 24 h) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
@@ -323,12 +323,14 @@ a fault, because that is the normal state of a folder that keeps pointers.
 
 The policy in force is read from the `.keepervirtual` standing in the
 **worktree**, never from `HEAD`, and a `virtualPatterns` list on the profile or
-in a folder TOML layer above it replaces the file's list wholesale — so what is
-in force may be neither committed nor in that file at all. (Protections, the
-`!` lines, are the union of every source and are never dropped.)
+in a folder TOML layer above it replaces the file's list wholesale where it
+carries at least one permissive line of its own (§9) — so what is in force may be
+neither committed nor in that file at all. (Protections, the `!` lines, are the
+union of every source and are never dropped.)
 
 Two folders excuse nothing whatever else is true: one whose `lfsMode` is
-`disabled`, and one with no policy at all — **unless** its `lfsMode` is
+`disabled`, and one no source has said anything about — no `.keepervirtual`, no
+`virtualPatterns` and no `virtualOverBytes` floor — **unless** its `lfsMode` is
 `pointerOnly`, which is itself the folder saying every tracked path may keep its
 pointer. A `pointerOnly` folder therefore needs no `.keepervirtual` and no
 `virtualPatterns` to have its absent objects excused. That is the only fact the
@@ -631,9 +633,11 @@ was never rewritten, so the next pass re-read the same file: the folder was stuc
 for good. It is the same `git lfs install` whose hooks keeper already declines to
 run (it drives `git` with `core.hooksPath` pointed at a path that cannot exist).
 
-`lfsMode = pointerOnly` leaves excluded paths as pointer files. This is the only
-lever that reduces LFS traffic — sparse checkout does **not**, because git-lfs is
-entirely sparse-checkout-unaware. Such a file reads clean regardless: handed
+`lfsMode = pointerOnly` leaves excluded paths as pointer files. It is one of
+keeper's three levers over LFS traffic — the others are `subpaths` and §9's
+virtualization policy, which since story 56.10 is asked before anything is
+fetched — while git's own sparse checkout reduces **none** of it, because git-lfs
+is entirely sparse-checkout-unaware. Such a file reads clean regardless: handed
 bytes that are already a pointer, the clean filter re-emits them unchanged rather
 than storing them and naming *that*, so the worktree text and the blob in the
 index stay the same object. Byte-for-byte, not re-rendered — a pointer written
@@ -752,8 +756,15 @@ a floor authorizes every LFS path at or above it, and `tier` reports `SizeFloor`
 for that state. A committed `.keepervirtual`, or a profile list with a positive
 line, takes that job back: the floor never widens a zone some source already
 named, and inside such a zone it keeps its older job of holding the small ones
-back. It defaults to `0`, which is still no floor and still means nothing stays
-away for being large — `tier` is `Unset` and the folder is not consulted at all.
+back. It defaults to `0`, which is no floor: nothing stays away **for being
+large**, and that is the whole of what a zero says. It decides nothing about a
+folder that named patterns — with `virtualOverBytes: 0` and a committed
+`.keepervirtual` covering `40-media/**`, `tier` is `PatternFile`, the folder is
+consulted on every verify and every release sweep, and everything under that
+pattern stays away. Only where no source named anything either does a zero leave
+`tier` at `Unset` and the folder unconsulted. So putting the floor back to `0` is
+not how a folder is made to stop virtualizing: the pattern that named those paths
+is what decides them, and it is the line to remove.
 The boundary is **inclusive**, so a file exactly at the floor is eligible. It
 comes only from the profile tiers, because gitignore dialect has no spelling for
 a size.
@@ -796,10 +807,12 @@ invalid .keepervirtual pattern "media/[": …
 and the message names the source carrying it: `.keepervirtual` for a line in the
 file, `virtualPatterns` for one in the profile or a folder TOML layer. A typo in
 a file every clone shares and a typo in one machine's own configuration are
-different problems and deserve different words. The refusal happens where the
-policy is compiled, which is inside `verify` — the daemon contains it to that
-one folder's verify line and carries on with the rest. There is no process-wide
-startup abort, and one folder's bad pattern stops nothing else.
+different problems and deserve different words. The refusal happens wherever the
+policy is compiled, which is every consumer above — a folder's verify line, its
+sync pass, a release request or sweep, and the Files pane's listing — and it is
+contained to that one folder either way: the daemon reports it on that folder's
+line and carries on with the rest. There is no process-wide startup abort, and
+one folder's bad pattern stops nothing else.
 
 A line that is only punctuation — a bare `!`, `/` or `!/` — is not refused but
 dropped like a blank line, reported nowhere and not counted as that source having
@@ -813,17 +826,41 @@ a style preference. It is git-lfs#3092, where a pattern change dropped content
 that existed nowhere else. Only per-object proof ever authorizes deleting a
 byte, and it is taken at the moment of the deletion.
 
-**The policy authorizes; it does not instruct.** The only thing that consults it
-today is `verify`, where its job is to stop a folder full of pointers being
-reported as a fault (§8) — those paths are counted as virtual instead. Its answer
-is one of the four facts that excuse an absent object, every one of which has to
-be free (§8), and a folder whose tier is unset or whose `lfsMode` is `disabled`
-excuses nothing whatever the policy says. It is not a download filter. What keeps
-content off this machine on arrival is `lfsMode = pointerOnly`, the whole-profile
-lever, or a path outside the profile's `subpaths`, the per-path one — or an
-explicit release of content that was already here. A path the policy calls
-virtual, whose object is in this machine's store, is materialized by the next
-pull like any other.
+**The policy authorizes; it does not instruct** — but it has four consumers, and
+one of them runs before a byte is fetched. `verify` asks whether an absent object
+is a fault or the ordinary state of a folder that keeps pointers (§8); its answer
+there is one of the four facts that excuse an absent object, every one of which
+has to be free (§8). The **arrival** path asks before it publishes or downloads
+anything and skips both for a path the policy authorizes, which is what makes
+"do not fetch the big ones" mean it rather than fetching them and calling them
+virtual afterwards — so the policy *is* a download filter, and has been since
+story 56.10. The **release** door asks it twice, once about the folder before any
+path is named and once per path (both below). And the **Files pane** asks it per
+materialized row, to decide whether that row counts a deadline down or carries a
+word instead. Two folders excuse and authorize nothing whatever else is true, and
+they are §8's two: one whose `lfsMode` is `disabled`, and one no source has said
+anything about — no permissive pattern in force from any source and no positive
+`virtualOverBytes` floor, so `tier` is `Unset`.
+
+What the policy still never does is delete. A `Virtual` answer makes content
+*eligible* to be given back; only a release takes it — `dehydrate`, or the sweep
+— per object, and only after every refusal below is proved. The whole-profile
+lever is still `lfsMode = pointerOnly` and the coarse per-path one is still the
+profile's `subpaths`; the policy is the fine one, and the only one a repository
+can commit for every clone.
+
+Story 56.16 has two consequences for a folder whose **only** virtualization
+setting is a size floor, and both are behaviour its owner will see. **`verify`
+stops calling it faulty**: its tier is `SizeFloor` rather than `Unset`, so absent
+objects at or above the floor are counted as virtual instead of reported as
+missing. For somebody who set the floor deliberately that is the report finally
+agreeing with the configuration; for somebody who set it while the setting was
+inert, it is a signal that goes quiet. **And the release sweep arms for it**: the
+folder now passes the mode gate below, so local content past its `releaseTtlMs`
+becomes eligible to be given back. That is the point rather than a side effect —
+a folder that may never let go can never become light — and *eligible* is the
+whole of it: every individual deletion still proves its own case per object,
+through every refusal in *What a release refuses to do* below.
 
 ### What a release refuses to do
 
@@ -831,17 +868,33 @@ Removing a path's content is the one operation in this chapter that can destroy
 data, so it proves its case before it writes anything, and the proof is the same
 whether you asked for it or the sweep did.
 
-Before anything about the path is asked, a release is gated on the folder's
-**mode**: only `lfsMode = pointerOnly` may let content go. A folder in the
-default `materialize` mode refuses with `AlwaysMaterializes` — it would
-re-materialize the path on the next pass, so the release would be undone — and a
-folder with large-file support off refuses `LfsDisabled`. Both answer on the
-request door and in the sweep alike, before the hash, before the question to the
-server, and before the open-file question.
+Before anything about the path is asked, a release is gated on the **folder**,
+and two of the three modes answer there alone. `lfsMode = pointerOnly` lets
+content go by configuration — every path in such a folder is virtual on purpose,
+so no policy is compiled and no file is read. A folder with large-file support
+off refuses `LfsDisabled`. The default `materialize` mode is neither answer: its
+policy is compiled here, and the folder is refused `AlwaysMaterializes` only
+where that policy **authorizes nothing at all** — no permissive pattern in force
+from any source and, since story 56.16, no positive `virtualOverBytes` floor
+either. That is the state the refusal was always about, and its old reasoning is
+intact for it: a folder that may keep every path would re-materialize this one on
+the next pass, so the release would be undone and the fetch spent twice. A
+`materialize` folder that authorizes *something* has no such answer to give and
+releases, as it has since story 56.10 — and because story 56.16 brought the bare
+floor inside that question, a folder whose only virtualization setting is a floor
+now passes this gate where it could not before.
 
-Behind that gate, six per-path refusals — seven release refusals in all, one
-enum: `ContentRefusal`, carried by `SyncError::Refused`. Each is a
-distinguishable value a caller branches on rather than a line in a log:
+The same compiled policy is then asked again per path, at the **committed
+pointer's** size rather than the worktree's, so the answer is the same before and
+after a release: a path it does not authorize refuses `NotVirtual`, which names
+the pattern list to add a line to rather than the folder's mode to change. Every
+one of these answers on the request door and in the sweep alike, before the hash,
+before the question to the server, and before the open-file question.
+
+Behind those two gates, six more per-path refusals, all values of the one enum
+`ContentRefusal` that `AlwaysMaterializes`, `LfsDisabled` and `NotVirtual` belong
+to, carried by `SyncError::Refused`. Each is a distinguishable value a caller
+branches on rather than a line in a log:
 
 | refusal | the condition |
 | --- | --- |
@@ -1049,9 +1102,10 @@ an absolute epoch-ms instant, because a countdown is the one string Rust cannot
 own — it is stale the instant it is serialized, while an instant stays true
 without anyone re-asking. Where nothing is counting, the row carries a word for
 why instead — it is pinned, its authorship is unconfirmed, the window is
-indefinite, the folder's mode keeps everything, or the folder's large-file
+indefinite, the folder's mode keeps *this path* (`materialize`, with nothing in
+its policy authorizing that path to stay away), or the folder's large-file
 support is off while the ledger rows it had survive — and exactly one of the two
-is ever present. The last three all draw the same word, `Kept`, and it is the
+is ever present. The last two both draw the same word, `Kept`, and it is the
 sentence beside it that tells them apart: keeper keeps the reasons separate
 because telling the owner of a `disabled` folder that it "is set to keep
 large-file content" is false of the folder and points at a setting that reads the
@@ -1059,9 +1113,12 @@ other way. The pane ticks once a second, and only while some row is actually
 counting.
 
 Automatic release on that success edge is the only release mechanism built here,
-and it runs only in a `pointerOnly` folder: nothing in a folder left in the
-default `materialize` mode is ever released automatically, and the decline is a
-debug line, so no surface will tell you why nothing happened. Releasing on a
+and it runs wherever the folder authorizes something: in a `pointerOnly` folder
+always, and in a `materialize` one for the paths its policy authorizes — which,
+since story 56.16, includes a folder whose only virtualization setting is a
+`virtualOverBytes` floor. A folder that authorizes nothing at all declines the
+whole sweep, and the decline is a debug line, so no surface will tell you why
+nothing happened. Releasing on a
 **schedule** you choose — off, manual or scheduled — is **Epic 57's `tasks`
 verb**, so the nightly script has a home rather than being something keeper
 declines to do; releasing by hand is here today, as `dehydrate` and as the
@@ -1842,13 +1899,15 @@ real git remotes, including a full LFS round trip (upload, peer clone, download,
 materialize) against a local LFS server and the review-lane airlock. Virtual
 files (§9) are real and exercised end to end: the excuse the policy gives
 `verify`, the `ls-files` inventory, `materialize` on demand, the four row states
-with the sentences and glyphs that carry them, `pin`/`unpin`, and — in a
-`pointerOnly` folder — the release deadline a materialized row counts down. A
-folder in the default `materialize` mode answers with a word and no instant, so
-no row counts there: a counting row needs `lfsMode = pointerOnly`, a non-zero
-`releaseTtlMs`, an unpinned row and, for content this clone authored, a
-`synced_at_ms` that is not NULL. One part is not reachable at runtime, and one
-is reachable on Linux only:
+with the sentences and glyphs that carry them, `pin`/`unpin`, and the release
+deadline a materialized row counts down. A counting row needs an unpinned row, a
+non-zero `releaseTtlMs`, content the remote is known to hold — for bytes this
+clone authored, a `synced_at_ms` that is not NULL — and a folder that authorizes
+that path to stay away: `lfsMode = pointerOnly`, or the default `materialize`
+with the folder's own policy resolving the path to virtual, a bare
+`virtualOverBytes` floor included since story 56.16. A row whose folder keeps it
+answers with a word and no instant instead. One part is not reachable at
+runtime, and one is reachable on Linux only:
 
 - **§12 progress and warnings.** These are engine-side and correct — the tray
   decision, the status line and the warning onset logic are implemented and
@@ -1856,12 +1915,15 @@ is reachable on Linux only:
 - **Releasing content (§9), on macOS and Windows.** `dehydrate` and the release
   sweep are implemented, covered by tests, and **live on Linux**: the daemon and
   the desktop app there both answer the open-file question from `/proc` by inode
-  identity, so a `pointerOnly` folder really does release. Two conditions still
-  gate it — a folder reaches the open-file question only when its `lfsMode` is
-  `pointerOnly`, because the default `materialize` mode refuses before it, and
-  macOS and Windows cannot answer that question without racing, so both refuse
-  `OpenUnknown` there. Nothing releases content on a macOS or Windows machine
-  until that platform can answer the question.
+  identity, so a folder that authorizes something really does release. What
+  gates reaching that question is the folder's policy and not its mode alone —
+  `pointerOnly` passes always, `materialize` passes for the paths its policy
+  authorizes, a bare `virtualOverBytes` floor included since story 56.16, and
+  only a folder that authorizes nothing at all is refused `AlwaysMaterializes`
+  before the question is reached. macOS and Windows still cannot answer that
+  question without racing, so both refuse `OpenUnknown` there. Nothing releases
+  content on a macOS or Windows machine until that platform can answer the
+  question.
 
 ## 18. Measured envelopes
 
