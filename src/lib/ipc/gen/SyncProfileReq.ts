@@ -31,9 +31,12 @@ id: string | null, name: string, localPath: string, remoteUrl: string, branch: s
  */
 virtualPatterns: Array<string> | null, 
 /**
- * The size floor to store, in bytes. `0` is keeper's documented "no floor"
- * and is a value like any other, so a blank box sends `0` rather than
- * omitting the key; `None` here is still only "no control for this".
+ * The size floor to store, in bytes — the smallest size a path may stay
+ * unmaterialized at, and, when no permissive pattern is in force from any
+ * source, the thing that decides which paths do (Story 56.16). `0` is
+ * keeper's documented "no floor" and is a value like any other, so a blank
+ * box sends `0` rather than omitting the key; `None` here is still only
+ * "no control for this".
  */
 virtualOverBytes: number | null, 
 /**

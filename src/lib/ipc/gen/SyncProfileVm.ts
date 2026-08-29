@@ -25,15 +25,25 @@ export type SyncProfileVm = { id: string, name: string, localPath: string, remot
  * An empty list is *silence* rather than a withdrawal:
  * `lfs::virtual_policy::VirtualPolicy::compile` judges the profile list on
  * what it parses to, so `[]` leaves the committed `.keepervirtual` deciding.
+ * That is silence about the *pattern* question only — since Story 56.16 an
+ * empty list no longer leaves `virtual_over_bytes` inert, because a floor
+ * with no permissive pattern in force anywhere is itself the selector.
  */
 virtualPatterns: Array<string>, 
 /**
- * The smallest size, in bytes, a matched path may stay unmaterialized at
+ * The smallest size, in bytes, a path may stay unmaterialized at
  * (inclusive).
+ *
+ * A floor under the whole policy and, when no permissive pattern is in
+ * force from any source, the selector itself (Story 56.16). It read "a
+ * matched path" until then, and that word described a match that never
+ * happened: the owner's `virtualPatterns: []` with a 1 MiB floor selected
+ * nothing and his whole folder downloaded.
  *
  * `0` is keeper's documented "no floor" and not an absence, which is why
  * this is a plain `u64` and not an `Option`: no value of this field means
- * "unset", so there is nothing for a `None` to say.
+ * "unset", so there is nothing for a `None` to say. It stays silent under
+ * 56.16 too — a zero floor selects nothing, whatever the pattern list.
  */
 virtualOverBytes: number, 
 /**
