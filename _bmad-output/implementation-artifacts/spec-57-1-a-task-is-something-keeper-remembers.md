@@ -4,6 +4,7 @@ type: 'feature'
 created: '2026-08-29'
 status: 'done'
 baseline_revision: '502612410003d32f881a877b6e6efd12181d2601'
+final_revision: '022241bc2bc58465adedf45d121204af47ad862b'
 review_loop_iteration: 0
 followup_review_recommended: true
 context:
@@ -233,11 +234,25 @@ supervisor tick, and a `running_host` + `lease_until_ms` lease claimed by one co
 - `cargo fmt`: applied, `--check` clean.
 - `bun run typecheck` clean; `bun run lint` 4 warnings + 1 info; `bun run test` 297 files /
   4938 tests — all three exactly at baseline. No frontend file was touched.
-- **Mutation proof:** 45 guards were mutated away one at a time, the owning test run, and the file
-  restored and byte-compared against a pre-mutation snapshot. 44 killed their owning test. The one
-  survivor was informative rather than a gap: it proved that the `busy_timeout` call added during
-  the review was redundant, because rusqlite's own default already arms five seconds — so the call
-  was removed and the fact pinned by a test instead.
+- **Mutation proof.** Each guard was mutated away one at a time, its owning test run, and the file
+  restored from a pre-mutation snapshot and byte-compared against it; the sweep asserts the restore
+  before moving on, so no mutation can survive into the commit.
+  - An earlier sweep over the pre-review code covered **22** guards. 19 were killed immediately; 3
+    needed the fix the failure pointed at — two tests were degenerate at their chosen instant and
+    one anchor was not unique — after which all 3 were killed.
+  - The final sweep over the reviewed code covered **40** distinct guards. 33 were killed
+    immediately. Of the 7 survivors, **5** were real coverage gaps and were killed after adding the
+    tests they proved were missing (`the_shared_database_waits_…`, the two BLOB-column arms of
+    `a_row_whose_columns_will_not_read_…`, `arming_a_task_that_is_already_armed_changes_nothing`,
+    `a_leap_day_schedule_still_resolves_across_the_non_leap_century`, and
+    `a_task_on_an_unplugged_drive_waits_rather_than_failing`).
+  - **38 of the 40 are killed by an owning test.** The two that are not are recorded rather than
+    hidden: the history trim's `finished_ms IS NOT NULL` is unreachable through the public API
+    because the insert ordering already makes the newest row safe, so it is kept as the correct
+    predicate with a comment saying exactly that; and the `busy_timeout` call added during the
+    review turned out to be redundant — the surviving mutation is what proved rusqlite's own default
+    already arms five seconds — so the call was removed, both reviewers' premise corrected in the
+    docs that repeated it, and the fact pinned by a test instead of left as folklore.
 
 **Residual risks**
 - One deliberately unfalsifiable guard: the history trim's `finished_ms IS NOT NULL`. The insert
