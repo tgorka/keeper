@@ -59,6 +59,7 @@ pub mod progress;
 pub mod provenance;
 pub mod sparse;
 pub mod stability;
+pub mod tasks;
 pub mod volume;
 pub mod watch;
 

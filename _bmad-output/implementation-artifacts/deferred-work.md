@@ -4851,3 +4851,19 @@ status: open
   summary: The three floor sentences in the folder form are not gated on `lfsMode`, so under `pointerOnly` they describe a control that folder never consults and under `disabled` they describe a state it cannot be in.
   evidence: `syncVirtualOverNote` reads only the floor box and the patterns box. Under `LfsMode::PointerOnly` `engine::release_mode_gate` returns `Ok(None)` without compiling a policy at all and the arrival path never asks the floor, so every tracked file stays away whatever its size — the ALONE and PROTECTED-ONLY sentences are then wrong in the opposite direction from usual, promising a floor that is not consulted. Under `Disabled` nothing is routed through LFS, so no file in the folder can ever be a placeholder. Story 56.16 narrowed the worst of this by tying both new sentences to files "keeper tracks", which makes the `disabled` reading vacuous rather than false, so what remains is the same class of imprecision the pre-existing `SYNC_VIRTUAL_PATTERNS_NOTE` already carries — and the `Large files` select sits directly above both controls. Deferred rather than done because the honest fix is a mode-scoped sentence for all three virtual controls at once (patterns, floor, release window), decided together, not a fourth conditional bolted onto the floor box; `syncVirtualOverBandShown` already reads `form.lfsMode`, so the machinery is present when that story is written.
   status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-57-1-a-task-is-something-keeper-remembers.md`
+  summary: AD-137 says a task declares which hosts may run it, but no column holds that, so the honest `unhosted` negative is unstorable until 57.6 adds one.
+  evidence: AD-137 calls the host declaration architecture rather than UI copy; neither AD-135's column list nor the `tasks` schema has the field. AD-135's own migration note sanctions an additive `ensure_task_columns` later, so this is a sequencing gap and not a defect — but 57.6 cannot render the unhosted state without it.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-57-1-a-task-is-something-keeper-remembers.md`
+  summary: `task_runs.host` is `{device_id}#{pid}`, which cannot answer "did the daemon or the app run this" across a restart — the exact question AD-137 requires per row.
+  evidence: The pid changes on every restart and the device row is shared by both hosts on Linux (`db::device_identity`), so neither the role nor a stable per-host name is recoverable from the column. 57.5 is where the host vocabulary appears; the column will need the role beside the process.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-57-1-a-task-is-something-keeper-remembers.md`
+  summary: Nothing renews a task lease, so a single sync pass longer than `TASK_LEASE_MS` (one hour) can be joined by a second host over one git working tree.
+  evidence: `Engine::claim_and_run` takes the lease once and `db::finish_task_run` is now scoped to the holder, so the *late* finish is safe — but the reclaim itself is not prevented. Deliberate for this wave (a lease that follows a possibly-dead process is worse), and the honest fix is either a renewal on the tick or an abort; revisit when a task kind's work can exceed an hour.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-57-1-a-task-is-something-keeper-remembers.md`
+  summary: A long host-wide task run holds `Engine::tick` and therefore delays the supervisor's shutdown, which NFR-42 asks to be a bounded finalize.
+  evidence: `run_due_tasks` is awaited inside `tick()`, and `run()`'s `tokio::select!` cannot poll `shutdown.changed()` while a tick is awaited; `self.interrupt` is set only after the loop breaks. This is the shape `tick_profile` already has for a 20-folder pass, so it is pre-existing rather than introduced — but a task makes the worst case longer, and `release_task_leases` only bounds the lease, not the wait.

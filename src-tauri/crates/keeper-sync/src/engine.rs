@@ -48,6 +48,7 @@ use crate::progress::{
 use crate::provenance::{commit_message, Provenance, SyncSource};
 use crate::sparse::SparseCone;
 use crate::stability::{FileSample, StabilityGate, StabilityVerdict};
+use crate::tasks;
 use crate::volume::{self, VolumeMarker, VolumeStatus};
 use crate::watch::{FolderWatcher, WatchConfig, WatchEvent};
 
@@ -489,6 +490,63 @@ pub const RELEASE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 /// advances its injected clock by this interval to reach a second pass, and a
 /// literal there would silently stop reaching one if this changed.
 pub const RELEASE_LOOK_EVERY_MS: i64 = 3_600_000;
+
+/// How long a host holds a task's lease (Story 57.2, AD-136).
+///
+/// An hour, and the two failures it sits between are asymmetric. A lease that
+/// is too short lets a second host start a run the first one is still doing —
+/// two passes over one working tree, which is the concurrent-index-lock failure
+/// AD-62 exists to prevent. A lease that is too long only delays the retry
+/// after a host is killed. So it is sized by the longest thing a task does,
+/// which is a whole sync pass over a large folder, and the cost of overshooting
+/// is paid by the rarer case.
+///
+/// Nothing renews it, deliberately: a run that outlives its lease is reclaimed
+/// and its attempt recorded as `abandoned`, which is a fact a reader can act on
+/// rather than a lease that quietly follows a process that may already be dead.
+const TASK_LEASE_MS: i64 = 3_600_000;
+
+/// How soon a task retries after a run that did not happen.
+///
+/// A [`tasks::TaskOutcome::Busy`] or [`tasks::TaskOutcome::Deferred`] run did no
+/// work, so it must not consume the schedule's window: a `@daily` sweep that
+/// collided with the supervisor's own pass at 03:00 would otherwise lose the
+/// whole day. A minute is the schedule floor, so retrying at it cannot fire
+/// faster than any schedule this dialect can express, and it is short enough
+/// that a folder whose drive returns is served in the minute after.
+const TASK_RETRY_MS: i64 = 60_000;
+
+/// Why a task is running: because its window opened, or because somebody asked.
+///
+/// Two things hang off it and neither is cosmetic. The claim only demands an
+/// open window for a scheduled run, and the provenance a commit carries names
+/// the engine's own policy for a scheduled run and a person for a requested one
+/// — the distinction `SyncSource` already draws, and one a commit message keeps
+/// forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskTrigger {
+    /// The due-gate on this host's tick opened the window.
+    Scheduled,
+    /// A person, a CLI verb or an IPC command asked for it.
+    Requested,
+}
+
+impl TaskTrigger {
+    /// What a commit this run creates should say about who caused it.
+    ///
+    /// `Watch` for a scheduled run, for the reason the recordings push already
+    /// records at its own call site: *"not a person asking, but the engine
+    /// acting on a policy the folder carries"*. `Manual` for a requested one,
+    /// because that is precisely what it is. `Cli` is deliberately not used:
+    /// it would make an in-process due-gate indistinguishable from the real
+    /// `keeper-syncd` verb 57.3 adds, in a fact git keeps forever.
+    fn source(self) -> SyncSource {
+        match self {
+            Self::Scheduled => SyncSource::Watch,
+            Self::Requested => SyncSource::Manual,
+        }
+    }
+}
 
 /// How many consecutive transient failures before a profile stops calling
 /// itself healthy.
@@ -1724,9 +1782,15 @@ impl Engine {
         Ok(())
     }
 
-    /// Return in-flight units to the queue so a restart resumes them.
+    /// Return in-flight units to the queue, and in-flight task leases to
+    /// whoever comes next, so a restart resumes rather than waits.
+    ///
+    /// The lease half is released first and never fails the finalize: a lease
+    /// this process cannot hand back expires on its own, while a journal unit
+    /// that is not requeued waits for the next startup to notice it.
     fn finalize(&self) -> Result<()> {
         let now = self.platform.now_ms();
+        self.release_task_leases();
         self.with_db(|conn| db::recover_running(conn, now))
             .map(drop)
     }
@@ -1741,6 +1805,16 @@ impl Engine {
         // removing one is visible only from here: `tick_profile` never runs for
         // a disabled profile, so it cannot be the thing that notices.
         self.retain_watchers(&profiles);
+        // Host-wide, and outside the `enabled` filter below: a task belongs to
+        // the machine rather than to one folder, so a paused profile must not be
+        // what decides whether the machine's nightly housekeeping happens.
+        //
+        // On the tick that already exists, which is the whole of AD-136. There
+        // is no task thread, no second interval and no `.timer` inside this
+        // process — AD-62 forbids a second clock over one git repository, and a
+        // due-gate on the supervisor's own tick has exactly the resolution a
+        // one-minute schedule floor needs.
+        self.run_due_tasks(&profiles).await;
         for profile in profiles {
             if !profile.enabled {
                 continue;
@@ -1754,6 +1828,371 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Tasks (Story 57.1, Story 57.2 — AD-135, AD-136)
+    // -----------------------------------------------------------------------
+
+    /// Ask every task whether it is due, and run what is.
+    ///
+    /// A due-gate, not a scheduler. This function owns no clock, no thread and
+    /// no interval: it reads [`SyncPlatform::now_ms`] exactly as
+    /// [`Self::scan_is_due`] and [`Self::sweep_is_due`] do, which is what makes
+    /// a schedule something a test can advance rather than something a test has
+    /// to wait for. The decision itself is [`tasks::decide`], which is pure.
+    ///
+    /// Never fails the tick, following [`Self::drain_finished_assertions`]:
+    /// housekeeping that could stop a folder syncing would be a far worse
+    /// bargain than housekeeping that occasionally does not happen.
+    async fn run_due_tasks(&self, profiles: &[SyncProfile]) {
+        let offset = self.platform.utc_offset_minutes();
+        let listing = match self.with_db(db::list_tasks) {
+            Ok(listing) => listing,
+            Err(err) => {
+                tracing::debug!(error = %err, "cannot read the task list this tick");
+                return;
+            }
+        };
+        // Logged, not raised. A row this build cannot read is the other host
+        // writing a task a newer keeper understands, which is a fact about the
+        // fleet and not a fault in this process (NFR-43).
+        for unknown in &listing.unknown {
+            tracing::debug!(
+                task = unknown.id,
+                reason = unknown.reason,
+                "this host cannot run one of the stored tasks"
+            );
+        }
+        for task in &listing.tasks {
+            // The clock is read per task, not once for the loop. A task ahead of
+            // this one in the list may have spent forty minutes inside a sync
+            // pass, and a `now` from before it would arm the next task's window
+            // in the past and — worse — stamp its lease already expired, which
+            // the other host would reclaim while this one was running it.
+            let now = self.platform.now_ms();
+            // Re-read from the row rather than cached across ticks: the other
+            // host writing this same `sync.db` may have rewritten it since.
+            let schedule = match task.parsed_schedule() {
+                Ok(schedule) => schedule,
+                // Unreachable — `list_tasks` already lists such a row as
+                // unknown — but total, because a loop over stored rows that can
+                // panic on one of them is not a loop this tick may contain.
+                Err(_) => continue,
+            };
+            match tasks::decide(&task.state(), schedule.as_ref(), now) {
+                tasks::Action::None => {}
+                tasks::Action::Arm => self.arm_task_window(task, schedule.as_ref(), now, offset),
+                tasks::Action::Run => {
+                    let run = self
+                        .claim_and_run(task, profiles, now, offset, TaskTrigger::Scheduled)
+                        .await;
+                    if let Err(err) = run {
+                        tracing::warn!(task = task.id, error = %err, "a due task could not run");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compute a first window and stop there.
+    ///
+    /// First sight arms and declines, the discipline [`Self::release_is_due`]
+    /// already keeps for a sweep that deletes: a nightly task saved at noon must
+    /// run tonight, not the moment it was saved. Anything else would make
+    /// "create a task" and "run a task" the same gesture.
+    fn arm_task_window(
+        &self,
+        task: &db::TaskRow,
+        schedule: Option<&tasks::TaskSchedule>,
+        now_ms: i64,
+        utc_offset_minutes: i32,
+    ) {
+        let Some(next) = schedule.and_then(|s| s.next_due_after(now_ms, utc_offset_minutes)) else {
+            // `warn`, not `debug`, and this is the one place in the feature where
+            // the level is load-bearing: the row stays unarmed, so the next tick
+            // decides `Arm` again and the task reports itself enabled and
+            // scheduled while nothing ever runs. That is exactly the shape this
+            // epic exists to close, and the default log level is `info`, so a
+            // `debug` line here would have made it invisible in a shipped
+            // install. The parser refuses a schedule that names no real date, so
+            // reaching this means a newer keeper wrote one whose next instant is
+            // beyond this build's eight-year search window.
+            tracing::warn!(
+                task = task.id,
+                schedule = task.schedule.as_deref().unwrap_or(""),
+                "this task's schedule has no next instant this keeper can find, so it \
+                 is enabled and will not run"
+            );
+            return;
+        };
+        if let Err(err) = self.with_db(|conn| db::arm_task(conn, &task.id, Some(next), now_ms)) {
+            tracing::debug!(task = task.id, error = %err, "cannot arm a task's window");
+        }
+    }
+
+    /// Take the lease, do the work, record what happened.
+    ///
+    /// The order is not negotiable. **The claim is first and is the only
+    /// arbiter**: on a Linux box the daemon and the app both write this
+    /// `sync.db`, so both reach this line for the same due task and exactly one
+    /// may pass — see [`db::claim_task`], whose single conditional `UPDATE` is
+    /// what decides. **Recording is last and unconditional**: a run nobody
+    /// recorded is indistinguishable from a task that never came due, which is
+    /// the invisible-failure shape this whole epic exists to close.
+    ///
+    /// `Ok(None)` means the claim was declined — a live lease elsewhere, or a
+    /// window this host has already lost to the other one. Neither is a failure,
+    /// and [`Self::run_due_tasks`] treats it as one host's ordinary answer on a
+    /// machine with two.
+    async fn claim_and_run(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+        now_ms: i64,
+        utc_offset_minutes: i32,
+        trigger: TaskTrigger,
+    ) -> Result<Option<i64>> {
+        let host = self.task_host();
+        let due_at_most = match trigger {
+            // The window must already be open, and the claim checks it in the
+            // same statement that takes the lease. Without it, two hosts whose
+            // ticks coincide on a task with fast work both see a free lease —
+            // the first one's release lands before the second one's claim — and
+            // one window yields two runs.
+            TaskTrigger::Scheduled => Some(now_ms),
+            TaskTrigger::Requested => None,
+        };
+        let Some(run_id) = self.with_db(|conn| {
+            db::claim_task(conn, &task.id, &host, now_ms, TASK_LEASE_MS, due_at_most)
+        })?
+        else {
+            return Ok(None);
+        };
+        let (outcome, detail) = self.perform_task(task, profiles, trigger.source()).await;
+        // The clock is read again rather than reused: a sync pass takes as long
+        // as it takes, and a window computed from the instant the task became
+        // due would come due again the moment a run that overran it finished.
+        let finished = self.platform.now_ms();
+        let next_due_ms =
+            self.next_task_window(task, finished, utc_offset_minutes, trigger, outcome);
+        tracing::info!(
+            task = task.id,
+            kind = task.kind.as_str(),
+            outcome = outcome.as_str(),
+            detail = detail,
+            "task run finished"
+        );
+        self.with_db(|conn| {
+            db::finish_task_run(
+                conn,
+                db::TaskRunClose {
+                    run_id,
+                    task_id: &task.id,
+                    host: &host,
+                    finished_ms: finished,
+                    outcome,
+                    detail: Some(detail.as_str()),
+                    next_due_ms,
+                },
+            )
+        })?;
+        Ok(Some(run_id))
+    }
+
+    /// When the task should next come due, given how this run ended.
+    ///
+    /// Three rules, and each of them was a way to lose housekeeping silently.
+    ///
+    /// * A run that **did not happen** — [`tasks::TaskOutcome::Busy`] because the
+    ///   folder was already syncing, or [`tasks::TaskOutcome::Deferred`] because
+    ///   its drive is unplugged — must not consume the window. Advancing to the
+    ///   next scheduled instant would have cost a `@daily` task a whole day for
+    ///   a collision the design calls normal. It retries after
+    ///   [`TASK_RETRY_MS`], or at the scheduled instant if that comes sooner.
+    /// * A **requested** run leaves the schedule alone, because asking for a run
+    ///   now is not asking to skip the next one — unless the window it found was
+    ///   already open, in which case that window has just been served and
+    ///   writing it back would run the task again on the very next tick.
+    /// * Otherwise the next instant is computed from when this run **finished**,
+    ///   which is what [`tasks::TaskSchedule::Every`]'s own doc records.
+    fn next_task_window(
+        &self,
+        task: &db::TaskRow,
+        finished_ms: i64,
+        utc_offset_minutes: i32,
+        trigger: TaskTrigger,
+        outcome: tasks::TaskOutcome,
+    ) -> Option<i64> {
+        let scheduled = task
+            .parsed_schedule()
+            .ok()
+            .flatten()
+            .and_then(|schedule| schedule.next_due_after(finished_ms, utc_offset_minutes));
+        if matches!(
+            outcome,
+            tasks::TaskOutcome::Busy | tasks::TaskOutcome::Deferred
+        ) {
+            let retry = finished_ms.saturating_add(TASK_RETRY_MS);
+            return Some(scheduled.map_or(retry, |at| at.min(retry)));
+        }
+        match trigger {
+            TaskTrigger::Scheduled => scheduled,
+            TaskTrigger::Requested => match task.next_due_ms {
+                Some(at) if at > finished_ms => Some(at),
+                _ => scheduled,
+            },
+        }
+    }
+
+    /// Do the work one task names.
+    ///
+    /// Exhaustive with no `_` arm, so a kind added later has to decide what it
+    /// does rather than inherit silence — and so the kind that must never exist
+    /// has nowhere to be added by accident: `update` has no
+    /// [`tasks::TaskKind`] variant, and `docs/sync.md` refuses unattended
+    /// replacement of this binary.
+    async fn perform_task(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+        source: SyncSource,
+    ) -> (tasks::TaskOutcome, String) {
+        match task.kind {
+            tasks::TaskKind::Sync => self.perform_sync_task(task, profiles, source).await,
+        }
+    }
+
+    /// One sync pass over the named folder, or over every enabled folder when
+    /// the task is host-wide.
+    ///
+    /// [`Self::sync_once`] is the whole implementation, and that is the point.
+    /// It opens by taking the very reservation [`Self::tick_profile`] takes, so
+    /// NFR-42's "a task never holds a git index concurrently with its host's
+    /// sync pass" is a structural fact about this code rather than a convention
+    /// a reviewer has to trust — within this process, which is what NFR-42 asks
+    /// for; across two hosts the lease is what serializes them.
+    ///
+    /// Idempotent and safely abandonable for the same borrowed reason: a sync
+    /// pass is what the supervisor does every few seconds anyway, everything it
+    /// queues goes through the journal, and `db::recover_running` re-drives at
+    /// startup whatever a killed host left `running`.
+    ///
+    /// A **paused** folder is not synced, by either route.
+    /// [`Self::sync_once`] deliberately ignores `enabled` — it is the door a
+    /// person's explicit request comes through — so the check has to be here, or
+    /// a task would be the one thing on the machine that overrides a pause.
+    async fn perform_sync_task(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+        source: SyncSource,
+    ) -> (tasks::TaskOutcome, String) {
+        let targets: Vec<String> = match &task.profile_id {
+            Some(id) => match profiles.iter().find(|profile| profile.id == *id) {
+                // Named a folder that is gone. A real misconfiguration and the
+                // only one this kind can have, so it is reported as a failure
+                // rather than as a quiet pass — though `db::delete_profile` now
+                // takes a folder's tasks with it, so it should not arise.
+                None => {
+                    return (tasks::TaskOutcome::Failed, format!("no such folder: {id}"));
+                }
+                // A pause is an answer, not an error.
+                Some(profile) if !profile.enabled => {
+                    return (
+                        tasks::TaskOutcome::Deferred,
+                        format!("{} is paused, so nothing was synced", profile.name),
+                    );
+                }
+                Some(profile) => vec![profile.id.clone()],
+            },
+            None => profiles
+                .iter()
+                .filter(|profile| profile.enabled)
+                .map(|profile| profile.id.clone())
+                .collect(),
+        };
+        if targets.is_empty() {
+            return (tasks::TaskOutcome::Ok, "no folders to sync".to_owned());
+        }
+        let mut synced = 0usize;
+        let mut busy = 0usize;
+        let mut deferred = 0usize;
+        let mut failure: Option<String> = None;
+        for id in &targets {
+            match self.sync_once(id, source).await {
+                Ok(_) => synced += 1,
+                Err(SyncError::Busy(_)) => busy += 1,
+                // Not failures, and this tree already decided which are which:
+                // `MediaAbsent` and `LfsUploadPending` are
+                // `Retriability::Deferred`, and AD-48 settles the first by name
+                // — "an unplugged volume is absence, never failure". Recording
+                // them as failures would have a nightly task on an external
+                // drive raise a failure notification every night it is unplugged.
+                Err(SyncError::Cancelled) => deferred += 1,
+                Err(err) if err.retriability() == Retriability::Deferred => {
+                    deferred += 1;
+                }
+                // The first failure is what the record carries, and the pass
+                // continues: one unreachable remote must not hide whether the
+                // other folders were served.
+                Err(err) => {
+                    failure.get_or_insert_with(|| err.to_string());
+                }
+            }
+        }
+        let failed = targets
+            .len()
+            .saturating_sub(synced)
+            .saturating_sub(busy)
+            .saturating_sub(deferred);
+        let detail =
+            format!("{synced} synced, {busy} already syncing, {deferred} waiting, {failed} failed");
+        match failure {
+            Some(reason) => (tasks::TaskOutcome::Failed, format!("{detail}: {reason}")),
+            // Nothing ran, and nothing went wrong: the reservation held, or a
+            // drive is not here. Either way the window is retried rather than
+            // consumed — see [`Self::next_task_window`].
+            None if synced == 0 && deferred > 0 => (tasks::TaskOutcome::Deferred, detail),
+            None if synced == 0 => (tasks::TaskOutcome::Busy, detail),
+            None => (tasks::TaskOutcome::Ok, detail),
+        }
+    }
+
+    /// Who holds a lease, as something a reader can act on.
+    ///
+    /// The device id alone will not do: on Linux the daemon and the app share
+    /// one data dir's `sync.db` and therefore one `device` row, so a lease
+    /// naming only the device could not say which of the two processes holds it.
+    /// The process id is what separates them, and it is also the only part a
+    /// person can check against a process list to see whether the holder is
+    /// still alive.
+    fn task_host(&self) -> String {
+        format!("{}#{}", self.device().id, std::process::id())
+    }
+
+    /// Hand back every task lease this process holds.
+    ///
+    /// Called from [`Self::finalize`], which is the supervisor's shutdown path.
+    /// A `systemctl restart` in the middle of a run would otherwise leave the
+    /// lease held by a pid that no longer exists for the whole of
+    /// [`TASK_LEASE_MS`], and the restarted daemon cannot prove that pid is dead
+    /// — on Linux the app shares the device row and may legitimately hold one.
+    /// NFR-42 asks that a SIGTERM be a bounded finalize; this is what bounds it.
+    fn release_task_leases(&self) {
+        let now = self.platform.now_ms();
+        let host = self.task_host();
+        match self.with_db(|conn| db::release_host_leases(conn, &host, now)) {
+            Ok(0) => {}
+            Ok(released) => {
+                tracing::info!(released, host, "handed back this host's task leases");
+            }
+            Err(err) => {
+                // The lease expires on its own, so this costs a delay rather
+                // than a wedge — but it is a real fault and says so.
+                tracing::warn!(error = %err, "cannot hand back this host's task leases");
+            }
+        }
     }
 
     async fn tick_profile(&self, profile: &SyncProfile) -> Result<()> {
@@ -6846,6 +7285,78 @@ impl Engine {
     // Public operations
     // -----------------------------------------------------------------------
 
+    /// Save a task, refusing a schedule this build cannot parse (FR-347).
+    ///
+    /// The refusal happens **here**, where the person who typed the expression
+    /// is, rather than at the tick that would otherwise accept it and silently
+    /// never fire. [`db::upsert_task`] carries the whole rule; this is the door
+    /// every host reaches it through.
+    pub fn save_task(&self, task: &db::TaskRow) -> Result<()> {
+        self.with_db(|conn| db::upsert_task(conn, task))
+    }
+
+    /// Every stored task, with the rows this build cannot read listed beside
+    /// them rather than dropped (NFR-43).
+    pub fn tasks(&self) -> Result<db::TaskListing> {
+        self.with_db(db::list_tasks)
+    }
+
+    /// One task's run history, newest first.
+    pub fn task_history(&self, id: &str, limit: usize) -> Result<Vec<db::TaskRunRow>> {
+        self.with_db(|conn| db::task_runs(conn, id, limit))
+    }
+
+    /// Forget a task and everything it recorded.
+    pub fn forget_task(&self, id: &str) -> Result<()> {
+        self.with_db(|conn| db::delete_task(conn, id))
+    }
+
+    /// Run one task now, recording it exactly as a scheduled run is recorded
+    /// (FR-349).
+    ///
+    /// The same code path as the due-gate, which is what makes the owner's *"it
+    /// does not have to be automatic, it can be a script"* true rather than
+    /// approximated: a cron wrapper, a systemd timer and a person at a prompt
+    /// all reach [`Self::claim_and_run`], take the same lease, and leave the
+    /// same row in `task_runs`.
+    ///
+    /// The schedule is deliberately **not** moved: somebody asking for a run now
+    /// is not asking to skip tonight's.
+    ///
+    /// Refuses, by type: [`SyncError::Config`] for a task that does not exist
+    /// and for one that is off or disabled — an "off" that still runs when asked
+    /// is not off — and [`SyncError::Busy`] when a live lease is held, which the
+    /// CLI's exit taxonomy already reads as "somebody else is doing this" rather
+    /// than as a failure.
+    pub async fn run_task_now(&self, id: &str) -> Result<db::TaskRunRow> {
+        let Some(task) = self.with_db(|conn| db::get_task(conn, id))? else {
+            return Err(SyncError::Config(format!("no such task: {id}")));
+        };
+        if !task.enabled || task.mode == tasks::TaskMode::Off {
+            return Err(SyncError::Config(format!(
+                "task {id} is off, so nothing runs it — not even a request"
+            )));
+        }
+        let profiles = self.list_profiles()?;
+        let now = self.platform.now_ms();
+        let offset = self.platform.utc_offset_minutes();
+        let Some(run_id) = self
+            .claim_and_run(&task, &profiles, now, offset, TaskTrigger::Requested)
+            .await?
+        else {
+            return Err(SyncError::Busy(id.to_owned()));
+        };
+        // The run is fetched by its own id, not as "the newest": the other host
+        // sharing this database may have opened one of its own in between, and
+        // handing back its row would report somebody else's work as this call's.
+        self.with_db(|conn| db::task_runs(conn, id, db::TASK_RUNS_CAP))?
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .ok_or_else(|| {
+                SyncError::Journal(format!("task {id} ran, but its run was not recorded"))
+            })
+    }
+
     /// Run one complete sync for a profile, ignoring the schedule.
     pub async fn sync_once(&self, id: &str, source: SyncSource) -> Result<SyncOutcome> {
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
@@ -11219,6 +11730,598 @@ mod tests {
             "https://git.invalid/x/y.git",
         )
     }
+
+    /// A task fixture. `profile_id: None` is host-wide, which is the shape that
+    /// exercises the record and the gate without needing a real repository.
+    fn task(id: &str, profile_id: Option<&str>, schedule: &str) -> db::TaskRow {
+        db::TaskRow {
+            id: id.to_owned(),
+            profile_id: profile_id.map(str::to_owned),
+            kind: tasks::TaskKind::Sync,
+            schedule: Some(schedule.to_owned()),
+            mode: tasks::TaskMode::Scheduled,
+            next_due_ms: None,
+            enabled: true,
+            updated_ms: 0,
+            running_host: None,
+            lease_until_ms: None,
+        }
+    }
+
+    /// AD-136's central claim, asserted the only way it honestly can be: by
+    /// **tick count**, never by elapsed wall time. A test that proved a schedule
+    /// by sleeping would be asserting that a timer exists, which is precisely
+    /// what must not (AD-62).
+    #[tokio::test]
+    async fn a_due_task_runs_on_the_tick_and_never_on_the_clock_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01TICK", None, "every 5m"))
+            .expect("a five-minute schedule is savable");
+
+        // First sight arms and declines: creating a task is not running it.
+        let _ = engine.tick().await;
+        assert!(
+            engine
+                .task_history("01TICK", 10)
+                .expect("history")
+                .is_empty(),
+            "the tick that first sees a task computes its window and stops there"
+        );
+        assert!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("the row is readable")
+                .next_due_ms
+                .is_some(),
+            "and the window it computed is on the row, where the other host can \
+             see it, not in this process"
+        );
+
+        // An hour of clock and no tick. There is no interval anywhere to fire,
+        // so nothing fires — this is what "no second clock" means, measured.
+        platform.advance_ms(3_600_000);
+        assert!(
+            engine
+                .task_history("01TICK", 10)
+                .expect("history")
+                .is_empty(),
+            "the clock alone is not a scheduler: only the tick reads it"
+        );
+
+        let _ = engine.tick().await;
+        let runs = engine.task_history("01TICK", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the first tick after the window ran it, once"
+        );
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            runs[0].detail.as_deref(),
+            Some("no folders to sync"),
+            "and it really performed the kind rather than only recording it"
+        );
+        assert!(runs[0].finished_ms.is_some(), "and closed the attempt");
+
+        // Five more ticks inside the fresh window.
+        for _ in 0..5 {
+            let _ = engine.tick().await;
+        }
+        assert_eq!(
+            engine.task_history("01TICK", 10).expect("history").len(),
+            1,
+            "the tick count is not the schedule: ticks inside a window are not runs"
+        );
+
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01TICK", 10).expect("history").len(),
+            2,
+            "one run per window, on the first tick that follows it"
+        );
+    }
+
+    /// NFR-42's first half, and it is structural rather than promised: the work
+    /// goes through [`Engine::sync_once`], which opens by taking the very
+    /// reservation [`Engine::tick_profile`] takes. So a folder already syncing
+    /// answers `Busy` before anything reaches its index.
+    #[tokio::test]
+    async fn a_task_cannot_touch_a_folder_its_host_is_already_syncing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01BUSY", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+
+        // Held for the whole of the tick that follows, exactly as a sync pass
+        // from a previous tick would still be holding it.
+        let held = engine
+            .reserve(&p.id)
+            .expect("the reservation is free to take before the tick");
+        let _ = engine.tick().await;
+        drop(held);
+
+        let runs = engine.task_history("01BUSY", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the task came due and the attempt is recorded"
+        );
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Busy),
+            "a folder already syncing is the one-operation-per-profile rule \
+             working, and `Busy` is not a failure"
+        );
+    }
+
+    /// The requested run reaches the same code path as the due-gate — which is
+    /// what makes *"it does not have to be automatic, it can be a script"* true
+    /// rather than approximated — and it does not move the schedule.
+    ///
+    /// The clock is advanced between the arming and the request on purpose: with
+    /// the clock standing still, recomputing the window would land on the same
+    /// instant and the assertion below would pass over a run-now that *did* move
+    /// it.
+    #[tokio::test]
+    async fn a_requested_run_is_recorded_like_a_scheduled_one_and_leaves_the_window_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01NOW", None, "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+        let armed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms;
+        assert!(armed.is_some(), "the first window is armed");
+
+        // A minute in, well inside the window: this run is a request and
+        // nothing else.
+        platform.advance_ms(60_000);
+
+        let run = engine.run_task_now("01NOW").await.expect("a requested run");
+        assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
+        assert!(
+            run.host.contains('#'),
+            "the lease names the process and not only the device, because the \
+             daemon and the app share one device row"
+        );
+        assert_eq!(
+            engine.task_history("01NOW", 10).expect("history").len(),
+            1,
+            "recorded identically to a scheduled run — one row, same table"
+        );
+
+        let row = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(
+            row.next_due_ms, armed,
+            "asking for a run now is not asking to skip the next scheduled one"
+        );
+        assert_eq!(row.running_host, None, "and the lease is handed back");
+    }
+
+    /// NFR-43, and the epic's one structural refusal, at the level that decides
+    /// it: a row naming a kind this build does not have is listed and never run,
+    /// however due it looks. `update` above all — `docs/sync.md` refuses
+    /// unattended replacement of this binary, and there is no
+    /// [`tasks::TaskKind`] variant that could name it.
+    #[tokio::test]
+    async fn a_kind_this_build_does_not_have_is_listed_and_never_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        for (id, kind) in [("01UPD", "update"), ("01TEL", "teleport")] {
+            engine
+                .with_db(|conn| {
+                    // Past the typed door on purpose: `save_task` takes a
+                    // `TaskKind`, so raw SQL is the only way such a row exists —
+                    // which is what a newer keeper writing this file looks like.
+                    conn.execute(
+                        "INSERT INTO tasks (id, kind, schedule, mode, next_due_ms,
+                                            enabled, updated_ms)
+                         VALUES (?1, ?2, 'every 5m', 'scheduled', 0, 1, 0)",
+                        (id, kind),
+                    )?;
+                    Ok(())
+                })
+                .expect("a row written past the typed door");
+        }
+
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+
+        let listing = engine.tasks().expect("tasks");
+        assert!(
+            listing.tasks.is_empty(),
+            "neither row is one this build could honestly run"
+        );
+        assert_eq!(
+            listing.unknown.len(),
+            2,
+            "and both are listed rather than swallowed"
+        );
+        assert!(
+            engine
+                .task_history("01UPD", 10)
+                .expect("history")
+                .is_empty(),
+            "a schedule may never replace this binary, and no variant exists \
+             through which it could"
+        );
+        assert!(
+            engine
+                .task_history("01TEL", 10)
+                .expect("history")
+                .is_empty(),
+            "a task from a newer keeper is skipped, not attempted"
+        );
+    }
+
+    /// `Off` and `enabled = false` are the two ways a task is switched off, and
+    /// an "off" that still runs when asked is not off.
+    #[tokio::test]
+    async fn a_task_that_is_off_refuses_the_request_to_run_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut off = task("01OFF", None, "@daily");
+        off.mode = tasks::TaskMode::Off;
+        engine.save_task(&off).expect("save");
+        let mut disabled = task("01DIS", None, "@daily");
+        disabled.enabled = false;
+        engine.save_task(&disabled).expect("save");
+
+        for id in ["01OFF", "01DIS", "01NOSUCHTASK"] {
+            assert!(
+                matches!(engine.run_task_now(id).await, Err(SyncError::Config(_))),
+                "{id} must refuse by type, not fail silently"
+            );
+        }
+
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        assert!(
+            engine
+                .task_history("01OFF", 10)
+                .expect("history")
+                .is_empty()
+                && engine
+                    .task_history("01DIS", 10)
+                    .expect("history")
+                    .is_empty(),
+            "and neither is ever due either"
+        );
+    }
+
+    /// The refusal is at the door every host writes through, not only in the
+    /// parser: a schedule keeper cannot honour must never reach the table.
+    #[test]
+    fn the_engine_door_refuses_a_schedule_it_cannot_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        for expression in ["every 30s", "0 3 * *", "@yearly"] {
+            let err = engine
+                .save_task(&task("01BAD", None, expression))
+                .expect_err("refused");
+            assert!(
+                matches!(err, SyncError::Config(_)),
+                "{expression} must be a typed configuration refusal"
+            );
+            assert!(
+                err.to_string().contains(expression),
+                "and the refusal must quote what was written, got {err}"
+            );
+        }
+        assert!(
+            engine.tasks().expect("tasks").tasks.is_empty(),
+            "a refused schedule stores nothing at all"
+        );
+    }
+
+    /// A collision is not the day's answer. Recording `Busy` and advancing to
+    /// the next scheduled instant would have cost a `@daily` sweep the whole day
+    /// for a clash the design calls normal, so a run that did not happen retries
+    /// inside the minute instead of consuming the window.
+    #[tokio::test]
+    async fn a_run_that_did_not_happen_retries_within_the_minute_instead_of_losing_the_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01RETRY", Some(&p.id), "@daily"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        let nightly = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+        // Straight to the window, with the folder's reservation held for the
+        // whole of the tick that finds it open.
+        platform.advance_ms(nightly - platform.now_ms());
+        let held = engine.reserve(&p.id).expect("free before the tick");
+        let _ = engine.tick().await;
+        drop(held);
+
+        let runs = engine.task_history("01RETRY", 10).expect("history");
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Busy));
+        let next = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("rearmed");
+        assert_eq!(
+            next,
+            platform.now_ms() + 60_000,
+            "a minute, not tomorrow: the window was not served, so it is not spent"
+        );
+
+        platform.advance_ms(60_000);
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01RETRY", 10).expect("history").len(),
+            2,
+            "and the retry really is reached on the tick after it"
+        );
+    }
+
+    /// The two branches of `perform_sync_task` used to disagree: the host-wide
+    /// one filtered `enabled`, the profile-scoped one did not, and `sync_once`
+    /// deliberately ignores it — so a task was the one thing on the machine that
+    /// could override a pause and sync a folder at 03:00 anyway.
+    #[tokio::test]
+    async fn a_task_naming_a_paused_folder_syncs_nothing_and_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.enabled = false;
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01PAUSED", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01PAUSED", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the task came due and the attempt is recorded"
+        );
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Deferred),
+            "a pause is an answer, so it is not a failure either"
+        );
+        assert!(
+            runs[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("paused")),
+            "and the record says which fact it was, got {:?}",
+            runs[0].detail
+        );
+
+        // The same task on a folder that is gone is a real misconfiguration, and
+        // reads as one.
+        engine.forget_task("01PAUSED").expect("forget");
+        engine
+            .save_task(&task("01GONE", Some("01NOSUCHPROFILE"), "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+        let gone = engine.task_history("01GONE", 10).expect("history");
+        assert_eq!(gone[0].outcome, Some(tasks::TaskOutcome::Failed));
+    }
+
+    /// A requested run on a task whose window is already open has served that
+    /// window. Writing it back unchanged — "a request does not move the
+    /// schedule" taken too literally — made the very next tick run it again.
+    #[tokio::test]
+    async fn a_requested_run_that_finds_its_window_open_does_not_run_again_next_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01OPEN", None, "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+        // Past the window, without a tick to serve it.
+        platform.advance_ms(400_000);
+
+        engine
+            .run_task_now("01OPEN")
+            .await
+            .expect("a requested run");
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01OPEN", 10).expect("history").len(),
+            1,
+            "the request served the open window, so the tick after it has nothing to do"
+        );
+    }
+
+    /// NFR-42 asks that a SIGTERM be a bounded finalize. A `systemctl restart`
+    /// mid-run otherwise leaves the lease held by a pid that no longer exists
+    /// for the whole hour, and the restarted daemon cannot prove that pid is
+    /// dead — on Linux the app shares the device row and may hold one.
+    #[tokio::test]
+    async fn shutting_down_hands_back_this_hosts_task_leases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01TERM", None, "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+        // Claim it and abandon the run, as a killed process does.
+        let host = engine.task_host();
+        let now = platform.now_ms();
+        engine
+            .with_db(|conn| db::claim_task(conn, "01TERM", &host, now, TASK_LEASE_MS, None))
+            .expect("claim")
+            .expect("claimed");
+
+        engine.finalize().expect("finalize");
+
+        let row = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(
+            (row.running_host, row.lease_until_ms),
+            (None, None),
+            "the next host does not wait out an hour for a process that is gone"
+        );
+        assert_eq!(
+            engine.task_history("01TERM", 10).expect("history")[0].outcome,
+            Some(tasks::TaskOutcome::Abandoned),
+            "and the attempt is closed with the truth rather than left open"
+        );
+    }
+
+    /// The `Failed` arm and the tally, reached through the real dispatch: a
+    /// folder whose remote does not resolve. Everything above this asserts a
+    /// pass that had nothing to do, and a dispatch that only ever answers "no
+    /// folders" is a dispatch nothing has exercised.
+    #[tokio::test]
+    async fn a_folder_whose_remote_cannot_be_reached_records_a_failed_run_with_the_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01FAIL", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01FAIL", 10).expect("history");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Failed),
+            "an unresolvable remote is a failure and reads as one"
+        );
+        let detail = runs[0].detail.clone().expect("a reason");
+        assert!(
+            detail.starts_with("0 synced, 0 already syncing, 0 waiting, 1 failed:"),
+            "the tally is what a reader needs first, got {detail}"
+        );
+        assert!(
+            detail.len() > 50,
+            "and the reason is carried after it, got {detail}"
+        );
+    }
+
+    /// An unplugged drive is not a failure, and this tree settles that by name:
+    /// AD-48's *"an unplugged volume is absence, never failure"*, and
+    /// `SyncError::MediaAbsent` is `Retriability::Deferred` for exactly that
+    /// reason. Recording it as a failure would have a nightly task on an
+    /// external drive raise a failure notification every night it is unplugged.
+    #[tokio::test]
+    async fn a_task_on_an_unplugged_drive_waits_rather_than_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.removable = true;
+        p.volume_id = Some("01NOSUCHVOLUME".to_owned());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01ABSENT", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01ABSENT", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the task came due and the attempt is recorded"
+        );
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Deferred),
+            "absence is not failure, so nothing here is worth a notification"
+        );
+        assert_eq!(
+            runs[0].detail.as_deref(),
+            Some("0 synced, 0 already syncing, 1 waiting, 0 failed"),
+            "and the tally says which of the four it was"
+        );
+    }
+
     /// A shared branch overtaken by the other machine is weather, not a
     /// decision — and the reconcile happens *in this unit* (DW-207).
     ///
