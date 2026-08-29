@@ -656,6 +656,33 @@ enum WhenAbsent {
     Report,
 }
 
+/// What a materialize request asks the `materialized` ledger to record about
+/// when this path may be let go, with the clock already read (Story 56.17).
+///
+/// [`lfs::hydrate::KeepFor`]'s three answers, resolved: the caller's `2h` has
+/// become an absolute instant, because a ledger holding a duration would be
+/// stale the moment the row sat still and [`release_due_at`] compares against
+/// a clock. Resolved at the door rather than at the writer so that
+/// [`Engine::materialize_entry_now`], which runs
+/// [`Engine::materialize_held`] twice around a drain, records the same instant
+/// both times instead of one moved forward by the transfer.
+///
+/// Three variants rather than an `Option<i64>`, and the third is the one that
+/// matters: *write nothing* is not *clear it*. The copy planner hydrates a
+/// path so `copy` can read real bytes and has no opinion about retention, so
+/// duplicating a file must not withdraw the two hours its owner asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseInstruction {
+    /// Do not touch the column at all. Every caller that predates Story 56.17
+    /// means this, so their behaviour is unchanged down to the statement count.
+    Leave,
+    /// Withdraw any standing deadline: this path goes back on the folder's own
+    /// `releaseTtlMs` window.
+    Clear,
+    /// Let this path go no earlier than this absolute epoch-ms instant.
+    At(i64),
+}
+
 pub struct Engine {
     platform: Arc<dyn SyncPlatform>,
     /// Single connection behind a mutex. `sync.db` is small and every access is
@@ -7864,6 +7891,15 @@ impl Engine {
     /// its next tick, and which must not block a UI thread on a four-gigabyte
     /// transfer.
     ///
+    /// # `keep_for` is how long the person wants the file, not a policy
+    ///
+    /// [`lfs::hydrate::KeepFor::Unspecified`] is what every caller that
+    /// predates this story means and what they all keep getting: no deadline is
+    /// written, no standing one is disturbed, and the path is governed by the
+    /// folder's own `releaseTtlMs` window exactly as before.
+    /// [`lfs::hydrate::KeepFor::Ms`] is resolved **once** here against the
+    /// injected clock — see [`Self::release_instruction`].
+    ///
     /// Blocking, like every other repository caller: a `gix::Repository` is
     /// neither `Send` nor cheap to hold, so each open is scoped to a block and
     /// never spans an await point.
@@ -7871,14 +7907,43 @@ impl Engine {
         &self,
         id: &str,
         subpath: &str,
+        keep_for: lfs::hydrate::KeepFor,
     ) -> Result<lfs::hydrate::Materialization> {
         let (profile, rela, path) = self.materialize_request(id, subpath)?;
         let _reservation = self
             .reserve(&profile.id)
             .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        let instruction = self.release_instruction(keep_for);
         // Queueing, always: this door's whole contract is that the supervisor
         // delivers what it did not find here.
-        self.materialize_held(&profile, &rela, path, WhenAbsent::Queue)
+        self.materialize_held(&profile, &rela, path, WhenAbsent::Queue, instruction)
+    }
+
+    /// [`lfs::hydrate::KeepFor`] with the clock already read: what this request
+    /// asks the ledger to record, if anything (Story 56.17).
+    ///
+    /// **Resolved at the door and passed down**, so the two calls
+    /// [`Self::materialize_entry_now`] makes to [`Self::materialize_held`] —
+    /// one to queue, one to observe what the drain achieved — record the same
+    /// deadline rather than a second one however long the transfer took. A
+    /// ledger holding a duration instead of an instant would be stale the
+    /// moment the row sat still, and [`release_due_at`] compares against a
+    /// clock.
+    ///
+    /// Saturating rather than wrapping, for [`db::note_arrival`]'s reason: a
+    /// duration so large it overflows the clock means "essentially never", and
+    /// wrapping it negative would mean "immediately" — the one direction that
+    /// deletes something.
+    fn release_instruction(&self, keep_for: lfs::hydrate::KeepFor) -> ReleaseInstruction {
+        match keep_for {
+            lfs::hydrate::KeepFor::Unspecified => ReleaseInstruction::Leave,
+            lfs::hydrate::KeepFor::Indefinitely => ReleaseInstruction::Clear,
+            lfs::hydrate::KeepFor::Ms(ms) => ReleaseInstruction::At(
+                self.platform
+                    .now_ms()
+                    .saturating_add(i64::try_from(ms).unwrap_or(i64::MAX)),
+            ),
+        }
     }
 
     /// Everything a materialize request settles **before** it needs the
@@ -7972,12 +8037,27 @@ impl Engine {
     ///
     /// `rela` and `path` are [`Self::materialize_request`]'s two spellings of
     /// the same path; `path` is consumed because every answer carries it.
+    ///
+    /// `keep_until` is [`Self::release_instruction`]'s already-resolved answer,
+    /// recorded **before the three arms diverge** (Story 56.17). All three are
+    /// a person naming a time for this path: the content is already here, it
+    /// is published from the store here and now, or a transfer is queued and
+    /// the deadline has to be waiting when the bytes land. Writing it once,
+    /// above the split, is also what keeps the second call
+    /// [`Self::materialize_entry_now`] makes from meaning anything different
+    /// from the first.
+    ///
+    /// It is written **after** the pointer is resolved and the cone is
+    /// checked, and that is deliberate: a deadline recorded for a path this
+    /// folder does not track would be a ledger row nothing will ever consult —
+    /// the phantom [`db::set_pinned`]'s own doc records the cost of.
     fn materialize_held(
         &self,
         profile: &SyncProfile,
         rela: &Path,
         path: String,
         absent: WhenAbsent,
+        keep_until: ReleaseInstruction,
     ) -> Result<lfs::hydrate::Materialization> {
         use lfs::hydrate::{ContentRefusal, Materialization, MaterializeOutcome, Plan};
 
@@ -8011,6 +8091,33 @@ impl Engine {
         // content the profile exists to keep away (Story 27.2).
         if !SparseCone::new(&profile.subpaths).includes(rela) {
             return Err(SyncError::Refused(ContentRefusal::OutsideSubpaths { path }));
+        }
+
+        // The person's own answer to "and for how long?", recorded before the
+        // three arms below diverge (Story 56.17). All three are somebody naming
+        // a time for this path: the content is already here, it is published
+        // from the store here and now, or a transfer is queued and the deadline
+        // has to be waiting when the bytes land.
+        //
+        // Propagated rather than swallowed, unlike the best-effort memos
+        // further down: nothing has been published or queued yet, so a ledger
+        // that could not take the instruction fails the request whole instead
+        // of delivering content on a schedule nobody asked for.
+        match keep_until {
+            // No statement about retention, so no statement is written — which
+            // is what keeps every pre-56.17 caller, the copy planner included,
+            // exactly as it was.
+            ReleaseInstruction::Leave => {}
+            ReleaseInstruction::Clear => {
+                let now = self.platform.now_ms();
+                self.with_db(|conn| db::set_release_at(conn, &profile.id, &path, None, now))?;
+            }
+            ReleaseInstruction::At(at_ms) => {
+                let now = self.platform.now_ms();
+                self.with_db(|conn| {
+                    db::set_release_at(conn, &profile.id, &path, Some(at_ms), now)
+                })?;
+            }
         }
 
         let smudge = match lfs::hydrate::plan(&profile.local_path, rela, &indexed)? {
@@ -8295,11 +8402,17 @@ impl Engine {
     /// unplugged mid-transfer would otherwise be reported as
     /// `ContentRefusal::NotTracked` — "your file is not tracked by git" —
     /// rather than as the absence AD-48 requires.
+    ///
+    /// `keep_for` is [`Self::materialize_entry`]'s, resolved to an instant
+    /// **once** before the first pass so the observing pass records the same
+    /// deadline rather than one moved forward by however long the transfer
+    /// took (Story 56.17).
     pub async fn materialize_entry_now(
         &self,
         id: &str,
         subpath: &str,
         source: SyncSource,
+        keep_for: lfs::hydrate::KeepFor,
     ) -> Result<lfs::hydrate::Materialization> {
         use lfs::hydrate::MaterializeOutcome;
 
@@ -8307,8 +8420,10 @@ impl Engine {
         let _reservation = self
             .reserve(&profile.id)
             .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        let keep_until = self.release_instruction(keep_for);
 
-        let queued = self.materialize_held(&profile, &rela, path.clone(), WhenAbsent::Queue)?;
+        let queued =
+            self.materialize_held(&profile, &rela, path.clone(), WhenAbsent::Queue, keep_until)?;
         let (MaterializeOutcome::Queued, Some(unit)) = (queued.outcome, queued.unit_id) else {
             return Ok(queued);
         };
@@ -8352,7 +8467,11 @@ impl Engine {
         if !self.volume_ready(&profile)? {
             return Err(SyncError::MediaAbsent);
         }
-        let settled = self.materialize_held(&profile, &rela, path, WhenAbsent::Report)?;
+        // The same instant, not a fresh one: `keep_until` was resolved before
+        // the drain, so a two-hour ask is two hours from when it was asked
+        // rather than two hours from when the bytes happened to arrive.
+        let settled =
+            self.materialize_held(&profile, &rela, path, WhenAbsent::Report, keep_until)?;
         if settled.outcome == MaterializeOutcome::Queued {
             tracing::warn!(
                 profile = profile.name,
@@ -10414,7 +10533,7 @@ fn release_path_gate(
 }
 
 /// The instant this row becomes releasable, or `None` for *never* (Story 56.5,
-/// FR-341, AD-131).
+/// FR-341, AD-131; Story 56.17).
 ///
 /// A free function with no `self`, no I/O and no clock, because this is where
 /// the whole feature's safety lives: the sweep reads rows, asks this, and
@@ -10437,6 +10556,24 @@ fn release_path_gate(
 /// `at_ms`: that column is `NOT NULL` and is a real instant the content was
 /// here, so a folder whose rows predate this story is not inert.
 ///
+/// **`row.release_at_ms` replaces the folder's window, in both directions**
+/// (Story 56.17). It is the absolute instant somebody named for this one path
+/// — `keeper-syncd materialize --for 2h`, or the Files row's own choice — and
+/// a chosen hour inside a day-long window goes twenty-three hours sooner while
+/// a chosen week stays six days longer. A replacement and never a `min` or a
+/// `max`: the person said how long they want the file, and a folder-wide knob
+/// they may not even know about must not quietly overrule them either way.
+///
+/// **It is read AFTER the provenance branch, and that ordering is the whole
+/// safety of this story.** The `?` above has already run by the time a chosen
+/// deadline is looked at, so a locally authored path the remote has never been
+/// observed holding is still on no clock at any age — asking for such a file
+/// "for an hour" records the wish and changes nothing about its eligibility.
+/// A deadline read first would turn a duration into a way past FR-341, which
+/// is the one barrier standing between the sweep and bytes that exist on
+/// exactly one machine. Reading it below the pin's early return says the same
+/// thing about the other floor.
+///
 /// `pub` rather than `pub(crate)` because AC 2 asks for the candidate set to be
 /// asserted *as a set*, over the rows a real repository and a real sync
 /// actually produced — and `tests/release_sweep.rs` cannot do that without
@@ -10451,7 +10588,10 @@ pub fn release_due_at(row: &db::MaterializedRow, ttl_ms: u64) -> Option<i64> {
     } else {
         row.last_used_ms.unwrap_or(row.at_ms)
     };
-    Some(since.saturating_add(ttl_ms as i64))
+    Some(
+        row.release_at_ms
+            .unwrap_or_else(|| since.saturating_add(ttl_ms as i64)),
+    )
 }
 
 /// Why a materialized row will or will not be released, in the shape a surface
@@ -10490,8 +10630,23 @@ pub fn release_due_at(row: &db::MaterializedRow, ttl_ms: u64) -> Option<i64> {
 /// meaning a surface acts on: a request will be refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseSchedule {
-    /// Releases no earlier than this absolute epoch-ms instant.
+    /// Releases no earlier than this absolute epoch-ms instant, off the
+    /// folder's own `releaseTtlMs` window.
     Due { at_ms: i64 },
+    /// Releases no earlier than this absolute epoch-ms instant, because
+    /// somebody named it for **this path** (Story 56.17).
+    ///
+    /// The same instant, drawn by the same cell through the same countdown —
+    /// [`Self::instant_or_words`] answers `Ok` for both, so nothing downstream
+    /// branches on which of the two it is. What differs is the sentence, and
+    /// that is the whole reason this is a variant rather than a narrowing of
+    /// [`Self::Due`]: [`Self::Due`]'s sentence describes a folder-wide window
+    /// the person may never have heard of, and repeating it over a file they
+    /// personally asked to keep for two hours would attribute their own
+    /// instruction to a setting. This enum's five wordy variants already exist
+    /// because each is a different sentence to the person who asked; a sixth
+    /// instant is the same rule applied to a row that does have a clock.
+    DueByRequest { at_ms: i64 },
     /// The path is pinned, so keeper keeps its content until the pin is
     /// lifted. The one reason that outranks every other, and the only one the
     /// person holding it can undo from the row itself.
@@ -10554,7 +10709,10 @@ impl ReleaseSchedule {
     /// variant is a compile error in exactly one place, here.
     fn instant_or_words(&self) -> std::result::Result<i64, &'static str> {
         match self {
-            Self::Due { at_ms } => Ok(*at_ms),
+            // Two instants, one wire shape: whose clock it is changes the
+            // sentence and nothing else, so no surface has to know which of
+            // the two it is drawing. See [`Self::DueByRequest`].
+            Self::Due { at_ms } | Self::DueByRequest { at_ms } => Ok(*at_ms),
             Self::Pinned => Err("Pinned"),
             Self::Unconfirmed => Err("Not sent"),
             // "Manual" is a releasable row and "Kept" is a refused one; the
@@ -10568,7 +10726,7 @@ impl ReleaseSchedule {
     }
 
     /// The absolute instant a surface counts down to — `Some` exactly for
-    /// [`Self::Due`].
+    /// [`Self::Due`] and [`Self::DueByRequest`].
     ///
     /// This and [`Self::hold`] are the mapping onto the wire, and they are two
     /// complementary `Option`s rather than one enum because the consumer is a
@@ -10588,7 +10746,7 @@ impl ReleaseSchedule {
     }
 
     /// The one or two words a surface draws when there is no instant — `None`
-    /// exactly for [`Self::Due`].
+    /// exactly for [`Self::Due`] and [`Self::DueByRequest`].
     ///
     /// Short because it stands where a figure would stand, in a cell sized for
     /// `23 hr`; the whole reason is [`Self::sentence`]'s job. "Not sent" rather
@@ -10616,7 +10774,7 @@ impl ReleaseSchedule {
 
     /// The sentence, written for the person who asked. Always present.
     ///
-    /// Present for [`Self::Due`] too, and that one is load-bearing: the sweep
+    /// Present for the two instants too, and that is load-bearing: the sweep
     /// runs on the first successful sync after an hourly due-gate and is
     /// budgeted to [`RELEASE_BUDGET_OBJECTS`] objects a pass, so a countdown
     /// reaching zero means *eligible*, never *released*. A cell that let the
@@ -10632,6 +10790,14 @@ impl ReleaseSchedule {
             Self::Due { .. } => {
                 "keeper lets this content go on the first sync after the time runs out; \
                  the copy stays here until then"
+            }
+            // Named for this one path, so the sentence says so: the person is
+            // owed the fact that this is THEIR instruction and that it beats
+            // the folder's own interval, and it carries `Due`'s caveat because
+            // the sweep it waits on is the same one.
+            Self::DueByRequest { .. } => {
+                "You asked keeper to keep this content for a set time; it goes on the first \
+                 sync after that runs out, whatever this folder's own release interval says"
             }
             Self::Pinned => {
                 "This path is pinned, so keeper keeps its content on this computer until \
@@ -10723,13 +10889,27 @@ pub fn release_schedule(
         LfsMode::Disabled => return ReleaseSchedule::LfsOff,
     }
     let Some(ttl_ms) = ttl_ms else {
+        // Story 56.17 does NOT reach past this: a folder whose automatic
+        // release is switched off has no clock at all, so a chosen deadline has
+        // no window to override and nothing would ever fire it — the sweep
+        // returns before it reads a clock and its gate arms no window. The
+        // instruction stays recorded and starts being honoured the moment the
+        // folder's interval is switched on; until then "Manual" is the true
+        // answer, and it is the word that keeps the row's Release control.
         return ReleaseSchedule::Indefinite;
     };
     match release_due_at(row, ttl_ms) {
+        // Whose clock it is (Story 56.17). `release_due_at` has already
+        // decided the instant; this only names where it came from, so the two
+        // can never disagree about the number and the sentence can be honest
+        // about the instruction.
+        Some(at_ms) if row.release_at_ms.is_some() => ReleaseSchedule::DueByRequest { at_ms },
         Some(at_ms) => ReleaseSchedule::Due { at_ms },
         // `release_due_at` answers `None` for exactly two rows: a pinned one,
         // refused above, and FR-341's locally-authored row the remote has never
-        // been observed holding. So this arm is that row and only that row.
+        // been observed holding. So this arm is that row and only that row —
+        // and a chosen deadline does not move it, because the provenance branch
+        // runs above the deadline inside that function.
         None => ReleaseSchedule::Unconfirmed,
     }
 }
@@ -10879,7 +11059,10 @@ impl crate::copy::ContentSource for Engine {
             }
         }
 
-        match self.materialize_entry(&profile.id, &subpath)?.outcome {
+        match self
+            .materialize_entry(&profile.id, &subpath, lfs::hydrate::KeepFor::Unspecified)?
+            .outcome
+        {
             MaterializeOutcome::Materialized | MaterializeOutcome::AlreadyMaterialized => Ok(()),
             // Belt and braces for the check above: a download queued between
             // the two means the object is not on this machine, a copy cannot
@@ -11207,6 +11390,7 @@ mod tests {
             size_bytes: None,
             pinned: false,
             local_origin: false,
+            release_at_ms: None,
         }
     }
 
@@ -11291,6 +11475,142 @@ mod tests {
         let mut row = ledger_row("clip.mp4", 1_000);
         row.last_used_ms = Some(4_000);
         assert_eq!(release_due_at(&row, 0), Some(4_000));
+    }
+
+    /// A deadline chosen for one path replaces the folder's window in both
+    /// directions, and reaches past neither floor (Story 56.17).
+    ///
+    /// Over hand-built rows and beside the provenance test rather than folded
+    /// into it, because the claim is about *precedence* between four facts —
+    /// the pin, the provenance, the chosen instant and the folder's window —
+    /// and every wrong ordering of them is a different file deleted at a
+    /// different wrong moment.
+    #[test]
+    fn a_chosen_deadline_replaces_the_window_without_reaching_past_either_floor() {
+        const TTL: u64 = 24 * 60 * 60 * 1_000;
+
+        // Shorter than the folder's day: it goes at the hour that was asked
+        // for, not twenty-three hours later.
+        let mut sooner = ledger_row("clip.mp4", 1_000);
+        sooner.last_used_ms = Some(5_000);
+        sooner.release_at_ms = Some(5_000 + 60 * 60 * 1_000);
+        assert_eq!(
+            release_due_at(&sooner, TTL),
+            Some(5_000 + 60 * 60 * 1_000),
+            "a replacement, not a floor under the folder's window"
+        );
+
+        // Longer than it: it stays, rather than being capped at the folder's
+        // day. Both directions, because a `min` and a `max` each look right
+        // from one side.
+        let mut later = ledger_row("clip.mp4", 1_000);
+        later.last_used_ms = Some(5_000);
+        later.release_at_ms = Some(5_000 + 7 * TTL as i64);
+        assert_eq!(
+            release_due_at(&later, TTL),
+            Some(5_000 + 7 * TTL as i64),
+            "a replacement, not a ceiling over the folder's window"
+        );
+
+        // The pin is above it, as it is above every clock.
+        let mut pinned = later.clone();
+        pinned.pinned = true;
+        pinned.release_at_ms = Some(0);
+        assert_eq!(
+            release_due_at(&pinned, TTL),
+            None,
+            "the pin is read before any clock, and a chosen deadline is a clock"
+        );
+
+        // FR-341 is above it too, and this is the line the whole story turns
+        // on: a duration must not be a way of putting content that exists on
+        // one machine onto a release clock.
+        let mut unconfirmed = ledger_row("clip.mp4", 1_000);
+        unconfirmed.local_origin = true;
+        unconfirmed.synced_at_ms = None;
+        unconfirmed.last_used_ms = Some(9_000_000);
+        unconfirmed.release_at_ms = Some(0);
+        assert_eq!(
+            release_due_at(&unconfirmed, TTL),
+            None,
+            "never confirmed upstream, so never eligible — at any age, and \
+             whatever deadline was asked for"
+        );
+
+        // And once it IS confirmed, the chosen deadline is the clock behind
+        // that barrier rather than the folder's window.
+        let mut confirmed = unconfirmed.clone();
+        confirmed.synced_at_ms = Some(2_000);
+        assert_eq!(
+            release_due_at(&confirmed, TTL),
+            Some(0),
+            "the confirmation opens the gate; the instruction sets the time"
+        );
+    }
+
+    /// The classifier names whose clock a row is on, so the sentence can
+    /// (Story 56.17).
+    ///
+    /// The instant is [`release_due_at`]'s in both cases and is asserted to be
+    /// the same number, because the two variants must never disagree about
+    /// *when* — only about who said so.
+    #[test]
+    fn a_chosen_deadline_is_classified_as_the_persons_own_and_not_the_folders() {
+        use lfs::virtual_policy::Virtualization;
+        const TTL: u64 = 24 * 60 * 60 * 1_000;
+
+        let mut folders = ledger_row("clip.mp4", 1_000);
+        folders.last_used_ms = Some(5_000);
+        assert_eq!(
+            release_schedule(
+                &folders,
+                Some(TTL),
+                LfsMode::PointerOnly,
+                Virtualization::Virtual
+            ),
+            ReleaseSchedule::Due {
+                at_ms: 5_000 + TTL as i64
+            },
+        );
+
+        let mut asked = folders.clone();
+        asked.release_at_ms = Some(5_000 + 60 * 60 * 1_000);
+        let schedule = release_schedule(
+            &asked,
+            Some(TTL),
+            LfsMode::PointerOnly,
+            Virtualization::Virtual,
+        );
+        assert_eq!(
+            schedule,
+            ReleaseSchedule::DueByRequest {
+                at_ms: 5_000 + 60 * 60 * 1_000
+            },
+            "the same row with an instruction on it is the person's clock, not \
+             the folder's — and the cell says so"
+        );
+        assert_eq!(
+            schedule.releases_after_ms(),
+            release_due_at(&asked, TTL),
+            "and the number is the predicate's own, so the pane and the sweep \
+             cannot disagree about when this file goes"
+        );
+        assert_eq!(
+            schedule.hold(),
+            None,
+            "it counts down through the cell every other deadline uses"
+        );
+
+        // The folder's automatic release switched off is still off. See
+        // `release_schedule`'s own note: there is no window for a deadline to
+        // override, and the sweep returns before it reads a clock.
+        assert_eq!(
+            release_schedule(&asked, None, LfsMode::PointerOnly, Virtualization::Virtual),
+            ReleaseSchedule::Indefinite,
+            "a folder that releases nothing on its own releases nothing on its \
+             own, and the row says `Manual` rather than promising a countdown \
+             nothing will honour"
+        );
     }
 
     /// Every branch of the surface classifier, in the order it asks them
@@ -11538,6 +11858,7 @@ mod tests {
     fn release_schedule_pairs_an_instant_with_words_exactly_one_way() {
         let all = [
             ReleaseSchedule::Due { at_ms: 1_700_000 },
+            ReleaseSchedule::DueByRequest { at_ms: 1_700_000 },
             ReleaseSchedule::Pinned,
             ReleaseSchedule::Unconfirmed,
             ReleaseSchedule::Indefinite,
@@ -11568,8 +11889,8 @@ mod tests {
         assert_eq!(
             sentences.len(),
             distinct,
-            "six reasons, six sentences — a shared one would tell somebody the wrong \
-             thing about their own file"
+            "seven reasons, seven sentences — a shared one would tell somebody the \
+             wrong thing about their own file"
         );
 
         // Story 56.14. The Files pane's Release control is withheld on exactly
@@ -18876,7 +19197,11 @@ mod tests {
         let p = adoptable(dir.path());
         engine.upsert_profile(&p).expect("upsert");
 
-        let refusal = |subpath: &str| match engine.materialize_entry(&p.id, subpath) {
+        let refusal = |subpath: &str| match engine.materialize_entry(
+            &p.id,
+            subpath,
+            lfs::hydrate::KeepFor::Unspecified,
+        ) {
             Err(SyncError::Refused(refusal)) => refusal,
             other => panic!("expected a refusal for {subpath:?}, got {other:?}"),
         };
@@ -18899,7 +19224,7 @@ mod tests {
             ));
             assert!(
                 matches!(
-                    engine.materialize_entry(&p.id, "clip.mp4"),
+                    engine.materialize_entry(&p.id, "clip.mp4", lfs::hydrate::KeepFor::Unspecified),
                     Err(SyncError::Busy(_))
                 ),
                 "and a path that IS askable answers busy while the folder is"
@@ -18984,7 +19309,11 @@ mod tests {
         .expect("commit the pointer");
         drop(repo);
         assert!(matches!(
-            match engine.materialize_entry(&coned.id, "media/clip.mp4") {
+            match engine.materialize_entry(
+                &coned.id,
+                "media/clip.mp4",
+                lfs::hydrate::KeepFor::Unspecified
+            ) {
                 Err(SyncError::Refused(refusal)) => refusal,
                 other => panic!("expected a refusal, got {other:?}"),
             },
@@ -19007,7 +19336,11 @@ mod tests {
         // An unknown profile is a configuration error, not a refusal: the
         // caller named something that does not exist.
         assert!(matches!(
-            engine.materialize_entry("01NOSUCHPROFILE", "clip.mp4"),
+            engine.materialize_entry(
+                "01NOSUCHPROFILE",
+                "clip.mp4",
+                lfs::hydrate::KeepFor::Unspecified
+            ),
             Err(SyncError::Config(_))
         ));
     }

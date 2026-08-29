@@ -388,6 +388,56 @@ impl From<BrowseRefusal> for ContentRefusal {
     }
 }
 
+/// How long a materialize request asks for the content to stay on this
+/// machine (Story 56.17).
+///
+/// Three answers rather than two, and the third one earns its place. "The
+/// caller named no duration" and "the caller said *indefinitely*" look alike
+/// and are not: the second is an instruction that must **withdraw** a deadline
+/// somebody set earlier, and the first must leave it exactly where it is.
+/// Folded into one value, the copy planner — which hydrates a path only so
+/// that `copy` can read real bytes, and has no opinion about retention at all
+/// — would silently discard the two hours the owner asked for, just by
+/// duplicating the file.
+///
+/// A duration and not an instant: the person says "two hours", and the engine
+/// resolves that against the injected clock once, at the door. See
+/// `Engine::keep_until_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeepFor {
+    /// The caller named no duration and has no opinion about retention: leave
+    /// whatever standing instruction this path already carries. The default,
+    /// and what every caller that predates this story means.
+    #[default]
+    Unspecified,
+    /// Explicitly indefinite: withdraw any chosen deadline, so the path is
+    /// governed by the folder's own `releaseTtlMs` window and nothing else.
+    /// This is what `--for 0` and the Files row's *Indefinitely* both mean.
+    Indefinitely,
+    /// Keep the content this many milliseconds from now, whatever the folder's
+    /// own window says — shorter goes sooner, longer stays longer.
+    Ms(u64),
+}
+
+impl KeepFor {
+    /// The reading of an optional millisecond count, as both doors spell it.
+    ///
+    /// `keeper-syncd`'s `--for` is an `Option<u64>` because clap models an
+    /// absent flag that way, and the Tauri command's argument is one because
+    /// TypeScript spells an omitted argument `undefined`. Both then have to
+    /// answer the same question about a zero, so the answer lives here rather
+    /// than being written twice: **absent is `Unspecified`, an explicit zero is
+    /// `Indefinitely`**. A zero is a thing somebody typed, and the only sense
+    /// it makes is "no limit".
+    pub fn from_ms(keep_for_ms: Option<u64>) -> Self {
+        match keep_for_ms {
+            None => Self::Unspecified,
+            Some(0) => Self::Indefinitely,
+            Some(ms) => Self::Ms(ms),
+        }
+    }
+}
+
 /// What asking for one path's content did.
 ///
 /// Three answers rather than a boolean, because "it is already here" and "it is

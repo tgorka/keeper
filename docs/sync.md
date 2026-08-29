@@ -1022,7 +1022,9 @@ Which clock measures a path is decided by where its content came from, and it is
 recorded rather than guessed. keeper's ledger — the `materialized` table, keyed
 by profile and path — carries `at_ms` (when the content landed), `last_used_ms`
 (when keeper last served it), `synced_at_ms` (when the remote was observed
-holding that path's object) and `local_origin`.
+holding that path's object), `local_origin`, and `release_at_ms` (an instant
+somebody named for this one path, and `NULL` on every row nobody has named one
+for, which is nearly all of them).
 
 * Content that **arrived from the remote** and was never modified here is
   measured from `last_used_ms`, falling back to `at_ms` where keeper has never
@@ -1045,6 +1047,33 @@ that asks the server, written only once the server has actually been asked. It
 is deliberately **never** written at a profile's success edge: "this folder
 synced" says nothing about any one path inside it.
 
+A single path can also carry an instant somebody named, instead of inheriting
+the folder's window. `keeper-syncd materialize <profile> <subpath> --for 2h`,
+and the same choice on a Files row, write an absolute `release_at_ms` against
+that one path, and from then on that is the instant the sweep reads. It
+**replaces** the folder's window in both directions rather than bounding it:
+two hours against a twenty-four-hour folder means the path goes twenty-two
+hours sooner than everything around it, and a week against the same folder
+means it stays six days longer. It is deliberately not a floor, not a ceiling
+and not a `min`/`max` blend of the two clocks — somebody who asks for a file
+*for two hours* has said what they want, and a window they never set is not a
+better answer than the one they gave. The pin still outranks it absolutely,
+because a pin is checked before any clock is looked at: a pinned path carrying
+a deadline an hour in the past is not a candidate, and is never even asked
+about.
+
+What a named instant does **not** do is move the locally-authored rule. The
+provenance question above is asked first and unconditionally, so a path this
+clone wrote that nothing has confirmed the server holds is still **not eligible
+at any age** — chosen duration or not. That ordering is the whole point rather
+than an accident of where the code fell: if a deadline could be honoured over a
+`NULL` `synced_at_ms`, then `--for 1m` would be a way around the one barrier
+that exists to stop keeper deleting bytes that live on exactly one machine, and
+the barrier would be worth nothing to the person it protects. The instruction is
+also spent the moment it is served — a release clears `release_at_ms` along with
+the content — so a path materialized again later starts on the folder's window
+again, rather than being instantly eligible off a deadline already in the past.
+
 ### `releaseTtlMs`, the per-pass budget, and when the sweep runs
 
 `releaseTtlMs` is the window — how long content may stay after its clock last
@@ -1058,6 +1087,20 @@ every out-of-range number is one somebody typed. A window between a minute and a
 hour is accepted and then honoured no more often than hourly, because the look
 gate below re-arms an hour ahead on every pass that runs — so a short window is
 not a way to see the feature work sooner.
+
+**And `0` stays `0` for a path somebody named a deadline for.** A per-file
+instruction does not resurrect the sweep in a folder whose automatic release is
+switched off: the window is never armed and the pass returns before it reads a
+clock, so nothing is released, and the row goes on reading `Manual`, the word
+for an indefinite window, which is still the truth about it. That direction is
+deliberate rather than a case nobody thought about. The documented meaning of
+`0` is *keeper deletes nothing here on its own*, and a per-file deadline that
+punched through it would make that knob unsafe to lean on — for exactly the
+operator who set it because deletions in that folder were unacceptable, and who
+would discover the exception as missing bytes. A folder with no clock has no
+window for a deadline to override. The instruction is still recorded against the
+path, and it starts being honoured the moment the folder's window is switched
+on.
 
 A pass is bounded by two ceilings rather than one — `RELEASE_BUDGET_OBJECTS`
 (32) and `RELEASE_BUDGET_BYTES` (1 GiB). The count bounds **attempts** and is
@@ -1129,7 +1172,7 @@ declines to do; releasing by hand is here today, as `dehydrate` and as the
 | verb | what it does |
 | --- | --- |
 | `ls-files [profile] [--remote]` | what this clone actually holds, per LFS path; `--remote` adds the per-object question to the server |
-| `materialize <profile> <subpath>` | fetch one path's content, waiting for the transfer if the object is not here yet |
+| `materialize <profile> <subpath> [--for <duration>]` | fetch one path's content, waiting for the transfer if the object is not here yet, and optionally keep it for a stated time rather than for the folder's window |
 | `dehydrate <profile> <subpath>` | release one path's content, leaving the committed pointer |
 | `pin <profile> <subpath>` | keep one path's content whatever the sweep says |
 | `unpin <profile> <subpath>` | withdraw that instruction |
@@ -1143,6 +1186,28 @@ by contrast, are reported and leave the exit code alone. And `materialize` on th
 queued before it returns, and exits non-zero if the bytes did not arrive. The
 **app's** door still queues and returns, because the app's own engine is the
 supervisor that will deliver it and a UI must not block on a four-gigabyte fetch.
+
+`--for` takes a whole number of minutes, hours or days — `30m`, `2h`, `1d` — and
+`0`, which means indefinite: the path is on the folder's own window and nothing
+else, which is what the verb has always done with no flag at all. The two are
+not quite the same instruction, and the difference shows on exactly one row.
+**No flag** says nothing about retention, so a deadline this path is already
+carrying is left standing — that is what keeps `materialize` unchanged for every
+script and every internal caller written before this existed, the copy planner
+among them, which hydrates a path only so a `copy` can read real bytes and has
+no opinion about how long it stays. **`--for 0`** is somebody saying
+*indefinitely* out loud, and it withdraws such a deadline. On the ordinary path,
+which is carrying none, the two do the same nothing.
+
+Anything else is refused before the command runs at all, in one
+sentence that names those forms and quotes back what was typed: `1w`, `2`,
+`-1h`, `1.5h`, `2 h`, `0m`, the empty string, and a number of days so large the
+product overflows are all the same refusal, taken by the argument parser before
+a profile is opened or a pointer is looked at. That is the same habit as
+`releaseTtlMs` being refused rather than clamped — a duration is the kind of
+thing a script gets wrong once, and hearing about it before any bytes move
+costs nothing, while a `materialize` that fetches four gigabytes and *then*
+argues about its flag costs the whole transfer.
 
 `--json` is a **global** flag and works on either side of the subcommand. §13
 carries the wording contract — the lines each verb prints and the JSON field
@@ -1158,6 +1223,17 @@ where the CLI verb is `dehydrate`, and the app has no Unpin, because nothing on
 the wire carries a **boolean** a toggle could read: the row learns that it is
 pinned only as Rust's own word in `release.hold`, which cannot tell a control
 which way it is about to go. `keeper-syncd unpin` is the door back out.
+
+**Materialize** now offers the same choice at the click. Right-clicking a
+`virtual` row opens the verb into a submenu — 1 hour, 8 hours, 24 hours,
+indefinitely — and every one of them is the same command with a different
+duration, so there is no second verb to learn and no dialog to dismiss. The
+promoted icon control in the hover cluster keeps the single meaning it has had
+since it was first drawn — fetch it and say nothing about how long — because an
+icon has no room for four words and a control that silently picked one of them
+would be worse than one that picks none. That is the CLI's no-flag case, and
+the submenu's *Indefinitely* is its `--for 0`; the four choices and the button
+are one command with one argument, not two verbs.
 
 ### What `ls`, `du` and other programs see
 
@@ -1702,6 +1778,15 @@ does not track as an LFS path, so a pin is never recorded where nothing will
 consult it. `unpin` withdraws it and disturbs neither clock, so the path is due
 whenever it would have been due had it never been pinned. `--json` for both is
 exactly `profileId`, `profile`, `path`, `pinned`.
+
+`materialize <id> <path> --for <duration>` is the third way a path's release
+time is decided, between the folder's window and the pin: it records an instant
+on that one path, which then stands in for `releaseTtlMs` in both directions
+while the pin and the unconfirmed-authorship refusal both still outrank it. §9's
+"Two release clocks, and which one applies" is the authority for how the three
+compose, including what a `releaseTtlMs` of `0` does to a named deadline; this
+section only notes that the sweep reading it is the same sweep, running the same
+refusals.
 
 Releasing on a schedule you choose, or from a button, is a later story's
 `tasks`; and no stored timestamp authorizes a deletion here — it only decides

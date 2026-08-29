@@ -48,6 +48,7 @@ use keeper_sync::db;
 use keeper_sync::engine::Engine;
 use keeper_sync::error::SyncError;
 use keeper_sync::git;
+use keeper_sync::lfs::hydrate::KeepFor;
 use keeper_sync::lfs::pointer::Pointer;
 use keeper_sync::lfs::store::LfsStore;
 use keeper_sync::lfs::virtual_policy::VIRTUAL_PATTERN_FILE;
@@ -835,7 +836,7 @@ async fn a_request_publishes_what_was_asked_for_and_not_its_virtual_siblings() {
     }
 
     f.engine
-        .materialize_entry(PROFILE_ID, KEPT)
+        .materialize_entry(PROFILE_ID, KEPT, KeepFor::Unspecified)
         .expect("the path is tracked and the remote holds the object");
     f.sync().await;
 

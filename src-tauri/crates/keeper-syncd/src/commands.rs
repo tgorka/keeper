@@ -33,7 +33,7 @@ use keeper_sync::db::UnitStanding;
 use keeper_sync::engine::{Engine, VerifyReport};
 use keeper_sync::lfs::audit::RemoteAudit;
 use keeper_sync::lfs::hydrate::{
-    ContentRefusal, Materialization, MaterializeOutcome, Pin, Release,
+    ContentRefusal, KeepFor, Materialization, MaterializeOutcome, Pin, Release,
 };
 use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
@@ -299,7 +299,8 @@ pub enum Command {
         #[arg(long)]
         remote: bool,
     },
-    /// Ask for one virtual path's content (FR-338).
+    /// Ask for one virtual path's content, optionally for a stated time
+    /// (FR-338).
     ///
     /// Publishes the file inline when this machine already holds the object,
     /// and otherwise **fetches it before returning**: the verb performs its own
@@ -310,12 +311,27 @@ pub enum Command {
     /// wrapper can act on it. A path whose worktree bytes are neither the
     /// committed pointer nor the content it names is **refused by name** and
     /// left exactly as it is: keeper does not overwrite a local modification.
+    ///
+    /// With `--for`, this path is kept for the time you name and then let go on
+    /// the first successful sync after it runs out — whatever the folder's own
+    /// release interval says, in both directions.
     Materialize {
         /// Profile id or name. Required: materializing is a write, and "all
         /// folders" is not a thing anybody means by it.
         profile: String,
         /// The path inside the folder, as `ls-files` spells it.
         subpath: String,
+        /// How long to keep this one path's content: a whole number of
+        /// minutes, hours or days — `30m`, `2h`, `1d` — or `0` for no limit.
+        ///
+        /// It replaces this folder's own release interval for this path alone,
+        /// in both directions: an hour inside a day-long window goes sooner,
+        /// and a week stays longer. A pin still outranks it, and content this
+        /// machine wrote that nothing has confirmed the server holds is still
+        /// never released at any age. Omit it, or pass `0`, to leave the path
+        /// on the folder's own interval.
+        #[arg(long = "for", value_name = "DURATION", value_parser = parse_keep_for)]
+        keep_for: Option<u64>,
     },
     /// Release one path's content, leaving the pointer this folder committed
     /// (FR-332, FR-333).
@@ -652,9 +668,13 @@ pub async fn run(
             let engine = engine_for(&platform, config)?;
             cmd_ls_files(&printer, &engine, profile.as_deref(), remote).await
         }
-        Command::Materialize { profile, subpath } => {
+        Command::Materialize {
+            profile,
+            subpath,
+            keep_for,
+        } => {
             let engine = engine_for(&platform, config)?;
-            cmd_materialize(&printer, &engine, &profile, &subpath).await
+            cmd_materialize(&printer, &engine, &profile, &subpath, keep_for).await
         }
         Command::Dehydrate { profile, subpath } => {
             let engine = engine_for(&platform, config)?;
@@ -1546,6 +1566,64 @@ async fn cmd_ls_files(
 // materialize
 // ---------------------------------------------------------------------------
 
+/// `--for`'s value: a whole number of minutes, hours or days, in milliseconds
+/// (Story 56.17).
+///
+/// A clap `value_parser`, so a malformed duration is refused **before any
+/// engine is opened, any profile is resolved and any pointer is looked at** —
+/// the same discipline `SyncProfile::validate`'s `validate_quiet_time` applies
+/// to a quiet window, and for the same reason: a duration nobody can parse is
+/// a duration that would silently mean something else, and here the something
+/// else is when keeper deletes a copy of somebody's file.
+///
+/// **Refused rather than coerced, with the input quoted.** `1w` is not a week
+/// rounded to seven days, `1.5h` is not ninety minutes and `2` is not two of
+/// anything: each is somebody expecting a unit this verb does not have, and
+/// guessing which would be worse than saying so. The sentence names all four
+/// accepted forms, because the reader is looking at it precisely because they
+/// do not know them.
+///
+/// **`0` is accepted and means indefinite**, which is what the verb already
+/// does with no flag at all — see [`keeper_sync::lfs::hydrate::KeepFor`] for
+/// the one difference between saying it and not saying it.
+///
+/// Three units and no seconds: the shortest release window `SyncProfile`
+/// accepts is a minute (`MIN_RELEASE_TTL_MS`) and the sweep looks at most once
+/// an hour, so a duration in seconds would be a promise nothing keeps.
+/// Overflow is refused by the same sentence rather than saturating, for
+/// `validate`'s reason: a number that large is one somebody typed.
+fn parse_keep_for(value: &str) -> std::result::Result<u64, String> {
+    let malformed = || {
+        format!(
+            "--for must be a whole number of minutes, hours or days like 30m, 2h or 1d, \
+             or 0 for no limit, got {value}"
+        )
+    };
+    if value == "0" {
+        return Ok(0);
+    }
+    let (digits, unit_ms) = match value.as_bytes().last() {
+        Some(b'm') => (&value[..value.len() - 1], 60_000u64),
+        Some(b'h') => (&value[..value.len() - 1], 60 * 60_000),
+        Some(b'd') => (&value[..value.len() - 1], 24 * 60 * 60_000),
+        _ => return Err(malformed()),
+    };
+    // `str::parse::<u64>` accepts a leading `+` and rejects a leading `-`, but
+    // it would also accept `+2h`; the digit test is what keeps the accepted set
+    // exactly the four forms the sentence names.
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(malformed());
+    }
+    let count: u64 = digits.parse().map_err(|_| malformed())?;
+    if count == 0 {
+        // `0m` is a duration of zero, which is not "no limit" — it is a person
+        // asking for a window that has already closed. Refused rather than
+        // silently promoted to indefinite, because those are opposite answers.
+        return Err(malformed());
+    }
+    count.checked_mul(unit_ms).ok_or_else(malformed)
+}
+
 /// One materialization as a human reads it.
 ///
 /// Pure, and taking the profile's name rather than the profile, so the sentence
@@ -1702,6 +1780,7 @@ async fn cmd_materialize(
     engine: &Engine,
     wanted: &str,
     subpath: &str,
+    keep_for_ms: Option<u64>,
 ) -> std::result::Result<(), CliError> {
     let profiles = engine.list_profiles()?;
     let matched = select(&profiles, Some(wanted))?;
@@ -1719,7 +1798,12 @@ async fn cmd_materialize(
     };
 
     let done = engine
-        .materialize_entry_now(&profile.id, subpath, SyncSource::Cli)
+        .materialize_entry_now(
+            &profile.id,
+            subpath,
+            SyncSource::Cli,
+            KeepFor::from_ms(keep_for_ms),
+        )
         .await
         .map_err(|err| {
             // `Busy` is `EXIT_OK` for `sync --once`, where losing a race did no
@@ -3641,16 +3725,119 @@ mod tests {
         );
     }
 
-    /// Two positionals, in that order, and neither optional.
+    /// Two positionals, in that order, and neither optional; `--for` is the
+    /// only thing that is.
     #[test]
     fn materialize_takes_a_folder_and_a_path_inside_it() {
         let cli =
             parse(&["keeper-syncd", "materialize", "docs", "40-media/clip.mp4"]).expect("parse");
-        let Command::Materialize { profile, subpath } = cli.command else {
+        let Command::Materialize {
+            profile,
+            subpath,
+            keep_for,
+        } = cli.command
+        else {
             panic!("expected materialize");
         };
         assert_eq!(profile, "docs");
         assert_eq!(subpath, "40-media/clip.mp4");
+        assert_eq!(
+            keep_for, None,
+            "no flag is no statement about how long, which is what every \
+             invocation written before Story 56.17 means"
+        );
+    }
+
+    /// `--for` reaches the verb as milliseconds, and a value nobody can read
+    /// is refused **at parse time** with the value quoted (Story 56.17).
+    ///
+    /// At parse time is the claim, not merely "refused": clap's `value_parser`
+    /// runs before `run` opens an engine, resolves a profile or looks at a
+    /// pointer, so a typo cannot half-materialize anything. The same discipline
+    /// `validate_quiet_time` applies to a quiet window, and here the cost of
+    /// guessing at a unit is when keeper deletes a copy of somebody's file.
+    #[test]
+    fn for_is_parsed_into_milliseconds_and_a_typo_is_refused_with_the_value_quoted() {
+        for (spelling, expected) in [
+            ("30m", Some(1_800_000)),
+            ("2h", Some(7_200_000)),
+            ("1d", Some(86_400_000)),
+            // Accepted, and it means indefinite — the folder's own interval and
+            // nothing else, which is what the verb does with no flag.
+            ("0", Some(0)),
+        ] {
+            let cli = parse(&[
+                "keeper-syncd",
+                "materialize",
+                "docs",
+                "clip.mp4",
+                "--for",
+                spelling,
+            ])
+            .unwrap_or_else(|err| panic!("`--for {spelling}` should parse: {err}"));
+            let Command::Materialize { keep_for, .. } = cli.command else {
+                panic!("expected materialize");
+            };
+            assert_eq!(keep_for, expected, "--for {spelling}");
+        }
+
+        // Every one of these is somebody expecting a unit this verb does not
+        // have, or a shape it does not read. Guessing at any of them would be
+        // worse than saying so.
+        for spelling in [
+            "1w",
+            "2",
+            "1.5h",
+            "2 h",
+            "h",
+            "",
+            "0m",
+            "+2h",
+            "1H",
+            "99999999999999999999d",
+        ] {
+            let err = parse(&[
+                "keeper-syncd",
+                "materialize",
+                "docs",
+                "clip.mp4",
+                "--for",
+                spelling,
+            ])
+            .expect_err(&format!("`--for {spelling}` must be refused"))
+            .to_string();
+            assert!(
+                err.contains(spelling),
+                "the refusal has to quote what was typed, or the person cannot \
+                 see their own typo: {err}"
+            );
+            assert!(
+                err.contains("30m") && err.contains("2h") && err.contains("1d"),
+                "and it has to name the forms that do work, because the reader \
+                 is looking at it precisely because they do not know them: {err}"
+            );
+        }
+
+        // `-1h` never reaches the parser: clap reads a leading `-` as short
+        // flags and refuses `-1` before any value parser runs. Still refused at
+        // parse time, which is the claim, but by clap's own message — asserted
+        // separately rather than folded into the loop above, because a test
+        // that expected THIS sentence to quote `-1h` would be asserting
+        // something clap does not do and would have to be weakened to pass.
+        let err = parse(&[
+            "keeper-syncd",
+            "materialize",
+            "docs",
+            "clip.mp4",
+            "--for",
+            "-1h",
+        ])
+        .expect_err("a negative duration is refused")
+        .to_string();
+        assert!(
+            err.contains("-1"),
+            "and it still shows what was typed: {err}"
+        );
     }
 
     // --- dehydrate: the two documents and the exit-0 branch (Story 56.4) ----

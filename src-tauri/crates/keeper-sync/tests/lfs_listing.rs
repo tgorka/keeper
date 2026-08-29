@@ -24,7 +24,7 @@ use keeper_sync::browse::{self, BrowseListing, EntrySyncStatus, MaterializedView
 use keeper_sync::engine::{Engine, PendingReason};
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::git;
-use keeper_sync::lfs::hydrate::MaterializeOutcome;
+use keeper_sync::lfs::hydrate::{KeepFor, MaterializeOutcome};
 use keeper_sync::lfs::listing::LfsFileState;
 use keeper_sync::lfs::pointer::Pointer;
 use keeper_sync::lfs::store::LfsStore;
@@ -347,7 +347,7 @@ fn a_materialized_path_reads_materialized_and_its_untouched_sibling_stays_virtua
     engine.upsert_profile(&p).expect("register the profile");
 
     let done = engine
-        .materialize_entry(&p.id, "clip.mp4")
+        .materialize_entry(&p.id, "clip.mp4", KeepFor::Unspecified)
         .expect("the object is in the store, so this publishes inline");
     assert_eq!(done.outcome, MaterializeOutcome::Materialized);
     assert_eq!(done.oid, clip.oid);
@@ -482,7 +482,7 @@ async fn a_queued_download_reads_materializing_through_the_engines_own_pending_l
     engine.upsert_profile(&p).expect("register the profile");
 
     let queued = engine
-        .materialize_entry(&p.id, "clip.mp4")
+        .materialize_entry(&p.id, "clip.mp4", KeepFor::Unspecified)
         .expect("a queued transfer is an outcome, not a failure");
     assert_eq!(queued.outcome, MaterializeOutcome::Queued);
     assert!(

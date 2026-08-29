@@ -30,7 +30,7 @@ use keeper_sync::db;
 use keeper_sync::engine::Engine;
 use keeper_sync::error::SyncError;
 use keeper_sync::git;
-use keeper_sync::lfs::hydrate::{ContentRefusal, MaterializeOutcome};
+use keeper_sync::lfs::hydrate::{ContentRefusal, KeepFor, MaterializeOutcome};
 use keeper_sync::lfs::listing::LfsFileState;
 use keeper_sync::lfs::pointer::Pointer;
 use keeper_sync::lfs::store::LfsStore;
@@ -238,7 +238,7 @@ fn an_object_already_in_the_store_is_published_and_the_tree_stays_clean() {
     };
 
     let done = engine
-        .materialize_entry("01JMATERIALIZE", "clip.mp4")
+        .materialize_entry("01JMATERIALIZE", "clip.mp4", KeepFor::Unspecified)
         .expect("the object is here, so this cannot refuse");
 
     assert_eq!(done.outcome, MaterializeOutcome::Materialized);
@@ -279,7 +279,7 @@ fn an_object_already_in_the_store_is_published_and_the_tree_stays_clean() {
 
     // Asking again is the already-held answer, and it writes nothing.
     let again = engine
-        .materialize_entry("01JMATERIALIZE", "clip.mp4")
+        .materialize_entry("01JMATERIALIZE", "clip.mp4", KeepFor::Unspecified)
         .expect("asking twice is not an error");
     assert_eq!(again.outcome, MaterializeOutcome::AlreadyMaterialized);
     assert_eq!(again.unit_id, None);
@@ -350,7 +350,7 @@ fn the_already_held_answer_records_the_use_without_restarting_the_arrival_clock(
     let landed = platform.now_ms();
 
     let held = engine
-        .materialize_entry("01JMATERIALIZE", "clip.mp4")
+        .materialize_entry("01JMATERIALIZE", "clip.mp4", KeepFor::Unspecified)
         .expect("the content is here, so this cannot refuse");
     assert_eq!(
         held.outcome,
@@ -374,7 +374,7 @@ fn the_already_held_answer_records_the_use_without_restarting_the_arrival_clock(
     // A minute later, and the same question again.
     platform.advance_ms(60_000);
     let again = engine
-        .materialize_entry("01JMATERIALIZE", "clip.mp4")
+        .materialize_entry("01JMATERIALIZE", "clip.mp4", KeepFor::Unspecified)
         .expect("asking twice is not an error");
     assert_eq!(again.outcome, MaterializeOutcome::AlreadyMaterialized);
 
@@ -422,7 +422,7 @@ fn an_absent_object_is_queued_once_however_many_times_it_is_asked_for() {
     };
 
     let queued = engine
-        .materialize_entry("01JMATERIALIZE", "clip.mp4")
+        .materialize_entry("01JMATERIALIZE", "clip.mp4", KeepFor::Unspecified)
         .expect("a queued transfer is an outcome, not a failure");
     assert_eq!(queued.outcome, MaterializeOutcome::Queued);
     assert_eq!(queued.oid, pointer.oid);
@@ -442,7 +442,7 @@ fn an_absent_object_is_queued_once_however_many_times_it_is_asked_for() {
     );
 
     let repeat = engine
-        .materialize_entry("01JMATERIALIZE", "clip.mp4")
+        .materialize_entry("01JMATERIALIZE", "clip.mp4", KeepFor::Unspecified)
         .expect("asking again is not an error");
     assert_eq!(repeat.outcome, MaterializeOutcome::Queued);
     assert_eq!(
@@ -640,7 +640,12 @@ async fn a_one_shot_request_drains_what_it_queued_and_lands_the_bytes() {
     );
 
     let done = engine
-        .materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli)
+        .materialize_entry_now(
+            "01JMATERIALIZE",
+            "clip.mp4",
+            SyncSource::Cli,
+            KeepFor::Unspecified,
+        )
         .await
         .expect("the remote holds the object, so the request can be satisfied");
 
@@ -758,7 +763,12 @@ async fn a_queued_download_the_store_already_holds_costs_no_transfer() {
     label_download(&platform, unit, "held.mp4");
 
     let done = engine
-        .materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli)
+        .materialize_entry_now(
+            "01JMATERIALIZE",
+            "clip.mp4",
+            SyncSource::Cli,
+            KeepFor::Unspecified,
+        )
         .await
         .expect("the remote holds the requested object");
     assert_eq!(
@@ -822,7 +832,12 @@ async fn a_transfer_that_cannot_land_stops_without_cancelling_its_own_backoff() 
 
     let done = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        engine.materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli),
+        engine.materialize_entry_now(
+            "01JMATERIALIZE",
+            "clip.mp4",
+            SyncSource::Cli,
+            KeepFor::Unspecified,
+        ),
     )
     .await
     .expect("the drain loop must terminate on a transfer that cannot land")
@@ -901,7 +916,12 @@ async fn one_request_does_not_drain_the_folders_whole_download_backlog() {
 
     let done = tokio::time::timeout(
         std::time::Duration::from_secs(120),
-        engine.materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli),
+        engine.materialize_entry_now(
+            "01JMATERIALIZE",
+            "clip.mp4",
+            SyncSource::Cli,
+            KeepFor::Unspecified,
+        ),
     )
     .await
     .expect("the drain must not run the folder's whole queue")
@@ -952,7 +972,12 @@ async fn the_request_drains_transfers_and_leaves_every_other_kind_alone() {
     let push = enqueue_push(&platform);
 
     let done = engine
-        .materialize_entry_now("01JMATERIALIZE", "clip.mp4", SyncSource::Cli)
+        .materialize_entry_now(
+            "01JMATERIALIZE",
+            "clip.mp4",
+            SyncSource::Cli,
+            KeepFor::Unspecified,
+        )
         .await
         .expect("the remote holds the requested object");
     assert_eq!(done.outcome, MaterializeOutcome::Materialized);
@@ -987,7 +1012,7 @@ fn a_locally_modified_file_is_refused_and_nothing_is_written_or_queued() {
     };
 
     let err = engine
-        .materialize_entry("01JMATERIALIZE", "clip.mp4")
+        .materialize_entry("01JMATERIALIZE", "clip.mp4", KeepFor::Unspecified)
         .expect_err("keeper must not overwrite an edit");
     assert!(
         matches!(
@@ -1041,7 +1066,7 @@ fn a_parent_symlink_pointing_out_of_the_folder_is_refused() {
     };
 
     let err = engine
-        .materialize_entry("01JMATERIALIZE", "vault/clip.mp4")
+        .materialize_entry("01JMATERIALIZE", "vault/clip.mp4", KeepFor::Unspecified)
         .expect_err("a write may not leave the folder");
     assert!(
         matches!(&err, SyncError::Refused(ContentRefusal::Escapes(_))),

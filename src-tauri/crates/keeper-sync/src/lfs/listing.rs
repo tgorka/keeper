@@ -231,6 +231,7 @@ mod tests {
             size_bytes: None,
             pinned: false,
             local_origin: false,
+            release_at_ms: None,
         }
     }
 

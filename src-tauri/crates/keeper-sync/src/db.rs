@@ -254,23 +254,25 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 }
 
 /// Add the late nullable columns `materialized` has grown, if they are not
-/// there yet (Stories 56.2, 56.5 and 56.14).
+/// there yet (Stories 56.2, 56.5, 56.14 and 56.17).
 ///
-/// Seven facts the ledger has to hold before anything can decide what to
+/// Eight facts the ledger has to hold before anything can decide what to
 /// release: when the content was last *read* (`last_used_ms`), when the remote
 /// last confirmed it holds the object (`synced_at_ms`), whether the owner has
 /// asked for this path to stay on the machine (`pinned`), the object's
 /// identity and length (`oid`, `size_bytes`) so a row still answers after the
 /// worktree stops holding a pointer to consult, which way the content
 /// travelled (`local_origin`, Story 56.5) so the release sweep knows which of
-/// the two clocks applies to this path, and when the content was released
-/// (`released_at_ms`, Story 56.14) so those facts survive the release.
+/// the two clocks applies to this path, when the content was released
+/// (`released_at_ms`, Story 56.14) so those facts survive the release, and the
+/// instant the owner asked for this one path to be let go again
+/// (`release_at_ms`, Story 56.17).
 ///
 /// Literally [`ensure_activity_columns`]'s shape, including the `drop(stmt)`
 /// before the first `conn.execute` — `rusqlite` holds the connection while a
 /// prepared statement lives, so an `ALTER TABLE` issued with the PRAGMA
 /// statement still alive is a borrow error, not a runtime surprise. The one
-/// difference is that these seven columns are not all the same type, so the
+/// difference is that these eight columns are not all the same type, so the
 /// loop carries the type beside the name rather than hard-coding `INTEGER`.
 ///
 /// **Nullable and without a `DEFAULT`, and no `meta` marker.** `NULL` is the
@@ -296,6 +298,17 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 /// used to `DELETE` the row, so the column's absence and its `NULL` say the
 /// same thing about historical data, and [`forget_materialized`] is the only
 /// writer that ever fills it.
+///
+/// **`NULL` in `release_at_ms` means *this path is on the folder's own
+/// window*** (Story 56.17), which is what every row written before that story
+/// meant by existing at all. A non-`NULL` value is an absolute epoch-ms
+/// instant somebody named — `keeper-syncd materialize --for 2h`, or the Files
+/// row's own choice — and [`crate::engine::release_due_at`] reads it *instead
+/// of* the folder's `releaseTtlMs` arithmetic, in both directions. Two
+/// timestamps that look alike and are not: `released_at_ms` is when content
+/// left, `release_at_ms` is when it may. [`set_release_at`] is the only writer
+/// that fills it and [`forget_materialized`] is the only one that clears it,
+/// because the instruction is spent the moment the content goes.
 fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
     // Column 1 of `table_info` is the column name.
@@ -311,6 +324,7 @@ fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
         ("size_bytes", "INTEGER"),
         ("local_origin", "INTEGER"),
         ("released_at_ms", "INTEGER"),
+        ("release_at_ms", "INTEGER"),
     ] {
         if !existing.iter().any(|c| c == column) {
             conn.execute(
@@ -911,6 +925,82 @@ pub fn set_pinned(
     Ok(())
 }
 
+/// Record the instant the owner asked for one path's content to be let go
+/// again, or withdraw that instruction (Story 56.17, `release_at_ms`).
+///
+/// One column either way, naming exactly `release_at_ms`, in [`set_pinned`]'s
+/// two-direction shape and for its reasons: it must not disturb either clock,
+/// `local_origin`, the recorded identity, `pinned` or `at_ms`. `at_ms` on
+/// insert is the instant the instruction was given, which is the only
+/// timestamp this call knows.
+///
+/// `at_ms` here is an absolute epoch-ms **deadline**, not a duration: a
+/// duration serialized into a ledger would be stale by however long the row
+/// sat there, and [`crate::engine::release_due_at`] compares against a clock.
+/// The caller resolves the person's `2h` against the injected clock once, so a
+/// verb that writes this twice — `Engine::materialize_entry_now` observes its
+/// own request a second time after draining — writes the same instant rather
+/// than a later one.
+///
+/// # Why the insert stamps `released_at_ms`, and the conflict arm never does
+///
+/// A duration is recorded when the person asks, and for an object this machine
+/// does not hold yet that is *before* any content lands: the ask queues a
+/// download and the row has to be waiting when the bytes arrive. An inserted
+/// row with `released_at_ms` `NULL` would then tell [`materialized_paths`],
+/// [`materialized_rows`] and `lfs::listing::collect` that this clone holds
+/// content it does not — the phantom-row loss [`set_pinned`]'s own doc records
+/// for its pin arm. The honest value is available for free here, because that
+/// column's documented meaning is exactly *the content is not here*, which for
+/// a queued path is true; and [`remember_materialized`],
+/// [`observe_materialized`] and [`note_local_authorship`] all clear it the
+/// moment content does land, so nothing else has to know.
+///
+/// The conflict arm must **not** carry it: a row that already exists is a row
+/// about content whose presence somebody else established, and marking it
+/// released would hide a materialized path from every present-tense reader.
+///
+/// # Withdrawing is UPDATE-only
+///
+/// [`set_pinned`]'s asymmetry verbatim. Withdrawing an instruction the ledger
+/// never recorded is nothing at all, and an upsert here would insert a row
+/// asserting "content landed here now" for content that is not here — which
+/// [`crate::engine::release_due_at`] reads as a candidate forever.
+///
+/// `None` is also what *indefinite* writes: a materialize with no duration,
+/// `--for 0`, and the row's own Indefinitely are three spellings of one
+/// instruction — put this path back on the folder's window — and they must not
+/// mean three things. On a path nobody ever named a time for the statement
+/// sets `NULL` to `NULL`, which is why the plain verb's behaviour is unchanged.
+pub fn set_release_at(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    at_ms: Option<i64>,
+    now_ms: i64,
+) -> Result<()> {
+    match at_ms {
+        Some(at_ms) => {
+            conn.execute(
+                "INSERT INTO materialized
+                     (profile_id, path, at_ms, release_at_ms, released_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?3)
+                 ON CONFLICT(profile_id, path)
+                 DO UPDATE SET release_at_ms = excluded.release_at_ms",
+                (profile_id, path, now_ms, at_ms),
+            )?;
+        }
+        None => {
+            conn.execute(
+                "UPDATE materialized SET release_at_ms = NULL
+                  WHERE profile_id = ?1 AND path = ?2",
+                (profile_id, path),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Every path this clone holds content for **right now**.
 ///
 /// Read whole rather than asked per row: the caller is deciding a mark for a
@@ -939,11 +1029,11 @@ pub fn materialized_paths(
     Ok(out)
 }
 
-/// One row of the `materialized` ledger, late columns included (Stories 56.2
-/// and 56.5).
+/// One row of the `materialized` ledger, late columns included (Stories 56.2,
+/// 56.5 and 56.17).
 ///
-/// A struct rather than a tuple because five of the eight fields are
-/// `Option`s of two types and four of them are timestamps: a transposition
+/// A struct rather than a tuple because six of the nine fields are
+/// `Option`s of two types and five of them are timestamps: a transposition
 /// between `last_used_ms` and `synced_at_ms` would compile, pass every type
 /// check, and make a release decision on the wrong fact.
 ///
@@ -989,6 +1079,20 @@ pub struct MaterializedRow {
     /// this machine authored and has not yet pushed is never eligible, and
     /// `last_used_ms` for content that came from the remote.
     pub local_origin: bool,
+    /// The absolute epoch-ms instant the owner asked for this one path's
+    /// content to be let go again (Story 56.17), or `None` for a path on the
+    /// folder's own `releaseTtlMs` window — which is every path nobody has
+    /// named a time for, and every row written before the column existed.
+    ///
+    /// [`crate::engine::release_due_at`] reads it **instead of** the folder's
+    /// window, in both directions: an hour chosen inside a day-long window
+    /// goes sooner, and two days chosen inside it stay longer. It does not
+    /// outrank [`Self::pinned`], and it does not reach past FR-341 — a path
+    /// this clone authored that nothing has confirmed the remote holds is
+    /// still on no clock at any age, because a chosen duration must not become
+    /// a way around the barrier that stops keeper deleting bytes which exist
+    /// on one machine.
+    pub release_at_ms: Option<i64>,
 }
 
 /// Every `materialized` row whose content this profile **still holds**, whole.
@@ -1010,7 +1114,8 @@ pub struct MaterializedRow {
 /// bounded only by the byte budget.
 pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<MaterializedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT path, at_ms, last_used_ms, synced_at_ms, oid, size_bytes, pinned, local_origin
+        "SELECT path, at_ms, last_used_ms, synced_at_ms, oid, size_bytes, pinned, local_origin,
+                release_at_ms
            FROM materialized
           WHERE profile_id = ?1 AND released_at_ms IS NULL
           ORDER BY path",
@@ -1025,11 +1130,13 @@ pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<Mate
             r.get::<_, Option<i64>>(5)?,
             r.get::<_, Option<i64>>(6)?,
             r.get::<_, Option<i64>>(7)?,
+            r.get::<_, Option<i64>>(8)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (path, at_ms, last_used_ms, synced_at_ms, oid, size, pinned, local_origin) = row?;
+        let (path, at_ms, last_used_ms, synced_at_ms, oid, size, pinned, local_origin, release_at) =
+            row?;
         out.push(MaterializedRow {
             path,
             at_ms,
@@ -1043,6 +1150,9 @@ pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<Mate
             // `NULL` is *arrived from the remote*: see the column's own note
             // in [`ensure_materialized_columns`].
             local_origin: local_origin.unwrap_or(0) != 0,
+            // `NULL` is *this path is on the folder's own window*, which is
+            // the only reading of a row nobody named a time for (Story 56.17).
+            release_at_ms: release_at,
         });
     }
     Ok(out)
@@ -1141,6 +1251,18 @@ pub fn is_pinned(conn: &Connection, profile_id: &str, path: &str) -> Result<bool
 /// that, whatever a future caller does. `COALESCE` because a `NULL` **is**
 /// unpinned — [`MaterializedRow::pinned`]'s documented rule, and every row
 /// written before the column existed reads back that way.
+///
+/// # Why `release_at_ms` is the one column it clears (Story 56.17)
+///
+/// A chosen release time is a standing instruction, and this is the moment it
+/// is **served**: the content the owner asked to keep for two hours is gone.
+/// Left standing it would be a deadline in the past, so the same path
+/// materialized again with no duration — [`remember_materialized`] clears
+/// `released_at_ms`, and the row comes back live — would be eligible for
+/// release on the very next sweep, hours before the folder's own window says
+/// so. It is cleared beside the stamp rather than by a second statement
+/// because the two are one fact: this content left, and nobody is any longer
+/// waiting for it to.
 pub fn forget_materialized(
     conn: &Connection,
     profile_id: &str,
@@ -1148,7 +1270,7 @@ pub fn forget_materialized(
     now_ms: i64,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE materialized SET released_at_ms = ?3
+        "UPDATE materialized SET released_at_ms = ?3, release_at_ms = NULL
           WHERE profile_id = ?1 AND path = ?2 AND COALESCE(pinned, 0) = 0",
         (profile_id, path, now_ms),
     )?;
@@ -3221,6 +3343,7 @@ mod tests {
                 size_bytes: None,
                 pinned: false,
                 local_origin: false,
+                release_at_ms: None,
             }],
             "the old row survives with its timestamp untouched, and every late \
              column reads as absent rather than as zero, epoch or unpinned-by-record"
@@ -3287,6 +3410,7 @@ mod tests {
                 size_bytes: Some(4_194_304),
                 pinned: true,
                 local_origin: false,
+                release_at_ms: None,
             }],
             "only the timestamp moved: an upsert that named more than `at_ms`, \
              or a REPLACE that named less, fails here"
@@ -3354,6 +3478,7 @@ mod tests {
                 size_bytes: None,
                 pinned: true,
                 local_origin: false,
+                release_at_ms: None,
             },
             "four writers, four facts, none of them disturbing another"
         );
@@ -3535,6 +3660,7 @@ mod tests {
                 size_bytes: Some(4_096),
                 pinned: false,
                 local_origin: false,
+                release_at_ms: None,
             },
             "the floor is gone and nothing else moved: both clocks, the \
              provenance, the identity and the landing instant are exactly where \
@@ -3551,6 +3677,119 @@ mod tests {
             1_700,
             "and re-pinning a row that exists does not restamp the landing instant"
         );
+    }
+
+    /// A chosen release time is recorded as one column, withdrawn as one
+    /// column, and disturbs nothing else (Story 56.17).
+    #[test]
+    fn set_release_at_writes_one_fact_and_withdrawing_it_writes_one_fact() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        note_arrival(&c, "p", "clip.mp4", 1_700, "aaa111", 4_096).expect("arrival");
+        note_synced(&c, "p", "clip.mp4", 1_750).expect("the remote holds it");
+        set_pinned(&c, "p", "clip.mp4", true, 1_800).expect("pin");
+
+        set_release_at(&c, "p", "clip.mp4", Some(9_000), 1_900).expect("keep it two hours");
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read").remove(0),
+            MaterializedRow {
+                path: "clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: Some(1_700),
+                synced_at_ms: Some(1_750),
+                oid: Some("aaa111".to_owned()),
+                size_bytes: Some(4_096),
+                pinned: true,
+                local_origin: false,
+                release_at_ms: Some(9_000),
+            },
+            "one column: neither clock, the provenance, the identity, the pin \
+             nor the landing instant may move for an instruction about when \
+             the content may go"
+        );
+
+        // A later instruction replaces an earlier one rather than joining it.
+        set_release_at(&c, "p", "clip.mp4", Some(20_000), 2_000).expect("make it eight hours");
+        assert_eq!(
+            materialized_rows(&c, "p")
+                .expect("read")
+                .remove(0)
+                .release_at_ms,
+            Some(20_000)
+        );
+
+        set_release_at(&c, "p", "clip.mp4", None, 2_100).expect("indefinitely, after all");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(row.release_at_ms, None, "withdrawn");
+        assert!(row.pinned, "and the pin is still the pin");
+        assert_eq!(row.at_ms, 1_700, "and the landing instant never moved");
+    }
+
+    /// Naming a time for content that is not here yet writes a row **no
+    /// present-tense reader can see** (Story 56.17).
+    ///
+    /// The queued case is the whole reason the instruction is recorded when it
+    /// is asked for rather than when the bytes land, and it is also where a
+    /// naive upsert does real damage: a row with `released_at_ms` `NULL` claims
+    /// this clone holds the content. `Engine::pending` reads that as the
+    /// `replacing` flag, the sweep reads it as a candidate that can only refuse
+    /// `AlreadyPointer`, and the listing reads it as a materialized path. So
+    /// the insert says what is true — the content is not here — and the landing
+    /// writers clear it.
+    #[test]
+    fn a_deadline_for_content_that_has_not_landed_is_invisible_until_it_does() {
+        let c = conn();
+        set_release_at(&c, "p", "coming.mp4", Some(9_000), 1_000).expect("keep it two hours");
+
+        assert!(
+            materialized_paths(&c, "p").expect("read").is_empty(),
+            "nothing here claims this machine holds the content"
+        );
+        assert!(
+            materialized_rows(&c, "p").expect("read").is_empty(),
+            "and the sweep has no candidate to spend a budget slot refusing"
+        );
+
+        // The download lands, through the writer the arrival path uses.
+        remember_materialized(&c, "p", "coming.mp4", 5_000).expect("landing");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(
+            row.at_ms, 5_000,
+            "and the landing instant is the truth, not the instant the \
+             instruction was given"
+        );
+        assert_eq!(
+            row.release_at_ms,
+            Some(9_000),
+            "the deadline was waiting for the bytes, which is the point of \
+             recording it when the person asked"
+        );
+    }
+
+    /// Releasing content spends the instruction that was waiting for it
+    /// (Story 56.17).
+    ///
+    /// Left standing it would be a deadline in the past, so the same path
+    /// materialized again with no duration — `remember_materialized` clears
+    /// `released_at_ms`, so the row comes back live — would be eligible on the
+    /// very next sweep, hours before the folder's own window says so.
+    #[test]
+    fn releasing_a_path_withdraws_the_deadline_that_asked_for_it() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_000).expect("landing");
+        set_release_at(&c, "p", "clip.mp4", Some(2_000), 1_000).expect("keep it an hour");
+
+        forget_materialized(&c, "p", "clip.mp4", 2_500).expect("released");
+        assert!(materialized_rows(&c, "p").expect("read").is_empty());
+
+        remember_materialized(&c, "p", "clip.mp4", 9_000).expect("asked for again, indefinitely");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(
+            row.release_at_ms, None,
+            "the served instruction is gone, so this path is on the folder's \
+             own window and not on a deadline that expired hours ago"
+        );
+        assert_eq!(row.at_ms, 9_000);
     }
 
     /// A length SQLite's signed integer cannot hold saturates, and never wraps
@@ -3619,6 +3858,7 @@ mod tests {
                 size_bytes: None,
                 pinned: false,
                 local_origin: false,
+                release_at_ms: None,
             },
             "the neighbour folder's row at the same path is untouched"
         );

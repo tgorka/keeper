@@ -2666,6 +2666,18 @@ pub async fn sync_open_entry(
 /// is a separate process and its own reservation, which is stated on
 /// `Engine::materialize_entry`.
 ///
+/// **`keep_for_ms` is how long the person wants the file** (Story 56.17), in
+/// milliseconds, and it is the row's submenu rather than a setting: absent
+/// means the caller named no duration and any standing one is left exactly as
+/// it is, `0` means *indefinitely* and withdraws one, and a positive value
+/// keeps this path's content that long whatever the folder's own release
+/// interval says — shorter goes sooner, longer stays longer. The reading of
+/// those three cases is `keeper_sync::lfs::hydrate::KeepFor::from_ms`, shared
+/// with `keeper-syncd materialize --for`, because a zero must not mean two
+/// things on two surfaces. Every rule behind it — the pin's floor, FR-341's
+/// refusal to put unconfirmed local content on any clock at all — is the
+/// engine's and is unchanged here.
+///
 /// Rejects with: `syncUnavailable` (the folder is already syncing), `internal`
 /// (no such profile, an unplugged removable volume, a subpath that escapes the
 /// root — including through a symlinked parent, a path that is not a tracked
@@ -2677,15 +2689,18 @@ pub async fn sync_materialize_entry(
     state: tauri::State<'_, AppState>,
     id: String,
     subpath: String,
+    keep_for_ms: Option<u64>,
 ) -> Result<(), IpcError> {
     // The owned `Arc` `engine_of` hands back is moved into the blocking task
     // rather than borrowed: `Engine` lives behind an `Arc` precisely so a call
     // that may copy gigabytes can hold it without holding `state`.
     let engine = engine_of(&state)?;
     let asked = subpath.clone();
-    let done = tokio::task::spawn_blocking(move || engine.materialize_entry(&id, &subpath))
-        .await
-        .map_err(|err| open_failure(format!("could not materialize {asked}: {err}")))?;
+    let keep_for = keeper_sync::lfs::hydrate::KeepFor::from_ms(keep_for_ms);
+    let done =
+        tokio::task::spawn_blocking(move || engine.materialize_entry(&id, &subpath, keep_for))
+            .await
+            .map_err(|err| open_failure(format!("could not materialize {asked}: {err}")))?;
     match done {
         Ok(outcome) => {
             tracing::info!(

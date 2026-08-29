@@ -124,6 +124,9 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { FullValueButton, useOverflowing } from "@/components/ui/overflow-value";
@@ -311,6 +314,54 @@ export const FILES_CANCEL_LABEL = "Cancel";
 export const FILES_MATERIALIZE_LABEL = "Materialize";
 export const FILES_RELEASE_LABEL = "Release";
 export const FILES_PIN_LABEL = "Pin";
+
+/**
+ * How long the person can ask Materialize to keep one path's content for (story
+ * 56.17, FR-341).
+ *
+ * **Four fixed choices and not a picker.** The owner asked for the choice to be
+ * at the click — he went looking for "download for a set time" on the row and
+ * found nothing — and a date picker, a modal or a free-text field all put the
+ * answer a surface away from the question. Four is also all the row can honestly
+ * report back: {@link FILES_ROW_RELEASE_PX} is a `w-16` cell — six characters at
+ * this text size — drawing `formatReleaseIn`'s coarse ladder, so `1 hr` /
+ * `8 hr` / `23 hr` is the whole vocabulary a chosen deadline has for saying
+ * itself, and offering minutes or weeks would let a person name a duration this
+ * pane cannot read back to them.
+ *
+ * **Why these four.** A folder's own `releaseTtlMs` is 24 h by default, so the
+ * list brackets it on both sides: two below it for "I need this for the
+ * afternoon, not for tomorrow", one AT it, and one that switches the folder's
+ * clock off for this path entirely. The middle two are the two shapes of a
+ * working day.
+ *
+ * `Indefinitely` carries `0`, and the zero rather than an omission is the whole
+ * of its meaning. Rust reads an ABSENT duration as "this caller said nothing
+ * about retention, so leave whatever instruction this path already carries" —
+ * which is what the promoted control below sends, and what the copy planner and
+ * every pre-56.17 caller mean — and reads an explicit `0` as "indefinitely",
+ * which WITHDRAWS a standing deadline. Both then leave the path on the folder's
+ * own window, so on the ordinary row the two are indistinguishable; they differ
+ * on exactly the row this choice exists for, a path whose content was asked for
+ * "for two hours" and has not landed yet. See `KeepFor` in
+ * `keeper-sync/src/lfs/hydrate.rs`.
+ *
+ * Exported so {@link FilesPane}'s tests name the choices rather than re-typing
+ * the numbers: a suite holding its own copy of `28_800_000` would go on passing
+ * after this list changed.
+ */
+export const FILES_MATERIALIZE_DURATIONS: readonly {
+  readonly id: string;
+  readonly label: string;
+  /** Milliseconds, or `0` for indefinitely. Never `undefined`: the omission is
+   *  the promoted control's answer and means something else. */
+  readonly keepForMs: number;
+}[] = [
+  { id: "1h", label: "1 hour", keepForMs: 3_600_000 },
+  { id: "8h", label: "8 hours", keepForMs: 28_800_000 },
+  { id: "24h", label: "24 hours", keepForMs: 86_400_000 },
+  { id: "indefinite", label: "Indefinitely", keepForMs: 0 },
+];
 
 /**
  * Rust's words for a row whose Release request is CERTAIN to be refused (story
@@ -938,7 +989,42 @@ interface FilesRowAction {
   /** The glyph the promoted control draws. */
   readonly icon: LucideIcon;
   /** What the control and the menu item both do. One handler, so they cannot
-   *  drift — the rule `PriorityAction` states and this borrows. */
+   *  drift — the rule `PriorityAction` states and this borrows.
+   *
+   *  **This stays the verb's DEFAULT when {@link options} are present** (story
+   *  56.17). The hover cluster is icons — Story 48.9 took the words off it — and
+   *  an icon has no room for four of them, so a promoted control goes on firing
+   *  exactly this and means exactly what it has always meant. The submenu is an
+   *  addition to the menu, never a replacement for the verb. */
+  readonly onSelect: () => void;
+  /** The narrower answers this verb will accept, spelled as a submenu by the
+   *  row's context menu (story 56.17).
+   *
+   *  Absent on every verb but Materialize, and a verb without them renders in
+   *  BOTH surfaces exactly as it did before this field existed — which is why no
+   *  existing row changes. Where they are present the menu draws
+   *  {@link label} as a `ContextMenuSubTrigger` and each option as an item under
+   *  it; the cluster ignores them entirely and keeps {@link onSelect}. */
+  readonly options?: readonly FilesRowActionOption[];
+}
+
+/**
+ * One narrower answer to a verb the row already has (story 56.17).
+ *
+ * Deliberately not a `FilesRowAction`: an option has no glyph, because it is
+ * never promoted onto the row — the cluster shows a PREFIX of the verbs and
+ * nothing else, so an option that could be promoted would be a fifth control
+ * competing with the four the row already fights for pixels over.
+ */
+interface FilesRowActionOption {
+  /** Stable identity, for the menu item's key and for the tests that name it. */
+  readonly id: string;
+  /** The words in the menu item, and its accessible name. */
+  readonly label: string;
+  /** What choosing it does — the verb's own request, narrowed. Its own handler
+   *  rather than a value the menu interprets, so every option goes through
+   *  `runRowVerb` and inherits 56.14's per-burst serialization and the pane's
+   *  one alert sink. */
   readonly onSelect: () => void;
 }
 
@@ -2302,6 +2388,15 @@ export function FilesPane() {
             // A `materializing` row offers none of them, because the work it
             // would ask for is already in flight: the only honest verb there
             // would be a cancel, and Story 56.9 was not asked for one.
+            //
+            // **And it is the one verb with options** (story 56.17): the same
+            // request, narrowed to a duration the person names. `onSelect` here
+            // is untouched and still sends no duration, because that is what a
+            // promoted icon can honestly mean and what this verb has meant since
+            // 56.3; the four choices ride along in `options` and only the menu
+            // reads them. Each goes through `runRowVerb` exactly as the default
+            // does, so a refusal reaches the pane's one alert and two presses in
+            // one burst still do not overlap.
             ...(entry.sync.status === "virtual"
               ? [
                   {
@@ -2312,6 +2407,18 @@ export function FilesPane() {
                       runRowVerb(node, () =>
                         syncMaterializeEntry(node.profileId, entry.relativePath),
                       ),
+                    options: FILES_MATERIALIZE_DURATIONS.map((choice) => ({
+                      id: choice.id,
+                      label: choice.label,
+                      onSelect: () =>
+                        runRowVerb(node, () =>
+                          syncMaterializeEntry(
+                            node.profileId,
+                            entry.relativePath,
+                            choice.keepForMs,
+                          ),
+                        ),
+                    })),
                   },
                 ]
               : []),
@@ -2734,11 +2841,38 @@ export function FilesPane() {
               <ContextMenuSeparator />
             </>
           )}
-          {actions.map((action) => (
-            <ContextMenuItem key={action.id} onSelect={action.onSelect}>
-              {action.label}
-            </ContextMenuItem>
-          ))}
+          {/* A verb carrying narrower answers is a SUBMENU on the same item, and
+              this is `chat-row.tsx`'s construction — `ContextMenuSub` /
+              `SubTrigger` / `SubContent`, the shipped idiom for exactly this
+              shape — rather than a fifth one invented here. Every other verb
+              renders precisely as it did before story 56.17, which is what keeps
+              the item list, its order and its wording unchanged on every row that
+              gained nothing.
+
+              **A modal was refused.** The row's verbs are one typed
+              `FilesRowAction[]` feeding two surfaces, and a dialog would need a
+              third: its own focus trap, its own dismissal and its own place for a
+              refusal to land — while the pane already has one `role="alert"` sink
+              that every verb's rejection reaches. The choice belongs at the click
+              that raised the question. */}
+          {actions.map((action) =>
+            action.options === undefined ? (
+              <ContextMenuItem key={action.id} onSelect={action.onSelect}>
+                {action.label}
+              </ContextMenuItem>
+            ) : (
+              <ContextMenuSub key={action.id}>
+                <ContextMenuSubTrigger>{action.label}</ContextMenuSubTrigger>
+                <ContextMenuSubContent>
+                  {action.options.map((option) => (
+                    <ContextMenuItem key={option.id} onSelect={option.onSelect}>
+                      {option.label}
+                    </ContextMenuItem>
+                  ))}
+                </ContextMenuSubContent>
+              </ContextMenuSub>
+            ),
+          )}
         </ContextMenuContent>
       </ContextMenu>
     );

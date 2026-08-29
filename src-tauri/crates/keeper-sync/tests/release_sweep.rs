@@ -50,6 +50,7 @@ use keeper_sync::engine::{
     RELEASE_LOOK_EVERY_MS,
 };
 use keeper_sync::git;
+use keeper_sync::lfs::hydrate::{KeepFor, MaterializeOutcome};
 use keeper_sync::lfs::pointer::Pointer;
 use keeper_sync::lfs::store::LfsStore;
 use keeper_sync::platform::{SyncPlatform, TestPlatform};
@@ -293,9 +294,16 @@ fn ledger_paths(platform: &TestPlatform) -> Vec<String> {
 /// that an unconfirmed locally authored path must not reach 56.4's guards at
 /// all.
 fn candidates(platform: &TestPlatform, now_ms: i64) -> Vec<String> {
+    candidates_with(platform, now_ms, TTL_MS)
+}
+
+/// [`candidates`] for the tests whose folder runs a different window from
+/// [`TTL_MS`] — Story 56.17's, which need a folder window a chosen duration can
+/// be shorter and longer than.
+fn candidates_with(platform: &TestPlatform, now_ms: i64, ttl_ms: u64) -> Vec<String> {
     ledger_rows(platform)
         .into_iter()
-        .filter(|row| release_due_at(row, TTL_MS).is_some_and(|due| now_ms >= due))
+        .filter(|row| release_due_at(row, ttl_ms).is_some_and(|due| now_ms >= due))
         .map(|row| row.path)
         .collect()
 }
@@ -485,6 +493,28 @@ impl Fixture {
             .expect("record the materialization");
         db::note_local_authorship(&conn, PROFILE_ID, path, at_ms, &pointer.oid, pointer.size)
             .expect("record the authorship");
+    }
+
+    /// Ask for `path` **for a stated time**, through the production verb
+    /// (Story 56.17).
+    ///
+    /// `Engine::materialize_entry` and not a planted column, for the reason
+    /// the pin fixture reaches for `Engine::pin_entry`: an instruction nothing
+    /// in production can give is not an instruction. Every path this suite
+    /// seeds is already materialized, so the verb takes its already-held arm —
+    /// which is exactly the arm a person clicking Materialize on a row keeper
+    /// already holds takes, and the arm that has to record the deadline all
+    /// the same.
+    fn kept_for(&self, path: &str, keep_for_ms: u64) {
+        let done = self
+            .engine
+            .materialize_entry(PROFILE_ID, path, KeepFor::Ms(keep_for_ms))
+            .expect("the path is tracked and its content is here");
+        assert_eq!(
+            done.outcome,
+            MaterializeOutcome::AlreadyMaterialized,
+            "the fixture seeds content, so this is the already-held arm"
+        );
     }
 }
 
@@ -1769,5 +1799,328 @@ async fn a_row_with_no_recorded_size_is_shown_the_clock_the_sweep_will_use() {
         committed_blob(&f.root, "zone/clip.mp4"),
         "which is the half that makes the surface's answer true rather than \
          merely optimistic"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A duration the person chose (Story 56.17)
+// ---------------------------------------------------------------------------
+
+/// The folder's own window for these four tests: a day, so a chosen hour is
+/// plainly shorter than it and a chosen two days plainly longer.
+///
+/// Expressed as a multiple of [`TTL_MS`] rather than as a literal so the two
+/// numbers cannot drift apart, and so an assertion reads "a day" beside "an
+/// hour" instead of two seven-digit constants.
+const FOLDER_WINDOW_MS: u64 = TTL_MS * 24;
+
+/// A path asked for by the hour goes after that hour, though the folder keeps
+/// everything else for a day.
+///
+/// The shorter direction, and the one the owner asked for by name. The
+/// assertion that makes it about the *deadline* and not about the sweep
+/// running at all is the candidate set: with the folder's day-long window the
+/// row is not due for another twenty-three hours.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_path_asked_for_an_hour_goes_after_that_hour_inside_a_day_long_window() {
+    let Some(f) = fixture(&["clip.mp4"], |p| {
+        p.release_ttl_ms = FOLDER_WINDOW_MS;
+    })
+    .await
+    else {
+        return;
+    };
+    // Spent before the ask, so the release below is a real sweep and so the
+    // look window is not what the chosen hour is racing.
+    f.open_the_release_window().await;
+
+    let landed = f.platform.now_ms();
+    f.arrived("clip.mp4", landed);
+    f.kept_for("clip.mp4", TTL_MS);
+
+    let blob = committed_blob(&f.root, "clip.mp4");
+    let target = f.path("clip.mp4");
+    let before = inode(&target);
+
+    f.platform.advance_ms(TTL_MS as i64);
+    assert_eq!(
+        candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS),
+        vec!["clip.mp4".to_owned()],
+        "an hour after the ask the path is a candidate, though the folder's own \
+         window has twenty-three hours left to run"
+    );
+
+    f.sync().await;
+
+    assert_eq!(
+        std::fs::read(&target).expect("read the released file"),
+        blob,
+        "byte for byte the blob git committed"
+    );
+    assert_ne!(
+        inode(&target),
+        before,
+        "the inode changed, which is what a rename does and a truncation does not"
+    );
+    assert!(
+        ledger_paths(&f.platform).is_empty(),
+        "and the ledger no longer claims this machine holds the content"
+    );
+}
+
+/// A path asked for by two days survives the folder's day-long window, and
+/// goes when the two days are up.
+///
+/// The longer direction. Both halves are asserted through a real sweep,
+/// because "it was not released" a day in would also be true of a folder whose
+/// sweep never ran — so the same fixture is then carried past the chosen
+/// deadline and the release is the proof that everything else was working.
+#[tokio::test]
+async fn a_path_asked_for_two_days_outlives_a_day_long_window() {
+    let Some(f) = fixture(&["clip.mp4"], |p| {
+        p.release_ttl_ms = FOLDER_WINDOW_MS;
+    })
+    .await
+    else {
+        return;
+    };
+    f.open_the_release_window().await;
+
+    f.arrived("clip.mp4", f.platform.now_ms());
+    f.kept_for("clip.mp4", FOLDER_WINDOW_MS * 2);
+
+    // An hour past the folder's own window, which is when it would have gone.
+    f.platform.advance_ms((FOLDER_WINDOW_MS + TTL_MS) as i64);
+    assert!(
+        candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS).is_empty(),
+        "past the folder's window and not a candidate: the instant the person \
+         named replaced it rather than capping it"
+    );
+
+    f.sync().await;
+    assert_eq!(
+        std::fs::read(f.path("clip.mp4")).expect("read"),
+        f.content("clip.mp4"),
+        "and a real sweep leaves the content exactly where it is"
+    );
+
+    // Past the two days the person did ask for.
+    f.platform.advance_ms(FOLDER_WINDOW_MS as i64);
+    assert_eq!(
+        candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS),
+        vec!["clip.mp4".to_owned()],
+    );
+    f.sync().await;
+    assert!(
+        ledger_paths(&f.platform).is_empty(),
+        "the deadline the person named is honoured in both directions, so it \
+         does eventually go"
+    );
+}
+
+/// A pin outranks a chosen duration, and withdrawing the pin hands the path
+/// back to that duration rather than to the folder's window.
+///
+/// Three halves, and each is needed. The floor first: 56.5 checks the pin
+/// before any clock, and a story that added a deadline *above* that line would
+/// delete content the owner had pinned. Then the falsifiable one — the whole
+/// test runs two hours in, inside the folder's own day, so lifting the pin can
+/// only make the path a candidate because of the hour that was asked for.
+/// Then the pin again, a thousand hours on, for the "at any age" claim the
+/// first two do not make.
+#[tokio::test]
+async fn a_pin_outranks_a_chosen_duration_and_survives_it() {
+    let Some(f) = fixture(&["clip.mp4"], |p| {
+        p.release_ttl_ms = FOLDER_WINDOW_MS;
+    })
+    .await
+    else {
+        return;
+    };
+    f.open_the_release_window().await;
+
+    f.arrived("clip.mp4", f.platform.now_ms());
+    f.kept_for("clip.mp4", TTL_MS);
+    f.engine
+        .pin_entry(PROFILE_ID, "clip.mp4", true)
+        .expect("the path is tracked, so the pin is recorded");
+
+    // Two hours: past the hour that was asked for, and well inside the
+    // folder's own day. Both halves below need that window — the pin has to
+    // hold against a deadline that has already passed, and lifting it has to
+    // make the path a candidate for a reason that is not the folder's clock.
+    f.platform.advance_ms(TTL_MS as i64 * 2);
+    let row = ledger_rows(&f.platform).remove(0);
+    assert!(row.pinned, "the fixture is a pinned row");
+    assert!(
+        row.release_at_ms.is_some_and(|at| at < f.platform.now_ms()),
+        "carrying a chosen deadline that has already passed"
+    );
+    assert!(
+        candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS).is_empty(),
+        "and it is still not a candidate: the pin is asked before any clock, \
+         and a duration is a clock"
+    );
+
+    f.sync().await;
+    assert_eq!(
+        std::fs::read(f.path("clip.mp4")).expect("read"),
+        f.content("clip.mp4"),
+        "the content is untouched"
+    );
+
+    // Withdrawn, the path is due on the instruction it was given — and the
+    // folder's own day has twenty-two hours left to run, so nothing but that
+    // instruction can be what makes it a candidate.
+    f.engine
+        .pin_entry(PROFILE_ID, "clip.mp4", false)
+        .expect("unpin");
+    assert_eq!(
+        candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS),
+        vec!["clip.mp4".to_owned()],
+        "the pin was a floor over the chosen deadline, and lifting it puts the \
+         path back on that deadline rather than on the folder's window"
+    );
+
+    // And the floor really is ageless: pinned again, a thousand times the hour
+    // that was asked for changes nothing.
+    f.engine
+        .pin_entry(PROFILE_ID, "clip.mp4", true)
+        .expect("pin again");
+    f.platform.advance_ms(TTL_MS as i64 * 1_000);
+    assert!(
+        candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS).is_empty(),
+        "a pinned path is never a candidate, at any age, on either clock"
+    );
+}
+
+/// **The data-loss case, with a duration on it.** A path this clone wrote that
+/// nothing has confirmed the remote holds is on no clock at any age, and
+/// asking for it "for an hour" does not put it on one.
+///
+/// FR-341 is a `?` inside `release_due_at`, and the whole risk this story
+/// carries is that a chosen deadline gets read *before* it. Asserted on the
+/// candidate set rather than on the absence of a release, for AD-131's reason:
+/// the barrier is that such a path is never considered, not that it is
+/// considered and refused.
+///
+/// The second half is what makes it falsifiable today: once the upload IS
+/// confirmed, the hour that was asked for — already long past — makes the path
+/// a candidate at once, instead of a day after the confirmation.
+#[tokio::test]
+async fn a_chosen_duration_does_not_release_a_path_the_remote_has_never_confirmed() {
+    let Some(f) = fixture(&["clip.mp4"], |p| {
+        p.release_ttl_ms = FOLDER_WINDOW_MS;
+    })
+    .await
+    else {
+        return;
+    };
+    f.open_the_release_window().await;
+
+    f.authored("clip.mp4", f.platform.now_ms());
+    f.kept_for("clip.mp4", TTL_MS);
+
+    // A hundred times the hour that was asked for, and a use inside it.
+    f.platform.advance_ms(TTL_MS as i64 * 100);
+    db::note_use(
+        &ledger_conn(&f.platform),
+        PROFILE_ID,
+        "clip.mp4",
+        f.platform.now_ms(),
+    )
+    .expect("the owner opened their own file");
+    f.platform.advance_ms(TTL_MS as i64 * 100);
+
+    let row = ledger_rows(&f.platform).remove(0);
+    assert!(row.local_origin, "the fixture is a locally authored row");
+    assert_eq!(
+        row.synced_at_ms, None,
+        "and the remote has never been observed holding these bytes"
+    );
+    assert!(
+        row.release_at_ms.is_some_and(|at| at < f.platform.now_ms()),
+        "and a deadline was chosen for it, and is long past"
+    );
+    assert!(
+        candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS).is_empty(),
+        "so it is absent from the candidate set at any age: a duration is not a \
+         way around FR-341"
+    );
+
+    f.sync().await;
+    assert_eq!(
+        std::fs::read(f.path("clip.mp4")).expect("read"),
+        f.content("clip.mp4"),
+        "and a real sync leaves the only copy of these bytes where it is"
+    );
+
+    // The upload completes, which is the one moment the per-path proof exists.
+    // Now — and only now — the deadline the person named applies, and it is
+    // already behind us.
+    db::note_synced(
+        &ledger_conn(&f.platform),
+        PROFILE_ID,
+        "clip.mp4",
+        f.platform.now_ms(),
+    )
+    .expect("the unit that carried these bytes completed");
+    assert_eq!(
+        candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS),
+        vec!["clip.mp4".to_owned()],
+        "the confirmation is the barrier, and the chosen hour is the clock \
+         behind it — not the folder's day"
+    );
+}
+
+/// Asking again says nothing about the deadline unless it says something
+/// (Story 56.17).
+///
+/// The three spellings a caller has, through the production verb: no duration
+/// at all — which is the copy planner, every pre-56.17 caller and the row's
+/// promoted icon — leaves a standing instruction where it is, while an explicit
+/// *indefinitely* withdraws it. Folded into one value, duplicating a file would
+/// quietly discard the two hours its owner asked for.
+#[tokio::test]
+async fn asking_again_without_a_duration_leaves_the_one_already_given() {
+    let Some(f) = fixture(&["clip.mp4"], |p| {
+        p.release_ttl_ms = FOLDER_WINDOW_MS;
+    })
+    .await
+    else {
+        return;
+    };
+    f.open_the_release_window().await;
+
+    f.arrived("clip.mp4", f.platform.now_ms());
+    f.kept_for("clip.mp4", TTL_MS);
+    let chosen = ledger_rows(&f.platform).remove(0).release_at_ms;
+    assert!(
+        chosen.is_some(),
+        "the fixture is a path asked for by the hour"
+    );
+
+    f.engine
+        .materialize_entry(PROFILE_ID, "clip.mp4", KeepFor::Unspecified)
+        .expect("ask again, saying nothing about how long");
+    assert_eq!(
+        ledger_rows(&f.platform).remove(0).release_at_ms,
+        chosen,
+        "a caller with no opinion about retention must not overwrite one"
+    );
+
+    f.engine
+        .materialize_entry(PROFILE_ID, "clip.mp4", KeepFor::Indefinitely)
+        .expect("ask again, indefinitely this time");
+    assert_eq!(
+        ledger_rows(&f.platform).remove(0).release_at_ms,
+        None,
+        "and a caller that does say it withdraws the instruction, so the path \
+         is back on the folder's own window"
+    );
+    assert!(
+        candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS).is_empty(),
+        "which is a day away, not the hour that was asked for and withdrawn"
     );
 }
