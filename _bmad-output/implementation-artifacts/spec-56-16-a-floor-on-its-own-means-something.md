@@ -2,10 +2,11 @@
 title: 'A floor on its own means something'
 type: 'bugfix'
 created: '2026-08-29'
-status: 'in-review'
+status: 'done'
 review_loop_iteration: 0
 baseline_revision: '84abf87'
-followup_review_recommended: false
+final_revision: 'f519dbe'
+followup_review_recommended: true
 context: []
 warnings: []
 ---
@@ -285,18 +286,46 @@ not have. Gating the three main notes on `lfsMode: disabled` (where nothing is L
 so nothing stays away whatever either box says) is **out of scope**: that lie predates this
 story, applies equally to the patterns note, and the mode select sits directly above both.
 
-**Mutation proof, per test.** The suite cannot be executed in this worktree (a sibling agent
-holds the shared `target/`, and `cargo` is the coordinator's to run), so the fix was mutated away
-and each of the seven new tests reasoned over instead. The mutation was
-`let floor_selects = patterns.is_empty() && false && profile.virtual_over_bytes > 0;` — one edit,
-`floor_selects` unconditionally `false`, which restores the pre-story `resolve`
-(`self.patterns.matches(rela)` alone), the pre-story tier ladder (no `SizeFloor` arm reachable)
-and the pre-story `authorizes_anything` (`!self.patterns.is_empty()`). It has since been removed;
-`floor_selects` reads from `patterns.is_empty() && profile.virtual_over_bytes > 0` again.
+**Mutation proof — EXECUTED.** The first draft of this section reasoned over the seven tests
+because a sibling agent held the shared `target/`. The lock came free after the review pass, so
+both Rust mutations were run for real and this records what the runner actually printed. The
+reasoning below it is kept because it is what the predictions were, and comparing the two is the
+only way to know whether the reasoning was worth anything.
 
-Four of the seven fail without the fix. Three cannot, by construction, and each of those exists
-to fail against a *wrong* fix rather than an absent one — recorded as such rather than counted as
-coverage they do not provide:
+*Mutation 1 — the selector.* `let floor_selects = patterns.is_empty() &&
+profile.virtual_over_bytes > 0 && false;`, which restores the pre-story `resolve`
+(`self.patterns.matches(rela)` alone), the pre-story tier ladder (no `SizeFloor` arm reachable)
+and the pre-story `authorizes_anything`. Result: `test result: FAILED. 41 passed; 5 failed`.
+
+| Test that failed | Printed assertion | left / right |
+|---|---|---|
+| `the_owners_stored_configuration_keeps_his_large_files_away` | "a file above the floor is what the floor was set to keep away" | `Materialize` / `Virtual` |
+| `a_committed_protection_still_wins_over_a_floor_that_selects_on_its_own` | "and it protects only what it names: the floor still selects the rest" | `Materialize` / `Virtual` |
+| `a_profile_protection_still_wins_over_a_floor_that_selects_on_its_own` | "and the floor selects everything it did not name" | `Materialize` / `Virtual` |
+| `a_control_file_is_never_virtual_under_a_floor_that_selects_on_its_own` | "the fixture really is a floor-only policy" | `Unset` / `SizeFloor` |
+| `a_path_with_no_components_is_not_selected_by_a_floor` | "the fixture really is a floor-only policy, or the assertions below would pass with nothing selecting anything at all" | `Unset` / `SizeFloor` |
+
+*Mutation 2 — the frame guard.* `is_inside_the_repository`'s `names_something` initialised to
+`true` rather than `false`, i.e. the pre-review behaviour where `""` and `"."` were inside the
+frame. Result: `test result: FAILED. 45 passed; 1 failed` —
+`a_path_with_no_components_is_not_selected_by_a_floor`, on `"" names no file in the repository, so
+there is nothing here for a floor to authorize`, left `Virtual` right `Materialize`. So the
+review's finding was a real defect and its test is a real fence, not a restatement.
+
+*Restore verified by reading, not by memory.* After each mutation the file was replaced from a
+pre-mutation copy and `git diff --stat` plus `git status --porcelain` were both empty, then
+`cargo test -p keeper-sync --lib lfs::virtual_policy` was re-run: `46 passed; 0 failed`.
+
+**How the predictions held up.** The reasoned table said four of the original seven would fail.
+The runner failed five, because the fifth is the test the review pass added and the table predates
+it; of the original seven it failed exactly the four predicted, on exactly the predicted
+assertions and values. The three the table said *cannot* fail did not fail. The reasoning was
+accurate, and it was still worth executing: reasoning cannot distinguish "this assertion fails"
+from "this assertion fails for the reason I think".
+
+Four of the seven original tests fail without the fix. Three cannot, by construction, and each of
+those exists to fail against a *wrong* fix rather than an absent one — recorded as such rather
+than counted as coverage they do not provide:
 
 | Test | Without the fix | First failing assertion and the value it sees |
 |---|---|---|
@@ -337,3 +366,77 @@ reasoning.
 **Manual checks (if no CLI):**
 - `src-tauri/crates/keeper/src/sync_ipc.rs` cannot be compiled on this host (`gobject-sys`). It
   is doc-comment-only in this story; every touched symbol is reported for the macOS gate.
+
+## Auto Run Result
+
+Status: done. Two commits on `fix/56-15-a-clone-that-stopped-says-so`, not pushed: `866a339`
+(the change) and `f519dbe` (the ten review patches). A sibling agent's story 56.15 commit
+`363bf25` sits between them on the shared branch; the coordinator ships both stories as one PR.
+
+**What was implemented.** A non-zero `virtualOverBytes` with an empty *effective* permissive
+pattern set is now the selector: every LFS path at or above the floor may stay away, reported as
+`VirtualPolicyTier::SizeFloor`. Protections and control files still win unconditionally, a zero
+floor is still silence, and the floor never widens a zone some source already named. The folder
+form's one unconditional sentence became four mutually exclusive ones plus a pair of lines saying
+which of the floor and the LFS tracking size actually decides. `docs/sync.md` §3, §8, §9 and §17
+were corrected, including two claims that had been false since story 56.10.
+
+**The owner's configuration, unchanged, now does what he meant.** `tgdrive-light` —
+`{"lfsMode":"materialize","lfsThresholdBytes":262144,"virtualPatterns":[],"virtualOverBytes":1048576}`
+— keeps every file at or above 1 MiB as a placeholder and fetches it when he opens it. Proven by
+`the_owners_stored_configuration_keeps_his_large_files_away`, whose fixture is that row.
+
+**Files changed**
+- `src-tauri/crates/keeper-sync/src/lfs/virtual_policy.rs` — `floor_selects`, the `SizeFloor`
+  tier, `resolve`'s third gate, `authorizes_anything`, the frame guard's named-component rule,
+  and eight new tests.
+- `src-tauri/crates/keeper-sync/src/profile/mod.rs` — `virtual_over_bytes`' doc; no code change.
+- `src-tauri/crates/keeper/src/sync_ipc.rs` — doc text on three fields; no code, field or wire
+  change. Committed inside `363bf25` by agreement, since the shell crate's error arm forced that
+  file into the sibling's commit.
+- `src/components/sync/add-folder-form.tsx` — four floor sentences, two band lines, the
+  positive-half mirror, and one byte-count helper shared with the save.
+- `src/components/sync/add-folder-form.test.tsx` — three new tests, one renamed and extended.
+- `dev/mock-shell.ts` — the `tgdrive-light` fixture, so the state can be looked at.
+- `docs/sync.md` — §3 table, §8, §9 and §17.
+
+**Review findings.** 10 patched (3 high, 6 medium, 1 low), 1 deferred, 0 rejected, 0 intent
+gaps. Two findings were spec-caused and are argued in the Spec Change Log as patches rather than
+a `bad_spec` loopback. The three high findings were worth the whole round: the form's sentence
+contradicted the engine for a protections-only list, the floor's promise was false below the LFS
+tracking threshold with the corrective line gated on the wrong side of the comparison, and the
+change armed the release sweep for folders previously exempt while the spec asserted it could not.
+
+**Verification performed** — every command run on this host, on the final tree:
+- `cargo test -p keeper-core -p keeper-sync -p keeper-syncd` → **3596 passed, 0 failed, 1
+  ignored** (baseline 3579; the delta is this story's 8 and the sibling story's tests).
+- `cargo test -p keeper-sync --lib lfs::virtual_policy` → **46 passed, 0 failed**, all eight new
+  tests named in the output.
+- Mutation proof, executed twice and restored: neutering `floor_selects` → **41 passed, 5
+  failed**; reverting the frame guard → **45 passed, 1 failed**. Both restores verified by an
+  empty `git diff --stat` and `git status --porcelain`, then a green re-run. Printed assertions
+  and `left`/`right` values are in the Design Notes.
+- `cargo clippy -p keeper-core -p keeper-sync -p keeper-syncd --all-targets -- -D warnings` →
+  clean (keeper-sync confirmed re-checked, not cached).
+- `cargo fmt --all --check` → clean.
+- `bun run test` → **297 files, 4935 tests passed** (baseline 4932 + this story's 3).
+- `bun run typecheck` → clean. `bun run lint` → 4 warnings + 1 info, exactly baseline.
+- `git status --porcelain -- src/lib/ipc/gen` → empty; no binding drift, and none was possible
+  because no wire field changed.
+
+**Not verifiable here, for the macOS gate.** `src-tauri/crates/keeper` cannot link on Linux
+(`gobject-sys`), so `bun run check:rust`'s `--workspace` clippy and `bun run test:rust`'s
+`cargo-nextest` were replaced by the three-crate equivalents above. This story's symbols in that
+crate are `SyncProfileVm::virtual_patterns`, `SyncProfileVm::virtual_over_bytes` and
+`SyncProfileReq::virtual_over_bytes` — doc comments only, so a compile is a formality. The
+sibling story's `SyncError::CheckoutUnfinished` arm in the same file is load-bearing and has never
+been compiled anywhere; the PR body must name it.
+
+**Residual risks.**
+- The floor sentences are still not scoped to `lfsMode` beyond claiming only about files keeper
+  tracks; under `pointerOnly` the floor is not the operative control. Deferred with the argument,
+  because the honest fix scopes all three virtual controls at once.
+- A folder carrying a positive floor and no permissive pattern gains a release sweep it did not
+  have. Intended and now documented in three places, and the population is exactly the folders
+  whose floor was a dead control — but it is a real behaviour change on upgrade, and the release
+  path is reachable today only on Linux, where `open_file_state` can answer.
