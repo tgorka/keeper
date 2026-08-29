@@ -57,7 +57,9 @@ import {
   SYNC_TOKEN_READ_FAILED_PREFIX,
   SYNC_TOKEN_SHOW_LABEL,
   SYNC_TOKEN_UNREADABLE_NOTE,
+  SYNC_VIRTUAL_OVER_ALONE_NOTE,
   SYNC_VIRTUAL_OVER_LABEL,
+  SYNC_VIRTUAL_OVER_MATCHED_NOTE,
   SYNC_VIRTUAL_OVER_NONE_NOTE,
   SYNC_VIRTUAL_PATTERNS_LABEL,
   syncFolderOwnedNote,
@@ -1129,11 +1131,10 @@ describe("AddFolderForm virtual-file controls (Story 56.12)", () => {
    * Story 56.14: the size-floor box says when its content means "no floor".
    *
    * Fails before `SYNC_VIRTUAL_OVER_NONE_NOTE` was rendered. `0` is not a neutral
-   * fallback for this field — it is the documented instruction that every matched
-   * file may stay away, which is the widest setting it has — and anything
-   * `pinnedValue` cannot read as a positive number silently became it with
-   * nothing on screen, while the release box one line down explained both of its
-   * own coercions.
+   * fallback for this field — it is the documented instruction that nothing stays
+   * away for being large — and anything `pinnedValue` cannot read as a positive
+   * number silently became it with nothing on screen, while the release box one
+   * line down explained both of its own coercions.
    *
    * Three inputs, because the failure is a CLASS and not the empty box: a blank
    * field, a typed zero, and a half-typed number that parses to nothing. Each
@@ -1158,6 +1159,12 @@ describe("AddFolderForm virtual-file controls (Story 56.12)", () => {
     // A real floor takes it away again — otherwise the note would be furniture.
     fireEvent.change(floor, { target: { value: "8" } });
     expect(screen.queryByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).not.toBeInTheDocument();
+    // ...and it is replaced by the sentence for the state the form is now in:
+    // with the patterns box empty, a real floor is the SELECTOR (story 56.16).
+    // Asserting only the none-note's absence would pass over a form that said
+    // nothing at all about a floor that decides everything, which is precisely
+    // the silence the owner was left in.
+    expect(screen.getByText(SYNC_VIRTUAL_OVER_ALONE_NOTE)).toBeInTheDocument();
 
     // And the note tells the truth about what is sent: the same `=== null` that
     // renders it is what sends `0`.
@@ -1166,6 +1173,50 @@ describe("AddFolderForm virtual-file controls (Story 56.12)", () => {
     await waitFor(() =>
       expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ virtualOverBytes: 0 })),
     );
+  });
+
+  /**
+   * Story 56.16: the floor's note is true in each of the three states, and only
+   * one of them is on screen at a time.
+   *
+   * The owner saved
+   * `{"name":"tgdrive-light","virtualPatterns":[],"virtualOverBytes":1048576}` —
+   * a 1 MiB floor and no patterns, which can only mean "don't fetch the big
+   * files" — and the form answered with "A matched file smaller than this is
+   * downloaded anyway", a sentence about a match that could never happen. It sat
+   * beside `SYNC_VIRTUAL_OVER_NONE_NOTE`, so a blank box showed BOTH: two
+   * sentences, one of them false, under one control.
+   *
+   * Each state therefore asserts the absence of the other two and not merely the
+   * presence of its own. A note pair that can render two contradictory sentences
+   * is the defect's own shape, and a test that only looked for the right one
+   * would not have caught it before either.
+   */
+  it("the floor's note is true in each of the three states", async () => {
+    render(<AddFolderForm />);
+    await openAdvanced();
+    const floor = screen.getByLabelText(SYNC_VIRTUAL_OVER_LABEL);
+    const patterns = screen.getByLabelText(SYNC_VIRTUAL_PATTERNS_LABEL);
+
+    // (1) Nothing named, no floor: nothing stays away at all.
+    fireEvent.change(patterns, { target: { value: "" } });
+    fireEvent.change(floor, { target: { value: "" } });
+    expect(screen.getByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_ALONE_NOTE)).not.toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_MATCHED_NOTE)).not.toBeInTheDocument();
+
+    // (2) The owner's state: nothing named, a real floor — the floor decides.
+    fireEvent.change(floor, { target: { value: "1" } });
+    expect(screen.getByText(SYNC_VIRTUAL_OVER_ALONE_NOTE)).toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).not.toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_MATCHED_NOTE)).not.toBeInTheDocument();
+
+    // (3) Patterns named and a floor: the field's original job, and the only
+    // state the old unconditional sentence was ever true in.
+    fireEvent.change(patterns, { target: { value: "scans/**" } });
+    expect(screen.getByText(SYNC_VIRTUAL_OVER_MATCHED_NOTE)).toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_NONE_NOTE)).not.toBeInTheDocument();
+    expect(screen.queryByText(SYNC_VIRTUAL_OVER_ALONE_NOTE)).not.toBeInTheDocument();
   });
 
   it("seeds an edit form from the policy in force and saves it back unchanged", async () => {

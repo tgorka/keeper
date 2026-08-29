@@ -1,0 +1,225 @@
+---
+title: 'A floor on its own means something'
+type: 'bugfix'
+created: '2026-08-29'
+status: 'in-progress'
+review_loop_iteration: 0
+baseline_revision: '84abf87'
+followup_review_recommended: false
+context: []
+warnings: []
+---
+
+<intent-contract>
+
+## Intent
+
+**Problem:** The owner named a folder `tgdrive-light` and saved `virtualOverBytes: 1 MiB` with
+`virtualPatterns: []`, plainly meaning "don't fetch the big files". `VirtualPolicy::resolve`
+requires `self.patterns.matches(rela)` before it will answer `Virtual`, and with no permissive
+line anywhere the compiled set is empty — so every one of his 16 GB downloads anyway. The form
+accepted the setting and its note ("A matched file smaller than this is downloaded anyway")
+described a match that never happens. A control that silently does nothing.
+
+**Approach:** Make the floor a selector when nothing else selects: with the permissive set
+empty and `virtual_over_bytes > 0`, every LFS path at or above the floor may stay away, under a
+new `VirtualPolicyTier::SizeFloor` so the state is nameable rather than inferred. Protections
+stay the union of every source and still win unconditionally. Then reword the form's two notes
+so the pair is true in all three states, and correct `docs/sync.md` §9.
+
+## Boundaries & Constraints
+
+**Always:**
+- The floor authorizes *hydration decisions only* (AD-123, FR-330). Nothing in this story
+  deletes, prunes, dehydrates or truncates a byte, and `resolve` still performs no I/O (FR-328).
+- A protection wins over a floor-only policy exactly as it wins over a pattern — from
+  `.keepervirtual`, from `virtualPatterns`, from either folder TOML layer, unioned (story 56.14).
+- Control files (`.keepervirtual`, `.gitattributes`, `.lfsconfig`, `.git/`, `.keeper/`, …) can
+  never be virtual, floor or no floor.
+- An **unset** `virtualPatterns` is still silence: an empty profile list still leaves the
+  committed `.keepervirtual` deciding (the reading DW's "a host cannot decline the policy" entry
+  says must not change). The floor selects only when the *effective* permissive set — after that
+  precedence has run — is empty.
+- `virtualOverBytes: 0` with no patterns stays silent: `tier == Unset`, nothing stays away.
+- The form's note and the value it saves are decided by the same predicates, so the sentence and
+  the wire cannot drift.
+
+**Block If:** The semantics chosen would need a wire or `SyncProfile` field change. (They do
+not: `virtual_over_bytes` already exists on both, so `EXPRESSED`/`PRESERVED` and the
+`a_save_cannot_move_a_field_no_request_can_express` fixture are already correct.)
+
+**Never:**
+- No refusal path for "a floor with no patterns" — direction (b) is rejected, argued in Design
+  Notes; the floor must not become un-saveable.
+- No edit to `engine.rs`, `src/git/**` or `src/db.rs` (sibling agent `Story5615` owns them). The
+  engine needs none: `authorizes_anything()` and `tier()` already gate it and both now answer
+  correctly for a floor-only policy.
+- No hand-edit of `src/lib/ipc/gen/**`.
+- No change to `lfsMode`/`lfsThresholdBytes` routing. The floor sits above the LFS threshold and
+  does not move it.
+
+## I/O & Edge-Case Matrix
+
+| Scenario | Input / State | Expected Output / Behavior | Error Handling |
+|---|---|---|---|
+| The owner's folder | `virtualPatterns: []`, floor 1 MiB, no `.keepervirtual` | 4 MiB path → `Virtual`; 64 KiB path → `Materialize`; `tier() == SizeFloor`; `authorizes_anything()` | No error expected |
+| Floor exactly at the boundary | floor 1 MiB, path of exactly 1 MiB | `Virtual` — the floor is inclusive | No error expected |
+| Committed protection vs a floor-only policy | `.keepervirtual` = `!30-masters`, `virtualPatterns: []`, floor 1 MiB | `30-masters/a.mov` 4 MiB → `Materialize`; `40-media/a.mov` 4 MiB → `Virtual` | No error expected |
+| Profile protection vs a floor-only policy | `virtualPatterns: ["!30-masters"]`, floor 1 MiB | Same two answers; `tier() == SizeFloor` | No error expected |
+| Floor never widens an existing zone | `.keepervirtual` = `40-media/**`, floor 1 MiB | `50-iso/big.iso` 4 MiB → `Materialize`; `40-media/a.mov` 4 MiB → `Virtual`; `tier() == PatternFile` | No error expected |
+| Zero floor, no patterns | `virtualPatterns: []`, floor `0`, no file | `tier() == Unset`; `!authorizes_anything()`; a 10 MB path → `Materialize` | No error expected |
+| Control file under a floor-only policy | floor 1 MiB, `.gitattributes` of 4 MiB | `Materialize` | No error expected |
+| Form, no patterns + no floor | box empty, floor box `""`/`0`/`1e` | `SYNC_VIRTUAL_OVER_NONE_NOTE`; save carries `virtualOverBytes: 0` | No error expected |
+| Form, no patterns + a floor | patterns box empty, floor `1` | `SYNC_VIRTUAL_OVER_ALONE_NOTE` | No error expected |
+| Form, patterns + a floor | patterns box `scans/**`, floor `1` | `SYNC_VIRTUAL_OVER_MATCHED_NOTE` | No error expected |
+
+</intent-contract>
+
+## Code Map
+
+- `src-tauri/crates/keeper-sync/src/lfs/virtual_policy.rs` -- `VirtualPolicy::compile` gains the
+  `floor_selects` decision and the `SizeFloor` tier; `resolve` and `authorizes_anything` consult
+  it; `VirtualPolicyTier` gains the variant. All new tests live in the in-file `mod tests`.
+- `src-tauri/crates/keeper-sync/src/profile/mod.rs` -- `virtual_over_bytes`' doc comment, which
+  today says "a matched path".
+- `src-tauri/crates/keeper/src/sync_ipc.rs` -- the same correction on `SyncProfileVm` and
+  `SyncProfileReq`. No field added, no wire change; shell crate cannot be compiled here.
+- `src/components/sync/add-folder-form.tsx` -- three mutually exclusive floor notes chosen by
+  one pure helper; the patterns note gains the "and then the size decides" clause; the
+  between-thresholds note.
+- `src/components/sync/add-folder-form.test.tsx` -- the three-state test; the existing
+  story-56.14 "no floor" test updated to the new sentence.
+- `dev/mock-shell.ts` -- a floor-only fixture profile so the harness can show the state.
+- `docs/sync.md` §9 -- the floor paragraph, the stale 56.14 override paragraph, and the
+  `virtualOverBytes` row of the §3 table.
+
+## Tasks & Acceptance
+
+**Execution:**
+- [ ] `virtual_policy.rs` -- write the seven failing tests FIRST and record their pre-fix text.
+- [ ] `virtual_policy.rs` -- add `VirtualPolicyTier::SizeFloor`; compute
+  `floor_selects = patterns.is_empty() && profile.virtual_over_bytes > 0` in `compile` and store
+  it; make `resolve` answer `Virtual` on it after the protection and control-file gates; make
+  `authorizes_anything` include it -- the floor is what says something, so it must participate in
+  whether the tier says anything at all.
+- [ ] `virtual_policy.rs` -- mutate the new condition away and record each test's failure.
+- [ ] `profile/mod.rs` + `sync_ipc.rs` -- correct the three "a matched path" doc comments -- the
+  field's contract changed and its own documentation was the first place the lie lived.
+- [ ] `add-folder-form.tsx` -- `syncVirtualOverNote(floor, patterns)` plus the three constants and
+  the between-thresholds line -- the note said a match was required when no match ever happens.
+- [ ] `add-folder-form.test.tsx` -- assert each of the three sentences over the real component.
+- [ ] `dev/mock-shell.ts` -- add the floor-only profile.
+- [ ] `docs/sync.md` -- §9's floor paragraph and precedence; drop the pre-56.14 claim that a
+  `!`-only list installs an empty positive list.
+
+**Acceptance Criteria:**
+- Given the owner's stored configuration verbatim and unchanged, when the policy compiles, then a
+  4 MiB LFS path resolves `Virtual` and a 64 KiB one `Materialize`.
+- Given any protection from any source, when a floor-only policy resolves the path it names, then
+  the answer is `Materialize`.
+- Given a floor of `0` and no pattern anywhere, when the policy compiles, then `tier()` is
+  `Unset` and no path of any size resolves `Virtual`.
+- Given the form in each of the three states, when Advanced is open, then exactly one floor
+  sentence is on screen and it is the true one.
+- Given `cargo clippy -D warnings` over the three buildable crates, when it runs, then it is
+  clean; Rust tests at or above 3579 passed / 0 failed; frontend green; typecheck clean; lint at
+  baseline.
+
+## Spec Change Log
+
+## Review Triage Log
+
+## Design Notes
+
+**Why (a) and not (b).** Direction (b) — refuse to save a floor with no patterns — is honest but
+wrong here. The owner's instruction is already unambiguous: a size floor is a statement about
+size, and the only reason it needed a pattern beside it was an implementation detail of
+`resolve`. Refusing it would also make the *widest* useful configuration the one keeper cannot
+express, and would break a stored row that already exists on his machine — a load-bearing
+profile becoming unloadable is worse than the bug. (a) also keeps AD-123 intact untouched: the
+floor still only authorizes a hydration decision and never a deletion, and per-object proof is
+still the only thing that lets a byte go.
+
+**The other direction cannot be reached silently.** The two silent readings are now both
+impossible: a positive floor with no patterns *does* something (`tier() == SizeFloor`, and the
+form says so), and a zero floor with no patterns does nothing *and says so* — the tier is
+`Unset` and `SYNC_VIRTUAL_OVER_NONE_NOTE` is on screen. `SizeFloor` is a distinct variant rather
+than reusing `Profile` for exactly this reason: `Profile` would claim `virtualPatterns` decided,
+which is the empty list, and a regression that stopped the floor selecting could then pass a
+tier assertion. It cannot pass one that names `SizeFloor`.
+
+**The floor never widens an existing zone.** `floor_selects` is computed from the *effective*
+permissive set, after precedence. So a folder that already names files keeps naming exactly
+those, and the floor keeps its old job of holding the small ones back. Only a folder that named
+nothing gains a selector — which is the folder that previously had a dead control.
+
+**`lfsMode` and the two thresholds.** His profile is `materialize` with
+`lfsThresholdBytes: 262144`, so keeper routes files ≥ 256 KiB through LFS, and the virtual floor
+of 1 MiB sits above that. Three bands result:
+
+```
+< 256 KiB          not LFS at all — stored in git, always present locally
+256 KiB … 1 MiB    LFS-tracked (uploaded to the server) AND kept on this computer
+>= 1 MiB           LFS-tracked and a placeholder — fetched when he opens it
+```
+
+The middle band is the one he will ask about, and it is the intended shape: the floor is a
+*local space* decision, the LFS threshold is a *transport* decision, and they are allowed to
+disagree. The form says so in one line, rendered only when a positive floor sits above a
+positive threshold under `lfsMode: materialize` — so it can never claim a band that mode does
+not have. Gating the three main notes on `lfsMode: disabled` (where nothing is LFS-tracked and
+so nothing stays away whatever either box says) is **out of scope**: that lie predates this
+story, applies equally to the patterns note, and the mode select sits directly above both.
+
+**Mutation proof, per test.** The suite cannot be executed in this worktree (a sibling agent
+holds the shared `target/`, and `cargo` is the coordinator's to run), so the fix was mutated away
+and each of the seven new tests reasoned over instead. The mutation was
+`let floor_selects = patterns.is_empty() && false && profile.virtual_over_bytes > 0;` — one edit,
+`floor_selects` unconditionally `false`, which restores the pre-story `resolve`
+(`self.patterns.matches(rela)` alone), the pre-story tier ladder (no `SizeFloor` arm reachable)
+and the pre-story `authorizes_anything` (`!self.patterns.is_empty()`). It has since been removed;
+`floor_selects` reads from `patterns.is_empty() && profile.virtual_over_bytes > 0` again.
+
+Four of the seven fail without the fix. Three cannot, by construction, and each of those exists
+to fail against a *wrong* fix rather than an absent one — recorded as such rather than counted as
+coverage they do not provide:
+
+| Test | Without the fix | First failing assertion and the value it sees |
+|---|---|---|
+| `the_owners_stored_configuration_keeps_his_large_files_away` | **FAILS** | `resolve("40-media/holiday.mov", 4 MiB)`: left `Materialize`, right `Virtual` — "a file above the floor is what the floor was set to keep away". `patterns` is empty (no `.keepervirtual`, `virtualPatterns: []`), so `patterns.matches` is `false` and the size gate above it has already been passed. The three later assertions are never reached; had they been, `tier()` would read `Unset` and `authorizes_anything()` `false`. This is the owner's 16 GB, exactly. |
+| `a_committed_protection_still_wins_over_a_floor_that_selects_on_its_own` | **FAILS** | Second assertion, `resolve("40-media/a.mov", 4 MiB)`: left `Materialize`, right `Virtual` — "and it protects only what it names: the floor still selects the rest". The first assertion passes *vacuously* — `30-masters/a.mov` is `Materialize` because nothing was virtual at all, not because `never` won — which is why the second one has to be in the same test. |
+| `a_profile_protection_still_wins_over_a_floor_that_selects_on_its_own` | **FAILS** | Second assertion, `resolve("40-media/a.mov", 4 MiB)`: left `Materialize`, right `Virtual` — "and the floor selects everything it did not name". The tier assertion below it is never reached; it would read `Profile` (no file spoke, `from_profile.says_something()` is true on the `!` line) against an expected `SizeFloor` — the precise confusion the separate variant exists to make unpassable. |
+| `a_control_file_is_never_virtual_under_a_floor_that_selects_on_its_own` | **FAILS** | First assertion, `tier()`: left `Unset`, right `SizeFloor` — "the fixture really is a floor-only policy". That assertion is there for this reason: the control-file loop under it asserts `Materialize` and would pass vacuously in a policy that virtualizes nothing, so without a tier check the whole test would be dead weight. |
+| `a_floor_never_widens_a_zone_a_pattern_file_already_named` | passes | Cannot fail: `.keepervirtual` names `40-media/**`, so `patterns` is non-empty and `floor_selects` is `false` **with or without** the fix — which is the claim. It fails a fix that computed the floor's authority before precedence, or from `profile.virtual_patterns.is_empty()` rather than the compiled set: `resolve("50-iso/big.iso", 4 MiB)` would then read `Virtual` against `Materialize`, a zone no source ever named silently dehydrating on upgrade. |
+| `a_floor_of_zero_with_no_patterns_still_says_nothing` | passes | Cannot fail: with `virtual_over_bytes == 0` both spellings of `floor_selects` are `false`. It fails the naive fix `let floor_selects = patterns.is_empty();` — `tier()` would read `SizeFloor` against `Unset`, `authorizes_anything()` `true` against `false`, and `resolve(.., 10_000_000)` `Virtual` against `Materialize`. `0` is the default every profile ever written carries, so that fix is the owner's bug inverted and running on every folder in existence. |
+| `a_path_outside_the_repository_is_still_never_virtual_under_a_floor` | passes | Cannot fail: it asserts `Materialize` only, and without the fix nothing is virtual. It fences the frame guard against a fix that answered from the floor before `is_inside_the_repository` — under a floor-only policy there is no pattern to mismatch, so that guard is the *only* thing standing between `/home/u/tgdrive/40-media/a.mov` and a `Virtual` answer, where before it was the second line of defence. |
+
+The honest reading of that table: the story's behavioural claim is fenced by four tests, and the
+three that cannot fail here are the ones that constrain the *shape* of the fix rather than its
+presence. Two of them (`a_floor_never_widens…`, `a_floor_of_zero…`) each kill a specific plausible
+wrong implementation, which is why they are worth their lines.
+
+**The frontend half was mutated for real.** `vitest` needs neither `cargo` nor the shared
+`target/`, so it was run: `add-folder-form.test.tsx` is 46 passed / 0 failed. Collapsing
+`syncVirtualOverNote` to `return SYNC_VIRTUAL_OVER_MATCHED_NOTE;` — the old unconditional
+sentence, which is exactly what the owner was shown — fails **two** tests: the new
+`the floor's note is true in each of the three states` and story 56.14's
+`says when the size floor is off, for every input that means off`. Restoring the branch returns
+both to green. So the pair-cannot-contradict-itself claim is fenced by executed tests, not by
+reasoning.
+
+## Verification
+
+**Commands:**
+- `cargo test -p keeper-sync --lib lfs::virtual_policy` -- expected: the seven new tests pass;
+  each was recorded failing before the change.
+- `cargo clippy -p keeper-sync -p keeper-syncd -p keeper-core --all-targets -- -D warnings` --
+  expected: clean.
+- `cargo fmt --check` -- expected: clean.
+- `bun run test src/components/sync/add-folder-form.test.tsx` -- expected: green including the
+  three-state test.
+- `bun run typecheck` / `bun run lint` -- expected: clean / baseline (4 warnings + 1 info).
+
+**Manual checks (if no CLI):**
+- `src-tauri/crates/keeper/src/sync_ipc.rs` cannot be compiled on this host (`gobject-sys`). It
+  is doc-comment-only in this story; every touched symbol is reported for the macOS gate.

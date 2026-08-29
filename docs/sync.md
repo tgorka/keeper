@@ -79,7 +79,7 @@ reports names a profile. Profiles run concurrently and fail independently.
 | `lfsNever` | Globs that never go through LFS, whatever their size (default none) |
 | `lfsPruneLocal` | Release local LFS objects once the remote holds them (default **true**) |
 | `virtualPatterns` | Paths whose absent content `verify` will not call a fault (default none; see §9) |
-| `virtualOverBytes` | Size floor for that policy; `0` means no floor (default `0`) |
+| `virtualOverBytes` | Size floor for that policy, inclusive — and, with no permissive pattern in force from any source, the selector itself; `0` means no floor and nothing stays away (default `0`; see §9) |
 | `releaseTtlMs` | How long content may stay after its release clock last moved; `0` disables (default 24 h) |
 | `settleMs` | Quiescence window (see §4) |
 | `tags` | Extra `Keeper-Tag:` provenance trailers |
@@ -730,22 +730,48 @@ One departure, and it is the one worth remembering: **a protection wins
 unconditionally**, rather than by being the last match. Protections are also the
 **union** of every source, while a positive list from a higher tier replaces the
 file's list **wholesale** — so what is in force may be neither committed nor in
-that file at all. The boundary is worth stating exactly: a `virtualPatterns` list
-that parses to **at least one line**, positive or protective, counts as that tier
-having stated the policy and replaces the file's positive list entirely. A tier
-carrying nothing but `!` protections therefore installs an empty positive list
-and silently un-authorizes the whole committed zone, which `verify` then reports
-as missing objects — so a protection written up there has to sit beside the
-positive patterns you still want. `.keepervirtual` itself, `.lfsconfig`, `.git/`,
-`.keeper/` and git's own control files — `.gitattributes`, `.gitignore` and
-`.gitmodules` — can never be virtual whatever any pattern says; a virtualized
-`.gitattributes` would break LFS routing for its whole subtree.
+that file at all. The boundary is worth stating exactly, and it changed in story
+56.14: the override is decided on the **permissive half alone**. A
+`virtualPatterns` list that parses to at least one *positive* line replaces the
+file's positive list entirely; a list carrying nothing but `!` protections
+replaces nothing, and its protections simply union in with everyone else's. That
+is AD-123's rule in one sentence — a policy edit may widen what may leave and may
+never narrow what is kept — and the older reading broke it in the worst
+direction: one machine restating one exception installed an empty positive list
+and silently un-authorized the whole committed zone, which `verify` then reported
+as missing objects. `.keepervirtual` itself, `.lfsconfig`, `.git/`, `.keeper/`
+and git's own control files — `.gitattributes`, `.gitignore` and `.gitmodules` —
+can never be virtual whatever any pattern says; a virtualized `.gitattributes`
+would break LFS routing for its whole subtree.
 
 `virtualOverBytes` is a size floor under the whole policy: below it a path is
-materialized whatever matched it. It defaults to `0` — no floor — and the
-boundary is **inclusive**, so a file exactly at the floor is eligible. It comes
-only from the profile tiers, because gitignore dialect has no spelling for a
-size.
+materialized whatever matched it. When **no permissive pattern is in force from
+any source** it is also the **selector** (story 56.16) — a size is a statement
+about which files may stay away, so a folder whose only virtualization setting is
+a floor authorizes every LFS path at or above it, and `tier` reports `SizeFloor`
+for that state. A committed `.keepervirtual`, or a profile list with a positive
+line, takes that job back: the floor never widens a zone some source already
+named, and inside such a zone it keeps its older job of holding the small ones
+back. It defaults to `0`, which is still no floor and still means nothing stays
+away for being large — `tier` is `Unset` and the folder is not consulted at all.
+The boundary is **inclusive**, so a file exactly at the floor is eligible. It
+comes only from the profile tiers, because gitignore dialect has no spelling for
+a size.
+
+Three bands result, and the middle one is the one operators ask about. With
+`lfsMode: materialize`, `lfsThresholdBytes: 262144` and `virtualOverBytes:
+1048576`:
+
+```
+< 256 KiB          not LFS at all — stored in git, always present locally
+256 KiB … 1 MiB    LFS-tracked (uploaded to the server) AND kept on this computer
+>= 1 MiB           LFS-tracked and a placeholder — fetched when it is opened
+```
+
+That is the intended shape rather than a gap: the floor is a *local space*
+decision and the LFS threshold is a *transport* decision, and they are allowed to
+disagree. Under `pointerOnly` or `disabled` there is no middle band, because
+neither mode both tracks a file and keeps its content here.
 
 Precedence, ascending:
 
