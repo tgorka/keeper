@@ -2990,6 +2990,12 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
 /// with the expression quoted, because the alternative is a row that reports
 /// itself enabled and silently never fires.
 ///
+/// The id rule itself lives in [`crate::tasks::validate_id`] rather than here
+/// (Story 57.3). It is the same rule 57.3's CLI selector has to apply before it
+/// opens a database — to tell a spelling this keeper could never have stored
+/// from a well-formed id that names no row — and two copies of it would drift
+/// in the direction of a selector accepting an id this function refuses.
+///
 /// # Runtime state is not the caller's to write
 ///
 /// `running_host`, `lease_until_ms` and `next_due_ms` are owned by
@@ -3004,23 +3010,30 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
 /// future `lease_until_ms` and no `running_host` was held off by
 /// [`crate::tasks::decide`] forever.
 ///
-/// The window is cleared when the **schedule text changes**, so a new schedule
-/// takes effect on the next tick rather than after the old one's window elapses.
-/// `IS NOT` rather than `<>` because SQLite's `<>` is NULL-poisoned and a task
-/// gaining or losing its schedule is precisely the case that must be noticed.
+/// # A task coming back into service arms afresh, and never catches up
+///
+/// The window is cleared on three edges, and every one of them is a way a
+/// stored `next_due_ms` in the *past* would otherwise fire the moment the row
+/// became live again — which is catch-up, and Epic 57 rules catch-up out:
+/// *a task whose host was off for a week runs once when it returns, not seven
+/// times*.
+///
+/// * The **schedule text changes**, so a new schedule takes effect on the next
+///   tick rather than after the old one's window elapses.
+/// * The row goes from **disabled to enabled**. `tasks disable nightly` on a
+///   `@daily` release task, then `tasks enable nightly` a month later, left a
+///   window a month old, and [`crate::tasks::decide`] runs a task whose window
+///   is in the past — so re-enabling fired a *deletion sweep* on the very next
+///   1 Hz tick instead of at 03:00.
+/// * The **mode becomes `scheduled`** when it was not. Same story by the other
+///   door: `scheduled` → `manual` for a month → `scheduled` keeps a frozen past
+///   window, because the schedule text never moved.
+///
+/// `IS NOT` rather than `<>` throughout because SQLite's `<>` is NULL-poisoned
+/// and a task gaining or losing its schedule is precisely the case that must be
+/// noticed.
 pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<()> {
-    if task.id.trim().is_empty() {
-        return Err(SyncError::Config("task id must not be empty".into()));
-    }
-    // Refused rather than trimmed: the id is a primary key, it is what 57.3's
-    // CLI reads from argv and what `task_runs.task_id` joins on, and silently
-    // accepting three spellings of one intended task is worse than saying so.
-    if task.id.trim() != task.id {
-        return Err(SyncError::Config(format!(
-            "task id must not begin or end with whitespace, got {:?}",
-            task.id
-        )));
-    }
+    crate::tasks::validate_id(&task.id)?;
     // The parser's own refusal, propagated unchanged: it already names the
     // rule and quotes the expression, and a second layer of prose around it
     // would bury the one line that says what is wrong.
@@ -3059,6 +3072,9 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<()> {
              schedule    = excluded.schedule,
              mode        = excluded.mode,
              next_due_ms = CASE WHEN excluded.schedule IS NOT tasks.schedule
+                                  OR (excluded.enabled = 1 AND tasks.enabled = 0)
+                                  OR (excluded.mode = 'scheduled'
+                                      AND tasks.mode IS NOT 'scheduled')
                                 THEN NULL ELSE tasks.next_due_ms END,
              enabled     = excluded.enabled,
              updated_ms  = excluded.updated_ms",
@@ -6086,6 +6102,62 @@ mod tests {
             get_task(&c, "01S").expect("get").expect("row").next_due_ms,
             None,
             "a new schedule is unarmed, so the next tick computes its first window"
+        );
+    }
+
+    /// A task coming back into service arms afresh, and never catches up.
+    ///
+    /// Both edges, and both were the same defect wearing different clothes: a
+    /// `next_due_ms` that fell into the past while the row was not live, and
+    /// `crate::tasks::decide` runs a task whose window is past. So `tasks
+    /// disable nightly` on a `@daily` **release** task, then `tasks enable
+    /// nightly` a month later, fired a deletion sweep on the very next 1 Hz tick
+    /// instead of at 03:00 — catch-up, which Epic 57 rules out by name, and
+    /// which for the release kind means a deletion at an instant nobody chose.
+    ///
+    /// The window is asserted `None` rather than "not the old value", because
+    /// `None` is what makes the next tick take `Action::Arm` and compute the
+    /// real next instant.
+    #[test]
+    fn a_task_coming_back_into_service_arms_afresh_rather_than_catching_up() {
+        let c = conn();
+        let live = task("01E", Some("@daily"), TaskMode::Scheduled);
+        upsert_task(&c, &live).expect("save");
+        arm_task(&c, "01E", Some(50_000), 0).expect("arm");
+
+        let mut disabled = live.clone();
+        disabled.enabled = false;
+        upsert_task(&c, &disabled).expect("disable");
+        assert_eq!(
+            get_task(&c, "01E").expect("get").expect("row").next_due_ms,
+            Some(50_000),
+            "going out of service changes nothing: the row is simply not live"
+        );
+
+        upsert_task(&c, &live).expect("enable");
+        assert_eq!(
+            get_task(&c, "01E").expect("get").expect("row").next_due_ms,
+            None,
+            "but coming back into service must not fire a month-old window on \
+             the next tick"
+        );
+
+        // The other door: the schedule text never moves, so only the mode edge
+        // can clear the window here.
+        arm_task(&c, "01E", Some(50_000), 0).expect("arm");
+        let mut manual = live.clone();
+        manual.mode = TaskMode::Manual;
+        upsert_task(&c, &manual).expect("to manual");
+        assert_eq!(
+            get_task(&c, "01E").expect("get").expect("row").next_due_ms,
+            Some(50_000),
+            "a manual task keeps its remembered window; nothing obeys it"
+        );
+        upsert_task(&c, &live).expect("back to scheduled");
+        assert_eq!(
+            get_task(&c, "01E").expect("get").expect("row").next_due_ms,
+            None,
+            "and putting it back on its schedule arms afresh too"
         );
     }
 

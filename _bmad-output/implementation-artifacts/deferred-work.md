@@ -4867,3 +4867,7 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/spec-57-1-a-task-is-something-keeper-remembers.md`
   summary: A long host-wide task run holds `Engine::tick` and therefore delays the supervisor's shutdown, which NFR-42 asks to be a bounded finalize.
   evidence: `run_due_tasks` is awaited inside `tick()`, and `run()`'s `tokio::select!` cannot poll `shutdown.changed()` while a tick is awaited; `self.interrupt` is set only after the loop breaks. This is the shape `tick_profile` already has for a 20-folder pass, so it is pre-existing rather than introduced — but a task makes the worst case longer, and `release_task_leases` only bounds the lease, not the wait.
+
+- source_spec: `{project-root}/_bmad-output/implementation-artifacts/spec-57-3-the-verb-a-cron-can-call.md`
+  summary: `Engine::perform_sync_task` reports `TaskOutcome::Ok` for a host-wide sync task on a machine whose every folder is paused, so a cron wrapper cannot tell "the sync task is working" from "the sync task can never run here".
+  evidence: `engine.rs`'s host-wide branch collects `profiles.iter().filter(|p| p.enabled)` and its `targets.is_empty()` arm answers `(Ok, "no folders to sync")` without distinguishing "no folders configured" from "every folder paused" — the same shape story 57.4 fixed for the release kind by answering `Deferred` (exit 4) for the second. Pre-existing: it shipped with story 57.1, not with this change, and the sync kind's `Ok` is not a deletion, so it was left rather than widened into this diff.

@@ -49,6 +49,7 @@ use keeper_sync::engine::{
     release_due_at, Engine, ReleaseSchedule, RELEASE_BUDGET_BYTES, RELEASE_BUDGET_OBJECTS,
     RELEASE_LOOK_EVERY_MS,
 };
+use keeper_sync::error::SyncError;
 use keeper_sync::git;
 use keeper_sync::lfs::hydrate::{KeepFor, MaterializeOutcome};
 use keeper_sync::lfs::pointer::Pointer;
@@ -56,6 +57,7 @@ use keeper_sync::lfs::store::LfsStore;
 use keeper_sync::platform::{SyncPlatform, TestPlatform};
 use keeper_sync::profile::{LfsMode, SyncProfile, DEFAULT_RELEASE_TTL_MS};
 use keeper_sync::provenance::{Provenance, SyncSource};
+use keeper_sync::tasks::{TaskKind, TaskMode, TaskOutcome};
 
 /// What each pointer stands for. Small on purpose: the budget test seeds
 /// `RELEASE_BUDGET_OBJECTS + 1` of these and every one of them is hashed twice
@@ -67,6 +69,13 @@ const PROFILE_ID: &str = "01JRELEASE";
 /// The retention window every test here reasons about. Short and explicit, so
 /// an assertion says "a minute past the window" rather than "a day and a bit".
 const TTL_MS: u64 = 60 * 60 * 1000;
+
+/// The id of the release task Story 57.4's three-mode tests store.
+///
+/// One constant because every one of those tests reaches it through
+/// `Engine::run_task_now`, which takes an id and nothing else — the same door
+/// 57.3's `keeper-syncd tasks run release` will come through.
+const RELEASE_TASK_ID: &str = "01JRELEASETASK";
 
 /// `false` when this machine has no usable `git`, in which case there is no
 /// index to read and nothing here is falsifiable — the skip
@@ -515,6 +524,57 @@ impl Fixture {
             MaterializeOutcome::AlreadyMaterialized,
             "the fixture seeds content, so this is the already-held arm"
         );
+    }
+
+    /// Store a release task governing this folder, in the mode under test
+    /// (Story 57.4, FR-350).
+    ///
+    /// Through `Engine::save_task` — the one door every host writes tasks
+    /// through — rather than a planted row, for the reason [`Self::kept_for`]
+    /// reaches for `Engine::materialize_entry`: a knob nothing in production can
+    /// set is not a knob.
+    ///
+    /// The schedule is `@daily` in every mode, including `off` and `manual`,
+    /// deliberately. `mode` decides who may trigger and `enabled` decides
+    /// whether the row is live; a schedule is remembered either way, and a
+    /// fixture that omitted it for the non-scheduled modes would be asserting
+    /// the modes against three different rows.
+    fn release_task(&self, mode: TaskMode) {
+        self.engine
+            .save_task(&db::TaskRow {
+                id: RELEASE_TASK_ID.to_owned(),
+                profile_id: Some(PROFILE_ID.to_owned()),
+                kind: TaskKind::Release,
+                schedule: Some("@daily".to_owned()),
+                mode,
+                next_due_ms: None,
+                enabled: true,
+                updated_ms: 0,
+                running_host: None,
+                lease_until_ms: None,
+            })
+            .expect("a release task with a parseable schedule is savable");
+    }
+
+    /// Run the stored release task the way 57.3's `keeper-syncd tasks run
+    /// release` will, and hand back the row it recorded.
+    async fn run_the_release_task(&self) -> db::TaskRunRow {
+        self.engine
+            .run_task_now(RELEASE_TASK_ID)
+            .await
+            .expect("the task is stored and is not off")
+    }
+
+    /// How many bytes the worktree is holding at `name` right now.
+    ///
+    /// The measurement the whole story is about: a release is content leaving
+    /// the worktree, and the number of bytes that left is what a task has to be
+    /// able to report. Read from the filesystem rather than from the ledger, so
+    /// an assertion about reclaimed space is about space.
+    fn held_bytes(&self, name: &str) -> u64 {
+        std::fs::metadata(self.path(name))
+            .expect("the fixture seeds this path")
+            .len()
     }
 }
 
@@ -2122,5 +2182,289 @@ async fn asking_again_without_a_duration_leaves_the_one_already_given() {
     assert!(
         candidates_with(&f.platform, f.platform.now_ms(), FOLDER_WINDOW_MS).is_empty(),
         "which is a day away, not the hour that was asked for and withdrawn"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Release as a task, and its three modes (Story 57.4, FR-349, FR-350, AD-136)
+// ---------------------------------------------------------------------------
+
+/// **Upgrading into Story 57.4 changes nothing.**
+///
+/// With no `tasks` row anywhere — which is every `sync.db` in the field, since
+/// nothing in this story creates a row on migration, on open or on first tick —
+/// a successful sync releases exactly what Epic 56 releases today, and the
+/// bytes that left the worktree are counted rather than inferred.
+///
+/// This is the arrangement the three mode tests below reuse **unchanged**, so
+/// that "releases" and "releases nothing" there is attributable to the stored
+/// row and to nothing else about the fixture.
+#[tokio::test]
+async fn with_no_task_rows_at_all_a_successful_sync_releases_what_it_always_did() {
+    let Some(f) = fixture(&["clip.mp4"], |_| {}).await else {
+        return;
+    };
+    f.open_the_release_window().await;
+    f.arrived("clip.mp4", f.platform.now_ms());
+    let blob = committed_blob(&f.root, "clip.mp4");
+    let held_before = f.held_bytes("clip.mp4");
+    assert_eq!(
+        held_before, CONTENT_BYTES,
+        "the fixture starts materialized, or there is nothing to release"
+    );
+
+    f.platform.advance_ms(TTL_MS as i64);
+    f.sync().await;
+
+    let held_after = f.held_bytes("clip.mp4");
+    assert_eq!(
+        std::fs::read(f.path("clip.mp4")).expect("read the released file"),
+        blob,
+        "byte for byte the blob git committed — not a re-rendering of it"
+    );
+    // Not `held_before - held_after == CONTENT_BYTES - blob.len()`, which the
+    // two assertions around it already force and which therefore could never
+    // fail on its own. What the worktree holds now is the pointer text and
+    // nothing else, stated as the absolute number so a release that left a
+    // truncated file or a second copy behind would be caught here.
+    assert_eq!(
+        held_after,
+        blob.len() as u64,
+        "and the space it was holding really came back"
+    );
+    assert!(
+        ledger_paths(&f.platform).is_empty(),
+        "the ledger no longer claims this machine holds the content"
+    );
+
+    let listing = db::list_tasks(&ledger_conn(&f.platform)).expect("list the host's tasks");
+    assert_eq!(
+        (listing.tasks.len(), listing.unknown.len()),
+        (0, 0),
+        "and no row was invented anywhere to make that happen: this story adds a \
+         governor, not a default"
+    );
+}
+
+/// Mode `off`: the success edge releases nothing, and a request is refused.
+///
+/// The arrangement is [`with_no_task_rows_at_all_a_successful_sync_releases_what_it_always_did`]'s,
+/// byte for byte, so the only thing that can explain the file still being here
+/// is the stored row. `Engine::tick` is private, so the third half of `off` —
+/// that the task never comes due either — is asserted in the engine's own
+/// `a_release_task_that_is_off_never_comes_due`, where the tick is reachable.
+#[tokio::test]
+async fn a_release_task_in_mode_off_stops_the_success_edge_and_refuses_the_request() {
+    let Some(f) = fixture(&["clip.mp4"], |_| {}).await else {
+        return;
+    };
+    f.open_the_release_window().await;
+    f.arrived("clip.mp4", f.platform.now_ms());
+    f.release_task(TaskMode::Off);
+
+    f.platform.advance_ms(TTL_MS as i64);
+    f.sync().await;
+
+    assert_eq!(
+        std::fs::read(f.path("clip.mp4")).expect("read"),
+        f.content("clip.mp4"),
+        "the bytes are exactly where they were"
+    );
+    assert_eq!(
+        ledger_paths(&f.platform),
+        vec!["clip.mp4".to_owned()],
+        "and so is the row that would have gone with them"
+    );
+
+    let err = f
+        .engine
+        .run_task_now(RELEASE_TASK_ID)
+        .await
+        .expect_err("an `off` that still runs when asked is not off");
+    assert!(
+        matches!(err, SyncError::Config(_)),
+        "the refusal is typed, so 57.3's CLI can exit 2 on it, got {err:?}"
+    );
+    assert!(
+        f.engine
+            .task_history(RELEASE_TASK_ID, 10)
+            .expect("history")
+            .is_empty(),
+        "and a refused request opens no attempt at all"
+    );
+}
+
+/// Mode `manual`: the success edge releases nothing, and `tasks run release`
+/// releases the very same path the default case released.
+///
+/// This is the owner's ask, executable: *usuwanie nie musi być automatyczne,
+/// może to być skrypt puszczany w odpowiednim czasie* — the deletion stops
+/// riding the sync and waits to be called.
+#[tokio::test]
+async fn a_release_task_in_mode_manual_waits_to_be_called_and_then_releases() {
+    let Some(f) = fixture(&["clip.mp4"], |_| {}).await else {
+        return;
+    };
+    f.open_the_release_window().await;
+    f.arrived("clip.mp4", f.platform.now_ms());
+    f.release_task(TaskMode::Manual);
+    let blob = committed_blob(&f.root, "clip.mp4");
+    let held_before = f.held_bytes("clip.mp4");
+
+    f.platform.advance_ms(TTL_MS as i64);
+    f.sync().await;
+
+    assert_eq!(
+        f.held_bytes("clip.mp4"),
+        held_before,
+        "a sync is not the caller a `manual` task is waiting for"
+    );
+    assert_eq!(ledger_paths(&f.platform), vec!["clip.mp4".to_owned()]);
+
+    let run = f.run_the_release_task().await;
+
+    assert_eq!(
+        std::fs::read(f.path("clip.mp4")).expect("read the released file"),
+        blob,
+        "and when it is called it releases the very same path, byte for byte"
+    );
+    assert!(
+        ledger_paths(&f.platform).is_empty(),
+        "with the same ledger retraction the success edge would have made"
+    );
+    assert_eq!(
+        run.outcome,
+        Some(TaskOutcome::Ok),
+        "recorded as a run that worked"
+    );
+    assert_eq!(
+        run.detail.as_deref(),
+        Some(
+            format!(
+                "released 1 paths ({CONTENT_BYTES} bytes) from 1 folders, \
+                 0 declined, 0 already syncing, 0 unavailable"
+            )
+            .as_str()
+        ),
+        "and the record says what it achieved, which is the only thing a headless \
+         box ever sees"
+    );
+}
+
+/// Mode `scheduled`: the success edge still releases, **and** a task run
+/// releases past a look window that is closed.
+///
+/// Two claims, and the second is the load-bearing one. Putting the sweep on a
+/// schedule adds a driver rather than taking the existing one away, so the
+/// first half asserts the folder did not quietly lose the housekeeping it had.
+/// The second half then runs the task at an instant where
+/// `Engine::release_is_due`'s hourly *look* window is shut — the sync above
+/// re-armed it — and `movie.mp4` is nevertheless released. That gate exists
+/// because the success edge fires every few seconds and knows nothing about
+/// when a person wants a deletion; a task IS that statement, so honouring the
+/// gate as well would make the first scheduled run a silent no-op.
+///
+/// The two paths are put on deliberately different clocks — a second apart —
+/// so that the sync releases exactly one of them and leaves the other for the
+/// task, inside the same look window.
+#[tokio::test]
+async fn a_release_task_in_mode_scheduled_keeps_the_success_edge_and_runs_past_the_look_gate() {
+    let Some(f) = fixture(&["clip.mp4", "movie.mp4"], |_| {}).await else {
+        return;
+    };
+    f.open_the_release_window().await;
+    let armed_at = f.platform.now_ms();
+    f.arrived("clip.mp4", armed_at);
+    // A second later, so `movie.mp4` is not yet a candidate on the sync below
+    // and its own deadline still falls well inside the look window that sync
+    // re-arms.
+    f.arrived("movie.mp4", armed_at + 1_000);
+    f.release_task(TaskMode::Scheduled);
+
+    f.platform.advance_ms(TTL_MS as i64);
+    f.sync().await;
+
+    assert_eq!(
+        ledger_paths(&f.platform),
+        vec!["movie.mp4".to_owned()],
+        "a `scheduled` release task does not take away the driver the folder had"
+    );
+
+    // One second more: `movie.mp4` is now due, and the look window the sync
+    // just re-armed does not open for another whole hour.
+    f.platform.advance_ms(1_000);
+    assert_eq!(
+        candidates(&f.platform, f.platform.now_ms()),
+        vec!["movie.mp4".to_owned()],
+        "the remaining path is due, so what follows is about the look gate"
+    );
+    let run = f.run_the_release_task().await;
+
+    assert_eq!(
+        std::fs::read(f.path("movie.mp4")).expect("read the released file"),
+        committed_blob(&f.root, "movie.mp4"),
+        "a task's schedule REPLACES the look gate; honouring both would make the \
+         first scheduled run a silent no-op"
+    );
+    assert_eq!(run.outcome, Some(TaskOutcome::Ok));
+    assert!(
+        ledger_paths(&f.platform).is_empty(),
+        "and the ledger no longer claims this machine holds either one"
+    );
+}
+
+/// **The data-loss case, under a task.** Content this clone wrote that nothing
+/// has confirmed the remote holds is not released by `tasks run release` at any
+/// age, and its ledger row is not touched either (FR-341, AD-131).
+///
+/// A task is not a privileged caller. `release_expired` is the whole
+/// implementation of the release verb and the trigger changes only *when* the
+/// pass may look — so FR-341's `?` inside `release_due_at` is reached
+/// identically, and the path is never *considered* rather than considered and
+/// refused. Asserted on the candidate set as well as on the bytes, for AD-131's
+/// reason: "it was not released" would also be true of a path that reached
+/// 56.4's guards and was turned away there.
+#[tokio::test]
+async fn a_task_does_not_release_a_path_the_remote_has_never_confirmed() {
+    let Some(f) = fixture(&["clip.mp4"], |_| {}).await else {
+        return;
+    };
+    f.open_the_release_window().await;
+    f.authored("clip.mp4", f.platform.now_ms());
+    f.release_task(TaskMode::Manual);
+    let before = ledger_rows(&f.platform);
+    assert_eq!(before.len(), 1, "the fixture recorded one authored path");
+
+    // A hundred windows, so nothing here can be "not yet".
+    f.platform.advance_ms(TTL_MS as i64 * 100);
+    assert!(
+        candidates(&f.platform, f.platform.now_ms()).is_empty(),
+        "such a path is on no clock at any age"
+    );
+
+    let run = f.run_the_release_task().await;
+
+    assert_eq!(
+        std::fs::read(f.path("clip.mp4")).expect("read"),
+        f.content("clip.mp4"),
+        "the only copy of this content is still the only copy of it"
+    );
+    assert_eq!(
+        ledger_rows(&f.platform),
+        before,
+        "and the row is untouched — not retracted, not restamped"
+    );
+    assert_eq!(
+        run.outcome,
+        Some(TaskOutcome::Ok),
+        "a pass with nothing it may release is a pass that worked"
+    );
+    assert_eq!(
+        run.detail.as_deref(),
+        Some(
+            "released 0 paths (0 bytes) from 1 folders, \
+             0 declined, 0 already syncing, 0 unavailable"
+        ),
+        "and it says so rather than reporting a release it did not make"
     );
 }

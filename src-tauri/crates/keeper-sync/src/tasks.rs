@@ -96,6 +96,25 @@ pub enum TaskKind {
     /// Sync one profile's folder once, through the engine's ordinary one-shot
     /// pass and its reservation.
     Sync,
+    /// One release sweep over the named folder, or over every enabled folder
+    /// when the task is host-wide (Story 57.4, FR-349, FR-350).
+    ///
+    /// `Engine::release_expired` is the whole implementation — the same body
+    /// the success edge of a sync runs — so every Epic 56 refusal, both AD-131
+    /// clocks, the pin, 56.17's per-file deadline and both budgets apply to it
+    /// identically. **A task is not a privileged caller**; what a task trigger
+    /// changes is only *when* the pass may look.
+    ///
+    /// **Why this could not be the first kind.** Story 57.1's Design Notes
+    /// settle it: the sweep carries its own hourly `release_is_due` **look**
+    /// gate, so a task's schedule would not have controlled it — a nightly
+    /// release task would have fired at 03:00 and been declined by an interval
+    /// that knows nothing about schedules. Threading a triggered-run bypass
+    /// through that gate, together with the off/manual/scheduled mode this row
+    /// now imposes on the success edge too, *is* Story 57.4. `Sync` needed none
+    /// of it, which is why "a due task really runs" could be asserted a wave
+    /// earlier without a stub.
+    Release,
 }
 
 impl TaskKind {
@@ -104,6 +123,7 @@ impl TaskKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Sync => "sync",
+            Self::Release => "release",
         }
     }
 
@@ -112,6 +132,7 @@ impl TaskKind {
     pub fn from_stored(value: &str) -> Option<Self> {
         match value {
             "sync" => Some(Self::Sync),
+            "release" => Some(Self::Release),
             _ => None,
         }
     }
@@ -653,6 +674,44 @@ fn civil_from_days(day: i64) -> (i64, u32, u32) {
     (year, month as u32, day_of_month as u32)
 }
 
+/// Whether `id` is a spelling a task could ever have been stored under
+/// (Story 57.3, FR-347).
+///
+/// **The single implementation of that rule**, and public because two callers
+/// on opposite sides of the database need the same answer from it:
+/// [`crate::db::upsert_task`], which refuses at the write door, and 57.3's
+/// `keeper-syncd tasks` selector, which has to tell **"a spelling this keeper
+/// could never have stored"** — malformed, refuse and quote it — apart from
+/// **"well formed, but no such task"** — unknown, refuse and list what is
+/// known. Those are two different sentences and two different pieces of advice
+/// to the person at the prompt: a selector that could not distinguish them
+/// would answer "no such task" to `tasks run "nightly "` and send somebody
+/// looking for a row that was never the problem.
+///
+/// Pure — no `self`, no clock, no `Connection` — so the selector may ask it
+/// before it opens a database, and so the rule is asserted against literal
+/// strings. A second copy of it inside the CLI is the one duplication this
+/// story cannot afford: two copies drift, and the drift would be silent in the
+/// direction of accepting an id [`crate::db::upsert_task`] will not store.
+///
+/// The two rules and both messages are the ones the write door has carried
+/// since Story 57.1, moved here verbatim rather than reworded — a stored
+/// refusal's text is what a person greps for.
+pub fn validate_id(id: &str) -> Result<()> {
+    if id.trim().is_empty() {
+        return Err(SyncError::Config("task id must not be empty".into()));
+    }
+    // Refused rather than trimmed: the id is a primary key, it is what 57.3's
+    // CLI reads from argv and what `task_runs.task_id` joins on, and silently
+    // accepting three spellings of one intended task is worse than saying so.
+    if id.trim() != id {
+        return Err(SyncError::Config(format!(
+            "task id must not begin or end with whitespace, got {id:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// The pure gate: what this host should do about one task, right now.
 ///
 /// No `self`, no clock, no database and no allocation, so the state machine is
@@ -1101,7 +1160,7 @@ mod tests {
     /// run (NFR-43).
     #[test]
     fn an_unrecognised_stored_kind_including_update_is_not_a_kind_this_build_runs() {
-        for value in ["update", "release", "Sync", "", "teleport"] {
+        for value in ["update", "Sync", "", "teleport", "Release", "releases"] {
             assert_eq!(
                 TaskKind::from_stored(value),
                 None,
@@ -1109,18 +1168,20 @@ mod tests {
             );
         }
         assert_eq!(TaskKind::from_stored("sync"), Some(TaskKind::Sync));
+        // Story 57.4's kind, asserted beside the refusals rather than in a test
+        // of its own: the claim worth making is that adding a second kind did
+        // not widen the vocabulary by anything else, and `update` in particular
+        // is still nothing this build can name.
+        assert_eq!(TaskKind::from_stored("release"), Some(TaskKind::Release));
     }
 
     /// The on-disk spellings are the compatibility surface, so every one of
     /// them must survive a round trip through the reader that parses it.
     #[test]
     fn every_stored_spelling_round_trips() {
-        // One variant today, so this is an assertion rather than a loop; the
-        // loop returns when a second kind lands.
-        assert_eq!(
-            TaskKind::from_stored(TaskKind::Sync.as_str()),
-            Some(TaskKind::Sync)
-        );
+        for kind in [TaskKind::Sync, TaskKind::Release] {
+            assert_eq!(TaskKind::from_stored(kind.as_str()), Some(kind));
+        }
         for mode in [TaskMode::Off, TaskMode::Manual, TaskMode::Scheduled] {
             assert_eq!(TaskMode::from_stored(mode.as_str()), Some(mode));
         }
@@ -1133,5 +1194,42 @@ mod tests {
         ] {
             assert_eq!(TaskOutcome::from_stored(outcome.as_str()), Some(outcome));
         }
+    }
+
+    /// The id rule, at the one place that now holds it (Story 57.3).
+    ///
+    /// Asserted here rather than only through `db::upsert_task` because
+    /// 57.3's CLI asks this function *before* it opens a database, to tell "a
+    /// spelling this keeper could never have stored" apart from "well formed,
+    /// but no such task" — two different sentences to the person at the prompt.
+    /// An interior space is accepted deliberately: the rule is about the edges,
+    /// and refusing more than the write door refuses would have the selector
+    /// reject an id `upsert_task` is perfectly willing to store.
+    #[test]
+    fn the_id_rule_accepts_what_the_write_door_stores_and_refuses_what_it_will_not() {
+        for id in ["nightly", "01JTASK", "release sweep"] {
+            assert!(
+                validate_id(id).is_ok(),
+                "{id:?} is a spelling this keeper stores"
+            );
+        }
+        for id in ["", "   ", "\t", " nightly", "nightly ", "nightly\n"] {
+            let err = validate_id(id).expect_err("refused");
+            assert!(
+                matches!(err, SyncError::Config(_)),
+                "{id:?} must be a typed configuration refusal, got {err:?}"
+            );
+        }
+        // The two messages, verbatim, because 57.3's CLI prints them and a
+        // refusal that does not quote the input leaves nothing to fix.
+        assert_eq!(
+            validate_id("").expect_err("refused").to_string(),
+            "invalid sync configuration: task id must not be empty"
+        );
+        assert_eq!(
+            validate_id("nightly ").expect_err("refused").to_string(),
+            "invalid sync configuration: task id must not begin or end with whitespace, \
+             got \"nightly \""
+        );
     }
 }
