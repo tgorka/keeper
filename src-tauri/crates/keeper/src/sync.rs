@@ -463,6 +463,39 @@ pub fn stop_supervisor() {
     }
 }
 
+/// Stop the supervisor **and** hand this host's task leases back, on the quit
+/// path only (Story 57.5, AD-137, NFR-42).
+///
+/// [`stop_supervisor`] alone was not enough, and the gap is a race the app
+/// loses. `Engine::run` releases the leases after its loop breaks — its
+/// post-loop `finalize()` is what reaches `db::release_host_leases` — but
+/// [`start_supervisor`] drops the spawned task's `JoinHandle`, nothing on the
+/// quit path awaits it, and `self.tick().await` runs inside the `select!`
+/// *branch*, so a supervisor mid-tick cannot even observe the signal before the
+/// process exits. A task holding a lease at quit was therefore unrunnable by
+/// **any** host for the whole of `TASK_LEASE_MS`, and the lease names a pid the
+/// next launch cannot prove dead — on Linux the daemon shares the device row
+/// and may legitimately hold one.
+///
+/// So the release is done here, synchronously, on the thread that is quitting:
+/// one bounded conditional `UPDATE` scoped to this host's own leases,
+/// idempotent, and exactly what `finalize` would have done.
+///
+/// [`engine_if_open`] rather than [`engine`]: quitting must never *build* an
+/// engine, which would open a database to release leases that by definition
+/// cannot exist yet.
+///
+/// **Only the quit path calls this.** Closing the window runs
+/// `api.prevent_close()` + `window.hide()` and keeps the process, the engine and
+/// the supervisor alive — a hidden keeper is still a task host — so releasing
+/// there would stop work the user never asked to stop.
+pub fn finalize_for_quit() {
+    stop_supervisor();
+    if let Some(engine) = engine_if_open() {
+        engine.release_task_leases();
+    }
+}
+
 fn supervisor_slot() -> MutexGuard<'static, Option<tokio::sync::watch::Sender<bool>>> {
     SUPERVISOR
         .lock()

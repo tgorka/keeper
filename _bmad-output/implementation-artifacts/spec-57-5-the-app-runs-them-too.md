@@ -121,10 +121,12 @@ the host that will actually run it — including the honest negatives AD-137 nam
 - [x] `keeper-sync/src/engine.rs` — test the onset edge over a recording platform: many failures,
       one notification; recovery re-arms; `Busy`/`Deferred` neither notify nor clear. Test that
       `release_task_leases` frees a held lease so another host claims it.
-- [ ] `keeper/src/sync_ipc.rs` — the five commands and the row→VM mapping.
-- [ ] `keeper/src/sync.rs` + `keeper/src/lib.rs` — `finalize_for_quit` on the quit path only, the
+- [x] `keeper/src/sync_ipc.rs` — the five commands and the row→VM mapping.
+- [x] `keeper/src/sync.rs` + `keeper/src/lib.rs` — `finalize_for_quit` on the quit path only, the
       splice, and a source test asserting one interval in the shell and that `CloseRequested`
-      reaches neither the stop nor the release.
+      reaches neither the stop nor the release. The source test landed in
+      [`src/test/task-host-tick.test.ts`](../../src/test/task-host-tick.test.ts) rather than in
+      `keeper/src/lib.rs` — see Design Notes, *Where the source test lives*.
 - [ ] `src/lib/ipc/client.ts` — five wrappers with literal command names.
 - [ ] `src/hooks/use-tasks-shortcut.ts` (+ test) — ⌘8/Ctrl+8, IME, typing targets, capability gate.
 - [ ] `src/components/layout/tasks-pane.tsx` (+ test) — the rows, Run now, the unhosted case, the
@@ -150,6 +152,17 @@ the host that will actually run it — including the honest negatives AD-137 nam
 ## Review Triage Log
 
 ## Design Notes
+
+**Where the source test lives, and why not in `keeper/src/lib.rs`.** The Code Map put the
+no-second-clock scan in the shell crate. It is in
+[`src/test/task-host-tick.test.ts`](../../src/test/task-host-tick.test.ts) instead, for the reason
+`src/test/command-registration.test.ts` states in its own header: the `keeper` crate does not
+compile on Linux (AD-55, AD-56), so a `#[cfg(test)]` assertion there runs only on the macOS gate —
+prose on the machine most of this epic was written on, and on CI. Both facts the test guards are
+about *source text* (how many intervals exist; which arm reaches the release), so a scanner is the
+honest shape either way, and this repository already has three of them
+(`tray-notes-labels`, `capture-capability`, `file-scheme-registration`). One rule, one place: it is
+not also duplicated in Rust.
 
 **The app was already a host; this story makes it an honest one.** `Engine::tick` calls
 `run_due_tasks` (engine.rs:1904) and `lib.rs:600-604` starts that supervisor under `#[cfg(desktop)]`.
