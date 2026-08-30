@@ -2,10 +2,12 @@
 
 /**
  * Whether a `keeper-syncd` unit on this machine can run tasks out of *this*
- * app's database.
+ * app's database, and for how long.
  *
- * Two independent facts collapse into one enum, because either alone is
- * misleading: a unit can be enabled and still be irrelevant, and an absent unit
- * is not a failure. See [`daemon_presence`] for how the shell establishes them.
+ * Three independent facts collapse into one enum, because no one of them is
+ * enough on its own: a unit can be enabled and still be irrelevant, an absent
+ * unit is not a failure, and a unit that is enabled *and* relevant still stops
+ * at logout unless lingering was enabled for the user. See [`daemon_presence`]
+ * for how the shell establishes all three.
  */
-export type DaemonPresence = "runs" | "otherDataDir" | "absent";
+export type DaemonPresence = "runs" | "runsUntilLogout" | "otherDataDir" | "absent";

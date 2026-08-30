@@ -61,9 +61,13 @@
 # **Lingering is required, not a nicety.** A `--user` unit is stopped when its
 # user's last session ends, so without it this timer works until you log out and
 # then silently never again — which is precisely the invisible non-execution
-# Epic 57 exists to close. Note also that the app's Tasks view does NOT check
-# lingering: `systemctl --user is-enabled` says a unit is wanted at login, not
-# that it survives logout.
+# Epic 57 exists to close. The app's Tasks view does check it, so it will not
+# claim a post-logout run this box cannot make: with lingering off, a task the
+# enabled keeper-syncd.service hosts reads "runs this while you are logged in —
+# lingering is off, so its schedule stops when your session ends". What no
+# keeper surface can see is THIS timer — enabling it registers nothing with
+# keeper — so a box driven only by the pair below still names the app as the
+# host of those tasks.
 #
 # There is deliberately no [Install] section here, so this unit cannot be
 # enabled at all — `systemctl --user enable` on it answers "The unit files have

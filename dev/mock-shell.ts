@@ -1573,14 +1573,18 @@ const FOLDER_MIGRATION = {
  * loosely here would make the pane look right while the app claimed a host it
  * does not have, which is the exact failure AD-137 exists to prevent.
  *
- * Six rows and one unreadable one, because the surface has that many branches:
+ * Seven rows and one unreadable one, because the surface has that many branches:
  * a scheduled task with a window ahead of it, one mid-run holding a lease, one
- * whose last run failed, a manual one nothing schedules, a switched-off one, an
- * **unhosted** one that looks enabled and will never fire, and a row a newer
- * keeper wrote that this build shows rather than drops (NFR-43).
+ * hosted by an enabled unit that does **not** linger (so its schedule stops at
+ * logout), one whose last run failed, a manual one nothing schedules, a
+ * switched-off one, an **unhosted** one that looks enabled and will never fire,
+ * and a row a newer keeper wrote that this build shows rather than drops
+ * (NFR-43).
  */
 const HOST_SENTENCES = {
   daemon: "the keeper-syncd unit on this machine runs this, logged in or not",
+  daemonUntilLogout:
+    "the keeper-syncd unit on this machine runs this while you are logged in — lingering is off, so its schedule stops when your session ends",
   app: "keeper runs this — only while keeper is running",
   appOtherDataDir:
     "keeper runs this — only while keeper is running; the keeper-syncd unit here reads a different data directory, so it never sees this task",
@@ -1701,6 +1705,26 @@ const TASKS: TaskVm[] = [
     leaseUntilMs: ahead(58),
     lastRun: TASK_RUNS["01JRELEASESWEEPBBBBBBBBBBB"][0],
     host: { kind: "daemon", sentence: HOST_SENTENCES.daemon, reason: null },
+  },
+  {
+    id: "01JLOGROTATEFFFFFFFFFFFFFF",
+    kind: "release",
+    mode: "scheduled",
+    enabled: true,
+    profileId: null,
+    profile: null,
+    schedule: "0 4 * * *",
+    nextDueMs: ahead(1_017),
+    runningHost: null,
+    leaseUntilMs: null,
+    // Never run yet, and the point of the row is the sentence: the unit IS
+    // enabled and DOES read this database, so the daemon really is the host —
+    // but `loginctl enable-linger` was never run here, so a `--user` unit dies
+    // with the session and the 04:00 sweep stops the first time this person
+    // logs out. `systemctl --user is-enabled` cannot see that; the file
+    // `enable-linger` creates can, and that is what the app stats.
+    lastRun: null,
+    host: { kind: "daemon", sentence: HOST_SENTENCES.daemonUntilLogout, reason: null },
   },
   {
     id: "01JVAULTPUSHCCCCCCCCCCCCCC",

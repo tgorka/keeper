@@ -234,4 +234,38 @@ describe("the task projection reports a fault as a fault", () => {
       expect(fn, signature).not.toContain("daemon_presence_here(");
     }
   });
+
+  it("asks whether the user lingers, and hands that answer to the verdict", () => {
+    // Story 57.5's review, finding 2. `systemctl --user is-enabled` answers
+    // *wanted at login*, not *survives logout*, so an enabled unit on a box
+    // where `loginctl enable-linger` was never run stops with the session — and
+    // the row said "logged in or not" anyway. The fact now exists, and the only
+    // thing that can make the fix inert is the shell failing to establish it:
+    // `keeper_core::tasks::daemon_presence` would still compile, and would
+    // simply never return `RunsUntilLogout`. This crate cannot be built here, so
+    // this is the gate.
+    const here = bodyOf(SYNC_IPC, "fn daemon_presence_here(app_data_dir");
+    expect(here).toContain("DaemonHostFacts");
+    expect(here).toContain("lingering: daemon_lingering()");
+    // Never a constant: `lingering: true` is precisely the over-claim, and
+    // `lingering: false` would make the lingering box read as the session-only
+    // one forever.
+    expect(here).not.toMatch(/lingering:\s*(true|false)/);
+
+    // One `stat`, not a second subprocess. `Path::exists` on
+    // `/var/lib/systemd/linger/<name>` is the same predicate logind's own
+    // `Linger` D-Bus property evaluates (`user_check_linger_file` is
+    // `access(p, F_OK)` on that path), so the cheap route is not the weaker one
+    // — and the path itself lives in keeper-core, where it is tested.
+    const lingering = bodyOf(SYNC_IPC, "fn daemon_lingering()");
+    expect(lingering).toContain("linger_marker_path");
+    expect(lingering).toContain(".exists()");
+    expect(lingering).not.toContain("Command::new");
+    expect(lingering).not.toContain("loginctl");
+    // The name it probes for, and the fallback that keeps a missing $USER from
+    // being read as lingering.
+    expect(lingering).toContain('"USER"');
+    expect(lingering).toContain('"LOGNAME"');
+    expect(lingering).toContain("return false");
+  });
 });

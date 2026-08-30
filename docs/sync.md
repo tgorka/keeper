@@ -2217,7 +2217,8 @@ and offers **Run now**. A failure notifies **once per onset** — on the
 rule and exists because a text-keyed version of it once produced thousands of
 notifications an hour.
 
-Two honest limits on that view. Its Linux daemon verdict is computed from
+One honest limit on that view, and one thing it does check that you might expect
+it not to. The limit: its Linux daemon verdict is computed from
 `keeper-syncd.service` being enabled **and** resolving the same data directory,
 which by default it does not (`~/.local/share/keeper-sync` against
 `~/.local/share/dev.tgorka.keeper`) — that case gets its own sentence rather than
@@ -2226,11 +2227,24 @@ below has no `keeper-syncd.service` enabled at all, so the app names itself as
 the host for those tasks: the timer still runs them, and the view does not know
 the timer exists.
 
-And the verdict does **not** check lingering. `systemctl --user is-enabled` says
-a unit is wanted at login, not that it survives logout, so on a box with the
-service enabled and lingering off the row's *logged in or not* is optimistic.
-`loginctl show-user "$USER" --property=Linger` is the question, and nothing in
-the app asks it for you.
+And the verdict **does** check lingering, so *logged in or not* means it. There
+are two daemon sentences, not one, because `systemctl --user is-enabled` answers
+*wanted at login* and not *survives logout*:
+
+- lingering on — *"the keeper-syncd unit on this machine runs this, logged in or
+  not"*
+- lingering off — *"the keeper-syncd unit on this machine runs this while you are
+  logged in — lingering is off, so its schedule stops when your session ends"*
+
+The app asks by stat-ing `/var/lib/systemd/linger/$USER`, which is not a guess
+at the answer `loginctl show-user "$USER" --property=Linger` would give: it is
+the same answer. That property's getter in logind is one call to
+`user_check_linger_file`, whose entire body is `access()` on that path, and
+`loginctl enable-linger` is what creates the file. A machine with no systemd at
+all has no such file and no `systemctl` either, so it reads as *no daemon* and
+never reaches a daemon sentence. If neither `$USER` nor `$LOGNAME` is set the app
+cannot form the name and reports the session-only sentence — under-claiming the
+daemon's reach rather than promising a run that will not happen.
 
 ### Exactly one runner, whoever asks
 

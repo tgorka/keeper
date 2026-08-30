@@ -98,12 +98,15 @@ is safe.
   That refusal predates this decision and survives it. (`docs/sync.md` §13; AD-136)
 - **The platform asymmetry, stated so it is not discovered:** on Linux the systemd user service is
   a real background host, and a timer/oneshot pair ships beside it calling the same one-shot verb;
-  both need `loginctl enable-linger` to survive logout. On **macOS keeper ships no background host
-  at all** — the `keeper-syncd` binary *is* built and published for macOS, and its one-shot verbs
-  work there, but no launchd plist exists anywhere in the tree, so nothing starts `watch` and
-  nothing triggers a task. The desktop app is therefore the only host keeper provides, a task runs
-  only while keeper is running, and the UI says so rather than implying a schedule that cannot fire.
-  (AD-137; `docs/sync.md` §14)
+  both need `loginctl enable-linger` to survive logout. That condition is checked rather than
+  assumed — `systemctl --user is-enabled` means *wanted at login*, not *survives logout*, so the
+  Tasks view stats the file `enable-linger` creates and shows a lingering box *"logged in or not"*
+  and a non-lingering one *"its schedule stops when your session ends"*. On **macOS keeper ships no
+  background host at all** — the `keeper-syncd` binary *is* built and published for macOS, and its
+  one-shot verbs work there, but no launchd plist exists anywhere in the tree, so nothing starts
+  `watch` and nothing triggers a task. The desktop app is therefore the only host keeper provides,
+  a task runs only while keeper is running, and the UI says so rather than implying a schedule that
+  cannot fire. (AD-137; `docs/sync.md` §14)
 - **Revisit trigger:** a launchd agent for `keeper-syncd` on macOS. The blocker is not the crate —
   it builds and ships there — it is deciding what a background daemon on macOS should own when the
   app is already a real background host. Until then the asymmetry is visible in the product, not

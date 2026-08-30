@@ -1854,6 +1854,42 @@ fn daemon_data_dir() -> Option<std::path::PathBuf> {
     Some(base.join("keeper-sync"))
 }
 
+/// `true` when lingering is enabled for the user this app runs as — the fact
+/// that decides whether an enabled `--user` unit outlives the session
+/// (Story 57.5's review, finding 2).
+///
+/// **One `stat`, no subprocess, no new dependency**, and not a weaker signal
+/// than the `loginctl` invocation the review proposed: it is the *same*
+/// predicate. `loginctl show-user --property=Linger` reads
+/// `org.freedesktop.login1.User.Linger`, whose getter `property_get_linger`
+/// (systemd `src/login/logind-user-dbus.c:172-190`) is nothing but a call to
+/// `user_check_linger_file`, whose whole body is `access(p, F_OK)` on
+/// `/var/lib/systemd/linger/<name>` (`src/login/logind-user.c:717-737`). The
+/// spelling of that path lives in [`keeper_core::tasks::linger_marker_path`],
+/// which also refuses the names that must never be joined onto it; this
+/// function is only the `exists()` and the name.
+///
+/// `$USER` then `$LOGNAME`, and `false` if neither is set: both are set by PAM
+/// and by systemd's own user-manager environment, so a desktop session has
+/// them, and an environment that has neither cannot be asked. `false` is the
+/// under-claiming direction — the row then says the schedule stops at logout,
+/// which is visible and recoverable, where the reverse would promise a 3 a.m.
+/// run that never happens.
+///
+/// **Blocking** (one `stat`), and called only from [`daemon_presence_here`].
+#[cfg(target_os = "linux")]
+fn daemon_lingering() -> bool {
+    let Some(user) = ["USER", "LOGNAME"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| !value.is_empty())
+    else {
+        tracing::debug!("neither $USER nor $LOGNAME is set; not claiming lingering");
+        return false;
+    };
+    keeper_core::tasks::linger_marker_path(&user).is_some_and(|marker| marker.exists())
+}
+
 /// How long the `systemctl` probe may take before it is killed and read as
 /// *no daemon* (this story's review, finding 11).
 ///
@@ -1967,13 +2003,22 @@ const DAEMON_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// platform sniff.
 ///
 /// **Blocking**; reached only through [`daemon_presence_probe`], which is what
-/// keeps the fork/exec and the two `canonicalize` calls off a runtime worker
-/// (this story's review, finding 11).
+/// keeps the fork/exec, the lingering `stat` and the two `canonicalize` calls
+/// off a runtime worker (this story's review, finding 11).
 ///
 /// Probed per listing rather than cached, deliberately: a person who installs
-/// and enables the unit while keeper is open must see the Tasks view stop
-/// claiming the app is the host, and this costs one bounded `systemctl` spawn on
-/// a human-triggered read.
+/// and enables the unit — or runs `loginctl enable-linger` — while keeper is
+/// open must see the Tasks view stop claiming the app is the host, and stop
+/// claiming the schedule dies at logout. It costs one bounded `systemctl` spawn
+/// and one `stat` on a human-triggered read.
+///
+/// Every one of `DaemonHostFacts`'s four fields is established here, and the two
+/// that make a *daemon* verdict — `unit_enabled` and `lingering` — are two
+/// different questions about the same unit: whether systemd will start it, and
+/// whether systemd keeps it after the session that started it ends. The type is
+/// named in full at the call site rather than imported, because every use of it
+/// sits under `#[cfg(target_os = "linux")]` and an import would be an unused
+/// one on every other target.
 ///
 /// **On macOS this is `Absent` by construction, and that is the honest answer.**
 /// `keeper-syncd` does build and ship for macOS — `release.yml` publishes
@@ -1998,11 +2043,13 @@ fn daemon_presence_here(app_data_dir: Option<&std::path::Path>) -> DaemonPresenc
     // daemon has written a database there.
     let resolve = |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or(path.to_owned());
     let daemon_dir = daemon_data_dir().map(|dir| resolve(&dir));
-    daemon_presence(
-        daemon_unit_enabled(),
-        daemon_dir.as_deref(),
-        &resolve(app_dir),
-    )
+    let app_dir = resolve(app_dir);
+    daemon_presence(keeper_core::tasks::DaemonHostFacts {
+        unit_enabled: daemon_unit_enabled(),
+        lingering: daemon_lingering(),
+        daemon_data_dir: daemon_dir.as_deref(),
+        app_data_dir: &app_dir,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]

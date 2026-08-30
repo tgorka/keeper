@@ -370,9 +370,12 @@ not off the epic:
 - The app's Tasks view will not name the timer as a host, because `daemon_presence` probes
   `keeper-syncd.service` only. Left as-is deliberately — changing it is a behaviour change in a
   crate that cannot be compiled here — and §14 states the limit instead.
-- `daemon_presence` also does not check `loginctl … Linger`, so its *logged in or not* sentence is
-  optimistic on a non-lingering box (found by `TasksReview`, logged against 57.5). §14 makes
-  lingering a required, verified install step and states the blind spot outright.
+- `daemon_presence` did not check lingering either, so its *logged in or not* sentence was optimistic
+  on a non-lingering box (found by `TasksReview`, logged against 57.5). **Closed after this story
+  landed**, which is what it was waiting for: with the user timer shipped, 57.5's review pass 3 gave
+  `DaemonPresence` a `RunsUntilLogout` state fed by one `stat` of `/var/lib/systemd/linger/$USER`,
+  and §14's blind-spot paragraph is replaced by the two sentences the view now shows. §14 keeps
+  lingering as a required, verified install step.
 - `tasks-pane.tsx`'s empty state told users to run `keeper-syncd task add`, which has never existed.
   Found by `TasksReview`, owned by `TasksFixes`, who confirmed the pane will quote §14's real
   spelling (`keeper-syncd tasks set <id> --kind …`). Not fixed here: that file belongs to 57.5's

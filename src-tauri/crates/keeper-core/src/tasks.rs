@@ -36,7 +36,7 @@
 //! carries `#[ts(type = "number")]` for [`crate::vm::PingVm::ts`]'s reason: the
 //! default ts-rs mapping is `bigint`, which no `JSON.parse` ever produces.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -55,14 +55,38 @@ const MODE_OFF: &str = "off";
 const MODE_MANUAL: &str = "manual";
 const MODE_SCHEDULED: &str = "scheduled";
 
-/// What the daemon sentence says when `keeper-syncd`'s unit will run the task.
+/// What the daemon sentence says when `keeper-syncd`'s unit will run the task
+/// **and survives logout**.
 ///
-/// The six sentences below are `pub const` rather than inline literals because
+/// The seven sentences below are `pub const` rather than inline literals because
 /// three parties quote them: this module builds them, its tests assert them, and
 /// the Tasks pane renders them. Two copies of a sentence is how a surface ends
 /// up claiming a host it no longer has.
+///
+/// *"logged in or not"* is a load-bearing promise, not a flourish, and it is
+/// true here because [`daemon_presence`] refuses to reach this sentence until a
+/// caller has established that lingering is on — see
+/// [`DaemonPresence::RunsUntilLogout`] for the machine where it is not, and
+/// [`linger_marker_path`] for the fact that separates them (Story 57.5's
+/// review, finding 2).
 pub const HOST_SENTENCE_DAEMON: &str =
     "the keeper-syncd unit on this machine runs this, logged in or not";
+
+/// The daemon sentence for a unit that is enabled, shares the database, and
+/// **dies with the session** because lingering was never enabled.
+///
+/// The host is still the daemon — the unit really does run the task — so this
+/// is a second sentence under one [`TaskHostKind::Daemon`], exactly as
+/// [`HOST_SENTENCE_APP_OTHER_DATA_DIR`] is a second sentence under
+/// [`TaskHostKind::App`]. What changes is the one thing the person planning a
+/// nightly sweep needs: a `--user` unit is stopped when its user's last session
+/// ends, so on this machine the schedule stops at logout and nothing says so
+/// unless this sentence does. It names the switch (`lingering is off`) rather
+/// than printing a command, because the command lives in `docs/sync.md` §14
+/// beside the verification step that proves it took.
+pub const HOST_SENTENCE_DAEMON_UNTIL_LOGOUT: &str =
+    "the keeper-syncd unit on this machine runs this while you are logged in — \
+     lingering is off, so its schedule stops when your session ends";
 
 /// The honest macOS sentence, and the honest Linux-without-a-unit one: the app
 /// is a real background host — closing the window calls `prevent_close()` +
@@ -137,19 +161,27 @@ pub const UNHOSTED_UNKNOWN_MODE: &str =
     "its mode is one this build does not understand, so nothing here will run it";
 
 /// Whether a `keeper-syncd` unit on this machine can run tasks out of *this*
-/// app's database.
+/// app's database, and for how long.
 ///
-/// Two independent facts collapse into one enum, because either alone is
-/// misleading: a unit can be enabled and still be irrelevant, and an absent unit
-/// is not a failure. See [`daemon_presence`] for how the shell establishes them.
+/// Three independent facts collapse into one enum, because no one of them is
+/// enough on its own: a unit can be enabled and still be irrelevant, an absent
+/// unit is not a failure, and a unit that is enabled *and* relevant still stops
+/// at logout unless lingering was enabled for the user. See [`daemon_presence`]
+/// for how the shell establishes all three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum DaemonPresence {
-    /// A `keeper-syncd` user unit is enabled here **and** reads the same data
-    /// directory, so it sees this app's `tasks` table and will run due rows
-    /// whether or not anybody is logged in.
+    /// A `keeper-syncd` user unit is enabled here, reads the same data
+    /// directory, **and** lingers — so it sees this app's `tasks` table and will
+    /// run due rows whether or not anybody is logged in.
     Runs,
+    /// Everything [`Self::Runs`] needs except lingering: the unit is enabled and
+    /// shares the database, so it really is the host, but a `--user` unit is
+    /// stopped when its user's last session ends and `loginctl enable-linger`
+    /// was never run here. The schedule therefore stops at logout (Story 57.5's
+    /// review, finding 2).
+    RunsUntilLogout,
     /// A unit is enabled here but resolves a different data directory — the
     /// default on Linux — so it never sees this app's tasks.
     OtherDataDir,
@@ -169,7 +201,9 @@ pub enum DaemonPresence {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum TaskHostKind {
-    /// The `keeper-syncd` unit on this machine runs it, logged in or not.
+    /// The `keeper-syncd` unit on this machine runs it. Whether that survives
+    /// logout is the sentence's to say, not this variant's — see
+    /// [`HOST_SENTENCE_DAEMON`] and [`HOST_SENTENCE_DAEMON_UNTIL_LOGOUT`].
     Daemon,
     /// The desktop app runs it, and only while the app is running.
     App,
@@ -354,8 +388,98 @@ pub struct TaskHostFacts<'a> {
     pub profile_unreadable: bool,
 }
 
+/// Exactly the facts [`daemon_presence`] needs, borrowed.
+///
+/// A named-field struct rather than four positional arguments for the reason
+/// [`TaskHostFacts`] states, applied to a worse case: `unit_enabled` and
+/// `lingering` are two adjacent `bool`s, so a call site could swap them without
+/// a type error — and swapping them turns *"no unit here"* into *"runs, logged
+/// in or not"*, which is the over-claim AD-137 exists to forbid.
+///
+/// Every field is a fact the **caller** establishes, because this function does
+/// no I/O. `keeper/src/sync_ipc.rs`'s `daemon_presence_here` owns all four:
+/// `systemctl --user is-enabled` for the unit, [`linger_marker_path`] plus one
+/// `Path::exists` for lingering, and two `canonicalize` calls for the paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonHostFacts<'a> {
+    /// Whether a `keeper-syncd` **user** unit is enabled on this machine.
+    pub unit_enabled: bool,
+    /// Whether lingering is enabled for the user this app runs as — i.e.
+    /// whether that user's systemd manager, and every `--user` unit under it,
+    /// survives the end of their last session.
+    ///
+    /// Only consulted when the unit is enabled and shares the database, since
+    /// nothing else can make it matter. `false` is the safe direction: it
+    /// under-claims the daemon's reach rather than promising a run that will not
+    /// happen, so a caller that cannot establish the fact must pass `false`.
+    pub lingering: bool,
+    /// Where the daemon resolves its data directory, `None` when the caller
+    /// could not resolve it at all.
+    pub daemon_data_dir: Option<&'a Path>,
+    /// Where *this* app resolves its own.
+    pub app_data_dir: &'a Path,
+}
+
+/// The directory `systemd-logind` keeps one file in per lingering user.
+///
+/// A hardcoded literal in logind, in all three places it uses it —
+/// `method_set_user_linger` (`src/login/logind-dbus.c:1668`),
+/// `user_check_linger_file` (`src/login/logind-user.c:728`) and
+/// `manager_enumerate_linger_users` (`src/login/logind.c:294`) — and unchanged
+/// from systemd v219 (2015) to today. It is not derived from a build-time state
+/// directory, so there is no second spelling to look for.
+pub const LINGER_DIR: &str = "/var/lib/systemd/linger";
+
+/// The file whose existence **is** the answer to *"does this user linger?"*, or
+/// `None` for a user name that must not be turned into a path.
+///
+/// # Why a `Path::exists` and not `loginctl show-user --property=Linger`
+///
+/// Because they are the same question, and one of them is a fork/exec onto a
+/// D-Bus round trip. `loginctl` reads the `Linger` property of
+/// `org.freedesktop.login1.User`; that property's getter,
+/// `property_get_linger` (`src/login/logind-user-dbus.c:172-190`), is nothing
+/// but a call to `user_check_linger_file`, whose entire body is
+/// `access("/var/lib/systemd/linger/<name>", F_OK)`
+/// (`src/login/logind-user.c:717-737`). So this is not a proxy signal standing
+/// in for the real one — it is the byte logind itself stats, read directly. The
+/// file is also the state of record rather than a cache: `loginctl
+/// enable-linger` creates it (`touch`, mode 0644, in a directory logind creates
+/// mode 0755 — `logind-dbus.c:1655-1671`), `disable-linger` unlinks it, and
+/// logind re-stats it per query as well as enumerating the directory at
+/// startup. Both modes are world-readable, so the process asking about its own
+/// user needs no privilege.
+///
+/// # What it answers on a machine with no systemd at all
+///
+/// `false`, and not as an error: [`Path::exists`] returns `bool` and folds
+/// `ENOENT` — a missing `/var/lib/systemd`, a missing `linger/`, a missing file
+/// — into the same `false`. On such a machine `systemctl --user is-enabled`
+/// also fails, so [`DaemonPresence::Absent`] is reached before lingering is
+/// consulted at all; the answer is unreachable *and* safe.
+///
+/// # The names refused, and why refusing beats escaping
+///
+/// `None` for an empty name, for `.` or `..`, and for anything containing `/`
+/// or a NUL. This is not hygiene theatre: the name arrives from the
+/// environment, and `Path::join("")` or `join(".")` yields
+/// [`LINGER_DIR`] itself — which exists on every systemd box — so an empty
+/// `$USER` would report *lingering* for a user who does not linger. That is the
+/// one direction this module may never fail in.
+///
+/// Logind writes the name through `cescape`, so a name holding bytes C would
+/// escape (control characters, `"`, `\`) is stored escaped and this lookup
+/// misses it, answering `false`. Deliberate: `cescape` is the identity on every
+/// POSIX-portable user name, and the failure is the under-claiming direction.
+pub fn linger_marker_path(user: &str) -> Option<PathBuf> {
+    if user.is_empty() || user == "." || user == ".." || user.contains('/') || user.contains('\0') {
+        return None;
+    }
+    Some(Path::new(LINGER_DIR).join(user))
+}
+
 /// Decide whether a `keeper-syncd` unit on this machine can run *this* app's
-/// tasks.
+/// tasks, and whether it keeps doing so after logout.
 ///
 /// The load-bearing fact, because it is counter-intuitive: **by default the two
 /// hosts do not share one `sync.db`.** `keeper-syncd` resolves its data
@@ -367,6 +491,16 @@ pub struct TaskHostFacts<'a> {
 /// host for anything the app wrote — which is exactly what AD-137 records at its
 /// *"the record is shared; the schedule is per host by default"* bullet.
 ///
+/// The second counter-intuitive fact, and the reason this function has a fourth
+/// input: **an enabled `--user` unit is not a background service until the user
+/// lingers.** `systemctl --user is-enabled` answers *wanted at login*, not
+/// *survives logout*; without `loginctl enable-linger` the user's manager is
+/// torn down with their last session and every unit under it goes with it. So
+/// lingering decides which of two sentences a row shows
+/// ([`DaemonPresence::Runs`] against [`DaemonPresence::RunsUntilLogout`]), and
+/// it is asked rather than assumed because assuming it is how *"logged in or
+/// not"* became an over-claim (Story 57.5's review, finding 2).
+///
 /// The caller canonicalizes both paths before calling: this function compares
 /// them as given and does no I/O, so a symlinked or `..`-bearing path is the
 /// caller's problem to resolve, not a difference to report.
@@ -377,17 +511,21 @@ pub struct TaskHostFacts<'a> {
 /// crediting a host that turns out not to see the row produces a task that looks
 /// hosted and never fires, while under-crediting one produces a row that says
 /// "keeper runs this" on a machine where the daemon might also run it — visible,
-/// recoverable, and not a silent non-execution.
-pub fn daemon_presence(
-    unit_enabled: bool,
-    daemon_data_dir: Option<&Path>,
-    app_data_dir: &Path,
-) -> DaemonPresence {
-    if !unit_enabled {
+/// recoverable, and not a silent non-execution. `lingering: false` is the same
+/// direction one step in: the daemon is still credited, for exactly as long as
+/// it will actually be there.
+pub fn daemon_presence(facts: DaemonHostFacts<'_>) -> DaemonPresence {
+    if !facts.unit_enabled {
         return DaemonPresence::Absent;
     }
-    match daemon_data_dir {
-        Some(dir) if dir == app_data_dir => DaemonPresence::Runs,
+    match facts.daemon_data_dir {
+        Some(dir) if dir == facts.app_data_dir => {
+            if facts.lingering {
+                DaemonPresence::Runs
+            } else {
+                DaemonPresence::RunsUntilLogout
+            }
+        }
         _ => DaemonPresence::OtherDataDir,
     }
 }
@@ -427,7 +565,10 @@ pub fn daemon_presence(
 ///    invisible-failure shape: a row that reports itself enabled while nothing
 ///    will ever make it due.
 /// 5. **Scheduled with a schedule** is the only case where the daemon can be the
-///    host, so [`daemon_presence`] is consulted only here.
+///    host, so [`daemon_presence`] is consulted only here — and its two daemon
+///    answers give the same [`TaskHostKind::Daemon`] two sentences, because how
+///    long the host lasts is exactly what the person setting a schedule needs
+///    and exactly what the kind cannot carry.
 /// 6. **Any other mode spelling is unhosted**, exhaustively and without a panic.
 ///    Unreachable in production — see [`UNHOSTED_UNKNOWN_MODE`] — and kept as a
 ///    total function for a future in-crate caller.
@@ -451,6 +592,9 @@ pub fn task_host(facts: TaskHostFacts<'_>, daemon: DaemonPresence) -> TaskHostVm
         }
         return match daemon {
             DaemonPresence::Runs => verdict(TaskHostKind::Daemon, HOST_SENTENCE_DAEMON),
+            DaemonPresence::RunsUntilLogout => {
+                verdict(TaskHostKind::Daemon, HOST_SENTENCE_DAEMON_UNTIL_LOGOUT)
+            }
             DaemonPresence::Absent => verdict(TaskHostKind::App, HOST_SENTENCE_APP),
             DaemonPresence::OtherDataDir => {
                 verdict(TaskHostKind::App, HOST_SENTENCE_APP_OTHER_DATA_DIR)
@@ -720,6 +864,58 @@ mod tests {
         assert_eq!(host.reason, None);
     }
 
+    /// Lingering absent: the daemon is still the host, and the sentence stops
+    /// promising the one thing a non-lingering box cannot deliver.
+    ///
+    /// The **real strings** are asserted rather than a substring or the kind,
+    /// because the defect this closes was a sentence, not a verdict: a reword
+    /// that put *"logged in or not"* back on this branch would be the original
+    /// over-claim restored, and a `kind`-only assertion would not notice.
+    #[test]
+    fn a_linux_box_whose_enabled_unit_does_not_linger_says_the_schedule_stops_at_logout() {
+        let host = task_host(scheduled(), DaemonPresence::RunsUntilLogout);
+        assert_eq!(host.kind, TaskHostKind::Daemon);
+        assert_eq!(
+            host.sentence,
+            "the keeper-syncd unit on this machine runs this while you are logged in — \
+             lingering is off, so its schedule stops when your session ends"
+        );
+        assert_eq!(host.sentence, HOST_SENTENCE_DAEMON_UNTIL_LOGOUT);
+        assert_eq!(host.reason, None);
+    }
+
+    /// The two daemon sentences are one kind and two promises, and the promise
+    /// is the part that must not leak across.
+    #[test]
+    fn the_two_daemon_sentences_differ_and_only_the_lingering_one_claims_post_logout() {
+        let lingering = task_host(scheduled(), DaemonPresence::Runs);
+        let session_only = task_host(scheduled(), DaemonPresence::RunsUntilLogout);
+
+        assert_eq!(lingering.kind, session_only.kind);
+        assert_ne!(
+            lingering.sentence, session_only.sentence,
+            "one sentence for both would be the over-claim on one of the two boxes"
+        );
+
+        // The exact phrase the intent contract's I/O matrix quotes, and the one
+        // a non-lingering machine may never be told.
+        assert!(
+            lingering.sentence.contains("logged in or not"),
+            "the lingering box keeps AD-137's promise verbatim: {}",
+            lingering.sentence
+        );
+        assert!(
+            !session_only.sentence.contains("logged in or not"),
+            "a unit that dies at logout must not claim to outlive it: {}",
+            session_only.sentence
+        );
+        assert!(
+            session_only.sentence.contains("logged in"),
+            "under-claiming is fine; saying nothing about the limit is not: {}",
+            session_only.sentence
+        );
+    }
+
     #[test]
     fn a_mac_with_no_daemon_anywhere_reads_app_only_while_keeper_is_running() {
         let host = task_host(scheduled(), DaemonPresence::Absent);
@@ -746,6 +942,7 @@ mod tests {
     fn only_the_unhosted_verdicts_carry_a_reason() {
         let cases = [
             task_host(scheduled(), DaemonPresence::Runs),
+            task_host(scheduled(), DaemonPresence::RunsUntilLogout),
             task_host(scheduled(), DaemonPresence::Absent),
             task_host(scheduled(), DaemonPresence::OtherDataDir),
             task_host(
@@ -783,22 +980,75 @@ mod tests {
         PathBuf::from(path)
     }
 
+    /// The stock shape every `daemon_presence` test below mutates: a lingering
+    /// unit sharing the app's own directory.
+    fn lingering_unit(app: &Path) -> DaemonHostFacts<'_> {
+        DaemonHostFacts {
+            unit_enabled: true,
+            lingering: true,
+            daemon_data_dir: Some(app),
+            app_data_dir: app,
+        }
+    }
+
     #[test]
     fn a_unit_that_is_not_enabled_is_absent() {
         let app = dir("/home/dev/.local/share/dev.tgorka.keeper");
-        // Even pointing at the very same directory: not enabled is not a host.
+        // Even pointing at the very same directory, and even lingering: not
+        // enabled is not a host.
         assert_eq!(
-            daemon_presence(false, Some(&app), &app),
+            daemon_presence(DaemonHostFacts {
+                unit_enabled: false,
+                ..lingering_unit(&app)
+            }),
             DaemonPresence::Absent
         );
     }
 
+    /// The non-Linux case, and the one where the lingering question does not
+    /// arise at all.
+    ///
+    /// `daemon_presence_here` is `Absent` by construction off Linux
+    /// (`keeper/src/sync_ipc.rs`), so no Mac ever reaches a daemon sentence.
+    /// Asserted with `lingering: true` **and** matching directories, which is
+    /// the most credit-worthy input this function can be handed: if the gate
+    /// order ever inverted, this is the test that catches a Mac being told a
+    /// systemd unit runs its tasks.
     #[test]
-    fn an_enabled_unit_reading_the_same_data_dir_runs_tasks() {
+    fn a_host_with_no_unit_reads_app_whatever_the_lingering_fact_says() {
+        let app = dir("/Users/dev/Library/Application Support/dev.tgorka.keeper");
+        let presence = daemon_presence(DaemonHostFacts {
+            unit_enabled: false,
+            ..lingering_unit(&app)
+        });
+        assert_eq!(presence, DaemonPresence::Absent);
+
+        let host = task_host(scheduled(), presence);
+        assert_eq!(host.kind, TaskHostKind::App);
+        assert_eq!(
+            host.sentence,
+            "keeper runs this — only while keeper is running"
+        );
+        assert_eq!(host.sentence, HOST_SENTENCE_APP);
+    }
+
+    #[test]
+    fn an_enabled_lingering_unit_reading_the_same_data_dir_runs_tasks() {
+        let app = dir("/home/dev/.local/share/dev.tgorka.keeper");
+        assert_eq!(daemon_presence(lingering_unit(&app)), DaemonPresence::Runs);
+    }
+
+    /// The finding this pass closes: one bit apart from the case above, and a
+    /// different promise on screen.
+    #[test]
+    fn an_enabled_unit_that_does_not_linger_runs_only_until_logout() {
         let app = dir("/home/dev/.local/share/dev.tgorka.keeper");
         assert_eq!(
-            daemon_presence(true, Some(&app), &app),
-            DaemonPresence::Runs
+            daemon_presence(DaemonHostFacts {
+                lingering: false,
+                ..lingering_unit(&app)
+            }),
+            DaemonPresence::RunsUntilLogout
         );
     }
 
@@ -807,17 +1057,29 @@ mod tests {
         // The stock Linux pairing, and the reason this function exists.
         let app = dir("/home/dev/.local/share/dev.tgorka.keeper");
         let daemon = dir("/home/dev/.local/share/keeper-sync");
-        assert_eq!(
-            daemon_presence(true, Some(&daemon), &app),
-            DaemonPresence::OtherDataDir
-        );
+        // Asserted for both lingering answers: a unit that cannot see the row
+        // is irrelevant however long it lives, so lingering must not promote it.
+        for lingering in [true, false] {
+            assert_eq!(
+                daemon_presence(DaemonHostFacts {
+                    lingering,
+                    daemon_data_dir: Some(&daemon),
+                    ..lingering_unit(&app)
+                }),
+                DaemonPresence::OtherDataDir,
+                "lingering={lingering}"
+            );
+        }
     }
 
     #[test]
     fn an_enabled_unit_whose_data_dir_cannot_be_resolved_is_not_credited() {
         let app = dir("/home/dev/.local/share/dev.tgorka.keeper");
         assert_eq!(
-            daemon_presence(true, None, &app),
+            daemon_presence(DaemonHostFacts {
+                daemon_data_dir: None,
+                ..lingering_unit(&app)
+            }),
             DaemonPresence::OtherDataDir
         );
     }
@@ -827,9 +1089,62 @@ mod tests {
         // The two functions composed, which is how the shell calls them.
         let app = dir("/home/dev/.local/share/dev.tgorka.keeper");
         let daemon = dir("/home/dev/.local/share/keeper-sync");
-        let presence = daemon_presence(true, Some(&daemon), &app);
+        let presence = daemon_presence(DaemonHostFacts {
+            daemon_data_dir: Some(&daemon),
+            ..lingering_unit(&app)
+        });
         let host = task_host(scheduled(), presence);
         assert_eq!(host.kind, TaskHostKind::App);
         assert_eq!(host.sentence, HOST_SENTENCE_APP_OTHER_DATA_DIR);
+    }
+
+    /// The marker path is logind's own, spelled exactly.
+    #[test]
+    fn the_linger_marker_is_the_file_logind_stats_for_that_user() {
+        assert_eq!(LINGER_DIR, "/var/lib/systemd/linger");
+        assert_eq!(
+            linger_marker_path("dev"),
+            Some(PathBuf::from("/var/lib/systemd/linger/dev"))
+        );
+    }
+
+    /// A name that would make the probe answer *lingering* for a user who does
+    /// not linger is refused instead.
+    ///
+    /// `Path::join("")` and `join(".")` both yield [`LINGER_DIR`] itself, which
+    /// exists on every systemd box — so an empty or dotted `$USER` would turn a
+    /// present directory into a false promise. `..` walks out of it, and a name
+    /// with a `/` names some other file entirely. This is the one direction the
+    /// module may never fail in, so it is a refusal rather than a sanitisation.
+    #[test]
+    fn a_user_name_that_could_name_the_directory_itself_is_refused() {
+        for hostile in ["", ".", "..", "/", "dev/../root", "../root", "a/b"] {
+            assert_eq!(
+                linger_marker_path(hostile),
+                None,
+                "{hostile:?} must not become a linger probe"
+            );
+        }
+        assert_eq!(linger_marker_path("de\0v"), None, "a NUL cannot be stat'ed");
+    }
+
+    /// On a machine with no systemd at all the probe is `false`, not an error.
+    ///
+    /// [`Path::exists`] returns `bool` and folds every `ENOENT` on the way down
+    /// — no `/var/lib/systemd`, no `linger/`, no file — into the same answer, so
+    /// a container or a non-systemd distribution reads *not lingering* rather
+    /// than propagating a failure the caller would have to invent a verdict for.
+    /// That answer is also unreachable in production: `systemctl --user
+    /// is-enabled` fails on such a box, so [`DaemonPresence::Absent`] is
+    /// returned before lingering is consulted.
+    #[test]
+    fn probing_a_user_who_does_not_linger_answers_false_rather_than_failing() {
+        let path =
+            linger_marker_path("keeper-linger-probe-no-such-user").expect("a plain name is usable");
+        assert!(
+            !path.exists(),
+            "{} must not exist; the probe's negative answer is a bool, not an error",
+            path.display()
+        );
     }
 }
