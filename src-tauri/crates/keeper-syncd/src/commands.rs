@@ -549,6 +549,10 @@ pub enum TaskCommand {
     ///
     /// `2` — the selector is wrong, or the task is off or disabled. Retrying
     /// changes nothing; somebody has to edit something.
+    ///
+    /// `3` — a prerequisite is missing, in practice `git` (AD-41). Raised by
+    /// `Engine::open` before this verb reaches a task at all, so it says nothing
+    /// about the task you named.
     Run {
         /// The task's id, exactly as `tasks list` spells it.
         task: String,
@@ -4042,14 +4046,19 @@ mod tests {
         // far from the code it describes. `tasks run` is the verb whose whole
         // purpose is to be called from a wrapper that branches on `$?`, so the
         // help that omits a code is help that cannot be acted on — and this
-        // asserts the four numbers are actually named where the caller looks.
+        // asserts every number a caller can actually see in `$?` is named where
+        // the caller looks. `3` joined the list in Story 57.7: it is reachable
+        // because `Engine::open` resolves `git` before any task verb runs, the
+        // shipped systemd unit lists it in `RestartPreventExitStatus`, and
+        // `docs/sync.md` §14 documents it — so a wrapper author reading only
+        // this help would have been the one consumer left unable to handle it.
         let mut cli = Cli::command();
         let tasks = cli.find_subcommand_mut("tasks").expect("a `tasks` verb");
         let run = tasks
             .find_subcommand_mut("run")
             .expect("a `tasks run` verb");
         let help = run.render_long_help().to_string();
-        for expected in ["0", "1", "2", "4", "deferred"] {
+        for expected in ["0", "1", "2", "3", "4", "deferred"] {
             assert!(
                 help.contains(expected),
                 "`tasks run --help` must name {expected}; got:\n{help}"
@@ -6513,28 +6522,92 @@ mod tests {
             !exec.contains("%I"),
             "%I would turn a hyphenated task id into a path: {exec}"
         );
-        let expanded = exec.replace("%h", "/home/tester").replace("%i", "nightly");
+
+        // **Sentinels, not plausible values.** Substituting `%i` with `nightly`
+        // would let a unit that had DROPPED `%i` and hard-coded `nightly`
+        // produce a byte-identical argv and pass every assertion below — and
+        // that unit is the silent 3 a.m. failure this test exists to catch, with
+        // `keeper-syncd-tasks@weekly.service` sweeping `nightly` forever. A
+        // string no author would type is what makes the assertion about the
+        // template rather than about the string.
+        const HOME: &str = "/home/specifier-h-under-test";
+        const INSTANCE: &str = "specifier-i-under-test";
+
+        // Split FIRST, then expand each word — which is the order systemd uses.
+        // Expanding first and splitting after models a different program: an
+        // instance name containing a space would be one argument here and two
+        // there, and the whole point of this test is to build the argv systemd
+        // builds.
+        let argv: Vec<String> = exec
+            .split_whitespace()
+            .map(|word| word.replace("%h", HOME).replace("%i", INSTANCE))
+            .collect();
         assert!(
-            !expanded.contains('%'),
-            "an unexpanded specifier would reach argv verbatim: {expanded}"
+            argv.iter().all(|word| !word.contains('%')),
+            "an unexpanded specifier would reach argv verbatim: {argv:?}"
+        );
+        assert_eq!(
+            argv.first().map(String::as_str),
+            Some(&*format!("{HOME}/.local/bin/keeper-syncd")),
+            "a user unit runs the binary the user installed under $HOME: {argv:?}"
         );
 
-        let argv: Vec<&str> = expanded.split_whitespace().collect();
-        assert_eq!(
-            argv.first().copied(),
-            Some("/home/tester/.local/bin/keeper-syncd"),
-            "a user unit runs the binary the user installed under $HOME: {expanded}"
-        );
         // clap reads argv[0] as the program name, which is exactly what that is.
-        let cli = parse(&argv).unwrap_or_else(|err| {
-            panic!("`{expanded}` must parse as a keeper-syncd command:\n{err}")
-        });
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let cli = parse(&borrowed)
+            .unwrap_or_else(|err| panic!("{argv:?} must parse as a keeper-syncd command:\n{err}"));
         match cli.command {
             Command::Tasks {
                 command: TaskCommand::Run { task },
-            } => assert_eq!(task, "nightly", "the instance name IS the task selector"),
+            } => assert_eq!(
+                task, INSTANCE,
+                "the INSTANCE NAME must be the task selector — a hard-coded id \
+                 here makes every instance of the template run one task"
+            ),
             other => panic!("the unit must run one task and nothing else, got {other:?}"),
         }
+    }
+
+    /// A deferral is not a failed unit, and only `SuccessExitStatus=` says so.
+    ///
+    /// `RestartPreventExitStatus=` suppresses the *restart*; it leaves systemd's
+    /// own verdict alone. Without this line every night an external drive is out
+    /// ends with the instance in `failed` — red in `systemctl --user status`,
+    /// listed in `systemctl --user --failed`, firing any `OnFailure=` hook — which
+    /// is the nightly alert nobody reads, raised by systemd itself, in the one
+    /// unit whose whole premise is that a deferral must not raise one. It also
+    /// breaks `docs/sync.md` §14's own install step 5, which starts the service
+    /// directly to prove the install works.
+    #[test]
+    fn the_shipped_task_service_does_not_call_a_deferral_a_failure() {
+        let service = parse_unit(TASK_SERVICE_FILE);
+        let success: Vec<u8> = unit_value(&service, "Service", "SuccessExitStatus")
+            .split_whitespace()
+            .map(|word| word.parse().expect("an exit status is a number"))
+            .collect();
+        assert_eq!(
+            success,
+            vec![EXIT_DEFERRED],
+            "exactly the deferral: 2 and 3 stay genuine failures, and 0 needs no \
+             mention"
+        );
+    }
+
+    /// One `[Service]` key that is absent is worth a test of its own.
+    ///
+    /// `RemainAfterExit=yes` would leave this instance `active` after its first
+    /// run, and systemd does not start a unit that is already active — so every
+    /// later trigger becomes a silent no-op and the schedule stops after exactly
+    /// one run, looking for all the world like it worked. Nothing else in this
+    /// module constrains a key it does not name, so the one whose default must
+    /// not change is named here.
+    #[test]
+    fn the_shipped_task_service_does_not_stay_active_after_its_run() {
+        let service = parse_unit(TASK_SERVICE_FILE);
+        assert!(
+            unit_values(&service, "Service", "RemainAfterExit").is_empty(),
+            "RemainAfterExit would make every trigger after the first a no-op"
+        );
     }
 
     /// The unit never retries a number a retry cannot help — and still retries
@@ -6552,7 +6625,8 @@ mod tests {
         assert_eq!(
             unit_value(&service, "Service", "Restart"),
             "on-failure",
-            "the only restart policy Type=oneshot accepts besides `no`"
+            "the policy this unit wants; Type=oneshot refuses only `always` and \
+             `on-success`, and needs systemd 244+ to accept any Restart= at all"
         );
 
         let mut prevented: Vec<u8> = unit_value(&service, "Service", "RestartPreventExitStatus")
@@ -6560,25 +6634,35 @@ mod tests {
             .map(|word| word.parse().expect("an exit status is a number"))
             .collect();
         prevented.sort_unstable();
+        // Exhaustive, so this covers both directions at once: `1` and `0` are
+        // absent because they are not in the list, and stating them separately
+        // below an `assert_eq!` would only look like an independent guard.
+        // `1` is the restartable one — the work ran and failed, often on a
+        // transient remote, and the next OnCalendar may be a day away.
         assert_eq!(
             prevented,
             vec![EXIT_CONFIG, EXIT_PREREQUISITE, EXIT_DEFERRED],
-            "exactly the three numbers a restart cannot help"
-        );
-        assert!(
-            !prevented.contains(&EXIT_FAILURE),
-            "1 is the restartable one: the work ran and failed, often on a \
-             transient remote, and the next OnCalendar may be a day away"
-        );
-        assert!(
-            !prevented.contains(&EXIT_OK),
-            "success is not a restart condition on a one-shot at all"
+            "exactly the three numbers a restart cannot help — never {EXIT_FAILURE} \
+             (restartable) and never {EXIT_OK} (not a restart condition at all)"
         );
 
-        // A bound, stated here rather than inherited from whatever
-        // DefaultStartLimit* the distribution ships.
-        assert!(!unit_values(&service, "Unit", "StartLimitIntervalSec").is_empty());
-        assert!(!unit_values(&service, "Unit", "StartLimitBurst").is_empty());
+        // **The values, not their presence.** `StartLimitBurst=0` disables
+        // systemd's start rate limiting entirely, and so does
+        // `StartLimitIntervalSec=0` — either one turns `RestartSec=60` into the
+        // unbounded every-minute loop this bound exists to prevent, while
+        // passing any assertion that only checks the key is set. These two
+        // numbers are also quoted in `docs/sync.md` §14 ("three attempts in ten
+        // minutes"), and the chapter test below is what keeps that in step.
+        assert_eq!(
+            unit_value(&service, "Unit", "StartLimitIntervalSec"),
+            "600",
+            "ten minutes; 0 would disable rate limiting"
+        );
+        assert_eq!(
+            unit_value(&service, "Unit", "StartLimitBurst"),
+            "3",
+            "three attempts; 0 would disable rate limiting"
+        );
     }
 
     /// The cadence lives in the timer and the work lives in the verb — one of
@@ -6627,16 +6711,22 @@ mod tests {
         assert!(unit_values(&timer, "Timer", "Unit").is_empty());
     }
 
-    /// `docs/sync.md` §14 quotes two lines out of these unit files verbatim, and
-    /// this is what stops those quotations going stale.
+    /// `docs/sync.md` §14 quotes several lines out of these unit files verbatim,
+    /// and this is what stops those quotations going stale.
     ///
     /// Story 56.13 shipped a `--help` describing behaviour that had already been
     /// replaced, and it survived review precisely because the prose sat a long
     /// way from the code. A documented `OnCalendar=` default is the same shape of
     /// claim: nothing in the build reads it, an operator plans around it, and the
-    /// person who retunes the shipped timer has no reason to open a 2 400-line
-    /// document. So the two lines the chapter states as fact are asserted against
-    /// the files they describe.
+    /// person who retunes the shipped timer has no reason to open a 2 500-line
+    /// document.
+    ///
+    /// **Anchored to the sentence, not to any occurrence.** §14 also prints
+    /// `OnCalendar=*-*-* 03:00:00` in its install block as the value an operator
+    /// might choose, so an unanchored `contains("OnCalendar=…")` would go green
+    /// the moment somebody retuned the shipped timer to that value — leaving the
+    /// chapter's "the shipped default is" sentence stale, which is precisely what
+    /// this test exists to prevent.
     #[test]
     fn the_chapter_quotes_the_units_as_they_are_actually_shipped() {
         let chapter = std::fs::read_to_string(
@@ -6646,23 +6736,72 @@ mod tests {
                 .expect("docs/sync.md must be reachable from this crate"),
         )
         .expect("docs/sync.md must be readable");
+        let quotes = |claim: String, why: &str| {
+            assert!(
+                chapter.contains(&claim),
+                "docs/sync.md §14 must carry the sentence {claim:?} — {why}"
+            );
+        };
 
         let timer = parse_unit(TASK_TIMER_FILE);
         let cadence = unit_value(&timer, "Timer", "OnCalendar");
-        assert!(
-            chapter.contains(&format!("OnCalendar={cadence}")),
-            "§14 states the shipped default cadence; the timer now says \
-             OnCalendar={cadence} and the chapter does not"
+        quotes(
+            format!("The shipped default is `OnCalendar={cadence}`"),
+            "the cadence an operator plans around",
+        );
+        // The two directives that move a run away from the instant the operator
+        // wrote, so the chapter has to name both with their real values.
+        quotes(
+            format!(
+                "`RandomizedDelaySec={}`",
+                unit_value(&timer, "Timer", "RandomizedDelaySec")
+            ),
+            "the jitter, which shifts every run by up to that much",
+        );
+        quotes(
+            format!("`Persistent={}`", unit_value(&timer, "Timer", "Persistent")),
+            "the boot catch-up, which runs a missed sweep at an unplanned hour",
         );
 
         let service = parse_unit(TASK_SERVICE_FILE);
         let prevented = unit_value(&service, "Service", "RestartPreventExitStatus");
-        assert!(
-            chapter.contains(&format!("RestartPreventExitStatus={prevented}")),
-            "§14 quotes the exit statuses the unit refuses to retry; the unit now \
-             says {prevented:?} and the chapter does not"
+        quotes(
+            format!("`RestartPreventExitStatus={prevented}`"),
+            "the statuses the unit refuses to retry",
         );
+        quotes(
+            format!(
+                "`SuccessExitStatus={}`",
+                unit_value(&service, "Service", "SuccessExitStatus")
+            ),
+            "what stops a deferral leaving the unit in `failed`",
+        );
+        // The retry ceiling, quoted as the chapter spells it — the two numbers
+        // rather than a prose paraphrase, so retuning either one breaks the
+        // sentence rather than leaving "three attempts in ten minutes" standing
+        // over a unit that now says something else.
+        for key in ["StartLimitBurst", "StartLimitIntervalSec"] {
+            quotes(
+                format!("`{key}={}`", unit_value(&service, "Unit", key)),
+                "the retry ceiling an operator reasons about",
+            );
+        }
 
+        // The systemd floor. `Restart=` on a `Type=oneshot` unit is refused
+        // before v244, so an operator on an older distribution gets a unit that
+        // never loads and a timer that fires onto nothing every night — the
+        // invisible non-execution this epic exists to close. Both the unit
+        // header and the chapter must name the same version, or bumping one
+        // leaves the other advising a floor that is no longer true.
+        const SYSTEMD_FLOOR: &str = "systemd 244";
+        assert!(
+            unit_file(TASK_SERVICE_FILE).contains(SYSTEMD_FLOOR),
+            "the unit that needs it must name {SYSTEMD_FLOOR}"
+        );
+        quotes(
+            SYSTEMD_FLOOR.to_owned(),
+            "the version floor, which decides whether the unit loads at all",
+        );
         // Both filenames appear in the chapter, so the install block cannot name
         // a file this crate does not ship.
         for name in [TASK_SERVICE_FILE, TASK_TIMER_FILE] {

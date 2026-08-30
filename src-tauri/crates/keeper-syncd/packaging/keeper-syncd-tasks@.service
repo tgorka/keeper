@@ -13,6 +13,17 @@
 # the timer's OnCalendar= is the cadence for THIS driver. The timer's header
 # says which `--mode` to pair with it.
 #
+# **Requires systemd 244 or newer.** `Restart=` below is set on a Type=oneshot
+# unit, and systemd refused that combination outright until v244 relaxed the
+# rule to "anything but `always` and `on-success`" — before it, `daemon-reload`
+# logs *"Service has Restart= setting other than no, which isn't allowed for
+# Type=oneshot services. Refusing."* and the unit never loads, so the timer
+# fires every night onto nothing. v244 is December 2019: Debian 11 (247),
+# Ubuntu 20.04 (245) and RHEL 9 (252) are all fine; Debian 10 (241),
+# Ubuntu 18.04 (237) and RHEL 8 (239) are not. On one of those, delete the
+# Restart=/RestartSec= pair and let the timer's next trigger be the retry —
+# SuccessExitStatus= and the hardening lines are all older than that.
+#
 # A **template** unit: the instance name is the task id, so one file drives
 # every task on the box and there is no second copy to drift.
 #
@@ -20,8 +31,21 @@
 #
 # The id goes in verbatim (`%i`, never `%I`), because a task id normally
 # contains hyphens — `release-nightly` — and `%I` would unescape those into
-# slashes and ask keeper for a task nobody stored. An id containing a literal
-# `/` therefore cannot be an instance name at all; rename the task.
+# slashes and ask keeper for a task nobody stored.
+#
+# **Not every id keeper will store can be an instance name.**
+# `keeper_sync::tasks::validate_id` refuses only an empty id and one padded with
+# whitespace, so keeper accepts `night sweep`, `sync@home`, `réveil` and a
+# 500-character id. A systemd unit name admits only ASCII alphanumerics and
+# `: - _ . \` (with `@` as the instance separator) and is capped at 256 bytes,
+# so anything else is unusable here in exactly the way `/` is: `systemctl`
+# rejects the name, or you reach for `systemd-escape` and — because `%i` is
+# verbatim by design — keeper is handed the escaped spelling (`night\x20sweep`)
+# and answers "no such task", exit 2. That refusal writes NO `task_runs` row, so
+# it is invisible to `tasks list`, `tasks status` and the Tasks view. Give a task
+# you intend to drive from a timer an id systemd can spell, when you create it:
+# keeper has no rename verb, and `tasks forget` + `tasks set` destroys the run
+# history that is the whole point of a task.
 #
 # Install (both files, then enable the TIMER, not this). docs/sync.md §14 has the
 # same sequence with the reasoning:
@@ -30,7 +54,7 @@
 #   systemctl --user daemon-reload
 #   loginctl enable-linger "$USER"                  # REQUIRED — see below
 #   loginctl show-user "$USER" --property=Linger    # must print Linger=yes
-#   systemctl --user edit keeper-syncd-tasks@nightly.timer   # set OnCalendar=
+#   systemctl --user edit keeper-syncd-tasks@nightly.timer   # reset then set OnCalendar=
 #   systemctl --user enable --now keeper-syncd-tasks@nightly.timer
 #   systemctl --user list-timers 'keeper-syncd-tasks@*'
 #
@@ -41,25 +65,30 @@
 # lingering: `systemctl --user is-enabled` says a unit is wanted at login, not
 # that it survives logout.
 #
-# There is deliberately no [Install] section here. Enabling a timer-driven
-# one-shot would run it once at login and never again, which looks like it
-# worked and is the opposite of a schedule.
+# There is deliberately no [Install] section here, so this unit cannot be
+# enabled at all — `systemctl --user enable` on it answers "The unit files have
+# no installation config". That is the intent: enabling a timer-driven one-shot
+# *would* run it once at login and never again, which looks like it worked.
 
 [Unit]
 Description=keeper task %i — one run
 Documentation=https://github.com/tgorka/keeper
 # Ordering only, and advisory in a user manager, exactly as in
-# keeper-syncd.service: network-online.target belongs to the system manager. It
-# earns its place here because Persistent=true in the timer can fire a missed
-# run moments after boot. Not a Requires= — AD-49 makes offline the normal case,
-# and a task that could not reach its remote exits 1 and is asked again.
+# keeper-syncd.service: network-online.target belongs to the system manager. Its
+# value here is modest and worth stating honestly — Persistent=true in the timer
+# can fire a missed run after boot, though RandomizedDelaySec= applies to that
+# catch-up too, so it lands 0-60 minutes in rather than immediately. Not a
+# Requires= — AD-49 makes offline the normal case, and a task that could not
+# reach its remote exits 1 and is asked again.
 After=network-online.target
 
 # The retry below is bounded here rather than left to the manager's defaults, so
 # the ceiling is visible beside the policy it bounds: at most three attempts in
 # ten minutes, after which this instance stays failed until the timer's next
 # trigger. Without a stated bound a task failing for a persistent reason would
-# retry on whatever DefaultStartLimit* the distribution happens to ship.
+# retry on whatever DefaultStartLimit* the distribution happens to ship. Neither
+# value may be 0 — either one disables rate limiting entirely and turns
+# RestartSec= into an unbounded loop.
 StartLimitIntervalSec=600
 StartLimitBurst=3
 
@@ -71,10 +100,25 @@ WorkingDirectory=%h
 # refusals and writes the same `task_runs` row a scheduled run does.
 ExecStart=%h/.local/bin/keeper-syncd tasks run %i
 
-# Restart=on-failure is permitted on Type=oneshot (only `always` and
-# `on-success` are not), and it is worth having: exit 1 means the work ran and
-# failed, which is often a transient remote, and the next OnCalendar may be a
-# day away.
+# NOT set, and it matters more than it looks: RemainAfterExit=yes would leave
+# this instance `active` after its first run, and systemd does not start a unit
+# that is already active — so every later trigger would be a silent no-op.
+
+# Exit 4 is not a failure of this unit, and only SuccessExitStatus= can say so.
+# RestartPreventExitStatus= below suppresses the *restart*; it does not change
+# systemd's own verdict, so without this line every night an external drive is
+# out ends with the instance in `failed`: red in `systemctl --user status`,
+# listed in `systemctl --user --failed`, and firing any OnFailure= hook on the
+# box. That is the nightly alert nobody reads, raised by systemd itself, in the
+# one unit whose whole premise is that a deferral must not raise one. 2 and 3
+# stay genuine failures.
+SuccessExitStatus=4
+
+# Restart=on-failure is permitted on Type=oneshot from systemd 244 (only
+# `always` and `on-success` are refused; `on-abnormal`, `on-abort` and
+# `on-watchdog` are allowed too) — see the version note in the header. It is
+# worth having: exit 1 means the work ran and failed, often on a transient
+# remote, and the next OnCalendar may be a day away.
 Restart=on-failure
 RestartSec=60
 # The exit taxonomy, honoured (commands.rs: EXIT_CONFIG, EXIT_PREREQUISITE,
@@ -82,12 +126,13 @@ RestartSec=60
 #   2 — a configuration error: the task id in this instance name is wrong, or
 #       the task is off or disabled. Retrying buries the one log line that says
 #       what to fix, which is why keeper-syncd.service refuses 2 and 3 too.
-#   3 — a prerequisite is missing, in practice `git` (AD-41).
+#   3 — a prerequisite is missing, in practice `git` (AD-41). Raised by
+#       `Engine::open` before any task verb runs.
 #   4 — the work did NOT run and NOTHING IS WRONG: the drive is unplugged, the
 #       folder is paused, it was already syncing, or `keeper-syncd watch` holds
 #       this task's lease. AD-48: an unplugged volume is absence, never failure.
-#       Restarting a deferral every minute for a month is exactly the alert
-#       nobody reads that EXIT_DEFERRED was added to prevent.
+#       Listed here as well as in SuccessExitStatus= so the intent survives
+#       somebody deleting one of the two lines.
 # 1 is deliberately absent from this list: it is the restartable one.
 RestartPreventExitStatus=2 3 4
 
@@ -115,5 +160,10 @@ PrivateTmp=yes
 #   TimeoutStartSec= — systemd disables it by default for Type=oneshot, and
 #     that default is kept deliberately. A host-wide sync task's duration is not
 #     knowable from a unit file, so any number written here would eventually
-#     kill real work; and it cannot pile up, because systemd will not start a
-#     one-shot that is still running when the timer next fires.
+#     kill real work. The cost of the default is worth knowing: a run still
+#     going when the timer next fires is not started again — systemd merges the
+#     new start job into the in-flight one — so that trigger is **dropped with
+#     no `task_runs` row written at all**, and Persistent= will not catch it up
+#     because the timer's stamp advanced. Unlike a held lease or a held
+#     reservation, which both record `busy`, a dropped trigger is invisible to
+#     every keeper surface. Keep the cadence coarser than the work.

@@ -15,13 +15,20 @@
 #     This is the arrangement for a box with no app and no `watch` service.
 #   * **timer AND `keeper-syncd watch`** — `--mode scheduled` with a schedule.
 #     Both drivers run and the lease keeps them from overlapping. A run this
-#     timer triggered leaves the daemon's next window alone — *unless* that
-#     window was already open, in which case it has just been served and is
-#     re-armed to the following instant (`Engine::next_task_window`). That is
-#     reachable here: Persistent=true fires a missed trigger at boot with no
-#     ordering against the daemon's first tick, so a catch-up run can land while
-#     the window is still overdue. Give the timer the coarser cadence unless you
-#     mean the work to happen twice.
+#     timer triggered leaves the daemon's next window alone in the ordinary
+#     case, but `Engine::next_task_window` has TWO exceptions and both move it:
+#       - the window was already open when this run finished: it has just been
+#         served, so it is re-armed to the following instant. Reachable via
+#         Persistent=true, which fires a catch-up with no ordering against the
+#         daemon's first tick after boot.
+#       - the run recorded `busy` or `deferred`: that arm is taken BEFORE the
+#         trigger is even looked at, and it rewrites the window to the sooner of
+#         the next scheduled instant and one minute from now. So a timer run
+#         that did nothing at 00:00 because the folder was mid-sync can leave the
+#         daemon sweeping at 00:01 instead of at the 03:00 the operator chose.
+#     Give the timer the coarser cadence unless you mean the work to happen
+#     twice, and prefer `--mode manual` plus this timer if you want exactly one
+#     cadence in exactly one place.
 #   * **neither, for now** — `--mode off`. The task refuses every trigger, this
 #     one included, and the unit exits 2 without retrying.
 #

@@ -2043,6 +2043,17 @@ replaced by the sooner of *a minute from now* and the next scheduled instant, so
 the sweep happens in the minute after the drive comes back rather than tomorrow
 night.
 
+**That one-minute retry and the fifty-run cap interact, and the interaction can
+cost you the record.** A `scheduled` task whose condition stays unmet — a
+removable folder whose drive is out — defers, re-arms a minute later, defers
+again, and writes a row every minute. Fifty minutes of that evicts everything
+older, so `tasks status` a month later shows fifty identical `deferred` rows from
+the last hour and no trace of the last successful sweep. If you need the history
+to survive a long absence, `tasks disable` the task while the drive is away, or
+drive it from the timer with `--mode manual` so the cadence is the timer's and
+nothing re-arms a minute later. This is a real limit of a bounded log, not a
+fault: the cap is what stops a schedule doing its job from growing `sync.db`.
+
 **`tasks run` does not check whether the task is due.** It performs the work,
 every time, which is what makes a `cron` entry, a systemd timer and a person at
 a prompt behave identically — and what makes the timer's own cadence the one that
@@ -2120,6 +2131,7 @@ task decides how the two relate:
 | `off` (or `enabled = 0`) | does not run | refused: an "off" that still runs when asked is not off |
 | `manual` | **does not run** | runs |
 | `scheduled` | still runs | runs |
+| stored but **unreadable** by this build | **runs** — see below | refused: the row cannot be selected either |
 
 **The first row is the important one: with no release task stored, nothing about
 §9 changes.** That is the arm an un-migrated `sync.db` takes, and it is why
@@ -2130,18 +2142,36 @@ had — while `manual` is the ask this feature was built for: *deletion does not
 have to be automatic, it can be a script run at the right time*.
 
 A folder's own release row outranks a host-wide one, and where several apply the
-least permissive wins. And if the task table cannot be read at all — the other
-host holding a write lock, say — the sweep **declines that pass** rather than
+least permissive wins. And if the task table cannot be read **at all** — the
+other host holding a write lock, say — the sweep declines that pass rather than
 guessing that nobody switched it off, because the honest answer to "may I delete
 content" when the governing instruction is unreadable is no.
 
-One release-task answer is worth knowing before it surprises you: a run where
-**nothing looked** is recorded `deferred` and exits `4`, not `0`. That covers a
-folder whose `releaseTtlMs` is `0`, one whose large-file support is off, one
-whose folder configuration is faulted, and one whose own release row says `off`.
-Counting those as swept would have made *released 0 paths from 10 folders* mean
-either "ten folders had nothing due" or "ten folders refused", and the operator
-who most needs that difference is the one who asked for a run and got silence.
+**The last row fails the other way, and it is worth knowing before you rely on an
+`off` row.** A whole unreadable *table* declines; a single unreadable *row* does
+not. Governance is folded over the rows this build could parse, and a row whose
+`kind` or `mode` a newer keeper wrote is not among them (NFR-43 lists it as
+unknown instead), so governance resolves to *nothing stored* and the §9 success
+edge sweeps exactly as if the row were absent. This is reachable: it is the same
+forward-compatibility case §14 describes above under *unhosted*, and it arises
+when two keeper versions share one `sync.db` or when one host is downgraded. If
+you are switching automatic release **off** and two versions are in play, verify
+with `keeper-syncd tasks list` on the **older** binary that the row appears under
+`tasks` and not under `unknown` — a row it lists as unknown is a row it will not
+honour.
+
+One more release-task answer is worth knowing before it surprises you: a run
+where **nothing looked** is normally recorded `deferred` and exits `4`, not `0`.
+That covers a folder whose `releaseTtlMs` is `0`, one whose large-file support is
+off, one whose folder configuration is faulted, one whose own release row says
+`off`, and a host whose every folder is paused. Counting those as swept would have
+made *released 0 paths from 10 folders* mean either "ten folders had nothing due"
+or "ten folders refused", and the operator who most needs that difference is the
+one who asked for a run and got silence. The **one** exception is a host with no
+folders configured at all: that is `ok` and exit `0`, deliberately, because a box
+with nothing to sweep has nothing wrong with it and never will until somebody adds
+a folder — so a wrapper that treats `0` as "the sweep is working" should also be
+watching that the box still has the folders it is supposed to have.
 
 ### Which host actually runs a task — the platform asymmetry, stated once
 
@@ -2236,9 +2266,21 @@ keeper-syncd-tasks@.timer      # the trigger
 Both are **templates**, and the instance name is the task id — the same string
 `tasks list` prints — so one pair of files drives every task on the box:
 
+Both need **systemd 244 or newer**. The service sets `Restart=` on a
+`Type=oneshot` unit, which systemd refused outright until v244 relaxed the rule;
+before that, `daemon-reload` logs *"Service has Restart= setting other than no,
+which isn't allowed for Type=oneshot services. Refusing."* and the unit never
+loads, so the timer fires every night onto nothing. Debian 11, Ubuntu 20.04 and
+RHEL 9 are all newer; Debian 10, Ubuntu 18.04 and RHEL 8 are not. On one of
+those, delete the unit's `Restart=`/`RestartSec=` pair and let the timer's next
+trigger be the retry — everything else in both files is older than v244.
+
+Run this from the repository root, where `src-tauri/` is the cargo workspace:
+
 ```
 # 1. the binary, and the two units
-install -Dm755 target/release/keeper-syncd ~/.local/bin/keeper-syncd
+install -Dm755 src-tauri/target/release/keeper-syncd ~/.local/bin/keeper-syncd
+cd src-tauri/crates/keeper-syncd/packaging
 install -Dm644 keeper-syncd-tasks@.service ~/.config/systemd/user/keeper-syncd-tasks@.service
 install -Dm644 keeper-syncd-tasks@.timer   ~/.config/systemd/user/keeper-syncd-tasks@.timer
 systemctl --user daemon-reload
@@ -2248,28 +2290,54 @@ systemctl --user daemon-reload
 loginctl enable-linger "$USER"
 loginctl show-user "$USER" --property=Linger     # must print Linger=yes
 
-# 3. the task, and the cadence you actually want
+# 3. the task
 keeper-syncd tasks set nightly --kind release --mode manual
-systemctl --user edit keeper-syncd-tasks@nightly.timer   # OnCalendar=*-*-* 03:00:00
 
-# 4. enable the TIMER
+# 4. the cadence. NOTE THE EMPTY ASSIGNMENT: OnCalendar= is a LIST, so a
+#    drop-in that only adds a value leaves the shipped `daily` in place and the
+#    timer then elapses TWICE. The empty line clears the list first.
+systemctl --user edit keeper-syncd-tasks@nightly.timer
+#   [Timer]
+#   OnCalendar=
+#   OnCalendar=*-*-* 03:00:00
+
+# 5. enable the TIMER, then read back what systemd actually resolved
 systemctl --user enable --now keeper-syncd-tasks@nightly.timer
 systemctl --user list-timers 'keeper-syncd-tasks@*'
+systemctl --user show keeper-syncd-tasks@nightly.timer -p TimersCalendar
 
-# 5. prove it end to end, without waiting for 03:00
+# 6. prove it end to end, without waiting for 03:00
 systemctl --user start keeper-syncd-tasks@nightly.service
 keeper-syncd tasks status nightly
 ```
 
 Step 2 is the one people skip, and skipping it produces a schedule that works
-until you log out and silently never again. Step 5 is worth doing once: it
-exercises the real unit, and `tasks status` then shows the run it produced, with
-its outcome — which is the whole point of a task having a memory.
+until you log out and silently never again. **Step 4's empty `OnCalendar=` is the
+other one**, and it is the more expensive: forget it and a `release` task deletes
+content at midnight as well as at the hour you chose, which nothing at setup time
+reveals — `list-timers` shows only the *next* elapse, which is why step 5 also
+reads `TimersCalendar` back, and that is the line that shows both entries if you
+left both. Step 6 is worth doing once: it exercises the real unit, and
+`tasks status` then shows the run it produced, with its outcome.
 
-Enable the **timer**, never the service: enabling a timer-driven oneshot runs it
-once at login and never again, which looks like it worked. A task id containing a
-`/` cannot be an instance name — rename the task; hyphens are fine and are the
-common case.
+Enable the **timer**, never the service. The shipped service has no `[Install]`
+section at all, so `systemctl --user enable` on it answers *"The unit files have
+no installation config"* rather than doing something subtly wrong — that absence
+is deliberate, because a timer-driven oneshot that *could* be enabled would run
+once at login and never again, which looks like it worked.
+
+**Not every task id can be a systemd instance name.** keeper stores any id that
+is not empty and not padded with whitespace, so `night sweep`, `sync@home` and
+`réveil` are all valid tasks; a systemd unit name admits only ASCII
+alphanumerics and `: - _ . \`, with `@` as the instance separator, and caps the
+whole name at 256 bytes. Anything outside that is unusable here: `systemctl`
+refuses the name, or you reach for `systemd-escape` and — because the unit passes
+the instance name through verbatim, which is what keeps ordinary hyphens working
+— keeper receives the escaped spelling (`night\x20sweep`) and answers *no such
+task*, exit `2`. That refusal writes **no run row**, so it is invisible to
+`tasks list`, `tasks status` and the Tasks view. Choose a timer-driven task's id
+when you create it: keeper has no rename verb, and `tasks forget` followed by
+`tasks set` throws away the run history that is the whole point of a task.
 
 **The timer's `OnCalendar` is the cadence for this driver, so set it to when you
 want the work to happen.** This is the one thing about the pair that is easy to
@@ -2281,15 +2349,37 @@ identically. The `schedule` column is read by the **in-process** hosts: the
 `keeper-syncd watch` daemon's tick and the desktop app's. So an hourly trigger on
 a task whose schedule reads `0 3 * * *` does the work twenty-four times a day,
 not once. The shipped default is `OnCalendar=daily`, deliberately conservative,
-and `systemctl --user edit` is how you change it without editing a shipped file.
+and step 4 above is how you change it without editing a shipped file.
+
+**Two more directives move a run away from the instant you wrote, and both are
+shipped on.** `RandomizedDelaySec=3600` spreads the wake over an hour, so an
+`OnCalendar=*-*-* 03:00:00` drop-in actually fires at a uniformly random point
+between 03:00 and 04:00 — `list-timers` showing a NEXT column up to an hour later
+than you typed is the timer working, not a fault. It exists because a fleet of
+boxes all hitting one forge at exactly the same second is a self-inflicted
+thundering herd; lower it if a folder is only attached during a narrow window,
+because a run whose jitter pushes it outside that window defers instead. And
+`Persistent=true` means a trigger missed while the machine was off fires **once**
+when it comes back rather than waiting for tomorrow — so a laptop shut overnight
+runs its release sweep after boot, not at 03:00. That catch-up is jittered too.
+Both are worth keeping and neither is worth discovering as a surprise deletion.
 
 Which `--mode` to pair with the timer follows from that:
 
 | you are running | give the task | why |
 | --- | --- | --- |
 | the timer only, no `watch` service and no app | `--mode manual` | nothing schedules the task, so the timer is the whole cadence and there is exactly one to read |
-| the timer **and** `keeper-syncd watch` | `--mode scheduled` with a schedule | both drivers run and the lease keeps them from overlapping. A run this timer triggered leaves the daemon's next window alone — *unless* that window was already open, in which case it has just been served and is re-armed to the following instant. Give the timer the coarser cadence unless you mean the work to happen twice |
+| the timer **and** `keeper-syncd watch` | `--mode scheduled` with a schedule | both drivers run and the lease keeps them from overlapping, but **two** things move the daemon's next window and neither is obvious. If that window was already open when the timer's run finished, it has just been served and is re-armed to the following instant. And if the run recorded `busy` or `deferred` — the folder was mid-sync, the drive was out — that arm is taken *before* the trigger is even consulted and rewrites the window to the sooner of the next scheduled instant and one minute from now: a timer run that did nothing at 00:00 can leave the daemon sweeping at 00:01 instead of at the 03:00 you chose. Give the timer the coarser cadence, or prefer `--mode manual` above and keep one cadence in one place |
 | neither, for now | `--mode off` | every trigger is refused, this one included, and the unit exits `2` without retrying |
+
+One cosmetic wrinkle in the `manual` arrangement, so it does not read as a
+contradiction. The window arithmetic that re-arms a `busy` or `deferred` run does
+not consult the mode, so the first timer-driven run that defers writes a
+`nextDueMs` a minute ahead onto a `manual` task — and the Tasks view and
+`--json` will both show a next-due instant for a task that has no schedule.
+Nothing acts on it: the due-gate answers *nothing to do* for any mode but
+`scheduled`, so the task still runs only when the timer asks. Read the timer, not
+that field, as the answer to *when will this happen* on a manual task.
 
 What stays in keeper either way is everything keeper can be asked about: the
 task's name, kind, target, mode, its whole run history, and the schedule the
@@ -2297,15 +2387,39 @@ in-process hosts honour. Putting a cadence in a unit file *instead of* a task �
 no row at all, just a timer — is what AD-136 rejected, because then `tasks list`
 and the Tasks view would have nothing to show and nothing to report on.
 
-The unit honours the exit taxonomy: `RestartPreventExitStatus=2 3 4`, because a
+The unit honours the exit taxonomy twice over, because systemd asks two separate
+questions. `RestartPreventExitStatus=2 3 4` answers *should this be retried*: a
 configuration error, a missing `git` and a deferral are the three numbers a
-restart cannot help — and a `4` retried every minute is that nightly alert nobody
-reads. `1` stays restartable, bounded at three attempts in ten minutes, after
+restart cannot help, and a `4` retried every minute is that nightly alert nobody
+reads. `SuccessExitStatus=4` answers *was this a failure*, and it is the line
+that matters more than it looks: `RestartPreventExitStatus` suppresses only the
+restart, so without it every night an external drive is out would end with the
+instance in `failed` — red under `systemctl --user status`, listed in
+`systemctl --user --failed`, firing any `OnFailure=` hook on the box. That is
+systemd raising the very alert the exit code exists to prevent, and it would also
+make step 6 of the install above print *"Job for
+keeper-syncd-tasks@nightly.service failed"* at the moment it is meant to prove
+the install works. `2` and `3` stay genuine failures. `1` stays restartable,
+bounded by `StartLimitBurst=3` within `StartLimitIntervalSec=600`, after
 which the instance waits for the timer's next trigger. The daemon unit's stop
 contract is deliberately **not** copied: `watch` installs a SIGTERM handler and
 finalizes under a 10 s bound, `tasks run` installs none — it does not need one,
 because a task is idempotent and safely abandonable, and a run killed mid-flight
 is closed as `abandoned` by the next host to reclaim its lease.
+
+**One overlap keeps no record at all, and it is the only one that does not.** A
+held lease records `busy`; a held per-folder reservation records `busy`; but a
+trigger that arrives while the previous run is *still going* is not a run at all
+— systemd merges the new start job into the in-flight one, nothing is spawned,
+and the timer's own stamp advances so `Persistent=` will not catch it up either.
+No `task_runs` row is written, so that skipped night is invisible to `tasks
+list`, `tasks status`, `--json` and the Tasks view alike. The unit sets no
+`TimeoutStartSec` on purpose — a host-wide sync task's duration is not knowable
+from a unit file, so any number written there would eventually kill real work —
+which means the defence is yours: **keep the cadence coarser than the work.** If
+a task can take more than an hour, do not trigger it hourly, and check
+`systemctl --user status keeper-syncd-tasks@<id>.service` if a night looks
+missing from the history.
 
 A plain `cron` entry is the same thing with less ceremony, and reaches the same
 code path:
@@ -2458,8 +2572,11 @@ clone authored, a `synced_at_ms` that is not NULL — and a folder that authoriz
 that path to stay away: `lfsMode = pointerOnly`, or the default `materialize`
 with the folder's own policy resolving the path to virtual, a bare
 `virtualOverBytes` floor included since story 56.16. A row whose folder keeps it
-answers with a word and no instant instead. One part is not reachable at
-runtime, and one is reachable on Linux only:
+answers with a word and no instant instead. **Tasks (§14) are real** as of
+2026-08-30 — the record, the dialect, the due-gate on each host's existing tick,
+the seven CLI verbs with their exit taxonomy, the release task's three modes, the
+⌘8 view and the systemd timer pair — with the platform limits §14 states rather
+than a gap here. Two parts are not reachable everywhere:
 
 - **§12 progress and warnings.** These are engine-side and correct — the tray
   decision, the status line and the warning onset logic are implemented and
@@ -2476,6 +2593,12 @@ runtime, and one is reachable on Linux only:
   question without racing, so both refuse `OpenUnknown` there. Nothing releases
   content on a macOS or Windows machine until that platform can answer the
   question.
+- **A packaged background host, on macOS.** Tasks (§14) run there only while the
+  desktop app is running: a `keeper-syncd` binary is published for macOS and its
+  one-shot verbs work, but keeper ships no launchd agent, so nothing starts
+  `watch` and nothing triggers `tasks run` unless you write a `cron` entry
+  yourself. On Linux both the daemon and the shipped timer pair are real hosts,
+  and both need `loginctl enable-linger` to survive logout.
 
 ## 19. Measured envelopes
 
