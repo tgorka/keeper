@@ -1775,16 +1775,25 @@ fn task_run_vm(run: &keeper_sync::db::TaskRunRow) -> TaskRunVm {
 /// The verdict is [`keeper_core::tasks::task_host`]'s and nothing here
 /// second-guesses it: this function's whole job is to establish the facts it
 /// reads — above all `profile`, which is `None` exactly when the task names a
-/// folder that is no longer a sync profile, and is therefore the input that
-/// produces the **unhosted** answer AD-137 requires.
+/// folder this app could not resolve, and is therefore the input that produces
+/// the **unhosted** answer AD-137 requires.
 ///
 /// Every profile is searched, including paused ones. A paused folder still
 /// exists, so a task naming it is `off`-adjacent at worst — reporting it as
 /// *unhosted* would tell the user their configuration is broken when they had
 /// merely pressed pause.
+///
+/// `unreadable_profiles` is the same discipline applied one level down (this
+/// story's review, finding 3). `db::list_profiles` drops a row it cannot
+/// deserialize, so an id that is present and healthy in the store resolves to
+/// `None` here exactly as a deleted one does — and rendering that as "keeper does
+/// not sync that folder", in red, permanently, is the same class of lie. The ids
+/// come from `Engine::unreadable_profile_ids`, and the pure function turns them
+/// into a different sentence.
 fn task_vm(
     row: &keeper_sync::db::TaskRow,
     profiles: &[SyncProfile],
+    unreadable_profiles: &[String],
     last_run: Option<TaskRunVm>,
     daemon: DaemonPresence,
 ) -> TaskVm {
@@ -1800,6 +1809,10 @@ fn task_vm(
             schedule: row.schedule.as_deref(),
             profile_id: row.profile_id.as_deref(),
             profile: profile.as_deref(),
+            profile_unreadable: row
+                .profile_id
+                .as_deref()
+                .is_some_and(|id| unreadable_profiles.iter().any(|other| other == id)),
         },
         daemon,
     );
@@ -1841,7 +1854,18 @@ fn daemon_data_dir() -> Option<std::path::PathBuf> {
     Some(base.join("keeper-sync"))
 }
 
-/// `Some(true)` when a `keeper-syncd` user unit is enabled here.
+/// How long the `systemctl` probe may take before it is killed and read as
+/// *no daemon* (this story's review, finding 11).
+///
+/// `systemctl --user is-enabled` answers in milliseconds on a healthy box and is
+/// meant to fail fast on an unhealthy one — but "meant to" is not a deadline, and
+/// a wedged user bus makes `.output()` wait forever. The safe direction is
+/// already written into [`daemon_unit_enabled`]: anything unexpected reads as no
+/// unit, which under-claims rather than over-claims a host.
+#[cfg(target_os = "linux")]
+const DAEMON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `true` when a `keeper-syncd` user unit is enabled here.
 ///
 /// `is-enabled` and not `is-active`: AD-137's question is whether the unit will
 /// run the task, and an enabled unit that is momentarily stopped still will,
@@ -1850,35 +1874,112 @@ fn daemon_data_dir() -> Option<std::path::PathBuf> {
 /// `indirect` and the rest all exit 0 from `is-enabled` without meaning that,
 /// which is why the exit code alone is not the answer.
 ///
-/// A missing `systemctl`, a machine with no user bus, a refusal — all read as
-/// "no unit", which is the safe direction: crediting a daemon that turns out not
-/// to see the row produces a task that looks hosted and never fires, while
-/// under-crediting one produces a row that says "keeper runs this" on a machine
-/// where the daemon might also run it — visible, and not a silent
-/// non-execution.
+/// A missing `systemctl`, a machine with no user bus, a refusal, **or a probe
+/// that outlasts [`DAEMON_PROBE_TIMEOUT`]** — all read as "no unit", which is the
+/// safe direction: crediting a daemon that turns out not to see the row produces
+/// a task that looks hosted and never fires, while under-crediting one produces
+/// a row that says "keeper runs this" on a machine where the daemon might also
+/// run it — visible, and not a silent non-execution.
+///
+/// **Blocking, and it must only be called off the async runtime** — through
+/// [`daemon_presence_probe`], which is the only caller. Spawning, waiting and
+/// two `canonicalize` calls on a runtime worker is the rule `sync_footprint`
+/// states in this same file: blocking work there "would stall every other command
+/// sharing the thread".
 #[cfg(target_os = "linux")]
 fn daemon_unit_enabled() -> bool {
-    let Ok(output) = std::process::Command::new("systemctl")
+    let Ok(mut child) = std::process::Command::new("systemctl")
         .args(["--user", "is-enabled", DAEMON_UNIT])
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
     else {
         return false;
     };
-    let answer = String::from_utf8_lossy(&output.stdout);
+    // Polled rather than `.output()`: that call reads to EOF and waits with no
+    // deadline, which is the unbounded wait this loop replaces. The output is a
+    // single word, so it cannot fill the pipe buffer and is read after the wait.
+    let deadline = std::time::Instant::now() + DAEMON_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                tracing::debug!("the systemctl daemon probe outlasted its deadline; no daemon");
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+    let mut answer = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        use std::io::Read;
+        let _ = stdout.read_to_string(&mut answer);
+    }
     matches!(answer.trim(), "enabled" | "enabled-runtime")
 }
+
+/// [`daemon_presence_here`] on a blocking thread, bounded, defaulting to
+/// [`DaemonPresence::Absent`].
+///
+/// The commands that need a host verdict are `async fn`s, so their bodies run on
+/// a runtime worker — and the probe underneath is a fork/exec/wait plus two
+/// `canonicalize` calls (this story's review, finding 11). It is deliberately
+/// uncached, because a person who enables the unit while keeper is open must see
+/// the view stop claiming the app is the host, so every listing pays it and every
+/// listing must pay it *off* the runtime.
+///
+/// A join failure or an overrun reads as `Absent`, the direction
+/// [`daemon_unit_enabled`] already documents as safe.
+async fn daemon_presence_probe(app_data_dir: Option<std::path::PathBuf>) -> DaemonPresence {
+    let probe =
+        tauri::async_runtime::spawn_blocking(move || daemon_presence_here(app_data_dir.as_deref()));
+    match tokio::time::timeout(DAEMON_PROBE_BUDGET, probe).await {
+        Ok(Ok(presence)) => presence,
+        Ok(Err(err)) => {
+            tracing::warn!(%err, "the daemon presence probe panicked; reporting no daemon");
+            DaemonPresence::Absent
+        }
+        Err(_) => {
+            tracing::warn!("the daemon presence probe outlasted its budget; reporting no daemon");
+            DaemonPresence::Absent
+        }
+    }
+}
+
+/// The ceiling on the whole presence probe, kill included.
+///
+/// Above [`DAEMON_PROBE_TIMEOUT`] on Linux so the inner deadline is what
+/// normally fires and the answer stays the inner function's; this is the
+/// backstop for the two `canonicalize` calls beside it — a stat on a dead
+/// network mount — and the only bound on non-Linux, where the probe is a
+/// constant.
+const DAEMON_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Which host a scheduled task on this machine has, as a fact rather than a
 /// platform sniff.
 ///
+/// **Blocking**; reached only through [`daemon_presence_probe`], which is what
+/// keeps the fork/exec and the two `canonicalize` calls off a runtime worker
+/// (this story's review, finding 11).
+///
 /// Probed per listing rather than cached, deliberately: a person who installs
 /// and enables the unit while keeper is open must see the Tasks view stop
-/// claiming the app is the host, and this costs one `systemctl` spawn on a
-/// human-triggered read.
+/// claiming the app is the host, and this costs one bounded `systemctl` spawn on
+/// a human-triggered read.
 ///
 /// **On macOS this is `Absent` by construction, and that is the honest answer.**
-/// There is no launchd plist for `keeper-syncd` anywhere in this repository, so
-/// the app is the only host a Mac has — which is exactly why the row must say
+/// `keeper-syncd` does build and ship for macOS — `release.yml` publishes
+/// `keeper-syncd-aarch64-apple-darwin` — but no launchd plist exists anywhere in
+/// this repository, so nothing starts it in the background and the app is the
+/// only host a Mac has out of the box. Which is exactly why the row must say
 /// "only while keeper is running" rather than implying a background service
 /// (AD-137).
 #[cfg(target_os = "linux")]
@@ -1921,15 +2022,22 @@ fn daemon_presence_here(_app_data_dir: Option<&std::path::Path>) -> DaemonPresen
 /// save `n` bounded `SELECT`s would buy nothing and would need a second query
 /// shape beside `db::task_runs`.
 ///
+/// **Every read here propagates**, which it did not before this story's review
+/// (finding 3). A swallowed `list_profiles` fault made *every* folder-scoped task
+/// read `unhosted` with "it names a folder keeper does not sync" — the one thing
+/// AD-137 exists to prevent — and a swallowed history read made a task that had
+/// run report "never run". A failed read is a fault to report, not a fact to
+/// invent: the pane shows the refusal and keeps whatever it last had.
+///
 /// Rejects with: `unsupported` (no usable git), `internal`.
 #[tauri::command]
 pub async fn sync_tasks(state: tauri::State<'_, AppState>) -> Result<TaskListingVm, IpcError> {
     let engine = engine_of(&state)?;
     let listing = engine.tasks().map_err(|err| sync_ipc_error(&err))?;
-    let profiles = engine
-        .list_profiles()
-        .map_err(|err| sync_ipc_error(&err))
-        .unwrap_or_default();
+    let profiles = engine.list_profiles().map_err(|err| sync_ipc_error(&err))?;
+    let unreadable = engine
+        .unreadable_profile_ids()
+        .map_err(|err| sync_ipc_error(&err))?;
     // The ENGINE's data directory, read through the same port `Engine::open`
     // resolves `sync.db` against — not `Platform::data_dir` beside it. The
     // question is which database this app's tasks live in, so asking anything
@@ -1938,18 +2046,16 @@ pub async fn sync_tasks(state: tauri::State<'_, AppState>) -> Result<TaskListing
     let app_dir = crate::sync::sync_platform(Arc::clone(&state.platform))
         .data_dir()
         .ok();
-    let daemon = daemon_presence_here(app_dir.as_deref());
-    let tasks = listing
-        .tasks
-        .iter()
-        .map(|row| {
-            let last_run = engine
-                .task_history(&row.id, 1)
-                .ok()
-                .and_then(|runs| runs.first().map(task_run_vm));
-            task_vm(row, &profiles, last_run, daemon)
-        })
-        .collect();
+    let daemon = daemon_presence_probe(app_dir).await;
+    let mut tasks = Vec::with_capacity(listing.tasks.len());
+    for row in &listing.tasks {
+        let last_run = engine
+            .task_history(&row.id, 1)
+            .map_err(|err| sync_ipc_error(&err))?
+            .first()
+            .map(task_run_vm);
+        tasks.push(task_vm(row, &profiles, &unreadable, last_run, daemon));
+    }
     Ok(TaskListingVm {
         tasks,
         unknown: listing
@@ -2079,22 +2185,27 @@ pub async fn sync_task_save(
                 "task '{id}' was saved but does not read back"
             )))
         })?;
-    let profiles = engine
-        .list_profiles()
-        .map_err(|err| sync_ipc_error(&err))
-        .unwrap_or_default();
+    // Propagated, never swallowed — see `sync_tasks`, and finding 3 of this
+    // story's review: a failed profile read used to make the row the user had
+    // just saved come back claiming its folder does not exist.
+    let profiles = engine.list_profiles().map_err(|err| sync_ipc_error(&err))?;
+    let unreadable = engine
+        .unreadable_profile_ids()
+        .map_err(|err| sync_ipc_error(&err))?;
     // `platform` above is the same port, so this is the engine's own data
     // directory — see `sync_tasks`.
     let app_dir = platform.data_dir().ok();
     let last_run = engine
         .task_history(&id, 1)
-        .ok()
-        .and_then(|runs| runs.first().map(task_run_vm));
+        .map_err(|err| sync_ipc_error(&err))?
+        .first()
+        .map(task_run_vm);
     Ok(task_vm(
         stored,
         &profiles,
+        &unreadable,
         last_run,
-        daemon_presence_here(app_dir.as_deref()),
+        daemon_presence_probe(app_dir).await,
     ))
 }
 

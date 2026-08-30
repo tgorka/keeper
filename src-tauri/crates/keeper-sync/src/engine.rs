@@ -516,6 +516,32 @@ const TASK_LEASE_MS: i64 = 3_600_000;
 /// that a folder whose drive returns is served in the minute after.
 const TASK_RETRY_MS: i64 = 60_000;
 
+/// How long a quitting host waits for its own task runs to settle before it
+/// hands the remaining leases back (Story 57.5's review, finding 1).
+///
+/// Two seconds, and it buys exactly one thing: a run that ends inside it closes
+/// its own row and releases its own lease with the **true** outcome, instead of
+/// being recorded `abandoned` and leaving its lease to expire. That is the
+/// common shape — a `release` sweep with nothing to prune, a sync pass over a
+/// converged folder — so the budget is worth a small delay on a gesture the user
+/// has already committed to.
+///
+/// It is deliberately *not* sized to the longest thing a task does. A sync pass
+/// over a large folder takes minutes and a quit may not, so overshooting the
+/// budget is the designed case rather than the failure case:
+/// [`Engine::release_task_leases`] then leaves that task's lease held and the
+/// correctness of the whole path rests on that, not on this number. Which is
+/// why this may be tuned freely and why no test asserts its value.
+const TASK_QUIT_SETTLE_MS: u64 = 2_000;
+
+/// [`TASK_QUIT_SETTLE_MS`] as the type a caller passes.
+///
+/// `pub` because the desktop app's quit path is in another crate and must not
+/// invent its own budget: one number, in the crate that knows what a task run
+/// costs.
+pub const TASK_QUIT_SETTLE: std::time::Duration =
+    std::time::Duration::from_millis(TASK_QUIT_SETTLE_MS);
+
 /// Why a task is running: because its window opened, or because somebody asked.
 ///
 /// Two things hang off it and neither is cosmetic. The claim only demands an
@@ -889,6 +915,31 @@ pub struct Engine {
     /// has its own notifier and its own user to tell — and a durable flag would
     /// have one host's toast suppress the other's.
     task_faults: Mutex<HashSet<String>>,
+    /// Task ids whose run **this process is executing right now** — the set the
+    /// quit path must not hand a lease back for (Story 57.5's review).
+    ///
+    /// A `watch::Sender` rather than a `Mutex<HashSet<_>>` so the set and the
+    /// wakeup are one thing: [`Engine::settle_task_runs`] awaits a drain without
+    /// polling, and there is no second structure to drift out of step with this
+    /// one. Reads go through [`tokio::sync::watch::Sender::borrow`], which needs
+    /// no receiver to exist.
+    ///
+    /// Why it exists at all: [`db::release_host_leases`] frees every lease this
+    /// host holds, and on the quit path that used to include the lease of a run
+    /// still in flight. `stop_supervisor` only *signals* — `self.tick().await`
+    /// runs inside the `select!` branch — so a supervisor inside
+    /// [`Self::claim_and_run`] cannot observe the signal, and the git child it
+    /// spawned is a `std::process::Command` with no `kill_on_drop`. Freeing that
+    /// lease let the other host on a shared `sync.db` satisfy `claim_task`'s
+    /// `running_host IS NULL AND next_due_ms <= now` on its next tick and start a
+    /// **second concurrent run** of the same task over the same git working tree
+    /// — the serialization the claim exists to make structurally impossible, and
+    /// for a `release`-kind task a content-risk rather than a noisy one.
+    ///
+    /// Process-local, like [`Self::task_faults`] and for a stronger reason: the
+    /// question it answers is "is *this* process still running it", which no
+    /// column could answer for a host that has already died.
+    task_runs_in_flight: tokio::sync::watch::Sender<HashSet<String>>,
     /// When each profile may next be rescanned for local work.
     ///
     /// The supervisor ticks at 1 Hz because a queued unit should start almost
@@ -1132,6 +1183,26 @@ impl Drop for WalkClaim<'_> {
     }
 }
 
+/// One task run this process is executing, deregistered when this is dropped.
+///
+/// Same discipline as [`WalkClaim`] and the failure mode is the mirror image: a
+/// leaked entry here does not lose work, it makes every later quit hold that
+/// task's lease until [`TASK_LEASE_MS`] expires — so the removal has to survive
+/// the `?` on `finish_task_run`, an error out of the work, and a panic on a
+/// worker thread. See [`Engine::task_runs_in_flight`].
+struct TaskRunInFlight<'a> {
+    engine: &'a Engine,
+    task_id: String,
+}
+
+impl Drop for TaskRunInFlight<'_> {
+    fn drop(&mut self) {
+        self.engine.task_runs_in_flight.send_modify(|running| {
+            running.remove(&self.task_id);
+        });
+    }
+}
+
 /// One remembered answer from `git-lfs-authenticate`, with its own deadline.
 ///
 /// The deadline is stored rather than recomputed because the two answers expire
@@ -1218,6 +1289,7 @@ impl Engine {
             labels_backfilled: Mutex::new(HashSet::new()),
             transient_failures: Mutex::new(HashMap::new()),
             task_faults: Mutex::new(HashSet::new()),
+            task_runs_in_flight: tokio::sync::watch::Sender::new(HashSet::new()),
             next_scan_ms: Mutex::new(HashMap::new()),
             next_sweep_ms: Mutex::new(HashMap::new()),
             next_release_ms: Mutex::new(HashMap::new()),
@@ -1444,6 +1516,16 @@ impl Engine {
 
     pub fn list_profiles(&self) -> Result<Vec<SyncProfile>> {
         self.with_db(db::list_profiles)
+    }
+
+    /// Profile ids the store holds and this build cannot read — the ids
+    /// [`Self::list_profiles`] drops.
+    ///
+    /// Asked by the task projection, which must not report "keeper does not sync
+    /// that folder" about a folder whose row it merely failed to parse. See
+    /// [`db::unreadable_profile_ids`].
+    pub fn unreadable_profile_ids(&self) -> Result<Vec<String>> {
+        self.with_db(db::unreadable_profile_ids)
     }
 
     pub fn upsert_profile(&self, profile: &SyncProfile) -> Result<()> {
@@ -2138,6 +2220,13 @@ impl Engine {
         else {
             return Ok(None);
         };
+        // The lease is now held by this process, so from here to the end of this
+        // function the quit path must not hand it back — see
+        // [`Self::task_runs_in_flight`]. Registered *after* the claim (a declined
+        // claim runs nothing) and dropped by the guard, so an early `?` return or
+        // a panic inside the work cannot leave the id behind and wedge every
+        // later quit into holding a lease for a run that ended.
+        let _in_flight = self.mark_task_run_in_flight(&task.id);
         let (outcome, detail) = self.perform_task(task, profiles, trigger.source()).await;
         // The clock is read again rather than reused: a sync pass takes as long
         // as it takes, and a window computed from the instant the task became
@@ -2528,7 +2617,63 @@ impl Engine {
         format!("{}#{}", self.device().id, std::process::id())
     }
 
-    /// Hand back every task lease this process holds.
+    /// Note that this process is executing `task_id`'s run, until the returned
+    /// guard is dropped.
+    ///
+    /// A guard rather than a matched pair of calls because the interval it marks
+    /// contains a `?`, a `.await` and arbitrary git work: any exit that is not
+    /// the happy one must still clear the id, or the next quit would hold a
+    /// lease open for a run that ended long ago.
+    fn mark_task_run_in_flight(&self, task_id: &str) -> TaskRunInFlight<'_> {
+        self.task_runs_in_flight.send_modify(|running| {
+            running.insert(task_id.to_owned());
+        });
+        TaskRunInFlight {
+            engine: self,
+            task_id: task_id.to_owned(),
+        }
+    }
+
+    /// Task ids whose run this process is executing right now.
+    fn task_runs_in_flight(&self) -> HashSet<String> {
+        self.task_runs_in_flight.borrow().clone()
+    }
+
+    /// Wait, for at most `budget`, until this process is running no task.
+    ///
+    /// Returns the ids still in flight when it gave up — empty means everything
+    /// settled, and every one of those runs released its own lease truthfully
+    /// through [`db::finish_task_run`]. Awaits the set rather than polling a
+    /// clock: a run that finishes in a millisecond costs a millisecond of quit.
+    ///
+    /// The budget is the caller's, because the two callers have different ones:
+    /// the supervisor's own shutdown has already broken its loop and has nothing
+    /// to wait for, while a quitting app is spending a user's patience.
+    pub async fn settle_task_runs(&self, budget: std::time::Duration) -> HashSet<String> {
+        let mut running = self.task_runs_in_flight.subscribe();
+        let drained = tokio::time::timeout(budget, async {
+            while !running.borrow_and_update().is_empty() {
+                // `Err` is a dropped sender, which cannot happen while `self`
+                // is borrowed — but a `while let` on it would spin, so it ends
+                // the wait rather than being ignored.
+                if running.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+        if drained.is_err() {
+            let held = self.task_runs_in_flight();
+            tracing::warn!(
+                tasks = ?held,
+                budget_ms = budget.as_millis(),
+                "quitting while a task run is still executing; its lease is left to expire"
+            );
+        }
+        self.task_runs_in_flight()
+    }
+
+    /// Hand back the task leases this process holds and is **not** running.
     ///
     /// Called from [`Self::finalize`], which is the supervisor's shutdown path.
     /// A `systemctl restart` in the middle of a run would otherwise leave the
@@ -2537,18 +2682,32 @@ impl Engine {
     /// — on Linux the app shares the device row and may legitimately hold one.
     /// NFR-42 asks that a SIGTERM be a bounded finalize; this is what bounds it.
     ///
-    /// **`pub` for the desktop app's quit path** (Story 57.5). `finalize` is
-    /// only reached *after* `Self::run`'s loop breaks, and the app drops the
+    /// **`pub` for the desktop app's quit path** (Story 57.5), which reaches it
+    /// through [`Self::finalize_task_leases_for_quit`]. `finalize` is only
+    /// reached *after* `Self::run`'s loop breaks, and the app drops the
     /// supervisor's `JoinHandle` at spawn — so on quit nothing awaits the
     /// supervisor and `finalize` races process exit, usually losing. The quit
-    /// thread therefore calls this directly on the `Arc` it already holds. Safe
-    /// to call from anywhere and at any time: one bounded, conditional `UPDATE`
-    /// scoped to this host's own leases, idempotent, and a no-op when it holds
-    /// none.
+    /// thread therefore calls this directly on the `Arc` it already holds.
+    ///
+    /// **A lease whose run is still in flight is not handed back**, which is the
+    /// half `finalize`'s ordering used to provide for free and the direct call
+    /// dropped. [`db::release_host_leases`] still closes that run's row as
+    /// [`tasks::TaskOutcome::Abandoned`] — quitting mid-run *is* abandoning it,
+    /// and the history has to say so — but the task row keeps `running_host`, so
+    /// the other host on a shared `sync.db` cannot start a second concurrent run
+    /// over a working tree an orphaned git child is still writing. That lease
+    /// expires the ordinary [`TASK_LEASE_MS`] way, which is the floor the whole
+    /// scheme already stands on. Under-claiming a released lease costs a delay;
+    /// over-claiming one costs the serialization [`db::claim_task`] exists for.
+    ///
+    /// Safe to call from anywhere and at any time: one bounded conditional
+    /// `UPDATE` scoped to this host's own leases, idempotent, and a no-op when it
+    /// holds none.
     pub fn release_task_leases(&self) {
         let now = self.platform.now_ms();
         let host = self.task_host();
-        match self.with_db(|conn| db::release_host_leases(conn, &host, now)) {
+        let running = self.task_runs_in_flight();
+        match self.with_db(|conn| db::release_host_leases(conn, &host, now, &running)) {
             Ok(0) => {}
             Ok(released) => {
                 tracing::info!(released, host, "handed back this host's task leases");
@@ -2559,6 +2718,33 @@ impl Engine {
                 tracing::warn!(error = %err, "cannot hand back this host's task leases");
             }
         }
+    }
+
+    /// The quit path's whole task-lease sequence, in the order that makes it
+    /// safe (Story 57.5's review, finding 1).
+    ///
+    /// The caller has already signalled the supervisor to stop. That signal is
+    /// all it is: `Engine::run`'s `self.tick().await` runs inside the `select!`
+    /// *branch*, so a supervisor already inside [`Self::claim_and_run`] cannot
+    /// observe it, and the app awaits no `JoinHandle`. So:
+    ///
+    /// 1. **Settle**, bounded by `budget`. A run that ends inside the budget
+    ///    closes its own row and releases its own lease with the true outcome —
+    ///    which is exactly what `finalize`'s post-loop ordering used to
+    ///    guarantee, restored here without awaiting a handle nobody kept.
+    /// 2. **Release, conditionally.** Whatever did not settle keeps its lease and
+    ///    is recorded [`tasks::TaskOutcome::Abandoned`]; everything else is
+    ///    handed straight back.
+    ///
+    /// Returns the ids whose leases were deliberately left held, so the caller
+    /// can log the fact rather than assume it.
+    pub async fn finalize_task_leases_for_quit(
+        &self,
+        budget: std::time::Duration,
+    ) -> HashSet<String> {
+        let held = self.settle_task_runs(budget).await;
+        self.release_task_leases();
+        held
     }
 
     async fn tick_profile(&self, profile: &SyncProfile) -> Result<()> {
@@ -7668,8 +7854,22 @@ impl Engine {
     /// is, rather than at the tick that would otherwise accept it and silently
     /// never fire. [`db::upsert_task`] carries the whole rule; this is the door
     /// every host reaches it through.
+    ///
+    /// **A task coming back into service clears its fault**, on exactly the
+    /// edges the store already recognises as a fresh arming (Story 57.5's
+    /// review, finding 4). Without it, disable-a-broken-task → fix the remote →
+    /// re-enable → break again notified nobody: [`Self::note_task_outcome`]
+    /// found the id still in [`Self::task_faults`], read the failure as a repeat
+    /// and stayed silent for the rest of the process's life — the
+    /// invisible-failure shape that state exists to close, reintroduced by the
+    /// state itself. A created row clears it too, which is the forget-and-
+    /// re-create path: the id is the same, the task is not.
     pub fn save_task(&self, task: &db::TaskRow) -> Result<()> {
-        self.with_db(|conn| db::upsert_task(conn, task))
+        let effect = self.with_db(|conn| db::upsert_task(conn, task))?;
+        if matches!(effect, db::TaskSave::Created | db::TaskSave::Rearmed) {
+            Self::lock(&self.task_faults).remove(&task.id);
+        }
+        Ok(())
     }
 
     /// Every stored task, with the rows this build cannot read listed beside
@@ -7684,8 +7884,16 @@ impl Engine {
     }
 
     /// Forget a task and everything it recorded.
+    ///
+    /// Including its fault, which is not merely housekeeping: re-creating the
+    /// same id afterwards is the documented edit-rather-than-duplicate path, and
+    /// a fault surviving the forget made the **new** record's first failure
+    /// silent (Story 57.5's review, finding 4). It also stops the set growing for
+    /// the process's life with ids of tasks that no longer exist.
     pub fn forget_task(&self, id: &str) -> Result<()> {
-        self.with_db(|conn| db::delete_task(conn, id))
+        self.with_db(|conn| db::delete_task(conn, id))?;
+        Self::lock(&self.task_faults).remove(id);
+        Ok(())
     }
 
     /// Run one task now, recording it exactly as a scheduled run is recorded
@@ -12396,6 +12604,87 @@ mod tests {
         Engine::open(platform).ok()
     }
 
+    /// A [`TestPlatform`] that parks the caller inside a **task** notification.
+    ///
+    /// The one deterministic seam into "a task run is in flight right now" that
+    /// does not require a slow fixture: `claim_and_run` calls
+    /// `note_task_outcome` — and so `platform.notify` — one statement before
+    /// `finish_task_run`, with the lease held, the run row open and the
+    /// in-flight guard live. Parking there makes the quit-path race a
+    /// deterministic test instead of a sleep.
+    ///
+    /// Only `Task — ` titles park: a failing folder posts its own warning
+    /// through the same port, and parking on that would stop the tick before it
+    /// ever reached the task.
+    struct ParkedTaskNotify {
+        inner: Arc<TestPlatform>,
+        /// Fired once, when the run is provably in flight.
+        entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        /// Taken once, and blocked on until the test lets the run finish.
+        resume: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl SyncPlatform for ParkedTaskNotify {
+        fn data_dir(&self) -> Result<PathBuf> {
+            self.inner.data_dir()
+        }
+
+        fn secret_get(&self, key: &str) -> Result<Option<String>> {
+            self.inner.secret_get(key)
+        }
+
+        fn secret_set(&self, key: &str, value: &str) -> Result<()> {
+            self.inner.secret_set(key, value)
+        }
+
+        fn secret_delete(&self, key: &str) -> Result<()> {
+            self.inner.secret_delete(key)
+        }
+
+        fn notify(&self, title: &str, body: &str) {
+            self.inner.notify(title, body);
+            if !title.starts_with("Task — ") {
+                return;
+            }
+            if let Some(entered) = Engine::lock(&self.entered).take() {
+                let _ = entered.send(());
+            }
+            // `block_in_place` rather than a bare `recv`: this runs on a runtime
+            // worker, and the test's own future needs that worker's other tasks
+            // to keep being polled while this one is parked.
+            let waiting = Engine::lock(&self.resume).take();
+            if let Some(resume) = waiting {
+                tokio::task::block_in_place(|| {
+                    let _ = resume.recv();
+                });
+            }
+        }
+
+        fn now_ms(&self) -> i64 {
+            self.inner.now_ms()
+        }
+
+        fn utc_offset_minutes(&self) -> i32 {
+            self.inner.utc_offset_minutes()
+        }
+
+        fn open_file_state(&self, path: &Path) -> crate::OpenFileState {
+            self.inner.open_file_state(path)
+        }
+
+        fn free_space(&self, path: &Path) -> Option<u64> {
+            self.inner.free_space(path)
+        }
+
+        fn git_program(&self) -> Result<PathBuf> {
+            self.inner.git_program()
+        }
+
+        fn host_label(&self) -> String {
+            self.inner.host_label()
+        }
+    }
+
     fn profile(dir: &Path) -> SyncProfile {
         SyncProfile::new(
             "01JTESTPROFILE",
@@ -13094,6 +13383,82 @@ mod tests {
         );
     }
 
+    /// A task that comes back into service arms its **alarm** afresh too, not
+    /// only its window (Story 57.5's review, finding 4).
+    ///
+    /// `Ok` was the only thing that cleared a fault, so every route back into
+    /// service left a stale one and made the returning task's first failure
+    /// silent for the rest of the process's life — the invisible-failure shape
+    /// the state exists to close, reintroduced by the state. Each leg below is a
+    /// sequence built only from verbs this story ships, and each is a separate
+    /// bug: the CLI's `tasks forget` + re-create (which the IPC `sync_task_save`
+    /// makes a two-click gesture), and `tasks disable` → fix the remote →
+    /// `tasks enable`.
+    #[test]
+    fn a_task_coming_back_into_service_clears_its_fault_so_the_next_failure_is_heard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let row = task("01BACK", None, "every 5m");
+        let reason = "the remote could not be reached";
+        let toasts = || {
+            notifications_posted(&platform)
+                .into_iter()
+                .filter(|(title, _)| title.starts_with("Task — "))
+                .count()
+        };
+
+        engine.save_task(&row).expect("save");
+        engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
+        assert_eq!(toasts(), 1, "the first failure is an onset");
+
+        // Leg 1: forget and re-create. The id is the same; the task is not, and
+        // a brand-new record's first failure must never be silent.
+        engine.forget_task("01BACK").expect("forget");
+        engine.save_task(&row).expect("re-create");
+        engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
+        assert_eq!(
+            toasts(),
+            2,
+            "a re-created task's first failure is its own onset"
+        );
+
+        // Leg 2: disable, fix the remote, enable, break again — the edge
+        // `db::upsert_task` already treats as a fresh arming.
+        let mut disabled = row.clone();
+        disabled.enabled = false;
+        engine.save_task(&disabled).expect("disable");
+        engine.save_task(&row).expect("enable");
+        engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
+        assert_eq!(
+            toasts(),
+            3,
+            "a task put back into service reports its next failure"
+        );
+
+        // Leg 3: the mode edge, with the schedule text unmoved.
+        let mut manual = row.clone();
+        manual.mode = tasks::TaskMode::Manual;
+        engine.save_task(&manual).expect("to manual");
+        engine.save_task(&row).expect("back to scheduled");
+        engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
+        assert_eq!(toasts(), 4, "and so does one put back on its schedule");
+
+        // The mirror, and the reason the clear is keyed on the store's edges
+        // rather than on "a save happened": an idle re-save is not a recovery,
+        // so it must not re-arm the alarm and let an hour of failures notify
+        // once per save.
+        engine.save_task(&row).expect("an identical save");
+        engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
+        assert_eq!(
+            toasts(),
+            4,
+            "a save that changed nothing is not a task coming back into service"
+        );
+    }
+
     /// The same guarantee through the code that actually produces the failures,
     /// rather than through a test that hand-feeds outcomes: a folder whose
     /// remote does not resolve, coming due over and over.
@@ -13145,15 +13510,19 @@ mod tests {
         );
     }
 
-    /// The lease handback the desktop app's **quit** path calls directly.
+    /// The lease handback the desktop app's **quit** path calls, through the
+    /// verb it actually calls.
     ///
-    /// `Engine::finalize` reaches this too, but only after `Engine::run`'s loop
-    /// has broken — and the app drops the supervisor's `JoinHandle` at spawn, so
-    /// nothing awaits that. The quit thread therefore needs the release as a
-    /// verb it can call on the `Arc` it already holds, which is what makes this
-    /// `pub`. Asserted the way it matters: another host can claim afterwards.
+    /// `Engine::finalize` reaches the release too, but only after
+    /// `Engine::run`'s loop has broken — and the app drops the supervisor's
+    /// `JoinHandle` at spawn, so nothing awaits that. The quit thread therefore
+    /// needs the whole sequence as one verb it can call on the `Arc` it already
+    /// holds, which is what makes it `pub`. This is the ordinary case — nothing
+    /// of this host's is running — so the settle is instant and everything is
+    /// handed back. Asserted the way it matters: another host can claim
+    /// afterwards.
     #[tokio::test]
-    async fn releasing_this_hosts_leases_lets_another_host_claim_the_task() {
+    async fn quitting_with_nothing_running_hands_every_lease_back_at_once() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));
         let Ok(engine) = Engine::open(platform.clone()) else {
@@ -13182,7 +13551,16 @@ mod tests {
             "a held lease is what stops two hosts running one window"
         );
 
-        engine.release_task_leases();
+        // The budget is generous on purpose: nothing is in flight, so a settle
+        // that waited at all would be a settle that cannot tell the two cases
+        // apart, and this assertion would take ten seconds instead of none.
+        let held = engine
+            .finalize_task_leases_for_quit(std::time::Duration::from_secs(10))
+            .await;
+        assert!(
+            held.is_empty(),
+            "a lease this host merely holds is not a run this host is executing"
+        );
 
         assert!(
             engine
@@ -13192,6 +13570,202 @@ mod tests {
             "and handing it back is what stops the next host waiting out TASK_LEASE_MS \
              for a process that has quit"
         );
+    }
+
+    /// **The hazard this story's review found, excluded.** A task whose run is
+    /// still executing when the app quits must not become claimable by the other
+    /// host (Story 57.5's review, finding 1).
+    ///
+    /// Driven through the real ordering rather than by unit-calling the release:
+    /// a real `tick` claims a real lease and enters real work, and the quit
+    /// verb runs against it exactly as `sync::finalize_for_quit` runs it. The
+    /// old code released here, and the process does not exit at that point —
+    /// `lib.rs` then spends up to three seconds in
+    /// `block_on(timeout(3s, shutdown_all()))` — so the daemon's next 1 Hz tick
+    /// found `running_host IS NULL` with the window still open (`next_due_ms` is
+    /// advanced by `finish_task_run`, which had not run) and started a second
+    /// concurrent pass over the same git working tree, against an orphaned git
+    /// child with no `kill_on_drop`. For a `release`-kind task that is a
+    /// content-risk window.
+    ///
+    /// The run is parked at its failure notification, which is a point the real
+    /// path reaches with the lease held, the run row open and the in-flight guard
+    /// live — `note_task_outcome` is called one statement before
+    /// `finish_task_run`. `block_in_place` rather than a bare blocking recv so
+    /// the parked worker hands its other tasks off, which is why this test needs
+    /// the multi-thread flavour.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_still_executing_at_quit_is_not_left_claimable_by_the_other_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Arc::new(TestPlatform::new(dir.path()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let platform = Arc::new(ParkedTaskNotify {
+            inner: Arc::clone(&inner),
+            entered: Mutex::new(Some(entered_tx)),
+            resume: Mutex::new(Some(resume_rx)),
+        });
+        let Ok(engine) = Engine::open(platform as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+
+        // A folder whose remote does not resolve, so the run really fails and
+        // really reaches the notification — the same fixture
+        // `an_hour_of_a_task_failing_on_its_own_schedule_is_one_notification`
+        // uses, for the same reason.
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01MIDRUN", Some(&p.id), "every 5m"))
+            .expect("save");
+        // First sight arms the window and declines; the next tick is the one
+        // that claims and runs.
+        let _ = engine.tick().await;
+        inner.advance_ms(300_000);
+
+        let runner = Arc::clone(&engine);
+        let ticking = tokio::spawn(async move { runner.tick().await });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the task run reached its failure notification");
+
+        let other = format!("{}#{}", engine.device().id, std::process::id() + 1);
+        let now = inner.now_ms();
+        let claim_by_other = || {
+            engine
+                .with_db(|conn| db::claim_task(conn, "01MIDRUN", &other, now, TASK_LEASE_MS, None))
+                .expect("the claim statement runs")
+        };
+        assert!(
+            claim_by_other().is_none(),
+            "precondition: the run really is in flight and really holds the lease"
+        );
+
+        // The quit path, with a budget the parked run cannot possibly meet —
+        // which is the case that matters, because a sync pass over a large
+        // folder never meets it either.
+        let held = engine
+            .finalize_task_leases_for_quit(std::time::Duration::from_millis(50))
+            .await;
+        assert_eq!(
+            held,
+            HashSet::from(["01MIDRUN".to_owned()]),
+            "the quit path reports which lease it deliberately left held"
+        );
+
+        // THE PROPERTY.
+        assert!(
+            claim_by_other().is_none(),
+            "a task this host is still running must not be claimable by the other host \
+             after quit hands its leases back"
+        );
+
+        // ...and the attempt is recorded rather than left open: quitting mid-run
+        // IS abandoning it, and a run row with no outcome is a run that claims to
+        // still be going after the process is gone.
+        let runs = engine.task_history("01MIDRUN", 5).expect("history");
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Abandoned),
+            "the unsettled attempt is recorded abandoned, not silently dropped"
+        );
+
+        // The lease is held, not leaked. When the run does end, its own
+        // `finish_task_run` writes the true outcome over the abandonment — the
+        // later fact being the better one, which is the rule `db::claim_task`
+        // already documents for a reclaimed lease — and hands the lease back.
+        resume_tx.send(()).expect("resume the parked run");
+        ticking.await.expect("the tick completes").expect("tick");
+        assert_eq!(
+            engine.task_history("01MIDRUN", 5).expect("history")[0].outcome,
+            Some(tasks::TaskOutcome::Failed),
+            "the run's own outcome replaces the abandonment it overtook"
+        );
+        // Last, because a successful claim opens a run row of its own and would
+        // be the newest history row from here on.
+        assert!(
+            claim_by_other().is_some(),
+            "and once the run really ends, nothing waits out TASK_LEASE_MS"
+        );
+    }
+
+    /// The other half of the quit ordering: a run that **does** end inside the
+    /// budget releases its own lease with its own true outcome, so quitting
+    /// beside a fast task costs nothing and leaves nothing held.
+    ///
+    /// This is what the settle buys, and it is the reason the release is not
+    /// simply skipped whenever anything is running: without the wait a `release`
+    /// sweep with nothing to prune would hold its lease for the whole of
+    /// [`TASK_LEASE_MS`] every time the user quit while it happened to be
+    /// running. Fails if the settle stops waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_that_ends_inside_the_quit_budget_hands_its_own_lease_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Arc::new(TestPlatform::new(dir.path()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+        let platform = Arc::new(ParkedTaskNotify {
+            inner: Arc::clone(&inner),
+            entered: Mutex::new(Some(entered_tx)),
+            resume: Mutex::new(Some(resume_rx)),
+        });
+        let Ok(engine) = Engine::open(platform as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01FASTRUN", Some(&p.id), "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+        inner.advance_ms(300_000);
+
+        let runner = Arc::clone(&engine);
+        let ticking = tokio::spawn(async move { runner.tick().await });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the task run reached its failure notification");
+
+        // The run ends shortly after the quit path starts waiting, which is the
+        // shape a fast task has: in flight when quit begins, finished before the
+        // budget is spent.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = resume_tx.send(());
+        });
+
+        let held = engine
+            .finalize_task_leases_for_quit(std::time::Duration::from_secs(60))
+            .await;
+        assert!(
+            held.is_empty(),
+            "a run that settled inside the budget is not a run to hold a lease for"
+        );
+        assert_eq!(
+            engine.task_history("01FASTRUN", 5).expect("history")[0].outcome,
+            Some(tasks::TaskOutcome::Failed),
+            "and it recorded what really happened rather than an abandonment"
+        );
+
+        let other = format!("{}#{}", engine.device().id, std::process::id() + 1);
+        assert!(
+            engine
+                .with_db(|conn| db::claim_task(
+                    conn,
+                    "01FASTRUN",
+                    &other,
+                    inner.now_ms(),
+                    TASK_LEASE_MS,
+                    None
+                ))
+                .expect("the claim statement runs")
+                .is_some(),
+            "so the next host is not made to wait out TASK_LEASE_MS for nothing"
+        );
+        ticking.await.expect("the tick completes").expect("tick");
     }
 
     /// Which release row governs a folder's sweep, over every case that can

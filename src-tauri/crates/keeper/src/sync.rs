@@ -477,13 +477,29 @@ pub fn stop_supervisor() {
 /// next launch cannot prove dead — on Linux the daemon shares the device row
 /// and may legitimately hold one.
 ///
-/// So the release is done here, synchronously, on the thread that is quitting:
-/// one bounded conditional `UPDATE` scoped to this host's own leases,
-/// idempotent, and exactly what `finalize` would have done.
+/// **The ordering is the fix, not the call** (this story's review, finding 1).
+/// Releasing the moment the signal is sent was worse than the race it replaced:
+/// the process does not exit here — `lib.rs` then spends up to three seconds in
+/// `block_on(timeout(3s, shutdown_all()))` — and a git child already spawned is
+/// a `std::process::Command` with no `kill_on_drop`, so it keeps writing the
+/// worktree. Freeing that lease let the daemon's next tick satisfy
+/// `claim_task`'s `running_host IS NULL AND next_due_ms <= now` (the window is
+/// still open; `finish_task_run` is what advances it) and start a **second
+/// concurrent run** of the same task over the same working tree — and a
+/// `release`-kind task deletes local content, so that is a content-risk window
+/// rather than a noisy one. [`keeper_sync::Engine::finalize_task_leases_for_quit`]
+/// therefore settles first, bounded by [`keeper_sync::TASK_QUIT_SETTLE`], and
+/// then releases only what this process is no longer running; a run that
+/// outlasts the budget is recorded `abandoned` and keeps its lease, which
+/// expires the ordinary way.
 ///
 /// [`engine_if_open`] rather than [`engine`]: quitting must never *build* an
 /// engine, which would open a database to release leases that by definition
 /// cannot exist yet.
+///
+/// `block_on` on the quitting thread is this arm's established pattern — the
+/// bounded `shutdown_all` two statements later in `lib.rs` is the same shape —
+/// and the wait is bounded by the same kind of budget, so quit stays responsive.
 ///
 /// **Only the quit path calls this.** Closing the window runs
 /// `api.prevent_close()` + `window.hide()` and keeps the process, the engine and
@@ -491,8 +507,21 @@ pub fn stop_supervisor() {
 /// there would stop work the user never asked to stop.
 pub fn finalize_for_quit() {
     stop_supervisor();
-    if let Some(engine) = engine_if_open() {
-        engine.release_task_leases();
+    let Some(engine) = engine_if_open() else {
+        return;
+    };
+    let held = tauri::async_runtime::block_on(
+        engine.finalize_task_leases_for_quit(keeper_sync::TASK_QUIT_SETTLE),
+    );
+    if !held.is_empty() {
+        // Not a fault: the lease is deliberately still held and expires on its
+        // own. Said at `info` because the next launch — or the other host —
+        // sees a task that looks busy with no live process, and this line is the
+        // only place that explains why.
+        tracing::info!(
+            tasks = ?held,
+            "quit left these task runs unsettled; their leases expire rather than being handed back"
+        );
     }
 }
 

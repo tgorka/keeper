@@ -52,6 +52,7 @@ const codeOf = (source: string): string =>
 
 const LIB = codeOf(read("lib.rs"));
 const SYNC = codeOf(read("sync.rs"));
+const SYNC_IPC = codeOf(read("sync_ipc.rs"));
 
 /** Every `.rs` file in the shell crate, code only. */
 const shellSources = (): [string, string][] =>
@@ -121,11 +122,22 @@ describe("the quit path hands this host's task leases back", () => {
     expect(LIB.indexOf("sync::finalize_for_quit()")).toBeGreaterThan(exitAt);
   });
 
-  it("releases the leases through the engine, not by hoping the supervisor gets there", () => {
+  it("settles in-flight runs before it releases, and never releases unconditionally", () => {
     const body = SYNC.slice(SYNC.indexOf("pub fn finalize_for_quit()"));
     const fn = body.slice(0, body.indexOf("\n}"));
     expect(fn).toContain("stop_supervisor()");
-    expect(fn).toContain("release_task_leases()");
+
+    // The ordering IS the fix (this story's review, finding 1). The process does
+    // not exit at this point — the bounded `shutdown_all` runs after it — so a
+    // supervisor already inside a task run keeps going with a git child that has
+    // no `kill_on_drop`. Releasing that task's lease let the daemon on a shared
+    // `sync.db` start a second concurrent run over the same working tree, so the
+    // quit path must go through the engine verb that settles first and holds back
+    // what is still running, never through the unconditional release.
+    expect(fn).toContain("finalize_task_leases_for_quit(");
+    expect(fn).toContain("TASK_QUIT_SETTLE");
+    expect(fn).not.toMatch(/release_task_leases\(\)/);
+
     // `engine_if_open`, never `engine(...)`: quitting must not OPEN a database
     // to release leases that by definition cannot exist yet.
     expect(fn).toContain("engine_if_open()");
@@ -153,5 +165,73 @@ describe("the quit path hands this host's task leases back", () => {
     expect(windowEvents).not.toContain("finalize_for_quit");
     expect(windowEvents).not.toContain("stop_supervisor");
     expect(windowEvents).not.toContain("release_task_leases");
+  });
+});
+
+describe("the task projection reports a fault as a fault", () => {
+  // The middle link of finding 3's chain is `task_vm`, and it is in the one
+  // crate this host cannot build. `keeper-sync` proves the store can NAME a
+  // profile row it could not read (`unreadable_profile_ids`), and `keeper-core`
+  // proves the pure function turns that into a different sentence
+  // (`UNHOSTED_FOLDER_UNREADABLE`, not `UNHOSTED_FOLDER_GONE`). What no test
+  // running here can otherwise see is whether the shell joins them — so it is
+  // checked where a check runs, exactly as the quit path above is.
+
+  const bodyOf = (source: string, signature: string): string => {
+    const at = source.indexOf(signature);
+    expect(at, `${signature} must exist`).toBeGreaterThan(-1);
+    const body = source.slice(at);
+    return body.slice(0, body.indexOf("\n}"));
+  };
+
+  it("asks which profile rows were unreadable, and hands the answer to the verdict", () => {
+    expect(SYNC_IPC).toContain("unreadable_profile_ids()");
+    expect(SYNC_IPC).toContain("profile_unreadable:");
+
+    // Both commands that compute a host verdict, not just the listing one: a
+    // save is exactly when the verdict can change, and it had the same swallow.
+    for (const signature of ["pub async fn sync_tasks(", "pub async fn sync_task_save("]) {
+      const fn = bodyOf(SYNC_IPC, signature);
+      expect(fn, signature).toContain("unreadable_profile_ids()");
+      expect(fn, signature).toContain("&unreadable");
+    }
+  });
+
+  it("propagates a failed read instead of inventing a fact from it", () => {
+    // `unwrap_or_default()` on a profile read made EVERY folder-scoped task
+    // render "it names a folder keeper does not sync"; `.ok()` on a history read
+    // made a task that had run render "never run". Both are facts invented from
+    // a fault, and both were one line below a sibling call that propagates.
+    for (const signature of ["pub async fn sync_tasks(", "pub async fn sync_task_save("]) {
+      const fn = bodyOf(SYNC_IPC, signature);
+      expect(fn, signature).not.toContain("unwrap_or_default()");
+      // The exact swallow that was there: a `Result` turned into an `Option`
+      // and then chained, so the fault has nowhere left to go.
+      expect(fn, signature).not.toMatch(/\.ok\(\)\s*\n\s*\.and_then/);
+      expect(fn, signature).toContain("list_profiles()");
+      expect(fn, signature).toContain("task_history(");
+    }
+  });
+
+  it("keeps the daemon probe off the async runtime, with a deadline", () => {
+    // `systemctl` + two `canonicalize` calls, in an `async fn` body, on a
+    // runtime worker — the rule this file's own `sync_footprint` states. And
+    // `.output()` waits without a deadline, so a wedged user bus parked the
+    // command forever rather than reading as "no daemon".
+    expect(SYNC_IPC).toContain("spawn_blocking");
+    const probe = bodyOf(SYNC_IPC, "async fn daemon_presence_probe(");
+    expect(probe).toContain("spawn_blocking");
+    expect(probe).toContain("DaemonPresence::Absent");
+
+    const enabled = bodyOf(SYNC_IPC, "fn daemon_unit_enabled()");
+    expect(enabled).toContain("DAEMON_PROBE_TIMEOUT");
+    expect(enabled).not.toContain(".output()");
+
+    // And the two commands reach the probe only through the bounded wrapper.
+    for (const signature of ["pub async fn sync_tasks(", "pub async fn sync_task_save("]) {
+      const fn = bodyOf(SYNC_IPC, signature);
+      expect(fn, signature).toContain("daemon_presence_probe(");
+      expect(fn, signature).not.toContain("daemon_presence_here(");
+    }
   });
 });

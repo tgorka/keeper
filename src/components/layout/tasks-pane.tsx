@@ -39,7 +39,7 @@
  * capability-gated at the app-shell and sidebar level, so a machine that cannot
  * keep a task record gets no Tasks entry at all rather than an empty one.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -53,8 +53,57 @@ export const TASKS_PANE_SUBTITLE =
 
 /** Before the first read has landed the list is unknown, not empty. */
 export const TASKS_PANE_LOADING_SENTENCE = "Reading the task record…";
+
+/**
+ * The empty state, in two sentences: what this view is, and how a task gets
+ * here.
+ *
+ * **Load-bearing rather than cosmetic**, and it was wrong (Story 57.5's review,
+ * finding 5). Nothing in this epic creates a task row on migration, on open or
+ * on first tick, so *every existing install opens ⌘8 to this text and nothing
+ * else* — it is the first thing the owner reads, and it said
+ * "`keeper-syncd task add` creates one". There is no `task` group and no `add`
+ * verb: the group is `tasks` and creation is `tasks set` (`keeper-syncd`'s clap
+ * tree). Following it verbatim earned an `InvalidSubcommand`.
+ *
+ * Three things it must not do, each of which the old sentence did:
+ *
+ * - **Claim this view can create one.** It cannot. `sync_task_save` is a
+ *   registered command and the wire type exists, but no control here calls it,
+ *   so the honest sentence says so plainly instead of leaving the reader hunting
+ *   for a button.
+ * - **Name a verb the CLI does not have.**
+ *   {@link TASKS_PANE_EMPTY_COMMAND} is the real one, and
+ *   `tasks-pane.test.tsx` checks every `keeper-syncd` phrase in this file's copy
+ *   against the daemon's actual group and verb list, so a rename cannot quietly
+ *   re-break it.
+ * - **Promise a background service that is not there.** `keeper-syncd` builds
+ *   and ships for both Linux and macOS (`release.yml` publishes
+ *   `keeper-syncd-x86_64-unknown-linux-gnu` and
+ *   `keeper-syncd-aarch64-apple-darwin`), so the command is true to read on
+ *   either — but no launchd plist exists anywhere in this repository, so nothing
+ *   *starts* it in the background on a Mac. What is true on both is the thing
+ *   worth saying: keeper itself hosts the task while keeper is open, and each
+ *   row states which host it really has. No platform branch is needed for that,
+ *   which is just as well: a sniff here would be a guess, and
+ *   `src/test/no-user-agent-gating.test.ts` forbids one by name.
+ */
 export const TASKS_PANE_EMPTY_SENTENCE =
-  "No tasks yet. `keeper-syncd task add` creates one; every host that shares this folder's record will see it.";
+  "No tasks yet. This view lists, inspects and runs tasks; it cannot create one yet.";
+
+/** The one real creation command, quoted exactly as `keeper-syncd` spells it. */
+export const TASKS_PANE_EMPTY_COMMAND =
+  'keeper-syncd tasks set nightly --kind sync --schedule "0 3 * * *"';
+
+/**
+ * What happens once a task exists, and the only promise made here.
+ *
+ * Deliberately says *while keeper is running* and nothing stronger: whether a
+ * daemon also runs it is a per-machine fact each row states for itself, and this
+ * text has no way to establish it.
+ */
+export const TASKS_PANE_EMPTY_AFTER =
+  "Run that in a terminal and the task appears here. Every host that shares this record sees it, and keeper runs a due task while keeper is running — each row says which host will actually run it.";
 
 /**
  * The heading over the rows this build cannot read (NFR-43).
@@ -72,6 +121,27 @@ export const TASKS_UNKNOWN_HEADING = "Written by a newer keeper";
  * be running on the other host right now.
  */
 export const TASKS_UNKNOWN_BADGE = "Unknown";
+
+/**
+ * What stands in for the id of an unknown row that has none.
+ *
+ * `db::list_tasks` emits `UnknownTask { id: String::new(), … }` for a row whose
+ * `id` column will not read at all, and an empty `<span>` there rendered as a
+ * blank line above a reason with nothing to attach it to (Story 57.5's review,
+ * finding 10).
+ */
+export const TASKS_UNKNOWN_NO_ID_TEXT = "a row with no readable id";
+
+/**
+ * How often the pane re-measures "now" (Story 57.5's review, finding 6).
+ *
+ * Half a minute, because every relative string this pane renders is
+ * minute-grained: `formatTaskDue`/`formatTaskAgo` speak in minutes, hours and
+ * days, so a finer tick would re-render for no visible change and a coarser one
+ * would let "in 1 min" sit past its instant. It re-measures a clock and reads
+ * nothing — the engine is polled only by an explicit Refresh or a Run now.
+ */
+export const TASKS_CLOCK_TICK_MS = 30_000;
 
 export const TASK_RUN_NOW_TEXT = "Run now";
 export const TASK_REFRESH_TEXT = "Refresh";
@@ -326,22 +396,83 @@ export function TasksPane() {
   const [error, setError] = useState<string | null>(null);
   /** Per-task refusals from Run now, keyed by task id. */
   const [refusals, setRefusals] = useState<Record<string, string>>({});
-  const [runningId, setRunningId] = useState<string | null>(null);
   /**
-   * The instant every relative time on screen is measured from, captured per
-   * read rather than per render: two rows re-rendered a tick apart must not
-   * disagree about what "now" is, and re-reading the clock in each formatter
+   * Ids whose Run now is in flight — a set of them, not one slot (Story 57.5's
+   * review, finding 7).
+   *
+   * A single `string | null` disabled exactly one button and cleared
+   * unconditionally, so clicking Run now on a slow task A and then on B
+   * re-enabled A while A was still running, and A's own settle then re-enabled B
+   * while B was still running. A further click issued a second run for a task
+   * that already held a lease, the engine answered `Busy`, and the pane painted
+   * "somebody else is doing this" on a task the same person had just started
+   * from this same pane.
+   *
+   * `Record<string, true>` rather than a `Set`, matching {@link refusals} beside
+   * it: the question asked of it is only *"is this id in flight"*, and two
+   * differently-shaped keyed states in one component is a difference a reader
+   * has to explain.
+   */
+  const [running, setRunning] = useState<Record<string, true>>({});
+  /**
+   * The instant every relative time on screen is measured from, captured once
+   * per read *and* on a coarse tick: two rows re-rendered a tick apart must not
+   * disagree about what "now" is, and re-reading the clock inside each formatter
    * would make the pane's output depend on render order.
+   *
+   * The tick is finding 6 of this story's review. Without it `now` moved only
+   * when a read landed, so a pane left open froze: a row reading "in 5 min" said
+   * "in 5 min" an hour later and never reached "due now". This is a display
+   * clock in the frontend and not a second scheduler — AD-62's rule is about
+   * `tokio::time::interval` in the `keeper` crate, and nothing here polls the
+   * engine.
    */
   const [now, setNow] = useState(() => Date.now());
+  /**
+   * Which read is the newest, so a slow one cannot overwrite a fast one
+   * (finding 8).
+   *
+   * `refresh` has three independent triggers — the mount effect, the Refresh
+   * button and `runNow`'s settle — and no ordering between them. Press Refresh,
+   * then Run now before it resolves, and the pre-run listing could land last:
+   * the row then showed "never run" immediately after a run that happened, which
+   * is the exact failure the post-run re-read exists to prevent. `setNow` was
+   * overwritten with the stale read's clock too, shifting every relative time
+   * backwards.
+   */
+  const readToken = useRef(0);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (keepRefusals = false) => {
+    readToken.current += 1;
+    const mine = readToken.current;
     try {
       const next = await syncTasks();
+      if (mine !== readToken.current) {
+        return;
+      }
       setListing(next);
       setNow(Date.now());
       setError(null);
+      // A listing read *after* an attempt is newer evidence than the attempt
+      // (finding 9). `refusals` used to be cleared at exactly one point — the
+      // top of `runNow`, for the one id being run — so a "the other host is
+      // doing this" alert kept asserting a task was busy elsewhere while the row
+      // above it showed the completed run and no holder, clearable only by
+      // running the task again.
+      //
+      // `keepRefusals` is the one exception, and it is not a hedge: the read
+      // `runNow`'s own settle issues is *contemporaneous* with the attempt, not
+      // later than it. Clearing there would erase the refusal in the same tick it
+      // appeared, which is the pane's whole answer to a refused Run now and an
+      // acceptance criterion of this story. Every other read — the mount, the
+      // Refresh button — is genuinely newer and clears.
+      if (!keepRefusals) {
+        setRefusals({});
+      }
     } catch (cause) {
+      if (mine !== readToken.current) {
+        return;
+      }
       setError(messageOf(cause));
     }
   }, []);
@@ -350,9 +481,14 @@ export function TasksPane() {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    const clock = setInterval(() => setNow(Date.now()), TASKS_CLOCK_TICK_MS);
+    return () => clearInterval(clock);
+  }, []);
+
   const runNow = useCallback(
     async (id: string) => {
-      setRunningId(id);
+      setRunning((prior) => ({ ...prior, [id]: true }));
       // Cleared before the attempt, so a stale refusal cannot sit under a run
       // that has just succeeded.
       setRefusals((prior) => {
@@ -368,10 +504,17 @@ export function TasksPane() {
         // half.
         setRefusals((prior) => ({ ...prior, [id]: messageOf(cause) }));
       } finally {
-        setRunningId(null);
+        // Only the id that settled, never the whole set: another row's run may
+        // still be in flight.
+        setRunning((prior) => {
+          const { [id]: _settled, ...rest } = prior;
+          return rest;
+        });
         // Re-read either way: a refused run still changes nothing, and a run
         // that happened changed the history, the window and possibly the lease.
-        await refresh();
+        // The refusal this attempt may just have recorded survives it — see
+        // `refresh`.
+        await refresh(true);
       }
     },
     [refresh],
@@ -413,7 +556,13 @@ export function TasksPane() {
             <p className="px-6 pt-4 text-muted-foreground text-sm">{TASKS_PANE_LOADING_SENTENCE}</p>
           )}
           {listing !== null && listing.tasks.length === 0 && listing.unknown.length === 0 && (
-            <p className="px-6 pt-4 text-muted-foreground text-sm">{TASKS_PANE_EMPTY_SENTENCE}</p>
+            <div className="flex flex-col gap-2 px-6 pt-4">
+              <p className="text-muted-foreground text-sm">{TASKS_PANE_EMPTY_SENTENCE}</p>
+              <code className="w-fit max-w-full overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-foreground text-xs">
+                {TASKS_PANE_EMPTY_COMMAND}
+              </code>
+              <p className="text-muted-foreground text-sm">{TASKS_PANE_EMPTY_AFTER}</p>
+            </div>
           )}
           {listing !== null && listing.tasks.length > 0 && (
             <ul className="flex flex-col">
@@ -423,7 +572,7 @@ export function TasksPane() {
                   task={task}
                   now={now}
                   refusal={refusals[task.id] ?? null}
-                  running={runningId === task.id}
+                  running={running[task.id] === true}
                   onRunNow={(id) => void runNow(id)}
                 />
               ))}
@@ -435,16 +584,29 @@ export function TasksPane() {
                 {TASKS_UNKNOWN_HEADING}
               </h2>
               <ul className="flex flex-col">
-                {listing.unknown.map((row) => (
+                {listing.unknown.map((row, index) => (
                   <li
-                    key={row.id}
+                    // The index, because the ID is the thing that is not unique
+                    // here (finding 10): `db::list_tasks` emits
+                    // `UnknownTask { id: String::new(), … }` for a row whose `id`
+                    // column will not read, and two of those gave React two
+                    // siblings keyed `""` — a duplicate-key warning, and
+                    // reconciliation free to reuse one row's DOM for the other so
+                    // the two distinct reasons swap or fail to update. This is
+                    // the one list that exists to tolerate malformed rows, and it
+                    // is `ORDER BY id` from the store rather than reorderable by
+                    // the user, so the index is stable across reads.
+                    // biome-ignore lint/suspicious/noArrayIndexKey: see above — the id is not unique
+                    key={`${index}:${row.id}`}
                     data-testid={TASKS_UNKNOWN_ROW_TESTID}
                     data-task-id={row.id}
                     className="flex flex-col gap-1 px-6 py-3"
                   >
                     <span className="flex items-center gap-2">
                       <Badge variant="outline">{TASKS_UNKNOWN_BADGE}</Badge>
-                      <span className="truncate font-medium text-foreground text-sm">{row.id}</span>
+                      <span className="truncate font-medium text-foreground text-sm">
+                        {row.id === "" ? TASKS_UNKNOWN_NO_ID_TEXT : row.id}
+                      </span>
                     </span>
                     <span className="text-muted-foreground text-sm">{row.reason}</span>
                   </li>

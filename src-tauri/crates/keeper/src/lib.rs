@@ -1258,9 +1258,17 @@ pub fn run() {
                 // may never be polled before the process exits. A task holding
                 // a lease at quit would then be unrunnable by ANY host for the
                 // whole of `TASK_LEASE_MS`, and the lease names a pid the next
-                // launch cannot prove dead. `finalize_for_quit` releases them
-                // directly through the `Arc` this thread already holds: one
-                // bounded `UPDATE`, idempotent, exactly what `finalize` does.
+                // launch cannot prove dead.
+                //
+                // Releasing them the instant the signal is sent was not the fix
+                // either, and this arm is why: the process does NOT exit here —
+                // the bounded `shutdown_all` below runs first — so a supervisor
+                // already inside a task run keeps going, with a git child that
+                // has no `kill_on_drop`. `finalize_for_quit` therefore settles
+                // in-flight runs within a bounded budget and only then releases,
+                // and it never releases a lease whose run is still executing:
+                // freeing that one let the daemon on a shared `sync.db` start a
+                // second concurrent run over the same working tree.
                 //
                 // Deliberately NOT on the window-close path: closing hides the
                 // window and keeps the host (`WindowEvent::CloseRequested`

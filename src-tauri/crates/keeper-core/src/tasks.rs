@@ -91,8 +91,31 @@ pub const HOST_SENTENCE_OFF: &str = "switched off — nothing runs this, not eve
 pub const HOST_SENTENCE_UNHOSTED: &str = "nothing will run this";
 
 /// Unhosted because the task names a profile that is no longer a sync profile.
+///
+/// "Gone", strictly: the id is in no profile list *and* the store holds no row
+/// for it that merely failed to read. That second case has its own reason —
+/// [`UNHOSTED_FOLDER_UNREADABLE`] — because telling somebody their folder is
+/// gone when keeper simply could not parse its row sends them to delete a task
+/// that is fine.
 pub const UNHOSTED_FOLDER_GONE: &str =
     "it names a folder keeper does not sync, so no host here can run it";
+
+/// Unhosted because the task's folder **has** a stored row and this build could
+/// not read it (Story 57.5's review, finding 3).
+///
+/// A fault to surface, not a folder to forget. `db::list_profiles` skips a row
+/// it cannot deserialize — so an older keeper is not bricked by a newer one's
+/// profile — and that skip made a task scoped to a healthy, actively-syncing
+/// folder report *"it names a folder keeper does not sync"* **persistently**,
+/// which is the one thing AD-137 exists to prevent, produced by the projection
+/// rather than by this function.
+///
+/// The verdict is still *unhosted*, and truthfully so: the engine's own
+/// `run_due_tasks` reads the same skipped list, so nothing on this host will run
+/// the task either. What changes is what the person is told to do about it.
+pub const UNHOSTED_FOLDER_UNREADABLE: &str =
+    "keeper could not read this folder's configuration, so no host here can run it — \
+     the folder itself may be fine";
 
 /// Unhosted because `mode = scheduled` and the schedule column is null — the
 /// "reports itself enabled while parsing to never" shape the epic names as the
@@ -100,7 +123,16 @@ pub const UNHOSTED_FOLDER_GONE: &str =
 pub const UNHOSTED_NO_SCHEDULE: &str =
     "it is set to run on a schedule but none is stored, so nothing will ever make it due";
 
-/// Unhosted because a newer keeper wrote a `mode` this build cannot read.
+/// Unhosted because the `mode` spelling is one this build cannot read.
+///
+/// **Unreachable from any production caller, and deliberately kept.** A row
+/// whose stored `mode` this build cannot read never becomes a `TaskRow` at all:
+/// `db::decode_task` files it under `TaskListing.unknown` before anything
+/// projects it, so NFR-43's newer-keeper path belongs to `db::list_tasks` and
+/// the pane's *"written by a newer keeper"* section, not here. This gate is the
+/// total-function defence against a future in-crate caller that builds
+/// [`TaskHostFacts`] by hand — which is why it is asserted by a unit test that
+/// constructs exactly that.
 pub const UNHOSTED_UNKNOWN_MODE: &str =
     "its mode is one this build does not understand, so nothing here will run it";
 
@@ -308,9 +340,18 @@ pub struct TaskHostFacts<'a> {
     pub schedule: Option<&'a str>,
     /// The profile id the task is scoped to, `None` for host-wide.
     pub profile_id: Option<&'a str>,
-    /// The resolved name of that profile, `None` when the id names no current
-    /// profile — i.e. the folder is gone.
+    /// The resolved name of that profile, `None` when the id names no profile
+    /// the caller could read.
     pub profile: Option<&'a str>,
+    /// Whether the store holds a row for `profile_id` that the caller **could
+    /// not read**, as opposed to holding none at all.
+    ///
+    /// The one bit that separates "this folder is not configured" from "keeper
+    /// could not read this folder's configuration", and it has to be a fact the
+    /// caller establishes because this function does no I/O. `false` whenever
+    /// `profile` is `Some` (there was nothing to fail to read) and whenever
+    /// `profile_id` is `None` (a host-wide task names no folder).
+    pub profile_unreadable: bool,
 }
 
 /// Decide whether a `keeper-syncd` unit on this machine can run *this* app's
@@ -371,9 +412,14 @@ pub fn daemon_presence(
 ///    reach [`TaskHostKind::Unhosted`]. It precedes the folder gate because a
 ///    switched-off task whose folder also vanished is still just off — raising an
 ///    alarm about a row the user deliberately silenced is noise.
-/// 2. **The missing folder next**, ahead of every mode gate, because it defeats
-///    all of them: a `manual` task whose folder is gone cannot run when asked
-///    either, so answering [`TaskHostKind::OnRequest`] would be a false offer.
+/// 2. **The unresolvable folder next**, ahead of every mode gate, because it
+///    defeats all of them: a `manual` task whose folder is gone cannot run when
+///    asked either, so answering [`TaskHostKind::OnRequest`] would be a false
+///    offer. It answers with **two** different reasons, and the difference is
+///    load-bearing: a folder that is genuinely not configured
+///    ([`UNHOSTED_FOLDER_GONE`]) versus one whose stored row the caller could
+///    not read ([`UNHOSTED_FOLDER_UNREADABLE`]). The second is a fault to
+///    surface, not a folder to forget.
 /// 3. **`manual` before the schedule gate**, because a manual task's schedule is
 ///    "remembered, not obeyed" (`keeper-sync/src/tasks.rs:152-153`) — a null
 ///    schedule there is normal, not a fault, and gate 4 would misreport it.
@@ -382,14 +428,19 @@ pub fn daemon_presence(
 ///    will ever make it due.
 /// 5. **Scheduled with a schedule** is the only case where the daemon can be the
 ///    host, so [`daemon_presence`] is consulted only here.
-/// 6. **Any other mode spelling is unhosted**, exhaustively and without a panic —
-///    NFR-43's tolerance applied to a row a newer keeper wrote.
+/// 6. **Any other mode spelling is unhosted**, exhaustively and without a panic.
+///    Unreachable in production — see [`UNHOSTED_UNKNOWN_MODE`] — and kept as a
+///    total function for a future in-crate caller.
 pub fn task_host(facts: TaskHostFacts<'_>, daemon: DaemonPresence) -> TaskHostVm {
     if !facts.enabled || facts.mode == MODE_OFF {
         return verdict(TaskHostKind::Off, HOST_SENTENCE_OFF);
     }
     if facts.profile_id.is_some() && facts.profile.is_none() {
-        return unhosted(UNHOSTED_FOLDER_GONE);
+        return unhosted(if facts.profile_unreadable {
+            UNHOSTED_FOLDER_UNREADABLE
+        } else {
+            UNHOSTED_FOLDER_GONE
+        });
     }
     if facts.mode == MODE_MANUAL {
         return verdict(TaskHostKind::OnRequest, HOST_SENTENCE_ON_REQUEST);
@@ -444,6 +495,7 @@ mod tests {
             schedule: Some("every 5m"),
             profile_id: None,
             profile: None,
+            profile_unreadable: false,
         }
     }
 
@@ -503,6 +555,69 @@ mod tests {
         assert_eq!(host.kind, TaskHostKind::Unhosted);
         assert_eq!(host.sentence, HOST_SENTENCE_UNHOSTED);
         assert_eq!(host.reason.as_deref(), Some(UNHOSTED_FOLDER_GONE));
+    }
+
+    /// The persistent-lie case this story's review found (finding 3): a task
+    /// scoped to a folder that is *there* and syncing, whose profile row this
+    /// build cannot deserialize. `db::list_profiles` skips such a row, so
+    /// `profile` is `None` exactly as it is for a deleted folder — and telling
+    /// the owner their folder is gone sends them to delete a task that is fine.
+    #[test]
+    fn a_task_whose_folder_row_is_unreadable_says_so_instead_of_folder_gone() {
+        let host = task_host(
+            TaskHostFacts {
+                profile_id: Some("unreadable"),
+                profile: None,
+                profile_unreadable: true,
+                ..scheduled()
+            },
+            DaemonPresence::Runs,
+        );
+        assert_eq!(
+            host.kind,
+            TaskHostKind::Unhosted,
+            "still unhosted — the engine reads the same skipped list, so nothing runs it"
+        );
+        assert_eq!(host.sentence, HOST_SENTENCE_UNHOSTED);
+        assert_eq!(
+            host.reason.as_deref(),
+            Some(UNHOSTED_FOLDER_UNREADABLE),
+            "but the reason names a fault to fix, not a folder to forget"
+        );
+        assert_ne!(
+            UNHOSTED_FOLDER_UNREADABLE, UNHOSTED_FOLDER_GONE,
+            "the two must never collapse into one sentence"
+        );
+    }
+
+    /// The flag decides nothing on its own: it is only consulted when the
+    /// profile could not be resolved at all. A folder that resolves is hosted
+    /// however the flag is set, so a caller that sets it too eagerly cannot
+    /// invent an unhosted verdict.
+    #[test]
+    fn the_unreadable_flag_is_only_consulted_when_the_folder_did_not_resolve() {
+        let resolved = task_host(
+            TaskHostFacts {
+                profile_id: Some("p1"),
+                profile: Some("media"),
+                profile_unreadable: true,
+                ..scheduled()
+            },
+            DaemonPresence::Absent,
+        );
+        assert_eq!(resolved.kind, TaskHostKind::App);
+        assert_eq!(resolved.reason, None);
+
+        // And a host-wide task names no folder, so neither reason can reach it.
+        let host_wide = task_host(
+            TaskHostFacts {
+                profile_unreadable: true,
+                ..scheduled()
+            },
+            DaemonPresence::Absent,
+        );
+        assert_eq!(host_wide.kind, TaskHostKind::App);
+        assert_eq!(host_wide.reason, None);
     }
 
     #[test]
@@ -577,6 +692,12 @@ mod tests {
         assert_eq!(host.reason.as_deref(), Some(UNHOSTED_NO_SCHEDULE));
     }
 
+    /// Gate 6, which **no production caller can reach**: `db::decode_task` files
+    /// a row whose `mode` will not read under `TaskListing.unknown` before
+    /// anything projects it, so the facts below can only be built by hand — and
+    /// this test is the hand that builds them. Kept because the alternative to a
+    /// total function is a future in-crate caller falling through to a *hosted*
+    /// verdict, which is the over-claim AD-137 forbids by name.
     #[test]
     fn a_mode_this_build_cannot_read_reads_unhosted_with_the_reason() {
         let host = task_host(
