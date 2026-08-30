@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use keeper_core::tasks::{
-    daemon_presence, task_host, DaemonPresence, TaskHostFacts, TaskListingVm, TaskRunVm,
-    TaskSaveReq, TaskVm, UnknownTaskVm,
+    task_host, DaemonPresence, TaskHostFacts, TaskListingVm, TaskRunVm, TaskSaveReq, TaskVm,
+    UnknownTaskVm,
 };
 use keeper_core::vm::{
     ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
@@ -2044,7 +2044,7 @@ fn daemon_presence_here(app_data_dir: Option<&std::path::Path>) -> DaemonPresenc
     let resolve = |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or(path.to_owned());
     let daemon_dir = daemon_data_dir().map(|dir| resolve(&dir));
     let app_dir = resolve(app_dir);
-    daemon_presence(keeper_core::tasks::DaemonHostFacts {
+    keeper_core::tasks::daemon_presence(keeper_core::tasks::DaemonHostFacts {
         unit_enabled: daemon_unit_enabled(),
         lingering: daemon_lingering(),
         daemon_data_dir: daemon_dir.as_deref(),
