@@ -58,7 +58,7 @@ const shellSources = (): [string, string][] =>
   readdirSync(SHELL_DIR, { recursive: true, withFileTypes: true })
     .filter((entry) => entry.isFile() && entry.name.endsWith(".rs"))
     .map((entry) => {
-      const relative = resolve(entry.parentPath ?? entry.path, entry.name);
+      const relative = resolve(entry.parentPath, entry.name);
       return [relative, codeOf(readFileSync(relative, "utf8"))] as [string, string];
     });
 

@@ -152,6 +152,14 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
     await logTodayInCurrentSession();
   },
 
+  // --- Tasks (Epic 57, FR-351/FR-352, AD-137) --- registry-gated on the same
+  // capability in Rust, the notes rule a third time. One verb: the view. What a
+  // task does from there — Run now, and the host it states — is the pane's, and
+  // the palette routes rather than re-implementing it.
+  "tasks-view": () => {
+    primaryViewStore.getState().setView("tasks");
+  },
+
   // --- Global actions (dialogs / commands) ---
   "new-chat": () => newChatStore.getState().open(),
   "open-search": () => searchStore.getState().open("global"),

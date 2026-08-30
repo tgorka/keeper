@@ -15,6 +15,7 @@ import { RecordingPane } from "@/components/layout/recording-pane";
 import { SettingsPane } from "@/components/layout/settings-pane";
 import { SIDEBAR_WIDTH_CLASS, SidebarPane } from "@/components/layout/sidebar-pane";
 import { SyncPane } from "@/components/layout/sync-pane";
+import { TasksPane } from "@/components/layout/tasks-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
 import { NotesPane } from "@/components/notes/notes-pane";
 import { RecordingsPane } from "@/components/recordings/recordings-pane";
@@ -42,6 +43,7 @@ import { useRecordingShortcut } from "@/hooks/use-recording-shortcut";
 import { useSearchShortcuts } from "@/hooks/use-search-shortcuts";
 import { useSessionsShortcut } from "@/hooks/use-sessions-shortcut";
 import { useShellLayout } from "@/hooks/use-shell-layout";
+import { useTasksShortcut } from "@/hooks/use-tasks-shortcut";
 import { useUnreadJump } from "@/hooks/use-unread-jump";
 import { useVerification } from "@/hooks/use-verification";
 import { useViewShortcuts } from "@/hooks/use-view-shortcuts";
@@ -93,6 +95,9 @@ export function AppShell() {
   // Wire ⌘7 to the Sessions board and ⌘⌥L to log-today (Phase 7, FR-251);
   // self-gated on the sessions capability by the same rule.
   useSessionsShortcut();
+  // Wire ⌘8 to the Tasks view (Epic 57, FR-351, FR-352), self-gated on the same
+  // capability — the third surface over the one `sync.db` (AD-137).
+  useTasksShortcut();
   // Wire ⌘3 to the Approval Pane (Story 7.3).
   useApprovalShortcut();
   // Wire ⌘K to toggle the command palette (Story 9.1).
@@ -328,6 +333,15 @@ export function AppShell() {
                   <SessionsPane />
                   <PanelStrip />
                 </>
+              ) : sessions && primaryView === "tasks" ? (
+                // Epic 57: the schedules, and which host runs each of them.
+                // Gated on the same construction as notes and sessions, so a
+                // stale "tasks" primary-view can never render a pane over a
+                // record this build has no database for (AD-137).
+                //
+                // No panel strip: a task is not a document, and there is
+                // nothing here to open in an editor.
+                <TasksPane />
               ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (

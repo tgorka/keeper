@@ -56,6 +56,7 @@ export type { CopyEntryVm } from "./gen/CopyEntryVm";
 export type { CopyJobState } from "./gen/CopyJobState";
 export type { CopyJobVm } from "./gen/CopyJobVm";
 export type { CouplingCaveatVm } from "./gen/CouplingCaveatVm";
+export type { DaemonPresence } from "./gen/DaemonPresence";
 export type { DemoBatch } from "./gen/DemoBatch";
 export type { DemoItem } from "./gen/DemoItem";
 export type { DiscoveredBridgeVm } from "./gen/DiscoveredBridgeVm";
@@ -260,6 +261,12 @@ export type { SyncUnspellableVm } from "./gen/SyncUnspellableVm";
 export type { SyncVerifyVm } from "./gen/SyncVerifyVm";
 export type { TagVocabularyEntryVm } from "./gen/TagVocabularyEntryVm";
 export type { TagVocabularyVm } from "./gen/TagVocabularyVm";
+export type { TaskHostKind } from "./gen/TaskHostKind";
+export type { TaskHostVm } from "./gen/TaskHostVm";
+export type { TaskListingVm } from "./gen/TaskListingVm";
+export type { TaskRunVm } from "./gen/TaskRunVm";
+export type { TaskSaveReq } from "./gen/TaskSaveReq";
+export type { TaskVm } from "./gen/TaskVm";
 export type { TccPermission } from "./gen/TccPermission";
 export type { TemplateChangeVm } from "./gen/TemplateChangeVm";
 export type { TemplateUpdateAppliedVm } from "./gen/TemplateUpdateAppliedVm";
@@ -274,6 +281,7 @@ export type { TimelineItemVm } from "./gen/TimelineItemVm";
 export type { TimelineOp } from "./gen/TimelineOp";
 export type { TypingBatch } from "./gen/TypingBatch";
 export type { TypistVm } from "./gen/TypistVm";
+export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
 export type { WidgetKind } from "./gen/WidgetKind";
@@ -403,6 +411,10 @@ import type { SyncProgressVm } from "./gen/SyncProgressVm";
 import type { SyncStatusVm } from "./gen/SyncStatusVm";
 import type { SyncVerifyVm } from "./gen/SyncVerifyVm";
 import type { TagVocabularyVm } from "./gen/TagVocabularyVm";
+import type { TaskListingVm } from "./gen/TaskListingVm";
+import type { TaskRunVm } from "./gen/TaskRunVm";
+import type { TaskSaveReq } from "./gen/TaskSaveReq";
+import type { TaskVm } from "./gen/TaskVm";
 import type { TccPermission } from "./gen/TccPermission";
 import type { TemplateUpdateApplyReq } from "./gen/TemplateUpdateApplyReq";
 import type { TemplateUpdateOfferVm } from "./gen/TemplateUpdateOfferVm";
@@ -6299,4 +6311,83 @@ export async function sessionsDelete(rootId: string, sessionId: string): Promise
  */
 export async function sessionsUnarchive(rootId: string, sessionId: string): Promise<void> {
   await invoke<void>("sessions_unarchive", { rootId, sessionId });
+}
+
+// ---------------------------------------------------------------------------
+// Tasks (Story 57.5/57.6, FR-351, FR-352, AD-137)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every stored task, with the host that will actually run each one.
+ *
+ * `host.sentence` is composed in Rust and rendered verbatim: which host runs a
+ * task is decided by `keeper_core::tasks::task_host` over facts the app can
+ * establish, never by a platform sniff in the browser — which would be a guess,
+ * and which `src/test/no-user-agent-gating.test.ts` forbids by name. AD-137's
+ * whole point is that every host claim on screen is true.
+ *
+ * `host.reason` is non-null only for an **unhosted** task, so a
+ * non-null reason is the alarm.
+ *
+ * `unknown` carries the rows this build cannot read (NFR-43). They are listed
+ * rather than dropped, so a task a newer keeper wrote is visible instead of
+ * silently absent from a list the user believes is complete.
+ *
+ * Rejects with: `unsupported` (no usable git), `internal`.
+ */
+export async function syncTasks(): Promise<TaskListingVm> {
+  return await invoke<TaskListingVm>("sync_tasks");
+}
+
+/**
+ * One task's run history, newest first. `limit` is clamped in Rust; omitting it
+ * asks for the default page.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function syncTaskHistory(id: string, limit?: number): Promise<TaskRunVm[]> {
+  return await invoke<TaskRunVm[]>("sync_task_history", { id, limit });
+}
+
+/**
+ * Run one task now, resolving the run it recorded.
+ *
+ * **The refusals are the half worth handling.** A task that is off, a task that
+ * does not exist and a task whose lease is held by the other host on this
+ * machine all reject — they never resolve with a sad outcome — so a caller that
+ * only reads the resolution would show a run that did not happen. The rejection
+ * carries the engine's own sentence, which is what the row quotes.
+ *
+ * Rejects with: `unsupported`, `busy` (a live lease elsewhere), `internal` (off,
+ * disabled, or no such task).
+ */
+export async function syncTaskRunNow(id: string): Promise<TaskRunVm> {
+  return await invoke<TaskRunVm>("sync_task_run_now", { id });
+}
+
+/**
+ * Create or replace a task, resolving the row as the next read reports it.
+ *
+ * The answer is re-read rather than echoed: the store owns `nextDueMs` and both
+ * lease columns and clears the window whenever the schedule, the mode or the
+ * enabled flag moves, so the request's own values would show a "next due" that
+ * was just discarded. A blank `id` mints one.
+ *
+ * A schedule that does not parse is **refused, never coerced** (FR-347), and the
+ * rejection quotes the expression.
+ *
+ * Rejects with: `unsupported`, `internal` (an unreadable kind or mode, a
+ * schedule that does not parse, `scheduled` with no schedule).
+ */
+export async function syncTaskSave(req: TaskSaveReq): Promise<TaskVm> {
+  return await invoke<TaskVm>("sync_task_save", { req });
+}
+
+/**
+ * Forget a task and everything it recorded. Deletes a record, never content.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function syncTaskForget(id: string): Promise<void> {
+  await invoke<void>("sync_task_forget", { id });
 }

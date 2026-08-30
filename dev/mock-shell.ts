@@ -59,6 +59,10 @@ import type {
   SyncProfileReq,
   SyncProfileVm,
   SyncVerifyVm,
+  TaskListingVm,
+  TaskRunVm,
+  TaskSaveReq,
+  TaskVm,
 } from "@/lib/ipc/client";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
@@ -1558,7 +1562,318 @@ const FOLDER_MIGRATION = {
   trashes: ["refs", "prompts"],
 };
 
+/**
+ * Every state a Tasks row can be in (Epic 57, Story 57.6, AD-137).
+ *
+ * The point of this block is the *host* column. That decision is
+ * `keeper_core::tasks::task_host`'s and it is not re-derived here — these are
+ * its outputs, quoted from the `HOST_SENTENCE_*` and `UNHOSTED_*` constants in
+ * `keeper-core/src/tasks.rs` — so what a browser on Linux shows is what the
+ * real command would answer on the machine each row describes. A sentence typed
+ * loosely here would make the pane look right while the app claimed a host it
+ * does not have, which is the exact failure AD-137 exists to prevent.
+ *
+ * Six rows and one unreadable one, because the surface has that many branches:
+ * a scheduled task with a window ahead of it, one mid-run holding a lease, one
+ * whose last run failed, a manual one nothing schedules, a switched-off one, an
+ * **unhosted** one that looks enabled and will never fire, and a row a newer
+ * keeper wrote that this build shows rather than drops (NFR-43).
+ */
+const HOST_SENTENCES = {
+  daemon: "the keeper-syncd unit on this machine runs this, logged in or not",
+  app: "keeper runs this — only while keeper is running",
+  appOtherDataDir:
+    "keeper runs this — only while keeper is running; the keeper-syncd unit here reads a different data directory, so it never sees this task",
+  onRequest: "nothing schedules this — it runs when you ask",
+  off: "switched off — nothing runs this, not even a request",
+  unhosted: "nothing will run this",
+} as const;
+
+const UNHOSTED_FOLDER_GONE = "it names a folder keeper does not sync, so no host here can run it";
+
+/** How long from now, in minutes — `ago`'s mirror, for a window still ahead. */
+const ahead = (minutes: number) => NOW + minutes * 60_000;
+
+const TASK_RUNS: Record<string, TaskRunVm[]> = {
+  // A healthy nightly: three clean passes.
+  "01JNIGHTLYSYNCAAAAAAAAAAAA": [3, 1_443, 2_883].map((minutes, index) => ({
+    id: 300 - index,
+    taskId: "01JNIGHTLYSYNCAAAAAAAAAAAA",
+    startedMs: ago(minutes),
+    finishedMs: ago(minutes - 1),
+    outcome: "ok",
+    unknownOutcome: null,
+    detail: "3 synced, 0 already syncing, 0 waiting, 0 failed",
+    host: "01DEVICE#4188",
+  })),
+  // Mid-run: the newest attempt has no `finishedMs` and no outcome, which is
+  // what "running now" is made of. The lease on the row below matches it.
+  "01JRELEASESWEEPBBBBBBBBBBB": [
+    {
+      id: 411,
+      taskId: "01JRELEASESWEEPBBBBBBBBBBB",
+      startedMs: ago(2),
+      finishedMs: null,
+      outcome: null,
+      unknownOutcome: null,
+      detail: null,
+      host: "01DEVICE#912",
+    },
+    {
+      id: 410,
+      taskId: "01JRELEASESWEEPBBBBBBBBBBB",
+      startedMs: ago(362),
+      finishedMs: ago(360),
+      outcome: "ok",
+      unknownOutcome: null,
+      detail: "looked at 1 284 objects, released 96, reclaimed 74 GB",
+      host: "01DEVICE#912",
+    },
+  ],
+  // A failure, with the tally first and the reason after it — the shape
+  // `perform_sync_task` composes.
+  "01JVAULTPUSHCCCCCCCCCCCCCC": [
+    {
+      id: 502,
+      taskId: "01JVAULTPUSHCCCCCCCCCCCCCC",
+      startedMs: ago(9),
+      finishedMs: ago(8),
+      outcome: "failed",
+      unknownOutcome: null,
+      detail:
+        "0 synced, 0 already syncing, 0 waiting, 1 failed: could not resolve host git.tgorka.dev",
+      host: "01DEVICE#4188",
+    },
+    {
+      id: 501,
+      taskId: "01JVAULTPUSHCCCCCCCCCCCCCC",
+      startedMs: ago(69),
+      finishedMs: ago(68),
+      outcome: "deferred",
+      unknownOutcome: null,
+      detail: "0 synced, 0 already syncing, 1 waiting, 0 failed",
+      host: "01DEVICE#4188",
+    },
+  ],
+  // A run a newer keeper recorded: the spelling is carried and rendered
+  // verbatim rather than flattened to "unknown".
+  "01JARCHIVETRIMDDDDDDDDDDDD": [
+    {
+      id: 601,
+      taskId: "01JARCHIVETRIMDDDDDDDDDDDD",
+      startedMs: ago(1_500),
+      finishedMs: ago(1_499),
+      outcome: null,
+      unknownOutcome: "sublimated",
+      detail: "recorded by keeper 0.9.0",
+      host: "01DEVICE#77",
+    },
+  ],
+};
+
+const TASKS: TaskVm[] = [
+  {
+    id: "01JNIGHTLYSYNCAAAAAAAAAAAA",
+    kind: "sync",
+    mode: "scheduled",
+    enabled: true,
+    profileId: null,
+    profile: null,
+    schedule: "@daily 03:00",
+    nextDueMs: ahead(957),
+    runningHost: null,
+    leaseUntilMs: null,
+    lastRun: TASK_RUNS["01JNIGHTLYSYNCAAAAAAAAAAAA"][0],
+    host: { kind: "app", sentence: HOST_SENTENCES.app, reason: null },
+  },
+  {
+    id: "01JRELEASESWEEPBBBBBBBBBBB",
+    kind: "release",
+    mode: "scheduled",
+    enabled: true,
+    profileId: "p1",
+    profile: "keeper",
+    schedule: "every 6h",
+    nextDueMs: ahead(358),
+    // Mid-run and holding the lease: the other host on this machine cannot
+    // claim this task until the lease expires or this one hands it back.
+    runningHost: "01DEVICE#912",
+    leaseUntilMs: ahead(58),
+    lastRun: TASK_RUNS["01JRELEASESWEEPBBBBBBBBBBB"][0],
+    host: { kind: "daemon", sentence: HOST_SENTENCES.daemon, reason: null },
+  },
+  {
+    id: "01JVAULTPUSHCCCCCCCCCCCCCC",
+    kind: "sync",
+    mode: "scheduled",
+    enabled: true,
+    profileId: "p2",
+    profile: "notes",
+    schedule: "@hourly",
+    nextDueMs: ahead(51),
+    runningHost: null,
+    leaseUntilMs: null,
+    lastRun: TASK_RUNS["01JVAULTPUSHCCCCCCCCCCCCCC"][0],
+    // The Linux default: a unit IS enabled here, and it reads a different data
+    // directory, so it never sees this row. Saying only "keeper runs this"
+    // would leave the user believing the enabled unit is the host.
+    host: { kind: "app", sentence: HOST_SENTENCES.appOtherDataDir, reason: null },
+  },
+  {
+    id: "01JARCHIVETRIMDDDDDDDDDDDD",
+    kind: "release",
+    mode: "manual",
+    enabled: true,
+    profileId: "p3",
+    profile: "archive",
+    // Remembered, not obeyed: a manual task's schedule is stored and ignored,
+    // so the row must not read as though something will fire it.
+    schedule: "@weekly",
+    nextDueMs: null,
+    runningHost: null,
+    leaseUntilMs: null,
+    lastRun: TASK_RUNS["01JARCHIVETRIMDDDDDDDDDDDD"][0],
+    host: { kind: "onRequest", sentence: HOST_SENTENCES.onRequest, reason: null },
+  },
+  {
+    id: "01JORPHANEDTASKEEEEEEEEEEE",
+    kind: "sync",
+    mode: "scheduled",
+    enabled: true,
+    // The folder is gone: the id names no current profile, so `profile` is null
+    // and nothing on this machine can run the task. It still looks enabled,
+    // which is the whole reason the row has to say otherwise.
+    profileId: "01JNOSUCHPROFILE",
+    profile: null,
+    schedule: "@daily 04:30",
+    nextDueMs: ahead(1_407),
+    runningHost: null,
+    leaseUntilMs: null,
+    lastRun: null,
+    host: {
+      kind: "unhosted",
+      sentence: HOST_SENTENCES.unhosted,
+      reason: UNHOSTED_FOLDER_GONE,
+    },
+  },
+  {
+    id: "01JPAUSEDSWEEPFFFFFFFFFFFF",
+    kind: "release",
+    mode: "off",
+    enabled: true,
+    profileId: "p1",
+    profile: "keeper",
+    schedule: "@daily 02:00",
+    nextDueMs: null,
+    runningHost: null,
+    leaseUntilMs: null,
+    lastRun: null,
+    // Off, and deliberately NOT unhosted: nothing is wrong with this row and
+    // the user switched it off on purpose.
+    host: { kind: "off", sentence: HOST_SENTENCES.off, reason: null },
+  },
+];
+
+const TASK_LISTING: TaskListingVm = {
+  tasks: TASKS,
+  unknown: [
+    {
+      id: "01JTELEPORTTASKGGGGGGGGGGG",
+      reason: "unknown task kind 'teleport'",
+    },
+  ],
+};
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  // --- Tasks (Epic 57, Story 57.6) ---------------------------------------
+  //
+  // Handlers rather than `ANSWERS` entries, because four of the five depend on
+  // WHICH task was asked about — and because the flow worth looking at is
+  // pressing Run now on a task the engine refuses. A table could not refuse.
+  sync_tasks: () => TASK_LISTING,
+  sync_task_history: (payload) => {
+    const runs = TASK_RUNS[String(payload.id)] ?? [];
+    // The clamp the command applies, mirrored so a caller asking for two rows
+    // is not quietly handed ten.
+    const limit = typeof payload.limit === "number" ? payload.limit : 20;
+    return runs.slice(0, Math.max(1, limit));
+  },
+  // The refusals, which are the half of Run now worth seeing. A thrown value
+  // rejects the `invoke`, and `client.ts` normalises it into the `IpcError`
+  // envelope the pane quotes on the row — so a busy task and an off one each
+  // read the way they will in the app, rather than resolving with a run that
+  // never happened.
+  sync_task_run_now: (payload) => {
+    const id = String(payload.id);
+    const task = TASKS.find((candidate) => candidate.id === id);
+    if (task === undefined) {
+      throw { code: "internal", message: `no such task: ${id}`, accountId: null, retriable: false };
+    }
+    if (!task.enabled || task.mode === "off") {
+      throw {
+        code: "internal",
+        message: `task ${id} is off, so nothing runs it — not even a request`,
+        accountId: null,
+        retriable: false,
+      };
+    }
+    if (task.runningHost !== null) {
+      throw {
+        code: "busy",
+        message: `${id} is already running on ${task.runningHost}`,
+        accountId: null,
+        retriable: true,
+      };
+    }
+    const run: TaskRunVm = {
+      id: 900 + TASKS.indexOf(task),
+      taskId: id,
+      startedMs: NOW,
+      finishedMs: NOW + 1_200,
+      outcome: "ok",
+      unknownOutcome: null,
+      detail: "no folders to sync",
+      host: "01DEVICE#4188",
+    };
+    // Recorded, so the next read shows the run rather than the pane appearing
+    // to have done nothing — the same reason `sync_profile_save` is stateful.
+    TASK_RUNS[id] = [run, ...(TASK_RUNS[id] ?? [])];
+    task.lastRun = run;
+    return run;
+  },
+  sync_task_save: (payload) => {
+    const req = payload.req as TaskSaveReq;
+    const existing = TASKS.find((candidate) => candidate.id === req.id);
+    const prior = existing ?? TASKS[0];
+    const saved: TaskVm = {
+      ...prior,
+      id: req.id === "" ? `01JMOCKSAVED${TASKS.length}` : req.id,
+      kind: req.kind,
+      mode: req.mode,
+      enabled: req.enabled,
+      profileId: req.profileId,
+      schedule: req.schedule,
+      // The store owns the window and clears it on any of these three moving,
+      // so echoing the request's value back would show a "next due" the real
+      // command would have discarded.
+      nextDueMs: null,
+      runningHost: null,
+      leaseUntilMs: null,
+    };
+    if (existing === undefined) {
+      TASKS.push(saved);
+    } else {
+      TASKS.splice(TASKS.indexOf(existing), 1, saved);
+    }
+    return saved;
+  },
+  sync_task_forget: (payload) => {
+    const at = TASKS.findIndex((candidate) => candidate.id === String(payload.id));
+    if (at >= 0) {
+      TASKS.splice(at, 1);
+    }
+    return null;
+  },
   // Two sessions, two shapes: a table would answer the flat one for both and
   // the folder-shaped row would render as something it is not.
   sessions_detail: (payload) =>

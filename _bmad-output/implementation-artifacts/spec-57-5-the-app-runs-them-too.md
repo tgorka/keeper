@@ -2,10 +2,11 @@
 title: 'The app runs them too, and ⌘8 says which host will'
 type: 'feature'
 created: '2026-08-29'
-status: 'in-progress'
+status: 'done'
 baseline_revision: 'fb4d4a7'
+final_revision: 'PENDING_COMMIT'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 context:
   - '{project-root}/_bmad-output/planning-artifacts/epic-57-a-task-that-runs-when-it-should.md'
   - '{project-root}/_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/ARCHITECTURE-SCHEDULED-TASKS.md'
@@ -127,13 +128,18 @@ the host that will actually run it — including the honest negatives AD-137 nam
       reaches neither the stop nor the release. The source test landed in
       [`src/test/task-host-tick.test.ts`](../../src/test/task-host-tick.test.ts) rather than in
       `keeper/src/lib.rs` — see Design Notes, *Where the source test lives*.
-- [ ] `src/lib/ipc/client.ts` — five wrappers with literal command names.
-- [ ] `src/hooks/use-tasks-shortcut.ts` (+ test) — ⌘8/Ctrl+8, IME, typing targets, capability gate.
-- [ ] `src/components/layout/tasks-pane.tsx` (+ test) — the rows, Run now, the unhosted case, the
+- [x] `src/lib/ipc/client.ts` — five wrappers with literal command names.
+- [x] `src/hooks/use-tasks-shortcut.ts` (+ test) — ⌘8/Ctrl+8, IME, typing targets, capability gate.
+- [x] `src/components/layout/tasks-pane.tsx` (+ test) — the rows, Run now, the unhosted case, the
       unknown row, the macOS sentence; exported copy constants and testids.
-- [ ] `src/lib/stores/primary-view.ts`, `app-shell.tsx`, `sidebar-pane.tsx`, `actions.ts` — wiring.
-- [ ] `dev/mock-shell.ts` — scheduled-with-next-due, mid-run-holding-a-lease, failed-last-run,
+- [x] `src/lib/stores/primary-view.ts`, `app-shell.tsx`, `sidebar-pane.tsx`, `actions.ts` — wiring,
+      plus a registry↔handler cross-check in `actions.test.ts`: `keeper-core` proves the registry
+      carries `tasks-view` and its ⌘8 chip, and that test proves the id has a handler here, which
+      is the half no Rust test can see.
+- [x] `dev/mock-shell.ts` — scheduled-with-next-due, mid-run-holding-a-lease, failed-last-run,
       unknown-kind and unhosted fixtures, so the whole view is exercisable in a browser on Linux.
+      Two more were added — a `manual` row and a switched-off one — because the pane branches on
+      five host kinds and the named five left `onRequest` and `off` unexercised.
 
 **Acceptance Criteria:**
 - Given the desktop build, when the shell's sources are scanned, then exactly one
@@ -150,6 +156,80 @@ the host that will actually run it — including the honest negatives AD-137 nam
 ## Spec Change Log
 
 ## Review Triage Log
+
+### 2026-08-30 — Review pass
+- intent_gap: 0
+- bad_spec: 0
+- patch: 0
+- defer: 0
+- reject: 0
+- addressed_findings:
+  - none
+
+**Not run.** Step-04's Blind Hunter / Edge Case Hunter pass was cut short by a session budget, so
+the counts above are the absence of a review rather than a clean one. Every gate in *Verification*
+did run and is recorded under `## Auto Run Result`; `followup_review_recommended` is `true` and this
+entry is what it points at. The two areas an adversarial reader should start from are the Linux
+`systemctl`/data-directory probe in `sync_ipc.rs` (the one branch no test on this host can execute)
+and `sync_task_save`'s handling of a row a newer keeper wrote.
+
+## Auto Run Result
+
+Status: done
+
+**What was implemented.** The desktop app is now an honest task host and says so. It already ran
+due tasks — `Engine::run`'s supervisor tick calls `run_due_tasks`, and `lib.rs` starts that
+supervisor at boot under `#[cfg(desktop)]` — so nothing new schedules anything; what this story adds
+is the lease handback on quit, the once-per-onset failure notification, five IPC verbs, and a Tasks
+view at ⌘8 whose every row states the host that will actually run it.
+
+**Files changed**
+- `src-tauri/crates/keeper-core/src/tasks.rs` — **new.** Nine wire types plus `daemon_presence` and
+  `task_host`, AD-137's pure decision, with the host matrix unit-tested exhaustively. In
+  `keeper-core` so `cargo test -p keeper-core` regenerates every ts-rs binding on Linux.
+- `src-tauri/crates/keeper-core/src/lib.rs` — `pub mod tasks;`.
+- `src-tauri/crates/keeper-core/src/palette.rs` — the gated `Tasks` category and the `tasks-view`
+  ⌘8 action, plus tests that the section is present iff the gate is on and that ⌘8 has one owner.
+- `src-tauri/crates/keeper-sync/src/engine.rs` — `task_faults`, `note_task_outcome` (called from
+  `claim_and_run`), `pub release_task_leases`, and three tests.
+- `src-tauri/crates/keeper/src/sync_ipc.rs` — the five commands, the row→VM mapping, and the Linux
+  `systemctl --user is-enabled` + data-directory probe that feeds `daemon_presence`.
+- `src-tauri/crates/keeper/src/sync.rs` — `finalize_for_quit()`.
+- `src-tauri/crates/keeper/src/lib.rs` — the five commands in the desktop splice; `ExitRequested`
+  calls `finalize_for_quit` instead of `stop_supervisor`.
+- `src/test/task-host-tick.test.ts` — **new.** The source scan: one interval in the shell, the quit
+  path releases, the window-close path does not.
+- `src/lib/ipc/client.ts` — five wrappers and eight type re-exports.
+- `src/hooks/use-tasks-shortcut.ts` (+ test) — **new.** ⌘8/Ctrl+8 with the IME, Alt, typing-target
+  and capability guards.
+- `src/components/layout/tasks-pane.tsx` (+ test) — **new.** The rows, the formatters, the copy.
+- `src/lib/stores/primary-view.ts`, `app-shell.tsx`, `sidebar-pane.tsx`, `actions.ts` (+ test) — the
+  wiring and the registry↔handler cross-check.
+- `dev/mock-shell.ts` — seven fixtures covering every branch the pane has.
+
+**Verification**
+- `cargo test -p keeper-sync -p keeper-core -p keeper-syncd`: **3736 passed, 0 failed** (baseline
+  3704).
+- `cargo clippy … -p keeper-core -p keeper-sync -p keeper-syncd --all-targets -- -D warnings`:
+  clean (one pre-existing future-compat note about `proc-macro-error2`).
+- `cargo fmt --all --check`: no diff — which is also the only local syntax gate the shell crate has.
+- `bun run typecheck`: clean. `bun run lint`: 4 warnings + 1 info, the baseline. `bun run test`:
+  **300 files / 4966 tests passed** (baseline 297 / 4938).
+- `src/lib/ipc/gen/` was re-emitted by the export test and is byte-identical, so the eight bindings
+  match their Rust doc comments and nothing there was hand-written.
+- Seventeen mutations were applied and reverted one at a time; each killed its owning test, and
+  every restore was verified by `cmp` against a pristine copy plus `git diff`.
+
+**Residual risks**
+- The `keeper` shell crate cannot be compiled on this host (`gobject-sys`). Every symbol it gained
+  was read back against its call site and `cargo fmt --check` parsed it, but `bun run check:rust:macos`
+  is the first real type check.
+- `daemon_unit_enabled` and `daemon_data_dir` are `#[cfg(target_os = "linux")]` and are exercised by
+  no test: they spawn `systemctl` and read the environment. The failure direction is safe by
+  construction (anything unexpected reads as *no daemon*, which under-claims rather than
+  over-claims), and `daemon_presence` itself — the decision they feed — is fully unit-tested in
+  `keeper-core`.
+- Step-04's adversarial review pass was not run; see the triage log above.
 
 ## Design Notes
 
