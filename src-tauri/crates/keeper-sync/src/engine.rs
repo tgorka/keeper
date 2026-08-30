@@ -875,6 +875,20 @@ pub struct Engine {
     /// that has silently stopped syncing, and reporting that one as healthy is
     /// the dishonesty this counter exists to prevent. Reset by any success.
     transient_failures: Mutex<HashMap<String, u32>>,
+    /// Task ids whose last real run failed — the sticky half of
+    /// [`Engine::note_task_outcome`]'s once-per-onset rule.
+    ///
+    /// A set and not a counter, because the question is only *"were we already
+    /// failing?"*. [`Engine::warn`] answers the same question off
+    /// `SyncStatus.warning`, but that field is per **profile** and a task may be
+    /// host-wide, so it has no profile to be sticky on. Keyed by task id, which
+    /// is what makes two failing tasks two onsets.
+    ///
+    /// Process-local rather than a column, deliberately: the notification is a
+    /// property of *this* host's session — the other host on a shared `sync.db`
+    /// has its own notifier and its own user to tell — and a durable flag would
+    /// have one host's toast suppress the other's.
+    task_faults: Mutex<HashSet<String>>,
     /// When each profile may next be rescanned for local work.
     ///
     /// The supervisor ticks at 1 Hz because a queued unit should start almost
@@ -1203,6 +1217,7 @@ impl Engine {
             collapsed_reported: Mutex::new(HashSet::new()),
             labels_backfilled: Mutex::new(HashSet::new()),
             transient_failures: Mutex::new(HashMap::new()),
+            task_faults: Mutex::new(HashSet::new()),
             next_scan_ms: Mutex::new(HashMap::new()),
             next_sweep_ms: Mutex::new(HashMap::new()),
             next_release_ms: Mutex::new(HashMap::new()),
@@ -1821,6 +1836,75 @@ impl Engine {
         }
     }
 
+    /// Tell the user a task started failing — **once per onset**, never per
+    /// attempt.
+    ///
+    /// [`Self::warn`]'s rule, and it is here rather than reusing `warn` for one
+    /// structural reason: `warn` reads its edge off `SyncStatus.warning`, which
+    /// is keyed by profile, and a task may be host-wide (`profile_id` is
+    /// `None`) — so there is no profile snapshot for it to be sticky on. The
+    /// state moves to [`Self::task_faults`], keyed by task id; the rule does not
+    /// move at all.
+    ///
+    /// Why the rule is not negotiable: a text-keyed onset on this tree once
+    /// produced 3 600 notifications an hour, because several real warnings carry
+    /// a count that moves with the condition they describe, and every tick read
+    /// as a fresh onset (Story 29.6). A `@hourly` task against an unreachable
+    /// remote is the same storm on a slower clock, and it trains a user to turn
+    /// keeper's notifications off entirely.
+    ///
+    /// The three non-failing outcomes are handled by *what they are*, not by an
+    /// `_` arm:
+    ///
+    /// * [`tasks::TaskOutcome::Ok`] is the only reset. The `present → absent`
+    ///   write **is** the re-arm, so a recovered-then-recurring failure notifies
+    ///   again with no separate "already told them" flag to go stale.
+    /// * [`tasks::TaskOutcome::Busy`] and [`tasks::TaskOutcome::Deferred`]
+    ///   neither notify nor clear: the work did not run, so nothing failed and
+    ///   nothing recovered. Clearing on `Deferred` would have a nightly task on
+    ///   an unplugged drive notify every night it stayed unplugged.
+    /// * [`tasks::TaskOutcome::Abandoned`] is written by the *next* host
+    ///   reclaiming an expired lease, so it says nothing about this task's work
+    ///   either — and treating it as a recovery would re-arm the alarm on every
+    ///   restart.
+    ///
+    /// The notification is posted after the lock is released, mirroring
+    /// [`Self::warn`]: a notifier can block, and holding a mutex across it would
+    /// stall whichever host's tick is inside [`Self::claim_and_run`].
+    ///
+    /// The failure is logged on the same edge and for the same reason — a
+    /// per-attempt log line is the same storm in a different sink — while
+    /// [`Self::claim_and_run`]'s own `info` line records every individual run
+    /// with its outcome and detail, which is what diagnosis needs.
+    fn note_task_outcome(&self, task: &db::TaskRow, outcome: tasks::TaskOutcome, detail: &str) {
+        let raised = match outcome {
+            tasks::TaskOutcome::Failed => {
+                let onset = Self::lock(&self.task_faults).insert(task.id.clone());
+                // Allocated only on the edge: the repeat path runs once per
+                // attempt for as long as the task stays broken and must not copy
+                // a message nobody is going to send.
+                onset.then(|| detail.to_owned())
+            }
+            tasks::TaskOutcome::Ok => {
+                Self::lock(&self.task_faults).remove(&task.id);
+                None
+            }
+            tasks::TaskOutcome::Busy
+            | tasks::TaskOutcome::Deferred
+            | tasks::TaskOutcome::Abandoned => None,
+        };
+        if let Some(message) = raised {
+            tracing::warn!(
+                task = task.id,
+                kind = task.kind.as_str(),
+                detail = %message,
+                "a scheduled task has started failing"
+            );
+            self.platform
+                .notify(&format!("Task — {}", task.kind.as_str()), &message);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // The supervisor
     // -----------------------------------------------------------------------
@@ -2068,6 +2152,11 @@ impl Engine {
             detail = detail,
             "task run finished"
         );
+        // Before the record and not after it, deliberately. The record write is
+        // the one step here that can fail, and the case where it does is exactly
+        // the case where nothing else in the system will ever mention this
+        // failure — so the toast must not be behind the `?`.
+        self.note_task_outcome(task, outcome, &detail);
         self.with_db(|conn| {
             db::finish_task_run(
                 conn,
@@ -2447,7 +2536,16 @@ impl Engine {
     /// [`TASK_LEASE_MS`], and the restarted daemon cannot prove that pid is dead
     /// — on Linux the app shares the device row and may legitimately hold one.
     /// NFR-42 asks that a SIGTERM be a bounded finalize; this is what bounds it.
-    fn release_task_leases(&self) {
+    ///
+    /// **`pub` for the desktop app's quit path** (Story 57.5). `finalize` is
+    /// only reached *after* `Self::run`'s loop breaks, and the app drops the
+    /// supervisor's `JoinHandle` at spawn — so on quit nothing awaits the
+    /// supervisor and `finalize` races process exit, usually losing. The quit
+    /// thread therefore calls this directly on the `Arc` it already holds. Safe
+    /// to call from anywhere and at any time: one bounded, conditional `UPDATE`
+    /// scoped to this host's own leases, idempotent, and a no-op when it holds
+    /// none.
+    pub fn release_task_leases(&self) {
         let now = self.platform.now_ms();
         let host = self.task_host();
         match self.with_db(|conn| db::release_host_leases(conn, &host, now)) {
@@ -12907,6 +13005,192 @@ mod tests {
             runs[0].detail.as_deref(),
             Some("0 synced, 0 already syncing, 1 waiting, 0 failed"),
             "and the tally says which of the four it was"
+        );
+    }
+
+    /// [`Engine::warn`]'s rule, in the shape a *task* needs it — and the reason
+    /// the rule exists at all: a text-keyed onset once produced 3 600
+    /// notifications an hour on this tree (Story 29.6).
+    ///
+    /// A task cannot reuse `warn` itself. `warn` keys on `SyncStatus.warning`,
+    /// which is per **profile**, and a task may be host-wide — it has no profile
+    /// to be sticky on. So the state is keyed by task id, and the rule is the
+    /// same one: insert-and-notify on the `absent → present` edge, remove on
+    /// `Ok`, leave `Busy`/`Deferred` alone because a run that did not happen is
+    /// neither a failure nor a recovery.
+    ///
+    /// **The detail string never moves across the recovery boundary here, and
+    /// that is the point.** An implementation that de-duplicated on the message
+    /// text would pass every assertion up to the recovery and then fail the one
+    /// after it, which is exactly the bug shape being guarded.
+    #[test]
+    fn a_failing_task_notifies_once_per_onset_and_re_arms_only_on_a_success() {
+        const TICKS: u32 = 3_600;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let row = task("01ONSET", None, "every 5m");
+        let same = "the remote could not be reached";
+
+        for _ in 0..TICKS {
+            engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, same);
+        }
+        let posted = notifications_posted(&platform);
+        assert_eq!(posted.len(), 1, "an hour of failures is one toast");
+        assert_eq!(
+            posted[0].0, "Task — sync",
+            "the toast names the kind, which is what the row it came from is"
+        );
+        assert_eq!(posted[0].1, same, "and carries the reason it failed");
+
+        // Neither of the two non-failures is an event, and — the half that
+        // matters — neither of them CLEARS the fault either. A `Deferred`
+        // between two failures used to be enough to re-arm an onset keyed on
+        // "the last outcome was not Failed", and a nightly task on an unplugged
+        // drive then notified every single night.
+        for outcome in [tasks::TaskOutcome::Busy, tasks::TaskOutcome::Deferred] {
+            engine.note_task_outcome(&row, outcome, "already syncing");
+            engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, same);
+        }
+        assert_eq!(
+            notifications_posted(&platform).len(),
+            1,
+            "busy and deferred neither notify nor clear: no recovery happened"
+        );
+
+        // `Abandoned` is written by the NEXT host reclaiming an expired lease,
+        // so it says nothing about whether this task's work succeeded. Treating
+        // it as a recovery would have every restart re-arm the alarm.
+        engine.note_task_outcome(&row, tasks::TaskOutcome::Abandoned, "reclaimed");
+        engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, same);
+        assert_eq!(
+            notifications_posted(&platform).len(),
+            1,
+            "a reclaimed lease is not a successful run"
+        );
+
+        // The recovery, and then the same failure with the same wording. The
+        // `Ok` is the reset, so this is a second event.
+        engine.note_task_outcome(&row, tasks::TaskOutcome::Ok, "no folders to sync");
+        engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, same);
+        let posted = notifications_posted(&platform);
+        assert_eq!(
+            posted.len(),
+            2,
+            "a recovered-then-recurring failure is a new event, identical wording or not"
+        );
+        assert_eq!(posted[1].1, same);
+
+        // And the state is per task, not per host: a second task failing is its
+        // own onset even while the first one is still faulted.
+        let other = task("01OTHER", None, "every 5m");
+        engine.note_task_outcome(&other, tasks::TaskOutcome::Failed, "a different reason");
+        assert_eq!(
+            notifications_posted(&platform).len(),
+            3,
+            "two tasks are two onsets"
+        );
+    }
+
+    /// The same guarantee through the code that actually produces the failures,
+    /// rather than through a test that hand-feeds outcomes: a folder whose
+    /// remote does not resolve, coming due over and over.
+    ///
+    /// This is the assertion that fails if `note_task_outcome` exists and
+    /// nothing calls it — the invisible half of the feature, and the one a unit
+    /// test on the helper cannot see.
+    #[tokio::test]
+    async fn an_hour_of_a_task_failing_on_its_own_schedule_is_one_notification() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01STORM", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        // Twelve windows is an hour of a `every 5m` task, each one served by one
+        // tick — the run count is asserted so a schedule that stopped firing
+        // cannot be what makes the notification count pass.
+        let _ = engine.tick().await;
+        for _ in 0..12 {
+            platform.advance_ms(300_000);
+            let _ = engine.tick().await;
+        }
+        let runs = engine.task_history("01STORM", 20).expect("history");
+        assert_eq!(runs.len(), 12, "twelve windows, twelve attempts");
+        assert!(
+            runs.iter()
+                .all(|run| run.outcome == Some(tasks::TaskOutcome::Failed)),
+            "and every one of them really failed"
+        );
+
+        // The profile's own sync warnings are per profile and go through
+        // `warn`; a task's go through the task's own onset. Both are onset-keyed,
+        // so an hour of this folder is one of each and never twelve of either.
+        let posted = notifications_posted(&platform);
+        let task_toasts: Vec<&(String, String)> = posted
+            .iter()
+            .filter(|(title, _)| title.starts_with("Task — "))
+            .collect();
+        assert_eq!(
+            task_toasts.len(),
+            1,
+            "twelve failed runs are one notification, got {posted:?}"
+        );
+    }
+
+    /// The lease handback the desktop app's **quit** path calls directly.
+    ///
+    /// `Engine::finalize` reaches this too, but only after `Engine::run`'s loop
+    /// has broken — and the app drops the supervisor's `JoinHandle` at spawn, so
+    /// nothing awaits that. The quit thread therefore needs the release as a
+    /// verb it can call on the `Arc` it already holds, which is what makes this
+    /// `pub`. Asserted the way it matters: another host can claim afterwards.
+    #[tokio::test]
+    async fn releasing_this_hosts_leases_lets_another_host_claim_the_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01QUIT", None, "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+
+        let host = engine.task_host();
+        let now = platform.now_ms();
+        engine
+            .with_db(|conn| db::claim_task(conn, "01QUIT", &host, now, TASK_LEASE_MS, None))
+            .expect("claim")
+            .expect("claimed");
+
+        // The other host on this machine — the daemon, sharing the device row
+        // and differing only in pid — cannot take a live lease.
+        let other = format!("{}#{}", engine.device().id, std::process::id() + 1);
+        assert!(
+            engine
+                .with_db(|conn| db::claim_task(conn, "01QUIT", &other, now, TASK_LEASE_MS, None))
+                .expect("the claim statement runs")
+                .is_none(),
+            "a held lease is what stops two hosts running one window"
+        );
+
+        engine.release_task_leases();
+
+        assert!(
+            engine
+                .with_db(|conn| db::claim_task(conn, "01QUIT", &other, now, TASK_LEASE_MS, None))
+                .expect("the claim statement runs")
+                .is_some(),
+            "and handing it back is what stops the next host waiting out TASK_LEASE_MS \
+             for a process that has quit"
         );
     }
 
