@@ -2,10 +2,11 @@
 title: 'Packaging and the chapter: a timer that calls the verb, and prose that is true'
 type: 'feature'
 created: '2026-08-30'
-status: 'in-progress'
+status: 'done'
 baseline_revision: '48f5475'
+final_revision: '5d8b98d'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 context:
   - '{project-root}/_bmad-output/planning-artifacts/epic-57-a-task-that-runs-when-it-should.md'
   - '{project-root}/_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/ARCHITECTURE-SCHEDULED-TASKS.md'
@@ -156,6 +157,229 @@ and `TaskCommand::Run`'s own `--help`. All three now state the exception. Reacha
 `Persistent=true` fires a catch-up run with no ordering against the daemon's first tick.
 
 ## Review Triage Log
+
+### 2026-08-30 — Review pass
+- intent_gap: 0
+- bad_spec: 0
+- patch: 22: (high 3, medium 13, low 6)
+- defer: 2: (medium 2)
+- reject: 0
+- addressed_findings:
+  - `[high]` `[patch]` **`OnCalendar=` is a list, and §14's drop-in recipe did not reset it.** Both
+    reviewers, independently. An operator following step 3 verbatim would have got a `release` task
+    triggered at 00:00 **and** 03:00 — a content-deleting sweep at an hour they had explicitly
+    configured away from, invisible because `list-timers` shows only the next elapse. The install
+    block is now numbered 1–6 with the empty `OnCalendar=` assignment as its own commented step, and
+    step 5 reads `TimersCalendar` back so both entries are visible if it is skipped anyway.
+  - `[high]` `[patch]` **No `SuccessExitStatus=4`, so a deferral left the unit `failed`.** Both
+    reviewers. `RestartPreventExitStatus=` suppresses the restart and not systemd's own verdict, so
+    every night a drive was out ended red in `systemctl --user status`, listed in `--failed`, firing
+    any `OnFailure=` hook — systemd raising the exact alert exit `4` exists to prevent, and breaking
+    §14's own install step 6. Added to the unit, documented, and given a test of its own.
+  - `[high]` `[patch]` **`Restart=` on `Type=oneshot` is refused before systemd 244.** Blind Hunter,
+    with the v243 source message quoted. On Debian 10, Ubuntu 18.04 or RHEL 8 the unit never loads
+    and the timer fires onto nothing every night — on precisely the headless-server class the pair
+    was built for. The floor is now stated in the unit header and in §14, with the fallback (delete
+    `Restart=`/`RestartSec=`), and a test binds the two statements together.
+  - `[medium]` `[patch]` **The install block's binary path was wrong and no single cwd worked.**
+    `target/release/keeper-syncd` does not exist; the workspace root is `src-tauri/`. Fixed to
+    `src-tauri/target/release/…` with an explicit `cd` before the unit-file installs.
+  - `[medium]` `[patch]` **`next_task_window` has a *second* exception and it fires first.** Edge
+    Case Hunter. The `Busy | Deferred` arm precedes the `match trigger`, so a timer run that did
+    nothing at 00:00 rewrites the window to 00:01 and the daemon sweeps three hours early. Named in
+    the timer header and in the `--mode` table; the one-exception claim was false in both.
+  - `[medium]` `[patch]` **`Persistent=true` and `RandomizedDelaySec=3600` appeared in neither the
+    chapter nor the test bindings.** Both reviewers. A `03:00` drop-in actually fires at a random
+    point in 03:00–04:00, and a laptop shut overnight sweeps after boot. Both now documented with
+    their real values, and the chapter test asserts the values it quotes.
+  - `[medium]` `[patch]` **An unreadable release *row* fails open where an unreadable *table* fails
+    closed.** Edge Case Hunter. `release_governance` folds only over parsed rows, so a stored `off`
+    row a newer keeper wrote is ignored and the §9 edge deletes. Added as a fifth row of the
+    three-mode table with the verification step (`tasks list` on the older binary). The code
+    behaviour itself is deferred — see below.
+  - `[medium]` `[patch]` **"rename the task" — there is no rename verb.** Edge Case Hunter. The only
+    implementation is `forget` + `set`, which destroys the run history the chapter opens by calling
+    the whole point of a task. Reworded to *choose the id when you create it*, with the cost stated.
+  - `[medium]` `[patch]` **`/` was presented as the only unusable id.** Both reviewers. `validate_id`
+    imposes no character set and no length bound, so `night sweep`, `sync@home` and `réveil` are all
+    storable and none can be an instance name; the 256-byte unit-name cap applies too. The chapter
+    and the unit header now give the real character set and the invisible failure it produces (exit
+    `2`, no run row).
+  - `[medium]` `[patch]` **An overlapping trigger is dropped with no run recorded.** Edge Case
+    Hunter. Unlike a held lease or reservation, which both record `busy`, this writes nothing and
+    `Persistent=` will not catch it up — invisible non-execution, the thing the epic exists to close.
+    Documented in both files with the defence: keep the cadence coarser than the work.
+  - `[medium]` `[patch]` **"a run where nothing looked exits 4" over-claimed.** Edge Case Hunter.
+    `perform_release_task` returns `Ok`/exit `0` when no folders are configured at all. The sentence
+    now carries that exception and what a wrapper should watch instead.
+  - `[medium]` `[patch]` **The strongest test could not tell `%i` from a hard-coded id.** Blind
+    Hunter. Substituting `%i` with `nightly` made a unit that had *dropped* `%i` produce a
+    byte-identical argv. Now substitutes sentinels (`specifier-i-under-test`), and splits before
+    expanding so the argv is the one systemd builds. Mutation-proven: hard-coding the id fails it.
+  - `[medium]` `[patch]` **The start-limit assertion permitted `StartLimitBurst=0`.** Blind Hunter —
+    which is the unbounded every-minute loop the bound exists to prevent. Now asserts the values,
+    and the chapter quotes them as `StartLimitBurst=3` / `StartLimitIntervalSec=600` so the prose
+    breaks with the unit.
+  - `[medium]` `[patch]` **The chapter-quote assertion was unanchored.** Both reviewers. §14 already
+    prints `OnCalendar=*-*-* 03:00:00` as an example, so retuning the shipped timer to that value
+    would have kept the test green over a stale "the shipped default is" sentence — the exact
+    staleness it was written to catch. Now anchored to the sentence.
+  - `[medium]` `[patch]` **Nothing constrained `[Service]` keys the tests did not name.** Edge Case
+    Hunter: `RemainAfterExit=yes` would leave the instance active and turn every later trigger into
+    a silent no-op, and it passed all six tests. Given its own test.
+  - `[medium]` `[patch]` **§18 omitted §14 entirely.** Blind Hunter. A reader consulting the status
+    section concluded Tasks was designed but not built. §18 now records tasks as real with the
+    macOS background-host limit as a fourth bullet.
+  - `[medium]` `[patch]` **§14 documented exit `3`; `tasks run --help` did not.** Blind Hunter. `3`
+    is reachable (`Engine::open` resolves `git` first) and the shipped unit lists it, so a wrapper
+    author reading only `--help` was the one consumer left unable to handle it. Added to the help,
+    and `tasks_run_help_names_the_exit_codes_it_can_produce` now requires it.
+  - `[medium]` `[patch]` **The one-minute retry evicts the 50-run history.** Edge Case Hunter. Fifty
+    minutes of a drive being out wipes every earlier row, so the record §14 calls the source of truth
+    cannot answer the question it exists for. Documented with the two mitigations.
+  - `[low]` `[patch]` Two assertions that could not fail (`!prevented.contains(&EXIT_FAILURE)` after
+    an exhaustive `assert_eq!`) read as independent guards; folded into the `assert_eq!` message.
+  - `[low]` `[patch]` The `Restart=` assertion message misstated which values `Type=oneshot` accepts,
+    contradicting the unit file's own correct comment. Corrected.
+  - `[low]` `[patch]` `expanded.split_whitespace()` modelled expand-then-split; systemd splits then
+    expands. Reordered, which matters for any instance name containing a space.
+  - `[low]` `[patch]` "enabling a timer-driven oneshot runs it once at login" was stated as
+    observable behaviour, but the shipped service has no `[Install]` and cannot be enabled at all.
+    Restored to the conditional the unit header already used, with what `systemctl` actually says.
+  - `[low]` `[patch]` `docs/decisions.md` D-3 named "needs the daemon crate to build there first" as
+    the launchd blocker, which §14 now contradicts with evidence (`release.yml:242`). D-3's platform
+    paragraph and revisit trigger rewritten to the true blocker; its `§4`/`§13` citations untouched
+    and still resolving.
+  - `[medium]` `[defer]` The unreadable-release-row behaviour itself: `release_governance` should
+    arguably fail closed on an unknown row the way it fails closed on an unreadable table. Ledgered
+    rather than fixed — it is a behaviour change in `keeper-sync/src/engine.rs`, which this story is
+    scoped out of and which a sibling agent held during this run.
+  - `[medium]` `[defer]` `ARCHITECTURE-SCHEDULED-TASKS.md:111` ("the unit file that ships is a thin
+    caller of `tasks run`, **not the source of truth**") is contradicted by the shipped artifact,
+    since `OnCalendar` is the source of truth for that driver's cadence. Ledgered; the planning doc
+    is not this story's to rewrite.
+
+**Both reviewers reported clean on the areas most at risk.** Every JSON key name and count, exit-code
+mapping, outcome spelling, lease and retry constant, `unhosted` reason and gate order, and the whole
+schedule dialect — Edge Case Hunter fed every boundary input through `TaskSchedule::parse`,
+`CronSpec::parse` and `parse_field` and found the chapter's grammar matching the parser in every
+case. The `TimeoutStartSec`-is-infinite-for-`oneshot` claim and the `%i`-versus-`%I` reasoning both
+verified correct in both directions.
+
+## Auto Run Result
+
+Status: done
+
+**What was implemented.** A Linux box with no app and no GUI can now put a keeper task on a
+schedule, and `docs/sync.md` finally describes the feature the epic built. Two template unit files
+in `packaging/`, a §14 chapter written verb-by-verb against the source, and repairs to every
+sentence Epic 57 falsified elsewhere in that document.
+
+**Files changed**
+- `src-tauri/crates/keeper-syncd/packaging/keeper-syncd-tasks@.service` — **new.** `Type=oneshot`,
+  `ExecStart=%h/.local/bin/keeper-syncd tasks run %i`, `Restart=on-failure` + `RestartSec=60` +
+  `RestartPreventExitStatus=2 3 4`, the retry ceiling written down (`StartLimitIntervalSec=600`,
+  `StartLimitBurst=3`) rather than inherited, `NoNewPrivileges=yes`, `PrivateTmp=yes`, no
+  `[Install]`, and a comment block recording what is deliberately absent and why.
+- `src-tauri/crates/keeper-syncd/packaging/keeper-syncd-tasks@.timer` — **new.** `OnCalendar=daily`,
+  `Persistent=true`, `RandomizedDelaySec=3600`, `AccuracySec=1m`, `WantedBy=timers.target`, and a
+  header that states which cadence is real and which `--mode` to pair with it.
+- `src-tauri/crates/keeper-syncd/src/commands.rs` — a `packaging` test module (six tests over a
+  strict INI reader) and two corrected doc comments on `TaskCommand::Run`.
+- `docs/sync.md` — §14 Tasks (≈370 lines); §14–§19 → §15–§20; repairs in §9, §13 and §20.
+- `docs/decisions.md` — deliberately **unchanged**; see the renumbering record below.
+
+**The renumbering, re-resolved line by line.** §14 was inserted after the daemon chapter, so §13 and
+everything below it kept their numbers while §14–§19 became §15–§20. Every `§N` in both files was
+followed: references exist to §1, §4, §5, §6, §7, §8, §9, §10, §11, §12, §13 (all unmoved) and to
+§15 (moved). Exactly **one** reference needed changing — the Troubleshooting table's credential row,
+`(§15)` → `(§16)` for Security posture. No reference to §17–§20 exists anywhere. `docs/decisions.md`
+cites `docs/sync.md` §4 (iCloud placeholders, D-2) and §13 (`update` never installs by itself, D-3);
+both still resolve, so that file was not touched. A script check confirms the heading sequence is
+`1..20` with no gap and that all 36 code fences balance.
+
+**What was cross-checked against the source, and where.** Every claim in §14 was read off the code,
+not off the epic:
+- the seven verbs and `tasks set`'s six flags — `commands.rs:502-642` (`TaskCommand`, `TaskSetArgs`)
+- the exit codes `0/1/2/3/4` and that `4` is reachable only from `tasks run` — `commands.rs:17-26`,
+  `:58-87`, `task_exit_code` `:2962`
+- the dialect: 5-field cron, the `@`-aliases' exact desugaring, `every <n>` units, the four
+  refusals, the one-minute floor and one-year ceiling — `keeper-sync/src/tasks.rs:31-42`, `:302-412`;
+  the field grammar (`*`, `n`, `low-high`, `/step`, no wrap, no names, `7`=Sunday) — `:571-623`
+- `every` measuring from the **end** of the previous run — `tasks.rs:259-272`
+- the eleven task-document keys, the seven run keys and conditional `unknownOutcome`, and all five
+  envelopes — `commands.rs:3340-3465`
+- the five outcome spellings — `tasks.rs:208-218`; the 50-run cap — `db.rs:2794`
+- the three release modes and the `(None, _)` = Epic-56-unchanged arm — `engine.rs:7957-8071`
+- a release run where nothing looked is `Deferred` — `engine.rs:2504-2516`, including the real
+  `detail` string quoted in the chapter's JSON example
+- lease `1 h` / retry `1 min` — `engine.rs:507`, `:517`; `<device-id>#<pid>` — `engine.rs:2527-2529`
+- the three `unhosted` reasons and the gate order — `keeper-core/src/tasks.rs:93-105`, `:387-410`
+- `update` has no `TaskKind` and a stored `"update"` row reads unknown — `tasks.rs:81-86`
+
+**Two corrections the cross-check forced, both of which the epic got wrong.**
+1. **`tasks run` never consults a schedule.** `claim_and_run` passes `due_at_most: None` for
+   `TaskTrigger::Requested` (`engine.rs:2126-2134`), so the verb performs the work every time. The
+   epic's and `ARCHITECTURE-SCHEDULED-TASKS.md:111`'s framing of the shipped unit as a caller that
+   merely *asks whether work is due* is wrong. Caught before shipping: the first draft's
+   `OnCalendar=hourly` would have run a nightly release sweep twenty-four times a day. See the Spec
+   Change Log.
+2. **`keeper-syncd` does build on macOS.** `release.yml:229-282` builds and publishes
+   `keeper-syncd-aarch64-apple-darwin` with a checksum, and `platform.rs:867-875` has an explicit
+   macOS gate. The prose in this tree that says the crate "does not build there" is a half-stated
+   premise reaching the right conclusion. The provable AD-137 fact is narrower: **no launchd plist
+   exists anywhere in the repository**, so keeper ships no background host on macOS even though the
+   binary and its one-shot verbs work there. §14 and the launchd paragraph say that version.
+
+**Verification**
+- `cargo test -p keeper-sync -p keeper-core -p keeper-syncd`: **3756 passed, 0 failed** (baseline
+  3736; eight of the new ones are mine, the rest a sibling's concurrent story). The first commit
+  measured 3742 before the review fixes added two more tests.
+- `cargo clippy … -p keeper-core -p keeper-sync -p keeper-syncd --all-targets -- -D warnings`:
+  **clean**, zero warnings, with commit `87f63ff` in the tree. One pre-existing future-compat note
+  about `proc-macro-error2`, the same one 57.5 recorded. Run by `TasksFixes` on the shared worktree
+  and handed over rather than duplicated: cargo was serialised between us by agreement, and their
+  run covers this commit plus their own changes, which is strictly stronger than an isolated one.
+- `cargo fmt --all --check`: no diff — also the only local syntax gate the shell crate has.
+  `cargo fmt -p keeper-syncd --check` was additionally run alone, because `--all` was transiently
+  red on a sibling's in-progress files and I did not run the formatter over their edits.
+- `bun run typecheck`: clean. `bun run lint`: 4 warnings + 1 info, the baseline. `bun run test`:
+  **300 files / 4966 tests passed**, the baseline exactly — no frontend file was touched.
+- `cargo test -p keeper-syncd --bin keeper-syncd -- tasks_run_help shipped chapter`: **7 passed**,
+  including `tasks_run_help_names_the_exit_codes_it_can_produce` — so the rewritten
+  `TaskCommand::Run` prose was proved to survive clap's rendering with `0/1/2/4/deferred` intact,
+  executed rather than asserted.
+- **`systemd-analyze` is absent on this host, and so is `systemctl`** (`command -v` finds neither).
+  No systemd-native validation was run and none is claimed. The substitute is six tests over a
+  strict INI reader that fails on anything which is not a comment, a blank line, a `[Section]`
+  header, or a `Key=Value` inside a section, and which keeps duplicate keys so a second `ExecStart=`
+  cannot hide.
+- Four mutations applied and reverted one at a time, each restore verified by `cmp` against a
+  pristine copy: `tasks run` → `tasks runn` failed only the clap-parse test; dropping `4` from
+  `RestartPreventExitStatus` failed only the exit-taxonomy test; retuning `OnCalendar` to `hourly`
+  failed only the chapter-binding test; and hard-coding
+  `nightly` in place of `%i` failed only the ExecStart test, which is the mutation the first draft of
+  that test did *not* catch and the review found.
+
+**Residual risks and handoffs**
+- Nothing here was executed by systemd. The units are proved to *parse* and to name a verb that
+  exists with those flags; that a real `systemctl --user` accepts them is untested on this host, and
+  §14's install block is the sequence a person should run once on a real box.
+- `Restart=on-failure` on a `Type=oneshot` is documented-valid (only `always` and `on-success` are
+  refused for that type) but was not exercised by a live systemd.
+- The app's Tasks view will not name the timer as a host, because `daemon_presence` probes
+  `keeper-syncd.service` only. Left as-is deliberately — changing it is a behaviour change in a
+  crate that cannot be compiled here — and §14 states the limit instead.
+- `daemon_presence` also does not check `loginctl … Linger`, so its *logged in or not* sentence is
+  optimistic on a non-lingering box (found by `TasksReview`, logged against 57.5). §14 makes
+  lingering a required, verified install step and states the blind spot outright.
+- `tasks-pane.tsx`'s empty state told users to run `keeper-syncd task add`, which has never existed.
+  Found by `TasksReview`, owned by `TasksFixes`, who confirmed the pane will quote §14's real
+  spelling (`keeper-syncd tasks set <id> --kind …`). Not fixed here: that file belongs to 57.5's
+  triage, and my chapter commits to the correct spelling so the two cannot drift again.
+- `ARCHITECTURE-SCHEDULED-TASKS.md:111` and `docs/decisions.md` D-3's "needs the daemon crate to
+  build there first" are both now contradicted by the shipped artifacts (see the two corrections
+  above). `TasksFixes` is putting both into `deferred-work.md`; neither was edited here.
 
 ## Design Notes
 
