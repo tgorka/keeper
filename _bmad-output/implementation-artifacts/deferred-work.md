@@ -4871,3 +4871,105 @@ status: open
 - source_spec: `{project-root}/_bmad-output/implementation-artifacts/spec-57-3-the-verb-a-cron-can-call.md`
   summary: `Engine::perform_sync_task` reports `TaskOutcome::Ok` for a host-wide sync task on a machine whose every folder is paused, so a cron wrapper cannot tell "the sync task is working" from "the sync task can never run here".
   evidence: `engine.rs`'s host-wide branch collects `profiles.iter().filter(|p| p.enabled)` and its `targets.is_empty()` arm answers `(Ok, "no folders to sync")` without distinguishing "no folders configured" from "every folder paused" — the same shape story 57.4 fixed for the release kind by answering `Deferred` (exit 4) for the second. Pre-existing: it shipped with story 57.1, not with this change, and the sync kind's `Ok` is not a deletion, so it was left rather than widened into this diff.
+
+- source_spec: `{project-root}/_bmad-output/implementation-artifacts/spec-57-5-the-app-runs-them-too.md`
+  summary: `db::upsert_task`'s forward-compatibility guard reads the stored `kind` only, so a save over a row whose `mode` a newer keeper wrote silently rewrites that mode to this build's vocabulary.
+  evidence: |
+    `upsert_task` (`keeper-sync/src/db.rs:3051-3064`) selects `kind` alone and refuses
+    the write when `TaskKind::from_stored` cannot read it — "overwriting it would
+    rewrite its kind to one of ours — the write half of NFR-43". `mode` is exactly as
+    unreadable: `decode_task` (`db.rs:2965-2967`) files a row under
+    `TaskListing.unknown` when `TaskMode::from_stored` returns `None`, so such a row
+    exists and is now VISIBLE — the Tasks pane renders it under "Written by a newer
+    keeper" with its id in `data-task-id`. A later save naming that id passes the kind
+    check and the `ON CONFLICT(id) DO UPDATE SET` clause rewrites `profile_id`, `kind`,
+    `schedule`, `mode` and `enabled`, destroying the mode the other host was acting on.
+    Pre-existing: `upsert_task` is untouched by story 57.5's diff and the identical
+    kind-only guard is present at `8e4f933~1`. What 57.5 changes is reachability — it
+    registers `sync_task_save` as an IPC command that accepts an arbitrary id, and it
+    puts those ids on screen. `db.rs`'s own guard test (:6232) stores an unreadable
+    *kind*; no test stores an unreadable mode and then upserts over it. The fix is
+    symmetrical with the guard that exists: select `kind, mode` and refuse on either.
+  status: done 2026-08-30
+  resolution: |
+    Re-triaged from `defer` to `patch` and fixed in story 57.5's review-loopback pass.
+    `db::upsert_task` now reads `kind, mode, schedule, enabled` from the pre-row in the
+    same transaction as the write — it needs the mode and schedule anyway, for the
+    "back into service" edges that clear `next_due_ms` and (new) the process-local
+    `task_faults` — so the guard became five lines beside its own twin:
+    `TaskMode::from_stored(mode).is_none()` refuses the overwrite with the same
+    sentence shape the kind guard uses. Test:
+    `a_task_whose_mode_this_build_cannot_read_is_never_overwritten_either`
+    (`keeper-sync/src/db.rs`) stores a raw row with `kind='sync', mode='teleport'`,
+    asserts the save is refused, and asserts BOTH columns survive untouched — the
+    half the existing kind test could not see. Deferred originally because it was
+    pre-existing; fixed because leaving a known silent-rewrite defect in the ledger
+    when its repair is free next to code that already reads the column is the worse
+    trade.
+
+- source_spec: `{project-root}/_bmad-output/implementation-artifacts/spec-57-5-the-app-runs-them-too.md`
+  summary: `HOST_SENTENCE_DAEMON` promises "logged in or not", which `systemctl --user is-enabled` cannot establish — a systemd user manager is torn down at logout unless `loginctl enable-linger` was run, so on a box with the unit enabled and the data directory shared but lingering never enabled, the Tasks view over-claims and the nightly sweep in fact stops at logout.
+  evidence: |
+    `keeper-core/src/tasks.rs`'s `HOST_SENTENCE_DAEMON`, fed by
+    `keeper/src/sync_ipc.rs`'s `daemon_unit_enabled` → `daemon_presence`. `is-enabled`
+    reports nothing about lingering and the code never asks; `grep -rn linger` finds the
+    fact only in `ARCHITECTURE-SCHEDULED-TASKS.md:117-119` — which names it explicitly,
+    *"the systemd **user** unit … **with `loginctl enable-linger` for post-logout**"* —
+    and in the packaging notes, never in code. This is the unsafe direction of AD-137's
+    own "every host claim on screen is true" rule. Unreachable on macOS, where
+    `daemon_presence_here` is `Absent` by construction.
+
+    Raised as `bad_spec` by story 57.5's review pass and deliberately NOT fixed in its
+    loopback pass, because the choice between the two coherent repairs is a product
+    decision with a cross-story coupling, not an implementation detail:
+      (a) probe `loginctl show-user "$USER" --property=Linger` and add a fourth
+          `DaemonPresence` state for enabled-but-not-lingering, with its own sentence; or
+      (b) weaken the sentence to what `is-enabled` actually establishes — e.g.
+          "including while keeper is closed" — and drop the post-logout claim.
+    Either way the intent contract's I/O matrix row quotes "logged in or not" verbatim
+    and must be amended with it, and whichever is chosen must agree with what story 57.7
+    installs (it owns `keeper-syncd.service`, the `keeper-syncd-tasks@` pair and
+    `docs/sync.md` §13/§14). Option (a) also adds a wire enum variant, so it is a
+    `keeper-core` binding change and a new branch in the pane's host switch.
+
+- source_spec: `{project-root}/_bmad-output/planning-artifacts/architecture/architecture-keeper-2026-07-03/ARCHITECTURE-SCHEDULED-TASKS.md`
+  summary: AD-136's "the unit file that ships is a *thin caller* of `tasks run`, not the source of truth" is contradicted by the artifact that shipped — `OnCalendar` IS the source of truth for that driver's cadence, because `tasks run` never reads the task's schedule.
+  evidence: |
+    `Engine::run_task_now` calls `claim_and_run(..., TaskTrigger::Requested)`
+    (`engine.rs:7721`), and `claim_and_run` maps `Requested` to `due_at_most: None`
+    (`engine.rs:2126-2133`), which drops `claim_task`'s `next_due_ms <= ?5` predicate
+    entirely (`db.rs:3215`). So `keeper-syncd tasks run <id>` performs the work every
+    time it is called and the stored `schedule` column governs only the in-process
+    hosts — `keeper-syncd watch` and the desktop app. The shipped
+    `keeper-syncd-tasks@.timer` therefore owns the cadence for the timer-driven path,
+    and an hourly trigger on a task whose schedule reads `0 3 * * *` does the work
+    twenty-four times a day. Story 57.7's own unit headers state this correctly and at
+    length; the architecture prose at `:111` still says the opposite, and it is the
+    document a later reader treats as authoritative. Not a code defect and not a
+    defect in 57.7 — the units were deliberately written to the code rather than to the
+    epic. What is left is that AD-136's sentence, and the epic's line 93 framing of the
+    pair, need to say that the task's schedule is what keeper *validates, displays and
+    reports on* while the unit's `OnCalendar` is what fires that driver. Surfaced by
+    story 57.7's implementation while story 57.5's review pass was running, not by that
+    review pass.
+
+- source_spec: `{project-root}/_bmad-output/implementation-artifacts/spec-57-3-the-verb-a-cron-can-call.md`
+  summary: `tasks run`'s clap doc promises "The schedule is deliberately not moved" without the exception the engine implements — an already-open window IS consumed by a requested run.
+  evidence: |
+    `keeper-syncd/src/commands.rs:530` documents the `Run` verb as "The same engine path
+    the scheduled tick takes … The schedule is deliberately not moved — asking for a run
+    now is not asking to skip the next one." `Engine::next_task_window`
+    (`engine.rs:2213-2219`) is `TaskTrigger::Requested => match task.next_due_ms {
+    Some(at) if at > finished_ms => Some(at), _ => scheduled }` — so the window is
+    preserved only while it is still in the FUTURE; an already-open window is treated as
+    served and re-armed to the following instant. The engine's own doc
+    (`engine.rs:2187-2190`) states that exception correctly, so this is the CLI's
+    doc being incomplete rather than a behavioural defect — the behaviour is right,
+    since writing an open window back would re-run the task on the very next tick.
+    It is worth correcting because the omission is load-bearing for the timer pair
+    57.7 ships: `Persistent=true` fires a missed trigger once at boot with no ordering
+    against `keeper-syncd watch` reaching its first tick, and a `Busy`/`Deferred` run
+    sets `next_due_ms` to `min(scheduled, now + TASK_RETRY_MS)`, which can already be
+    past — so a requested run landing on an overdue window is reachable in normal
+    operation, not only in theory. Pre-existing: the doc and `next_task_window` both
+    shipped before story 57.5's diff.
