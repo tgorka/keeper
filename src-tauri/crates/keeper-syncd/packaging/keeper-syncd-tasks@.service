@@ -1,0 +1,119 @@
+# keeper-syncd tasks — the one-shot half of the timer pair (Epic 57, AD-136).
+#
+# This unit is NOT a scheduler and must never become one. It is a **thin caller
+# of one verb**: keeper owns what a task IS — its name, its kind, its target,
+# its mode, every refusal it walks and the whole record of what it did — and
+# `tasks run` reaches exactly the code path the daemon's own tick reaches. That
+# is why a systemd timer as the *only* mechanism was rejected (AD-136): a
+# schedule written into unit files alone would be invisible to `tasks list`, to
+# the Tasks view, and to anything asking keeper what it intends to do.
+#
+# Read the accompanying .timer before you enable it. `tasks run` performs the
+# work every time it is called and never consults the task's own schedule, so
+# the timer's OnCalendar= is the cadence for THIS driver. The timer's header
+# says which `--mode` to pair with it.
+#
+# A **template** unit: the instance name is the task id, so one file drives
+# every task on the box and there is no second copy to drift.
+#
+#   keeper-syncd-tasks@nightly.service  ->  keeper-syncd tasks run nightly
+#
+# The id goes in verbatim (`%i`, never `%I`), because a task id normally
+# contains hyphens — `release-nightly` — and `%I` would unescape those into
+# slashes and ask keeper for a task nobody stored. An id containing a literal
+# `/` therefore cannot be an instance name at all; rename the task.
+#
+# Install (both files, then enable the TIMER, not this). docs/sync.md §14 has the
+# same sequence with the reasoning:
+#   install -Dm644 keeper-syncd-tasks@.service ~/.config/systemd/user/keeper-syncd-tasks@.service
+#   install -Dm644 keeper-syncd-tasks@.timer   ~/.config/systemd/user/keeper-syncd-tasks@.timer
+#   systemctl --user daemon-reload
+#   loginctl enable-linger "$USER"                  # REQUIRED — see below
+#   loginctl show-user "$USER" --property=Linger    # must print Linger=yes
+#   systemctl --user edit keeper-syncd-tasks@nightly.timer   # set OnCalendar=
+#   systemctl --user enable --now keeper-syncd-tasks@nightly.timer
+#   systemctl --user list-timers 'keeper-syncd-tasks@*'
+#
+# **Lingering is required, not a nicety.** A `--user` unit is stopped when its
+# user's last session ends, so without it this timer works until you log out and
+# then silently never again — which is precisely the invisible non-execution
+# Epic 57 exists to close. Note also that the app's Tasks view does NOT check
+# lingering: `systemctl --user is-enabled` says a unit is wanted at login, not
+# that it survives logout.
+#
+# There is deliberately no [Install] section here. Enabling a timer-driven
+# one-shot would run it once at login and never again, which looks like it
+# worked and is the opposite of a schedule.
+
+[Unit]
+Description=keeper task %i — one run
+Documentation=https://github.com/tgorka/keeper
+# Ordering only, and advisory in a user manager, exactly as in
+# keeper-syncd.service: network-online.target belongs to the system manager. It
+# earns its place here because Persistent=true in the timer can fire a missed
+# run moments after boot. Not a Requires= — AD-49 makes offline the normal case,
+# and a task that could not reach its remote exits 1 and is asked again.
+After=network-online.target
+
+# The retry below is bounded here rather than left to the manager's defaults, so
+# the ceiling is visible beside the policy it bounds: at most three attempts in
+# ten minutes, after which this instance stays failed until the timer's next
+# trigger. Without a stated bound a task failing for a persistent reason would
+# retry on whatever DefaultStartLimit* the distribution happens to ship.
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+# The whole body of this unit. One verb, one task, and keeper decides whether
+# the work is actually due — `tasks run` takes the same lease, walks the same
+# refusals and writes the same `task_runs` row a scheduled run does.
+ExecStart=%h/.local/bin/keeper-syncd tasks run %i
+
+# Restart=on-failure is permitted on Type=oneshot (only `always` and
+# `on-success` are not), and it is worth having: exit 1 means the work ran and
+# failed, which is often a transient remote, and the next OnCalendar may be a
+# day away.
+Restart=on-failure
+RestartSec=60
+# The exit taxonomy, honoured (commands.rs: EXIT_CONFIG, EXIT_PREREQUISITE,
+# EXIT_DEFERRED). These three are the numbers a restart cannot help:
+#   2 — a configuration error: the task id in this instance name is wrong, or
+#       the task is off or disabled. Retrying buries the one log line that says
+#       what to fix, which is why keeper-syncd.service refuses 2 and 3 too.
+#   3 — a prerequisite is missing, in practice `git` (AD-41).
+#   4 — the work did NOT run and NOTHING IS WRONG: the drive is unplugged, the
+#       folder is paused, it was already syncing, or `keeper-syncd watch` holds
+#       this task's lease. AD-48: an unplugged volume is absence, never failure.
+#       Restarting a deferral every minute for a month is exactly the alert
+#       nobody reads that EXIT_DEFERRED was added to prevent.
+# 1 is deliberately absent from this list: it is the restartable one.
+RestartPreventExitStatus=2 3 4
+
+# --- Hardening -------------------------------------------------------------
+# The same two lines keeper-syncd.service carries, and for the same reasons:
+# this process reads and writes the user's own files and talks to a git remote,
+# so it is the daemon's posture in a shorter-lived process.
+
+# Neither keeper nor the `git` binary it invokes ever needs to gain privileges.
+NoNewPrivileges=yes
+
+# A private /tmp namespace. Safe because nothing here stages through /tmp.
+PrivateTmp=yes
+
+# NOT SET, on purpose — the same list, plus one entry of this unit's own:
+#   ProtectHome= / ProtectSystem=strict / ReadOnlyPaths= / PrivateNetwork=
+#     — see keeper-syncd.service. A task writes wherever its folder lives.
+#   KillSignal= / TimeoutStopSec= — keeper-syncd.service sets these because
+#     `watch` installs a SIGTERM handler and finalizes in-flight work under a
+#     10 s bound. `tasks run` installs no such handler, so copying those lines
+#     would document a stop contract this verb does not have. It does not need
+#     one: NFR-42 makes every task idempotent and safely abandonable, and a run
+#     killed mid-flight is closed as `abandoned` by the next host to reclaim its
+#     expired lease, rather than left wedged.
+#   TimeoutStartSec= — systemd disables it by default for Type=oneshot, and
+#     that default is kept deliberately. A host-wide sync task's duration is not
+#     knowable from a unit file, so any number written here would eventually
+#     kill real work; and it cannot pile up, because systemd will not start a
+#     one-shot that is still running when the timer next fires.

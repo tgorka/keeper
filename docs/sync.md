@@ -1119,11 +1119,16 @@ the code states it rather than leaving it silent: the accumulator adds
 existed contributes nothing to the gigabyte, and a pass made of them is bounded
 by the thirty-two-object count alone.
 
-**The sweep rides the first successful sync after the window expires, and never
-a timer.** There is no thread, no interval and no `.timer` unit — two schedulers
-over one git repository produce concurrent index locks — and that edge is also
-the moment keeper has just proved it can reach the remote it would have to fetch
-the content back from. So **a folder that never syncs never releases anything**,
+**The automatic sweep rides the first successful sync after the window expires,
+and is never itself on a timer.** Nothing inside the engine schedules it: no
+thread, no interval and no in-process timer — two schedulers over one git
+repository produce concurrent index locks — and that edge is also the moment
+keeper has just proved it can reach the remote it would have to fetch the
+content back from. (A `release` **task** is a second, explicit driver for the
+same sweep, and §14 covers it — including that with no release task stored,
+nothing in this section changes. keeper does ship a `.timer` unit, and what it
+triggers is that task's one-shot verb, not this pass.) So **a folder that never
+syncs never releases anything** on the success edge,
 and neither does a paused one. Two further gates: the sweep is asked at most
 once an hour, and on its first sight of a profile **in this run** it arms that
 window and returns nothing. First sight is per run, not once in the folder's
@@ -1155,17 +1160,20 @@ large-file content" is false of the folder and points at a setting that reads th
 other way. The pane ticks once a second, and only while some row is actually
 counting.
 
-Automatic release on that success edge is the only release mechanism built here,
-and it runs wherever the folder authorizes something: in a `pointerOnly` folder
-always, and in a `materialize` one for the paths its policy authorizes — which,
-since story 56.16, includes a folder whose only virtualization setting is a
-`virtualOverBytes` floor. A folder that authorizes nothing at all declines the
-whole sweep, and the decline is a debug line, so no surface will tell you why
-nothing happened. Releasing on a
-**schedule** you choose — off, manual or scheduled — is **Epic 57's `tasks`
-verb**, so the nightly script has a home rather than being something keeper
-declines to do; releasing by hand is here today, as `dehydrate` and as the
-**Release** action on a materialized row.
+Automatic release on that success edge runs wherever the folder authorizes
+something: in a `pointerOnly` folder always, and in a `materialize` one for the
+paths its policy authorizes — which, since story 56.16, includes a folder whose
+only virtualization setting is a `virtualOverBytes` floor. A folder that
+authorizes nothing at all declines the whole sweep, and the decline is a debug
+line, so no surface will tell you why nothing happened.
+
+There are now three ways content is released, and they share one body. This
+success edge is the automatic one. Releasing **by hand** is `dehydrate` and the
+**Release** action on a materialized row. And releasing on a **schedule you
+choose** is a `release` task (§14), whose three modes — `off`, `manual`,
+`scheduled` — decide what happens to this success edge as well: `manual` stops
+it riding the sync, `scheduled` leaves it running and adds a schedule, and with
+no release task stored at all nothing here changes.
 
 ### The verbs
 
@@ -1540,6 +1548,8 @@ keeper-syncd materialize <id> <path>  # fetch one virtual path's content
 keeper-syncd dehydrate <id> <path>    # release one path's content again
 keeper-syncd pin <id> <path>          # keep one path's content, whatever the sweep says
 keeper-syncd unpin <id> <path>        # withdraw that instruction again
+keeper-syncd tasks list | status <task> | run <task>   # scheduled housekeeping (§14)
+keeper-syncd tasks set <task> [flags] | enable <task> | disable <task> | forget <task>
 keeper-syncd doctor               # diagnose the environment
 keeper-syncd logs
 ```
@@ -1754,8 +1764,9 @@ that folder rather than falling back to the 24-hour default — an operator whos
 committed `releaseTtlMs = 0` stops applying because of a typo somewhere else in
 that file must not discover it as deletions.
 
-**It never runs on a timer.** There is no schedule, no thread and no `.timer`
-unit: the sweep rides the first successful sync after the window expires, which
+**The automatic sweep never runs on a timer.** Nothing in the engine schedules
+it — no schedule, no thread, no in-process timer: it rides the first successful
+sync after the window expires, which
 is also the moment keeper has just proved it can reach the remote it would have
 to fetch the content back from. A folder that is paused, or that simply never
 syncs, never releases anything. Neither does the **first** sync of a folder
@@ -1788,9 +1799,11 @@ compose, including what a `releaseTtlMs` of `0` does to a named deadline; this
 section only notes that the sweep reading it is the same sweep, running the same
 refusals.
 
-Releasing on a schedule you choose, or from a button, is a later story's
-`tasks`; and no stored timestamp authorizes a deletion here — it only decides
-which paths are worth asking about.
+Releasing on a schedule you choose, or from a button, is a `release` **task**
+(§14): its three modes are `off`, `manual` and `scheduled`, `manual` is what
+takes the sweep off the sync edge entirely, and with no release task stored
+nothing above changes. No stored timestamp authorizes a deletion here either —
+it only decides which paths are worth asking about.
 
 Paths follow XDG: `$XDG_CONFIG_HOME/keeper-sync/config.toml`,
 `$XDG_DATA_HOME/keeper-sync/sync.db`, `$XDG_STATE_HOME/keeper-sync/`.
@@ -1807,10 +1820,14 @@ a commit.
 
 Install the user service from `packaging/keeper-syncd.service`.
 `SIGTERM` performs a bounded graceful finalize: an in-flight push aborts
-resumably rather than being killed mid-write.
+resumably rather than being killed mid-write. `packaging/` also holds
+`keeper-syncd-tasks@.service` and `keeper-syncd-tasks@.timer`, the pair that puts
+one task on a schedule with no daemon and no app running at all — see §14.
 
 Exit codes: `0` success, `1` operational failure, `2` configuration error,
-`3` missing prerequisite (no usable git).
+`3` missing prerequisite (no usable git), and `4` the work did not run and that
+is not a failure. `4` comes only from `tasks run` (§14); no other verb can
+produce it, so nothing that already reads `$?` changes.
 
 ### Installing, and keeping it current
 
@@ -1860,7 +1877,457 @@ published today.
 
 ---
 
-## 14. Making a folder visible to agents
+## 14. Tasks — named work with a schedule and a memory
+
+A **task** is a piece of keeper's own housekeeping with a name, a schedule, and
+a record of what happened. That last part is the reason it exists: periodicity
+was never the missing piece — both hosts have run a 1 Hz tick with due-gates on
+it for a long time, and `sync --once` has always been the documented `cron`
+entry point — but nothing *remembered*. There was no name to ask about, no next
+due time, and no last outcome, so no surface could honestly tell you whether
+housekeeping had run. Non-execution of housekeeping is invisible by nature, and
+that is what a task closes.
+
+Every run is written down: when it started, when it finished, on which host, how
+it ended, and one line of detail. The history is capped at **50 runs per task**
+by the store itself, the same discipline the activity log follows, so a schedule
+doing its job cannot grow `sync.db`. Unlike the activity log, which is
+explicitly not a source of truth, this record **is** the answer to "when did
+this last run, and what happened".
+
+### The two kinds, and the one that will never exist
+
+A task's `kind` is one of keeper's own verbs, never a shell string:
+
+| kind | what one run does |
+| --- | --- |
+| `sync` | one full sync pass over the named folder, or over every enabled folder when the task is host-wide — the same `sync --once` body, taking the same per-folder reservation |
+| `release` | one release sweep over the named folder, or over every enabled folder — the same body §9 describes, with every one of its refusals |
+
+Both reuse the existing implementation rather than gaining a second one, which
+is what makes "a task is not a privileged caller" true rather than promised: a
+`release` task refuses exactly where `dehydrate` refuses, hashes the actual
+bytes the same way, asks the server the same per-object question at the moment
+of the deletion, and honours the pin, the per-file deadline and both budgets.
+
+**`update` is not a task kind and never will be.** There is no such value to
+write, and a hand-written row naming one is skipped as an unreadable kind rather
+than honoured. The reason is §13's: the daemon holds a durable journal and can
+be mid-push at any moment, so swapping its binary unattended is how a routine
+release becomes a corrupted transfer. A schedule that installs software is the
+one thing this whole mechanism is built to refuse.
+
+A kind cannot be changed on a stored task, either. The armed window and the
+whole run history belong to the kind that made them, so `tasks set nightly --kind
+release` on a `sync` task is refused by name — forget it and create it again.
+
+### The schedule, and what happens to one keeper cannot read
+
+Three forms, and nothing else:
+
+| form | meaning |
+| --- | --- |
+| `0 3 * * *` | a **5-field cron** expression: minute, hour, day-of-month, month, day-of-week. Each field is a comma-separated list of `*`, a single number, a `low-high` range, or either of those with a `/step` — `*/15`, `1-5/2`. A step on a single number (`3/2`) is refused as a contradiction, and a range never wraps (`5-1` is a mistake, not "17:00 through 01:00"). `7` is a second spelling of Sunday. Local wall-clock time. |
+| `@hourly` `@daily` `@weekly` | exactly `0 * * * *`, `0 0 * * *` and `0 0 * * 0`. They desugar to cron rather than to intervals on purpose: `@daily` as "24 hours after whenever it was armed" would drift a nightly sweep to whatever time the host last restarted, and nightly would stop meaning night. |
+| `every 30m` `every 2h` `every 1d` | a plain interval. Units are `s`, `m`, `h`, `d`, and the long spellings (`minutes`, `hours`, `days`) work too. |
+
+Two things about the cron half are worth knowing before you rely on them. The
+day rule is **vixie's**, reproduced deliberately: when both day-of-month and
+day-of-week are restricted, a date matching *either* one fires — and whether a
+field counts as restricted is decided by its **first character**, so `*/2` is
+unrestricted and `1-31` is not, even though the range selects every day. A
+dialect that agreed with cron on the easy fields and diverged on the day rule
+would be worse than one that never claimed the name. And month and weekday
+**names** (`JAN`, `MON`) are deliberately absent: the grammar is small, and a
+name nobody parses is worse than a refusal that says so.
+
+`every <n>` measures from the **end of the previous run**, not from a fixed
+origin. A task whose pass takes ninety seconds on `every 1m` therefore fires
+about every two and a half minutes. That drift is the deliberate choice: a fixed
+origin would make a task that overran come due the instant it finished, which
+over a git repository is a worse answer.
+
+**A schedule keeper cannot parse is refused when it is saved, with the
+expression quoted.** Not coerced, not clamped, not accepted and quietly ignored
+— refused at the write door, where the person who typed it is standing. Four
+refusals:
+
+- it is not one of the three forms above;
+- it fires **more often than once a minute** — `every 30s` parses and is then
+  refused by the floor, so you are told about the floor rather than about a unit
+  keeper supposedly does not understand. Below a minute a scheduler spends more
+  time waking than working;
+- it fires **less often than once a year** — reachable only from `every`, where
+  `every 100000000d` multiplies cleanly and arms a window in the year 275 000.
+  Write a calendar pattern instead (`0 0 1 1 *`), which the cron half expresses
+  exactly and is not subject to this ceiling;
+- it **matches no instant at all** — `0 0 30 2 *` parses as five valid fields
+  and names a date that does not exist.
+
+Those last two matter more than they look. A schedule that parses to "never"
+while its row reports itself enabled is precisely the invisible failure this
+chapter exists to prevent, and it is the only failure mode a scheduler has that
+nobody notices.
+
+### The verbs
+
+```
+keeper-syncd tasks list                       # every task, its target, schedule and last run
+keeper-syncd tasks status <task>              # one task and its recorded runs, newest first
+keeper-syncd tasks run <task>                 # run one now, and exit with what happened
+keeper-syncd tasks set <task> [flags]         # create one, or change one that exists
+keeper-syncd tasks enable <task>              # put it back in service
+keeper-syncd tasks disable <task>             # take it out of service, forgetting nothing
+keeper-syncd tasks forget <task>              # delete it and its whole run history
+```
+
+`list` is the only one that addresses no task; every other verb acts on exactly
+one row, and a missing selector is told rather than read as "all of them" — for
+`run` and `forget` that would be a fan-out nobody asked for. A selector gets one
+of three answers, and they are three different pieces of advice: a spelling
+keeper could never have stored (leading or trailing whitespace, or empty) is
+quoted back; a well-formed id with no such row lists what *is* stored; and a row
+this build cannot read says so with its reason rather than claiming no match.
+
+`tasks set` takes six flags:
+
+| flag | effect |
+| --- | --- |
+| `--kind sync\|release` | required to **create**; kept as stored on update, and refused if it names a different kind |
+| `--profile <SEL>` | bind the task to one folder, by id or name |
+| `--host-wide` | unbind it: the task belongs to the machine, not to one folder |
+| `--schedule <EXPR>` | the expression above, validated here |
+| `--no-schedule` | forget the schedule — `--schedule`'s inverse |
+| `--mode off\|manual\|scheduled` | who may trigger it |
+
+On update **every flag you omit keeps its stored value**, so changing a schedule
+cannot unbind a folder by not mentioning it. The two clearing flags exist
+because a knob you can set but never unset is a dead knob. On create, `--mode`
+defaults to `scheduled` when you gave a `--schedule` and `manual` when you did
+not — defaulting to `scheduled` unconditionally would make `tasks set nightly
+--kind sync` fail at the write door for a reason the caller never mentioned.
+
+`mode` and `enabled` answer different questions and both are read. **`mode` says
+who may trigger the task** — `off` refuses everyone including an explicit
+request, `manual` runs only when asked, `scheduled` is the only one that is ever
+*due*. **`enabled` says whether the row is live at all**, and `tasks enable` /
+`tasks disable` are the only things that write it: `tasks set` never touches it,
+so a settings-shaped read-modify-write cannot silently un-pause a task somebody
+paused. A disabled `scheduled` task keeps its schedule and resumes on it, and
+bringing a task back into service arms its schedule **afresh** rather than firing
+a window that fell into the past while it was out of service.
+
+### Exit codes, which is what `tasks run` is for
+
+`tasks run` exists to be called from a wrapper that branches on `$?`, so the
+numbers are the contract:
+
+| code | meaning | what a wrapper should do |
+| --- | --- | --- |
+| `0` | the work ran and did what it was asked to | nothing |
+| `4` | the work did **not** run, and nothing is wrong: the drive is unplugged, the folder is paused, the folder was already syncing, or another host holds this task's lease. Recorded as `deferred` or `busy` | **nothing — do not alert** |
+| `1` | the work ran and failed, or a stored outcome this build cannot read was recorded. The reason is in the run's `detail` | alert; a retry may work |
+| `2` | the selector is wrong, or the task is off or disabled | fix something; retrying changes nothing |
+| `3` | a prerequisite is missing — in practice, `git` | install it |
+
+`4` is the one that did not exist before tasks did, and it is worth the number.
+Folding a deferral into `0` would make an external drive unplugged for a month
+indistinguishable from a nightly sweep that is working. Folding it into `1` would
+page somebody every night for §6's *an unplugged volume is absence, never
+failure* — and an alert that fires nightly for a normal condition is an alert
+nobody reads. Nothing that worked before returns `4`: it is reachable only from
+`tasks run`.
+
+A deferred or busy run does not eat its slot. Whatever window was armed is
+replaced by the sooner of *a minute from now* and the next scheduled instant, so
+the sweep happens in the minute after the drive comes back rather than tomorrow
+night.
+
+**`tasks run` does not check whether the task is due.** It performs the work,
+every time, which is what makes a `cron` entry, a systemd timer and a person at
+a prompt behave identically — and what makes the timer's own cadence the one that
+matters for that driver (see below). A schedule window still in the future is
+left alone, so a run now is not a request to skip tonight's; a window that was
+**already open** when the run finished has just been served, and is re-armed to
+the following instant rather than firing again on the next tick.
+
+The five recorded outcomes are `ok`, `busy`, `deferred`, `failed` and
+`abandoned`. `abandoned` is written *by the next host*, when it reclaims a lease
+whose holder never closed its run — so a killed process leaves a closed record
+rather than a wedged row.
+
+### `--json`
+
+The global `--json` flag works on either side of the subcommand and makes the
+output a document whose field names are the contract. camelCase throughout,
+matching `sizeBytes` and `profileId` elsewhere in this document.
+
+`tasks list` emits `{ "tasks": [...], "unknown": [...] }`. Both keys are always
+present, the empty array included — an absent `unknown` would make "this build
+can read everything stored" indistinguishable from an older consumer's document.
+Each `unknown` entry is `{ "id", "reason" }`.
+
+A task carries eleven keys, always all eleven:
+
+```json
+{ "id": "nightly", "kind": "release", "mode": "scheduled", "enabled": true,
+  "profileId": null, "profile": null, "schedule": "0 3 * * *",
+  "nextDueMs": 1764000000000, "runningHost": null, "leaseUntilMs": null,
+  "lastRun": { "id": 7, "taskId": "nightly", "startedMs": 1763913600000,
+               "finishedMs": 1763913604000, "outcome": "ok",
+               "detail": "released 3 paths (5242880 bytes) from 1 folders, 0 declined, 0 already syncing, 0 unavailable",
+               "host": "01J8ZQ…#48213" } }
+```
+
+A task's `runningHost` and a run's `host` are the same string,
+`<device-id>#<pid>`. The device id alone would not do — on Linux the daemon and
+the app can share one data directory's `sync.db` and therefore one device row —
+and the pid is also the only part a person can check against a process list to
+see whether the holder is still alive.
+
+`profileId` and `profile` are `null` rather than absent, because here `null` is a
+**real value**: a host-wide task belongs to the machine rather than to a folder,
+and that is an answer. A `profileId` that is *set* while `profile` is `null` is
+the other case — a task bound to a folder that is gone.
+
+A run carries seven keys, plus `unknownOutcome` **only** when the store held a
+spelling this build cannot read. That conditional key is the whole contract of
+the run document: `outcome: null` alone cannot separate "still in flight" from "a
+newer keeper wrote something we cannot read", so the presence of the second key
+is the signal, which is exactly why it is absent rather than null in the first
+case. `startedMs` and `finishedMs` are absolute instants, never countdowns — a
+countdown is stale the moment it is serialized.
+
+The other envelopes: `tasks status` emits `{ "task": …, "runs": [...] }`;
+`tasks run` emits `{ "task", "run", "outcome", "exit" }`, where `run` is `null`
+when a lease held elsewhere meant no run of ours was ever opened, and `exit`
+repeats the process status so a caller that captured stdout need not consult two
+channels; `tasks set`, `tasks enable` and `tasks disable` all emit
+`{ "task": … }` — the row **read back from the store**, never the row that was
+submitted; and `tasks forget` emits `{ "forgot": "<id>" }` and nothing else,
+because echoing the fields of something that no longer exists would invite a
+consumer to believe it still does.
+
+### The release task, and its three modes
+
+§9's release sweep rides the first successful sync after a window expires. A
+`release` task is a **second driver** for that same sweep, and the mode on the
+task decides how the two relate:
+
+| release task | the success edge (§9) | `tasks run <id>` |
+| --- | --- | --- |
+| **none stored** | runs, exactly as before | — |
+| `off` (or `enabled = 0`) | does not run | refused: an "off" that still runs when asked is not off |
+| `manual` | **does not run** | runs |
+| `scheduled` | still runs | runs |
+
+**The first row is the important one: with no release task stored, nothing about
+§9 changes.** That is the arm an un-migrated `sync.db` takes, and it is why
+upgrading into this feature changes nothing at all about when content is
+released. `scheduled` *adds* a driver rather than replacing one — somebody who
+put the sweep on a schedule did not thereby ask for less housekeeping than they
+had — while `manual` is the ask this feature was built for: *deletion does not
+have to be automatic, it can be a script run at the right time*.
+
+A folder's own release row outranks a host-wide one, and where several apply the
+least permissive wins. And if the task table cannot be read at all — the other
+host holding a write lock, say — the sweep **declines that pass** rather than
+guessing that nobody switched it off, because the honest answer to "may I delete
+content" when the governing instruction is unreadable is no.
+
+One release-task answer is worth knowing before it surprises you: a run where
+**nothing looked** is recorded `deferred` and exits `4`, not `0`. That covers a
+folder whose `releaseTtlMs` is `0`, one whose large-file support is off, one
+whose folder configuration is faulted, and one whose own release row says `off`.
+Counting those as swept would have made *released 0 paths from 10 folders* mean
+either "ten folders had nothing due" or "ten folders refused", and the operator
+who most needs that difference is the one who asked for a run and got silence.
+
+### Which host actually runs a task — the platform asymmetry, stated once
+
+This is the part to read before setting a schedule, because the two platforms
+are genuinely not the same and the difference is load-bearing rather than a gap
+somebody will close next month.
+
+**On Linux there is a real background host.** `keeper-syncd watch` evaluates due
+tasks on the supervisor tick it already runs, so with the systemd user service
+enabled **and lingering turned on** tasks run with nobody logged in. Lingering is
+not optional and not a nicety: a `--user` unit is stopped when its user's last
+session ends, so without `loginctl enable-linger $USER` the daemon dies at logout
+and its schedule stops with it. A systemd **timer** calling `keeper-syncd tasks
+run` is the second way, needs no daemon at all, and needs lingering for exactly
+the same reason — see the pair below.
+
+**On macOS keeper ships no background host for the daemon.** A
+`keeper-syncd-aarch64-apple-darwin` binary *is* published (§13), so its verbs run
+there by hand or from a `cron` entry you write yourself — but keeper ships **no
+launchd agent**, so nothing starts `watch` and nothing triggers `tasks run`
+unless you arrange it. The host keeper does provide is the desktop app, and it is
+a real one: closing the window hides it and keeps the process, the engine and its
+notifications alive, and launch-at-login exists. But **quit means quit** — a task
+runs only while keeper is running, and the Tasks view says so rather than
+implying a schedule that cannot fire.
+
+A task that **no present host can run** reads **unhosted**, with the reason,
+rather than *enabled and quiet*. Exactly three states produce it: a task bound to
+a folder keeper no longer syncs; a `scheduled` task with no schedule stored; and
+a task whose `mode` is a spelling this build does not understand, which is what a
+newer keeper on the other host can write. A task that is `off` or disabled is
+**never** unhosted, whatever else is wrong with it — that gate is asked first,
+because raising an alarm about a row somebody deliberately silenced is noise. A
+`manual` task is not unhosted either, and reads *on request* — unless its folder
+is gone, which defeats being asked as thoroughly as it defeats a schedule, so
+that gate sits above every mode gate. A reason is attached to the unhosted
+verdict and to nothing else, so a reason present at all **is** the alarm.
+
+In the app, ⌘8 opens **Tasks**: every row states its kind, schedule, the host
+that will actually run it, its next due time, its last run and its last outcome,
+and offers **Run now**. A failure notifies **once per onset** — on the
+`healthy → failing` edge, not once per attempt — which is the engine's existing
+rule and exists because a text-keyed version of it once produced thousands of
+notifications an hour.
+
+Two honest limits on that view. Its Linux daemon verdict is computed from
+`keeper-syncd.service` being enabled **and** resolving the same data directory,
+which by default it does not (`~/.local/share/keeper-sync` against
+`~/.local/share/dev.tgorka.keeper`) — that case gets its own sentence rather than
+being reported as a working daemon. But a box driven **only** by the timer pair
+below has no `keeper-syncd.service` enabled at all, so the app names itself as
+the host for those tasks: the timer still runs them, and the view does not know
+the timer exists.
+
+And the verdict does **not** check lingering. `systemctl --user is-enabled` says
+a unit is wanted at login, not that it survives logout, so on a box with the
+service enabled and lingering off the row's *logged in or not* is optimistic.
+`loginctl show-user "$USER" --property=Linger` is the question, and nothing in
+the app asks it for you.
+
+### Exactly one runner, whoever asks
+
+A task row carries `runningHost` and `leaseUntilMs`, claimed in the same single
+`UPDATE` that opens the run — the claim the transfer journal already uses — so
+two supervisors cannot take one row. This matters on Linux, where the daemon and
+the app can both be running against one `sync.db`. The lease lasts **one hour**
+and an expired one is reclaimable, so a killed host does not wedge a task
+forever; the reclaiming host closes the orphaned run as `abandoned`. A
+`keeper-syncd tasks run` that meets a live lease exits `4` and records `busy`:
+nothing failed, and nothing happened either.
+
+A host that quits mid-run hands back the leases of the tasks it is **not**
+running and leaves the one it is. That lease then expires the ordinary way,
+which is why the expiry rule above is the floor and not the exception —
+releasing it early would let the other host open a second concurrent run over
+the same git tree.
+
+A task never holds a git index concurrently with its host's own sync pass. Both
+kinds take the very reservation the sync tick takes, so that is a structural fact
+about the code rather than a convention — which is also what makes exit `4`'s
+"the folder was already syncing" reachable rather than aspirational.
+
+### The systemd timer pair — a schedule with no app and no GUI
+
+Two files ship beside the daemon's own unit, in `packaging/`:
+
+```
+keeper-syncd-tasks@.service    # a oneshot: `keeper-syncd tasks run %i`
+keeper-syncd-tasks@.timer      # the trigger
+```
+
+Both are **templates**, and the instance name is the task id — the same string
+`tasks list` prints — so one pair of files drives every task on the box:
+
+```
+# 1. the binary, and the two units
+install -Dm755 target/release/keeper-syncd ~/.local/bin/keeper-syncd
+install -Dm644 keeper-syncd-tasks@.service ~/.config/systemd/user/keeper-syncd-tasks@.service
+install -Dm644 keeper-syncd-tasks@.timer   ~/.config/systemd/user/keeper-syncd-tasks@.timer
+systemctl --user daemon-reload
+
+# 2. lingering — REQUIRED, not optional. Without it every --user unit on this
+#    box, this timer included, stops when your last session ends.
+loginctl enable-linger "$USER"
+loginctl show-user "$USER" --property=Linger     # must print Linger=yes
+
+# 3. the task, and the cadence you actually want
+keeper-syncd tasks set nightly --kind release --mode manual
+systemctl --user edit keeper-syncd-tasks@nightly.timer   # OnCalendar=*-*-* 03:00:00
+
+# 4. enable the TIMER
+systemctl --user enable --now keeper-syncd-tasks@nightly.timer
+systemctl --user list-timers 'keeper-syncd-tasks@*'
+
+# 5. prove it end to end, without waiting for 03:00
+systemctl --user start keeper-syncd-tasks@nightly.service
+keeper-syncd tasks status nightly
+```
+
+Step 2 is the one people skip, and skipping it produces a schedule that works
+until you log out and silently never again. Step 5 is worth doing once: it
+exercises the real unit, and `tasks status` then shows the run it produced, with
+its outcome — which is the whole point of a task having a memory.
+
+Enable the **timer**, never the service: enabling a timer-driven oneshot runs it
+once at login and never again, which looks like it worked. A task id containing a
+`/` cannot be an instance name — rename the task; hyphens are fine and are the
+common case.
+
+**The timer's `OnCalendar` is the cadence for this driver, so set it to when you
+want the work to happen.** This is the one thing about the pair that is easy to
+get wrong, and it is worth being blunt: `tasks run` **performs** the task every
+time it is called and never consults the task's `schedule` column. Asking for a
+run now is not asking whether a run is due — that is `tasks run`'s whole
+contract, and it is what makes a `cron` entry and a person at a prompt behave
+identically. The `schedule` column is read by the **in-process** hosts: the
+`keeper-syncd watch` daemon's tick and the desktop app's. So an hourly trigger on
+a task whose schedule reads `0 3 * * *` does the work twenty-four times a day,
+not once. The shipped default is `OnCalendar=daily`, deliberately conservative,
+and `systemctl --user edit` is how you change it without editing a shipped file.
+
+Which `--mode` to pair with the timer follows from that:
+
+| you are running | give the task | why |
+| --- | --- | --- |
+| the timer only, no `watch` service and no app | `--mode manual` | nothing schedules the task, so the timer is the whole cadence and there is exactly one to read |
+| the timer **and** `keeper-syncd watch` | `--mode scheduled` with a schedule | both drivers run and the lease keeps them from overlapping. A run this timer triggered leaves the daemon's next window alone — *unless* that window was already open, in which case it has just been served and is re-armed to the following instant. Give the timer the coarser cadence unless you mean the work to happen twice |
+| neither, for now | `--mode off` | every trigger is refused, this one included, and the unit exits `2` without retrying |
+
+What stays in keeper either way is everything keeper can be asked about: the
+task's name, kind, target, mode, its whole run history, and the schedule the
+in-process hosts honour. Putting a cadence in a unit file *instead of* a task —
+no row at all, just a timer — is what AD-136 rejected, because then `tasks list`
+and the Tasks view would have nothing to show and nothing to report on.
+
+The unit honours the exit taxonomy: `RestartPreventExitStatus=2 3 4`, because a
+configuration error, a missing `git` and a deferral are the three numbers a
+restart cannot help — and a `4` retried every minute is that nightly alert nobody
+reads. `1` stays restartable, bounded at three attempts in ten minutes, after
+which the instance waits for the timer's next trigger. The daemon unit's stop
+contract is deliberately **not** copied: `watch` installs a SIGTERM handler and
+finalizes under a 10 s bound, `tasks run` installs none — it does not need one,
+because a task is idempotent and safely abandonable, and a run killed mid-flight
+is closed as `abandoned` by the next host to reclaim its lease.
+
+A plain `cron` entry is the same thing with less ceremony, and reaches the same
+code path:
+
+```
+0 3 * * *  /home/you/.local/bin/keeper-syncd tasks run nightly
+```
+
+A timer, a `cron` entry, the daemon's tick and a person at a prompt all take the
+same lease, walk the same refusals and leave the same row in the history. There
+is no privileged caller.
+
+**No launchd agent ships, and that is a recorded gap rather than an oversight.**
+A macOS `keeper-syncd` binary is published, and the same one-shot verb works
+there — a `cron` entry in your own crontab reaches the identical code path. What
+keeper does not ship is a plist that starts anything, so on macOS the desktop app
+is the host keeper provides, with the limits stated above. `docs/decisions.md`
+D-3 names a launchd agent as the revisit trigger.
+
+---
+
+## 15. Making a folder visible to agents
 
 The reason to run `keeper-syncd` on a dev box or a container rather than the
 desktop app: an autonomous agent working in that environment sees a plain
@@ -1903,7 +2370,7 @@ Two things worth setting deliberately for an agent workspace:
 - **`excludes`**. Agent tooling leaves scratch files around. The built-in tier-0
   set covers editor and download conventions but not your build outputs.
 
-## 15. Security posture
+## 16. Security posture
 
 - Credentials live in the OS keychain (or, headless, a `0600` file). Everything
   gitoxide drives — fetch and the first clone — takes them through a
@@ -1943,7 +2410,7 @@ Two things worth setting deliberately for an agent workspace:
 
 ---
 
-## 16. Troubleshooting
+## 17. Troubleshooting
 
 **`doctor` first.** It reports git's presence and version, each profile's path
 and writability, removable-volume presence, inotify limits, journal depth and
@@ -1958,7 +2425,7 @@ free space, and exits non-zero when something is genuinely wrong.
 | Profile says *drive not connected* | The volume marker is absent. Re-attach the drive; nothing was deleted. |
 | A new removable profile stays *drive not connected* | Its folder is missing, or it is on this computer's own disk. Keeper will not mark either (§6): create the folder on the drive, or clear `removable`. |
 | *A different volume is mounted at this path* | Another drive is where this profile's own drive should be. Nothing is synced either way until the right one is attached. |
-| Authentication rejected, but `git` works in that folder by hand | Keeper uses the credential stored against the profile and nothing else — plain `git` is reading your OS credential store, which keeper deliberately ignores (§15). Add the token to the profile. |
+| Authentication rejected, but `git` works in that folder by hand | Keeper uses the credential stored against the profile and nothing else — plain `git` is reading your OS credential store, which keeper deliberately ignores (§16). Add the token to the profile. |
 | Watch mode misses changes on a network mount | inotify/FSEvents do not work on many network and FUSE mounts. Enable polling for that profile. |
 | `Too many open files` / watches exhausted | Raise `fs.inotify.max_user_watches`. One watcher is used per profile, not per folder. |
 | LFS upload restarts from zero | Expected. The `basic` adapter has no resumable upload. |
@@ -1976,7 +2443,7 @@ Linux).
 
 ---
 
-## 17. Current implementation status
+## 18. Current implementation status
 
 This document describes the designed behaviour. As of 2026-08-25 the engine and
 the `keeper-syncd` daemon implement and verify §§1–8, §10, §11 and §13 against
@@ -2010,7 +2477,7 @@ runtime, and one is reachable on Linux only:
   content on a macOS or Windows machine until that platform can answer the
   question.
 
-## 18. Measured envelopes
+## 19. Measured envelopes
 
 Measured on a release build, Linux, AMD Ryzen AI 9 HX PRO 370, local disk, with
 a `file://` remote so the numbers reflect the engine rather than a network.
@@ -2029,7 +2496,7 @@ mandatory rather than optional.
 Steady-state cost is dominated by one `lstat` per file, so a folder that is not
 changing is cheap to keep watched.
 
-## 19. Deliberate limitations
+## 20. Deliberate limitations
 
 - **The daemon's update is checksum-verified, not signature-verified.** It
   proves the bytes arrived intact from the URL it asked; it does not prove who
@@ -2041,7 +2508,9 @@ changing is cheap to keep watched.
   targets build from source. `update` names the asset it looked for rather than
   failing vaguely.
 - **`update` never runs on a timer, and never restarts the daemon.** Both are
-  deliberate; see §13.
+  deliberate; see §13. It is also **not a task kind and never will be** (§14):
+  keeper does ship a timer unit now, and `update` is precisely the one verb it
+  can never be pointed at.
 
 1. **No content merge.** Divergent text files produce conflict copies, not a
    three-way merge.
