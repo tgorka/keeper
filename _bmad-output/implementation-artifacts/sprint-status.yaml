@@ -997,6 +997,102 @@ development_status:
   57-7-packaging-and-the-chapter: backlog
   epic-57-retrospective: optional
 
+  # -- EPIC 58, 2026-08-31: a task you can drive ------------------------------
+  #
+  # The owner's Tasks-view pass, after installing the app and opening ⌘8.
+  # AD-138..AD-142 in
+  # architecture/architecture-keeper-2026-07-03/ARCHITECTURE-SCHEDULED-TASKS.md.
+  # Epic doc: epic-58-a-task-you-can-drive-and-a-window-that-passed.md.
+  # Stacks on epic 57, which is NOT merged.
+  #
+  # FIVE OF HIS NINE ASKS WERE UNREACHABLE, NOT ABSENT. sync_task_save,
+  # sync_task_forget and sync_task_history are implemented, registered in
+  # generate_handler! (keeper/src/lib.rs:977-982), typed in keeper-core,
+  # wrapped in src/lib/ipc/client.ts, mocked in dev/mock-shell.ts - and have
+  # ZERO production callers. task_runs.detail is written on every completed run
+  # (engine.rs:2417-2418) and read by no component. The pane's own copy says so:
+  # "it cannot create one yet" (tasks-pane.tsx:70-74, :107). Second epic in two
+  # where a complete backend shipped with no door (56: VirtualPolicy had one
+  # consumer). So WAVE 1 IS PURE FRONTEND: no Rust, no schema, no new IPC.
+  #
+  # THE LOAD-BEARING SEPARATION IS PROJECTION vs MIGRATION, and collapsing it
+  # ships a folder that syncs twice. "Widziec joby synchronizacji git ... w tym
+  # widoku i tym mechanizmie" is two sentences: IN THIS VIEW is 58.7 and is
+  # cheap; IN THIS MECHANISM is 58.8 and is expensive, because TaskKind::Sync is
+  # a SECOND BODY (perform_sync_task -> sync_once, engine.rs:2353/:7946) beside
+  # tick_profile -> scan_due -> drain_journal (:2750/:3099), and nothing
+  # suppresses scan_is_due when a Sync task exists. Not a corrupt index - both
+  # take Engine::reserve - but duplicated work and A LYING RECORD. The only
+  # sanctioned pattern is release_governance (engine.rs:8165-8221): the task row
+  # as a knob over the pre-existing gate, "the schedule drives it AND the
+  # success edge keeps working" (:8226). 58.8 SURRENDERS scan_is_due; it does
+  # not race it. Everything else keeper paces stays read-only forever, because a
+  # task row over a still-standing look-gate is a schedule that does not
+  # schedule (57.1's own note: "a nightly release task would have fired at 03:00
+  # and been declined by an interval that knows nothing about schedules").
+  #
+  # "ZALEGLY RUN ... TYLKO RAZ" IS ALREADY TRUE. No story builds it. next_due_ms
+  # is one i64, not a queue (tasks.rs:735-739), and the next window is computed
+  # from the FINISH instant so missed windows are overwritten, never enumerated
+  # (engine.rs:2231-2236). Regression-tested at db.rs:6300-6305. Epic 57
+  # deferred this and half the deferral was wrong: the "once, not seven times"
+  # sentence described shipped behaviour and now has teeth (AD-138 - the release
+  # kind DELETES content, so N sweeps are N deletion passes nobody chose,
+  # db.rs:6289-6294). Only "a knob nobody has asked for" was scope, and 58.4
+  # answers it.
+  #
+  # THE IMPURE-SHELL RISK IS NOT 57.2's. 57.2 raced two connections over one
+  # lease. 58.6's hole is ONE HOST, TWO TRIGGERS: the timer's `tasks run` is
+  # TaskTrigger::Requested, which sets due_at_most = None (engine.rs:2215) and
+  # bypasses claim_task's window condition (db.rs:3303), while the daemon's next
+  # tick claims the same past window as Scheduled. Two runs, one window.
+  # Recorded at deferred-work.md:5036-5042 as reachable in normal operation.
+  # Linux only; macOS has no daemon host. A copy of 57.2's test finds nothing.
+  #
+  # 58.4 SHIPS THE CLI FLAG AND THE FORM CONTROL IN ONE STORY. Not a
+  # preference - a policy writable from neither surface is born unreachable,
+  # which is the exact defect this epic exists to fix. Splitting them produces a
+  # column nobody can set from the app and a story that reports itself done.
+  #
+  # 58.5 exists because a declined window leaves NO ROW ANYWHERE today:
+  # task_runs rows are minted only by claim_task (db.rs:3331), which needs a
+  # host to have been present. Busy/Deferred/Abandoned all require that too
+  # (tasks.rs:184-205), and Deferred specifically means "retry within 60s"
+  # (engine.rs:2295-2301) - the OPPOSITE of skip. Reusing it turns
+  # on_missed=skip into on_missed=retry in a minute.
+  #
+  # AD-62 constrains CLOCKS, NOT VISIBILITY (AD-142). A read-only projection
+  # registers no scheduler; the pane's 30s display clock is already argued past
+  # it (tasks-pane.tsx:424-429) and src/test/task-host-tick.test.ts is the
+  # mechanical guard. No second due-gate for work an existing gate already
+  # paces.
+  #
+  # ensure_task_columns DOES NOT EXIST - only the DDL comment demanding it
+  # (db.rs:184-189). 58.4 writes it on the ensure_journal_columns shape
+  # (db.rs:429-432) and calls it at db.rs:234-236. Action is {None,Arm,Run}
+  # (tasks.rs:293-300) and cannot express skip; db::arm_task is WHERE
+  # next_due_ms IS NULL and cannot be reused for it (db.rs:3256-3260).
+  #
+  # AD-137's macOS paragraph was WRONG and is corrected in this epic's pass:
+  # keeper-syncd DOES build and ship for Darwin (release.yml:238-243). The
+  # provable fact is narrower and stronger - NO LAUNCHD PLIST EXISTS ANYWHERE IN
+  # THE TREE, so nothing starts it in the background.
+  #
+  # Wave 1's three stories are disjoint and parallelisable; they collide only in
+  # tasks-pane.tsx, so one owns the file and the other two coordinate. 58.1
+  # closes the loudest ask and needs no Rust at all.
+  epic-58: backlog
+  58-1-a-task-you-can-create-and-edit: backlog
+  58-2-the-row-says-what-the-run-said: backlog
+  58-3-a-list-of-runs-you-can-open: backlog
+  58-4-a-window-that-passed-while-nobody-was-home: backlog
+  58-5-a-window-nobody-ran-is-still-a-fact: backlog
+  58-6-two-hosts-one-missed-window-one-run: backlog
+  58-7-everything-else-this-host-paces: backlog
+  58-8-a-sync-task-that-governs-instead-of-duplicating: backlog
+  58-9-the-chapter-grows-a-policy: backlog
+  epic-58-retrospective: optional
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
