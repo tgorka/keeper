@@ -980,6 +980,7 @@ pub fn run() {
         sync_ipc::sync_task_run_now,
         sync_ipc::sync_task_save,
         sync_ipc::sync_task_forget,
+        sync_ipc::sync_paced_work,
         copy_ipc::copy_start,
         copy_ipc::copy_status,
         copy_ipc::copy_cancel,

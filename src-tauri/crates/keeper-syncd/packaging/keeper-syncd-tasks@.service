@@ -102,7 +102,20 @@ WorkingDirectory=%h
 # The whole body of this unit. One verb, one task, and keeper decides whether
 # the work is actually due — `tasks run` takes the same lease, walks the same
 # refusals and writes the same `task_runs` row a scheduled run does.
-ExecStart=%h/.local/bin/keeper-syncd tasks run %i
+#
+# `--timer` is not decoration and must not be dropped (Story 58.6). It tells
+# keeper that a SCHEDULED driver is asking rather than a person, which is a fact
+# nothing about this process can reveal: a human types the same argv. Without it,
+# a box running this timer beside `keeper-syncd watch` against a `--mode
+# scheduled` task gets TWO runs for one missed window — an ordinary request
+# deliberately claims without asking whether a window is open, while the daemon's
+# next tick claims the same past window independently. With it, both drivers race
+# for the one window and keeper's single conditional UPDATE gives it to one.
+#
+# On a `--mode manual` task — the timer-only arrangement the .timer header
+# recommends first — it changes nothing: nothing in-process paces that task, so
+# this timer IS its schedule and the run happens as always.
+ExecStart=%h/.local/bin/keeper-syncd tasks run --timer %i
 
 # NOT set, and it matters more than it looks: RemainAfterExit=yes would leave
 # this instance `active` after its first run, and systemd does not start a unit
@@ -133,8 +146,11 @@ RestartSec=60
 #   3 — a prerequisite is missing, in practice `git` (AD-41). Raised by
 #       `Engine::open` before any task verb runs.
 #   4 — the work did NOT run and NOTHING IS WRONG: the drive is unplugged, the
-#       folder is paused, it was already syncing, or `keeper-syncd watch` holds
-#       this task's lease. AD-48: an unplugged volume is absence, never failure.
+#       folder is paused, it was already syncing, `keeper-syncd watch` holds this
+#       task's lease, or — with --timer on a `--mode scheduled` task — no window
+#       was open for a scheduled driver to claim, which is the ordinary answer
+#       whenever the daemon got there first. AD-48: an unplugged volume is
+#       absence, never failure.
 #       Listed here as well as in SuccessExitStatus= so the intent survives
 #       somebody deleting one of the two lines.
 # 1 is deliberately absent from this list: it is the restartable one.

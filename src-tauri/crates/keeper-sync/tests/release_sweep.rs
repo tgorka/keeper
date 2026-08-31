@@ -541,18 +541,22 @@ impl Fixture {
     /// the modes against three different rows.
     fn release_task(&self, mode: TaskMode) {
         self.engine
-            .save_task(&db::TaskRow {
-                id: RELEASE_TASK_ID.to_owned(),
-                profile_id: Some(PROFILE_ID.to_owned()),
-                kind: TaskKind::Release,
-                schedule: Some("@daily".to_owned()),
-                mode,
-                next_due_ms: None,
-                enabled: true,
-                updated_ms: 0,
-                running_host: None,
-                lease_until_ms: None,
-            })
+            .save_task(
+                &db::TaskRow {
+                    id: RELEASE_TASK_ID.to_owned(),
+                    profile_id: Some(PROFILE_ID.to_owned()),
+                    kind: TaskKind::Release,
+                    schedule: Some("@daily".to_owned()),
+                    mode,
+                    next_due_ms: None,
+                    enabled: true,
+                    updated_ms: 0,
+                    running_host: None,
+                    lease_until_ms: None,
+                    on_missed: keeper_sync::tasks::TaskMissedPolicy::RunNow,
+                },
+                None,
+            )
             .expect("a release task with a parseable schedule is savable");
     }
 
@@ -560,7 +564,7 @@ impl Fixture {
     /// release` will, and hand back the row it recorded.
     async fn run_the_release_task(&self) -> db::TaskRunRow {
         self.engine
-            .run_task_now(RELEASE_TASK_ID)
+            .run_task_now(RELEASE_TASK_ID, keeper_sync::tasks::TaskRunDriver::Person)
             .await
             .expect("the task is stored and is not off")
     }
@@ -2278,7 +2282,7 @@ async fn a_release_task_in_mode_off_stops_the_success_edge_and_refuses_the_reque
 
     let err = f
         .engine
-        .run_task_now(RELEASE_TASK_ID)
+        .run_task_now(RELEASE_TASK_ID, keeper_sync::tasks::TaskRunDriver::Person)
         .await
         .expect_err("an `off` that still runs when asked is not off");
     assert!(

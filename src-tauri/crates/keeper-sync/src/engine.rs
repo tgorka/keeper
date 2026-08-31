@@ -440,7 +440,12 @@ const UNTRACKED_SWEEP_INTERVAL: Duration = Duration::from_secs(900);
 ///
 /// An hour, matching `SCRATCH_DEBRIS_AGE`: the sweep runs as often as a file can
 /// become eligible for it, and no oftener.
-const SWEEP_EVERY_MS: i64 = 3_600_000;
+///
+/// `pub` for Story 58.7: the projected read-only row for this sweep has to state
+/// the cadence that is actually in force, and the shell crate composing that row
+/// must read the constant rather than re-spell the literal — a second copy is a
+/// second place for it to disagree.
+pub const SWEEP_EVERY_MS: i64 = 3_600_000;
 
 /// Paths one release sweep may attempt (Story 56.5, AD-126).
 ///
@@ -555,6 +560,16 @@ enum TaskTrigger {
     Scheduled,
     /// A person, a CLI verb or an IPC command asked for it.
     Requested,
+    /// An external **scheduled** driver asked for it through the manual verb —
+    /// Story 57.7's `Persistent=true` timer (Story 58.6, FR-358).
+    ///
+    /// Between the other two on purpose, because that is where it sits: it is a
+    /// request in its shape and a schedule in its intent. Without it one missed
+    /// window yielded TWO runs on a box running both `keeper-syncd watch` and
+    /// the timer — the request bypassed `db::claim_task`'s window condition while
+    /// the daemon's next tick claimed the same past window independently
+    /// (`deferred-work.md:5023-5042`).
+    Timer,
 }
 
 impl TaskTrigger {
@@ -570,6 +585,11 @@ impl TaskTrigger {
         match self {
             Self::Scheduled => SyncSource::Watch,
             Self::Requested => SyncSource::Manual,
+            // `Cli`, and the paragraph above argues FOR it here rather than
+            // against it: a timer run really is the `keeper-syncd` verb, driven
+            // by policy rather than by a person. `Watch` would claim the engine's
+            // own tick did it and `Manual` would claim somebody was there.
+            Self::Timer => SyncSource::Cli,
         }
     }
 }
@@ -1971,9 +1991,17 @@ impl Engine {
                 Self::lock(&self.task_faults).remove(&task.id);
                 None
             }
+            // None of these four is a failure, so none of them raises and none
+            // of them clears: only a real `Ok` may say a broken task is working
+            // again. `Declined` is unreachable here rather than merely
+            // non-raising — nothing claimed a lease, so `claim_and_run` was
+            // never entered — and it is spelled out because this match has no
+            // `_` arm on purpose (Story 58.5).
             tasks::TaskOutcome::Busy
             | tasks::TaskOutcome::Deferred
-            | tasks::TaskOutcome::Abandoned => None,
+            | tasks::TaskOutcome::Abandoned
+            | tasks::TaskOutcome::Declined
+            | tasks::TaskOutcome::Postponed => None,
         };
         if let Some(message) = raised {
             tracing::warn!(
@@ -2131,9 +2159,24 @@ impl Engine {
                 // panic on one of them is not a loop this tick may contain.
                 Err(_) => continue,
             };
-            match tasks::decide(&task.state(), schedule.as_ref(), now) {
+            let decision = tasks::decide(&task.state(), schedule.as_ref(), now);
+            match decision {
                 tasks::Action::None => {}
                 tasks::Action::Arm => self.arm_task_window(task, schedule.as_ref(), now, offset),
+                // The variant that forced this match to grow. `Action::None`
+                // could not carry it: the past window would stay standing, so
+                // the next tick would decide about it again, forever.
+                // Both non-default policies act by WRITING, and the write is
+                // one function: `Action::None` could carry neither, because the
+                // past window would stay standing and the next tick would decide
+                // about it again, forever.
+                tasks::Action::Skip | tasks::Action::Postpone => self.move_task_window(
+                    task,
+                    schedule.as_ref(),
+                    now,
+                    offset,
+                    matches!(decision, tasks::Action::Skip),
+                ),
                 tasks::Action::Run => {
                     let run = self
                         .claim_and_run(task, profiles, now, offset, TaskTrigger::Scheduled)
@@ -2182,6 +2225,136 @@ impl Engine {
         }
     }
 
+    /// Abandon a window nobody served, arm the next one, and record that it
+    /// happened (Story 58.4 and Story 58.5, FR-356, FR-357, AD-139, AD-140).
+    ///
+    /// The `on_missed = skip` half of the policy, and it is a **write**, not a
+    /// silence. Returning `Action::None` from the gate would leave the past
+    /// window on the row, so the very next tick would decide about the same
+    /// window again and the task would sit enabled, scheduled and idle forever —
+    /// which is precisely the shape [`Self::arm_task_window`]'s `warn` above
+    /// exists to make visible.
+    ///
+    /// The next instant is computed from `now_ms` and not from the abandoned
+    /// window, which is the whole difference between skipping and catching up:
+    /// a `@daily` task whose host was away a month arms tonight, not thirty
+    /// times. And it goes through [`db::skip_task_window`] rather than
+    /// [`db::arm_task`], whose `WHERE next_due_ms IS NULL` a skip can never
+    /// satisfy — see that function for the compare-and-set that replaces it.
+    ///
+    /// **And it leaves a row** (Story 58.5). A declined window is a fact, and
+    /// until this story it left no row anywhere — `task_runs` rows were minted
+    /// only by [`db::claim_task`], which runs only when a host takes the lease —
+    /// so `skip` moved a window and then went quiet, and the *last run* line went
+    /// stale for a reason it could not show. The row is closed, zero-duration and
+    /// leaseless, carrying [`tasks::TaskOutcome::Declined`], and it is written in
+    /// the same transaction as the window: see [`db::skip_task_window`].
+    ///
+    /// Nothing here calls [`Self::note_task_outcome`], and that is deliberate
+    /// rather than an omission: a declined window is not a fault and raises no
+    /// toast. It is also not a run, so there is no lease to release and no
+    /// [`db::finish_task_run`] to reach.
+    fn move_task_window(
+        &self,
+        task: &db::TaskRow,
+        schedule: Option<&tasks::TaskSchedule>,
+        now_ms: i64,
+        utc_offset_minutes: i32,
+        declining: bool,
+    ) {
+        // Unreachable through `decide`, which answers neither action for a window
+        // that is `None`. Total anyway, because a loop over stored rows that can
+        // panic on one of them is not a loop this tick may contain.
+        let Some(observed) = task.next_due_ms else {
+            return;
+        };
+        // The two policies differ here and nowhere else: `skip` gives up on this
+        // window and arms the next natural one, `delay` keeps this window's work
+        // and arms it for `TASK_MISSED_DELAY_MS` from **now** — the instant this
+        // host noticed, which is the only anchor that survives a two-hour
+        // absence. `saturating_add` because a stored window from a newer keeper
+        // can be any `i64`.
+        let next = if declining {
+            let Some(scheduled) =
+                schedule.and_then(|s| s.next_due_after(now_ms, utc_offset_minutes))
+            else {
+                // The same fact, and the same level, as `arm_task_window`'s: the
+                // row keeps its past window, so this decision repeats on every
+                // tick and the task reports itself enabled and scheduled while
+                // nothing runs.
+                tracing::warn!(
+                    task = task.id,
+                    schedule = task.schedule.as_deref().unwrap_or(""),
+                    "this task's schedule has no next instant this keeper can find, so a \
+                     window it declined cannot be replaced and it will not run"
+                );
+                return;
+            };
+            scheduled
+        } else {
+            now_ms.saturating_add(tasks::TASK_MISSED_DELAY_MS)
+        };
+        let outcome = if declining {
+            tasks::TaskOutcome::Declined
+        } else {
+            tasks::TaskOutcome::Postponed
+        };
+        // Composed here rather than in the store, for the reason
+        // `perform_sync_task`'s summary is: `detail` is the one line a person
+        // reads to find out what happened, and the two instants plus the policy
+        // that decided are exactly the three facts this decision holds. Absolute
+        // instants, not relative ones — `relative_ms` lives in the CLI and the
+        // pane renders its own — so the stored line stays true however long after
+        // the fact it is read.
+        //
+        // The two sentences say different things on purpose. A reader's question
+        // is *will my housekeeping happen*, and the answer is "no" for one of
+        // these and "yes, later" for the other.
+        let detail = if declining {
+            format!(
+                "{policy}: the window at {observed} was not run, and {next} is armed in its place",
+                policy = task.on_missed.as_str(),
+            )
+        } else {
+            format!(
+                "{policy}: the window at {observed} is held back, and will be run at {next}",
+                policy = task.on_missed.as_str(),
+            )
+        };
+        let host = self.task_host();
+        let moved = db::TaskWindowMove {
+            task_id: &task.id,
+            host: &host,
+            observed_due_ms: observed,
+            next_due_ms: next,
+            now_ms,
+            outcome,
+            detail: &detail,
+        };
+        match self.with_db(|conn| db::move_task_window(conn, moved)) {
+            // `false` is not a fault: the other host sharing this `sync.db` armed,
+            // ran or moved the same window between this tick's listing read and
+            // this write, and the compare-and-set is what stops us undoing it. No
+            // record either — a row here would claim this host decided something
+            // it did not.
+            Ok(false) => tracing::debug!(
+                task = task.id,
+                "another host had already moved the window this tick meant to decide about"
+            ),
+            Ok(true) => tracing::info!(
+                task = task.id,
+                outcome = outcome.as_str(),
+                missed_ms = observed,
+                next_due_ms = next,
+                "a window nobody was home to serve was not run, and the policy has \
+                 armed the next one"
+            ),
+            Err(err) => {
+                tracing::debug!(task = task.id, error = %err, "cannot move a task's window");
+            }
+        }
+    }
+
     /// Take the lease, do the work, record what happened.
     ///
     /// The order is not negotiable. **The claim is first and is the only
@@ -2213,6 +2386,24 @@ impl Engine {
             // one window yields two runs.
             TaskTrigger::Scheduled => Some(now_ms),
             TaskTrigger::Requested => None,
+            // THE ONE RULE, and it is stated here because here is the only place
+            // it is read (Story 58.6). A timer demands an open window exactly
+            // when an in-process host is pacing the same task — `mode ==
+            // Scheduled` — because that is the only arrangement in which two
+            // drivers can both reach one window. Both of the arrangements the
+            // shipped unit documents fall out of it:
+            //
+            //   `--mode scheduled` beside `watch`: the timer and the daemon race
+            //   for one window, `claim_task`'s single conditional UPDATE gives it
+            //   to exactly one, and the loser records nothing.
+            //
+            //   `--mode manual` with no daemon: nothing in-process paces the
+            //   task, `next_due_ms` is NULL, and demanding a window would make
+            //   the timer never fire — which is the unit's own FIRST recommended
+            //   arrangement, so breaking it would be a fix that silently removes
+            //   the configuration it was documented alongside.
+            TaskTrigger::Timer if task.mode == tasks::TaskMode::Scheduled => Some(now_ms),
+            TaskTrigger::Timer => None,
         };
         let Some(run_id) = self.with_db(|conn| {
             db::claim_task(conn, &task.id, &host, now_ms, TASK_LEASE_MS, due_at_most)
@@ -2300,7 +2491,10 @@ impl Engine {
             return Some(scheduled.map_or(retry, |at| at.min(retry)));
         }
         match trigger {
-            TaskTrigger::Scheduled => scheduled,
+            // A timer is grouped with the due-gate rather than with a request:
+            // when it claimed at all it claimed a window, so that window has been
+            // served and the next instant is computed from this run's finish.
+            TaskTrigger::Scheduled | TaskTrigger::Timer => scheduled,
             TaskTrigger::Requested => match task.next_due_ms {
                 Some(at) if at > finished_ms => Some(at),
                 _ => scheduled,
@@ -3096,8 +3290,24 @@ impl Engine {
     /// are self-limiting besides: the debouncer collapses a burst into one
     /// event per path per 500 ms, and a deadline is by construction at least
     /// `CLOSE_WRITE_SETTLE_MS` later than the observation that produced it.
+    ///
+    /// # A scheduled sync task takes reason 3, and only reason 3
+    ///
+    /// [`Self::sync_poll_permits`] is the `sync_governance` half of Story 58.8:
+    /// with a `scheduled` [`tasks::TaskKind::Sync`] row governing this folder,
+    /// the paced backstop **stands down** and the task's schedule is the folder's
+    /// clock, because leaving both running is a folder synced twice per window.
+    /// Reasons 1 and 2 are untouched — a schedule cannot own a filesystem event
+    /// (AD-141), and a governed folder must still answer a file somebody just
+    /// saved.
+    ///
+    /// It is asked **after** `scan_is_due`, and the `&&` is what makes that
+    /// affordable: the window is still advanced on every fire, and the tasks
+    /// table is read at most once per poll interval per folder rather than once
+    /// per tick. See [`Self::sync_poll_permits`] for why the declined window is
+    /// left armed rather than removed.
     fn scan_due(&self, profile: &SyncProfile) -> bool {
-        let paced = self.scan_is_due(profile);
+        let paced = self.scan_is_due(profile) && self.sync_poll_permits(profile);
         paced || self.watch_wake_pending(&profile.id) || self.settle_window_elapsed(profile)
     }
 
@@ -7864,8 +8074,14 @@ impl Engine {
     /// invisible-failure shape that state exists to close, reintroduced by the
     /// state itself. A created row clears it too, which is the forget-and-
     /// re-create path: the id is the same, the task is not.
-    pub fn save_task(&self, task: &db::TaskRow) -> Result<()> {
-        let effect = self.with_db(|conn| db::upsert_task(conn, task))?;
+    ///
+    /// `baseline_updated_ms` is the lost-update guard [`db::upsert_task`]
+    /// documents. `Some(at)` is for the one caller that writes a reading a
+    /// person took earlier — the app's edit form, through `sync_task_save` —
+    /// and `None` for every caller that reads the row and writes it back inside
+    /// one call.
+    pub fn save_task(&self, task: &db::TaskRow, baseline_updated_ms: Option<i64>) -> Result<()> {
+        let effect = self.with_db(|conn| db::upsert_task(conn, task, baseline_updated_ms))?;
         if matches!(effect, db::TaskSave::Created | db::TaskSave::Rearmed) {
             Self::lock(&self.task_faults).remove(&task.id);
         }
@@ -7913,7 +8129,11 @@ impl Engine {
     /// is not off — and [`SyncError::Busy`] when a live lease is held, which the
     /// CLI's exit taxonomy already reads as "somebody else is doing this" rather
     /// than as a failure.
-    pub async fn run_task_now(&self, id: &str) -> Result<db::TaskRunRow> {
+    pub async fn run_task_now(
+        &self,
+        id: &str,
+        driver: tasks::TaskRunDriver,
+    ) -> Result<db::TaskRunRow> {
         let Some(task) = self.with_db(|conn| db::get_task(conn, id))? else {
             return Err(SyncError::Config(format!("no such task: {id}")));
         };
@@ -7925,10 +8145,19 @@ impl Engine {
         let profiles = self.list_profiles()?;
         let now = self.platform.now_ms();
         let offset = self.platform.utc_offset_minutes();
+        let trigger = match driver {
+            tasks::TaskRunDriver::Person => TaskTrigger::Requested,
+            tasks::TaskRunDriver::Timer => TaskTrigger::Timer,
+        };
         let Some(run_id) = self
-            .claim_and_run(&task, &profiles, now, offset, TaskTrigger::Requested)
+            .claim_and_run(&task, &profiles, now, offset, trigger)
             .await?
         else {
+            // For a `Person` this is only ever a lease held elsewhere. For a
+            // `Timer` on a scheduled task it is also the ordinary "nothing is
+            // due", which is the whole fix: the CLI maps both onto its
+            // did-not-run exit code, so a wrapper cannot tell them apart and does
+            // not need to.
             return Err(SyncError::Busy(id.to_owned()));
         };
         // The run is fetched by its own id, not as "the newest": the other host
@@ -8163,6 +8392,47 @@ impl Engine {
     /// stored `off` row forbids, on exactly the machine where two hosts contend
     /// for one database.
     fn release_governance(&self, profile_id: &str) -> Result<Option<tasks::TaskMode>> {
+        self.task_governance(profile_id, tasks::TaskKind::Release)
+    }
+
+    /// Which stored `Sync` row governs this folder's **paced backstop**, if any
+    /// (Story 58.8, FR-360, AD-141).
+    ///
+    /// [`Self::release_governance`]'s twin, over the same fold, and everything
+    /// that doc says about the two tiers, about `enabled == false` reading as
+    /// [`tasks::TaskMode::Off`] rather than as absent, and about a row this build
+    /// cannot read governing nothing applies here word for word.
+    ///
+    /// One thing does **not** transpose, and it is the `Err` arm.
+    /// [`Self::release_permits`] declines on a table it could not read, because
+    /// the question there is *may I delete content*. The question here is *may I
+    /// walk a tree*, and the honest answer when `sync.db` is briefly locked by
+    /// the other host is **yes** — a poll that stopped because a read failed
+    /// would be housekeeping that stopped a folder syncing, which is the bargain
+    /// [`Self::run_due_tasks`] already refuses in the other direction. So
+    /// [`Self::sync_poll_permits`] permits on `Err`; the `Result` survives only
+    /// so that the reason can be logged.
+    fn sync_governance(&self, profile_id: &str) -> Result<Option<tasks::TaskMode>> {
+        self.task_governance(profile_id, tasks::TaskKind::Sync)
+    }
+
+    /// Which stored task row of `kind` governs this folder, if any.
+    ///
+    /// One fold for both kinds, deliberately: the tier rule (*the narrower
+    /// statement wins*), the least-permissive rule and the rank they are measured
+    /// on are the same claim about both records, and a second copy would be a
+    /// second place for them to disagree. What each kind then *does* with the
+    /// answer differs, and that lives in [`Self::release_permits`] and
+    /// [`Self::sync_poll_permits`] where the claim being made is visible.
+    ///
+    /// The `kind` filter is load-bearing in both directions: a sync task says
+    /// nothing about whether content may be deleted, and a release task says
+    /// nothing about how often a folder is walked.
+    fn task_governance(
+        &self,
+        profile_id: &str,
+        kind: tasks::TaskKind,
+    ) -> Result<Option<tasks::TaskMode>> {
         let listing = self.with_db(db::list_tasks)?;
         // Least permissive wins, so the fold is a `min` over an order
         // [`tasks::TaskMode`] deliberately does not derive: its three variants
@@ -8177,11 +8447,11 @@ impl Engine {
         let mut mine: Option<tasks::TaskMode> = None;
         let mut host_wide: Option<tasks::TaskMode> = None;
         for task in &listing.tasks {
-            if task.kind != tasks::TaskKind::Release {
+            if task.kind != kind {
                 continue;
             }
             // A row that is not live is a knob set to off, not a knob that is
-            // absent. See this method's doc.
+            // absent. See [`Self::release_governance`]'s doc.
             let mode = if task.enabled {
                 task.mode
             } else {
@@ -8201,6 +8471,116 @@ impl Engine {
         }
         // The narrower statement first.
         Ok(mine.or(host_wide))
+    }
+
+    /// Which `Sync` task mode governs this folder's paced backstop, if any —
+    /// the read Story 58.7's projection makes (Story 58.8, FR-359, FR-360).
+    ///
+    /// `Some(`[`tasks::TaskMode::Scheduled`]`)` is the one answer that changes
+    /// what a person sees: the folder's paced poll has been **surrendered** to
+    /// that task's schedule, so a projected row printing
+    /// `effective_poll_interval_ms` as this folder's cadence would state a
+    /// cadence nothing is keeping. The other two answers mean a row exists and
+    /// the poll is unchanged — see [`Self::sync_poll_permits`] for why.
+    ///
+    /// **A read error and a real `None` are the same value here, and nothing
+    /// downstream may render them as different facts.** That is not a gap: if
+    /// the table could not be read, the poll genuinely still runs, so a row
+    /// printing the poll interval is *true*. A caller that ever needs to tell
+    /// the two apart needs a second return shape rather than a guess.
+    pub fn sync_governance_mode(&self, profile_id: &str) -> Option<tasks::TaskMode> {
+        self.sync_governance(profile_id).ok().flatten()
+    }
+
+    /// Whether this folder's **paced backstop** may open a walk on this tick
+    /// (Story 58.8, FR-360, NFR-45, AD-141).
+    ///
+    /// `release_permits`' twin, and the answer AD-141 demands of any story that
+    /// puts a task row over pre-existing paced work: *"builds that twin **and
+    /// surrenders the existing gate in the same change**; adding a driver
+    /// without surrendering the gate ships a folder that syncs twice."*
+    ///
+    /// The whole table, exhaustive and with no `_` arm:
+    ///
+    /// * `None` — no sync task governs this folder: **today's behaviour,
+    ///   unchanged**, and the arm an un-migrated `sync.db` takes.
+    /// * `Some(Off)` — the poll is **unchanged**. This is where this table
+    ///   diverges from [`Self::release_permits`]'s, and the divergence is the
+    ///   point: `off` on a release row stops the *only* driver of optional
+    ///   housekeeping, while the sync poll is the folder's basic function,
+    ///   switched on by adding the folder and paused by `profile.enabled`. Read
+    ///   as a pause, one forgotten `off` row would silently stop a folder
+    ///   syncing that nobody asked to stop, and it would duplicate a control
+    ///   that already exists and is visible.
+    /// * `Some(Manual)` — the poll is **unchanged**, for the same reason: a
+    ///   manual sync task adds a button, and a button takes nothing away.
+    /// * `Some(Scheduled)` — the paced backstop **stands down** and the task's
+    ///   schedule becomes this folder's clock. Anything else would leave the
+    ///   15 s pacing running underneath the schedule: the folder synced twice in
+    ///   one window, and a run row claiming *"1 synced"* for work the supervisor
+    ///   would have done anyway.
+    ///
+    /// # What keeps working, and why it is not the whole of `scan_due`
+    ///
+    /// Only the *paced* trigger is surrendered. [`Self::scan_due`] is
+    /// `paced || watch_wake_pending || settle_window_elapsed`, and AD-141 settles
+    /// the other two by name — *"two of its three triggers are filesystem events
+    /// a schedule cannot own"*. Standing them down as well would make a folder
+    /// with an hourly task feel **dead** to somebody who had just saved a file:
+    /// AD-34-11's low-latency path gone, and a settling file waiting out an hour
+    /// instead of its own window. So this is [`Self::release_permits`]' sentence
+    /// transposed rather than contradicted — *the schedule drives it **and** the
+    /// filesystem events keep working*.
+    ///
+    /// The journal drain is untouched too: [`Self::tick_profile`] still calls
+    /// [`Self::drain_journal`] every tick, with `scan_when_idle = false`. What
+    /// stands down is the walk that **discovers** new work, never the draining of
+    /// work already queued — standing that down would strand an in-flight upload
+    /// behind a schedule.
+    ///
+    /// # An unreadable table permits the poll, which is the opposite answer
+    ///
+    /// [`Self::release_permits`] declines on `Err` because the honest answer to
+    /// *may I delete content* under an unreadable instruction is no. Here the
+    /// question is *may I walk a tree*, and the rule this tree already states
+    /// applies unchanged: *housekeeping that could stop a folder syncing would be
+    /// a far worse bargain than housekeeping that occasionally does not happen*
+    /// ([`Self::run_due_tasks`]). A poll suppressed because the other host held a
+    /// write lock for a moment would be exactly that bargain, taken the wrong
+    /// way round.
+    ///
+    /// # Nothing is `remove`d, unlike the release window
+    ///
+    /// [`Self::scan_is_due`] is asked **first** and arms unconditionally, so this
+    /// is consulted only on the tick the paced window actually fired: the
+    /// `list_tasks` read costs one query per poll interval per folder rather than
+    /// one per 1 Hz tick, and a declined folder re-asks its governance at that
+    /// same cadence. When the governance stops applying — the task forgotten, or
+    /// moved to `manual` — the armed window is already at or behind `now`, so the
+    /// very next tick walks. That is [`Self::scan_is_due`]'s own first-sight
+    /// promise, reached without a `remove`, and it is why
+    /// [`Self::forget_release_window`]'s idiom is deliberately not copied here:
+    /// that `remove` exists so re-enabling a sweep cannot delete immediately, and
+    /// a walk deletes nothing.
+    fn sync_poll_permits(&self, profile: &SyncProfile) -> bool {
+        let governance = match self.sync_governance(&profile.id) {
+            Ok(governance) => governance,
+            Err(err) => {
+                tracing::debug!(
+                    profile = profile.name,
+                    error = %err,
+                    "cannot read this host's tasks, so the paced poll keeps running rather \
+                     than stopping a folder because a read failed",
+                );
+                return true;
+            }
+        };
+        match governance {
+            None => true,
+            Some(tasks::TaskMode::Off) => true,
+            Some(tasks::TaskMode::Manual) => true,
+            Some(tasks::TaskMode::Scheduled) => false,
+        }
     }
 
     /// Whether a release pass may proceed on this folder, given who is asking
@@ -12708,6 +13088,7 @@ mod tests {
             updated_ms: 0,
             running_host: None,
             lease_until_ms: None,
+            on_missed: tasks::TaskMissedPolicy::RunNow,
         }
     }
 
@@ -12735,7 +13116,7 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01TICK", None, "every 5m"))
+            .save_task(&task("01TICK", None, "every 5m"), None)
             .expect("a five-minute schedule is savable");
 
         // First sight arms and declines: creating a task is not running it.
@@ -12819,7 +13200,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01BUSY", Some(&p.id), "every 5m"))
+            .save_task(&task("01BUSY", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -12863,7 +13244,7 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01NOW", None, "every 5m"))
+            .save_task(&task("01NOW", None, "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         let armed = engine
@@ -12879,7 +13260,10 @@ mod tests {
         // nothing else.
         platform.advance_ms(60_000);
 
-        let run = engine.run_task_now("01NOW").await.expect("a requested run");
+        let run = engine
+            .run_task_now("01NOW", tasks::TaskRunDriver::Person)
+            .await
+            .expect("a requested run");
         assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
         assert!(
             run.host.contains('#'),
@@ -12975,14 +13359,17 @@ mod tests {
         };
         let mut off = task("01OFF", None, "@daily");
         off.mode = tasks::TaskMode::Off;
-        engine.save_task(&off).expect("save");
+        engine.save_task(&off, None).expect("save");
         let mut disabled = task("01DIS", None, "@daily");
         disabled.enabled = false;
-        engine.save_task(&disabled).expect("save");
+        engine.save_task(&disabled, None).expect("save");
 
         for id in ["01OFF", "01DIS", "01NOSUCHTASK"] {
             assert!(
-                matches!(engine.run_task_now(id).await, Err(SyncError::Config(_))),
+                matches!(
+                    engine.run_task_now(id, tasks::TaskRunDriver::Person).await,
+                    Err(SyncError::Config(_))
+                ),
                 "{id} must refuse by type, not fail silently"
             );
         }
@@ -13013,7 +13400,7 @@ mod tests {
         };
         for expression in ["every 30s", "0 3 * *", "@yearly"] {
             let err = engine
-                .save_task(&task("01BAD", None, expression))
+                .save_task(&task("01BAD", None, expression), None)
                 .expect_err("refused");
             assert!(
                 matches!(err, SyncError::Config(_)),
@@ -13044,7 +13431,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01RETRY", Some(&p.id), "@daily"))
+            .save_task(&task("01RETRY", Some(&p.id), "@daily"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -13103,7 +13490,7 @@ mod tests {
         p.enabled = false;
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01PAUSED", Some(&p.id), "every 5m"))
+            .save_task(&task("01PAUSED", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -13134,7 +13521,7 @@ mod tests {
         // reads as one.
         engine.forget_task("01PAUSED").expect("forget");
         engine
-            .save_task(&task("01GONE", Some("01NOSUCHPROFILE"), "every 5m"))
+            .save_task(&task("01GONE", Some("01NOSUCHPROFILE"), "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         platform.advance_ms(300_000);
@@ -13154,14 +13541,14 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01OPEN", None, "every 5m"))
+            .save_task(&task("01OPEN", None, "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         // Past the window, without a tick to serve it.
         platform.advance_ms(400_000);
 
         engine
-            .run_task_now("01OPEN")
+            .run_task_now("01OPEN", tasks::TaskRunDriver::Person)
             .await
             .expect("a requested run");
         let _ = engine.tick().await;
@@ -13169,6 +13556,722 @@ mod tests {
             engine.task_history("01OPEN", 10).expect("history").len(),
             1,
             "the request served the open window, so the tick after it has nothing to do"
+        );
+    }
+
+    /// [`task`] under one of the two non-default missed-window policies.
+    fn task_on_missed(id: &str, schedule: &str, on_missed: tasks::TaskMissedPolicy) -> db::TaskRow {
+        db::TaskRow {
+            on_missed,
+            ..task(id, None, schedule)
+        }
+    }
+
+    /// AD-138 and NFR-44, asserted where the risk actually is: through the
+    /// store, the claim and the run loop, with **real elapsed time** driven
+    /// through the platform clock rather than one hand-set `next_due_ms`.
+    ///
+    /// A hand-set window would prove only that `decide` compares two integers,
+    /// which `tasks.rs` already asserts. What has to be proved here is that two
+    /// hundred windows of absence, followed by ticks, produce **one** run — and
+    /// that after that run the ticks stop producing them, because the next
+    /// window is computed from the finish and not from any of the instants that
+    /// went by.
+    #[tokio::test]
+    async fn a_host_absent_across_two_hundred_windows_runs_the_task_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01MANY", None, "every 5m"), None)
+            .expect("save");
+        // First sight arms and declines, so the window this test is about is one
+        // the engine itself computed.
+        let _ = engine.tick().await;
+
+        // Two hundred windows with nobody home. No tick, because a host that is
+        // not there does not tick — which is the whole premise.
+        platform.advance_ms(200 * 300_000);
+
+        // And now it comes back. Ten ticks, because the claim is what has to
+        // decline the nine that follow the first.
+        for _ in 0..10 {
+            let _ = engine.tick().await;
+        }
+        assert_eq!(
+            engine.task_history("01MANY", 250).expect("history").len(),
+            1,
+            "one run for two hundred missed windows — not two hundred, and not \
+             one per tick either"
+        );
+
+        // The next window was computed from the finish, so it is ahead of the
+        // clock and the ticks inside it are not runs.
+        let armed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+        assert!(
+            armed > platform.now_ms(),
+            "the catch-up run overwrote the window rather than working through a \
+             backlog of them"
+        );
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01MANY", 250).expect("history").len(),
+            2,
+            "and the cadence resumes at one run per window"
+        );
+    }
+
+    /// `skip` declines the window nobody served, re-arms **forward**, and runs
+    /// nothing (Story 58.4).
+    ///
+    /// The forward half is the claim that matters and it is asserted as an
+    /// instant rather than as an absence: returning `Action::None` would also
+    /// have produced zero runs here, and would have left the same past window on
+    /// the row to be decided about again on the very next tick, forever. So the
+    /// assertion is that the *next decision is about a different window*.
+    #[tokio::test]
+    async fn a_skipped_window_is_declined_forward_and_the_task_runs_on_the_next_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01SKIP", "every 5m", tasks::TaskMissedPolicy::Skip),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let missed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        // Two hundred windows of absence, well past the grace.
+        platform.advance_ms(200 * 300_000);
+        for _ in 0..5 {
+            let _ = engine.tick().await;
+        }
+        let declined = engine.task_history("01SKIP", 250).expect("history");
+        assert_eq!(
+            declined.len(),
+            1,
+            "five ticks over two hundred missed windows decline ONE of them — \
+             the policy governs a window, it does not enumerate them"
+        );
+        assert_eq!(
+            declined[0].outcome,
+            Some(tasks::TaskOutcome::Declined),
+            "and the one row says the window was declined rather than run \
+             (Story 58.5): before that outcome existed this assertion could only \
+             have been about an absence, and an absence is what the invisible \
+             non-execution this feature closes looks like"
+        );
+        let rearmed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("still armed");
+        assert!(
+            rearmed > missed && rearmed > platform.now_ms(),
+            "the next decision must be about a LATER window than the one \
+             declined: {rearmed} against a declined {missed} and a clock at {}",
+            platform.now_ms()
+        );
+
+        // And the task is not broken by having skipped: the next window runs.
+        platform.advance_ms(rearmed - platform.now_ms());
+        let _ = engine.tick().await;
+        let after = engine.task_history("01SKIP", 10).expect("history");
+        assert_eq!(
+            after.len(),
+            2,
+            "`skip` declines a window nobody served, not the schedule"
+        );
+        assert_eq!(
+            after[0].outcome,
+            Some(tasks::TaskOutcome::Ok),
+            "and the newest row is the run, so a reader's 'last run' is the run \
+             and not the decline that preceded it"
+        );
+    }
+
+    /// A declined window **moves the last-run line**, which is the whole point
+    /// of Story 58.5.
+    ///
+    /// The state this closes is the one the feature's single load-bearing `warn`
+    /// is about: a row that reports itself enabled and scheduled while nothing
+    /// ever runs. With `skip` and no record, that is exactly what a `skip` task
+    /// looked like from every surface — `tasks status`, the Tasks view, the run
+    /// list — for as long as its host kept missing windows.
+    ///
+    /// Asserted through `task_history`'s newest row, because that is precisely
+    /// what `sync_tasks` projects onto `TaskVm.lastRun` and what the CLI's
+    /// `last:` line reads.
+    #[tokio::test]
+    async fn a_declined_window_moves_the_last_run_line_instead_of_going_quiet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01QUIET", "every 5m", tasks::TaskMissedPolicy::Skip),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let missed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        // The state before: enabled, scheduled, and never run. Both facts, so
+        // the assertion after the skip is about a change rather than a value.
+        let before = engine.tasks().expect("tasks").tasks.first().cloned();
+        assert!(before.is_some_and(|row| row.enabled));
+        assert!(
+            engine
+                .task_history("01QUIET", 1)
+                .expect("history")
+                .is_empty(),
+            "never run"
+        );
+
+        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS + 300_000);
+        let _ = engine.tick().await;
+
+        let last = engine.task_history("01QUIET", 1).expect("history");
+        assert_eq!(last.len(), 1, "the last-run line has something to say now");
+        assert_eq!(last[0].outcome, Some(tasks::TaskOutcome::Declined));
+        assert_eq!(
+            last[0].finished_ms,
+            Some(last[0].started_ms),
+            "closed and zero-duration: nothing ran, and that is the honest length"
+        );
+        assert!(
+            last[0].detail.as_deref().is_some_and(
+                |detail| detail.contains("skip") && detail.contains(&missed.to_string())
+            ),
+            "and the detail names the policy that declined and the instant it \
+             declined, which is what makes the row actionable rather than merely \
+             present: {:?}",
+            last[0].detail
+        );
+        assert!(
+            last[0].host.contains('#'),
+            "named to the keeper that took the decision — two machines share \
+             this record — while the task row keeps no lease at all"
+        );
+        let row = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(row.running_host, None);
+        assert_eq!(row.lease_until_ms, None);
+    }
+
+    /// `delay` holds a **missed** window back to `noticed + delay`, serves it
+    /// once, and is genuinely distinct from both siblings (Story 58.4, AD-139).
+    ///
+    /// This is the assertion the first draft of the story could not make. With
+    /// the delay anchored on `next_due_ms`, an hourly task whose host returned
+    /// two hours late had `next_due_ms + delay` an hour in the past, so `delay`
+    /// ran the window immediately and was indistinguishable from `run_now` — two
+    /// of the owner's three options collapsing into one, in exactly the scenario
+    /// he described. So the anchor is the instant a host **noticed**, and the
+    /// test drives that scenario rather than a convenient one.
+    #[tokio::test]
+    async fn a_delayed_window_is_held_back_from_when_it_was_noticed_and_then_runs_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01WAIT", "@hourly", tasks::TaskMissedPolicy::Delay),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let missed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        // The owner's scenario, literally: an hourly task, and a host back two
+        // hours after the window opened.
+        platform.advance_ms(missed + 2 * 3_600_000 - platform.now_ms());
+        let noticed = platform.now_ms();
+        let _ = engine.tick().await;
+
+        assert!(
+            engine.task_history("01WAIT", 10).expect("history").len() == 1,
+            "the tick that noticed recorded the postponement and ran nothing"
+        );
+        let held = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(
+            held.next_due_ms,
+            Some(noticed + tasks::TASK_MISSED_DELAY_MS),
+            "anchored on the noticing, not on the window: a window already two \
+             hours old is past any instant derived from itself, which is what \
+             made the first draft of this option identical to run_now"
+        );
+        assert!(
+            held.next_due_ms.is_some_and(|at| at > platform.now_ms()),
+            "and it is in the FUTURE, so `claim_task`'s `next_due_ms <= now` \
+             condition now correctly refuses the run for the length of the delay \
+             — the arbiter holds it back rather than something beside the arbiter"
+        );
+
+        // Ticks throughout the delay run nothing, and — the property a
+        // `decide`-side wait could not have offered — a host that restarts
+        // inside the delay still respects it, because the instant is on the row.
+        platform.advance_ms(tasks::TASK_MISSED_DELAY_MS - 1_000);
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        assert_eq!(
+            engine.task_history("01WAIT", 10).expect("history").len(),
+            1,
+            "still only the postponement: nothing has run"
+        );
+        let Ok(restarted) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let _ = restarted.tick().await;
+        assert_eq!(
+            restarted.task_history("01WAIT", 10).expect("history").len(),
+            1,
+            "a fresh engine reads the stored instant and honours the remaining \
+             delay rather than starting one of its own"
+        );
+
+        // And then it runs. Once.
+        platform.advance_ms(2_000);
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        let runs = engine.task_history("01WAIT", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            2,
+            "the postponement, then the run it was holding back — and only one \
+             run, however many ticks follow (AD-138)"
+        );
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Ok),
+            "the newest row is the run, so `delay` really does serve the window \
+             rather than dropping it — which is the whole difference from `skip`"
+        );
+        assert_eq!(runs[1].outcome, Some(tasks::TaskOutcome::Postponed));
+    }
+
+    /// A postponement is a **recorded, readable** fact, and it is not the same
+    /// fact as a decline (Story 58.5, AD-140).
+    ///
+    /// Main's second follow-up, and the reason it matters: during the delay a
+    /// person looking at ⌘8 must be able to tell *held back by policy* from
+    /// *nothing happened*. Those two states looked identical while the wait lived
+    /// in `decide`, because nothing was written.
+    #[tokio::test]
+    async fn a_postponement_is_readable_and_says_the_run_is_still_coming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01HELD", "every 5m", tasks::TaskMissedPolicy::Delay),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let missed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS + 300_000);
+        let _ = engine.tick().await;
+
+        let last = engine.task_history("01HELD", 1).expect("history");
+        assert_eq!(last.len(), 1, "the last-run line has something to say");
+        let held = &last[0];
+        assert_eq!(held.outcome, Some(tasks::TaskOutcome::Postponed));
+        assert_ne!(
+            held.outcome,
+            Some(tasks::TaskOutcome::Declined),
+            "and it is NOT a decline: a declined window will never be served, a \
+             postponed one will, and telling somebody their nightly sweep was \
+             dropped when it was only held back is the confusion this separation \
+             exists to prevent"
+        );
+        assert_eq!(
+            held.finished_ms,
+            Some(held.started_ms),
+            "closed and zero-duration: nothing ran"
+        );
+        let detail = held.detail.clone().expect("a detail");
+        assert!(
+            detail.contains("delay") && detail.contains(&missed.to_string()),
+            "the detail names the policy and the window it is about: {detail}"
+        );
+        assert!(
+            detail.contains("will be run"),
+            "and says the run is still coming, which is the one fact that \
+             separates this row from a declined one to a person reading it: \
+             {detail}"
+        );
+        let row = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(row.running_host, None, "no lease was taken");
+        assert!(
+            row.next_due_ms.is_some_and(|at| at > platform.now_ms()),
+            "and the row's next-due has moved forward, so the pane's own \
+             next-due line is legible during the delay without a second surface"
+        );
+    }
+
+    /// A hand-run **during** a postponement runs at once, and does not silently
+    /// become the postponed run (Story 58.4).
+    ///
+    /// This is the epic's own acceptance sentence, and with the delay anchored on
+    /// the noticing it is now literally true rather than approximately true. The
+    /// request must not be blocked, deferred or relabelled — a request never
+    /// passes through `decide` — and the postponed run still happens afterwards,
+    /// because the postponed instant is in the future and
+    /// `Engine::next_task_window` preserves a future window for exactly the
+    /// documented reason: *asking for a run now is not asking to skip the next
+    /// one*.
+    ///
+    /// NFR-44 is untouched by that second run: it forbids a **policy**
+    /// enumerating missed windows, and there is still exactly one postponement
+    /// for one missed window. The extra run is one a person asked for by hand.
+    #[tokio::test]
+    async fn a_hand_run_during_a_postponement_runs_at_once_and_does_not_consume_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01ASK", "every 5m", tasks::TaskMissedPolicy::Delay),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+
+        // Missed, then noticed: the tick records the postponement and moves the
+        // window into the future.
+        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS + 300_000);
+        let _ = engine.tick().await;
+        let held = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("held");
+        assert!(held > platform.now_ms(), "we are inside the delay");
+
+        // A person asks, inside the delay. It runs, immediately, and is recorded
+        // as its own run rather than as the one being held back.
+        let run = engine
+            .run_task_now("01ASK", tasks::TaskRunDriver::Person)
+            .await
+            .expect("a person asking is not asking about a window");
+        assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("row")
+                .next_due_ms,
+            Some(held),
+            "and the postponed instant is untouched: the request was not \
+             converted into the delayed run"
+        );
+
+        // Then the delay elapses and the held run happens, once.
+        platform.advance_ms(held - platform.now_ms());
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        let runs = engine.task_history("01ASK", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            3,
+            "the postponement, the hand-run, and the held run — and only one \
+             postponement for the one missed window, which is what NFR-44 is \
+             about: {runs:?}"
+        );
+        assert_eq!(
+            runs.iter()
+                .filter(|r| r.outcome == Some(tasks::TaskOutcome::Postponed))
+                .count(),
+            1
+        );
+    }
+
+    /// **One missed window, two drivers, one run** (Story 58.6, FR-358).
+    ///
+    /// The defect this story exists to close, and the epic is explicit that a
+    /// straight copy of 57.2's test would miss it: that one proves two
+    /// *connections* cannot share one lease. This is **one host, two triggers**.
+    /// Story 57.7's `Persistent=true` timer fires `tasks run` at boot with no
+    /// ordering against `keeper-syncd watch` reaching its first tick, and before
+    /// this fix the timer's run claimed with `due_at_most: None` — bypassing
+    /// `db::claim_task`'s window condition entirely — while the daemon's tick
+    /// claimed the same past window as `Scheduled`. Both succeeded.
+    ///
+    /// Driven in the order the boot actually produces: the timer first, because
+    /// `Persistent=true` fires before a freshly started daemon has ticked.
+    #[tokio::test]
+    async fn one_missed_window_and_both_drivers_yield_exactly_one_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01BOTH", None, "@hourly"), None)
+            .expect("save");
+        let _ = engine.tick().await;
+        let window = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        // The machine was off across the window and has just come back.
+        platform.advance_ms(window + 60_000 - platform.now_ms());
+
+        // THE ORDER MATTERS, and this is the one that reveals the defect. The
+        // daemon's tick gets there first, serves the missed window and moves it
+        // forward; the timer then fires with no ordering against that tick,
+        // because `Persistent=true` and `keeper-syncd watch` know nothing about
+        // each other. Before this story the timer's run passed
+        // `due_at_most: None` and so claimed anyway, on a window that had already
+        // been served — one missed window, two runs.
+        //
+        // (The reverse order was ALSO asserted while this test was being written
+        // and it passes with or without the fix, because `next_task_window` moves
+        // the window on the first run whichever driver made it. An assertion that
+        // holds under the mutation proves nothing, so the order below is the
+        // whole test.)
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01BOTH", 20).expect("history").len(),
+            1,
+            "the daemon served the missed window"
+        );
+        let served = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("re-armed");
+        assert!(served > platform.now_ms(), "and moved it forward");
+
+        // Now the timer, as the shipped unit invokes it.
+        let refused = engine
+            .run_task_now("01BOTH", tasks::TaskRunDriver::Timer)
+            .await
+            .expect_err("no window is open for a scheduled driver to claim");
+        assert!(
+            matches!(refused, SyncError::Busy(_)),
+            "declined as a deferral, which the CLI maps onto exit 4 — the work \
+             did not happen and nothing is wrong: {refused}"
+        );
+
+        let runs = engine.task_history("01BOTH", 20).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "ONE missed window, ONE run. Before this story the timer's request \
+             bypassed `claim_task`'s window condition and this was 2: {runs:?}"
+        );
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("row")
+                .next_due_ms,
+            Some(served),
+            "and the declined claim moved nothing"
+        );
+    }
+
+    /// The other half, and the half a careless fix breaks: **a hand-run with
+    /// nothing due still runs** (Story 58.6).
+    ///
+    /// `due_at_most: None` exists for this, and its own doc says why — *a person
+    /// asking is not asking about a window*. The fix may not turn *run it now*
+    /// into *run it if due*, so the two drivers are asserted side by side on the
+    /// same closed window: the person runs, the timer does not.
+    #[tokio::test]
+    async fn a_hand_run_with_nothing_due_still_runs_and_a_timer_does_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01BYHAND", None, "@daily"), None)
+            .expect("save");
+        let _ = engine.tick().await;
+        let armed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+        assert!(armed > platform.now_ms(), "nothing is due");
+
+        // A person, on a task whose window is hours away.
+        let run = engine
+            .run_task_now("01BYHAND", tasks::TaskRunDriver::Person)
+            .await
+            .expect("a person asking is not asking about a window");
+        assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("row")
+                .next_due_ms,
+            Some(armed),
+            "and asking for a run now is not asking to skip tonight's"
+        );
+
+        // The same closed window, asked by a timer on a scheduled task: refused,
+        // because an in-process host is pacing this task and the timer must not
+        // add a second cadence to it.
+        let refused = engine
+            .run_task_now("01BYHAND", tasks::TaskRunDriver::Timer)
+            .await
+            .expect_err("no window is open for a scheduled driver to claim");
+        assert!(
+            matches!(refused, SyncError::Busy(_)),
+            "reported as a deferral rather than a fault, which is what the CLI \
+             maps onto exit 4: {refused}"
+        );
+        assert_eq!(
+            engine.task_history("01BYHAND", 10).expect("history").len(),
+            1,
+            "the person's run, and nothing from the timer"
+        );
+    }
+
+    /// The timer-only arrangement the shipped unit recommends FIRST keeps
+    /// working: `--mode manual`, no daemon, so the timer **is** the schedule
+    /// (Story 58.6).
+    ///
+    /// This is the case a naive fix silently removes. A manual task has
+    /// `next_due_ms IS NULL`, so a timer that demanded an open window
+    /// unconditionally would never fire — and the unit's header tells operators
+    /// to prefer exactly this arrangement.
+    #[tokio::test]
+    async fn a_timer_is_the_whole_schedule_when_nothing_in_process_paces_the_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut manual = task("01TIMERONLY", None, "@daily");
+        manual.mode = tasks::TaskMode::Manual;
+        engine.save_task(&manual, None).expect("save");
+
+        // Nothing arms a manual task, so there is no window at all.
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("row")
+                .next_due_ms,
+            None,
+            "a manual task's schedule is remembered, not obeyed"
+        );
+
+        let run = engine
+            .run_task_now("01TIMERONLY", tasks::TaskRunDriver::Timer)
+            .await
+            .expect("the timer is this task's only cadence, so it claims");
+        assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            engine
+                .task_history("01TIMERONLY", 10)
+                .expect("history")
+                .len(),
+            1
         );
     }
 
@@ -13184,7 +14287,7 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01TERM", None, "every 5m"))
+            .save_task(&task("01TERM", None, "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         // Claim it and abandon the run, as a killed process does.
@@ -13230,7 +14333,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01FAIL", Some(&p.id), "every 5m"))
+            .save_task(&task("01FAIL", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -13272,7 +14375,7 @@ mod tests {
         p.volume_id = Some("01NOSUCHVOLUME".to_owned());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01ABSENT", Some(&p.id), "every 5m"))
+            .save_task(&task("01ABSENT", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -13410,14 +14513,14 @@ mod tests {
                 .count()
         };
 
-        engine.save_task(&row).expect("save");
+        engine.save_task(&row, None).expect("save");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(toasts(), 1, "the first failure is an onset");
 
         // Leg 1: forget and re-create. The id is the same; the task is not, and
         // a brand-new record's first failure must never be silent.
         engine.forget_task("01BACK").expect("forget");
-        engine.save_task(&row).expect("re-create");
+        engine.save_task(&row, None).expect("re-create");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(
             toasts(),
@@ -13429,8 +14532,8 @@ mod tests {
         // `db::upsert_task` already treats as a fresh arming.
         let mut disabled = row.clone();
         disabled.enabled = false;
-        engine.save_task(&disabled).expect("disable");
-        engine.save_task(&row).expect("enable");
+        engine.save_task(&disabled, None).expect("disable");
+        engine.save_task(&row, None).expect("enable");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(
             toasts(),
@@ -13441,8 +14544,8 @@ mod tests {
         // Leg 3: the mode edge, with the schedule text unmoved.
         let mut manual = row.clone();
         manual.mode = tasks::TaskMode::Manual;
-        engine.save_task(&manual).expect("to manual");
-        engine.save_task(&row).expect("back to scheduled");
+        engine.save_task(&manual, None).expect("to manual");
+        engine.save_task(&row, None).expect("back to scheduled");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(toasts(), 4, "and so does one put back on its schedule");
 
@@ -13450,7 +14553,7 @@ mod tests {
         // rather than on "a save happened": an idle re-save is not a recovery,
         // so it must not re-arm the alarm and let an hour of failures notify
         // once per save.
-        engine.save_task(&row).expect("an identical save");
+        engine.save_task(&row, None).expect("an identical save");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(
             toasts(),
@@ -13476,7 +14579,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01STORM", Some(&p.id), "every 5m"))
+            .save_task(&task("01STORM", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         // Twelve windows is an hour of a `every 5m` task, each one served by one
@@ -13529,7 +14632,7 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01QUIT", None, "every 5m"))
+            .save_task(&task("01QUIT", None, "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
 
@@ -13617,7 +14720,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01MIDRUN", Some(&p.id), "every 5m"))
+            .save_task(&task("01MIDRUN", Some(&p.id), "every 5m"), None)
             .expect("save");
         // First sight arms the window and declines; the next tick is the one
         // that claims and runs.
@@ -13718,7 +14821,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01FASTRUN", Some(&p.id), "every 5m"))
+            .save_task(&task("01FASTRUN", Some(&p.id), "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         inner.advance_ms(300_000);
@@ -13800,7 +14903,7 @@ mod tests {
         // records from governing each other.
         let mut sync_off = task("01SYNCOFF", None, "@daily");
         sync_off.mode = tasks::TaskMode::Off;
-        engine.save_task(&sync_off).expect("save");
+        engine.save_task(&sync_off, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13813,7 +14916,7 @@ mod tests {
         // folder. Read as host-wide it would switch this one's sweep off.
         let mut elsewhere = release_task("01ELSEWHERE", Some("01JOTHERFOLDER"), "@daily");
         elsewhere.mode = tasks::TaskMode::Off;
-        engine.save_task(&elsewhere).expect("save");
+        engine.save_task(&elsewhere, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13827,7 +14930,7 @@ mod tests {
         // precedence is not a second safety rule.
         let mut host_wide = release_task("01HOSTOFF", None, "@daily");
         host_wide.mode = tasks::TaskMode::Off;
-        engine.save_task(&host_wide).expect("save");
+        engine.save_task(&host_wide, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13837,7 +14940,7 @@ mod tests {
         );
         let mut mine = release_task("01MINE", Some(&p.id), "@daily");
         mine.mode = tasks::TaskMode::Scheduled;
-        engine.save_task(&mine).expect("save");
+        engine.save_task(&mine, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13850,7 +14953,7 @@ mod tests {
         // not be what decides.
         let mut also_mine = release_task("01ALSOMINE", Some(&p.id), "@daily");
         also_mine.mode = tasks::TaskMode::Manual;
-        engine.save_task(&also_mine).expect("save");
+        engine.save_task(&also_mine, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13865,7 +14968,7 @@ mod tests {
         // handed straight back to the hourly success-edge sweep — the opposite
         // of what switching a task off means to whoever switched it off.
         also_mine.enabled = false;
-        engine.save_task(&also_mine).expect("save");
+        engine.save_task(&also_mine, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13940,7 +15043,7 @@ mod tests {
             (tasks::TaskMode::Scheduled, true, true),
         ] {
             row.mode = mode;
-            engine.save_task(&row).expect("save");
+            engine.save_task(&row, None).expect("save");
             assert_eq!(
                 engine.release_permits(&p, ReleaseTrigger::SuccessEdge),
                 on_edge,
@@ -13954,6 +15057,377 @@ mod tests {
                 mode.as_str()
             );
         }
+    }
+
+    /// Which sync row governs a folder's paced backstop, over every case that
+    /// can disagree (Story 58.8, FR-360).
+    ///
+    /// [`Engine::release_governance`]'s test, mirrored, because the two now share
+    /// one fold and the mirror is what proves the `kind` filter still separates
+    /// them in **both** directions: a release task must say nothing about how
+    /// often a folder is walked, exactly as a sync task says nothing about
+    /// whether content may be deleted.
+    #[test]
+    fn a_folders_sync_governance_is_the_narrowest_row_and_the_least_permissive_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "no rows at all is the un-migrated database, and it has to read as \
+             `the folder polls exactly as it did` rather than as anything new"
+        );
+
+        // The mirror of the release test's first case, and the half that was
+        // untestable until the fold was shared.
+        let mut release_scheduled = release_task("01RELSCHED", Some(&p.id), "@daily");
+        release_scheduled.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&release_scheduled, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "a release task says nothing about how often a folder is walked"
+        );
+
+        // Another folder's row is a decision about another folder. Read as
+        // host-wide it would stand THIS folder's poll down.
+        let mut elsewhere = task("01ELSEWHERE", Some("01JOTHERFOLDER"), "@daily");
+        elsewhere.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&elsewhere, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "another folder's row governs another folder"
+        );
+
+        // Host-wide, then the folder's own — which wins even though it is the
+        // LESS permissive of the two here, because narrower is more specific and
+        // precedence is not a second safety rule.
+        let mut host_wide = task("01HOSTSCHED", None, "@daily");
+        host_wide.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&host_wide, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Scheduled),
+            "a host-wide row is the default every folder takes"
+        );
+        let mut mine = task("01MINE", Some(&p.id), "@daily");
+        mine.mode = tasks::TaskMode::Manual;
+        engine.save_task(&mine, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Manual),
+            "and a row naming this folder beats the host's default"
+        );
+
+        // Two rows in the SAME tier, and the order they were written in must not
+        // be what decides.
+        let mut also_mine = task("01ALSOMINE", Some(&p.id), "@daily");
+        also_mine.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&also_mine, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Manual),
+            "the least permissive of two rows in one tier is what the fold answers"
+        );
+
+        // `enabled = 0` is a knob set to off, not a knob that is absent.
+        mine.enabled = false;
+        engine.save_task(&mine, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Off),
+            "a row that is not live must not leave a knob that does nothing"
+        );
+
+        // A row a newer keeper wrote governs nothing, and the fallback is
+        // TODAY's pacing rather than a new one (NFR-43). The other reading —
+        // an unreadable row stands the poll down — would let one bad row
+        // silently stop a folder syncing.
+        for id in ["01MINE", "01ALSOMINE", "01HOSTSCHED"] {
+            engine.forget_task(id).expect("forget");
+        }
+        engine
+            .with_db(|conn| {
+                // Past the typed door on purpose: `save_task` takes a `TaskKind`,
+                // so raw SQL is the only way such a row exists — which is what a
+                // newer keeper writing this file looks like.
+                conn.execute(
+                    "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms,
+                                        enabled, updated_ms)
+                     VALUES ('01TEL', ?1, 'sync', 'every 5m', 'teleport', 0, 1, 0)",
+                    [&p.id],
+                )?;
+                Ok(())
+            })
+            .expect("a row written past the typed door");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "one row this build cannot read must not be able to stop a folder polling"
+        );
+    }
+
+    /// The poll table, arm by arm, with no arm left to inference (Story 58.8,
+    /// FR-360, AD-141).
+    ///
+    /// The two `true` arms are the ones worth a test rather than a comment:
+    /// `off` and `manual` on a **sync** row leave the folder's pacing alone,
+    /// where the same two modes on a **release** row stop the sweep. A sync
+    /// task is a schedule; a folder's pause is `profile.enabled`, and one
+    /// forgotten `off` row must not be able to stop a folder syncing.
+    #[test]
+    fn sync_poll_permits_answers_every_mode_the_table_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert!(
+            engine.sync_poll_permits(&p),
+            "(None): no row governs, so the folder polls exactly as it did"
+        );
+
+        let mut row = task("01GOV", Some(&p.id), "@daily");
+        for (mode, permitted) in [
+            (tasks::TaskMode::Off, true),
+            (tasks::TaskMode::Manual, true),
+            (tasks::TaskMode::Scheduled, false),
+        ] {
+            row.mode = mode;
+            engine.save_task(&row, None).expect("save");
+            assert_eq!(
+                engine.sync_poll_permits(&p),
+                permitted,
+                "Some({})",
+                mode.as_str()
+            );
+            assert_eq!(
+                engine.sync_governance_mode(&p.id),
+                Some(mode),
+                "and the projection reads the same verdict Story 58.7 renders"
+            );
+        }
+    }
+
+    /// One window, one driver: a folder with a `scheduled` sync task is not also
+    /// polled underneath it (Story 58.8, FR-360, NFR-45, AD-141).
+    ///
+    /// Driven through the real pacing rather than by asking one function. The
+    /// loop is the shape of both hosts: [`Engine::run_due_tasks`]' gate, first
+    /// sight arm, claim and close for the task half, and
+    /// [`Engine::tick_profile`]'s [`Engine::scan_due`] for the supervisor half.
+    /// Only `perform_task` is elided, because the quantity under test is
+    /// **drivers**, not bytes.
+    ///
+    /// The two phases are the before and after of AD-141's rule. With no sync
+    /// row the folder keeps its 240 paced walks an hour and nothing else — the
+    /// arm an un-migrated `sync.db` takes. With a `scheduled` row it gets the
+    /// task's windows and **no** paced walk: before this story that second phase
+    /// counted 240 walks *and* the task's full passes, which is the duplicated
+    /// work and the lying run record AD-141 names.
+    #[test]
+    fn a_scheduled_sync_task_is_the_folders_only_paced_driver() {
+        const TICKS: usize = 3_600;
+        const HOST: &str = "01JTESTDEVICE#1";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.poll_interval_ms = 15_000;
+        engine.upsert_profile(&p).expect("upsert");
+
+        // One hour of 1 Hz ticks, returning (paced walks, task windows served).
+        let drive_an_hour = |engine: &Engine| {
+            let mut walks = 0usize;
+            let mut served = 0usize;
+            for _ in 0..TICKS {
+                let now = platform.now_ms();
+                let listing = engine
+                    .with_db(db::list_tasks)
+                    .expect("the tasks table reads");
+                for row in &listing.tasks {
+                    let schedule = row.parsed_schedule().expect("a fixture schedule parses");
+                    match tasks::decide(&row.state(), schedule.as_ref(), now) {
+                        tasks::Action::Arm => {
+                            engine.arm_task_window(row, schedule.as_ref(), now, 0);
+                        }
+                        tasks::Action::Run => {
+                            let run_id = engine
+                                .with_db(|conn| {
+                                    db::claim_task(
+                                        conn,
+                                        &row.id,
+                                        HOST,
+                                        now,
+                                        TASK_LEASE_MS,
+                                        Some(now),
+                                    )
+                                })
+                                .expect("the claim statement runs")
+                                .expect("an open window with no live lease is claimable");
+                            served += 1;
+                            let next = engine.next_task_window(
+                                row,
+                                now,
+                                0,
+                                TaskTrigger::Scheduled,
+                                tasks::TaskOutcome::Ok,
+                            );
+                            engine
+                                .with_db(|conn| {
+                                    db::finish_task_run(
+                                        conn,
+                                        db::TaskRunClose {
+                                            run_id,
+                                            task_id: &row.id,
+                                            host: HOST,
+                                            finished_ms: now,
+                                            outcome: tasks::TaskOutcome::Ok,
+                                            detail: Some("counted, not performed"),
+                                            next_due_ms: next,
+                                        },
+                                    )
+                                })
+                                .expect("the run closes");
+                        }
+                        // Neither is reachable from this fixture: the policy is
+                        // `run_now` and no host goes away. Total anyway.
+                        tasks::Action::None | tasks::Action::Skip | tasks::Action::Postpone => {}
+                    }
+                }
+                if engine.scan_due(&p) {
+                    walks += 1;
+                    engine.clear_watch_wake(&p.id);
+                }
+                platform.advance_ms(TICK_MS as i64);
+            }
+            (walks, served)
+        };
+
+        assert_eq!(
+            drive_an_hour(&engine),
+            (240, 0),
+            "with no sync task stored, the folder keeps its own pacing: 3600 s of \
+             ticks at one paced walk every 15 s is 240, and nothing else drives it"
+        );
+
+        // `every 20m`, so the hour holds windows at +20 and +40 minutes — the
+        // +60 one lands on the tick after the last.
+        let mut governing = task("01HOURLY", Some(&p.id), "every 20m");
+        governing.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&governing, None).expect("save");
+
+        assert_eq!(
+            drive_an_hour(&engine),
+            (0, 2),
+            "a scheduled sync task is the folder's clock: its two windows are \
+             served and the 15 s backstop opens NOT ONE walk underneath them. \
+             Before Story 58.8 this counted (240, 2) — the same folder synced by \
+             two paced drivers, with the task's run row claiming work the \
+             supervisor would have done anyway"
+        );
+    }
+
+    /// The half that must survive the stand-down: a governed folder still
+    /// answers a file somebody just saved (Story 58.8, AD-141, AD-34-11).
+    ///
+    /// Asserted as a negative *and* a positive on the same folder in the same
+    /// state, because either half alone is satisfiable by the wrong fix.
+    /// Suppressing the whole of [`Engine::scan_due`] would pass the negative and
+    /// make a folder with an hourly task feel dead: the low-latency path gone,
+    /// and a settling file waiting out the schedule instead of its own window.
+    #[test]
+    fn a_governed_folders_filesystem_triggers_are_not_stood_down_with_its_poll() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.poll_interval_ms = 15_000;
+        engine.upsert_profile(&p).expect("upsert");
+
+        let mut governing = task("01HOURLY", Some(&p.id), "@hourly");
+        governing.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&governing, None).expect("save");
+
+        // Reason 3 is surrendered, including on first sight — the one tick that
+        // would otherwise walk whatever the pacing says.
+        assert!(
+            !engine.scan_due(&p),
+            "the paced backstop is the task schedule's now, so it opens no walk"
+        );
+        platform.advance_ms(p.poll_interval_ms as i64);
+        assert!(
+            !engine.scan_due(&p),
+            "and the window coming round again changes nothing while it is governed"
+        );
+
+        // Reason 1: the watcher saw something. This is what makes keeper feel
+        // live, and no schedule owns it.
+        engine.note_watch_wake(&p.id);
+        assert!(
+            engine.scan_due(&p),
+            "a delivered event still opens the walk at once on a governed folder"
+        );
+        engine.clear_watch_wake(&p.id);
+        assert!(!engine.scan_due(&p), "the walk spent it");
+
+        // Reason 2: a held file's settle window elapsed. A settling path needs a
+        // second observation, and observations happen only inside a walk — so
+        // standing this down would make a governed folder hold a finished
+        // download until the schedule came round.
+        let now = platform.now_ms();
+        let held = p.local_path.join("held.bin");
+        let mut gate = StabilityGate::for_profile(&p).expect("gate");
+        gate.observe(
+            &held,
+            FileSample {
+                size: 128,
+                mtime_ns: i128::from(now) * 1_000_000,
+                ctime_ns: i128::from(now) * 1_000_000,
+                inode: 11,
+            },
+            now,
+            false,
+        );
+        Engine::lock(&engine.gates).insert(p.id.clone(), gate);
+        assert!(
+            !engine.scan_due(&p),
+            "a file still inside its window is not yet a reason to walk"
+        );
+        platform.advance_ms(p.effective_settle_ms() as i64);
+        assert!(
+            engine.scan_due(&p),
+            "and its own deadline still reopens the walk, not the task's schedule"
+        );
     }
 
     /// A refusal does not merely decline to arm a window — it **clears** one
@@ -13989,7 +15463,7 @@ mod tests {
 
         let mut off = release_task("01OFFNOW", Some(&p.id), "@daily");
         off.mode = tasks::TaskMode::Off;
-        engine.save_task(&off).expect("save");
+        engine.save_task(&off, None).expect("save");
 
         assert!(!engine.release_permits(&p, ReleaseTrigger::SuccessEdge));
         assert!(
@@ -14057,7 +15531,7 @@ mod tests {
         p.enabled = false;
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&release_task("01RELPAUSED", Some(&p.id), "every 5m"))
+            .save_task(&release_task("01RELPAUSED", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -14097,11 +15571,10 @@ mod tests {
             return;
         };
         engine
-            .save_task(&release_task(
-                "01RELGONE",
-                Some("01JNOSUCHPROFILE"),
-                "every 5m",
-            ))
+            .save_task(
+                &release_task("01RELGONE", Some("01JNOSUCHPROFILE"), "every 5m"),
+                None,
+            )
             .expect("save");
 
         let _ = engine.tick().await;
@@ -14145,7 +15618,7 @@ mod tests {
             p.volume_id = Some("01NOSUCHVOLUME".to_owned());
             engine.upsert_profile(&p).expect("upsert");
             engine
-                .save_task(&release_task("01RELABSENT", bound, "every 5m"))
+                .save_task(&release_task("01RELABSENT", bound, "every 5m"), None)
                 .expect("save");
 
             let _ = engine.tick().await;
@@ -14201,7 +15674,7 @@ mod tests {
         };
         let mut off = release_task("01RELOFF", None, "every 5m");
         off.mode = tasks::TaskMode::Off;
-        engine.save_task(&off).expect("save");
+        engine.save_task(&off, None).expect("save");
 
         for _ in 0..3 {
             let _ = engine.tick().await;
@@ -14218,7 +15691,9 @@ mod tests {
         );
         assert!(
             matches!(
-                engine.run_task_now("01RELOFF").await,
+                engine
+                    .run_task_now("01RELOFF", tasks::TaskRunDriver::Person)
+                    .await,
                 Err(SyncError::Config(_))
             ),
             "and an `off` that still runs when asked is not off"
@@ -14259,7 +15734,7 @@ mod tests {
         p.lfs_mode = LfsMode::PointerOnly;
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&release_task("01RELALL", None, "every 5m"))
+            .save_task(&release_task("01RELALL", None, "every 5m"), None)
             .expect("the host-wide driver is scheduled and enabled");
 
         // Without the veto this folder really is swept, or the assertion below
@@ -14279,13 +15754,13 @@ mod tests {
         );
         engine.forget_task("01RELALL").expect("start again");
         engine
-            .save_task(&release_task("01RELALL", None, "every 5m"))
+            .save_task(&release_task("01RELALL", None, "every 5m"), None)
             .expect("the same driver, with a fresh history");
 
         let mut veto = release_task("01RELVETO", Some(&p.id), "every 5m");
         veto.mode = tasks::TaskMode::Off;
         engine
-            .save_task(&veto)
+            .save_task(&veto, None)
             .expect("and this folder says not to sweep it");
 
         let _ = engine.tick().await;

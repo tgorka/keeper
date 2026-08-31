@@ -292,6 +292,16 @@ pub struct TaskVm {
     pub profile: Option<String>,
     /// The stored schedule expression, `null` when none is stored.
     pub schedule: Option<String>,
+    /// What to do about a window that fell due while nobody was home: as
+    /// stored, `"run_now"`, `"delay"`, `"skip"`, or a spelling this build does
+    /// not know (Story 58.4).
+    ///
+    /// A `String` for [`Self::kind`]'s reason: a row a newer keeper wrote must
+    /// reach the view as the spelling it has. An unreadable policy makes the row
+    /// unreadable, so such a spelling only arrives here past a `list_tasks` that
+    /// could read it — which is why the view may render it verbatim rather than
+    /// having to guess.
+    pub on_missed: String,
     /// When it next comes due: ms since the Unix epoch, `null` when never.
     #[ts(type = "number | null")]
     pub next_due_ms: Option<i64>,
@@ -300,6 +310,14 @@ pub struct TaskVm {
     /// When that lease expires: ms since the Unix epoch, `null` when idle.
     #[ts(type = "number | null")]
     pub lease_until_ms: Option<i64>,
+    /// When this row was last written: ms since the Unix epoch (UTC).
+    ///
+    /// On the wire for one reason and it is not display: it is the baseline an
+    /// edit form sends back on [`TaskSaveReq::baseline_updated_ms`], so a save
+    /// whose reading has gone stale is refused instead of reverting whatever
+    /// another host moved meanwhile.
+    #[ts(type = "number")]
+    pub updated_ms: i64,
     /// The most recent recorded run, `null` when it has never run.
     pub last_run: Option<TaskRunVm>,
     /// Which host will actually run this — [`task_host`]'s verdict.
@@ -355,6 +373,22 @@ pub struct TaskSaveReq {
     pub profile_id: Option<String>,
     /// The schedule expression, `null` to store none.
     pub schedule: Option<String>,
+    /// The requested missed-window policy, as one of the stored spellings.
+    ///
+    /// A `String` rather than an enum for [`TaskVm::on_missed`]'s reason, and
+    /// refused rather than coerced when this build cannot read it — the same
+    /// answer `kind` and `mode` already get.
+    pub on_missed: String,
+    /// The `updated_ms` the caller's reading of this row carried, or `null`.
+    ///
+    /// The lost-update guard, and it is a **request** field rather than a
+    /// protocol detail because only the caller knows whether it holds a reading
+    /// worth checking. An edit form does — it seeded its values once, and every
+    /// field it is about to send is as old as that seeding — so it sends the row's
+    /// `updated_ms` and the store refuses the write if the stored value has
+    /// moved. A create sends `null`: there is no reading to be stale.
+    #[ts(type = "number | null")]
+    pub baseline_updated_ms: Option<i64>,
 }
 
 /// Exactly the facts [`task_host`] needs, borrowed.
@@ -621,6 +655,446 @@ fn unhosted(reason: &str) -> TaskHostVm {
         kind: TaskHostKind::Unhosted,
         sentence: HOST_SENTENCE_UNHOSTED.to_owned(),
         reason: Some(reason.to_owned()),
+    }
+}
+
+/// What kind of paced work one projected row describes (Story 58.7).
+///
+/// Three variants and not one more, because the inventory found only three
+/// periodic things on this machine that have **both** an identity and a
+/// cadence. Queue reads, event drains, watcher re-arms, credential TTLs and the
+/// hourly release *look* gate all run on a clock of some sort and none of them
+/// is projected: a row nobody can act on, whose interval means something other
+/// than "this is when it happens", is worse than its absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PacedWorkKind {
+    /// The per-profile look for changes — the paced *backstop* behind the
+    /// watcher, not the only thing that starts a sync.
+    Scan,
+    /// The hourly deletion of transfer scratch this folder will never reuse.
+    ScratchSweep,
+    /// A notes vault's commit-after-quiet and push-within-deadline pair, which
+    /// only the running app drives.
+    NotesCadence,
+}
+
+/// Whether the clock really paces a projected row right now.
+///
+/// The three non-paced variants are three different reasons for the same
+/// absence of a cadence, and collapsing them would lose the actionable half: a
+/// paused folder is paused because somebody paused it, a governed folder's scan
+/// happens on a *schedule the user can see and edit* in the task list above,
+/// and an unregistered vault is waiting on a folder that is not there. Only
+/// [`Self::Paced`] ever carries a cadence — see [`PacedWorkVm::cadence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum PacedWorkStanding {
+    /// The clock in the running app paces it, at [`PacedWorkVm::cadence`].
+    Paced,
+    /// Its folder is paused, so `tick` skips it entirely and nothing paces it.
+    Paused,
+    /// A scheduled Sync task has taken this folder's paced backstop, so the
+    /// backstop has stood down and the schedule above decides (Story 58.8).
+    Governed,
+    /// The work is configured but nothing is registered to do it: a notes vault
+    /// whose folder could not be resolved when the registry was last built —
+    /// the drive is away, or the folder moved.
+    ///
+    /// Separate from [`Self::Paused`] because the remedy is different and
+    /// neither sentence would be true of the other: nobody paused this, and
+    /// re-enabling nothing would bring it back.
+    Unregistered,
+}
+
+/// One thing this host paces, projected at read time from the profile list.
+///
+/// # Why there is no `next_due_ms`, no `last_run` and no run history
+///
+/// Not "not rendered yet" — **unrepresentable**, on purpose. Two facts make any
+/// next-run claim a lie this type must not be able to tell:
+///
+/// 1. The engine's `next_scan_ms` / `next_sweep_ms` are an in-memory
+///    `Mutex<HashMap>` discarded when the process ends, so after a restart
+///    there is no stored instant to project at all.
+/// 2. `scan_due` is `paced || watch_wake_pending || settle_window_elapsed` —
+///    two of the scan's three triggers are filesystem events. A file the
+///    watcher sees settle brings the next look forward by an amount nothing can
+///    predict, so even a live map would only ever be an upper bound.
+///
+/// And a finished unit leaves no trace to project a *last* run from either:
+/// `db::complete` is `DELETE FROM journal WHERE id = ?1`, and `activity` says of
+/// itself that it is a human-facing log and not a source of truth (AD-135). A
+/// key that could hold either number is a key a future edit would fill in, so
+/// this type has neither (AD-141).
+///
+/// The **invariant**, enforced by [`paced_work`] and by nothing in TypeScript:
+/// `cadence.is_some()` if and only if `standing == PacedWorkStanding::Paced`.
+/// That is what makes *"paused, about every 15 seconds"* impossible to build
+/// rather than merely untested.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PacedWorkVm {
+    /// The row's stable key: `"scan:<profileId>"`, `"sweep:<profileId>"` or
+    /// `"notes:<profileId>"`. A composite because the identity really is the
+    /// pair — one folder contributes up to three rows — and no store holds an
+    /// id of its own for work that is projected rather than recorded.
+    pub id: String,
+    /// Which of the three things this is.
+    pub kind: PacedWorkKind,
+    /// The folder this work belongs to. Never `null`: every projected row is
+    /// per-profile, which is why there is no host-wide case here.
+    pub profile_id: String,
+    /// That folder's human name, as the profile stores it.
+    pub profile: String,
+    /// Whether the clock paces it, and if not, why not.
+    pub standing: PacedWorkStanding,
+    /// The cadence phrase, `null` unless [`Self::standing`] is
+    /// [`PacedWorkStanding::Paced`] — see this type's invariant.
+    pub cadence: Option<String>,
+    /// The honest explanation, composed here and rendered verbatim.
+    ///
+    /// One of the `PACED_SENTENCE_*` constants, possibly with
+    /// [`PACED_SENTENCE_REMOVABLE_CLAUSE`] appended. Composed in Rust for
+    /// `HOST_SENTENCE_*`'s reason: each of these carries a fact the browser
+    /// cannot re-derive — that a saved file brings the next look forward, that a
+    /// governed folder's backstop has stood down, that only the running app
+    /// paces a vault — and a second copy in TypeScript is how a surface ends up
+    /// contradicting the engine.
+    pub sentence: String,
+}
+
+/// A paced scan, described from the folder's own poll interval.
+///
+/// The cadence is hedged — *about* every — and the sentence says why in words:
+/// the interval is a backstop, and two of the three things that start a scan are
+/// filesystem events. An unhedged "every 15 seconds" would be the over-claim
+/// [`PacedWorkVm`]'s missing keys exist to prevent, one level up.
+pub const PACED_SENTENCE_SCAN_PACED: &str = "keeper looks for changes on this cadence while it is running. The cadence is a backstop and not the only trigger: a file the watcher sees settle, or a write that closes, brings the next look forward.";
+
+/// A scan whose paced backstop a scheduled Sync task has taken (Story 58.8).
+///
+/// It still says the watcher can bring a look forward, because that is true
+/// under governance too: what stood down is the *interval*, not the event
+/// triggers. Saying only "a schedule decides" would tell somebody their edits
+/// wait until 3 a.m.
+pub const PACED_SENTENCE_SCAN_GOVERNED: &str = "a scheduled sync task decides when this folder is looked at, so the paced backstop has stood down. A file the watcher sees settle still brings a look forward.";
+
+/// The hourly scratch sweep. It names what it deletes, because "sweep" beside a
+/// folder full of the user's files must not read as a sweep of the files.
+pub const PACED_SENTENCE_SWEEP_PACED: &str =
+    "keeper deletes transfer scratch this folder will never use again, on this cadence, while it \
+     is running.";
+
+/// A notes vault's cadence, and the fact that makes it different from every
+/// task row above it: `keeper-syncd` never runs this. The daemon has no vault
+/// pacer at all, so a person who quits the app to let the service take over
+/// would be quietly leaving their notes uncommitted.
+pub const PACED_SENTENCE_NOTES_PACED: &str = "the app commits this vault after the quiet window and pushes within the deadline. Only the running app paces it — keeper-syncd never does.";
+
+/// A vault the registry does not hold, which is the honest answer whenever the
+/// vault folder could not be resolved when the registry was last built.
+///
+/// It names the remedy because the remedy is not obvious and is not "wait": the
+/// registry is rebuilt at launch and when a vault is flagged or unflagged, and
+/// by nothing else — so a drive that comes back mid-session does **not**
+/// re-register on its own. Saying "it resumes when the drive is back" would be
+/// the comfortable sentence and the false one.
+pub const PACED_SENTENCE_NOTES_UNREGISTERED: &str = "keeper has no vault registered for this folder, so nothing paces it: the vault folder could not be found when the registry was last built. The registry is rebuilt at launch, and when a vault is flagged or unflagged — not when a drive comes back.";
+
+/// Shared by all three kinds, because the reason is the folder's and not the
+/// work's: `tick` skips both the sweep and `tick_profile` for a profile that is
+/// not enabled, so one paused folder silences everything projected from it.
+/// This sentence therefore beats governance — a paused folder is paused.
+pub const PACED_SENTENCE_PAUSED: &str =
+    "this folder is paused, so nothing here is paced and no cadence is in force.";
+
+/// Appended to the scan and sweep sentences for a folder on removable media:
+/// both are work that finds nothing while the drive is away, and the honest
+/// thing to attach the fact to is the work that would have looked. Never
+/// appended to a paused row, where the sentence already says nothing is paced
+/// and a second reason would read as a second cause — nor to a notes row, whose
+/// unregistered sentence already names the missing folder as the reason.
+pub const PACED_SENTENCE_REMOVABLE_CLAUSE: &str =
+    " The folder is on removable media, so nothing happens at all while the drive is away.";
+
+/// A notes vault's two intervals, borrowed.
+///
+/// Its own struct rather than two `u64`s on [`PacedFolderFacts`] for the reason
+/// that struct itself states, applied to the worst case in this module: these
+/// are two adjacent same-typed numbers, so a call site could swap them without a
+/// type error — and swapping them says the vault is pushed after two seconds and
+/// committed after thirty, which is exactly backwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacedNotesFacts {
+    /// Quiet time after the last edit before the note is committed.
+    pub commit_idle_ms: u64,
+    /// How long a commit may sit locally before it is pushed.
+    pub push_interval_ms: u64,
+    /// Whether the vault registry actually holds this vault.
+    ///
+    /// **A configured vault and a paced vault are two different facts**, and
+    /// this is the second one. `notes_vault::register_one` returns nothing when
+    /// the vault root cannot be canonicalized — the drive is away, the folder
+    /// moved — and an unregistered vault is reached by no cadence tick and no
+    /// flush. Projecting the *configuration* alone would tell somebody their
+    /// notes are being committed and pushed while nothing at all is doing it,
+    /// which is the over-claim [`PacedWorkVm`]'s missing keys exist to prevent.
+    pub registered: bool,
+}
+
+/// Exactly the facts [`paced_work`] needs about one folder, borrowed.
+///
+/// [`TaskHostFacts`]'s shape and its reasons: a named-field struct rather than
+/// positional arguments so two same-typed fields cannot be swapped silently
+/// (`profile_id` with `profile`, `scan_interval_ms` with `sweep_interval_ms`),
+/// and borrowed because the caller is projecting a profile list it already
+/// holds. Every field is a fact the **caller** establishes: this function does
+/// no I/O and asks no engine anything, which is what keeps the projection pure
+/// and this crate free of `keeper-sync` (AD-40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacedFolderFacts<'a> {
+    /// The profile id, which every projected row's key is built from.
+    pub profile_id: &'a str,
+    /// The folder's human name.
+    pub profile: &'a str,
+    /// The profile's enabled flag. `false` silences every row for this folder.
+    pub enabled: bool,
+    /// Whether the folder lives on removable media.
+    pub removable: bool,
+    /// The scan's real interval — `effective_poll_interval_ms()`, never the
+    /// stored column: a profile may hold a zero there and the engine floors it,
+    /// so projecting the stored value would advertise a cadence of nothing.
+    pub scan_interval_ms: u64,
+    /// Whether a scheduled Sync task has taken this folder's paced backstop.
+    ///
+    /// A failed governance read is **not** a governance state: the caller passes
+    /// `false` there, and the row then prints its poll interval — which is true,
+    /// because the paced poll genuinely still runs when nothing was found to
+    /// have taken it.
+    pub scan_governed: bool,
+    /// The scratch sweep's interval — the engine's `SWEEP_EVERY_MS`, passed in
+    /// rather than mirrored here so there is no second place for it to disagree.
+    pub sweep_interval_ms: u64,
+    /// The vault's cadence, `None` when this folder holds no vault — which is
+    /// the whole of "no notes row for that folder".
+    pub notes: Option<PacedNotesFacts>,
+}
+
+/// Project every paced thing on this host from the folder list.
+///
+/// Pure, total and allocating only its answer: no clock is registered, no
+/// due-gate is consulted and nothing is written (AD-142). Each folder yields a
+/// scan row and a sweep row, plus a notes row when it holds a vault, in that
+/// order — so the rows for one folder arrive together.
+///
+/// The gates, in the order they are applied and for the reasons the sentences
+/// state:
+///
+/// 1. `!enabled` ⇒ [`PacedWorkStanding::Paused`] with no cadence, on **every**
+///    row of that folder. This beats governance deliberately: `tick` skips a
+///    disabled profile before it reaches any of this work, so a governed-looking
+///    scan row on a paused folder would name the wrong reason for the same
+///    silence.
+/// 2. An enabled folder whose scan is governed ⇒ [`PacedWorkStanding::Governed`]
+///    with no cadence, on the scan row alone. The sweep and the notes rows are
+///    untouched: a Sync task takes the *scan's* backstop and nothing else.
+/// 3. An enabled folder whose vault is not registered ⇒
+///    [`PacedWorkStanding::Unregistered`] with no cadence, on the notes row
+///    alone. The scan and the sweep do not go through the vault registry.
+/// 4. Otherwise [`PacedWorkStanding::Paced`], with the cadence phrase.
+///
+/// The invariant *`cadence.is_some()` iff `standing == Paced`* is a property of
+/// this function, asserted over every row it returns rather than only stated:
+/// `PacedWorkVm`'s two fields are independent and public, so a fourth kind added
+/// later can break the pairing, and the phrase it would put on screen —
+/// *"paused, about every 15 seconds"* — is exactly the one this class exists to
+/// make impossible. The assertion is `debug_assert!` because a release build
+/// must not lose the whole view over a wording fault, and every builder below is
+/// total: there is no input that reaches it.
+pub fn paced_work(folders: &[PacedFolderFacts<'_>]) -> Vec<PacedWorkVm> {
+    // Three rows per folder is the ceiling, and the common shape on a machine
+    // whose folders hold vaults.
+    let mut rows = Vec::with_capacity(folders.len() * 3);
+    for folder in folders {
+        rows.push(paced_scan_row(folder));
+        rows.push(paced_sweep_row(folder));
+        if let Some(notes) = folder.notes {
+            rows.push(paced_notes_row(folder, notes));
+        }
+    }
+    debug_assert!(
+        rows.iter()
+            .all(|row| { row.cadence.is_some() == (row.standing == PacedWorkStanding::Paced) }),
+        "a projected row carried a cadence without a paced standing, or a paced \
+         standing without a cadence"
+    );
+    rows
+}
+
+/// The scan row: the one row governance and removable media can reach.
+fn paced_scan_row(folder: &PacedFolderFacts<'_>) -> PacedWorkVm {
+    let (standing, cadence, mut sentence) = if !folder.enabled {
+        paced_paused()
+    } else if folder.scan_governed {
+        (
+            PacedWorkStanding::Governed,
+            None,
+            PACED_SENTENCE_SCAN_GOVERNED.to_owned(),
+        )
+    } else {
+        (
+            PacedWorkStanding::Paced,
+            Some(format!(
+                "about every {}",
+                duration_words(folder.scan_interval_ms)
+            )),
+            PACED_SENTENCE_SCAN_PACED.to_owned(),
+        )
+    };
+    // Only where it adds something: a paused row already says nothing is paced.
+    if folder.removable && standing != PacedWorkStanding::Paused {
+        sentence.push_str(PACED_SENTENCE_REMOVABLE_CLAUSE);
+    }
+    PacedWorkVm {
+        id: format!("scan:{}", folder.profile_id),
+        kind: PacedWorkKind::Scan,
+        profile_id: folder.profile_id.to_owned(),
+        profile: folder.profile.to_owned(),
+        standing,
+        cadence,
+        sentence,
+    }
+}
+
+/// The scratch sweep row. Governance cannot reach it: a scheduled Sync task
+/// takes the scan's backstop, and the sweep keeps its own hour.
+fn paced_sweep_row(folder: &PacedFolderFacts<'_>) -> PacedWorkVm {
+    let (standing, cadence, mut sentence) = if folder.enabled {
+        (
+            PacedWorkStanding::Paced,
+            Some(format!(
+                "every {}",
+                duration_words(folder.sweep_interval_ms)
+            )),
+            PACED_SENTENCE_SWEEP_PACED.to_owned(),
+        )
+    } else {
+        paced_paused()
+    };
+    // The same clause the scan row carries, for the same reason: with the drive
+    // away the sweep's own `read_dir` finds nothing, so an unhedged *"keeper
+    // deletes transfer scratch on this cadence"* claims a deletion that is not
+    // happening. Suppressed on a paused row, where the sentence already says
+    // nothing is paced.
+    if folder.removable && standing != PacedWorkStanding::Paused {
+        sentence.push_str(PACED_SENTENCE_REMOVABLE_CLAUSE);
+    }
+    PacedWorkVm {
+        id: format!("sweep:{}", folder.profile_id),
+        kind: PacedWorkKind::ScratchSweep,
+        profile_id: folder.profile_id.to_owned(),
+        profile: folder.profile.to_owned(),
+        standing,
+        cadence,
+        sentence,
+    }
+}
+
+/// The notes row, which exists only for a folder that holds a vault.
+///
+/// Three answers, and the order matters. A paused folder comes first because
+/// pausing is the reason somebody would recognise; an unregistered vault comes
+/// second because it is a fact about the folder rather than about the pacer; and
+/// only a registered vault on an enabled folder is paced.
+fn paced_notes_row(folder: &PacedFolderFacts<'_>, notes: PacedNotesFacts) -> PacedWorkVm {
+    let (standing, cadence, sentence) = if !folder.enabled {
+        paced_paused()
+    } else if !notes.registered {
+        (
+            PacedWorkStanding::Unregistered,
+            None,
+            PACED_SENTENCE_NOTES_UNREGISTERED.to_owned(),
+        )
+    } else {
+        (
+            PacedWorkStanding::Paced,
+            Some(format!(
+                "committed after {} of quiet, pushed within {}",
+                duration_words(notes.commit_idle_ms),
+                duration_words(notes.push_interval_ms)
+            )),
+            PACED_SENTENCE_NOTES_PACED.to_owned(),
+        )
+    };
+    PacedWorkVm {
+        id: format!("notes:{}", folder.profile_id),
+        kind: PacedWorkKind::NotesCadence,
+        profile_id: folder.profile_id.to_owned(),
+        profile: folder.profile.to_owned(),
+        standing,
+        cadence,
+        sentence,
+    }
+}
+
+/// The paused triple, in one place so the three row builders cannot disagree
+/// about it — and so *paused implies no cadence* is written down once.
+fn paced_paused() -> (PacedWorkStanding, Option<String>, String) {
+    (
+        PacedWorkStanding::Paused,
+        None,
+        PACED_SENTENCE_PAUSED.to_owned(),
+    )
+}
+
+/// A millisecond interval in the coarsest unit that divides it exactly.
+///
+/// Coarsest-exact rather than always-seconds because these intervals are read
+/// as a promise about frequency: *every 3600 seconds* is the same number as
+/// *every 1 hour* and reads as a machine talking. Exactness is what keeps it
+/// honest — 90 minutes is not "1 hour", so it stays "90 minutes" rather than
+/// being rounded into a unit it does not fill.
+///
+/// Seconds are the one rounded case, because `MIN_POLL_INTERVAL_MS` and the
+/// notes cadence are seconds-scale and a stored 1_500 is genuinely "2 seconds"
+/// to a reader. Below a second nothing is rounded and the raw number is shown:
+/// no shipped default is sub-second, so such a value is somebody's deliberate
+/// experiment and rounding it to "0 seconds" or "1 second" would hide it.
+fn duration_words(ms: u64) -> String {
+    const SECOND: u64 = 1_000;
+    const MINUTE: u64 = 60 * SECOND;
+    const HOUR: u64 = 60 * MINUTE;
+
+    if ms >= HOUR && ms.is_multiple_of(HOUR) {
+        return plural_words(ms / HOUR, "hour");
+    }
+    if ms >= MINUTE && ms.is_multiple_of(MINUTE) {
+        return plural_words(ms / MINUTE, "minute");
+    }
+    if ms < SECOND {
+        return format!("{ms} ms");
+    }
+    // Round rather than truncate: 1_900 ms is nearer two seconds than one, and
+    // truncating would under-state every cadence that is not a whole second.
+    // `saturating_add` because a stored interval is a `u64` a config file
+    // supplies: `ms + 500` overflows within 500 of `u64::MAX`, which panics a
+    // debug build and wraps a release one into an absurdly small cadence. No
+    // reachable interval is anywhere near it, and a panic in a projection that
+    // exists to be honest is worse than the two characters that prevent it.
+    plural_words(ms.saturating_add(SECOND / 2) / SECOND, "second")
+}
+
+/// `1 hour` / `2 hours`. English's own rule, in one place so no phrase above
+/// grows an "(s)".
+fn plural_words(count: u64, unit: &str) -> String {
+    if count == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{count} {unit}s")
     }
 }
 
@@ -1146,5 +1620,430 @@ mod tests {
             "{} must not exist; the probe's negative answer is a bool, not an error",
             path.display()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The paced-work projection (Story 58.7)
+    // -----------------------------------------------------------------------
+
+    /// An enabled, non-removable folder with no vault, on the engine's real
+    /// intervals — mutated per test by struct update, `scheduled()`'s idiom.
+    fn folder() -> PacedFolderFacts<'static> {
+        PacedFolderFacts {
+            profile_id: "p1",
+            profile: "keeper",
+            enabled: true,
+            removable: false,
+            scan_interval_ms: 15_000,
+            scan_governed: false,
+            sweep_interval_ms: 3_600_000,
+            notes: None,
+        }
+    }
+
+    /// The vault cadence the profile defaults ship with, on a vault the registry
+    /// actually holds — the only shape that is paced.
+    fn vault() -> PacedNotesFacts {
+        PacedNotesFacts {
+            commit_idle_ms: 2_000,
+            push_interval_ms: 30_000,
+            registered: true,
+        }
+    }
+
+    fn row_of(rows: &[PacedWorkVm], kind: PacedWorkKind) -> &PacedWorkVm {
+        rows.iter()
+            .find(|row| row.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind:?} row in {rows:?}"))
+    }
+
+    #[test]
+    fn a_folder_with_no_vault_yields_a_scan_row_and_a_sweep_row_and_nothing_else() {
+        let rows = paced_work(&[folder()]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, PacedWorkKind::Scan);
+        assert_eq!(rows[0].id, "scan:p1");
+        assert_eq!(rows[1].kind, PacedWorkKind::ScratchSweep);
+        assert_eq!(rows[1].id, "sweep:p1");
+        for row in &rows {
+            assert_eq!(row.profile_id, "p1");
+            assert_eq!(row.profile, "keeper");
+            assert_eq!(row.standing, PacedWorkStanding::Paced);
+        }
+    }
+
+    #[test]
+    fn a_folder_that_holds_a_vault_yields_the_notes_row_too() {
+        let rows = paced_work(&[PacedFolderFacts {
+            notes: Some(vault()),
+            ..folder()
+        }]);
+        assert_eq!(rows.len(), 3);
+        let notes = row_of(&rows, PacedWorkKind::NotesCadence);
+        assert_eq!(notes.id, "notes:p1");
+        assert_eq!(
+            notes.cadence.as_deref(),
+            Some("committed after 2 seconds of quiet, pushed within 30 seconds")
+        );
+        assert_eq!(notes.sentence, PACED_SENTENCE_NOTES_PACED);
+        // The fact that separates it from every task row above it in the view.
+        assert!(notes.sentence.contains("keeper-syncd never does"));
+    }
+
+    #[test]
+    fn the_scan_row_reads_the_effective_interval_and_hedges_it() {
+        let rows = paced_work(&[folder()]);
+        let scan = row_of(&rows, PacedWorkKind::Scan);
+        assert_eq!(scan.cadence.as_deref(), Some("about every 15 seconds"));
+        assert_eq!(scan.sentence, PACED_SENTENCE_SCAN_PACED);
+    }
+
+    /// The DW-116 row: a profile whose stored `poll_interval_ms` is zero.
+    ///
+    /// The caller passes `effective_poll_interval_ms()`, so what reaches here is
+    /// the floor and never the stored zero — a cadence of "0 ms" would advertise
+    /// a scan that never stops.
+    #[test]
+    fn a_floored_poll_interval_projects_the_floor_and_never_the_stored_zero() {
+        let rows = paced_work(&[PacedFolderFacts {
+            scan_interval_ms: 2_000,
+            ..folder()
+        }]);
+        let scan = row_of(&rows, PacedWorkKind::Scan);
+        assert_eq!(scan.cadence.as_deref(), Some("about every 2 seconds"));
+    }
+
+    #[test]
+    fn the_sweep_row_reads_the_engines_hour() {
+        let rows = paced_work(&[folder()]);
+        let sweep = row_of(&rows, PacedWorkKind::ScratchSweep);
+        assert_eq!(sweep.cadence.as_deref(), Some("every 1 hour"));
+        assert_eq!(sweep.sentence, PACED_SENTENCE_SWEEP_PACED);
+        // It names what it deletes: "sweep" beside a folder of the user's own
+        // files must not read as a sweep of the files.
+        assert!(sweep.sentence.contains("transfer scratch"));
+    }
+
+    /// A paused folder silences everything projected from it, and paused beats
+    /// governed: `tick` skips a disabled profile before it reaches any of this.
+    #[test]
+    fn a_paused_folder_advertises_no_cadence_on_any_of_its_rows() {
+        let rows = paced_work(&[PacedFolderFacts {
+            enabled: false,
+            scan_governed: true,
+            removable: true,
+            notes: Some(vault()),
+            ..folder()
+        }]);
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert_eq!(row.standing, PacedWorkStanding::Paused, "{:?}", row.kind);
+            assert_eq!(row.cadence, None, "{:?}", row.kind);
+            assert_eq!(row.sentence, PACED_SENTENCE_PAUSED, "{:?}", row.kind);
+        }
+    }
+
+    /// Story 58.8's stand-down, and the row beside it that must NOT move.
+    #[test]
+    fn a_governed_scan_row_stands_down_while_the_sweep_and_notes_rows_do_not() {
+        let rows = paced_work(&[PacedFolderFacts {
+            scan_governed: true,
+            notes: Some(vault()),
+            ..folder()
+        }]);
+        let scan = row_of(&rows, PacedWorkKind::Scan);
+        assert_eq!(scan.standing, PacedWorkStanding::Governed);
+        assert_eq!(scan.cadence, None);
+        assert_eq!(scan.sentence, PACED_SENTENCE_SCAN_GOVERNED);
+        // Governance takes the scan's backstop and nothing else.
+        for kind in [PacedWorkKind::ScratchSweep, PacedWorkKind::NotesCadence] {
+            let row = row_of(&rows, kind);
+            assert_eq!(row.standing, PacedWorkStanding::Paced, "{kind:?}");
+            assert!(row.cadence.is_some(), "{kind:?}");
+        }
+    }
+
+    /// A governance read that failed is not a governance state: the caller
+    /// passes `false` and the row prints its interval, which is true — the paced
+    /// poll genuinely still runs when nothing was found to have taken it.
+    #[test]
+    fn a_folder_no_task_governs_keeps_its_paced_backstop() {
+        let rows = paced_work(&[folder()]);
+        let scan = row_of(&rows, PacedWorkKind::Scan);
+        assert_eq!(scan.standing, PacedWorkStanding::Paced);
+        assert_eq!(scan.cadence.as_deref(), Some("about every 15 seconds"));
+    }
+
+    /// The clause rides the two rows whose work would have *looked* at the
+    /// folder, and not the notes row.
+    ///
+    /// The sweep earned it after review: `sweep_scratch_if_due` does not check
+    /// `volume_ready`, so with the drive away its `read_dir` finds nothing and
+    /// deletes nothing — an unhedged *"keeper deletes transfer scratch on this
+    /// cadence"* was claiming work that was not happening. The notes row is still
+    /// excluded, because a vault on an absent drive is unregistered and its own
+    /// sentence already names the missing folder as the reason.
+    #[test]
+    fn a_removable_folder_says_so_on_the_rows_that_would_have_looked() {
+        let rows = paced_work(&[PacedFolderFacts {
+            removable: true,
+            notes: Some(vault()),
+            ..folder()
+        }]);
+        assert_eq!(
+            row_of(&rows, PacedWorkKind::Scan).sentence,
+            format!("{PACED_SENTENCE_SCAN_PACED}{PACED_SENTENCE_REMOVABLE_CLAUSE}")
+        );
+        assert_eq!(
+            row_of(&rows, PacedWorkKind::ScratchSweep).sentence,
+            format!("{PACED_SENTENCE_SWEEP_PACED}{PACED_SENTENCE_REMOVABLE_CLAUSE}")
+        );
+        assert!(
+            !row_of(&rows, PacedWorkKind::NotesCadence)
+                .sentence
+                .contains("removable media"),
+            "the notes row names the folder it cannot find, not the drive"
+        );
+        // It rides governance too: the look is still what finds nothing.
+        let governed = paced_work(&[PacedFolderFacts {
+            removable: true,
+            scan_governed: true,
+            ..folder()
+        }]);
+        assert!(row_of(&governed, PacedWorkKind::Scan)
+            .sentence
+            .contains("removable media"));
+        // And a paused folder keeps its one reason: pausing, not the drive.
+        let paused = paced_work(&[PacedFolderFacts {
+            removable: true,
+            enabled: false,
+            ..folder()
+        }]);
+        for row in &paused {
+            assert_eq!(row.sentence, PACED_SENTENCE_PAUSED, "{:?}", row.kind);
+        }
+    }
+
+    /// The over-claim the registration fact exists to prevent: a configured
+    /// vault whose folder the registry could not resolve is reached by no
+    /// cadence tick and no flush, so it must not advertise one.
+    #[test]
+    fn an_unregistered_vault_advertises_no_cadence_and_names_the_registry() {
+        let rows = paced_work(&[PacedFolderFacts {
+            notes: Some(PacedNotesFacts {
+                registered: false,
+                ..vault()
+            }),
+            ..folder()
+        }]);
+        let notes = row_of(&rows, PacedWorkKind::NotesCadence);
+        assert_eq!(notes.standing, PacedWorkStanding::Unregistered);
+        assert_eq!(notes.cadence, None);
+        assert_eq!(notes.sentence, PACED_SENTENCE_NOTES_UNREGISTERED);
+        // Neither of the other two goes through the vault registry.
+        for kind in [PacedWorkKind::Scan, PacedWorkKind::ScratchSweep] {
+            assert_eq!(
+                row_of(&rows, kind).standing,
+                PacedWorkStanding::Paced,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// Pausing outranks registration: a paused folder gets one reason, and it is
+    /// the one somebody would recognise.
+    #[test]
+    fn a_paused_folder_with_an_unregistered_vault_reads_as_paused() {
+        let rows = paced_work(&[PacedFolderFacts {
+            enabled: false,
+            notes: Some(PacedNotesFacts {
+                registered: false,
+                ..vault()
+            }),
+            ..folder()
+        }]);
+        let notes = row_of(&rows, PacedWorkKind::NotesCadence);
+        assert_eq!(notes.standing, PacedWorkStanding::Paused);
+        assert_eq!(notes.sentence, PACED_SENTENCE_PAUSED);
+    }
+
+    /// An interval within rounding distance of `u64::MAX` used to panic a debug
+    /// build in `ms + 500` and wrap a release one to an absurdly small cadence.
+    /// Nothing shipped reaches it; a projection that exists to be honest simply
+    /// must not be able to panic on a number a config file can hold.
+    #[test]
+    fn an_absurd_interval_saturates_instead_of_overflowing() {
+        let rows = paced_work(&[PacedFolderFacts {
+            scan_interval_ms: u64::MAX,
+            ..folder()
+        }]);
+        let scan = row_of(&rows, PacedWorkKind::Scan);
+        // `u64::MAX` saturates rather than wrapping, so the rounding half is
+        // absorbed and the number is the truncated one. Either reading is
+        // nonsense to a person; the point is that neither is a panic.
+        assert_eq!(
+            scan.cadence.as_deref(),
+            Some("about every 18446744073709551 seconds")
+        );
+    }
+
+    /// The invariant, over every shape this projection can produce. It is the
+    /// one property no TypeScript branch may be trusted with: *"paused, about
+    /// every 15 seconds"* has to be impossible to build.
+    #[test]
+    fn a_cadence_is_present_exactly_when_the_standing_is_paced() {
+        let mut rows = Vec::new();
+        for enabled in [true, false] {
+            for governed in [true, false] {
+                for removable in [true, false] {
+                    // Every vault shape, including the unregistered one the
+                    // fourth standing exists for.
+                    for notes in [
+                        Some(vault()),
+                        Some(PacedNotesFacts {
+                            registered: false,
+                            ..vault()
+                        }),
+                        None,
+                    ] {
+                        rows.extend(paced_work(&[PacedFolderFacts {
+                            enabled,
+                            scan_governed: governed,
+                            removable,
+                            notes,
+                            ..folder()
+                        }]));
+                    }
+                }
+            }
+        }
+        assert!(!rows.is_empty());
+        // Every standing this build can emit really did occur above, or the
+        // sweep would be asserting the invariant over a subset of the space
+        // while reading as if it covered all of it.
+        for standing in [
+            PacedWorkStanding::Paced,
+            PacedWorkStanding::Paused,
+            PacedWorkStanding::Governed,
+            PacedWorkStanding::Unregistered,
+        ] {
+            assert!(
+                rows.iter().any(|row| row.standing == standing),
+                "{standing:?} never occurred in the sweep"
+            );
+        }
+        for row in &rows {
+            assert_eq!(
+                row.cadence.is_some(),
+                row.standing == PacedWorkStanding::Paced,
+                "{row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn several_folders_project_their_rows_together_and_keyed_by_id() {
+        let rows = paced_work(&[
+            folder(),
+            PacedFolderFacts {
+                profile_id: "p2",
+                profile: "vault",
+                notes: Some(vault()),
+                ..folder()
+            },
+        ]);
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["scan:p1", "sweep:p1", "scan:p2", "sweep:p2", "notes:p2"]
+        );
+    }
+
+    #[test]
+    fn no_folders_project_no_rows() {
+        assert!(paced_work(&[]).is_empty());
+    }
+
+    /// The coarsest-exact rule at its boundaries, including the one rounded case
+    /// and the sub-second one that is deliberately not rounded.
+    #[test]
+    fn duration_words_reads_in_the_coarsest_unit_that_divides_exactly() {
+        assert_eq!(duration_words(3_600_000), "1 hour");
+        assert_eq!(duration_words(7_200_000), "2 hours");
+        // 90 minutes does not fill an hour twice, so it stays minutes.
+        assert_eq!(duration_words(5_400_000), "90 minutes");
+        assert_eq!(duration_words(60_000), "1 minute");
+        assert_eq!(duration_words(900_000), "15 minutes");
+        assert_eq!(duration_words(1_000), "1 second");
+        assert_eq!(duration_words(15_000), "15 seconds");
+        // Rounded, not truncated.
+        assert_eq!(duration_words(1_500), "2 seconds");
+        assert_eq!(duration_words(1_400), "1 second");
+        assert_eq!(duration_words(59_500), "60 seconds");
+        // Below a second nothing is rounded away.
+        assert_eq!(duration_words(999), "999 ms");
+        assert_eq!(duration_words(1), "1 ms");
+        assert_eq!(duration_words(0), "0 ms");
+    }
+
+    /// The structural half of the under-claim: the wire object has exactly seven
+    /// keys, and none of them could carry a next run or a last run.
+    ///
+    /// Asserted on the emitted JSON rather than on the Rust type, because that is
+    /// what the view consumes — and asserted as an exact set rather than by
+    /// checking two names are absent, so a *third* over-claiming key added later
+    /// fails here too.
+    #[test]
+    fn the_paced_wire_shape_cannot_claim_a_next_run_or_a_last_run() {
+        let rows = paced_work(&[PacedFolderFacts {
+            notes: Some(vault()),
+            ..folder()
+        }]);
+        for row in &rows {
+            let json = serde_json::to_value(row).expect("a PacedWorkVm serializes");
+            let object = json.as_object().expect("it serializes as an object");
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "cadence",
+                    "id",
+                    "kind",
+                    "profile",
+                    "profileId",
+                    "sentence",
+                    "standing",
+                ]
+            );
+        }
+    }
+
+    /// The spellings the frontend switches on, pinned: `camelCase` on the enums
+    /// means `scratchSweep` and `notesCadence`, not `ScratchSweep`.
+    #[test]
+    fn the_paced_enums_go_on_the_wire_in_camel_case() {
+        let kinds = [
+            (PacedWorkKind::Scan, "scan"),
+            (PacedWorkKind::ScratchSweep, "scratchSweep"),
+            (PacedWorkKind::NotesCadence, "notesCadence"),
+        ];
+        for (kind, spelling) in kinds {
+            assert_eq!(
+                serde_json::to_value(kind).expect("a kind serializes"),
+                serde_json::Value::String(spelling.to_owned())
+            );
+        }
+        let standings = [
+            (PacedWorkStanding::Paced, "paced"),
+            (PacedWorkStanding::Paused, "paused"),
+            (PacedWorkStanding::Governed, "governed"),
+        ];
+        for (standing, spelling) in standings {
+            assert_eq!(
+                serde_json::to_value(standing).expect("a standing serializes"),
+                serde_json::Value::String(spelling.to_owned())
+            );
+        }
     }
 }

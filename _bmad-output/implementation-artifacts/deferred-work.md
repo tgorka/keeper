@@ -5040,3 +5040,101 @@ status: open
     past — so a requested run landing on an overdue window is reachable in normal
     operation, not only in theory. Pre-existing: the doc and `next_task_window` both
     shipped before story 57.5's diff.
+  status: done 2026-08-31
+  resolution: |
+    Resolved by story 58.6 (FR-358, AD-138). The behaviour was right and the doc was
+    incomplete, but the ENTRY's second half named a real defect and that is what was
+    fixed: a box running both `keeper-syncd watch` and the `Persistent=true` timer got
+    TWO runs for one missed window, because the timer's `tasks run` arrived as
+    `TaskTrigger::Requested` and so passed `due_at_most: None`, bypassing
+    `db::claim_task`'s window condition, while the daemon's next tick claimed the same
+    past window as `Scheduled`.
+    The fix does not narrow what a request may claim — `due_at_most: None` exists so
+    that a person asking is not asking about a window, and a hand-run with nothing due
+    still runs, asserted by
+    `a_hand_run_with_nothing_due_still_runs_and_a_timer_does_not`. It stops calling a
+    TIMER a person: a third `TaskTrigger::Timer`, reached through an explicit
+    `--timer` flag on `tasks run` that the shipped `keeper-syncd-tasks@.service` now
+    passes, claims like the due-gate when an in-process host is pacing the same task
+    (`mode == Scheduled`) and like a request when nothing else paces it — so the
+    unit's own first recommended arrangement, timer-only with `--mode manual`, keeps
+    working. Explicit rather than inferred because nothing about the process can tell
+    a timer from a person: the service runs the same binary with the same argv shape
+    somebody would type.
+    Tests: `one_missed_window_and_both_drivers_yield_exactly_one_run` drives both
+    trigger kinds against ONE overdue window (not two connections against one lease,
+    which is 57.2's test and proves something else);
+    `a_timer_is_the_whole_schedule_when_nothing_in_process_paces_the_task` guards the
+    manual arrangement a naive fix would silently remove; and
+    `the_shipped_task_service_runs_a_verb_this_binary_has` now asserts `timer: true`
+    out of the real `ExecStart=` through the real clap parser, because no other test
+    in the tree reads that line and dropping the flag would restore the defect
+    silently. The CLI doc omission this entry opened with is also corrected, in the
+    `Run` verb's clap prose and in both packaging units.
+    macOS is unaffected and no test pretends otherwise: `keeper-syncd` has no launchd
+    plist anywhere in the tree, so the app is the only host there and two drivers
+    cannot arise.
+
+- source_spec: `{project-root}/_bmad-output/implementation-artifacts/spec-58-1-a-task-you-can-create-and-edit.md`
+  summary: A task edit form left open across a listing change writes its seed-time values back over whatever another host changed meanwhile, because `upsert_task` has no compare-and-set.
+  evidence: |
+    `TaskForm` seeds all six values once (`task-form.tsx`, `useState(() => …)`), which is
+    `AddFolderForm`'s deliberate rule — re-syncing from the prop would overwrite what has
+    been typed since the form opened, and the pane hands the row a fresh object on every
+    read. Submit then sends the full tuple (kind, mode, enabled, profileId, schedule) and
+    `db::upsert_task` performs an unconditional `INSERT … ON CONFLICT(id) DO UPDATE` with
+    no version column and no `updated_ms` precondition, so every field another host or
+    `keeper-syncd tasks set` moved while the form sat open is silently reverted. The task
+    record is explicitly shared across hosts (`TASKS_PANE_EMPTY_AFTER`: "Every host that
+    shares this record sees it"), so this is an ordinary two-machine sequence rather than a
+    contrived one, and nothing on screen says a stale value was written back.
+    Deferred rather than patched for two reasons. It is the identical, already-accepted
+    property of the profile form this one is modelled on — `SyncProfileReq` merges onto a
+    clone of the stored profile precisely because a form cannot be trusted to carry every
+    field, and tasks have no such merge because `TaskSaveReq` carries all of them. And the
+    honest fix is a precondition in Rust (an `updated_ms` compare-and-set on `upsert_task`,
+    refusing a write whose baseline has moved, in the manner of the NFR-43 stored-row
+    guard beside it), which story 58.1 could not make: it is a frontend-only story and
+    changing `src-tauri/` was outside its boundaries. A UI-only mitigation — noticing the
+    prop changed and offering to re-seed — is a smaller version of the same idea and would
+    still lose the race, so it is not worth shipping ahead of the store-side guard.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-58-3-a-list-of-runs-you-can-open.md`
+  summary: `formatTaskAgo` clamps a clock that runs ahead to "just now", so every run recorded by a peer whose clock leads renders as "just now" in a list whose entire point is other hosts.
+  evidence: `tasks-pane.tsx`'s `formatTaskAgo` does `Math.max(0, now - atMs)`, and an existing test pins that behaviour (`formatTaskAgo(NOW + 60_000, NOW) === "just now"`). Story 58.3 multiplies it: the run history renders one relative time per run, each recorded by the host named beside it, so several runs hours apart can all read "just now" in newest-first order with nothing on screen revealing the skew. Pre-dates 58.3 and changing it changes the row's last-run cell too.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-58-3-a-list-of-runs-you-can-open.md`
+  summary: A readable `tasks` row whose `id` is the empty string is unnamed everywhere on the Tasks pane, not only on the new runs disclosure.
+  evidence: `tasks.id` is `TEXT` and `validate_id` only refuses an empty id on the save path, so a row written outside keeper decodes fine and is NOT diverted to the unknown list. `tasks-pane.tsx` renders `{task.id}` raw in the row header, in the Forget confirmation title, and now in the disclosure's `aria-label` — which degrades to "Runs:" naming nothing, and asks `sync_task_history("")`. The fix belongs to the row (one absent-name constant used everywhere the id is shown), not to the new control.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-58-7-everything-else-this-host-paces.md`
+  summary: A notes vault that goes unregistered because its folder was absent stays unregistered for the whole session — the registry is never rebuilt on the drive's return.
+  evidence: |
+    `notes_vault::register_one` returns `None` when the vault root cannot be canonicalized,
+    and `notes_vault::refresh` — the only thing that rebuilds the registry — is called from
+    exactly two places: `start` at launch, and the flag/unflag commands in `notes_ipc.rs`
+    (`:940`, `:988`). Nothing watches for the drive coming back, so a vault on removable
+    media that was away at launch is not paced until the app is relaunched or some vault is
+    flagged. Story 58.7's new `unregistered` standing makes this visible for the first time
+    and its sentence states it rather than promising a recovery that does not happen — which
+    is why this is a ledger entry and not a lie on screen.
+    Deferred rather than fixed inside 58.7: the honest fix is a re-registration trigger
+    (the volume-ready signal the sync engine already has, or a refresh on the profile-write
+    path), which is a change to the app's vault lifecycle rather than to a read-only
+    projection. Doing it under a story whose boundary is *project, never schedule* would
+    have added the one thing that story forbids itself.
+
+- source_spec: none
+  summary: `keeper-syncd`'s `durability_matrix::a_kill_during_a_large_object_transfer_leaves_the_object_recoverable` is load-sensitive: it kills the sync at a fixed 120 ms and fails intermittently under a full-suite run on macOS.
+  evidence: |
+    Observed 2026-08-31 during the epic-58 salvage gate on hesperia: the test failed inside
+    `bun run check:rust:macos` (full workspace run) and then passed twice in isolation on the
+    same commit, and had passed in a full run of the same code minutes earlier. The instant is
+    a literal — `let at = Duration::from_millis(120); peer.kill_sync_after(at)` — chosen so the
+    kill lands mid-transfer of a 24 MiB object. On a loaded host the transfer can be either
+    not yet started or already finished at 120 ms, so the interruption the test is about does
+    not happen and a later assertion reports the consequence rather than the cause.
+    Unrelated to epic 58 (nothing in it touches the transfer path). The fix is the deadline-poll
+    idiom the rest of the tree uses — kill on an observed condition (bytes in flight, a `tmp/`
+    object present) rather than on an elapsed duration — so the guard still fails when the
+    kill-sweep is broken and cannot fail because the machine was busy.

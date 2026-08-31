@@ -158,6 +158,9 @@ export type { NoteWriteVm } from "./gen/NoteWriteVm";
 export type { NotificationPermission } from "./gen/NotificationPermission";
 export type { NotifyTarget } from "./gen/NotifyTarget";
 export type { OutboxVm } from "./gen/OutboxVm";
+export type { PacedWorkKind } from "./gen/PacedWorkKind";
+export type { PacedWorkStanding } from "./gen/PacedWorkStanding";
+export type { PacedWorkVm } from "./gen/PacedWorkVm";
 export type { PaginationState } from "./gen/PaginationState";
 export type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 export type { PaletteActionVm } from "./gen/PaletteActionVm";
@@ -357,6 +360,7 @@ import type { NoteVaultSettingsReq } from "./gen/NoteVaultSettingsReq";
 import type { NoteVaultVm } from "./gen/NoteVaultVm";
 import type { NoteWriteVm } from "./gen/NoteWriteVm";
 import type { OutboxVm } from "./gen/OutboxVm";
+import type { PacedWorkVm } from "./gen/PacedWorkVm";
 import type { PaginationStatusBatch } from "./gen/PaginationStatusBatch";
 import type { PaletteMode } from "./gen/PaletteMode";
 import type { PaletteResultsVm } from "./gen/PaletteResultsVm";
@@ -6390,4 +6394,34 @@ export async function syncTaskSave(req: TaskSaveReq): Promise<TaskVm> {
  */
 export async function syncTaskForget(id: string): Promise<void> {
   await invoke<void>("sync_task_forget", { id });
+}
+
+/**
+ * Everything else this host paces: the per-folder scan, the hourly scratch
+ * sweep and each vault's notes cadence (Story 58.7).
+ *
+ * **Read-only, and not tasks.** These rows are projected from the folder list at
+ * read time — nothing stores them, nothing schedules them, and there is no verb
+ * to run, edit or forget one. Reading this registers no clock either (AD-142):
+ * it is one query a person asked for, not a poll.
+ *
+ * **No `nextRunMs`, no `lastRun`, and that is structural** (AD-141). The engine
+ * holds the next scan and sweep instants in memory only, so a restart discards
+ * them; and a scan is triggered by a settled file or a closed write as well as
+ * by its interval, so even a live instant would be an upper bound. A key that
+ * could carry such a claim is one a future edit would fill in, so the type has
+ * none.
+ *
+ * `cadence` is non-null **only** for `standing === "paced"` — the invariant is
+ * enforced in `keeper_core::tasks::paced_work`, so *"paused, about every 15
+ * seconds"* cannot arrive here. `sentence` is composed in Rust and rendered
+ * verbatim, `TaskVm.host.sentence`'s rule: each one carries a fact the browser
+ * cannot re-derive — that a saved file brings the next look forward, that a
+ * governed folder's backstop has stood down, that only the running app paces a
+ * vault.
+ *
+ * Rejects with: `unsupported`, `internal`.
+ */
+export async function syncPacedWork(): Promise<PacedWorkVm[]> {
+  return await invoke<PacedWorkVm[]>("sync_paced_work");
 }

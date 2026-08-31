@@ -2210,12 +2210,32 @@ is gone, which defeats being asked as thoroughly as it defeats a schedule, so
 that gate sits above every mode gate. A reason is attached to the unhosted
 verdict and to nothing else, so a reason present at all **is** the alarm.
 
-In the app, ⌘8 opens **Tasks**: every row states its kind, schedule, the host
-that will actually run it, its next due time, its last run and its last outcome,
-and offers **Run now**. A failure notifies **once per onset** — on the
-`healthy → failing` edge, not once per attempt — which is the engine's existing
-rule and exists because a text-keyed version of it once produced thousands of
-notifications an hour.
+In the app, ⌘8 opens **Tasks**, and it is now a place you can work rather than
+only look. Every row states its kind, its schedule, the host that will actually
+run it, its next due time, its missed-window policy, and its last run — the
+**outcome word and the line that run reported**, not merely that it ended; a run
+with no detail renders as absence rather than as an empty string, because those
+are different facts. Each row offers **Run now**, **Edit**, **Forget** and
+**Runs**:
+
+- **Add a task** is a form in the pane's header, and **Edit** is the same form
+  seeded from the row you pressed it on. Every refusal keeper makes at the write
+  door — a malformed id, a schedule it cannot parse, `scheduled` with no
+  schedule, a kind that differs from the stored one — is shown **verbatim**, in
+  the form that asked for it. The form re-implements none of those rules: it
+  carries no cron regex and does not trim what you typed, so a task is never
+  stored under a name nobody wrote.
+- **Forget** asks first, and says what it deletes: a record, never content.
+  Nothing a task ever did is undone by forgetting the task.
+- **Runs** opens that task's history — the same bounded, newest-first list
+  `tasks status` prints, with the outcome, the time, the host and the detail for
+  each run.
+- **Edit is not offered** on a row whose kind or mode this build cannot read.
+  The store would refuse the write, so the control could only fail.
+
+A failure notifies **once per onset** — on the `healthy → failing` edge, not
+once per attempt — which is the engine's existing rule and exists because a
+text-keyed version of it once produced thousands of notifications an hour.
 
 One honest limit on that view, and one thing it does check that you might expect
 it not to. The limit: its Linux daemon verdict is computed from
@@ -2245,6 +2265,136 @@ all has no such file and no `systemctl` either, so it reads as *no daemon* and
 never reaches a daemon sentence. If neither `$USER` nor `$LOGNAME` is set the app
 cannot form the name and reports the session-only sentence — under-claiming the
 daemon's reach rather than promising a run that will not happen.
+
+### The *Paced* rows: what else this host paces, and why you cannot drive them
+
+Below the tasks, the same view lists the other periodic work this machine does,
+as a visibly distinct read-only class: each folder's **scan**, its hourly
+**scratch sweep**, and — where a folder has a notes vault — the **notes
+cadence**. They are there because *"has keeper looked at this folder lately"* is
+a fair question and nothing answered it before.
+
+**They are projected, not scheduled, and the difference is the whole point.**
+A *Paced* row carries a standing and a cadence and nothing else: **no next due
+time, no last run, no history, and no buttons at all** — no Run now, no schedule
+field. That is not an unfinished view. Two of these three have their own
+standing look-gate, and a schedule laid over a gate that still stands is a
+schedule that does not schedule: it would report itself set and be declined by
+an interval that knows nothing about schedules. And the scan is not even a clock
+in the first place — keeper walks a folder for three independent reasons, and
+**two of them are filesystem events**: the watcher saw something, or a file
+that was still being written has finished settling. A control saying *you can
+change when this happens* would be false about work an event triggers.
+
+There is also nothing to remember. The next-scan and next-sweep instants live in
+memory and are discarded when the process ends, and a finished journal unit is
+deleted rather than recorded — so the view under-claims deliberately rather than
+inventing a last-run line it could not stand behind.
+
+Four standings, and they are four different answers:
+
+| standing | what it means |
+| --- | --- |
+| **paced** | the clock really is pacing this, and the cadence beside it is the one in force — `pollIntervalMs` after its floor is applied, never the number stored on the row |
+| **paused** | the folder is paused, so nothing paces it and **no cadence is shown**. A cadence beside *paused* would be a promise nothing is keeping |
+| **governed** | a `scheduled` **sync task** has taken this folder's paced walk over, so the task's schedule is the cadence — see below. No interval is shown, because none is in force |
+| **unregistered** | a notes row only: the folder holds a vault, but keeper has no vault *registered* for it, because the vault folder could not be found when the registry was last built. Nothing paces it, and it is not waiting on a clock |
+
+**A configured vault and a paced vault are two different facts**, which is why
+the fourth standing exists. The registry is rebuilt at launch and when a vault
+is flagged or unflagged — not when a drive comes back — so a vault on a disk
+that was away at launch stays unregistered for the session. The row says so
+rather than reciting a cadence nothing is keeping.
+
+**Pausing a folder pauses its vault too.** It did not always: the vault cadence
+is the app's own, and its push arm calls the same schedule-blind `sync_once`
+that **Sync now** calls, so a paused folder's notes were still committed and
+pushed on their cadence, and again when the window lost focus or the app quit.
+The gate now sits in the automatic callers — the cadence tick and the quit
+flush — and not in `sync_once`, because a person pressing Sync now on a paused
+folder is asking for exactly that and must still get it. Work that was owed when
+the folder was paused stays owed: the phase is left untouched, so resuming the
+folder serves it rather than losing it.
+
+Nothing here writes a `tasks` row, and nothing here registers a clock, an
+interval or a due-gate: every row is derived, at read time, from state the view
+had already fetched. If the projection cannot be read, the view shows the
+refusal and keeps the rows it had — and the task list above it is untouched.
+
+One thing the section says in words, because an absence is indistinguishable
+from a bug: these rows have **no buttons at all** — no Run now, no schedule
+field, no history. It says *none of it can be started from this section* rather
+than *nothing here can be run on demand*, because the latter is false: a
+folder's own **Sync now** is on the Sync pane, and a vault is flushed every time
+the window hides. A sentence written to stop somebody hunting for a control must
+not hide the control they were looking for.
+
+### A window that passed while nobody was home
+
+Every task carries one answer to *what should happen to a window that fell due
+while nothing was hosting this task*. It is one column, `on_missed`, writable
+with `keeper-syncd tasks set --on-missed <run-now|delay|skip>` and from the ⌘8
+form's **If a window is missed** field, and it is the owner's three words:
+**run it now**, **run it after a delay**, or **skip it and wait for the next
+window**. On the command line the vocabulary is kebab-case (`run-now`); in the
+column, in `--json` and in both renderings it is `run_now`. That is the only
+place the two spellings diverge.
+
+**All three serve a window normally while a host is present.** They differ only
+about a window nobody was here to serve, which keeper concludes once the window
+has been open for **15 minutes** (`TASK_MISSED_GRACE_MS`). Inside that grace
+every setting answers *run*, because a policy that acted sooner would not be a
+missed-window policy — it would be a re-timing of the schedule you wrote.
+
+| setting | what it does to a window nobody served |
+| --- | --- |
+| **`run_now`** | serves it on the first tick that sees it, **once**, however many windows went by |
+| **`delay`** | serves it **30 minutes after a host noticed it** (`TASK_MISSED_DELAY_MS`) — the anchor is the noticing, not the window |
+| **`skip`** | abandons it and arms the next natural window instead |
+
+`run_now` is the default, and it is the default because it is textually what
+this code has always done unconditionally: **an upgrade changes no existing
+install's meaning.** It is also precisely `Persistent=true` semantics
+in-process, which is the same rule the shipped systemd timer already words for
+itself — a trigger missed while the machine was off fires once when it comes
+back, once and not once per missed day.
+
+The other two act by **writing** rather than by waiting, and the instant they
+write is the row's own `next_due_ms`. Three things follow, and they are the
+reason the delay's anchor is the noticing:
+
+- A host back two hours late is already past any instant derived from the
+  window itself, so anchoring there would serve it immediately — which is
+  `run_now` under another name.
+- The wait is a persisted instant rather than a decision retaken each tick, so
+  the claim's own `next_due_ms <= now` condition holds the run back, and a
+  restart *inside* the delay still respects it.
+- A delay that lands past the next scheduled instant simply wins. The window is
+  one stored instant and not a queue, so the natural windows inside the delay
+  are not run and **no backlog accrues**.
+
+**A declined window is a recorded fact, not silence.** Both settings that do
+not run a window close a zero-duration run for it — outcome `declined` for
+`skip`, `postponed` for `delay` — and zero duration is the honest length of
+something that did not run. The detail names the policy that decided, the
+window it decided about and the instant that replaces it, as absolute times, so
+the line stays true however long after the fact it is read. The last-run line
+moves and the history says what happened, instead of a nightly sweep going
+quiet for a night. The two spellings are deliberately not shades of one word: a
+**declined** window will never be served, a **postponed** one will be, later.
+Neither carries failure vocabulary, because nothing went wrong in either.
+
+Two honest edges. If the other host sharing this `sync.db` armed, ran or moved
+the same window first, the compare-and-set declines to undo it and **no record
+is written** — a row here would claim this host decided something it did not.
+And `skip` needs somewhere to move the window to: a schedule with no next
+instant this build can find leaves the declined window unreplaced, logs that it
+will not run, and records nothing. Both are rare, and neither is a failure.
+
+One refusal worth knowing: a policy spelling this build does not recognise —
+a row written by a newer keeper — makes the task **listed but not run**. It is
+never guessed as `run_now`, because guessing in that direction would run a
+window its author asked to skip.
 
 ### Exactly one runner, whoever asks
 
@@ -2382,8 +2532,8 @@ Which `--mode` to pair with the timer follows from that:
 
 | you are running | give the task | why |
 | --- | --- | --- |
-| the timer only, no `watch` service and no app | `--mode manual` | nothing schedules the task, so the timer is the whole cadence and there is exactly one to read |
-| the timer **and** `keeper-syncd watch` | `--mode scheduled` with a schedule | both drivers run and the lease keeps them from overlapping, but **two** things move the daemon's next window and neither is obvious. If that window was already open when the timer's run finished, it has just been served and is re-armed to the following instant. And if the run recorded `busy` or `deferred` — the folder was mid-sync, the drive was out — that arm is taken *before* the trigger is even consulted and rewrites the window to the sooner of the next scheduled instant and one minute from now: a timer run that did nothing at 00:00 can leave the daemon sweeping at 00:01 instead of at the 03:00 you chose. Give the timer the coarser cadence, or prefer `--mode manual` above and keep one cadence in one place |
+| the timer only, no `watch` service and no app | `--mode manual` | nothing schedules the task, so the timer is the whole cadence and there is exactly one to read. `--timer` changes nothing here: with no in-process host pacing the task there is no window to demand, and demanding one would make the timer never fire |
+| the timer **and** `keeper-syncd watch` | `--mode scheduled` with a schedule | **Safe, and it was not before.** Two drivers reach one window here, and until the shipped unit passed `--timer` both of them ran it: an ordinary `tasks run` deliberately claims *without* asking whether a window is open, while the daemon's next tick claimed the same past window independently, so one missed window yielded two runs — two full sync passes, or two deletion sweeps, at instants nobody chose. With `--timer` the run demands an open window exactly as the daemon's own due-gate does, so the two race for the one window and keeper's single conditional `UPDATE` gives it to whichever arrives first; the loser records nothing at all. Two things still move the daemon's next window and neither is obvious. If the window was already open when the timer's run finished, it has just been served and is re-armed to the following instant. And if the run recorded `busy` or `deferred` — the folder was mid-sync, the drive was out — that arm is taken *before* the trigger is even consulted and rewrites the window to the sooner of the next scheduled instant and one minute from now: a timer run that did nothing at 00:00 can leave the daemon sweeping at 00:01 instead of at the 03:00 you chose. Give the timer the coarser cadence, or prefer `--mode manual` above |
 | neither, for now | `--mode off` | every trigger is refused, this one included, and the unit exits `2` without retrying |
 
 One cosmetic wrinkle in the `manual` arrangement, so it does not read as a
@@ -2394,6 +2544,20 @@ not consult the mode, so the first timer-driven run that defers writes a
 Nothing acts on it: the due-gate answers *nothing to do* for any mode but
 `scheduled`, so the task still runs only when the timer asks. Read the timer, not
 that field, as the answer to *when will this happen* on a manual task.
+
+**`--timer` is the unit's flag, and it is not for you.** A person at a prompt,
+or a script somebody wrote, runs `keeper-syncd tasks run <task>` without it and
+gets exactly what that verb has always meant: the work is performed, now,
+whether or not a window is open. That is deliberate and it is the whole contract
+of the verb — *run it now* must not quietly become *run it if due*. Nothing
+about the process can tell a timer from a person, either: the shipped unit runs
+the same binary with the same argv shape somebody would type, so an environment
+probe or a TTY test would be a heuristic that is wrong silently on the one box
+where this matters. Only the caller knows, so the caller says.
+
+The consequence, stated so it is not a surprise: on a `--mode scheduled` task
+whose window is **not** open, `tasks run --timer` exits `4` and does nothing.
+That is the fix working, and `4` already means *did not run, nothing wrong*.
 
 What stays in keeper either way is everything keeper can be asked about: the
 task's name, kind, target, mode, its whole run history, and the schedule the
@@ -2587,10 +2751,13 @@ that path to stay away: `lfsMode = pointerOnly`, or the default `materialize`
 with the folder's own policy resolving the path to virtual, a bare
 `virtualOverBytes` floor included since story 56.16. A row whose folder keeps it
 answers with a word and no instant instead. **Tasks (§14) are real** as of
-2026-08-30 — the record, the dialect, the due-gate on each host's existing tick,
+2026-08-31 — the record, the dialect, the due-gate on each host's existing tick,
 the seven CLI verbs with their exit taxonomy, the release task's three modes, the
-⌘8 view and the systemd timer pair — with the platform limits §14 states rather
-than a gap here. Two parts are not reachable everywhere:
+sync task's governance over a folder's own pacing, the three-way missed-window
+policy with a recorded outcome for the two settings that decline a window, the
+⌘8 view (create, edit, forget, the run report, the run history, and the
+read-only *Paced* rows) and the systemd timer pair — with the platform limits
+§14 states rather than a gap here. Two parts are not reachable everywhere:
 
 - **§12 progress and warnings.** These are engine-side and correct — the tray
   decision, the status line and the warning onset logic are implemented and

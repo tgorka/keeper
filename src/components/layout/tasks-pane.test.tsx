@@ -8,8 +8,8 @@
  * build cannot read is shown rather than dropped; and a Run now the engine
  * refuses shows the refusal without any row claiming the task ran.
  */
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
   syncTasks: vi.fn(),
@@ -17,16 +17,45 @@ vi.mock("@/lib/ipc/client", () => ({
   syncTaskHistory: vi.fn(),
   syncTaskSave: vi.fn(),
   syncTaskForget: vi.fn(),
+  // Story 58.7's read. Mocked here and answered in `beforeEach`, because the
+  // pane now reads it in the SAME settled pass as `syncTasks` — an unanswered
+  // mock resolves `undefined` and the section would render rows out of it.
+  syncPacedWork: vi.fn(),
+  // The mounted form's own read (Story 58.1): the folder picker.
+  syncProfiles: vi.fn(),
 }));
 
+import { LIST_FOLD_MORE_LABEL } from "@/components/layout/list-fold";
 import {
   formatTaskAgo,
   formatTaskDue,
+  PACED_BADGE,
+  PACED_CADENCE_LABEL,
+  PACED_EMPTY_TEXT,
+  PACED_FOLDER_LABEL,
+  PACED_HEADING,
+  PACED_KIND_LABELS,
+  PACED_LOADING_TEXT,
+  PACED_NO_CADENCE_TEXT,
+  PACED_REFUSAL_TESTID,
+  PACED_ROW_TESTID,
+  PACED_STANDING_LABELS,
+  PACED_SUBTITLE,
   TASK_DUE_NOW_TEXT,
+  TASK_EDIT_TEXT,
+  TASK_FORGET_CANCEL_TEXT,
+  TASK_FORGET_CONFIRM_BODY,
+  TASK_FORGET_TESTID,
+  TASK_FORGET_TEXT,
+  TASK_HISTORY_EMPTY_TEXT,
+  TASK_HISTORY_LOADING_TEXT,
+  TASK_HISTORY_NO_HOST_TEXT,
+  TASK_HISTORY_RETRY_NOTE,
+  TASK_HISTORY_TITLE,
   TASK_HOST_LABEL,
-  TASK_HOST_WIDE_TEXT,
   TASK_IN_FLIGHT_TEXT,
   TASK_LAST_OUTCOME_LABEL,
+  TASK_LAST_REPORT_LABEL,
   TASK_LAST_RUN_LABEL,
   TASK_NEVER_DUE_TEXT,
   TASK_NEVER_RAN_TEXT,
@@ -35,7 +64,13 @@ import {
   TASK_REFRESH_TEXT,
   TASK_RUN_NOW_TEXT,
   TASK_SCHEDULE_LABEL,
+  TASK_UNREADABLE_OUTCOME_TEXT,
   TASKS_CLOCK_TICK_MS,
+  TASKS_ERROR_TESTID,
+  TASKS_HISTORY_REFUSAL_TESTID,
+  TASKS_HISTORY_ROW_TESTID,
+  TASKS_HISTORY_TESTID,
+  TASKS_ORPHAN_REFUSAL_TESTID,
   TASKS_PANE_EMPTY_AFTER,
   TASKS_PANE_EMPTY_COMMAND,
   TASKS_PANE_EMPTY_SENTENCE,
@@ -47,10 +82,35 @@ import {
   TASKS_UNKNOWN_NO_ID_TEXT,
   TASKS_UNKNOWN_ROW_TESTID,
   TasksPane,
+  taskForgetConfirmTitle,
+  taskHistoryUnshownText,
   taskOutcomeText,
 } from "@/components/layout/tasks-pane";
-import type { TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
-import { syncTaskRunNow, syncTasks } from "@/lib/ipc/client";
+import {
+  TASK_FORM_ADD_SUBMIT_LABEL,
+  TASK_FORM_ADD_TITLE,
+  TASK_FORM_EDIT_SUBMIT_LABEL,
+  TASK_FORM_EDIT_TITLE,
+  TASK_FORM_ID_LABEL,
+  TASK_FORM_SCHEDULE_LABEL,
+  TASK_HOST_WIDE_TEXT,
+} from "@/components/sync/task-form";
+import type { PacedWorkVm, TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
+import {
+  syncPacedWork,
+  syncProfiles,
+  syncTaskForget,
+  syncTaskHistory,
+  syncTaskRunNow,
+  syncTaskSave,
+  syncTasks,
+} from "@/lib/ipc/client";
+import {
+  SYNC_LIST_FOLDED_FALLBACK,
+  SYNC_LIST_UNFOLDED_FALLBACK,
+  setSyncListSizes,
+  syncListSizes,
+} from "@/lib/stores/sync-detail";
 
 const NOW = 1_760_000_000_000;
 
@@ -59,6 +119,24 @@ const SENTENCE_APP = "keeper runs this — only while keeper is running";
 const SENTENCE_DAEMON = "the keeper-syncd unit on this machine runs this, logged in or not";
 const SENTENCE_UNHOSTED = "nothing will run this";
 const REASON_FOLDER_GONE = "it names a folder keeper does not sync, so no host here can run it";
+
+/**
+ * The `PACED_SENTENCE_*` constants `keeper_core::tasks` composes, verbatim.
+ *
+ * Spelled out here rather than imported, for the reason the four above are: the
+ * pane renders Rust's words and must not be allowed to agree with itself. A
+ * paraphrase in Rust would leave these tests green while the screen changed.
+ */
+const PACED_SENTENCE_SCAN =
+  "keeper looks for changes on this cadence while it is running. The cadence is a backstop and not the only trigger: a file the watcher sees settle, or a write that closes, brings the next look forward.";
+const PACED_SENTENCE_GOVERNED =
+  "a scheduled sync task decides when this folder is looked at, so the paced backstop has stood down. A file the watcher sees settle still brings a look forward.";
+const PACED_SENTENCE_SWEEP =
+  "keeper deletes transfer scratch this folder will never use again, on this cadence, while it is running.";
+const PACED_SENTENCE_PAUSED =
+  "this folder is paused, so nothing here is paced and no cadence is in force.";
+const PACED_SENTENCE_UNREGISTERED =
+  "keeper has no vault registered for this folder, so nothing paces it: the vault folder could not be found when the registry was last built. The registry is rebuilt at launch, and when a vault is flagged or unflagged — not when a drive comes back.";
 
 function run(over: Partial<TaskRunVm> = {}): TaskRunVm {
   return {
@@ -83,6 +161,12 @@ function task(over: Partial<TaskVm> = {}): TaskVm {
     profileId: null,
     profile: null,
     schedule: "@daily",
+    // Both required on `TaskVm` since Story 58.4: `onMissed` is the
+    // missed-window policy that story gave a control of its own, and
+    // `updatedMs` is the reading a save is checked against. Neither is rendered
+    // by this pane; the fixture carries them because the type does.
+    onMissed: "run_now",
+    updatedMs: NOW - 60_000,
     nextDueMs: NOW + 3_600_000,
     runningHost: null,
     leaseUntilMs: null,
@@ -100,12 +184,41 @@ function answer(value: TaskListingVm): void {
   vi.mocked(syncTasks).mockResolvedValue(value);
 }
 
+/** A paced scan row — the projection's canonical shape (Story 58.7). */
+function pacedRow(over: Partial<PacedWorkVm> = {}): PacedWorkVm {
+  return {
+    id: "scan:p1",
+    kind: "scan",
+    profileId: "p1",
+    profile: "keeper",
+    standing: "paced",
+    cadence: "about every 15 seconds",
+    sentence: PACED_SENTENCE_SCAN,
+    ...over,
+  };
+}
+
+function answerPaced(rows: PacedWorkVm[]): void {
+  vi.mocked(syncPacedWork).mockResolvedValue(rows);
+}
+
+beforeEach(() => {
+  // Every form this pane reveals reads the folder list as it mounts, so a test
+  // that opens one needs an answer here or the read never resolves.
+  vi.mocked(syncProfiles).mockResolvedValue([]);
+  // The projection is read in the same pass as the listing, so every test needs
+  // an answer for it. `[]` and not a row: the 63 tests that predate Story 58.7
+  // are about the task list, and a projected row in each of them would put a
+  // second `Cadence` cell inside reach of their queries.
+  answerPaced([]);
+});
+
 afterEach(() => {
   vi.clearAllMocks();
 });
 
 describe("the Tasks pane", () => {
-  it("states, per row, the kind, schedule, host, next due, last run and last outcome", async () => {
+  it("states, per row, the kind, schedule, host, next due, last run, outcome and report", async () => {
     answer(listing());
     render(<TasksPane />);
     const row = await screen.findByTestId(TASKS_ROW_TESTID);
@@ -120,12 +233,21 @@ describe("the Tasks pane", () => {
       TASK_NEXT_DUE_LABEL,
       TASK_LAST_RUN_LABEL,
       TASK_LAST_OUTCOME_LABEL,
+      // Added by Story 58.2, and added HERE and not only in that story's own
+      // block: this is the test a reader opens to learn what a row says, so a
+      // row that says six things and a test that enumerates five is the pane's
+      // contract understating itself — and deleting the cell would leave this
+      // test green.
+      TASK_LAST_REPORT_LABEL,
       TASK_HOST_LABEL,
     ]) {
       expect(within(row).getByText(label)).toBeInTheDocument();
     }
     expect(within(row).getByText("@daily")).toBeInTheDocument();
     expect(within(row).getByText("Succeeded")).toBeInTheDocument();
+    // The default fixture's own run reports this, so the canonical row carries
+    // the run's words too.
+    expect(within(row).getByText("no folders to sync")).toBeInTheDocument();
     expect(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeInTheDocument();
   });
 
@@ -330,6 +452,21 @@ describe("the pane's own formatters", () => {
     expect(taskOutcomeText(run({ outcome: "deferred" }))).toBe("Waited for a condition");
     // A spelling this build knows nothing about renders as itself.
     expect(taskOutcomeText(run({ outcome: "sublimated" }))).toBe("sublimated");
+    // Stories 58.4/58.5's two, and the property is that they are DIFFERENT
+    // sentences: a declined window will never be served, a postponed one will be
+    // served later. Rendering them as shades of one idea would tell somebody a
+    // sweep had been dropped when it had only been held back.
+    const declined = taskOutcomeText(run({ outcome: "declined" }));
+    const postponed = taskOutcomeText(run({ outcome: "postponed" }));
+    expect(declined).not.toBe(postponed);
+    expect(declined).toMatch(/next window/);
+    expect(postponed).toMatch(/later/);
+    // Neither is worded as a failure, and neither reads as still running: both
+    // rows are closed and zero-duration.
+    for (const text of [declined, postponed]) {
+      expect(text).not.toMatch(/fail|abandon/i);
+      expect(text).not.toBe(TASK_IN_FLIGHT_TEXT);
+    }
   });
 
   it("says a schedule is absent rather than rendering an empty cell", async () => {
@@ -369,7 +506,13 @@ describe("the Tasks pane's empty state names something that exists", () => {
     // existing install sees when it first opens ⌘8, because nothing in this epic
     // creates a task row on migration or on open.
     expect(COPY).not.toMatch(/keeper-syncd\s+task\s/);
-    expect(COPY).not.toMatch(/\badd\b/);
+    // Narrowed from a blanket `/\badd\b/` by Story 58.1: the pane now
+    // legitimately says "Add a task", because the app can create one. What the
+    // blanket ban was actually protecting is the CLI phrase, so that is what is
+    // banned — and the mechanical phrase loop below checks every
+    // `keeper-syncd <group> <verb>` in the copy against the real clap tree,
+    // which covers `add` and every other verb the binary does not have.
+    expect(COPY).not.toMatch(/keeper-syncd\s+\S+\s+add\b/);
 
     // Mechanical rather than a spot check: every `keeper-syncd <word> <word>`
     // phrase in the copy is measured against the real tree, so a future rename
@@ -386,13 +529,19 @@ describe("the Tasks pane's empty state names something that exists", () => {
     }
   });
 
-  it("offers the real creation command and says plainly that this view cannot", async () => {
+  it("says a task can be made here, and offers the control that makes one", async () => {
     answer(listing({ tasks: [], unknown: [] }));
     render(<TasksPane />);
 
     // On the real strings, so a reworded constant still has to say these things.
     expect(await screen.findByText(TASKS_PANE_EMPTY_SENTENCE)).toBeInTheDocument();
-    expect(TASKS_PANE_EMPTY_SENTENCE).toContain("cannot create one yet");
+    // The inverse of what this asserted until Story 58.1. The old copy said the
+    // view "cannot create one yet" and sent the reader to a terminal; it now can,
+    // and a sentence that still said otherwise would have the app deny a button
+    // sitting in the header above it.
+    expect(TASKS_PANE_EMPTY_SENTENCE).not.toMatch(/cannot create/);
+    expect(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE })).toBeInTheDocument();
+    // The command stays named as the other way in, and stays real.
     expect(screen.getByText(TASKS_PANE_EMPTY_COMMAND)).toBeInTheDocument();
     expect(TASKS_PANE_EMPTY_COMMAND).toContain("keeper-syncd tasks set");
     expect(screen.getByText(TASKS_PANE_EMPTY_AFTER)).toBeInTheDocument();
@@ -609,5 +758,1366 @@ describe("the Tasks pane's live state", () => {
     } finally {
       warned.mockRestore();
     }
+  });
+});
+
+/**
+ * Story 58.1: the two commands nothing ever called. `sync_task_save` and
+ * `sync_task_forget` were registered, typed, wrapped and mocked for a whole
+ * wave, and every one of these assertions is a control that now reaches one.
+ */
+describe("the Tasks pane creates, changes and forgets a task", () => {
+  it("reveals the add form inline in the pane rather than in a dialog", async () => {
+    answer(listing({ tasks: [], unknown: [] }));
+    render(<TasksPane />);
+    await screen.findByText(TASKS_PANE_EMPTY_SENTENCE);
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE }));
+
+    expect(await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE })).toBeInTheDocument();
+    // AD-C7's idiom is a disclosure, and the reason is not taste: the same
+    // component is revealed in two places, and a modal over a list of tasks
+    // hides the rows whose settings the person is comparing this one against.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("re-reads the listing after a save, so the window and the host verdict move", async () => {
+    answer(listing({ tasks: [], unknown: [] }));
+    vi.mocked(syncTaskSave).mockResolvedValue(task());
+    render(<TasksPane />);
+    await screen.findByText(TASKS_PANE_EMPTY_SENTENCE);
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE }));
+    await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE });
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "@daily" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(syncTaskSave).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "", schedule: "@daily" }),
+      ),
+    );
+    // `nextDueMs`, both lease columns and the host verdict are the store's and
+    // the engine's, never the request's, so the row can only be right after a
+    // read. And the disclosure closes behind a save that actually happened.
+    await waitFor(() => expect(syncTasks).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByRole("form", { name: TASK_FORM_ADD_TITLE })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("reveals a row's edit form seeded from the row already on screen", async () => {
+    answer(listing());
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+
+    // Named for the task it belongs to, because several rows can have one open.
+    const form = await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+    expect(within(form).getByLabelText(TASK_FORM_ID_LABEL)).toHaveValue("01SCHED");
+    // Seeded from the listing that is already on screen: no second read of the
+    // task record to open a form over a row it was just rendered from.
+    expect(syncTasks).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers neither Edit nor Forget on a row this build cannot read", async () => {
+    // They are not `TaskVm`s — `db::list_tasks` could not decode them — so there
+    // is nothing to seed a form from, and an upsert assembled out of a reason
+    // string is one `sync_task_save` would refuse. A control that can only fail
+    // is worse than no control.
+    answer(
+      listing({
+        tasks: [],
+        unknown: [{ id: "01FUTURE", reason: "unreadable task row: invalid kind 'teleport'" }],
+      }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_UNKNOWN_ROW_TESTID);
+
+    expect(within(row).queryByRole("button", { name: TASK_EDIT_TEXT })).not.toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: TASK_FORGET_TEXT })).not.toBeInTheDocument();
+    expect(within(row).queryAllByRole("button")).toHaveLength(0);
+  });
+
+  it("asks before forgetting, and says the answer deletes a record and not content", async () => {
+    answer(listing());
+    vi.mocked(syncTaskForget).mockResolvedValue(undefined);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_FORGET_TEXT }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    // Which task, by the id the row shows: a list of ten of these all confirm
+    // with the same words otherwise.
+    expect(within(dialog).getByText(taskForgetConfirmTitle("01SCHED"))).toBeInTheDocument();
+    // The one thing a person deciding this needs to know, in the backend's own
+    // framing (`sync_ipc.rs`: "Deletes a record, never content").
+    expect(within(dialog).getByTestId(TASK_FORGET_TESTID)).toHaveTextContent(
+      "deletes a record, never content",
+    );
+    expect(TASK_FORGET_CONFIRM_BODY).toMatch(/never content/);
+    // Asking is the point: nothing has happened yet.
+    expect(syncTaskForget).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: TASK_FORGET_CANCEL_TEXT }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    expect(syncTaskForget).not.toHaveBeenCalled();
+  });
+
+  it("forgets the task on the confirm, and the row leaves the pane", async () => {
+    // The one user-visible outcome of the whole path, and the earlier version of
+    // this test answered the SAME listing to both reads — so it passed over an
+    // implementation that deleted the wrong id, or whose re-read never reached
+    // the rendered list.
+    vi.mocked(syncTasks).mockResolvedValueOnce(listing());
+    vi.mocked(syncTasks).mockResolvedValue(listing({ tasks: [], unknown: [] }));
+    vi.mocked(syncTaskForget).mockResolvedValue(undefined);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_FORGET_TEXT }));
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: TASK_FORGET_TEXT }));
+
+    await waitFor(() => expect(syncTaskForget).toHaveBeenCalledWith("01SCHED"));
+    await waitFor(() => expect(syncTasks).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByTestId(TASKS_ROW_TESTID)).not.toBeInTheDocument());
+    expect(screen.getByText(TASKS_PANE_EMPTY_SENTENCE)).toBeInTheDocument();
+  });
+
+  it("shows a refused Forget on the row it is about, as a refused Run now is", async () => {
+    // An `internal` store error, which is what this path can actually emit:
+    // `sync_task_forget` runs two unconditional DELETEs and has no
+    // does-this-exist branch, so a "no such task" refusal was an invented
+    // failure. Two rows, so `within` is the assertion and not decoration.
+    answer(listing({ tasks: [task(), task({ id: "01OTHER" })] }));
+    vi.mocked(syncTaskForget).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+    const rows = await screen.findAllByTestId(TASKS_ROW_TESTID);
+    const mine = rows[1];
+
+    fireEvent.click(within(mine).getByRole("button", { name: TASK_FORGET_TEXT }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: TASK_FORGET_TEXT,
+      }),
+    );
+
+    // On its own row and on no other: the refusal names which task did not go.
+    await waitFor(() =>
+      expect(
+        within(screen.getAllByTestId(TASKS_ROW_TESTID)[1]).getByTestId(TASKS_REFUSAL_TESTID),
+      ).toHaveTextContent("database is locked"),
+    );
+    expect(
+      within(screen.getAllByTestId(TASKS_ROW_TESTID)[0]).queryByTestId(TASKS_REFUSAL_TESTID),
+    ).not.toBeInTheDocument();
+    // And the task is still there, because it was not deleted.
+    expect(
+      within(screen.getAllByTestId(TASKS_ROW_TESTID)[1]).getByText("01OTHER"),
+    ).toBeInTheDocument();
+  });
+
+  it("still reports a refused Forget when the row it belonged to has gone", async () => {
+    // `refusals` is keyed by task id and drawn by the row, so a refusal for a
+    // task the re-read no longer lists had nowhere to be drawn — and the
+    // likeliest reason a Forget is refused is that another writer removed the row
+    // first. A failed delete then looked exactly like a successful one, which is
+    // the invisible-failure shape this epic exists to close.
+    vi.mocked(syncTasks).mockResolvedValueOnce(listing());
+    vi.mocked(syncTasks).mockResolvedValue(listing({ tasks: [], unknown: [] }));
+    vi.mocked(syncTaskForget).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_FORGET_TEXT }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: TASK_FORGET_TEXT,
+      }),
+    );
+
+    const orphan = await screen.findByTestId(TASKS_ORPHAN_REFUSAL_TESTID);
+    expect(orphan).toHaveTextContent("database is locked");
+    // Named, because the row that would have said which task is gone.
+    expect(orphan).toHaveTextContent("01SCHED");
+  });
+
+  it("refuses to unmount a form, or delete its row, while its save is in flight", async () => {
+    // Two defects with one flag. Pressing the disclosure mid-save unmounted the
+    // form, so Rust's refusal had nowhere to land and a collapsed disclosure with
+    // no message read as a save that happened. And a Forget confirmed mid-save
+    // deletes a row the settling save re-inserts — `upsert_task` inserts when the
+    // id is absent — so a confirmed deletion silently undoes itself.
+    answer(listing());
+    // A held promise, `files-pane.test.tsx`'s shape: the executor form and not
+    // `Promise.withResolvers`, which this project's `lib` target does not have.
+    let land: ((saved: TaskVm) => void) | null = null;
+    vi.mocked(syncTaskSave).mockImplementation(
+      () =>
+        new Promise<TaskVm>((resolve) => {
+          land = resolve;
+        }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+    const form = await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+
+    fireEvent.click(within(form).getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+
+    const live = screen.getByTestId(TASKS_ROW_TESTID);
+    await waitFor(() =>
+      expect(within(live).getByRole("button", { name: TASK_EDIT_TEXT })).toBeDisabled(),
+    );
+    expect(within(live).getByRole("button", { name: TASK_FORGET_TEXT })).toBeDisabled();
+    expect(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE })).toBeDisabled();
+    expect(syncTaskForget).not.toHaveBeenCalled();
+
+    // The save settles and every control comes back.
+    await act(async () => {
+      land?.(task());
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE })).toBeEnabled(),
+    );
+  });
+
+  it("drops an edit disclosure whose row the record no longer has", async () => {
+    // The id is user-supplied on the Add form, so a stale `editingId` is
+    // re-creatable: forget `01SCHED`, add a new task called `01SCHED`, and the
+    // new row rendered with its form already expanded and `aria-expanded` set on
+    // a disclosure nobody had opened.
+    vi.mocked(syncTasks).mockResolvedValueOnce(listing());
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+    await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+
+    // The record loses the task, then gains one with the same id again.
+    vi.mocked(syncTasks).mockResolvedValueOnce(listing({ tasks: [], unknown: [] }));
+    fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
+      ).not.toBeInTheDocument(),
+    );
+
+    vi.mocked(syncTasks).mockResolvedValue(listing());
+    fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+    const back = await screen.findByTestId(TASKS_ROW_TESTID);
+    expect(within(back).getByRole("button", { name: TASK_EDIT_TEXT })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(
+      screen.queryByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * The row says what the run said (Story 58.2).
+ *
+ * One property, asserted ten ways: the sentence Rust composed for a run is on
+ * the row in its own words, and where a run recorded nothing the row is silent
+ * rather than blank or invented. Every assertion here is against the real string
+ * a reader sees, never against the presence of an element — the data was already
+ * typed, served and mocked for a whole wave, and it was the *reading* that was
+ * missing, so an assertion that only proves a cell exists would prove nothing.
+ *
+ * Cross-crate facts are named by symbol rather than by line: `src-tauri/` is
+ * being rewritten by the same wave that reads this file, so a line number here
+ * is wrong within the day.
+ */
+describe("the row says what the last run reported", () => {
+  it("shows the summary the run recorded, in the engine's own words", async () => {
+    // The whole story: `perform_sync_task` has composed this sentence on every
+    // completed run since wave 2, `TaskRunVm.detail` carried it to the frontend,
+    // and no control in this pane read it.
+    answer(
+      listing({
+        tasks: [
+          task({ lastRun: run({ detail: "3 synced, 0 already syncing, 0 waiting, 0 failed" }) }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).getByText(TASK_LAST_REPORT_LABEL)).toBeInTheDocument();
+    expect(
+      within(row).getByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
+    ).toBeInTheDocument();
+    // Beside keeper's verdict on the run, not instead of it.
+    expect(within(row).getByText("Succeeded")).toBeInTheDocument();
+  });
+
+  it("keeps a failure's reason whole, reason included", async () => {
+    // The reason is the actionable half — `perform_sync_task` wraps its counts
+    // as `"{detail}: {reason}"` on failure — so truncating this cell would be
+    // the one clipping on the row that actually costs the reader something.
+    const detail =
+      "0 synced, 0 already syncing, 0 waiting, 1 failed: could not resolve host git.tgorka.dev";
+    answer(listing({ tasks: [task({ lastRun: run({ outcome: "failed", detail }) })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).getByText(detail)).toBeInTheDocument();
+    expect(
+      within(row).getByText("could not resolve host git.tgorka.dev", { exact: false }),
+    ).toBeInTheDocument();
+    expect(within(row).getByText("Failed")).toBeInTheDocument();
+  });
+
+  it("says nothing for a run still in flight, and lets the outcome cell explain", async () => {
+    // `claim_task` opens the run row with `detail` unset, so an unfinished run
+    // has genuinely reported nothing yet — and the cell beside this one already
+    // accounts for the silence.
+    answer(
+      listing({
+        tasks: [
+          task({
+            lastRun: run({ finishedMs: null, outcome: null, unknownOutcome: null, detail: null }),
+          }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
+    expect(within(row).getByText(TASK_IN_FLIGHT_TEXT)).toBeInTheDocument();
+  });
+
+  it("says nothing for a reclaimed lease, which is a real state and not a failed read", async () => {
+    // Both `claim_task` and `release_host_leases` write `abandoned` without
+    // touching `detail`, so an absent report here means the run was taken away
+    // rather than that this pane failed to read one — and the outcome cell names
+    // it.
+    answer(listing({ tasks: [task({ lastRun: run({ outcome: "abandoned", detail: null }) })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
+    expect(within(row).getByText("Abandoned by the host that started it")).toBeInTheDocument();
+  });
+
+  it("adds no third copy of never run to a row that has not run", async () => {
+    // The count itself belongs to the refusal test — *"shows a refused Run now
+    // on the row, and no row claims the task ran"* — which asserts that a
+    // never-ran row says the words exactly twice. What is asserted here is the
+    // report cell's own half of that: a "nothing recorded" sentence in this cell
+    // would have been the third copy.
+    answer(listing({ tasks: [task({ lastRun: null })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
+    expect(within(row).queryByText(/nothing recorded|no report/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps both a newer keeper's spelling and its report", async () => {
+    // NFR-43 on both halves at once: an outcome this build cannot read renders
+    // as itself, and the detail beside it is still the run's own words.
+    answer(
+      listing({
+        tasks: [
+          task({
+            lastRun: run({
+              outcome: null,
+              unknownOutcome: "sublimated",
+              detail: "recorded by keeper 0.9.0",
+            }),
+          }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).getByText("sublimated")).toBeInTheDocument();
+    expect(within(row).getByText("recorded by keeper 0.9.0")).toBeInTheDocument();
+    expect(within(row).queryByText(TASK_IN_FLIGHT_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("draws no cell at all rather than an empty one when there is no report", async () => {
+    // Counted by the label rather than by a total: the host block renders a
+    // `<dt>` of its own outside the `<dl>`, so a row-wide `<dt>` total is one
+    // higher than the grid's, and a magic total would also have to move every
+    // time another story adds a cell to this row. Counting the cells whose
+    // heading IS the report label says what the test is about and needs no
+    // defensive note telling a later reader not to touch the numbers.
+    const reportCells = (row: HTMLElement): number =>
+      within(row).queryAllByText(TASK_LAST_REPORT_LABEL).length;
+
+    answer(listing({ tasks: [task({ lastRun: run({ outcome: "abandoned", detail: null }) })] }));
+    const silent = render(<TasksPane />);
+    expect(reportCells(await screen.findByTestId(TASKS_ROW_TESTID))).toBe(0);
+    silent.unmount();
+
+    answer(listing({ tasks: [task()] }));
+    render(<TasksPane />);
+    expect(reportCells(await screen.findByTestId(TASKS_ROW_TESTID))).toBe(1);
+  });
+
+  it("stays silent for a stored report that is blank rather than absent", async () => {
+    // `detail` is `TEXT NULL` with no non-empty constraint and `finish_task_run`
+    // binds whatever it is handed, so a writer this build never met — the NFR-43
+    // case this pane exists to tolerate — can store `""` or `"   "`. On a
+    // `!== null` guard that renders a LAST REPORT heading over nothing, which is
+    // the one shape a reader really would read as a failed read. Both spellings,
+    // because `getByText` normalises whitespace and would not tell them apart.
+    for (const detail of ["", "   "]) {
+      answer(listing({ tasks: [task({ lastRun: run({ detail }) })] }));
+      const view = render(<TasksPane />);
+      const row = await screen.findByTestId(TASKS_ROW_TESTID);
+      expect(within(row).queryByText(TASK_LAST_REPORT_LABEL), detail).not.toBeInTheDocument();
+      // And the row still says everything else it said.
+      expect(within(row).getByText("Succeeded")).toBeInTheDocument();
+      view.unmount();
+    }
+  });
+
+  it("gives the report the whole row rather than a quarter of it", async () => {
+    // The only assertion in this file that reads a class, and deliberately: the
+    // claim the `wide` prop makes is about layout, jsdom performs no layout, and
+    // dropping `wide` at the callsite is a silent omission rather than a type
+    // error — the prop defaults to `false`. Without this, half the change has no
+    // test and a git error goes back to wrapping five lines in a quarter column.
+    answer(listing({ tasks: [task({ lastRun: run({ detail: "3 synced" }) })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    const cell = within(row).getByText(TASK_LAST_REPORT_LABEL).parentElement;
+    expect(cell).toHaveClass("col-span-2", "sm:col-span-4");
+    // And the engine's own line breaks survive, which is what "verbatim" means
+    // once HTML is involved.
+    expect(within(row).getByText("3 synced")).toHaveClass("whitespace-pre-wrap");
+  });
+
+  it("draws the report on the row it belongs to and on no other", async () => {
+    // Two rows, one loud and one silent, because every other test here renders a
+    // single task: a cell drawn from the wrong row's run, or drawn on every row,
+    // would pass all of them.
+    answer(
+      listing({
+        tasks: [
+          task({
+            id: "A",
+            lastRun: run({ detail: "3 synced, 0 already syncing, 0 waiting, 0 failed" }),
+          }),
+          task({ id: "B", lastRun: run({ outcome: "abandoned", detail: null }) }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+    const [loud, silent] = screen.getAllByTestId(TASKS_ROW_TESTID);
+
+    expect(
+      within(loud).getByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
+    ).toBeInTheDocument();
+    expect(within(silent).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
+    expect(
+      within(silent).queryByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the report a row already had when a Run now is refused", async () => {
+    // The row's stated invariant is that a refusal changes nothing else on it,
+    // and the pane's own refusal test pins `lastRun: null` — so the fifth cell
+    // was the one value that invariant was never asserted for.
+    answer(listing({ tasks: [task({ lastRun: run({ detail: "3 synced, 0 waiting" }) })] }));
+    vi.mocked(syncTaskRunNow).mockRejectedValue({
+      code: "busy",
+      message: "task 01SCHED is being run by another host on this machine",
+      accountId: null,
+      retriable: true,
+    });
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    await screen.findByTestId(TASKS_REFUSAL_TESTID);
+
+    const after = screen.getByTestId(TASKS_ROW_TESTID);
+    expect(within(after).getByText("3 synced, 0 waiting")).toBeInTheDocument();
+  });
+});
+
+/**
+ * A list of runs you can open (Story 58.3).
+ *
+ * `db::task_runs`, `Engine::task_history` and `sync_task_history` were finished,
+ * clamped, typed, wrapped and mocked for a whole wave while the only reference
+ * to the wrapper under `src/` was the `vi.fn()` at the top of this file. So the
+ * property under test is not that the data arrives — it always did — but that a
+ * control reaches it, exactly once per deliberate press, and that the three
+ * states of a read never borrow each other's words.
+ *
+ * The first assertion here is the one that keeps the section from becoming a
+ * poll, and every other assertion is against a string a reader sees or an
+ * argument the command was called with. Cross-crate facts are named by symbol
+ * rather than by line: `src-tauri/` is edited by the same wave that reads this
+ * file.
+ */
+describe("a task's runs open on the row, and are read only when asked for", () => {
+  /**
+   * The answer `sync_task_history` gives, newest first as `db::task_runs` orders
+   * it.
+   *
+   * Timed from the real clock rather than from {@link NOW}, because the pane
+   * measures every relative time from `Date.now()` at the instant the listing
+   * landed — so a fixture pinned to a constant would render as years ago.
+   */
+  function runs(count: number, base: number = Date.now()): TaskRunVm[] {
+    return Array.from({ length: count }, (_, index) =>
+      run({
+        id: count - index,
+        startedMs: base - (index + 1) * 60_000,
+        detail: `run ${count - index} of ${count}`,
+      }),
+    );
+  }
+
+  /**
+   * The disclosure on one row. Its accessible name is its `aria-label` — the
+   * word alone would name ten controls the same thing on a list of ten tasks.
+   */
+  function disclosure(id: string): HTMLElement {
+    return screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: ${id}` });
+  }
+  /**
+   * The fold's row counts are mutable module state, and one test below changes
+   * them to reach a state the defaults cannot. Restored here so nothing after it
+   * inherits a two-row fold.
+   */
+  afterEach(() => {
+    setSyncListSizes({
+      folded: SYNC_LIST_FOLDED_FALLBACK,
+      unfolded: SYNC_LIST_UNFOLDED_FALLBACK,
+    });
+  });
+
+  it("reads no history at all until somebody opens a section", async () => {
+    // The property that keeps this section from becoming a poll: with the read
+    // on render, or on the listing, every row of every refresh would cost an
+    // IPC call and AD-62's sentence would be about this pane.
+    answer(listing({ tasks: [task({ id: "01SCHED" }), task({ id: "01OTHER" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    expect(syncTaskHistory).not.toHaveBeenCalled();
+    expect(screen.queryByTestId(TASKS_HISTORY_TESTID)).not.toBeInTheDocument();
+  });
+
+  it("reads that row's runs once when opened, and shows what each of them said", async () => {
+    const base = Date.now();
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue([
+      run({
+        id: 7,
+        host: "dev#1",
+        startedMs: base - 5 * 60_000,
+        detail: "3 synced, 0 already syncing, 0 waiting, 0 failed",
+      }),
+      run({
+        id: 6,
+        host: "laptop#2",
+        outcome: "failed",
+        startedMs: base - 65 * 60_000,
+        detail: "0 synced, 1 failed: could not resolve host git.tgorka.dev",
+      }),
+    ]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(2));
+
+    // One press, one call, with that row's id and no invented limit: the bound
+    // is `TASK_HISTORY_LIMIT_DEFAULT`, in Rust, where it already is.
+    expect(syncTaskHistory).toHaveBeenCalledTimes(1);
+    expect(syncTaskHistory).toHaveBeenCalledWith("01SCHED");
+
+    // The CLI's four columns, in the CLI's order, each asserted as the real
+    // string rather than as an element that exists.
+    const [newest, older] = screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID);
+    expect(within(newest).getByText("Succeeded")).toBeInTheDocument();
+    expect(within(newest).getByText("5 min ago")).toBeInTheDocument();
+    expect(within(newest).getByText("dev#1")).toBeInTheDocument();
+    expect(
+      within(newest).getByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
+    ).toBeInTheDocument();
+    // Two runs with different reports, so a section that drew one run's words on
+    // every row could not pass.
+    expect(within(older).getByText("Failed")).toBeInTheDocument();
+    expect(within(older).getByText("1 hr ago")).toBeInTheDocument();
+    expect(within(older).getByText("laptop#2")).toBeInTheDocument();
+    expect(
+      within(older).getByText("0 synced, 1 failed: could not resolve host git.tgorka.dev"),
+    ).toBeInTheDocument();
+  });
+
+  it("issues no second read when the clock ticks or the listing is re-read", async () => {
+    // The anti-poll property, driven rather than asserted in prose: the display
+    // clock and `refresh` are the two things that re-render an open section
+    // without anybody pressing anything, and a history read on either of them
+    // would be a poll per open row.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+      vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+      render(<TasksPane />);
+      await screen.findByTestId(TASKS_ROW_TESTID);
+
+      fireEvent.click(disclosure("01SCHED"));
+      await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(1));
+
+      await vi.advanceTimersByTimeAsync(TASKS_CLOCK_TICK_MS * 4);
+      fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+      await waitFor(() => expect(syncTasks).toHaveBeenCalledTimes(2));
+      // `waitFor` returns when the listing call is MADE, not when it has settled
+      // and re-rendered — and a regression that chained a history read onto that
+      // continuation would still be a microtask away. So the count is read after
+      // the settle has visibly landed and the timers have been flushed again.
+      await waitFor(() => expect(screen.getByText("run 1 of 1")).toBeInTheDocument());
+      await vi.advanceTimersByTimeAsync(TASKS_CLOCK_TICK_MS);
+
+      expect(syncTaskHistory).toHaveBeenCalledTimes(1);
+      // And the section is still open, still holding the rows it read.
+      expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes the first section when a second row is opened, and reads once for it", async () => {
+    answer(listing({ tasks: [task({ id: "01SCHED" }), task({ id: "01OTHER" })] }));
+    vi.mocked(syncTaskHistory).mockImplementation(async (id) => [
+      run({ id: 1, detail: `${id}'s own run` }),
+    ]);
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText("01SCHED's own run")).toBeInTheDocument();
+
+    fireEvent.click(disclosure("01OTHER"));
+    expect(await screen.findByText("01OTHER's own run")).toBeInTheDocument();
+
+    // One section open at a time, `editingId`'s rule: the first is gone rather
+    // than scrolled apart from the row it belongs to.
+    expect(screen.queryByText("01SCHED's own run")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId(TASKS_HISTORY_TESTID)).toHaveLength(1);
+    expect(syncTaskHistory).toHaveBeenCalledTimes(2);
+    expect(syncTaskHistory).toHaveBeenLastCalledWith("01OTHER");
+  });
+
+  it("cannot land a slow read in a section that has since moved to another row", async () => {
+    // `historyToken`'s whole reason. Without it the first row's read resolves
+    // into the one slot the second row is now drawing from, and a person reading
+    // `01OTHER`'s history is shown `01SCHED`'s.
+    let landFirst: (value: TaskRunVm[]) => void = () => {};
+    answer(listing({ tasks: [task({ id: "01SCHED" }), task({ id: "01OTHER" })] }));
+    vi.mocked(syncTaskHistory).mockImplementation((id) =>
+      id === "01SCHED"
+        ? new Promise<TaskRunVm[]>((resolve) => {
+            landFirst = resolve;
+          })
+        : Promise.resolve([run({ id: 2, detail: "01OTHER's own run" })]),
+    );
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText(TASK_HISTORY_LOADING_TEXT)).toBeInTheDocument();
+
+    fireEvent.click(disclosure("01OTHER"));
+    expect(await screen.findByText("01OTHER's own run")).toBeInTheDocument();
+
+    await act(async () => {
+      landFirst([run({ id: 1, detail: "01SCHED's own run" })]);
+    });
+
+    expect(screen.getByText("01OTHER's own run")).toBeInTheDocument();
+    expect(screen.queryByText("01SCHED's own run")).not.toBeInTheDocument();
+  });
+
+  it("re-reads when a section is closed and opened again", async () => {
+    // Closing forgets, so re-opening is a re-read rather than a cache hit — the
+    // list `task_runs` may have trimmed underneath it is not what gets shown.
+    let landSecond: (value: TaskRunVm[]) => void = () => {};
+    let calls = 0;
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockImplementation(() => {
+      calls += 1;
+      return calls === 1
+        ? Promise.resolve([run({ id: 1, detail: "the first read" })])
+        : new Promise<TaskRunVm[]>((resolve) => {
+            landSecond = resolve;
+          });
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText("the first read")).toBeInTheDocument();
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(screen.queryByTestId(TASKS_HISTORY_TESTID)).not.toBeInTheDocument();
+
+    fireEvent.click(disclosure("01SCHED"));
+    // The loading line again, and not the list it had: an unread section says so.
+    expect(await screen.findByText(TASK_HISTORY_LOADING_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText("the first read")).not.toBeInTheDocument();
+    expect(syncTaskHistory).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      landSecond([run({ id: 2, detail: "the second read" })]);
+    });
+    expect(screen.getByText("the second read")).toBeInTheDocument();
+  });
+
+  it("says no runs recorded for an empty history, and never the loading line", async () => {
+    // `[]` is a fact and `null` is not: the CLI answers this case with
+    // `"{task_id}: no runs recorded"` and so does this section.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue([]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText(TASK_HISTORY_EMPTY_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText(TASK_HISTORY_LOADING_TEXT)).not.toBeInTheDocument();
+    expect(screen.queryAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(0);
+  });
+
+  it("quotes a refused read and never claims the task has no runs", async () => {
+    // A failed read is a fault to report, not a fact to invent — and the
+    // rejection is an `IpcError` *value*, so `messageOf` rather than
+    // `instanceof Error` is what keeps this from rendering "[object Object]".
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    const refusal = await screen.findByTestId(TASKS_HISTORY_REFUSAL_TESTID);
+
+    expect(refusal).toHaveTextContent("database is locked");
+    expect(screen.queryByText(TASK_HISTORY_EMPTY_TEXT)).not.toBeInTheDocument();
+    expect(screen.queryByText(TASK_HISTORY_LOADING_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("keeps the runs it already had when a re-read is refused", async () => {
+    // `keepRows`: the rows on screen were read successfully and are still the
+    // best thing known about this task, so a refusal is added to them rather
+    // than substituted for them.
+    let calls = 0;
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskRunNow).mockResolvedValue(run());
+    vi.mocked(syncTaskHistory).mockImplementation(() => {
+      calls += 1;
+      return calls === 1
+        ? Promise.resolve([run({ id: 1, detail: "the read that worked" })])
+        : Promise.reject({
+            code: "internal",
+            message: "database is locked",
+            accountId: null,
+            retriable: false,
+          });
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText("the read that worked")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    const refusal = await screen.findByTestId(TASKS_HISTORY_REFUSAL_TESTID);
+
+    expect(refusal).toHaveTextContent("database is locked");
+    expect(screen.getByText("the read that worked")).toBeInTheDocument();
+    expect(screen.queryByText(TASK_HISTORY_EMPTY_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("re-reads the open row's history once after a Run now on that row", async () => {
+    // The one re-read a refresh does not do, and the reason it is not a poll:
+    // this run is what changed that task's history, and the person pressed the
+    // button themselves.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskRunNow).mockResolvedValue(run());
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(syncTaskHistory).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    // Two settles, not one: `waitFor` resolves the moment the count REACHES two,
+    // so a regression that read twice per Run now would slip past. The Run now
+    // button coming back enabled is the pane's own evidence that the whole
+    // settle — the run, the listing re-read and the history re-read — has run to
+    // completion.
+    await waitFor(() => expect(syncTaskHistory).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeEnabled(),
+    );
+
+    expect(vi.mocked(syncTaskHistory).mock.calls.map(([id]) => id)).toEqual(["01SCHED", "01SCHED"]);
+    expect(screen.getByText("run 1 of 1")).toBeInTheDocument();
+
+    // And a Run now on a row whose section is NOT open reads no history at all.
+    fireEvent.click(disclosure("01SCHED"));
+    fireEvent.click(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeEnabled(),
+    );
+    expect(syncTaskHistory).toHaveBeenCalledTimes(2);
+  });
+
+  it("closes a section whose row the listing no longer holds", async () => {
+    // `refresh`'s `editingId` pruning, verbatim: a section cannot belong to a
+    // row the record does not have, and the id is re-creatable by hand.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await screen.findByTestId(TASKS_HISTORY_TESTID);
+
+    answer(listing({ tasks: [task({ id: "01OTHER" })] }));
+    fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+
+    await waitFor(() => expect(screen.queryByTestId(TASKS_HISTORY_TESTID)).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: 01OTHER` })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("offers no runs disclosure on a row this build cannot read", async () => {
+    // Not a `TaskVm`, and its id may be `""` — so `sync_task_history` has
+    // nothing to be asked about. The 58.3-specific claim is the named control's
+    // absence; the blanket no-buttons assertion is the pane's own, one block up.
+    answer(
+      listing({
+        tasks: [],
+        unknown: [{ id: "01FUTURE", reason: "unreadable task row: invalid kind 'teleport'" }],
+      }),
+    );
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_UNKNOWN_ROW_TESTID);
+
+    expect(
+      screen.queryByRole("button", { name: `${TASK_HISTORY_TITLE}: 01FUTURE` }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: new RegExp(`^${TASK_HISTORY_TITLE}:`) }),
+    ).toBeNull();
+  });
+
+  it("folds a long history to the folded size and unfolds it on one press", async () => {
+    // The shared fold rather than a third list idiom, and the control is named
+    // for its own list so ten rows do not offer ten controls a screen reader
+    // calls the same thing. The expected count is READ from the preference
+    // rather than written as 10: `syncListSizes()` is mutable module state, so a
+    // literal here would fail one day with a row count that looks unrelated to
+    // the fold.
+    const { folded } = syncListSizes();
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(20));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() =>
+      expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(folded),
+    );
+    expect(screen.getByText("run 20 of 20")).toBeInTheDocument();
+    expect(screen.queryByText("run 1 of 20")).not.toBeInTheDocument();
+
+    const unfold = screen.getByRole("button", {
+      name: `${LIST_FOLD_MORE_LABEL(20)}: ${TASK_HISTORY_TITLE}: 01SCHED`,
+    });
+    fireEvent.click(unfold);
+
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(20));
+    expect(screen.getByText("run 1 of 20")).toBeInTheDocument();
+    // Everything read is now on screen, so nothing is being held back.
+    expect(screen.queryByText(/more recorded and not shown/)).not.toBeInTheDocument();
+  });
+
+  it("counts the runs an unfolded list still holds back", async () => {
+    // The fold's unfolded size is a global preference with a floor of ten while
+    // a history page is twenty runs, so *Show all* can leave half the list
+    // hidden with `FoldToggle` saying only "Show fewer" — a reader who pressed
+    // it would believe they had seen everything.
+    setSyncListSizes({ folded: 2, unfolded: 3 });
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(5));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(2));
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${LIST_FOLD_MORE_LABEL(3)}: ${TASK_HISTORY_TITLE}: 01SCHED`,
+      }),
+    );
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(3));
+
+    expect(screen.getByText(taskHistoryUnshownText(2))).toBeInTheDocument();
+  });
+
+  it("drops the empty sentence once a refusal explains why it cannot know", async () => {
+    // The sharpest of the three-states rules. A task with no runs reads `[]`,
+    // then a Run now writes one — and if that re-read is refused, a section
+    // still saying "no runs recorded" beside "database is locked" states as a
+    // fact the thing the refusal has just said it cannot know.
+    let calls = 0;
+    answer(listing({ tasks: [task({ id: "01SCHED", lastRun: null })] }));
+    vi.mocked(syncTaskRunNow).mockResolvedValue(run());
+    vi.mocked(syncTaskHistory).mockImplementation(() => {
+      calls += 1;
+      return calls === 1
+        ? Promise.resolve([])
+        : Promise.reject({
+            code: "internal",
+            message: "database is locked",
+            accountId: null,
+            retriable: false,
+          });
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText(TASK_HISTORY_EMPTY_TEXT)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    await screen.findByTestId(TASKS_HISTORY_REFUSAL_TESTID);
+
+    expect(screen.queryByText(TASK_HISTORY_EMPTY_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("says how to ask again, because nothing re-reads a refusal on its own", async () => {
+    // Without this the refusal is a dead end: a listing refresh deliberately
+    // leaves the section alone, so the only retry is closing the disclosure and
+    // opening it — which the one obvious press looks like a dismissal of.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    const refusal = await screen.findByTestId(TASKS_HISTORY_REFUSAL_TESTID);
+    expect(refusal).toHaveTextContent(TASK_HISTORY_RETRY_NOTE);
+
+    // And that retry genuinely works: close, open, and the command is asked
+    // again rather than the section restoring what it had.
+    fireEvent.click(disclosure("01SCHED"));
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(syncTaskHistory).toHaveBeenCalledTimes(2));
+  });
+
+  it("names a run whose host or report the record left blank", async () => {
+    // `host` is `TEXT NOT NULL` with no non-empty constraint and `detail` is
+    // nullable, so the same foreign-writer class `taskReportText` exists for can
+    // leave either blank. Which host ran it is most of the point of this list, so
+    // a blank there is named; a blank report is silence.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    // Timed from the real clock, because the pane measures every relative time
+    // against `Date.now()` at the instant the listing landed.
+    const started = Date.now() - 5 * 60_000;
+    vi.mocked(syncTaskHistory).mockResolvedValue([
+      run({ id: 2, startedMs: started, host: "   ", detail: "   " }),
+      run({ id: 1, startedMs: started, host: "dev#1", detail: "3 synced" }),
+    ]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(2));
+    const [blank, named] = screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID);
+
+    expect(within(blank).getByText(TASK_HISTORY_NO_HOST_TEXT)).toBeInTheDocument();
+    // The blank report draws no cell at all: the row ends at its host, so its
+    // whole text is the outcome, the time and the stand-in for the host.
+    expect(blank.textContent).toBe(`Succeeded5 min ago${TASK_HISTORY_NO_HOST_TEXT}`);
+    // And the row beside it is unaffected.
+    expect(within(named).getByText("dev#1")).toBeInTheDocument();
+    expect(within(named).getByText("3 synced")).toBeInTheDocument();
+  });
+
+  it("names an outcome whose stored spelling is blank rather than rendering nothing", async () => {
+    // A spelling this build cannot read is rendered verbatim (NFR-43) — but `""`
+    // renders as nothing, and this is the leading word of the row. Falling
+    // through would be worse still: the next branch would call a closed run
+    // "running now".
+    expect(taskOutcomeText(run({ outcome: null, unknownOutcome: "  " }))).toBe(
+      TASK_UNREADABLE_OUTCOME_TEXT,
+    );
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue([
+      run({ id: 1, outcome: null, unknownOutcome: "" }),
+    ]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    const entry = await screen.findByTestId(TASKS_HISTORY_ROW_TESTID);
+    expect(within(entry).getByText(TASK_UNREADABLE_OUTCOME_TEXT)).toBeInTheDocument();
+    expect(within(entry).queryByText(TASK_IN_FLIGHT_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("names the region it opens, so the control is not a dead end for a screen reader", async () => {
+    // `aria-expanded` alone announces "collapsed" and offers nothing to jump to.
+    // The IDREF exists only while the section does (`note-editor.tsx`'s form), so
+    // it can never dangle.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(disclosure("01SCHED")).not.toHaveAttribute("aria-controls");
+    fireEvent.click(disclosure("01SCHED"));
+    const section = await screen.findByTestId(TASKS_HISTORY_TESTID);
+
+    expect(disclosure("01SCHED")).toHaveAttribute("aria-controls", section.id);
+    expect(section.id).not.toBe("");
+  });
+
+  it("keeps one of the runs and the edit form open on a row, never both", async () => {
+    // The one-at-a-time argument this section borrows from `editingId` is about
+    // height: a twenty-run list plus an eight-control form is exactly the wall
+    // that argument exists to forbid.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await screen.findByTestId(TASKS_HISTORY_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+    await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+    expect(screen.queryByTestId(TASKS_HISTORY_TESTID)).not.toBeInTheDocument();
+
+    fireEvent.click(disclosure("01SCHED"));
+    await screen.findByTestId(TASKS_HISTORY_TESTID);
+    expect(
+      screen.queryByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("refuses to open the runs while a save is on its way to that record", async () => {
+    // The guard Edit and Forget already carry, for this control's own reason:
+    // opening the runs closes the edit form, so pressing this mid-save would
+    // unmount the form Rust's refusal has to land in.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskSave).mockImplementation(() => new Promise<TaskVm>(() => {}));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+    const form = await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+    fireEvent.click(within(form).getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(disclosure("01SCHED")).toBeDisabled());
+    fireEvent.click(disclosure("01SCHED"));
+    expect(syncTaskHistory).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("the pane also lists what this host paces, and says it is not a task", () => {
+  it("states, per projected row, its kind, its folder, its cadence and Rust's sentence", async () => {
+    answer(listing());
+    answerPaced([pacedRow()]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(row).toHaveAttribute("data-paced-id", "scan:p1");
+    expect(within(row).getByText(PACED_BADGE)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_KIND_LABELS.scan)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_FOLDER_LABEL)).toBeInTheDocument();
+    expect(within(row).getByText("keeper")).toBeInTheDocument();
+    expect(within(row).getByText(PACED_CADENCE_LABEL)).toBeInTheDocument();
+    expect(within(row).getByText("about every 15 seconds")).toBeInTheDocument();
+    // Rust's, verbatim — the two filesystem triggers included, which is the one
+    // thing the interval alone would be read as denying.
+    expect(within(row).getByText(PACED_SENTENCE_SCAN)).toBeInTheDocument();
+  });
+
+  it("renders a kind this build does not know as its own spelling", async () => {
+    // `HOST_KIND_LABELS`'s rule, applied to the class that grows next:
+    // `PacedWorkKind` can gain a variant in Rust, and a blank label would hide
+    // a row this build was still handed.
+    answer(listing());
+    answerPaced([
+      pacedRow({
+        id: "teleport:p1",
+        // A spelling only a newer keeper writes. Cast because the union in the
+        // generated binding is this build's, which is exactly the drift the
+        // fallback exists for.
+        kind: "teleportSweep" as PacedWorkVm["kind"],
+      }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+    expect(within(row).getByText("teleportSweep")).toBeInTheDocument();
+  });
+
+  it("offers no control of any kind on a projected row, and says so in words first", async () => {
+    // The absence, asserted in BOTH shapes. By name, because those four are the
+    // controls a reader of the list above will look for; and by role over the
+    // whole row, because a fifth control added later would pass the by-name
+    // assertions while putting a button on a row nothing can run.
+    //
+    // Not a disabled button either: a disabled control says *not now* and the
+    // truth is *not ever*.
+    answer(listing());
+    answerPaced([pacedRow()]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).queryAllByRole("button")).toEqual([]);
+    for (const name of [TASK_RUN_NOW_TEXT, TASK_EDIT_TEXT, TASK_FORGET_TEXT, TASK_HISTORY_TITLE]) {
+      expect(within(row).queryByRole("button", { name })).toBeNull();
+    }
+    // And the absence is EXPLAINED rather than merely present: a reader who
+    // knows a Sync task can be run on demand would otherwise read a row with no
+    // Run now as a row whose Run now failed to render.
+    expect(screen.getByText(PACED_SUBTITLE)).toBeInTheDocument();
+  });
+
+  it("does not re-read the projection when the pane's display clock ticks", async () => {
+    // AD-142: the projection registers no clock and is not polled. It rides the
+    // pane's existing read, so the tick that moves every relative time on screen
+    // must not cost a second call.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      answer(listing());
+      answerPaced([pacedRow()]);
+      render(<TasksPane />);
+      await screen.findByTestId(PACED_ROW_TESTID);
+
+      for (let tick = 0; tick < 3; tick += 1) {
+        await vi.advanceTimersByTimeAsync(TASKS_CLOCK_TICK_MS);
+      }
+
+      expect(syncPacedWork).toHaveBeenCalledTimes(1);
+      // The listing is not re-read either: one pass read both.
+      expect(syncTasks).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId(PACED_ROW_TESTID)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says a paused folder is paused, and shows no cadence beside it", async () => {
+    // The invariant is enforced in Rust — `cadence` is `Some` only for `paced` —
+    // so what this asserts is that the view does not invent one to fill the cell.
+    answer(listing());
+    answerPaced([
+      pacedRow({
+        id: "sweep:p3",
+        kind: "scratchSweep",
+        profile: "archive",
+        profileId: "p3",
+        standing: "paused",
+        cadence: null,
+        sentence: PACED_SENTENCE_PAUSED,
+      }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).getByText(PACED_SENTENCE_PAUSED)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
+    expect(within(row).queryByText(/about every/)).toBeNull();
+    // The badge carries the standing, so it cannot contradict the sentence on
+    // its own row. Found by rendering the section, not by a test: *Paced* sat
+    // one line above "nothing here is paced" and each half was correct alone.
+    expect(within(row).getByText(PACED_STANDING_LABELS.paused)).toBeInTheDocument();
+    expect(within(row).queryByText(PACED_BADGE)).toBeNull();
+  });
+
+  // NOT a contract test on Story 58.8, though it was labelled one. This test
+  // hands `syncPacedWork` a hardcoded governed row at the IPC boundary, so it
+  // exercises no Rust: reverting 58.8's stand-down leaves it green. What it does
+  // assert is this pane's half of the contract — that a governed row renders its
+  // sentence and invents no cadence to fill the empty column.
+  //
+  // The guard that would actually fail on such a revert lives where the decision
+  // does: `sync_poll_permits`' `Some(Scheduled) => false` arm and its tests in
+  // `keeper-sync`, and the projection's governed-row tests in `keeper-core`. A
+  // comment claiming coverage that a mock cannot provide is worse than no
+  // comment, because it is read as a reason not to write the real one.
+  it("says a governed scan has stood down, and advertises no cadence for it", async () => {
+    answer(listing());
+    answerPaced([
+      pacedRow({ standing: "governed", cadence: null, sentence: PACED_SENTENCE_GOVERNED }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).getByText(PACED_SENTENCE_GOVERNED)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
+    // The event triggers survive governance: what stood down is the interval.
+    expect(within(row).getByText(/watcher sees settle still brings a look forward/)).toBeVisible();
+  });
+
+  // The over-claim this row's registration fact exists to prevent: a folder can
+  // hold a vault keeper has nothing registered to pace, and the cadence cell
+  // must not recite an interval nobody is keeping.
+  it("says an unregistered vault is not paced, and names the registry rather than a cadence", async () => {
+    answer(listing());
+    answerPaced([
+      pacedRow({
+        id: "notes:p1",
+        kind: "notesCadence",
+        standing: "unregistered",
+        cadence: null,
+        sentence: PACED_SENTENCE_UNREGISTERED,
+      }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).getByText(PACED_SENTENCE_UNREGISTERED)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
+    expect(within(row).queryByText(/committed after/)).toBeNull();
+    // And it is still not a task: no control appeared with the new standing.
+    expect(within(row).queryAllByRole("button")).toHaveLength(0);
+  });
+
+  // The section's claim is completeness, so the fold may hide rows only while it
+  // is collapsed. Every other folding list in the app is capped by the query
+  // behind it; this one has no query, so a cap on the expanded view would drop
+  // rows with no control left to reveal them.
+  it("unfolds to every projected row rather than to the global unfolded size", async () => {
+    setSyncListSizes({ folded: 2, unfolded: 3 });
+    answer(listing());
+    const rows = Array.from({ length: 7 }, (_unused, index) =>
+      pacedRow({ id: `scan:p${index}`, profileId: `p${index}`, profile: `folder-${index}` }),
+    );
+    answerPaced(rows);
+    render(<TasksPane />);
+    await screen.findAllByTestId(PACED_ROW_TESTID);
+
+    expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(2);
+    // The control promises the list's own length, not the setting's.
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${LIST_FOLD_MORE_LABEL(7)}: ${PACED_HEADING}`,
+      }),
+    );
+    await waitFor(() => expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(7));
+
+    expect(screen.getByText("folder-6")).toBeVisible();
+  });
+
+  it("quotes a refused projection and leaves the task rows above it standing", async () => {
+    // `Promise.allSettled` is what makes this true: `all` would reject on the
+    // first failure and throw the listing away with it. A failed read is a fault
+    // to report, not a fact to invent — and never a reason to blank a list that
+    // read successfully.
+    answer(listing());
+    vi.mocked(syncPacedWork).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+
+    const refusal = await screen.findByTestId(PACED_REFUSAL_TESTID);
+    expect(refusal).toHaveTextContent("database is locked");
+    expect(refusal).toHaveAttribute("role", "alert");
+    // The section's own sentences yield to it: neither may claim anything about
+    // a machine whose projection did not read.
+    expect(screen.queryByText(PACED_EMPTY_TEXT)).toBeNull();
+    expect(screen.queryByText(PACED_LOADING_TEXT)).toBeNull();
+    // And the task list is untouched.
+    const row = screen.getByTestId(TASKS_ROW_TESTID);
+    expect(within(row).getByText("01SCHED")).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeInTheDocument();
+    expect(screen.queryByTestId(TASKS_ERROR_TESTID)).toBeNull();
+  });
+
+  it("says unread and says empty in different words, and never both", async () => {
+    // `null` is unread and `[]` is "keeper paces nothing here". A single
+    // falsy check would have said one of those two things about the other.
+    answer(listing());
+    // Never resolves: the section stays at `null` for the whole of this half.
+    vi.mocked(syncPacedWork).mockImplementation(() => new Promise<PacedWorkVm[]>(() => {}));
+    const unread = render(<TasksPane />);
+    expect(await screen.findByText(PACED_LOADING_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText(PACED_EMPTY_TEXT)).toBeNull();
+    unread.unmount();
+
+    answerPaced([]);
+    render(<TasksPane />);
+    expect(await screen.findByText(PACED_EMPTY_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText(PACED_LOADING_TEXT)).toBeNull();
+    expect(screen.queryAllByTestId(PACED_ROW_TESTID)).toEqual([]);
+  });
+
+  it("lists every projected row for a folder, and the sweep reads the engine's hour", async () => {
+    answer(listing());
+    answerPaced([
+      pacedRow(),
+      pacedRow({
+        id: "sweep:p1",
+        kind: "scratchSweep",
+        cadence: "every 1 hour",
+        sentence: PACED_SENTENCE_SWEEP,
+      }),
+    ]);
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(2));
+
+    const sweep = screen
+      .getAllByTestId(PACED_ROW_TESTID)
+      .find((candidate) => candidate.getAttribute("data-paced-id") === "sweep:p1");
+    expect(sweep).toBeDefined();
+    expect(within(sweep as HTMLElement).getByText(PACED_KIND_LABELS.scratchSweep)).toBeVisible();
+    expect(within(sweep as HTMLElement).getByText("every 1 hour")).toBeVisible();
+    expect(within(sweep as HTMLElement).getByText(PACED_SENTENCE_SWEEP)).toBeVisible();
   });
 });

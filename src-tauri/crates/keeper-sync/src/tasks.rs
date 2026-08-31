@@ -41,6 +41,59 @@ pub const MIN_SCHEDULE_INTERVAL_MS: i64 = 60_000;
 /// (`0 0 1 1 *`), so nothing is lost by refusing here.
 const MAX_SCHEDULE_INTERVAL_MS: i64 = 366 * 24 * 60 * 60 * 1_000;
 
+/// How long an open window may sit unserved before keeper concludes **nobody
+/// was home** (Story 58.4, FR-356, AD-139).
+///
+/// The policy's detection boundary, and the only thing that separates *"a window
+/// this host has not reached yet"* from *"a window nobody was here to serve"*.
+/// [`TaskMissedPolicy::RunNow`] does not consult it; the other two act only past
+/// it, so a window that opens while a host is present is served normally under
+/// **all three** settings. That is what makes `on_missed` a policy about *missed*
+/// windows rather than a general re-timing of the schedule — the owner's own
+/// qualifier, *"w takiej sytuacji"*.
+///
+/// **Why `skip` cannot do without it.** The due-gate runs on a 1 Hz tick, so
+/// with no grace a `skip` task's window would be abandoned within a second of
+/// opening, on every window, forever: a task that reports itself enabled and
+/// scheduled while nothing ever runs, which is the one shape this whole feature
+/// exists to close (`Engine::arm_task_window`'s load-bearing `warn`).
+///
+/// Fifteen minutes: long enough that a host that is present serves its own
+/// window well inside it (the tick is one second, and the only thing that can
+/// hold it up that far is a sync pass — in which case nobody *did* serve the
+/// window), and short enough that a `@daily` task missed overnight is still
+/// noticed on the day it was missed.
+pub const TASK_MISSED_GRACE_MS: i64 = 15 * 60_000;
+
+/// How long [`TaskMissedPolicy::Delay`] holds a missed window back, measured
+/// **from the instant a host noticed it** (Story 58.4, FR-356, AD-139).
+///
+/// A separate number from [`TASK_MISSED_GRACE_MS`] because it answers a separate
+/// question — that one is *when do we conclude nobody was home*, this one is
+/// *how long do we then wait* — and neither is derived from the other.
+///
+/// **The anchor is the noticing, not the window**, and that is the whole
+/// correctness of this setting. Anchoring on `next_due_ms` — the first draft of
+/// this story, and the literal reading of AD-139's arithmetic — makes the option
+/// vanish in precisely the scenario the owner described: an hourly task, a host
+/// back two hours late, so `next_due_ms + delay` is already an hour in the past
+/// and `delay` serves the window immediately, identically to `run_now`. Two of
+/// his three options would have been one option.
+///
+/// It costs **no second column** (AD-139's rule is intact): the postponement is
+/// written into `next_due_ms` itself, through the same forward-only
+/// compare-and-set a skip uses, so it is still exactly one stored instant and
+/// AD-138's no-enumeration rule holds by construction. Persisting it rather than
+/// recomputing it also means a restart *inside* the delay respects the delay,
+/// which a `decide`-side wait could not have offered.
+///
+/// Thirty minutes, and longer than the grace on purpose: the case this setting
+/// is for is a machine that has just come back, where the minutes after the
+/// grace elapses are the busiest — a boot, a login, a mail client and a browser
+/// all waking at once — and housekeeping over a git remote is exactly the work
+/// that should not join that.
+pub const TASK_MISSED_DELAY_MS: i64 = 30 * 60_000;
+
 /// Milliseconds in one minute — the resolution of the whole cron dialect.
 const MS_PER_MINUTE: i64 = 60_000;
 /// Milliseconds in one day, the unit [`CronSpec::next_due_after`] walks in.
@@ -177,9 +230,124 @@ impl TaskMode {
     }
 }
 
-/// How one run ended.
+/// What to do about a window that fell due while nobody was home (Story 58.4,
+/// FR-356, AD-139).
 ///
-/// Three of the five are deliberately **not** failures, and keeping them apart
+/// Two of these three already exist in the tree, unnamed and unselectable, which
+/// is the reason a policy is worth having rather than a behaviour worth
+/// inventing. [`Self::RunNow`] is what an ordinary restart does: nothing
+/// rewrites the row, so the stored past window fires on the next tick.
+/// [`Self::Skip`] is what [`crate::db::upsert_task`]'s three service edges do —
+/// they clear `next_due_ms` precisely so a stale window cannot fire. So today
+/// the operator gets one or the other depending on which door the row last came
+/// through; this makes the choice explicit and per task.
+///
+/// **No setting may enumerate more than one missed window** (AD-138, NFR-44).
+/// That is not tidiness: [`TaskKind::Release`] deletes local content, so N
+/// catch-up sweeps are N deletion passes at instants nobody chose. It holds by
+/// construction here — `next_due_ms` is one `i64`, not a queue, so "overdue by
+/// one window" and "overdue by two hundred" are the same state and nothing in
+/// [`decide`] can tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskMissedPolicy {
+    /// Serve the window on the first tick that sees it open.
+    ///
+    /// The default, and the default **because it reproduces today's restart
+    /// behaviour**, so no existing install changes meaning on upgrade. It is
+    /// also precisely systemd's `Persistent=true` semantics in-process, which
+    /// the shipped timer already words the same way: *"A trigger missed while
+    /// the machine was off or asleep fires once when it comes back … Once, not
+    /// once per missed day"*.
+    #[default]
+    RunNow,
+    /// Hold a missed window back, and serve it **once**,
+    /// [`TASK_MISSED_DELAY_MS`] after a host noticed it.
+    ///
+    /// Not a floor on how soon, and not a re-timing of the schedule: a window
+    /// that opens while a host is present is served normally, because this policy
+    /// is about a window that was *missed*. Only past [`TASK_MISSED_GRACE_MS`]
+    /// does it act, and then it acts by **writing** — see [`Action::Postpone`] —
+    /// so the wait is a persisted instant rather than a decision retaken on every
+    /// tick.
+    ///
+    /// Two things follow from that, and both are the reason the anchor moved.
+    /// `db::claim_task`'s `next_due_ms <= now` condition correctly **fails** for
+    /// the length of the delay, so the run is held back by the arbiter rather
+    /// than beside it. And a restart inside the delay respects the delay, because
+    /// the instant is on the row rather than in a process that has just started.
+    Delay,
+    /// Abandon a window nobody served and arm the next one.
+    ///
+    /// Only once it has been open for [`TASK_MISSED_GRACE_MS`]: a host that is
+    /// present serves its own window, and `skip` is about the window a host that
+    /// was absent left behind. It **must re-arm** — see [`Action::Skip`].
+    Skip,
+}
+
+impl TaskMissedPolicy {
+    /// Stable on-disk spelling, kept separate from any serde representation for
+    /// [`TaskKind::as_str`]'s reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RunNow => "run_now",
+            Self::Delay => "delay",
+            Self::Skip => "skip",
+        }
+    }
+
+    /// Parse the *stored* spelling; `None` for a policy a newer keeper wrote, so
+    /// the row is skipped and listed rather than run under a policy this build
+    /// guessed (NFR-43). Guessing is the dangerous direction: reading an unknown
+    /// spelling as `run_now` would run a window its author asked to skip.
+    pub fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "run_now" => Some(Self::RunNow),
+            "delay" => Some(Self::Delay),
+            "skip" => Some(Self::Skip),
+            _ => None,
+        }
+    }
+}
+
+/// Who asked for a run through the explicit run verb (Story 58.6, FR-358).
+///
+/// The engine's own `TaskTrigger` is private, and deliberately: `Scheduled` is
+/// the due-gate's to pass and nobody outside may claim to be it. This is the
+/// half a caller *may* choose, and it exists because **a timer is not a person**.
+///
+/// Nothing about the process can tell the two apart. `keeper-syncd-tasks@.service`
+/// runs the same binary with the same argv shape somebody would type, and a
+/// person may equally run the verb from a script — so an environment probe, a
+/// parent-process check or a TTY test would all be heuristics that are wrong
+/// silently, on the one box where the defect this distinction fixes exists. Only
+/// the caller knows, so the caller says.
+///
+/// A type rather than a `bool`, at every call site, for the reason this tree
+/// already states about two adjacent booleans: `run_task_now(id, true)` is a call
+/// nobody can read and anybody can invert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskRunDriver {
+    /// A person, or the app's Run now button, or a script somebody wrote.
+    ///
+    /// Asking for a run **now**, which is not asking whether one is due: the
+    /// claim demands no open window, and that is the whole point of it.
+    #[default]
+    Person,
+    /// A scheduled external driver — Story 57.7's `Persistent=true` timer —
+    /// wearing a manual verb.
+    ///
+    /// It gets the *window* discipline a scheduled run gets whenever an
+    /// in-process host is pacing the same task, because otherwise one missed
+    /// window yields two runs: the timer's request bypasses `db::claim_task`'s
+    /// window condition while the daemon's next tick claims the same past window
+    /// independently. When nothing in-process paces the task, this timer **is**
+    /// the schedule and claims like a request.
+    Timer,
+}
+
+/// How one run ended — or, for two of the seven, why there was no run at all.
+///
+/// Five of the seven are deliberately **not** failures, and keeping them apart
 /// is what stops a scheduled task crying wolf once an hour.
 ///
 /// [`Self::Busy`] records that the target was already in use when the task came
@@ -191,6 +359,16 @@ impl TaskMode {
 /// `Retriability::Deferred` for exactly that reason. [`Self::Abandoned`] is
 /// written *by the next host* when it reclaims an expired lease, so a killed
 /// process leaves a closed run rather than a wedged row.
+///
+/// [`Self::Declined`] and [`Self::Postponed`] are the odd two and the newest
+/// (Story 58.5), and the thing that makes them odd is worth stating: **every
+/// other variant is written by a host that took the lease**. Five of the seven
+/// therefore assert that a host was present and reached the task, which is
+/// precisely what is *not* true of a window that fell due while nobody was home.
+/// The pair are not interchangeable either: a declined window will **never** be
+/// served, a postponed one **will** be, later — so a surface that conflated them
+/// would tell somebody their housekeeping had been dropped when it had only been
+/// held back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
     /// The work ran and did what it was asked to.
@@ -203,6 +381,46 @@ pub enum TaskOutcome {
     Failed,
     /// The run was never closed by the host that started it.
     Abandoned,
+    /// There was no run: the task's missed-window policy declined this window
+    /// and armed the next one (Story 58.5, FR-357, AD-140).
+    ///
+    /// The one variant written **without a lease**, because nothing ran and
+    /// nothing needed serializing. It exists because none of the five above can
+    /// carry the fact, and their own doc comments settle it: `Busy` needs a
+    /// target that was in use, `Deferred` needs a condition that was waited on,
+    /// `Abandoned` needs a host that started a run, and `Ok` and `Failed` both
+    /// assert the work ran.
+    ///
+    /// **`Deferred` in particular must not be reused for this.**
+    /// `Engine::next_task_window` consumes `Deferred` to retry within
+    /// `TASK_RETRY_MS`, so it means *"try again very soon"* — the exact opposite
+    /// of *"this window is abandoned"*, and overloading it would silently turn
+    /// `on_missed = skip` into `on_missed = retry in a minute`. For the mirror
+    /// reason this variant stays **out** of that retry group: a decline has
+    /// already moved the window forward, so treating it as a run that did not
+    /// happen would rewind it and re-decide the same window a minute later.
+    ///
+    /// Recorded rather than logged because a policy nobody can see the effect of
+    /// is the invisible-non-execution shape this feature exists to close: before
+    /// this variant a declined window left no row anywhere, and the Tasks view's
+    /// *last run* went stale for a reason it could not show.
+    Declined,
+    /// There was no run *yet*: the task's missed-window policy held this window
+    /// back, and it is armed for later (Story 58.5, FR-357, AD-140).
+    ///
+    /// [`Self::Declined`]'s twin and its opposite. Both are written without a
+    /// lease, both record a decision rather than a run, and both exist so that
+    /// `on_missed`'s two non-default settings are visible rather than silent. The
+    /// difference is the one a reader most needs: this window **is** going to be
+    /// served, at the instant `detail` names.
+    ///
+    /// Kept separate from [`Self::Deferred`] for the reason that variant's own
+    /// doc gives — `Deferred` is consumed by `Engine::next_task_window` to retry
+    /// within `TASK_RETRY_MS`, which would collapse a thirty-minute postponement
+    /// into a one-minute one — and separate from [`Self::Declined`] because
+    /// *"held back"* and *"dropped"* are different answers to *"will my nightly
+    /// sweep happen"*.
+    Postponed,
 }
 
 impl TaskOutcome {
@@ -214,6 +432,8 @@ impl TaskOutcome {
             Self::Deferred => "deferred",
             Self::Failed => "failed",
             Self::Abandoned => "abandoned",
+            Self::Declined => "declined",
+            Self::Postponed => "postponed",
         }
     }
 
@@ -226,6 +446,8 @@ impl TaskOutcome {
             "deferred" => Some(Self::Deferred),
             "failed" => Some(Self::Failed),
             "abandoned" => Some(Self::Abandoned),
+            "declined" => Some(Self::Declined),
+            "postponed" => Some(Self::Postponed),
             _ => None,
         }
     }
@@ -286,6 +508,13 @@ pub struct TaskState {
     pub next_due_ms: Option<i64>,
     /// When the current holder's claim expires; `None` means unclaimed.
     pub lease_until_ms: Option<i64>,
+    /// What to do about a window that fell due while nobody was home.
+    ///
+    /// Read here rather than passed alongside because it is a property of the
+    /// row, exactly as `mode` is. Acting on it is [`decide`]'s, and for the two
+    /// non-default settings the action is a **write** rather than a wait: see
+    /// [`Action::Postpone`] and [`Action::Skip`].
+    pub on_missed: TaskMissedPolicy,
 }
 
 /// What the host should do about one task on this tick.
@@ -297,6 +526,40 @@ pub enum Action {
     Arm,
     /// Claim the lease and run the work.
     Run,
+    /// Abandon the open window and arm the next one. Nothing runs.
+    ///
+    /// The variant `Action` could not do without once a policy may decline a
+    /// window (Story 58.4). [`Self::None`] cannot express it: the past window
+    /// would stay standing, so the next tick would decide about it again,
+    /// forever. And the write cannot be `db::arm_task`, which is `WHERE
+    /// next_due_ms IS NULL` because first sight can only happen once — a skip
+    /// needs its own forward-only write.
+    ///
+    /// `Engine::run_due_tasks`' match is exhaustive with no `_` arm, so adding
+    /// this **forces** every host to decide what it does rather than inherit
+    /// silence.
+    Skip,
+    /// Hold the open window back to a later instant. Nothing runs, yet.
+    ///
+    /// [`TaskMissedPolicy::Delay`]'s action, and it is an action rather than a
+    /// wait for one reason: the delay has to be anchored on the instant a host
+    /// **noticed** the missed window, and the only place that instant can be kept
+    /// without a second column is `next_due_ms` itself. So the host writes
+    /// `now_ms + `[`TASK_MISSED_DELAY_MS`] through the same forward-only
+    /// compare-and-set [`Self::Skip`] uses.
+    ///
+    /// The window it writes is in the **future**, which is what distinguishes
+    /// this from [`Self::Skip`]: the run still happens, once, later. And because
+    /// the instant is stored, `db::claim_task`'s window condition holds the run
+    /// back on every host for the whole delay — including a host that restarts
+    /// inside it.
+    ///
+    /// It cannot loop. A postponed window arrives fresh — nought late — so
+    /// [`decide`] answers [`Self::Run`] rather than postponing again; only a host
+    /// that went away *again* for longer than the grace can postpone a second
+    /// time, which is the same fact about the same absence and still one stored
+    /// instant.
+    Postpone,
 }
 
 impl TaskSchedule {
@@ -722,6 +985,23 @@ pub fn validate_id(id: &str) -> Result<()> {
 /// noon must run tonight, not at noon. A live lease yields [`Action::None`] on
 /// every other host, and an *expired* one falls through to the due check, which
 /// is what makes a dead holder's task reclaimable rather than wedged forever.
+///
+/// # The MISSED window is where the policy lives
+///
+/// The due test is still a scalar compare on one stored instant, so nothing here
+/// counts elapsed windows and nothing here could produce N runs (AD-138).
+/// [`TaskState::on_missed`] chooses only what happens to a window that is
+/// **already open** *and* has been open for [`TASK_MISSED_GRACE_MS`] — long
+/// enough that no host was here to serve it. Inside the grace all three settings
+/// answer [`Action::Run`], which is what makes this a policy about *missed*
+/// windows rather than a re-timing of the schedule.
+///
+/// [`TaskMissedPolicy::RunNow`]'s answer is textually the one this function has
+/// always had, unconditionally, which is why it is the default and why an upgrade
+/// changes no install's meaning. The other two answer with a **write** rather
+/// than a wait — [`Action::Postpone`] and [`Action::Skip`] — because both need to
+/// anchor on the instant a host *noticed*, and `next_due_ms` is the only place
+/// that instant can live without a second column.
 pub fn decide(state: &TaskState, schedule: Option<&TaskSchedule>, now_ms: i64) -> Action {
     if !state.enabled || state.mode != TaskMode::Scheduled {
         return Action::None;
@@ -734,7 +1014,29 @@ pub fn decide(state: &TaskState, schedule: Option<&TaskSchedule>, now_ms: i64) -
     }
     match state.next_due_ms {
         None => Action::Arm,
-        Some(at) if now_ms >= at => Action::Run,
+        Some(at) if now_ms >= at => {
+            // The instant at which a window nobody served stops counting as one
+            // this host merely has not reached yet. Saturating because a stored
+            // window from a newer keeper can be any `i64`.
+            let missed = now_ms >= at.saturating_add(TASK_MISSED_GRACE_MS);
+            if !missed {
+                // A host is here and this is its own window. Every policy serves
+                // it, including the two that would otherwise re-time a schedule
+                // nobody asked them to re-time.
+                return Action::Run;
+            }
+            match state.on_missed {
+                // Today's behaviour, unchanged.
+                TaskMissedPolicy::RunNow => Action::Run,
+                // Held back to `now + TASK_MISSED_DELAY_MS`, which the host
+                // writes: the anchor is this noticing, not the window, because a
+                // window two hours old is already past any instant derived from
+                // itself.
+                TaskMissedPolicy::Delay => Action::Postpone,
+                // Dropped, and the next natural window armed in its place.
+                TaskMissedPolicy::Skip => Action::Skip,
+            }
+        }
         Some(_) => Action::None,
     }
 }
@@ -756,6 +1058,21 @@ mod tests {
             mode,
             next_due_ms,
             lease_until_ms: None,
+            on_missed: TaskMissedPolicy::RunNow,
+        }
+    }
+
+    /// [`state`] under one of the two non-default policies, spelled as an
+    /// override so the four cases below cannot drift in anything but the field
+    /// they are about.
+    fn state_with(
+        mode: TaskMode,
+        next_due_ms: Option<i64>,
+        on_missed: TaskMissedPolicy,
+    ) -> TaskState {
+        TaskState {
+            on_missed,
+            ..state(mode, next_due_ms)
         }
     }
 
@@ -1283,6 +1600,131 @@ mod tests {
                 parsed.is_ok(),
                 "the dev harness shows {literal:?}, which this dialect refuses: {}",
                 parsed.expect_err("refused")
+            );
+        }
+    }
+
+    /// One case per setting, and the whole point is the **boundary**: at
+    /// `next_due_ms + TASK_MISSED_GRACE_MS` the two non-default policies are
+    /// exact complements, and either side of it neither is the same as
+    /// `run_now`.
+    ///
+    /// Asserted against literal integers with no clock and no database, which is
+    /// what the pure split is for — and named as the *pure half* deliberately:
+    /// the risk in this story lives in the claim and in the store, and those are
+    /// asserted in `db.rs` and `engine.rs`.
+    #[test]
+    fn each_missed_window_policy_decides_its_own_side_of_the_grace_boundary() {
+        let due_at = JAN_1_2024_UTC;
+        let hourly = cron("@hourly");
+        let fresh = due_at + 1;
+        let stale = due_at + TASK_MISSED_GRACE_MS;
+
+        for (policy, at_fresh, at_stale) in [
+            // Unconditional, and textually the arm this function has always
+            // had: an upgrade changes no install's meaning.
+            (TaskMissedPolicy::RunNow, Action::Run, Action::Run),
+            // Inside the grace a host was here and serves its own window; past
+            // it the window was nobody's and is held back to an instant this
+            // host computes from NOW — see `TASK_MISSED_DELAY_MS` for why the
+            // anchor cannot be the window.
+            (TaskMissedPolicy::Delay, Action::Run, Action::Postpone),
+            // The same boundary, the other answer: dropped and re-armed.
+            (TaskMissedPolicy::Skip, Action::Run, Action::Skip),
+        ] {
+            assert_eq!(
+                decide(
+                    &state_with(TaskMode::Scheduled, Some(due_at), policy),
+                    Some(&hourly),
+                    fresh
+                ),
+                at_fresh,
+                "{} one millisecond into an open window",
+                policy.as_str()
+            );
+            assert_eq!(
+                decide(
+                    &state_with(TaskMode::Scheduled, Some(due_at), policy),
+                    Some(&hourly),
+                    stale
+                ),
+                at_stale,
+                "{} at the grace boundary",
+                policy.as_str()
+            );
+        }
+    }
+
+    /// AD-138, in the pure layer: the policy may govern the window and may never
+    /// enumerate it. Two hundred windows of clock produce **one** decision under
+    /// every setting, because there is nothing to enumerate — `next_due_ms` is
+    /// one `i64`, so overdue-by-one and overdue-by-two-hundred are the same
+    /// state and this function cannot tell them apart.
+    #[test]
+    fn no_policy_can_tell_one_missed_window_from_two_hundred() {
+        let due_at = JAN_1_2024_UTC;
+        let hourly = cron("@hourly");
+        for policy in [
+            TaskMissedPolicy::RunNow,
+            TaskMissedPolicy::Delay,
+            TaskMissedPolicy::Skip,
+        ] {
+            let one = decide(
+                &state_with(TaskMode::Scheduled, Some(due_at), policy),
+                Some(&hourly),
+                due_at + HOUR_MS,
+            );
+            let many = decide(
+                &state_with(TaskMode::Scheduled, Some(due_at), policy),
+                Some(&hourly),
+                due_at + 200 * HOUR_MS,
+            );
+            assert_eq!(
+                one,
+                many,
+                "{} must answer the same thing about one missed window and two \
+                 hundred, or something somewhere is counting them",
+                policy.as_str()
+            );
+        }
+
+        // And the answer is one run, or none — never a number that scales.
+        assert_eq!(
+            decide(
+                &state_with(TaskMode::Scheduled, Some(due_at), TaskMissedPolicy::Skip),
+                Some(&hourly),
+                due_at + 200 * DAY_MS
+            ),
+            Action::Skip,
+            "a task out of service for two hundred days drops one window, not two hundred"
+        );
+    }
+
+    /// The stored vocabulary is a closed set and an unknown spelling is `None`,
+    /// which is what routes the row to `decode_task`'s unknown path rather than
+    /// to a policy this build guessed. Guessing is the dangerous direction:
+    /// reading `"teleport"` as `run_now` would run a window its author asked to
+    /// skip.
+    #[test]
+    fn a_missed_window_policy_round_trips_and_an_unknown_spelling_is_refused() {
+        for policy in [
+            TaskMissedPolicy::RunNow,
+            TaskMissedPolicy::Delay,
+            TaskMissedPolicy::Skip,
+        ] {
+            assert_eq!(TaskMissedPolicy::from_stored(policy.as_str()), Some(policy));
+        }
+        assert_eq!(
+            TaskMissedPolicy::default(),
+            TaskMissedPolicy::RunNow,
+            "the default reproduces today's restart behaviour, which is the whole \
+             reason it is the default"
+        );
+        for spelling in ["", "run now", "RUN_NOW", "runnow", "teleport", "none"] {
+            assert_eq!(
+                TaskMissedPolicy::from_stored(spelling),
+                None,
+                "{spelling:?} is not a policy this build may act on"
             );
         }
     }
