@@ -459,13 +459,30 @@ export const PACED_SUBTITLE =
   "Work keeper paces on its own. These are not tasks: nothing here has a schedule you can set, and none of it can be started from this section — a folder's own Sync now is on the Sync pane.";
 
 /**
- * The badge on such a row, `TASKS_UNKNOWN_BADGE`'s idiom.
+ * The badge on such a row, `TASKS_UNKNOWN_BADGE`'s idiom: **the row's standing**,
+ * not the class it belongs to.
  *
  * *Paced* and not *Automatic* or *Internal*: it is the one word that says the
  * clock in this process drives it, which is exactly what distinguishes the row
  * from every task above it.
+ *
+ * It used to be that one word on **every** row, because the badge named the
+ * class the way the section heading does. Rendered, that put *Paced* beside
+ * *"this folder is paused, so nothing here is paced and no cadence is in
+ * force."* — the badge contradicting the sentence one line below it, on the same
+ * row, in a section whose whole purpose is not over-claiming. No test could see
+ * it: each half was correct on its own. The class is the heading's job, so the
+ * badge now carries the standing, and a standing this build does not know
+ * renders as its own spelling (`PACED_KIND_LABELS`' rule, because
+ * `PacedWorkStanding` can grow in Rust).
  */
 export const PACED_BADGE = "Paced";
+export const PACED_STANDING_LABELS: Record<string, string> = {
+  paced: PACED_BADGE,
+  paused: "Paused",
+  governed: "Scheduled",
+  unregistered: "Not registered",
+};
 
 /** Before this section's read lands the projection is unknown, not empty. */
 export const PACED_LOADING_TEXT = "Reading what this host paces…";
@@ -1169,7 +1186,9 @@ function PacedWorkList({
               className="flex flex-col gap-1"
             >
               <span className="flex items-center gap-2">
-                <Badge variant="outline">{PACED_BADGE}</Badge>
+                <Badge variant="outline">
+                  {PACED_STANDING_LABELS[row.standing] ?? row.standing}
+                </Badge>
                 <span className="font-medium text-foreground text-sm">
                   {PACED_KIND_LABELS[row.kind] ?? row.kind}
                 </span>

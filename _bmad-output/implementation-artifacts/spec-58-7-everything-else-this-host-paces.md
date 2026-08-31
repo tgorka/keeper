@@ -99,6 +99,12 @@ warnings: ['oversized']
   `notes = Some` yields a paced notes row; review showed that a *configured*
   vault and a *paced* vault are two different facts, so the matrix row now needs
   the registry to agree. See the triage log below.
+- 2026-08-31 -- the badge is the row's **standing**, not the class. The spec's
+  Boundaries asked for *"a Paced badge (the `TASKS_UNKNOWN_BADGE` idiom)"* on
+  these rows, and that is what shipped: one word on every row. Rendered, it put
+  *Paced* one line above *"this folder is paused, so nothing here is paced"*.
+  The class is the section heading's job. `PACED_STANDING_LABELS` now maps each
+  standing to its word, with the unknown-spelling fallback the kind labels use.
 
 ## Review Triage Log
 
@@ -106,8 +112,9 @@ warnings: ['oversized']
 that implemented it ended before it, leaving `review_loop_iteration: 0` and this
 section empty while the code was complete and green. Two read-only lenses were
 run against commit `99769f4` (a blind lens and an edge-case lens); the blind
-lens' provider was out of credits and its half was done by hand. Nine findings,
-all triaged, none deferred.
+lens' provider was out of credits and its half was done by hand. Nine findings
+from the lenses, plus a tenth that only rendering the section could produce —
+all triaged, two entered the deferred ledger as work that belongs elsewhere.
 
 **Fixed — two claims that were false on somebody's machine.** These are the
 class that matters: a sentence the view states as fact.
@@ -170,6 +177,35 @@ class that matters: a sentence the view states as fact.
 9. *`duration_words` could panic.* `ms + 500` overflows within 500 of
    `u64::MAX` — a debug panic, a release wrap to an absurdly small cadence — on a
    number a config file can hold. Now `saturating_add`.
+
+**Fixed — the tenth, which no test could have found.** The section was rendered
+in a browser against `dev/mock-shell.ts`'s fixtures and photographed.
+
+10. *The badge contradicted the sentence on its own row.* Every projected row
+    wore **Paced**, because the badge named the class the way the heading does —
+    so *Paced* sat one line above *"this folder is paused, so nothing here is
+    paced and no cadence is in force."* Each half was correct alone, which is
+    exactly why 74 passing tests did not see it. The badge now carries the
+    standing (`Paced` / `Scheduled` / `Not registered` / `Paused`), with the
+    unknown-spelling fallback the kind labels use.
+
+    Getting the section on screen at all needed a dev-fixture fix worth naming:
+    `dev/mock-shell.ts`'s `capabilities` answer was
+    `{ notes, recording, sync, chat }` — one key that is not on `CapabilitiesVm`
+    and eight that are missing, typechecking only because `ANSWERS` is
+    `Record<string, unknown>`. `sessions` is what gates the ⌘8 pane, so **every
+    task and paced fixture in that file was unreachable** in `bun run dev`: the
+    one screen the mock shell exists to make visible on Linux. It is now the full
+    view model with `satisfies`, so a flag added in Rust breaks the build there
+    instead of silently hiding a pane.
+
+**Deferred, with the reason.** Two findings are ledger entries rather than fixes
+here: a vault that goes unregistered while its drive is away is never
+re-registered until relaunch (the fix is a vault-lifecycle trigger, and this
+story's boundary is *project, never schedule*), and `keeper-syncd`'s
+kill-during-large-object durability test is load-sensitive — it failed once in
+the macOS gate and passed twice in isolation on the same commit, and nothing in
+this epic touches the transfer path.
 
 **Judged and not changed.** The reviewer filed a React-key collision risk and a
 `duration_words` boundary sweep and then withdrew both with the reasoning shown:

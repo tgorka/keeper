@@ -39,6 +39,7 @@ import {
   PACED_NO_CADENCE_TEXT,
   PACED_REFUSAL_TESTID,
   PACED_ROW_TESTID,
+  PACED_STANDING_LABELS,
   PACED_SUBTITLE,
   TASK_DUE_NOW_TEXT,
   TASK_EDIT_TEXT,
@@ -1969,6 +1970,11 @@ describe("the pane also lists what this host paces, and says it is not a task", 
     expect(within(row).getByText(PACED_SENTENCE_PAUSED)).toBeInTheDocument();
     expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
     expect(within(row).queryByText(/about every/)).toBeNull();
+    // The badge carries the standing, so it cannot contradict the sentence on
+    // its own row. Found by rendering the section, not by a test: *Paced* sat
+    // one line above "nothing here is paced" and each half was correct alone.
+    expect(within(row).getByText(PACED_STANDING_LABELS.paused)).toBeInTheDocument();
+    expect(within(row).queryByText(PACED_BADGE)).toBeNull();
   });
 
   // NOT a contract test on Story 58.8, though it was labelled one. This test

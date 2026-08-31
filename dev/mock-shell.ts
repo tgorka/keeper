@@ -47,6 +47,7 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   AccountVm,
+  CapabilitiesVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
@@ -1019,7 +1020,28 @@ const CSV_ROWS = [
  */
 const ANSWERS: Record<string, unknown> = {
   app_ping: "ok",
-  capabilities: { notes: true, recording: true, sync: true, chat: true },
+  // The full `CapabilitiesVm`, `satisfies`-checked for this file's own stated
+  // reason: it was `{ notes, recording, sync, chat }` — one key that does not
+  // exist on the type, and eight that do missing — which typechecked only
+  // because `ANSWERS` is `Record<string, unknown>`. The cost was not cosmetic:
+  // `sessions` is what gates BOTH the sessions board and the ⌘8 Tasks pane
+  // (`app-shell.tsx`), so every task and paced-work fixture below this line was
+  // unreachable in `bun run dev` — the one screen this file exists to make
+  // visible on Linux. Now a flag added in Rust breaks the build here instead.
+  capabilities: {
+    trayIcon: true,
+    globalHotkey: true,
+    launchAtLogin: true,
+    inAppUpdater: true,
+    nativeMenuBar: true,
+    bridgeSidecar: true,
+    revealInFileManager: true,
+    recording: true,
+    sync: true,
+    notes: true,
+    sessions: true,
+    overlayTitleBar: true,
+  } satisfies CapabilitiesVm,
   // ---------------------------------------------------------------------------
   // The two answers that decide WHICH screen boots (`src/App.tsx`
   // `renderContent`). Without them every `bun run dev` stopped at the first-run
