@@ -672,11 +672,22 @@ pub struct TaskSetArgs {
     /// What to do about a window that fell due while nobody was home:
     /// `run-now`, `delay` or `skip`.
     ///
+    /// All three serve a window normally while a host is present; they differ
+    /// only about a window nobody was here to serve, which keeper concludes
+    /// after 15 minutes.
+    ///
     /// `run-now` is the default and is what an ordinary restart already does —
     /// the stored past window fires on the first tick that sees it, **once**,
-    /// however many windows went by. `delay` serves it no sooner than fifteen
-    /// minutes after it fell due. `skip` abandons a window nobody served after
-    /// those fifteen minutes and arms the next one instead.
+    /// however many windows went by. `delay` runs it 30 minutes after a host
+    /// noticed it: the anchor is the **noticing**, not the window, because a
+    /// host back two hours late is already past any instant derived from the
+    /// window itself and would serve it immediately, which is `run-now`. `skip`
+    /// abandons a window nobody served within those 15 minutes and arms the next
+    /// one instead.
+    ///
+    /// A delay that lands past the next scheduled instant simply wins: the
+    /// window is one stored instant rather than a queue, so the natural windows
+    /// inside the delay are not run and no backlog accrues.
     ///
     /// On create this defaults to `run-now`, so a task created by an older
     /// script means exactly what it meant before. On update it keeps its stored
@@ -4176,6 +4187,57 @@ mod tests {
             assert!(
                 help.contains(expected),
                 "`tasks run --help` must name {expected}; got:\n{help}"
+            );
+        }
+    }
+
+    /// `tasks set --help`'s account of `--on-missed` is computed from the two
+    /// constants that decide it, not written beside them (Story 58.9).
+    ///
+    /// The guard exists because this help was **already wrong**, in exactly
+    /// Story 56.13's shape. Story 58.4 wrote *"`delay` serves it no sooner than
+    /// fifteen minutes after it fell due"*; the review then rejected that anchor
+    /// and the fix moved it to the instant a host **noticed** the window, with a
+    /// separate and longer constant. `TASK_MISSED_DELAY_MS` and
+    /// [`keeper_sync::tasks::decide`]'s doc were updated; this string and the
+    /// app's form note were not. A wrong number therefore survived a review pass
+    /// and a full gate, because prose that sits on a clap enum is far from the
+    /// code it describes and nothing compared them.
+    ///
+    /// So the numbers are derived here. Changing either constant without
+    /// rewriting the sentence fails this test rather than shipping.
+    #[test]
+    fn tasks_set_help_names_the_missed_window_numbers_its_constants_actually_use() {
+        let grace_minutes = keeper_sync::tasks::TASK_MISSED_GRACE_MS / 60_000;
+        let delay_minutes = keeper_sync::tasks::TASK_MISSED_DELAY_MS / 60_000;
+        assert_ne!(
+            grace_minutes, delay_minutes,
+            "the two numbers answer different questions — when do we conclude \
+             nobody was home, and how long do we then wait — so a help text that \
+             could use one for the other is a help text this test cannot guard"
+        );
+
+        let mut cli = Cli::command();
+        let tasks = cli.find_subcommand_mut("tasks").expect("a `tasks` verb");
+        let set = tasks
+            .find_subcommand_mut("set")
+            .expect("a `tasks set` verb");
+        let help = set.render_long_help().to_string();
+
+        // Each number is asserted **in its role**, not merely present. Written
+        // as two bare `contains("N minutes")` checks this test passed on a
+        // sentence that said *fifteen* minutes, because the clause contrasting
+        // it with the wrong anchor also mentioned thirty — the guard was
+        // satisfied by the very phrase warning against the error. The number and
+        // the instant it is measured from are one claim, so they are one
+        // assertion.
+        for expected in [
+            format!("concludes after {grace_minutes} minutes"),
+            format!("runs it {delay_minutes} minutes after a host noticed it"),
+        ] {
+            assert!(
+                help.contains(&expected),
+                "`tasks set --help` must state `{expected}`; got:\n{help}"
             );
         }
     }

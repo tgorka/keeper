@@ -159,16 +159,37 @@ export const TASK_FORM_SCHEDULE_NOTE =
 
 export const TASK_FORM_ON_MISSED_LABEL = "If a window is missed";
 /**
+ * The grace and the delay in minutes, mirroring `TASK_MISSED_GRACE_MS` and
+ * `TASK_MISSED_DELAY_MS` (`src-tauri/crates/keeper-sync/src/tasks.rs`).
+ *
+ * Named rather than written into the sentence, because the sentence they
+ * compose was **already wrong**. Story 58.4 wrote *"delay serves it no sooner
+ * than fifteen minutes after it fell due"*; the review then rejected that
+ * anchor, and the fix moved it to the instant a host **noticed** the window
+ * using a separate, longer constant — updating the Rust constant and
+ * `tasks::decide`'s doc but neither this string nor the CLI's `--help`. A wrong
+ * number therefore survived a review pass and a full gate.
+ *
+ * The coupling to Rust is mechanical rather than remembered: this file's test
+ * reads both constants out of that Rust source and asserts these two numbers
+ * and the sentences built from them, so changing either constant fails a test
+ * here rather than shipping a form that promises the old behaviour.
+ */
+export const TASK_MISSED_GRACE_MINUTES = 15;
+/** See {@link TASK_MISSED_GRACE_MINUTES} — the two are coupled to Rust together. */
+export const TASK_MISSED_DELAY_MINUTES = 30;
+
+/**
  * The three settings, accurate to `tasks::decide` and no longer than that.
  *
- * Fifteen minutes is `TASK_MISSED_GRACE_MS` and is named as a number rather than
- * as "a while", because it is the boundary both non-default settings turn on and
- * a person choosing between them is choosing about it. Nothing here
- * re-implements the rule: this text is read by a human, and `decide` is what
- * decides.
+ * Both numbers are named because a person choosing between the settings is
+ * choosing about them, and the delay's **anchor** is stated because the number
+ * alone is not the behaviour: thirty minutes measured from the window rather
+ * than from the noticing would make `delay` and `run_now` the same option for
+ * any host that was away longer than half an hour. Nothing here re-implements
+ * the rule — this text is read by a human, and `decide` is what decides.
  */
-export const TASK_FORM_ON_MISSED_NOTE =
-  "A window that fell due while nothing was hosting this task. run_now serves it on the first tick that sees it — once, however many windows went by, which is what an ordinary restart already does. delay serves it no sooner than fifteen minutes after it fell due. skip abandons a window nobody served within those fifteen minutes and arms the next one instead.";
+export const TASK_FORM_ON_MISSED_NOTE = `A window that fell due while nothing was hosting this task. All three settings serve a window normally while a host is here, and differ only about one nobody was here to serve — which keeper concludes after ${TASK_MISSED_GRACE_MINUTES} minutes. run_now serves it on the first tick that sees it — once, however many windows went by, which is what an ordinary restart already does. delay runs it ${TASK_MISSED_DELAY_MINUTES} minutes after a host noticed it: the anchor is the noticing and not the window, so a host back two hours late genuinely waits. skip abandons a window nobody served within those ${TASK_MISSED_GRACE_MINUTES} minutes and arms the next one instead.`;
 
 export const TASK_FORM_ADD_SUBMIT_LABEL = "Add task";
 export const TASK_FORM_EDIT_SUBMIT_LABEL = "Save task";

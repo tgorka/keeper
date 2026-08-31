@@ -15,6 +15,8 @@
  * all — it is the reading this form seeded from, sent back so the store can
  * refuse a save that would revert whatever another host moved meanwhile.
  */
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -37,11 +39,14 @@ import {
   TASK_FORM_KIND_LABEL,
   TASK_FORM_MODE_LABEL,
   TASK_FORM_ON_MISSED_LABEL,
+  TASK_FORM_ON_MISSED_NOTE,
   TASK_FORM_PROFILE_LABEL,
   TASK_FORM_PROFILE_READ_FAILED_PREFIX,
   TASK_FORM_PROFILE_READING_NOTE,
   TASK_FORM_SCHEDULE_LABEL,
   TASK_HOST_WIDE_TEXT,
+  TASK_MISSED_DELAY_MINUTES,
+  TASK_MISSED_GRACE_MINUTES,
   TaskForm,
   taskFormUnlistedProfileText,
 } from "@/components/sync/task-form";
@@ -593,5 +598,79 @@ describe("TaskForm, the missed-window policy", () => {
     // And every typed value survives, because the typed value is what a retry is
     // driven from.
     expect(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL)).toHaveValue("@weekly");
+  });
+});
+
+/**
+ * The note under *If a window is missed* states the numbers Rust actually uses
+ * (Story 58.9).
+ *
+ * This exists because the note was **wrong when it shipped**, in Story 56.13's
+ * shape: prose that sits far from the code it describes. Story 58.4 wrote
+ * *"delay serves it no sooner than fifteen minutes after it fell due"*; the
+ * review rejected that anchor and the fix moved it to the instant a host
+ * noticed the window, with a separate and longer constant. `TASK_MISSED_DELAY_MS`
+ * and `tasks::decide`'s doc were updated; this string was not, and a wrong
+ * number survived a review pass and a full gate because nothing compared the
+ * two.
+ *
+ * So the comparison is mechanical, and in this direction because it is the only
+ * one available: the Rust constants cannot import a TypeScript literal, and no
+ * ts-rs binding carries them. Reading Rust source from a frontend test is this
+ * repo's existing idiom for an invariant about a Rust file — `task-host-tick.test.ts`,
+ * `command-registration.test.ts`, `tray-notes-labels.test.ts`.
+ *
+ * **What this does NOT prove:** that `decide` behaves as the sentence says.
+ * `keeper-sync`'s own tests own that. This proves the sentence a person reads
+ * carries the numbers that code is compiled with.
+ */
+describe("the missed-window note states the numbers Rust actually uses", () => {
+  const TASKS_RS = resolve(
+    import.meta.dirname,
+    "../../../src-tauri/crates/keeper-sync/src/tasks.rs",
+  );
+
+  /** `pub const NAME: i64 = <n> * 60_000;` → `<n>`. */
+  const rustMinutes = (name: string): number => {
+    const source = readFileSync(TASKS_RS, "utf8");
+    const match = new RegExp(`pub const ${name}: i64 = (\\d+) \\* 60_000;`).exec(source);
+    if (match === null) {
+      throw new Error(
+        `${name} is not a whole number of minutes in tasks.rs any more, so this note's \
+wording needs rewriting rather than this regex widening`,
+      );
+    }
+    return Number(match[1]);
+  };
+
+  it("mirrors TASK_MISSED_GRACE_MS and TASK_MISSED_DELAY_MS", () => {
+    expect(TASK_MISSED_GRACE_MINUTES).toBe(rustMinutes("TASK_MISSED_GRACE_MS"));
+    expect(TASK_MISSED_DELAY_MINUTES).toBe(rustMinutes("TASK_MISSED_DELAY_MS"));
+  });
+
+  it("states each number in its role, and states the delay's anchor", () => {
+    // In its role, not merely present: the first draft of the equivalent guard
+    // on the CLI's `--help` asserted only that the digits appeared, and passed
+    // on a sentence saying *fifteen* minutes — because the clause contrasting it
+    // with the wrong anchor also mentioned thirty. The number and the instant it
+    // is measured from are one claim.
+    expect(TASK_FORM_ON_MISSED_NOTE).toContain(
+      `concludes after ${TASK_MISSED_GRACE_MINUTES} minutes`,
+    );
+    expect(TASK_FORM_ON_MISSED_NOTE).toContain(
+      `runs it ${TASK_MISSED_DELAY_MINUTES} minutes after a host noticed it`,
+    );
+    // The sentence the old one got wrong, asserted as itself: a reader who takes
+    // the anchor to be the window reads `delay` as `run_now` for any absence
+    // longer than the delay.
+    expect(TASK_FORM_ON_MISSED_NOTE).toContain("the anchor is the noticing and not the window");
+  });
+
+  it("is the sentence the form actually renders", () => {
+    // The constants could be right and the note could be right while the form
+    // rendered some other string. One assertion closes that.
+    mockProfiles.mockResolvedValue([]);
+    render(<TaskForm onSaved={vi.fn()} />);
+    expect(screen.getByText(TASK_FORM_ON_MISSED_NOTE)).toBeInTheDocument();
   });
 });
