@@ -92,6 +92,13 @@ pub const TASK_MISSED_GRACE_MS: i64 = 15 * 60_000;
 /// grace elapses are the busiest — a boot, a login, a mail client and a browser
 /// all waking at once — and housekeeping over a git remote is exactly the work
 /// that should not join that.
+/// **The default rather than the only value** (Story 59.6, FR-366). A task may
+/// carry its own `missed_delay_ms`, and an absent one means exactly this
+/// constant — so every row written before that column existed keeps meaning what
+/// it meant. [`effective_missed_delay_ms`] is the single place that resolution
+/// happens, and [`validate_missed_delay_ms`] is the single place an override is
+/// refused; the number below stays the one a person gets by not choosing.
+///
 pub const TASK_MISSED_DELAY_MS: i64 = 30 * 60_000;
 
 /// Milliseconds in one minute — the resolution of the whole cron dialect.

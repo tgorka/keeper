@@ -1141,7 +1141,8 @@ development_status:
   # 58.7/58.8/58.9's review passes are recorded in their own triage logs. The
   # epic reads `review` rather than `done` for epic-57's reason — the stories are
   # finished, the epic has not been merged or retrospected.
-  epic-58: review
+  # #297 merged 2026-08-31T09:33Z and shipped in v0.8.24.
+  epic-58: done
   58-1-a-task-you-can-create-and-edit: done
   58-2-the-row-says-what-the-run-said: done
   58-3-a-list-of-runs-you-can-open: done

@@ -101,7 +101,7 @@ A schedule helper shows the next few instants **Rust** computed; `nextDueMs` alr
     59.1  a list of names, and one task at a time   (level 1/level 2 split: the flat card column becomes a master list + a detail region)
     59.2  a run you can open                        (level 3: one execution as a surface, and a Runs control that looks like one)
     59.3  the row says its mode, and Run now says what it does  (the discoverability half of an ask that already works)
-    59.4  several tasks at once                     (multi-select, and only the bulk actions the store can honestly do)
+    59.4  one task at a time, and why not several  (single-select is the drill-down he described; a checkbox column is refused, with the reason)
 
     Wave 2 — the three additive fields
     59.5  a task you can name                      (description TEXT, nullable; the full column ripple)
@@ -156,10 +156,35 @@ that **Run now performs the work whether or not a window is open, and does not m
 the sentence `docs/sync.md:2507-2512` already owns, said where the button is. No Rust changes, and
 nothing that makes Run now consult the window: 58.6's paired tests exist to stop exactly that.
 
-**59.4** — Several tasks can be selected, and the actions offered on a selection are only the ones the
-store can perform honestly, one write per task, each reporting its own refusal — with a confirm that
-names the count for anything destructive. If the store has no bulk path, the story adds none: it
-loops, and says so.
+**59.4** — **The story is a refusal with a reason, and the reason is checkable.** Exactly one task is
+selected at a time; the pane offers no checkbox column. Two recorded decisions and one fact about the
+store say so:
+
+> No multi-select and no `aria-selected`. Nothing here acts on a set of files, so a selection model
+> would be state with no consumer.
+> — `spec-43-8-the-files-tab.md:347-348`
+
+> No multiselect delete for notes. The Files pane has a selection model; the notes list has a roving
+> cursor and no selection. **Inventing a second selection model is a different story.**
+> — `spec-45-17-tags-you-can-edit-spaces-and-notes-you-can-delete.md:200`
+
+The first was correctly overturned two stories later, once story 45.3 gave it a bulk consumer — which
+is the test to apply here, and Tasks fails it: **every task write in the whole stack is single-id.**
+`upsert_task(conn, task, baseline_updated_ms)` takes one row with one optimistic baseline
+(`db.rs:3154-3157`), `delete_task` one id (`db.rs:3800-3803`), `run_task_now` one id
+(`engine.rs:8132-8135`), all four IPC verbs a scalar `id`, and the CLI takes one id per verb while the
+same file happily uses `Vec<String>` for genuinely repeatable arguments. A checkbox column today
+would be state whose only possible action is a loop of N writes, each with its own conflict check and
+its own partial-failure story — and it would be the **second** selection idiom, which the notes
+decision forbids by name.
+
+So this story ships single-select and says the rest out loud rather than silently not doing it: if a
+bulk verb is wanted, its first story is a batched `enable`/`disable`/`forget` over `Vec<String>` with
+a per-id receipt in `db.rs` and `engine.rs`, and only then a selection model **copied** from
+`files-pane.tsx:1169` and `:1656-1706` — plain replaces, Cmd/Ctrl toggles, Shift takes the run,
+`aria-selected` per row, `aria-multiselectable` on the container, and `filesSelectionSentence`'s count
+wording. Never a second idiom. Acceptance is therefore: one selection, no checkbox, and a written
+note where the next reader will find it.
 
 **59.5** — A task carries an optional description, writable from the app and from `tasks set`, shown
 under its name, blank meaning nothing rendered. Given a task written before this column existed, it
@@ -192,14 +217,32 @@ the four standings it gained in 58.7.
 
 ## Design notes
 
-**Why level 3 is a surface and not a bigger row.** Epic 58 grew the row from 57.6's five cells to ten
-stacked blocks, and the owner's report is what that costs. Adding run detail to the same row would
-repeat it. The app already has the master/detail idiom this needs — `files-pane.tsx` with
-`PanelStrip`, `sessions-pane.tsx` with its detail — and `app-shell.tsx:336-344` renders `<TasksPane />`
-alone with the comment *"No panel strip: a task is not a document, and there is nothing here to open
-in an editor."* That comment is **scope, not teeth**: it argued against an editor, not against a
-detail region, and a run report is exactly a thing to open. 59.1 may site the detail inside the pane
-rather than in the panel strip, and should say which it chose and why.
+**Why level 3 is a surface and not a bigger row, and which two conventions it must reuse.** Epic 58
+grew the row from 57.6's five cells to ten stacked blocks, and the owner's report is what that costs.
+Adding run detail to the same row would repeat it.
+
+The decision is already made, and 59.1 does **not** get to choose: the master column is
+`useSurfaceColumn` (`src/components/layout/surface-column.tsx:246`, already the app's master-column
+convention and already used by `files-pane.tsx:1775`), and the detail is a **plain sibling region
+inside `tasks-pane.tsx`** — explicitly **not** `PanelStrip`, whose targets are documents opened in an
+editor (`files-pane.tsx:2158-2173` opens `{ kind: "file", profileId, relativePath }`). A run is not a
+panel target and must never enter `panelsStore`. Level 3 is a selected-run region keyed on
+`TaskRunVm.id`, fed by the run object the pane **already holds** — no new read.
+
+`app-shell.tsx:342-343`'s comment — *"No panel strip: a task is not a document, and there is nothing
+here to open in an editor"* — is **scope, not teeth**, and narrower than it reads: it refuses the panel
+strip, not detail-as-such, and protects no invariant. 59.1 keeps the refusal and **amends the sentence**
+so it stops reading as a refusal of a detail region.
+
+**The one thing in this wave that does have teeth**, from `spec-58-3:40`:
+
+> Never: poll history; hold one fetch per row in flight at once; register a timer; ask for an
+> unbounded list or invent a frontend limit
+
+That is AD-62's anti-poll invariant, and `tasks-pane.test.tsx:1378` enforces it. A master/detail
+**satisfies it better** than today's disclosure, because exactly one task is selected by construction —
+but only if the read stays on *selection*, one in flight, no timer, and Rust's own limit. 59.1 and 59.2
+must not turn selection into a render-time read.
 
 **What `output` will and will not mean.** He asked for output. A `sync` or `release` task has no
 stdout — it has a composed report, and `detail` is that report. 59.2 therefore ships *everything a run
