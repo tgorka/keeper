@@ -4,7 +4,7 @@ type: 'feature'
 created: '2026-08-31'
 status: 'done'
 baseline_revision: 'f8fbb90'
-final_revision: '98f634f'
+final_revision: '4ac49e7'
 review_loop_iteration: 0
 followup_review_recommended: true
 context:
@@ -166,12 +166,18 @@ Status: done
 - `historyRef` still mirrors `history` by hand, now through a single writer. A future writer that sets the state directly would break the pane's ability to see the open section from a stable callback.
 - The disclosure's layout claim — a link-weight control on its own line rather than a fourth button in the header — cannot be tested here, because jsdom performs no layout.
 
-**One thing went wrong in the bookkeeping, and it is not recoverable from here.** This story's four
-files were staged and, in the same second, a sibling agent working the same worktree ran a plain
-`git commit` — so 58.3's code landed inside `98f634f feat(58.6): two hosts, one missed window, one
-run` rather than in a commit of its own. The content is complete, green and shippable; the subject
-is wrong and the commit mixes two stories. Splitting it needs history rewriting, which this session
-is forbidden from doing, so `final_revision` names where the code actually is and the coordinator
-owns the decision. The avoidable half was mine: staging early in a shared worktree leaves work in an
-index a sibling's next `git commit` will sweep up, so the pathspec form (`git commit -- <paths>`) is
-the only safe one there.
+**The bookkeeping went wrong once and has been repaired.** This story's four files were staged and,
+in the same second, a sibling agent working the same worktree ran a plain `git commit` — so 58.3's
+code first landed inside `feat(58.6): two hosts, one missed window, one run` rather than in a commit
+of its own. The content was complete and green throughout; only the commit boundary was wrong, which
+matters because this epic ships as one PR per story.
+
+The coordinator split it before anything was pushed: `4ac49e7 feat(58.3): a list of runs you can
+open` now holds this story's four files and its spec, `2d37856 feat(58.6)` holds the seven
+`src-tauri` paths, `deferred-work.md` and its own spec, and the three commits that sat on top were
+replayed onto the split. The proof the split lost nothing is that the resulting tree is byte-identical
+to the pre-split one (`HEAD^{tree}` compared directly), not that the diffs looked right.
+
+The avoidable half was staging early in a shared worktree: it leaves work in an index a sibling's
+next `git commit` will sweep up, so the pathspec form (`git commit -- <paths>`) is the only safe one
+there. Every later commit in this epic used it.
