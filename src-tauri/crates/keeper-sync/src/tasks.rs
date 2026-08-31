@@ -92,13 +92,13 @@ pub const TASK_MISSED_GRACE_MS: i64 = 15 * 60_000;
 /// grace elapses are the busiest — a boot, a login, a mail client and a browser
 /// all waking at once — and housekeeping over a git remote is exactly the work
 /// that should not join that.
+///
 /// **The default rather than the only value** (Story 59.6, FR-366). A task may
 /// carry its own `missed_delay_ms`, and an absent one means exactly this
 /// constant — so every row written before that column existed keeps meaning what
 /// it meant. [`effective_missed_delay_ms`] is the single place that resolution
 /// happens, and [`validate_missed_delay_ms`] is the single place an override is
 /// refused; the number below stays the one a person gets by not choosing.
-///
 pub const TASK_MISSED_DELAY_MS: i64 = 30 * 60_000;
 
 /// Milliseconds in one minute — the resolution of the whole cron dialect.
@@ -145,6 +145,21 @@ const MAX_DAYS_IN_MONTH: [u32; 13] = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31,
 /// `from_stored` returns `None` for `"update"`, a hand-written row naming it is
 /// skipped like any other unknown kind rather than honoured.
 ///
+/// **Why the vocabulary stays closed, stated once here because this is where a
+/// third variant proves it can grow.** A kind names a verb *keeper* owns, so
+/// every kind is code that already exists in this workspace, already has its
+/// own refusals, and already answers to the same reviewer. A shell string
+/// would name a verb nobody in this tree wrote: the daemon's egress is
+/// disclosed in `docs/egress.md` and diffed against the previous tag by the
+/// release workflow, and a user command can reach any host on the internet
+/// while that diff shows nothing whatsoever. There is also no task timeout —
+/// only the one-hour lease — and no stdout capture, so an arbitrary command
+/// that hangs would hold a lease for an hour and report a line nobody wrote.
+/// `ARCHITECTURE-SCHEDULED-TASKS.md`'s `## Deferred` entry is therefore
+/// **still deferred**, and adding a variant here does not touch it: the price
+/// of a closed vocabulary is that somebody must write the arm, which is
+/// exactly the price being kept.
+///
 /// `Sync` is the kind that exists first because its effect is already real and
 /// already safe: `sync --once` is documented as the cron entry point, and
 /// `Engine::sync_once` opens by taking the same per-profile reservation the
@@ -175,6 +190,34 @@ pub enum TaskKind {
     /// of it, which is why "a due task really runs" could be asserted a wave
     /// earlier without a stub.
     Release,
+    /// One verification pass over the named folder, or over every enabled
+    /// folder when the task is host-wide (Story 59.9).
+    ///
+    /// `Engine::verify` is the whole implementation, unchanged and un-widened:
+    /// the same body `keeper-syncd verify` runs, with the same four free
+    /// excuses AD-129 requires before an absent object is called normal. What
+    /// a task adds is a **schedule and a memory** — the one thing a check
+    /// most needs, because a check nobody remembers running is
+    /// indistinguishable from a check that stopped running, which is the
+    /// sentence `verify`'s own `virtual` count already exists to answer.
+    ///
+    /// **Why this kind needed no new machinery, and why that is the test it
+    /// had to pass.** It reads: no worktree file is written, no object is
+    /// added to the store, and it opens the repository through
+    /// `git::repo::open_read_only` precisely so it does not do the ordinary
+    /// door's housekeeping — *"a check that repairs what it is checking is not
+    /// a check"*. So it takes **no reservation** and needs none, which also
+    /// means `TaskOutcome::Busy` is unreachable for this kind: a check that
+    /// stood aside while the host synced would report nothing on exactly the
+    /// folders that are moving. It asks **no network** either — the remote
+    /// half of `verify` is `--remote`, one batch round trip per object, and a
+    /// nightly task over NFR-41's ten-thousand-path fixture is the last place
+    /// that belongs.
+    ///
+    /// It is also the kind whose `detail` line is worth reading on a run that
+    /// went fine: *"1000 paths checked, 0 bad, 1000 virtual in 1 folders"* is
+    /// the answer to a question `sync` and `release` cannot be asked.
+    Verify,
 }
 
 impl TaskKind {
@@ -184,6 +227,7 @@ impl TaskKind {
         match self {
             Self::Sync => "sync",
             Self::Release => "release",
+            Self::Verify => "verify",
         }
     }
 
@@ -193,6 +237,7 @@ impl TaskKind {
         match value {
             "sync" => Some(Self::Sync),
             "release" => Some(Self::Release),
+            "verify" => Some(Self::Verify),
             _ => None,
         }
     }
@@ -982,6 +1027,83 @@ pub fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `delay_ms` is a per-task missed-window delay a task could coherently
+/// carry (Story 59.6, FR-366).
+///
+/// **The single implementation of that rule**, for [`validate_id`]'s reason and
+/// with the same two callers on opposite sides of the database:
+/// [`crate::db::upsert_task`] refuses at the write door, and `keeper-syncd tasks
+/// set` converts a person's minutes before it ever opens a store. Pure, so both
+/// may ask it, and so the two boundaries are asserted against literal integers.
+///
+/// `None` is always fine and always means [`TASK_MISSED_DELAY_MS`] — that is
+/// what keeps a row written before this column existed meaning what it meant.
+///
+/// # The floor is the grace period, and it is not a taste
+///
+/// [`TASK_MISSED_GRACE_MS`] is *the interval that concludes nobody was home*:
+/// nothing is a missed window until it has been open that long. A delay shorter
+/// than it is therefore not a delay at all — it would be over before the window
+/// it holds back was recognised as missed, so the very next tick would serve the
+/// window and `delay` would be spelling `run_now` at a cost of one extra write
+/// and one `postponed` run row per absence. Two settings, one behaviour, is
+/// exactly the collapse 58.4's review moved the anchor to avoid.
+///
+/// # The ceiling is the schedule's ceiling, for the schedule's reason
+///
+/// A delay is stored by writing `next_due_ms` forward, so an enormous one is
+/// indistinguishable from [`MAX_SCHEDULE_INTERVAL_MS`]'s own failure: a row that
+/// reports itself enabled and scheduled while the instant it is waiting for is
+/// past anybody's patience. `every 100000000d` is refused for that; `--missed-delay
+/// 100000000` would arrive at the same place through the other door, so it meets
+/// the same bound. Nothing is lost above it — a task that wants its housekeeping
+/// a year later wants a different schedule, not a delay.
+pub fn validate_missed_delay_ms(delay_ms: Option<i64>) -> Result<()> {
+    let Some(delay_ms) = delay_ms else {
+        return Ok(());
+    };
+    if delay_ms < TASK_MISSED_GRACE_MS {
+        return Err(SyncError::Config(format!(
+            "task missed-window delay must be at least the grace period \
+             ({TASK_MISSED_GRACE_MS} ms), because the grace period is the interval \
+             that concludes nobody was home — a shorter delay would elapse before \
+             the window it holds back counted as missed, which is run_now wearing \
+             delay's name, got {delay_ms} ms"
+        )));
+    }
+    if delay_ms > MAX_SCHEDULE_INTERVAL_MS {
+        return Err(SyncError::Config(format!(
+            "task missed-window delay must not exceed a year \
+             ({MAX_SCHEDULE_INTERVAL_MS} ms), the ceiling a schedule has and for the \
+             same reason: the delay is stored as the instant the window is held \
+             back to, so one that far ahead is a task that reports itself enabled \
+             and scheduled while nothing ever runs, got {delay_ms} ms"
+        )));
+    }
+    Ok(())
+}
+
+/// How long this task holds a missed window back: its own value, or the
+/// constant (Story 59.6, FR-366).
+///
+/// **The one place the override is resolved**, and it is a named function rather
+/// than an `unwrap_or` at the call site so that *"absent means the constant"* is
+/// a rule with a home instead of a habit. There is exactly one production reader
+/// of the answer — `Engine::move_task_window`, which turns it into the stored
+/// instant — and a second one appearing anywhere is a second chance to read a
+/// `None` as a zero.
+///
+/// It does not re-check the bounds, exactly as `db::get_task` does not re-check
+/// [`validate_id`]: the bounds are a rule about what may be *written*, and this
+/// is a read on a 1 Hz tick that has to answer. A value from a newer keeper is
+/// therefore honoured as stored rather than clamped — clamping would hold a
+/// window back to an instant nobody chose and leave no trace of having done it,
+/// and `move_task_window` writes the instant it computes into a `detail` line a
+/// person reads, so an unusual delay explains itself there.
+pub fn effective_missed_delay_ms(delay_ms: Option<i64>) -> i64 {
+    delay_ms.unwrap_or(TASK_MISSED_DELAY_MS)
+}
+
 /// The pure gate: what this host should do about one task, right now.
 ///
 /// No `self`, no clock, no database and no allocation, so the state machine is
@@ -1484,7 +1606,14 @@ mod tests {
     /// run (NFR-43).
     #[test]
     fn an_unrecognised_stored_kind_including_update_is_not_a_kind_this_build_runs() {
-        for value in ["update", "Sync", "", "teleport", "Release", "releases"] {
+        for value in [
+            "update", "Sync", "", "teleport", "Release", "releases", "Verify", "verifies",
+            // Story 59.9's own near-miss, and the one that matters most: the
+            // deferred kind is an arbitrary command, so the spelling a
+            // hand-written row would most plausibly try is a verb-looking
+            // string this build does not own.
+            "exec", "run",
+        ] {
             assert_eq!(
                 TaskKind::from_stored(value),
                 None,
@@ -1497,13 +1626,18 @@ mod tests {
         // not widen the vocabulary by anything else, and `update` in particular
         // is still nothing this build can name.
         assert_eq!(TaskKind::from_stored("release"), Some(TaskKind::Release));
+        // Story 59.9's kind, asserted here for the same reason `release` is:
+        // the claim is that a *third* variant widened the vocabulary by
+        // exactly one word, and that `update` is still nothing this build can
+        // name after it.
+        assert_eq!(TaskKind::from_stored("verify"), Some(TaskKind::Verify));
     }
 
     /// The on-disk spellings are the compatibility surface, so every one of
     /// them must survive a round trip through the reader that parses it.
     #[test]
     fn every_stored_spelling_round_trips() {
-        for kind in [TaskKind::Sync, TaskKind::Release] {
+        for kind in [TaskKind::Sync, TaskKind::Release, TaskKind::Verify] {
             assert_eq!(TaskKind::from_stored(kind.as_str()), Some(kind));
         }
         for mode in [TaskMode::Off, TaskMode::Manual, TaskMode::Scheduled] {
@@ -1732,6 +1866,82 @@ mod tests {
                 TaskMissedPolicy::from_stored(spelling),
                 None,
                 "{spelling:?} is not a policy this build may act on"
+            );
+        }
+    }
+
+    /// An absent override *is* the constant, and that is the whole compatibility
+    /// claim of this column (Story 59.6, FR-366).
+    ///
+    /// Asserted as an equality against `TASK_MISSED_DELAY_MS` rather than against
+    /// `30 * 60_000`, so changing the constant cannot make this test the thing
+    /// that has to be edited — and so a future `unwrap_or(0)`, which is the one
+    /// typo this function can contain, fails here rather than in a field install
+    /// where `delay` would silently have become `run_now`.
+    #[test]
+    fn a_task_with_no_delay_of_its_own_waits_exactly_the_constant() {
+        assert_eq!(effective_missed_delay_ms(None), TASK_MISSED_DELAY_MS);
+        assert_ne!(
+            effective_missed_delay_ms(None),
+            0,
+            "a zero default would make every delay task a run_now task, at the \
+             cost of one extra write per absence"
+        );
+        // And an override is honoured verbatim: the floor is a write-door rule,
+        // so nothing on the read path may quietly raise a stored value to it.
+        for delay_ms in [TASK_MISSED_GRACE_MS, TASK_MISSED_DELAY_MS + 1, MAX_SCHEDULE_INTERVAL_MS] {
+            assert_eq!(effective_missed_delay_ms(Some(delay_ms)), delay_ms);
+        }
+    }
+
+    /// The two bounds, at the boundary rather than near it, and each refusal
+    /// quotes the value (Story 59.6, FR-366).
+    ///
+    /// The floor is `TASK_MISSED_GRACE_MS` exactly — inclusive, because a delay
+    /// equal to the grace is coherent: the window is recognised as missed and
+    /// held back by the same interval again, which is a real, if impatient,
+    /// answer. One millisecond below it is not, and that is the assertion that
+    /// pins the inclusivity rather than leaving it to a reader of `<`.
+    #[test]
+    fn a_delay_shorter_than_the_grace_or_longer_than_a_year_is_refused() {
+        for accepted in [
+            None,
+            Some(TASK_MISSED_GRACE_MS),
+            Some(TASK_MISSED_DELAY_MS),
+            Some(MAX_SCHEDULE_INTERVAL_MS),
+        ] {
+            assert!(
+                validate_missed_delay_ms(accepted).is_ok(),
+                "{accepted:?} is a delay a task may carry"
+            );
+        }
+
+        for refused in [0, -1, 1, TASK_MISSED_GRACE_MS - 1, i64::MIN] {
+            let err = validate_missed_delay_ms(Some(refused))
+                .expect_err("shorter than the interval that concludes nobody was home");
+            let message = err.to_string();
+            assert!(
+                message.contains("concludes nobody was home"),
+                "the refusal must say why the grace period is the floor; got {message}"
+            );
+            assert!(
+                message.contains(&refused.to_string()),
+                "a refusal quotes the value it refused, as every other one in this \
+                 module does; got {message}"
+            );
+        }
+
+        for refused in [MAX_SCHEDULE_INTERVAL_MS + 1, i64::MAX] {
+            let message = validate_missed_delay_ms(Some(refused))
+                .expect_err("longer than a schedule may be")
+                .to_string();
+            assert!(
+                message.contains("must not exceed a year"),
+                "the refusal must name the ceiling it shares with the schedule; got {message}"
+            );
+            assert!(
+                message.contains(&refused.to_string()),
+                "a refusal quotes the value it refused; got {message}"
             );
         }
     }

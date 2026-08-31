@@ -1895,7 +1895,7 @@ doing its job cannot grow `sync.db`. Unlike the activity log, which is
 explicitly not a source of truth, this record **is** the answer to "when did
 this last run, and what happened".
 
-### The two kinds, and the one that will never exist
+### The kinds, and the one that will never exist
 
 A task's `kind` is one of keeper's own verbs, never a shell string:
 
@@ -1903,12 +1903,43 @@ A task's `kind` is one of keeper's own verbs, never a shell string:
 | --- | --- |
 | `sync` | one full sync pass over the named folder, or over every enabled folder when the task is host-wide — the same `sync --once` body, taking the same per-folder reservation |
 | `release` | one release sweep over the named folder, or over every enabled folder — the same body §9 describes, with every one of its refusals |
+| `verify` | one verification pass over the named folder, or over every enabled folder — the same body `keeper-syncd verify` runs, reading only: no worktree file is written, no object is added to the store, and no network is asked |
 
-Both reuse the existing implementation rather than gaining a second one, which
-is what makes "a task is not a privileged caller" true rather than promised: a
-`release` task refuses exactly where `dehydrate` refuses, hashes the actual
-bytes the same way, asks the server the same per-object question at the moment
-of the deletion, and honours the pin, the per-file deadline and both budgets.
+All three reuse the existing implementation rather than gaining a second one,
+which is what makes "a task is not a privileged caller" true rather than
+promised: a `release` task refuses exactly where `dehydrate` refuses, hashes the
+actual bytes the same way, asks the server the same per-object question at the
+moment of the deletion, and honours the pin, the per-file deadline and both
+budgets.
+
+`verify` is the one kind that takes **no per-folder reservation**, and that is
+deliberate rather than an omission: it writes nothing, so there is no second
+writer to serialize, and a check that stood aside whenever the host happened to
+be syncing would report on the quiet folders and skip the busy ones. It follows
+that a `verify` run never ends in `busy` — there is nothing for it to collide
+with. It does the remote half no more than the verb does: `verify --remote` is
+one batch round trip per object, and a nightly schedule over a folder with ten
+thousand virtual paths is the last place that belongs.
+
+A `verify` run that finds a bad path **fails**, and its detail names the first
+one, because a schedule reporting `ok` about the one folder whose content is
+damaged is the exact failure this chapter's opening paragraph is about. A folder
+whose verify could not run at all — an unparseable `.keepervirtual` is the
+ordinary way — is counted apart from a clean one and fails the run too: a check
+that could not run is not a check that passed. A folder whose removable volume
+is not attached is neither; it is `deferred`, and the window is retried rather
+than consumed.
+
+**A kind is a verb keeper already owns, and the vocabulary stays closed.** Not a
+shell string, and not because a third kind was hard to add — the price of a
+closed vocabulary is precisely that somebody has to write the arm, and that
+price is the point. Every remote this machine talks to is disclosed in
+`docs/egress.md`, which the release workflow diffs against the previous tag; a
+user-supplied command could reach any host on the internet and that diff would
+show nothing whatsoever. There is no task timeout either — only the one-hour
+lease — and no capture of what a command printed. Running arbitrary commands
+from a sync daemon is a different security posture and needs its own decision
+with a stated threat model; until there is one, there is no way to write one.
 
 **`update` is not a task kind and never will be.** There is no such value to
 write, and a hand-written row naming one is skipped as an unreadable kind rather
