@@ -4,7 +4,7 @@ type: 'feature'
 created: '2026-08-31'
 status: 'done'
 baseline_revision: '925bdf4'
-final_revision: 'TBD'
+final_revision: '0e17aca'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
@@ -223,10 +223,26 @@ plausible small number.
   `scripts/check-macos.sh`. Four agents shared this worktree; the coordinator runs the project-wide
   gates once, and the `keeper` shell crate cannot link on Linux.
 
-**Mutation proof:** revert `move_task_window`'s reader to a bare `tasks::TASK_MISSED_DELAY_MS` and
-`a_task_that_carries_its_own_delay_waits_that_long_and_not_the_constant` must fail; invert the form's
-note composition to the default literal and the computed-note test must fail.
+**Measured, 2026-08-31, on `0e17aca` plus the three coordinator-held files:**
+
+- `cargo test -p keeper-sync --lib` -- 1110 passed / 0 failed.
+- `cargo test -p keeper-syncd` -- 135 + 6 + 12 passed / 0 failed.
+- `bun run vitest run src/components/sync/task-form.test.tsx` -- 31 passed / 0 failed.
+- `cargo test -p keeper-core` -- passed; regenerated both bindings, committed from that run.
+- `bun run typecheck` -- one remaining error, and it is the intended one:
+  `src/components/layout/tasks-pane.test.tsx:156` needs `missedDelayMs: null` on its `taskVm()`
+  factory. That file belongs to 59.1's owner, who asked for the break rather than an optional field.
+
+**Mutation proof, both observed.**
+
+- Engine reader reverted to a bare `tasks::TASK_MISSED_DELAY_MS`:
+  `a_task_that_carries_its_own_delay_waits_that_long_and_not_the_constant` failed at
+  `engine.rs:14168` --
+  *assertion `left == right` failed: the row's own delay, anchored on the same noticing … left:
+  Some(1700011800000) right: Some(1700024400000)* — half an hour where four hours was chosen.
+  Restored; green again.
+- `taskFormOnMissedNote`'s `${delayMinutes}` reverted to `${TASK_MISSED_DELAY_MINUTES}`: two tests
+  failed — *composes the delay's number from the value it is given, not from the constant* and *is
+  the sentence the form actually renders, at the default and at a chosen value*. Restored; 31 green.
 
 ## Review Triage Log
-</content>
-<parameter name="i">Writing the 59.6 spec
