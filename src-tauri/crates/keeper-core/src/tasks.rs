@@ -292,6 +292,16 @@ pub struct TaskVm {
     pub profile: Option<String>,
     /// The stored schedule expression, `null` when none is stored.
     pub schedule: Option<String>,
+    /// What to do about a window that fell due while nobody was home: as
+    /// stored, `"run_now"`, `"delay"`, `"skip"`, or a spelling this build does
+    /// not know (Story 58.4).
+    ///
+    /// A `String` for [`Self::kind`]'s reason: a row a newer keeper wrote must
+    /// reach the view as the spelling it has. An unreadable policy makes the row
+    /// unreadable, so such a spelling only arrives here past a `list_tasks` that
+    /// could read it — which is why the view may render it verbatim rather than
+    /// having to guess.
+    pub on_missed: String,
     /// When it next comes due: ms since the Unix epoch, `null` when never.
     #[ts(type = "number | null")]
     pub next_due_ms: Option<i64>,
@@ -300,6 +310,14 @@ pub struct TaskVm {
     /// When that lease expires: ms since the Unix epoch, `null` when idle.
     #[ts(type = "number | null")]
     pub lease_until_ms: Option<i64>,
+    /// When this row was last written: ms since the Unix epoch (UTC).
+    ///
+    /// On the wire for one reason and it is not display: it is the baseline an
+    /// edit form sends back on [`TaskSaveReq::baseline_updated_ms`], so a save
+    /// whose reading has gone stale is refused instead of reverting whatever
+    /// another host moved meanwhile.
+    #[ts(type = "number")]
+    pub updated_ms: i64,
     /// The most recent recorded run, `null` when it has never run.
     pub last_run: Option<TaskRunVm>,
     /// Which host will actually run this — [`task_host`]'s verdict.
@@ -355,6 +373,22 @@ pub struct TaskSaveReq {
     pub profile_id: Option<String>,
     /// The schedule expression, `null` to store none.
     pub schedule: Option<String>,
+    /// The requested missed-window policy, as one of the stored spellings.
+    ///
+    /// A `String` rather than an enum for [`TaskVm::on_missed`]'s reason, and
+    /// refused rather than coerced when this build cannot read it — the same
+    /// answer `kind` and `mode` already get.
+    pub on_missed: String,
+    /// The `updated_ms` the caller's reading of this row carried, or `null`.
+    ///
+    /// The lost-update guard, and it is a **request** field rather than a
+    /// protocol detail because only the caller knows whether it holds a reading
+    /// worth checking. An edit form does — it seeded its values once, and every
+    /// field it is about to send is as old as that seeding — so it sends the row's
+    /// `updated_ms` and the store refuses the write if the stored value has
+    /// moved. A create sends `null`: there is no reading to be stale.
+    #[ts(type = "number | null")]
+    pub baseline_updated_ms: Option<i64>,
 }
 
 /// Exactly the facts [`task_host`] needs, borrowed.

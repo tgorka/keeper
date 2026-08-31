@@ -1684,9 +1684,11 @@ const TASKS: TaskVm[] = [
     profileId: null,
     profile: null,
     schedule: "0 3 * * *",
+    onMissed: "run_now",
     nextDueMs: ahead(957),
     runningHost: null,
     leaseUntilMs: null,
+    updatedMs: NOW - 2000,
     lastRun: TASK_RUNS["01JNIGHTLYSYNCAAAAAAAAAAAA"][0],
     host: { kind: "app", sentence: HOST_SENTENCES.app, reason: null },
   },
@@ -1698,11 +1700,15 @@ const TASKS: TaskVm[] = [
     profileId: "p1",
     profile: "keeper",
     schedule: "every 6h",
+    // skip, because a release sweep deletes: a window nobody
+    // served is better dropped than served at an instant nobody chose.
+    onMissed: "skip",
     nextDueMs: ahead(358),
     // Mid-run and holding the lease: the other host on this machine cannot
     // claim this task until the lease expires or this one hands it back.
     runningHost: "01DEVICE#912",
     leaseUntilMs: ahead(58),
+    updatedMs: NOW - 3000,
     lastRun: TASK_RUNS["01JRELEASESWEEPBBBBBBBBBBB"][0],
     host: { kind: "daemon", sentence: HOST_SENTENCES.daemon, reason: null },
   },
@@ -1714,9 +1720,13 @@ const TASKS: TaskVm[] = [
     profileId: null,
     profile: null,
     schedule: "0 4 * * *",
+    // delay, so a 04:00 sweep missed overnight does not fire in the
+    // same second the machine comes back.
+    onMissed: "delay",
     nextDueMs: ahead(1_017),
     runningHost: null,
     leaseUntilMs: null,
+    updatedMs: NOW - 4000,
     // Never run yet, and the point of the row is the sentence: the unit IS
     // enabled and DOES read this database, so the daemon really is the host —
     // but `loginctl enable-linger` was never run here, so a `--user` unit dies
@@ -1734,9 +1744,11 @@ const TASKS: TaskVm[] = [
     profileId: "p2",
     profile: "notes",
     schedule: "@hourly",
+    onMissed: "run_now",
     nextDueMs: ahead(51),
     runningHost: null,
     leaseUntilMs: null,
+    updatedMs: NOW - 5000,
     lastRun: TASK_RUNS["01JVAULTPUSHCCCCCCCCCCCCCC"][0],
     // The Linux default: a unit IS enabled here, and it reads a different data
     // directory, so it never sees this row. Saying only "keeper runs this"
@@ -1753,9 +1765,11 @@ const TASKS: TaskVm[] = [
     // Remembered, not obeyed: a manual task's schedule is stored and ignored,
     // so the row must not read as though something will fire it.
     schedule: "@weekly",
+    onMissed: "run_now",
     nextDueMs: null,
     runningHost: null,
     leaseUntilMs: null,
+    updatedMs: NOW - 6000,
     lastRun: TASK_RUNS["01JARCHIVETRIMDDDDDDDDDDDD"][0],
     host: { kind: "onRequest", sentence: HOST_SENTENCES.onRequest, reason: null },
   },
@@ -1770,9 +1784,11 @@ const TASKS: TaskVm[] = [
     profileId: "01JNOSUCHPROFILE",
     profile: null,
     schedule: "30 4 * * *",
+    onMissed: "run_now",
     nextDueMs: ahead(1_407),
     runningHost: null,
     leaseUntilMs: null,
+    updatedMs: NOW - 7000,
     lastRun: null,
     host: {
       kind: "unhosted",
@@ -1788,9 +1804,11 @@ const TASKS: TaskVm[] = [
     profileId: "p1",
     profile: "keeper",
     schedule: "0 2 * * *",
+    onMissed: "run_now",
     nextDueMs: null,
     runningHost: null,
     leaseUntilMs: null,
+    updatedMs: NOW - 8000,
     lastRun: null,
     // Off, and deliberately NOT unhosted: nothing is wrong with this row and
     // the user switched it off on purpose.
@@ -1868,6 +1886,29 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   sync_task_save: (payload) => {
     const req = payload.req as TaskSaveReq;
     const existing = TASKS.find((candidate) => candidate.id === req.id);
+    // The lost-update refusal, mirrored so the flow worth looking at is
+    // reachable in the dev shell: a form that seeded from a reading somebody
+    // else has since moved is refused, and the refusal is what the form renders.
+    // Every fixture carries a distinct `updatedMs`, so passing a stale one is
+    // the whole of the setup.
+    if (req.baselineUpdatedMs !== null) {
+      if (existing === undefined) {
+        throw {
+          code: "internal",
+          message: `task '${req.id}' no longer exists: it was forgotten elsewhere since this was opened, so there is nothing to change`,
+          accountId: null,
+          retriable: false,
+        };
+      }
+      if (existing.updatedMs !== req.baselineUpdatedMs) {
+        throw {
+          code: "internal",
+          message: `task '${req.id}' was changed elsewhere since this was opened (last written at ${existing.updatedMs}, this edit started from ${req.baselineUpdatedMs}): refusing to write stale values over it — re-read it and try again`,
+          accountId: null,
+          retriable: false,
+        };
+      }
+    }
     const prior = existing ?? TASKS[0];
     const saved: TaskVm = {
       ...prior,
@@ -1877,12 +1918,16 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       enabled: req.enabled,
       profileId: req.profileId,
       schedule: req.schedule,
+      onMissed: req.onMissed,
       // The store owns the window and clears it on any of these three moving,
       // so echoing the request's value back would show a "next due" the real
       // command would have discarded.
       nextDueMs: null,
       runningHost: null,
       leaseUntilMs: null,
+      // Written by the store on every save, which is what makes the baseline a
+      // moving target and the guard above worth having.
+      updatedMs: NOW,
     };
     if (existing === undefined) {
       TASKS.push(saved);

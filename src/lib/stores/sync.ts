@@ -74,6 +74,18 @@ export const TASK_KINDS = ["sync", "release"] as const;
 export const TASK_MODES = ["off", "manual", "scheduled"] as const;
 
 /**
+ * The legal task `onMissed` values (mirror of the Rust
+ * `TaskMissedPolicy::from_stored` match). Here for {@link TASK_KINDS}' reason
+ * and with no union type for the same one.
+ *
+ * Underscored, because these are the **stored** spellings and the stored
+ * spelling is what crosses IPC. `keeper-syncd tasks set --on-missed run-now`
+ * takes the kebab-case one, which is clap's convention and the single place the
+ * two diverge; nothing here converts, because nothing here talks to clap.
+ */
+export const TASK_MISSED_POLICIES = ["run_now", "delay", "skip"] as const;
+
+/**
  * The lane every profile created from Settings uses. The other lane
  * (`worktree`) is an agent airlock that Rust only accepts together with
  * `direction = pushOnly`, so it stays a syncd-config affordance rather than a

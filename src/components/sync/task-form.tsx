@@ -27,9 +27,16 @@
  * - **The scheduled-with-no-schedule refusal.** `upsert_task` catches the task
  *   that would report itself enabled and never run; this form lets the
  *   combination be expressed and shows the answer.
- * - **Whether a kind or a mode is readable.** `TaskKind::from_stored` and
- *   `TaskMode::from_stored` decide, and `db::decode_task` partitions on both, so
- *   an unreadable spelling never reaches an edit form in the first place.
+ * - **Whether a kind, a mode or a missed-window policy is readable.**
+ *   `TaskKind::from_stored`, `TaskMode::from_stored` and
+ *   `TaskMissedPolicy::from_stored` decide, and `db::decode_task` partitions on
+ *   all three, so an unreadable spelling never reaches an edit form in the first
+ *   place.
+ * - **Whether the row this form seeded from is still current.** `upsert_task`
+ *   carries an `updated_ms` compare-and-set (Story 58.4), so a save whose
+ *   baseline has moved is refused by the store and the refusal is rendered here.
+ *   The alternative — noticing the prop changed and offering to re-seed — is a
+ *   smaller version of the same idea that still loses the race.
  * - **Minting an id.** A blank id means keeper mints the ULID (`sync_ipc.rs`),
  *   which is why an add form sends `""` rather than inventing one.
  * - **The engine-owned columns.** `nextDueMs` and both lease columns have no key
@@ -52,7 +59,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import type { SyncProfileVm, TaskVm } from "@/lib/ipc/client";
 import { syncProfiles, syncTaskSave } from "@/lib/ipc/client";
-import { syncErrorMessage, TASK_KINDS, TASK_MODES } from "@/lib/stores/sync";
+import { syncErrorMessage, TASK_KINDS, TASK_MISSED_POLICIES, TASK_MODES } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
 /** The add form's title, and the label of every control that reveals it. */
@@ -150,6 +157,19 @@ export const TASK_FORM_SCHEDULE_LABEL = "Schedule";
 export const TASK_FORM_SCHEDULE_NOTE =
   "Five-field cron, or @hourly / @daily / @weekly, or every <n><unit> such as every 90m. Leave it empty to store no schedule. keeper refuses an expression it cannot read, and quotes what you typed.";
 
+export const TASK_FORM_ON_MISSED_LABEL = "If a window is missed";
+/**
+ * The three settings, accurate to `tasks::decide` and no longer than that.
+ *
+ * Fifteen minutes is `TASK_MISSED_GRACE_MS` and is named as a number rather than
+ * as "a while", because it is the boundary both non-default settings turn on and
+ * a person choosing between them is choosing about it. Nothing here
+ * re-implements the rule: this text is read by a human, and `decide` is what
+ * decides.
+ */
+export const TASK_FORM_ON_MISSED_NOTE =
+  "A window that fell due while nothing was hosting this task. run_now serves it on the first tick that sees it — once, however many windows went by, which is what an ordinary restart already does. delay serves it no sooner than fifteen minutes after it fell due. skip abandons a window nobody served within those fifteen minutes and arms the next one instead.";
+
 export const TASK_FORM_ADD_SUBMIT_LABEL = "Add task";
 export const TASK_FORM_EDIT_SUBMIT_LABEL = "Save task";
 export const TASK_FORM_CANCEL_LABEL = "Cancel";
@@ -161,7 +181,7 @@ export const TASK_FORM_ERROR_TESTID = "task-form-error";
 const SELECT_CLASS =
   "h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
 
-/** What the six controls hold. `id` and `schedule` are strings all the way. */
+/** What the seven controls hold. `id` and `schedule` are strings all the way. */
 type TaskFormValues = {
   id: string;
   kind: string;
@@ -170,6 +190,7 @@ type TaskFormValues = {
   /** `""` is the sentinel for `profileId: null` — see {@link TaskForm}. */
   profileId: string;
   schedule: string;
+  onMissed: string;
 };
 
 /**
@@ -211,7 +232,17 @@ export function TaskForm({
   // Seeded once, deliberately (see `task` above).
   const [form, setForm] = useState<TaskFormValues>(() =>
     task === undefined
-      ? { id: "", kind: "sync", mode: "scheduled", enabled: true, profileId: "", schedule: "" }
+      ? {
+          id: "",
+          kind: "sync",
+          mode: "scheduled",
+          enabled: true,
+          profileId: "",
+          schedule: "",
+          // The store's own default, spelled here so a created task means what
+          // a task created before this control existed meant.
+          onMissed: "run_now",
+        }
       : {
           id: task.id,
           kind: task.kind,
@@ -219,8 +250,18 @@ export function TaskForm({
           enabled: task.enabled,
           profileId: task.profileId ?? "",
           schedule: task.schedule ?? "",
+          onMissed: task.onMissed,
         },
   );
+  /**
+   * The reading this form is editing, or `null` on an add form.
+   *
+   * Seeded once from the same prop and for the same reason the values are —
+   * which is exactly what makes it a *baseline*. `upsert_task` refuses a write
+   * whose baseline has moved, so this is what turns "the row changed under you"
+   * from a silent revert into the sentence rendered below.
+   */
+  const [baselineUpdatedMs] = useState<number | null>(() => task?.updatedMs ?? null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   /** `null` until the folder read lands — an unknown list, not an empty one. */
@@ -329,6 +370,11 @@ export function TaskForm({
         // untrimmed for exactly the same reason. Every non-empty spelling goes
         // verbatim, whitespace and all.
         schedule: form.schedule === "" ? null : form.schedule,
+        onMissed: form.onMissed,
+        // The reading this form started from, so a save whose row has moved
+        // elsewhere is refused rather than reverting it. `null` on an add form:
+        // there is no reading to be stale.
+        baselineUpdatedMs,
       });
       onSaved?.(saved);
     } catch (raw) {
@@ -460,6 +506,29 @@ export function TaskForm({
         />
       </div>
       <p className="text-muted-foreground text-xs">{TASK_FORM_SCHEDULE_NOTE}</p>
+
+      {/* Beside the schedule because it is a question about the schedule, and
+          native for the reason the other three menus are. The option text is
+          the stored spelling itself — the same rule the kind menu states: two
+          words for one stored value is the drift AD-C7 forbids, and this is the
+          vocabulary `tasks list --json` prints. */}
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={`${fieldId}-on-missed`}>{TASK_FORM_ON_MISSED_LABEL}</Label>
+        <select
+          id={`${fieldId}-on-missed`}
+          className={cn(SELECT_CLASS, "w-56")}
+          value={form.onMissed}
+          disabled={saving}
+          onChange={(event) => setForm((live) => ({ ...live, onMissed: event.target.value }))}
+        >
+          {TASK_MISSED_POLICIES.map((policy) => (
+            <option key={policy} value={policy}>
+              {policy}
+            </option>
+          ))}
+        </select>
+      </div>
+      <p className="text-muted-foreground text-xs">{TASK_FORM_ON_MISSED_NOTE}</p>
 
       {/* Rust's sentence, corrected in no way, in the form that asked for it. */}
       {error !== null && (

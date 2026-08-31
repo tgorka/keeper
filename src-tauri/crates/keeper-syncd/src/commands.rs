@@ -44,7 +44,7 @@ use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
 use keeper_sync::provenance::SyncSource;
-use keeper_sync::tasks::{TaskKind, TaskMode, TaskOutcome};
+use keeper_sync::tasks::{TaskKind, TaskMissedPolicy, TaskMode, TaskOutcome};
 use keeper_sync::volume::{self, VolumeStatus};
 use keeper_sync::{
     ProfileState, Result as SyncResult, SyncDirection, SyncError, SyncLane, SyncPlatform,
@@ -649,6 +649,20 @@ pub struct TaskSetArgs {
     /// `manual` when you did not. On update it keeps its stored value.
     #[arg(long, value_enum)]
     pub mode: Option<TaskModeArg>,
+    /// What to do about a window that fell due while nobody was home:
+    /// `run-now`, `delay` or `skip`.
+    ///
+    /// `run-now` is the default and is what an ordinary restart already does —
+    /// the stored past window fires on the first tick that sees it, **once**,
+    /// however many windows went by. `delay` serves it no sooner than fifteen
+    /// minutes after it fell due. `skip` abandons a window nobody served after
+    /// those fifteen minutes and arms the next one instead.
+    ///
+    /// On create this defaults to `run-now`, so a task created by an older
+    /// script means exactly what it meant before. On update it keeps its stored
+    /// value.
+    #[arg(long, value_enum)]
+    pub on_missed: Option<TaskMissedArg>,
 }
 
 #[derive(Debug, Args)]
@@ -774,6 +788,32 @@ pub enum TaskModeArg {
     Off,
     Manual,
     Scheduled,
+}
+
+/// `--on-missed`'s vocabulary, which is [`TaskMissedPolicy`]'s and nothing more
+/// (Story 58.4).
+///
+/// Kebab-case by clap's own convention, which is the one place this vocabulary
+/// is spelled differently from the store: `run-now` on the command line,
+/// `run_now` in the column and in both renderings. That is deliberate — a
+/// clap flag with an underscore reads wrong beside `--host-wide` and
+/// `--no-schedule` — and it is the only divergence, which is why the conversion
+/// below is the single place it lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TaskMissedArg {
+    RunNow,
+    Delay,
+    Skip,
+}
+
+impl From<TaskMissedArg> for TaskMissedPolicy {
+    fn from(value: TaskMissedArg) -> Self {
+        match value {
+            TaskMissedArg::RunNow => Self::RunNow,
+            TaskMissedArg::Delay => Self::Delay,
+            TaskMissedArg::Skip => Self::Skip,
+        }
+    }
 }
 
 impl From<DirectionArg> for SyncDirection {
@@ -3235,7 +3275,7 @@ fn task_lines(now_ms: i64, views: &[TaskView<'_>], unknown: &[UnknownTask]) -> V
             (Some(id), None) => format!("[no such folder: {id}]"),
         };
         lines.push(format!(
-            "{id}  {kind}  {mode}  {target}  {schedule}  {due}{disabled}{running}",
+            "{id}  {kind}  {mode}  {target}  {schedule}  {due}{on_missed}{disabled}{running}",
             id = task.id,
             kind = task.kind.as_str(),
             mode = task.mode.as_str(),
@@ -3246,6 +3286,16 @@ fn task_lines(now_ms: i64, views: &[TaskView<'_>], unknown: &[UnknownTask]) -> V
                 // fault: a task created at noon arms tonight rather than firing
                 // at noon.
                 None => "never armed".to_owned(),
+            },
+            // A marker when it is not the default, exactly as `[disabled]`
+            // below: `run_now` is what every row on every install already did,
+            // so its absence is the honest rendering of it and a column here
+            // would say the same thing about every row on most machines. The
+            // `--json` document carries it unconditionally, because a fixed key
+            // set is that document's contract.
+            on_missed = match task.on_missed {
+                TaskMissedPolicy::RunNow => String::new(),
+                other => format!("  [on missed: {}]", other.as_str()),
             },
             disabled = if task.enabled { "" } else { "  [disabled]" },
             running = match &task.running_host {
@@ -3320,9 +3370,11 @@ fn task_run_lines(now_ms: i64, task_id: &str, runs: &[TaskRunRow]) -> Vec<String
 
 /// One task as the `--json` document carries it.
 ///
-/// The key set is the contract, and it is **fixed**: all eleven keys are always
+/// The key set is the contract, and it is **fixed**: all twelve keys are always
 /// present. Wave 3's Tasks view reads exactly this document, so a key that
-/// appears only sometimes would be a key every consumer has to guard.
+/// appears only sometimes would be a key every consumer has to guard —
+/// `onMissed` therefore appears on every row, including the `run_now` ones the
+/// human rendering leaves unmarked.
 ///
 /// camelCase, matching `sizeBytes` and `profileId` across `ls-files`, `verify`,
 /// `materialize` and `dehydrate`, so an operator reads every document the same
@@ -3363,6 +3415,7 @@ fn task_json(
         "nextDueMs": task.next_due_ms,
         "runningHost": task.running_host,
         "leaseUntilMs": task.lease_until_ms,
+        "onMissed": task.on_missed.as_str(),
         "lastRun": last.map(task_run_json),
     })
 }
@@ -3790,6 +3843,15 @@ fn cmd_task_set(
         (None, None) => TaskMode::Manual,
     };
 
+    // The same shape as `mode` above minus the derivation: there is nothing to
+    // derive, because the default is not a guess about intent — it is the
+    // behaviour every task on every install already had.
+    let on_missed = match (args.on_missed, existing) {
+        (Some(policy), _) => TaskMissedPolicy::from(policy),
+        (None, Some(row)) => row.on_missed,
+        (None, None) => TaskMissedPolicy::RunNow,
+    };
+
     let row = TaskRow {
         id: args.task.clone(),
         profile_id,
@@ -3805,8 +3867,9 @@ fn cmd_task_set(
         updated_ms: now_ms,
         running_host: existing.and_then(|row| row.running_host.clone()),
         lease_until_ms: existing.and_then(|row| row.lease_until_ms),
+        on_missed,
     };
-    engine.save_task(&row)?;
+    engine.save_task(&row, None)?;
     report_task(printer, engine, now_ms, &row.id)
 }
 
@@ -3831,7 +3894,7 @@ fn cmd_task_set_enabled(
         updated_ms: now_ms,
         ..stored.clone()
     };
-    engine.save_task(&row)?;
+    engine.save_task(&row, None)?;
     printer.line(format!(
         "{} task {}",
         if enabled { "Enabled" } else { "Disabled" },
@@ -5471,6 +5534,7 @@ mod tests {
             updated_ms: 1_700_000_000_000,
             running_host: None,
             lease_until_ms: None,
+            on_missed: TaskMissedPolicy::RunNow,
         }
     }
 
@@ -5499,6 +5563,7 @@ mod tests {
             schedule: None,
             no_schedule: false,
             mode: None,
+            on_missed: None,
         }
     }
 
@@ -5666,6 +5731,7 @@ mod tests {
                 "leaseUntilMs",
                 "mode",
                 "nextDueMs",
+                "onMissed",
                 "profile",
                 "profileId",
                 "runningHost",
@@ -5683,6 +5749,9 @@ mod tests {
         assert_eq!(document["nextDueMs"], serde_json::Value::Null);
         assert_eq!(document["runningHost"], serde_json::Value::Null);
         assert_eq!(document["leaseUntilMs"], serde_json::Value::Null);
+        // Present on every row including the default ones, unlike the human
+        // rendering's marker: a fixed key set is this document's contract.
+        assert_eq!(document["onMissed"], serde_json::json!("run_now"));
         assert_eq!(document["lastRun"], serde_json::Value::Null);
     }
 
@@ -6051,7 +6120,9 @@ mod tests {
         };
         let mut task = a_task("nightly");
         task.updated_ms = platform.now_ms();
-        engine.save_task(&task).expect("a host-wide sync task");
+        engine
+            .save_task(&task, None)
+            .expect("a host-wide sync task");
 
         // `Printer::new(false)` prints the human form to this test's stdout,
         // which is exactly what `cargo test` captures and discards.
@@ -6257,6 +6328,106 @@ mod tests {
             cmd_task_status(&printer, &engine, now, "adhoc").expect("status"),
             EXIT_OK
         );
+    }
+
+    /// `--on-missed` is writable from the CLI, keeps its stored value when
+    /// omitted, and reaches both renderings (Story 58.4, FR-356, AD-139).
+    ///
+    /// Both surfaces are asserted because the policy has to be **reachable and
+    /// readable** from each of them: a knob writable from neither is born
+    /// unreachable, which is the defect class this epic exists to close, and a
+    /// knob nobody can read back is one nobody can verify took. The human line
+    /// carries a marker only when the setting is not the default — `run_now` is
+    /// what every row already did — and the `--json` document carries it always,
+    /// because a fixed key set is that document's contract.
+    #[test]
+    fn the_missed_window_policy_is_writable_from_the_cli_and_read_back_by_both_renderings() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+        let stored = |id: &str| -> TaskRow {
+            let listing = engine.tasks().expect("tasks");
+            select_task(&listing, id).expect("a stored row").clone()
+        };
+        let rendered = |id: &str| -> (String, serde_json::Value) {
+            let row = stored(id);
+            let view = TaskView {
+                task: &row,
+                profile_name: None,
+                last: None,
+            };
+            (
+                task_lines(now, std::slice::from_ref(&view), &[]).join("\n"),
+                task_json(&row, None, None),
+            )
+        };
+
+        // Create without the flag: the default is what an ordinary restart
+        // already did, so an older script means what it always meant.
+        let mut args = set_args("nightly");
+        args.kind = Some(TaskKindArg::Sync);
+        args.schedule = Some("0 3 * * *".to_owned());
+        cmd_task_set(&printer, &engine, now, &args).expect("create");
+        assert_eq!(stored("nightly").on_missed, TaskMissedPolicy::RunNow);
+        let (line, document) = rendered("nightly");
+        assert!(
+            !line.contains("on missed"),
+            "the default is the absence of a marker, exactly as `enabled` is: {line}"
+        );
+        assert_eq!(
+            document["onMissed"], "run_now",
+            "but the document says so on every row"
+        );
+
+        // Set it, and read it back from both.
+        args.on_missed = Some(TaskMissedArg::Skip);
+        cmd_task_set(&printer, &engine, now, &args).expect("set the policy");
+        assert_eq!(stored("nightly").on_missed, TaskMissedPolicy::Skip);
+        let (line, document) = rendered("nightly");
+        assert!(
+            line.contains("[on missed: skip]"),
+            "a non-default policy is visible in the human rendering: {line}"
+        );
+        assert_eq!(document["onMissed"], "skip");
+
+        // Omitted keeps stored, which is the rule every other flag here follows:
+        // a caller changing a schedule must not silently reset a policy.
+        let mut only_schedule = set_args("nightly");
+        only_schedule.schedule = Some("0 4 * * *".to_owned());
+        cmd_task_set(&printer, &engine, now, &only_schedule).expect("change the schedule");
+        assert_eq!(
+            stored("nightly").on_missed,
+            TaskMissedPolicy::Skip,
+            "an omitted flag keeps what was stored"
+        );
+        assert_eq!(stored("nightly").schedule.as_deref(), Some("0 4 * * *"));
+
+        // And it is settable back, because a knob you can set and never unset is
+        // the dead knob this epic exists to close.
+        args.schedule = Some("0 4 * * *".to_owned());
+        args.on_missed = Some(TaskMissedArg::RunNow);
+        cmd_task_set(&printer, &engine, now, &args).expect("back to the default");
+        assert_eq!(stored("nightly").on_missed, TaskMissedPolicy::RunNow);
+
+        // The kebab-case flag and the stored spelling are the one place this
+        // vocabulary diverges, and the conversion is asserted so a third
+        // spelling cannot appear.
+        for (arg, policy) in [
+            (TaskMissedArg::RunNow, TaskMissedPolicy::RunNow),
+            (TaskMissedArg::Delay, TaskMissedPolicy::Delay),
+            (TaskMissedArg::Skip, TaskMissedPolicy::Skip),
+        ] {
+            assert_eq!(TaskMissedPolicy::from(arg), policy);
+            assert_eq!(
+                TaskMissedPolicy::from_stored(policy.as_str()),
+                Some(policy),
+                "and the stored spelling this writes is one the store reads back"
+            );
+        }
     }
 
     /// A stored task cannot be repurposed into another kind.

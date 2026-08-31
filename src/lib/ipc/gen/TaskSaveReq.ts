@@ -32,4 +32,23 @@ profileId: string | null,
 /**
  * The schedule expression, `null` to store none.
  */
-schedule: string | null, };
+schedule: string | null, 
+/**
+ * The requested missed-window policy, as one of the stored spellings.
+ *
+ * A `String` rather than an enum for [`TaskVm::on_missed`]'s reason, and
+ * refused rather than coerced when this build cannot read it — the same
+ * answer `kind` and `mode` already get.
+ */
+onMissed: string, 
+/**
+ * The `updated_ms` the caller's reading of this row carried, or `null`.
+ *
+ * The lost-update guard, and it is a **request** field rather than a
+ * protocol detail because only the caller knows whether it holds a reading
+ * worth checking. An edit form does — it seeded its values once, and every
+ * field it is about to send is as old as that seeding — so it sends the row's
+ * `updated_ms` and the store refuses the write if the stored value has
+ * moved. A create sends `null`: there is no reading to be stale.
+ */
+baselineUpdatedMs: number | null, };

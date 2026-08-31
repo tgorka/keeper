@@ -1824,9 +1824,11 @@ fn task_vm(
         profile_id: row.profile_id.clone(),
         profile,
         schedule: row.schedule.clone(),
+        on_missed: row.on_missed.as_str().to_owned(),
         next_due_ms: row.next_due_ms,
         running_host: row.running_host.clone(),
         lease_until_ms: row.lease_until_ms,
+        updated_ms: row.updated_ms,
         last_run,
         host,
     }
@@ -2200,6 +2202,17 @@ pub async fn sync_task_save(
             req.mode
         )))
     })?;
+    // Refused here, before the engine, for the reason `kind` and `mode` are:
+    // `db::TaskRow` has no way to carry a spelling this build cannot read, and
+    // guessing one would be the dangerous direction — reading an unknown policy
+    // as `run_now` would serve a window its author asked to skip.
+    let on_missed =
+        keeper_sync::tasks::TaskMissedPolicy::from_stored(&req.on_missed).ok_or_else(|| {
+            sync_ipc_error(&SyncError::Config(format!(
+                "this keeper does not know the missed-window policy '{}'",
+                req.on_missed
+            )))
+        })?;
     let id = if req.id.trim().is_empty() {
         new_ulid()
     } else {
@@ -2219,8 +2232,15 @@ pub async fn sync_task_save(
         updated_ms: platform.now_ms(),
         running_host: None,
         lease_until_ms: None,
+        on_missed,
     };
-    engine.save_task(&row).map_err(|err| sync_ipc_error(&err))?;
+    // The one caller that passes a baseline, and the reason the parameter
+    // exists: this form seeded its six values once, so every field it is about
+    // to write is as old as that seeding. `None` on a create — there is no
+    // reading to be stale.
+    engine
+        .save_task(&row, req.baseline_updated_ms)
+        .map_err(|err| sync_ipc_error(&err))?;
 
     let listing = engine.tasks().map_err(|err| sync_ipc_error(&err))?;
     let stored = listing

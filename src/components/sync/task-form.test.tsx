@@ -3,11 +3,17 @@
  * Story 58.1, FR-347, AD-C7).
  *
  * Every assertion here is one half of that sentence. The form's whole job is to
- * carry six values across IPC without improving any of them and to render the
+ * carry eight values across IPC without improving any of them and to render the
  * refusal verbatim when the store will not take them — so the tests check what
  * was *sent* as closely as what was shown, because a form that quietly trimmed
  * an id would pass a shallower version of all of this while storing a task under
  * a name nobody typed.
+ *
+ * Two of the eight arrived with Story 58.4: `onMissed`, the missed-window
+ * policy, whose whole point is that it is writable from here and not only from
+ * a terminal; and `baselineUpdatedMs`, which is not a value a person types at
+ * all — it is the reading this form seeded from, sent back so the store can
+ * refuse a save that would revert whatever another host moved meanwhile.
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,6 +36,7 @@ import {
   TASK_FORM_ID_LABEL,
   TASK_FORM_KIND_LABEL,
   TASK_FORM_MODE_LABEL,
+  TASK_FORM_ON_MISSED_LABEL,
   TASK_FORM_PROFILE_LABEL,
   TASK_FORM_PROFILE_READ_FAILED_PREFIX,
   TASK_FORM_PROFILE_READING_NOTE,
@@ -58,6 +65,8 @@ function taskVm(over: Partial<TaskVm> = {}): TaskVm {
     nextDueMs: NOW + 3_600_000,
     runningHost: null,
     leaseUntilMs: null,
+    updatedMs: NOW - 60_000,
+    onMissed: "run_now",
     lastRun: null,
     host: {
       kind: "app",
@@ -141,8 +150,8 @@ describe("TaskForm, adding a task", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
-    // Exactly these six keys, and `id: ""` above all: an id invented here would
-    // be a second minter, and `sync_ipc.rs` already has the only one.
+    // Exactly these eight keys, and `id: ""` above all: an id invented here
+    // would be a second minter, and `sync_ipc.rs` already has the only one.
     await waitFor(() =>
       expect(mockSave).toHaveBeenCalledWith({
         id: "",
@@ -151,6 +160,10 @@ describe("TaskForm, adding a task", () => {
         enabled: true,
         profileId: null,
         schedule: "@daily",
+        onMissed: "run_now",
+        // No reading to be stale: a create has no baseline, and passing one
+        // would make the store refuse a row it is about to insert.
+        baselineUpdatedMs: null,
       }),
     );
     await waitFor(() => expect(onSaved).toHaveBeenCalledWith(taskVm()));
@@ -414,6 +427,10 @@ describe("TaskForm, editing a task", () => {
         enabled: false,
         profileId: "01FOLDER",
         schedule: "@weekly",
+        onMissed: "run_now",
+        // The reading this form opened on, which is what makes the store's
+        // refusal possible at all.
+        baselineUpdatedMs: NOW - 60_000,
       }),
     );
   });
@@ -496,5 +513,85 @@ describe("TaskForm, editing a task", () => {
     await waitFor(() =>
       expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ profileId: "01NOSUCH" })),
     );
+  });
+});
+
+describe("TaskForm, the missed-window policy", () => {
+  it("offers the three settings this build can write and sends the chosen spelling", async () => {
+    // THE PROPERTY OF STORY 58.4, and it is a reachability property rather than
+    // a behavioural one: a policy writable only from `keeper-syncd tasks set` is
+    // born unreachable, which is the exact defect class this epic exists to
+    // close. The vocabulary is the STORED spelling — `run_now`, not the
+    // kebab-case `run-now` clap takes — because that is what crosses IPC.
+    const stored = taskVm({ onMissed: "run_now" });
+    mockSave.mockResolvedValue(taskVm({ onMissed: "skip" }));
+    render(<TaskForm task={stored} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    const picker = screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL);
+    expect(picker).toHaveValue("run_now");
+    expect(
+      Array.from(picker.querySelectorAll("option")).map((option) => option.getAttribute("value")),
+    ).toEqual(["run_now", "delay", "skip"]);
+
+    fireEvent.change(picker, { target: { value: "skip" } });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ onMissed: "skip" })),
+    );
+  });
+
+  it("arrives holding the stored policy rather than the add form's default", async () => {
+    // The same trap the kind and the mode already guard: an edit form that
+    // opened on the add form's defaults would silently rewrite the policy of a
+    // task somebody came here to change the schedule of — and for the release
+    // kind, rewriting `skip` to `run_now` is a deletion sweep at an instant
+    // nobody chose.
+    mockSave.mockResolvedValue(taskVm({ onMissed: "delay" }));
+    render(<TaskForm task={taskVm({ onMissed: "delay" })} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    expect(screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL)).toHaveValue("delay");
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "@weekly" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ onMissed: "delay" })),
+    );
+  });
+
+  it("renders the store's refusal when the row it seeded from has moved", async () => {
+    // Closing `deferred-work.md:5044-5066`. The form seeds once — deliberately,
+    // since re-syncing from the prop would overwrite what has been typed — so
+    // every value it is about to send is as old as that seeding. Before the
+    // store-side compare-and-set this save silently reverted whatever the other
+    // host had changed and nothing on screen said so.
+    mockSave.mockRejectedValue({
+      code: "internal",
+      message:
+        "invalid sync configuration: task '01SCHED' was changed elsewhere since this was opened (last written at 1760000090000, this edit started from 1759999940000): refusing to write stale values over it — re-read it and try again",
+      accountId: null,
+      retriable: false,
+    });
+    const onSaved = vi.fn();
+    render(<TaskForm task={taskVm()} onSaved={onSaved} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "@weekly" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+
+    // Rust's sentence, corrected in no way, in the form that asked for it.
+    expect(await screen.findByTestId(TASK_FORM_ERROR_TESTID)).toHaveTextContent(
+      /was changed elsewhere since this was opened/,
+    );
+    expect(onSaved).not.toHaveBeenCalled();
+    // And every typed value survives, because the typed value is what a retry is
+    // driven from.
+    expect(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL)).toHaveValue("@weekly");
   });
 });

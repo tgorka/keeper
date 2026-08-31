@@ -234,6 +234,7 @@ fn migrate(conn: &Connection) -> Result<()> {
     ensure_activity_columns(conn)?;
     ensure_journal_columns(conn)?;
     ensure_materialized_columns(conn)?;
+    ensure_task_columns(conn)?;
     ensure_prune_default(conn)?;
     Ok(())
 }
@@ -440,6 +441,38 @@ fn ensure_journal_columns(conn: &Connection) -> Result<()> {
     }
     if !existing.iter().any(|c| c == "urgency") {
         conn.execute("ALTER TABLE journal ADD COLUMN urgency INTEGER", [])?;
+    }
+    Ok(())
+}
+
+/// Add the tasks table's late columns — `on_missed` so far — if they are not
+/// there yet (Story 58.4, FR-356, AD-139).
+///
+/// The helper the DDL above has demanded since Story 57.1 and nobody had needed
+/// yet. Written on [`ensure_journal_columns`]' shape and for its reasons: one
+/// column at a time, `ALTER TABLE ... ADD COLUMN` guarded by the column list as
+/// its own idempotence, and `PRAGMA table_info`'s statement dropped before any
+/// `conn.execute` runs on the same connection.
+///
+/// **The `DEFAULT` is mandatory rather than tidy**, and it is the reason this
+/// column could not go into the batch above. [`upsert_task`]'s `INSERT` names
+/// its columns, so an older binary — the app and the daemon share one `sync.db`
+/// and are upgraded separately — writes a row without mentioning `on_missed`.
+/// Against a `NOT NULL` column with no default that write fails outright, which
+/// is NFR-43's other half. `'run_now'` is also the only defensible value: it is
+/// what an ordinary restart already does, so no stored row changes meaning when
+/// this migration runs.
+fn ensure_task_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(tasks)")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if !existing.iter().any(|c| c == "on_missed") {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN on_missed TEXT NOT NULL DEFAULT 'run_now'",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -2832,7 +2865,8 @@ pub const TASK_RUNS_CAP: usize = 50;
 /// Every column of `tasks`, in the order [`read_task`] decodes them. One
 /// constant so a reader added later cannot drift out of step with the decoder.
 const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
-                            enabled, updated_ms, running_host, lease_until_ms";
+                            enabled, updated_ms, running_host, lease_until_ms, \
+                            on_missed";
 
 /// One stored task.
 ///
@@ -2857,10 +2891,14 @@ pub struct TaskRow {
     /// The host holding the lease, if a run is in flight.
     pub running_host: Option<String>,
     pub lease_until_ms: Option<i64>,
+    /// What to do about a window that fell due while nobody was home
+    /// (Story 58.4). `run_now` on every row written before the column existed,
+    /// which is what an ordinary restart already did.
+    pub on_missed: crate::tasks::TaskMissedPolicy,
 }
 
 impl TaskRow {
-    /// Project the row onto exactly the four facts [`crate::tasks::decide`]
+    /// Project the row onto exactly the five facts [`crate::tasks::decide`]
     /// reads, so the pure gate never sees a `Connection` or a whole row it
     /// could be tempted to consult.
     pub fn state(&self) -> TaskState {
@@ -2869,6 +2907,7 @@ impl TaskRow {
             mode: self.mode,
             next_due_ms: self.next_due_ms,
             lease_until_ms: self.lease_until_ms,
+            on_missed: self.on_missed,
         }
     }
 
@@ -2941,6 +2980,7 @@ type StoredTask = (
     i64,
     Option<String>,
     Option<i64>,
+    String,
 );
 
 /// Read one `tasks` row, tolerating every column but the primary key.
@@ -2969,15 +3009,18 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
         row.get(7).unwrap_or_default(),
         row.get(8).unwrap_or_default(),
         row.get(9).unwrap_or_default(),
+        row.get(10).unwrap_or_default(),
     ))
 }
 
 /// Apply this build's vocabulary to a stored row, or say why it cannot be.
 ///
-/// Three ways a row can be unreadable and all three are the same answer: a
-/// `kind` with no variant here, a `mode` with no variant here, and a schedule
-/// this parser rejects. Running any of them would mean guessing what somebody
-/// else's keeper meant.
+/// Four ways a row can be unreadable and all four are the same answer: a `kind`
+/// with no variant here, a `mode` with no variant here, a missed-window policy
+/// with no variant here, and a schedule this parser rejects. Running any of them
+/// would mean guessing what somebody else's keeper meant — and for the policy
+/// the guess would be the dangerous direction twice over, because reading an
+/// unknown spelling as `run_now` would serve a window its author asked to skip.
 fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> {
     let (
         id,
@@ -2990,6 +3033,7 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         updated_ms,
         running_host,
         lease_until_ms,
+        on_missed,
     ) = stored;
     let unknown = |reason: String| UnknownTask {
         id: id.clone(),
@@ -3000,6 +3044,11 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
     };
     let Some(mode) = TaskMode::from_stored(&mode) else {
         return Err(unknown(format!("unknown task mode '{mode}'")));
+    };
+    let Some(on_missed) = crate::tasks::TaskMissedPolicy::from_stored(&on_missed) else {
+        return Err(unknown(format!(
+            "unknown missed-window policy '{on_missed}'"
+        )));
     };
     let row = TaskRow {
         id: id.clone(),
@@ -3012,6 +3061,7 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         updated_ms,
         running_host,
         lease_until_ms,
+        on_missed,
     };
     if let Err(err) = row.parsed_schedule() {
         return Err(unknown(format!("unreadable schedule: {err}")));
@@ -3079,7 +3129,33 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
 /// The pre-read and the write share one transaction, so nothing decides these
 /// edges against a row the other host has since rewritten — the discipline
 /// [`claim_task`] already keeps.
-pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<TaskSave> {
+///
+/// # `baseline_updated_ms` is the lost-update guard, and it is opt-in on purpose
+///
+/// `Some(at)` means *"I read this row when its `updated_ms` was `at`, and I am
+/// writing that reading back"*, and the write is **refused** when the stored
+/// value has moved or the row is gone. It closes the hole Story 58.1's review
+/// recorded (`deferred-work.md:5044-5066`): an edit form seeds its six values
+/// once — deliberately, since re-syncing from the prop would overwrite what has
+/// been typed — and this function was an unconditional `INSERT … ON CONFLICT DO
+/// UPDATE` with no version column, so every field the other host moved while the
+/// form sat open was silently reverted. Unlike `SyncProfileReq`, which merges
+/// onto a clone of the stored profile precisely because a form cannot be trusted
+/// to carry every field, a task save has no merge to hide behind. This is the
+/// NFR-43 stored-row refusal two blocks below applied to a row that **moved**
+/// rather than one that is **unreadable**: the same rule, in the same place, with
+/// the same rendered sentence.
+///
+/// `None` means there is no baseline to check, and it is what every write that
+/// reads the row and writes it back inside one call passes — the CLI's
+/// `tasks set`, `tasks enable`, `tasks disable`, and every engine-internal
+/// write. A precondition there would be theatre: nothing can have moved between
+/// two adjacent statements the way it can across a person's typing.
+pub fn upsert_task(
+    conn: &Connection,
+    task: &TaskRow,
+    baseline_updated_ms: Option<i64>,
+) -> Result<TaskSave> {
     crate::tasks::validate_id(&task.id)?;
     // The parser's own refusal, propagated unchanged: it already names the
     // rule and quotes the expression, and a second layer of prose around it
@@ -3092,11 +3168,19 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<TaskSave> {
         )));
     }
     let tx = conn.unchecked_transaction()?;
-    let stored: Option<(String, String, Option<String>, i64)> = tx
+    let stored: Option<(String, String, Option<String>, i64, i64)> = tx
         .query_row(
-            "SELECT kind, mode, schedule, enabled FROM tasks WHERE id = ?1",
+            "SELECT kind, mode, schedule, enabled, updated_ms FROM tasks WHERE id = ?1",
             [&task.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
     // A row this build cannot read belongs to a newer keeper, and overwriting it
@@ -3109,7 +3193,7 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<TaskSave> {
     // wrote silently rewrote that mode to one of ours — the same silent
     // downgrade by the other door, and reachable the moment an arbitrary-id
     // write verb exists, which this story registered.
-    if let Some((kind, mode, _, _)) = &stored {
+    if let Some((kind, mode, _, _, _)) = &stored {
         if TaskKind::from_stored(kind).is_none() {
             return Err(SyncError::Config(format!(
                 "task '{}' is stored as kind '{kind}', which this keeper cannot read: \
@@ -3125,9 +3209,36 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<TaskSave> {
             )));
         }
     }
+    // The lost-update guard, after the unreadable-row refusal because that one
+    // names something more actionable, and before the write because a refused
+    // write must change nothing. Both arms are refusals: a row whose
+    // `updated_ms` has moved was rewritten by somebody else, and a row that has
+    // gone was forgotten by somebody else — inserting over the second would
+    // resurrect a task another host deleted, which is a stranger outcome than
+    // saying so.
+    if let Some(baseline) = baseline_updated_ms {
+        match &stored {
+            Some((_, _, _, _, updated_ms)) if *updated_ms != baseline => {
+                return Err(SyncError::Config(format!(
+                    "task '{}' was changed elsewhere since this was opened \
+                     (last written at {updated_ms}, this edit started from {baseline}): \
+                     refusing to write stale values over it — re-read it and try again",
+                    task.id
+                )));
+            }
+            None => {
+                return Err(SyncError::Config(format!(
+                    "task '{}' no longer exists: it was forgotten elsewhere since \
+                     this was opened, so there is nothing to change",
+                    task.id
+                )));
+            }
+            Some(_) => {}
+        }
+    }
     let effect = match &stored {
         None => TaskSave::Created,
-        Some((_, mode, stored_schedule, enabled)) => {
+        Some((_, mode, stored_schedule, enabled, _)) => {
             let schedule_changed = stored_schedule.as_deref() != task.schedule.as_deref();
             let came_alive = task.enabled && *enabled == 0;
             let became_scheduled =
@@ -3141,8 +3252,8 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<TaskSave> {
     };
     tx.execute(
         "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
-                            updated_ms, running_host, lease_until_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL)
+                            updated_ms, running_host, lease_until_ms, on_missed)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9)
          ON CONFLICT(id) DO UPDATE SET
              profile_id  = excluded.profile_id,
              kind        = excluded.kind,
@@ -3150,7 +3261,8 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<TaskSave> {
              mode        = excluded.mode,
              next_due_ms = CASE WHEN ?8 = 1 THEN NULL ELSE tasks.next_due_ms END,
              enabled     = excluded.enabled,
-             updated_ms  = excluded.updated_ms",
+             updated_ms  = excluded.updated_ms,
+             on_missed   = excluded.on_missed",
         (
             &task.id,
             &task.profile_id,
@@ -3160,6 +3272,7 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<TaskSave> {
             i64::from(task.enabled),
             task.updated_ms,
             i64::from(effect == TaskSave::Rearmed),
+            task.on_missed.as_str(),
         ),
     )?;
     tx.commit()?;
@@ -3260,6 +3373,40 @@ pub fn arm_task(conn: &Connection, id: &str, next_due_ms: Option<i64>, now_ms: i
         (id, next_due_ms, now_ms),
     )?;
     Ok(())
+}
+
+/// Abandon an **open** window and arm the next one, and nothing else
+/// (Story 58.4, FR-356, AD-139).
+///
+/// [`arm_task`] cannot be reused for this and the reason is in its own `WHERE`:
+/// `next_due_ms IS NULL` is a condition a skip can never satisfy, because a skip
+/// is by definition about a window that is *there*. So this statement carries the
+/// same protection for the opposite precondition — a compare-and-set on the
+/// window the caller **decided about**:
+///
+/// * `next_due_ms = ?2` is the observed window. A decision computed from a
+///   listing read earlier in this tick cannot clobber a window the other host
+///   has since armed, run or skipped; the `UPDATE` simply affects no row.
+/// * `?3 > ?2` makes the write **forward-only by construction** rather than by
+///   the caller's care. A skip that moved a window backwards would be catch-up
+///   wearing the name of its opposite.
+///
+/// Returns whether the window was still the caller's to abandon, so a caller can
+/// record the fact rather than assume it — which is what Story 58.5 needs, and
+/// the reason this is not a `Result<()>`.
+pub fn skip_task_window(
+    conn: &Connection,
+    id: &str,
+    observed_due_ms: i64,
+    next_due_ms: i64,
+    now_ms: i64,
+) -> Result<bool> {
+    let affected = conn.execute(
+        "UPDATE tasks SET next_due_ms = ?3, updated_ms = ?4
+          WHERE id = ?1 AND next_due_ms = ?2 AND ?3 > ?2",
+        (id, observed_due_ms, next_due_ms, now_ms),
+    )?;
+    Ok(affected == 1)
 }
 
 /// Take the lease and open a run, or report that somebody else has it.
@@ -5584,6 +5731,7 @@ mod tests {
             updated_ms: 1,
             running_host: None,
             lease_until_ms: None,
+            on_missed: crate::tasks::TaskMissedPolicy::RunNow,
         }
     }
 
@@ -5667,6 +5815,10 @@ mod tests {
                 "updated_ms",
                 "running_host",
                 "lease_until_ms",
+                // Added by `ensure_task_columns` rather than by the batch, which
+                // is why it comes last: a store that predates it reaches this
+                // same shape down the additive path (Story 58.4).
+                "on_missed",
             ]
         );
         assert_eq!(
@@ -5702,7 +5854,7 @@ mod tests {
         // what a read-modify-write from a form carries — must never reach the
         // row and rewind the schedule.
         cron.next_due_ms = Some(9_000);
-        upsert_task(&c, &cron).expect("save");
+        upsert_task(&c, &cron, None).expect("save");
         let stored = TaskRow {
             next_due_ms: None,
             ..cron.clone()
@@ -5711,7 +5863,7 @@ mod tests {
             profile_id: None,
             ..task("01B", None, TaskMode::Manual)
         };
-        upsert_task(&c, &host_wide).expect("save the host-wide task");
+        upsert_task(&c, &host_wide, None).expect("save the host-wide task");
 
         assert_eq!(
             get_task(&c, "01A").expect("get"),
@@ -5733,22 +5885,28 @@ mod tests {
                 mode: TaskMode::Scheduled,
                 next_due_ms: Some(9_000),
                 lease_until_ms: None,
+                on_missed: crate::tasks::TaskMissedPolicy::RunNow,
             },
-            "the row projects into exactly the four facts the pure gate reads"
+            "the row projects into exactly the five facts the pure gate reads"
         );
     }
 
     #[test]
     fn an_upsert_over_a_running_task_does_not_free_its_lease() {
         let c = conn();
-        upsert_task(&c, &task("01U", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01U", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         claim_task(&c, "01U", "hostA", 0, 60_000, None)
             .expect("claim")
             .expect("the first claim wins");
 
         let mut edited = task("01U", Some("every 10m"), TaskMode::Scheduled);
         edited.updated_ms = 42;
-        upsert_task(&c, &edited).expect("save again while the run is in flight");
+        upsert_task(&c, &edited, None).expect("save again while the run is in flight");
 
         let row = get_task(&c, "01U").expect("get").expect("row");
         assert_eq!(row.schedule.as_deref(), Some("every 10m"));
@@ -5766,7 +5924,7 @@ mod tests {
         let c = conn();
         let bad = task("01M", Some("0 3 * *"), TaskMode::Scheduled);
         assert!(
-            matches!(upsert_task(&c, &bad), Err(SyncError::Config(_))),
+            matches!(upsert_task(&c, &bad, None), Err(SyncError::Config(_))),
             "refusal, never coercion, and it happens where the row is written"
         );
         assert!(
@@ -5780,7 +5938,7 @@ mod tests {
         let c = conn();
         let nonsense = task("01N", None, TaskMode::Scheduled);
         assert!(matches!(
-            upsert_task(&c, &nonsense),
+            upsert_task(&c, &nonsense, None),
             Err(SyncError::Config(_))
         ));
         assert!(get_task(&c, "01N").expect("get").is_none());
@@ -5790,7 +5948,7 @@ mod tests {
     fn an_empty_task_id_is_refused() {
         let c = conn();
         assert!(matches!(
-            upsert_task(&c, &task("", Some("every 5m"), TaskMode::Scheduled)),
+            upsert_task(&c, &task("", Some("every 5m"), TaskMode::Scheduled), None),
             Err(SyncError::Config(_))
         ));
     }
@@ -5799,7 +5957,12 @@ mod tests {
     fn a_task_kind_this_build_cannot_read_is_skipped_and_listed_not_fatal() {
         // A newer keeper's task must not brick an older one's list.
         let c = conn();
-        upsert_task(&c, &task("01A", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01A", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         raw_task(&c, "01T", "teleport", "scheduled", Some("every 5m"));
         // `update` is the one refusal the spec calls structural: `TaskKind` has
         // no such variant, so raw SQL is the only way to write one — and it
@@ -5861,6 +6024,7 @@ mod tests {
         upsert_task(
             &created,
             &task("01R", Some("every 5m"), TaskMode::Scheduled),
+            None,
         )
         .expect("save");
         drop(created);
@@ -5905,7 +6069,12 @@ mod tests {
     #[test]
     fn a_dead_holders_lease_is_reclaimable_at_the_expiry_instant_and_not_before() {
         let c = conn();
-        upsert_task(&c, &task("01L", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01L", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         let abandoned = claim_task(&c, "01L", "hostA", 0, 1_000, None)
             .expect("claim")
             .expect("hostA claims a free task");
@@ -5942,7 +6111,7 @@ mod tests {
         let c = conn();
         let mut off = task("01D", Some("every 5m"), TaskMode::Scheduled);
         off.enabled = false;
-        upsert_task(&c, &off).expect("save");
+        upsert_task(&c, &off, None).expect("save");
 
         assert_eq!(
             claim_task(&c, "01D", "hostA", 0, 60_000, None).expect("claim"),
@@ -5958,7 +6127,12 @@ mod tests {
     #[test]
     fn finishing_a_run_releases_the_lease_and_records_the_outcome_and_the_next_window() {
         let c = conn();
-        upsert_task(&c, &task("01F", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01F", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         let run = claim_task(&c, "01F", "hostA", 0, 60_000, None)
             .expect("claim")
             .expect("claimed");
@@ -6003,7 +6177,12 @@ mod tests {
     #[test]
     fn an_unreadable_run_outcome_is_carried_not_dropped_and_a_null_one_is_in_flight() {
         let c = conn();
-        upsert_task(&c, &task("01O", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01O", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         let in_flight = claim_task(&c, "01O", "hostA", 0, 60_000, None)
             .expect("claim")
             .expect("claimed");
@@ -6033,7 +6212,12 @@ mod tests {
     #[test]
     fn the_task_runs_cap_trims_the_oldest_and_keeps_the_newest() {
         let c = conn();
-        upsert_task(&c, &task("01C", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01C", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         let mut ids = Vec::new();
         for n in 0..TASK_RUNS_CAP + 5 {
             let now = 1_000 * (n as i64 + 1);
@@ -6073,7 +6257,12 @@ mod tests {
     #[test]
     fn deleting_a_task_takes_its_runs_with_it() {
         let c = conn();
-        upsert_task(&c, &task("01G", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01G", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         claim_task(&c, "01G", "hostA", 0, 60_000, None)
             .expect("claim")
             .expect("claimed");
@@ -6093,7 +6282,12 @@ mod tests {
     #[test]
     fn the_claim_refuses_a_window_that_is_not_open_yet() {
         let c = conn();
-        upsert_task(&c, &task("01W", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01W", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         arm_task(&c, "01W", Some(10_000), 0).expect("arm");
 
         assert_eq!(
@@ -6138,7 +6332,12 @@ mod tests {
     #[test]
     fn an_overrunning_host_cannot_free_the_lease_that_replaced_it() {
         let c = conn();
-        upsert_task(&c, &task("01X", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01X", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         arm_task(&c, "01X", Some(0), 0).expect("arm");
         let slow = claim_task(&c, "01X", "hostA", 0, 1_000, Some(0))
             .expect("claim")
@@ -6194,7 +6393,7 @@ mod tests {
     #[test]
     fn an_off_task_cannot_be_claimed_even_by_a_caller_that_did_not_check() {
         let c = conn();
-        upsert_task(&c, &task("01Z", Some("every 5m"), TaskMode::Off)).expect("save");
+        upsert_task(&c, &task("01Z", Some("every 5m"), TaskMode::Off), None).expect("save");
         arm_task(&c, "01Z", Some(0), 0).expect("arm");
 
         assert_eq!(
@@ -6211,7 +6410,12 @@ mod tests {
     #[test]
     fn a_row_whose_columns_will_not_read_is_listed_not_fatal() {
         let c = conn();
-        upsert_task(&c, &task("01A", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01A", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         // A BLOB, which TEXT affinity does not convert, in `kind` — so the
         // vocabulary column really does hand back a value this build's reader
         // refuses, and the tolerant read is what routes it to the unknown path
@@ -6257,25 +6461,321 @@ mod tests {
         );
     }
 
+    /// The migration is additive, and the `DEFAULT` is asserted rather than
+    /// assumed (Story 58.4, AD-139).
+    ///
+    /// Two claims, and both of them are about a store the *other* binary wrote.
+    /// The app and the daemon share one `sync.db` and are upgraded separately,
+    /// so both halves of NFR-43 are live facts rather than hypotheses:
+    ///
+    /// * a row written before the column existed must read back `run_now`,
+    ///   because that is what it already did — an upgrade that changed the
+    ///   meaning of a stored schedule would be the worst kind of silent change;
+    /// * an `INSERT` naming only the ten original columns — which is exactly
+    ///   what an older binary's `upsert_task` emits — must still succeed. That
+    ///   is the whole reason the column carries a `DEFAULT` instead of being
+    ///   nullable or living in the `CREATE TABLE` batch.
+    ///
+    /// The pre-migration store is built by dropping the column, which is the
+    /// only way to reach that shape from a current `migrate`: SQLite has
+    /// supported `DROP COLUMN` since 3.35 and rusqlite bundles far newer.
+    #[test]
+    fn the_missed_window_column_is_additive_and_its_default_is_todays_behaviour() {
+        let c = conn();
+        upsert_task(
+            &c,
+            &task("01OLD", Some("@daily"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
+        c.execute("ALTER TABLE tasks DROP COLUMN on_missed", [])
+            .expect("a store from before the column existed");
+
+        // An older binary's write: the ten columns the `CREATE TABLE` batch has.
+        c.execute(
+            "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
+                                updated_ms, running_host, lease_until_ms)
+             VALUES ('01OLDER', NULL, 'sync', 'every 5m', 'scheduled', NULL, 1, 1, NULL, NULL)",
+            [],
+        )
+        .expect("an older binary's INSERT names only the columns it knows");
+
+        ensure_task_columns(&c).expect("the additive migration");
+        for id in ["01OLD", "01OLDER"] {
+            assert_eq!(
+                get_task(&c, id).expect("get").expect("row").on_missed,
+                crate::tasks::TaskMissedPolicy::RunNow,
+                "{id} kept the behaviour it already had"
+            );
+        }
+
+        // And now the same write against the migrated schema, which is the case
+        // the DEFAULT exists for: an older binary is still running beside the
+        // newer one and its INSERT does not mention the column.
+        c.execute(
+            "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
+                                updated_ms, running_host, lease_until_ms)
+             VALUES ('01MIXED', NULL, 'sync', 'every 5m', 'scheduled', NULL, 1, 1, NULL, NULL)",
+            [],
+        )
+        .expect("the DEFAULT is what keeps an older binary's write working");
+        assert_eq!(
+            get_task(&c, "01MIXED")
+                .expect("get")
+                .expect("row")
+                .on_missed,
+            crate::tasks::TaskMissedPolicy::RunNow
+        );
+
+        // Idempotent, like its three siblings: a second migrate adds nothing.
+        ensure_task_columns(&c).expect("a second pass");
+    }
+
+    /// A policy spelling this build cannot read is **skipped and listed**, never
+    /// guessed (Story 58.4, NFR-43).
+    ///
+    /// The direction matters more here than for `kind` or `mode`: reading an
+    /// unknown policy as `run_now` — the tolerant-looking choice — would serve a
+    /// window whose author asked for it to be skipped, and for the release kind
+    /// that is a deletion at an instant nobody chose. So the row goes to the
+    /// unknown list and the rest of the host keeps working.
+    #[test]
+    fn a_missed_window_policy_this_build_cannot_read_is_skipped_and_listed() {
+        let c = conn();
+        upsert_task(
+            &c,
+            &task("01A", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
+        upsert_task(
+            &c,
+            &task("01T", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
+        c.execute(
+            "UPDATE tasks SET on_missed = 'teleport' WHERE id = '01T'",
+            [],
+        )
+        .expect("a newer keeper's policy");
+
+        let listing = list_tasks(&c).expect("list");
+        assert_eq!(
+            listing
+                .tasks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["01A"],
+            "one unreadable policy must not stop every task on the host"
+        );
+        assert_eq!(listing.unknown.len(), 1);
+        assert_eq!(listing.unknown[0].id, "01T");
+        assert!(
+            listing.unknown[0].reason.contains("teleport"),
+            "and the reason quotes the spelling, which is what somebody greps \
+             for: {}",
+            listing.unknown[0].reason
+        );
+        assert!(
+            get_task(&c, "01T").expect("get").is_none(),
+            "a row this build cannot read reads as absent by id too, so a \
+             create-if-absent caller cannot walk into overwriting it"
+        );
+    }
+
+    /// The skip write is forward-only and compare-and-set, and both halves are
+    /// asserted because both are load-bearing (Story 58.4).
+    ///
+    /// `arm_task` could not have been reused: its `WHERE next_due_ms IS NULL` is
+    /// a condition a skip can never satisfy. So this statement carries the same
+    /// protection for the opposite precondition — and the protection is real on
+    /// a machine where the app and the daemon both tick this row.
+    #[test]
+    fn declining_a_window_moves_it_forward_and_only_from_the_window_it_saw() {
+        let c = conn();
+        upsert_task(&c, &task("01SK", Some("@daily"), TaskMode::Scheduled), None).expect("save");
+        arm_task(&c, "01SK", Some(50_000), 0).expect("arm");
+
+        assert!(
+            !skip_task_window(&c, "01SK", 40_000, 90_000, 1).expect("write"),
+            "a decision about a window this row does not carry affects nothing: \
+             the other host has moved on since this tick's listing read"
+        );
+        assert_eq!(
+            get_task(&c, "01SK").expect("get").expect("row").next_due_ms,
+            Some(50_000),
+            "and the row it was not about is untouched"
+        );
+
+        assert!(
+            !skip_task_window(&c, "01SK", 50_000, 50_000, 1).expect("write"),
+            "and a replacement that is not later is refused by the statement \
+             rather than by the caller's care — a skip that moved a window \
+             backwards would be catch-up wearing the name of its opposite"
+        );
+        assert!(!skip_task_window(&c, "01SK", 50_000, 10_000, 1).expect("write"));
+        assert_eq!(
+            get_task(&c, "01SK").expect("get").expect("row").next_due_ms,
+            Some(50_000)
+        );
+
+        assert!(
+            skip_task_window(&c, "01SK", 50_000, 90_000, 60_000).expect("write"),
+            "the window it did see, replaced by a later one"
+        );
+        let row = get_task(&c, "01SK").expect("get").expect("row");
+        assert_eq!(
+            row.next_due_ms,
+            Some(90_000),
+            "which is what makes the NEXT decision be about a different window, \
+             and not about the same past one forever"
+        );
+        assert_eq!(row.updated_ms, 60_000, "and the write is dated");
+        assert_eq!(
+            row.running_host, None,
+            "a decline takes no lease: nothing ran"
+        );
+    }
+
+    /// The lost-update guard, both refusals and the one write it permits
+    /// (Story 58.4, closing `deferred-work.md:5044-5066`).
+    ///
+    /// The sequence is the ordinary two-machine one the ledger entry describes,
+    /// not a contrived race: a person opens the edit form, another host writes
+    /// the row, the person saves. Before this guard every field the other host
+    /// moved was silently reverted and nothing on screen said so.
+    #[test]
+    fn a_save_whose_baseline_has_moved_is_refused_rather_than_reverting_the_row() {
+        let c = conn();
+        let mut original = task("01CAS", Some("@daily"), TaskMode::Scheduled);
+        original.updated_ms = 1_000;
+        upsert_task(&c, &original, None).expect("save");
+
+        // The form opened here, so this is its baseline.
+        let baseline = get_task(&c, "01CAS").expect("get").expect("row").updated_ms;
+        assert_eq!(baseline, 1_000);
+
+        // A create needs no baseline, and passing `None` is not a weaker
+        // version of the guard — there is genuinely no reading to be stale.
+        let mut fresh = task("01NEW", Some("@daily"), TaskMode::Scheduled);
+        fresh.updated_ms = 2_000;
+        assert_eq!(
+            upsert_task(&c, &fresh, None).expect("create"),
+            TaskSave::Created
+        );
+
+        // The other host writes the row while the form sits open.
+        let mut elsewhere = task("01CAS", Some("every 30m"), TaskMode::Scheduled);
+        elsewhere.updated_ms = 5_000;
+        upsert_task(&c, &elsewhere, None).expect("the other host's save");
+
+        let mut stale = original.clone();
+        stale.updated_ms = 6_000;
+        let refusal = upsert_task(&c, &stale, Some(baseline)).expect_err("refused");
+        assert!(
+            matches!(&refusal, SyncError::Config(message)
+                if message.contains("changed elsewhere") && message.contains("5000")),
+            "the refusal names the baseline that moved, because that is the fact \
+             a person has to act on: {refusal}"
+        );
+        assert_eq!(
+            get_task(&c, "01CAS")
+                .expect("get")
+                .expect("row")
+                .schedule
+                .as_deref(),
+            Some("every 30m"),
+            "and a refused write changes nothing — the other host's schedule stands"
+        );
+
+        // Re-read and try again, which is what the refusal asks for.
+        let current = get_task(&c, "01CAS").expect("get").expect("row");
+        let mut retried = stale.clone();
+        retried.updated_ms = 7_000;
+        upsert_task(&c, &retried, Some(current.updated_ms)).expect("the baseline is current now");
+
+        // A row forgotten elsewhere is refused too, rather than resurrected: an
+        // insert here would bring back a task another host deleted.
+        delete_task(&c, "01CAS").expect("the other host forgets it");
+        let gone = upsert_task(&c, &retried, Some(7_000)).expect_err("refused");
+        assert!(
+            matches!(&gone, SyncError::Config(message) if message.contains("no longer exists")),
+            "{gone}"
+        );
+        assert!(get_task(&c, "01CAS").expect("get").is_none());
+    }
+
+    /// The policy round-trips through the write door and survives the edges that
+    /// clear a window, because it is a property of the task rather than of the
+    /// window.
+    #[test]
+    fn the_missed_window_policy_round_trips_and_survives_a_rearm() {
+        let c = conn();
+        let mut skipping = task("01P", Some("@daily"), TaskMode::Scheduled);
+        skipping.on_missed = crate::tasks::TaskMissedPolicy::Skip;
+        upsert_task(&c, &skipping, None).expect("save");
+        assert_eq!(
+            get_task(&c, "01P").expect("get").expect("row").on_missed,
+            crate::tasks::TaskMissedPolicy::Skip
+        );
+
+        // A schedule change re-arms, which clears the window and must not clear
+        // the policy: what to do about a missed window is not a fact about which
+        // window it was.
+        let mut rescheduled = skipping.clone();
+        rescheduled.schedule = Some("every 30m".to_owned());
+        assert_eq!(
+            upsert_task(&c, &rescheduled, None).expect("save"),
+            TaskSave::Rearmed
+        );
+        let row = get_task(&c, "01P").expect("get").expect("row");
+        assert_eq!(row.next_due_ms, None);
+        assert_eq!(row.on_missed, crate::tasks::TaskMissedPolicy::Skip);
+
+        // And it is writable back to the default, which is the other half of the
+        // dead-knob rule: a setting you can set and never unset is a dead knob.
+        upsert_task(&c, &rescheduled_with_default(&rescheduled), None).expect("save");
+        assert_eq!(
+            get_task(&c, "01P").expect("get").expect("row").on_missed,
+            crate::tasks::TaskMissedPolicy::RunNow
+        );
+    }
+
+    /// [`the_missed_window_policy_round_trips_and_survives_a_rearm`]'s one
+    /// override, named so the assertion above reads as the claim it makes.
+    fn rescheduled_with_default(row: &TaskRow) -> TaskRow {
+        TaskRow {
+            on_missed: crate::tasks::TaskMissedPolicy::RunNow,
+            ..row.clone()
+        }
+    }
+
     /// A schedule change has to take effect on the next tick, not after the old
     /// schedule's window elapses — and an unrelated save must not move a window
     /// at all, which is what a settings form re-saving a whole row does.
     #[test]
     fn changing_the_schedule_rearms_and_an_unrelated_save_leaves_the_window_alone() {
         let c = conn();
-        upsert_task(&c, &task("01S", Some("@daily"), TaskMode::Scheduled)).expect("save");
+        upsert_task(&c, &task("01S", Some("@daily"), TaskMode::Scheduled), None).expect("save");
         arm_task(&c, "01S", Some(50_000), 0).expect("arm");
 
         let mut renamed = task("01S", Some("@daily"), TaskMode::Scheduled);
         renamed.profile_id = Some("elsewhere".to_owned());
-        upsert_task(&c, &renamed).expect("save");
+        upsert_task(&c, &renamed, None).expect("save");
         assert_eq!(
             get_task(&c, "01S").expect("get").expect("row").next_due_ms,
             Some(50_000),
             "the schedule did not change, so neither does the window"
         );
 
-        upsert_task(&c, &task("01S", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01S", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         assert_eq!(
             get_task(&c, "01S").expect("get").expect("row").next_due_ms,
             None,
@@ -6300,19 +6800,19 @@ mod tests {
     fn a_task_coming_back_into_service_arms_afresh_rather_than_catching_up() {
         let c = conn();
         let live = task("01E", Some("@daily"), TaskMode::Scheduled);
-        upsert_task(&c, &live).expect("save");
+        upsert_task(&c, &live, None).expect("save");
         arm_task(&c, "01E", Some(50_000), 0).expect("arm");
 
         let mut disabled = live.clone();
         disabled.enabled = false;
-        upsert_task(&c, &disabled).expect("disable");
+        upsert_task(&c, &disabled, None).expect("disable");
         assert_eq!(
             get_task(&c, "01E").expect("get").expect("row").next_due_ms,
             Some(50_000),
             "going out of service changes nothing: the row is simply not live"
         );
 
-        upsert_task(&c, &live).expect("enable");
+        upsert_task(&c, &live, None).expect("enable");
         assert_eq!(
             get_task(&c, "01E").expect("get").expect("row").next_due_ms,
             None,
@@ -6325,13 +6825,13 @@ mod tests {
         arm_task(&c, "01E", Some(50_000), 0).expect("arm");
         let mut manual = live.clone();
         manual.mode = TaskMode::Manual;
-        upsert_task(&c, &manual).expect("to manual");
+        upsert_task(&c, &manual, None).expect("to manual");
         assert_eq!(
             get_task(&c, "01E").expect("get").expect("row").next_due_ms,
             Some(50_000),
             "a manual task keeps its remembered window; nothing obeys it"
         );
-        upsert_task(&c, &live).expect("back to scheduled");
+        upsert_task(&c, &live, None).expect("back to scheduled");
         assert_eq!(
             get_task(&c, "01E").expect("get").expect("row").next_due_ms,
             None,
@@ -6351,14 +6851,14 @@ mod tests {
         let live = task("01SAVE", Some("@daily"), TaskMode::Scheduled);
 
         assert_eq!(
-            upsert_task(&c, &live).expect("save"),
+            upsert_task(&c, &live, None).expect("save"),
             TaskSave::Created,
             "there was no row"
         );
 
         arm_task(&c, "01SAVE", Some(50_000), 0).expect("arm");
         assert_eq!(
-            upsert_task(&c, &live).expect("save"),
+            upsert_task(&c, &live, None).expect("save"),
             TaskSave::Updated,
             "an identical save moves nothing"
         );
@@ -6375,7 +6875,7 @@ mod tests {
         let mut rescheduled = live.clone();
         rescheduled.schedule = Some("every 5m".to_owned());
         assert_eq!(
-            upsert_task(&c, &rescheduled).expect("save"),
+            upsert_task(&c, &rescheduled, None).expect("save"),
             TaskSave::Rearmed
         );
         assert_eq!(
@@ -6391,12 +6891,12 @@ mod tests {
         let mut disabled = rescheduled.clone();
         disabled.enabled = false;
         assert_eq!(
-            upsert_task(&c, &disabled).expect("save"),
+            upsert_task(&c, &disabled, None).expect("save"),
             TaskSave::Updated,
             "a task going quiet has not come back into service"
         );
         assert_eq!(
-            upsert_task(&c, &rescheduled).expect("save"),
+            upsert_task(&c, &rescheduled, None).expect("save"),
             TaskSave::Rearmed
         );
         assert_eq!(
@@ -6411,9 +6911,12 @@ mod tests {
         arm_task(&c, "01SAVE", Some(50_000), 0).expect("arm");
         let mut manual = rescheduled.clone();
         manual.mode = TaskMode::Manual;
-        assert_eq!(upsert_task(&c, &manual).expect("save"), TaskSave::Updated);
         assert_eq!(
-            upsert_task(&c, &rescheduled).expect("save"),
+            upsert_task(&c, &manual, None).expect("save"),
+            TaskSave::Updated
+        );
+        assert_eq!(
+            upsert_task(&c, &rescheduled, None).expect("save"),
             TaskSave::Rearmed
         );
 
@@ -6424,7 +6927,7 @@ mod tests {
         unscheduled.mode = TaskMode::Manual;
         unscheduled.schedule = None;
         assert_eq!(
-            upsert_task(&c, &unscheduled).expect("save"),
+            upsert_task(&c, &unscheduled, None).expect("save"),
             TaskSave::Rearmed,
             "losing a schedule must be noticed, not swallowed by a NULL comparison"
         );
@@ -6442,7 +6945,7 @@ mod tests {
                 ..task("01A", Some("every 5m"), TaskMode::Scheduled)
             };
             assert!(
-                matches!(upsert_task(&c, &padded), Err(SyncError::Config(_))),
+                matches!(upsert_task(&c, &padded, None), Err(SyncError::Config(_))),
                 "{id:?} must be refused"
             );
         }
@@ -6473,7 +6976,12 @@ mod tests {
     #[test]
     fn arming_a_task_that_is_already_armed_changes_nothing() {
         let c = conn();
-        upsert_task(&c, &task("01AA", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01AA", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         arm_task(&c, "01AA", Some(50_000), 1_000).expect("arm");
 
         arm_task(&c, "01AA", Some(10), 2_000).expect("a stale decision arrives");
@@ -6497,7 +7005,7 @@ mod tests {
 
         let mine = task("01N", Some("every 5m"), TaskMode::Scheduled);
         assert!(
-            matches!(upsert_task(&c, &mine), Err(SyncError::Config(_))),
+            matches!(upsert_task(&c, &mine, None), Err(SyncError::Config(_))),
             "refusing to overwrite is the only honest answer"
         );
         let stored: String = c
@@ -6522,7 +7030,7 @@ mod tests {
 
         let mine = task("01NM", Some("every 5m"), TaskMode::Scheduled);
         assert!(
-            matches!(upsert_task(&c, &mine), Err(SyncError::Config(_))),
+            matches!(upsert_task(&c, &mine, None), Err(SyncError::Config(_))),
             "a readable kind is not permission to rewrite an unreadable mode"
         );
         let (kind, mode): (String, String) = c
@@ -6546,7 +7054,12 @@ mod tests {
     #[test]
     fn the_trim_never_takes_the_run_the_claim_just_opened() {
         let c = conn();
-        upsert_task(&c, &task("01I", Some("every 1m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01I", Some("every 1m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         for n in 0..TASK_RUNS_CAP as i64 {
             let run = claim_task(&c, "01I", "hostA", n * 10, 1, None)
                 .expect("claim")
@@ -6610,12 +7123,17 @@ mod tests {
     fn releasing_a_hosts_leases_closes_its_runs_and_frees_its_tasks() {
         let c = conn();
         for id in ["01P", "01Q"] {
-            upsert_task(&c, &task(id, Some("every 5m"), TaskMode::Scheduled)).expect("save");
+            upsert_task(&c, &task(id, Some("every 5m"), TaskMode::Scheduled), None).expect("save");
             claim_task(&c, id, "dying", 0, 3_600_000, None)
                 .expect("claim")
                 .expect("claimed");
         }
-        upsert_task(&c, &task("01R2", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01R2", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         claim_task(&c, "01R2", "other", 0, 3_600_000, None)
             .expect("claim")
             .expect("claimed");
@@ -6659,7 +7177,7 @@ mod tests {
     fn a_run_still_in_flight_keeps_its_lease_while_every_other_one_is_handed_back() {
         let c = conn();
         for id in ["01RUNNING", "01IDLE"] {
-            upsert_task(&c, &task(id, Some("every 5m"), TaskMode::Scheduled)).expect("save");
+            upsert_task(&c, &task(id, Some("every 5m"), TaskMode::Scheduled), None).expect("save");
             claim_task(&c, id, "quitting", 0, 3_600_000, None)
                 .expect("claim")
                 .expect("claimed");
@@ -6714,7 +7232,12 @@ mod tests {
     #[test]
     fn holding_back_every_lease_releases_none_and_is_not_an_error() {
         let c = conn();
-        upsert_task(&c, &task("01ONLY", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01ONLY", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         claim_task(&c, "01ONLY", "quitting", 0, 3_600_000, None)
             .expect("claim")
             .expect("claimed");
@@ -6741,11 +7264,21 @@ mod tests {
     #[test]
     fn holding_back_a_lease_this_host_does_not_hold_is_a_no_op() {
         let c = conn();
-        upsert_task(&c, &task("01MINE", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01MINE", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         claim_task(&c, "01MINE", "quitting", 0, 3_600_000, None)
             .expect("claim")
             .expect("claimed");
-        upsert_task(&c, &task("01THEIRS", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        upsert_task(
+            &c,
+            &task("01THEIRS", Some("every 5m"), TaskMode::Scheduled),
+            None,
+        )
+        .expect("save");
         claim_task(&c, "01THEIRS", "other", 0, 3_600_000, None)
             .expect("claim")
             .expect("claimed");
@@ -6778,6 +7311,7 @@ mod tests {
         upsert_task(
             &created,
             &task("01B2", Some("every 5m"), TaskMode::Scheduled),
+            None,
         )
         .expect("save");
 
@@ -6813,7 +7347,7 @@ mod tests {
         upsert_profile(&c, &profile("p"), 0).expect("profile");
         let mut owned = task("01Y", Some("every 5m"), TaskMode::Scheduled);
         owned.profile_id = Some("p".to_owned());
-        upsert_task(&c, &owned).expect("save");
+        upsert_task(&c, &owned, None).expect("save");
         claim_task(&c, "01Y", "hostA", 0, 60_000, None)
             .expect("claim")
             .expect("claimed");
@@ -6821,7 +7355,7 @@ mod tests {
             profile_id: None,
             ..task("01HW", Some("every 5m"), TaskMode::Scheduled)
         };
-        upsert_task(&c, &host_wide).expect("save");
+        upsert_task(&c, &host_wide, None).expect("save");
 
         delete_profile(&c, "p").expect("delete");
 

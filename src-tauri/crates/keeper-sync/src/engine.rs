@@ -2134,6 +2134,10 @@ impl Engine {
             match tasks::decide(&task.state(), schedule.as_ref(), now) {
                 tasks::Action::None => {}
                 tasks::Action::Arm => self.arm_task_window(task, schedule.as_ref(), now, offset),
+                // The variant that forced this match to grow. `Action::None`
+                // could not carry it: the past window would stay standing, so
+                // the next tick would decide about it again, forever.
+                tasks::Action::Skip => self.skip_task_window(task, schedule.as_ref(), now, offset),
                 tasks::Action::Run => {
                     let run = self
                         .claim_and_run(task, profiles, now, offset, TaskTrigger::Scheduled)
@@ -2179,6 +2183,67 @@ impl Engine {
         };
         if let Err(err) = self.with_db(|conn| db::arm_task(conn, &task.id, Some(next), now_ms)) {
             tracing::debug!(task = task.id, error = %err, "cannot arm a task's window");
+        }
+    }
+
+    /// Abandon a window nobody served and arm the next one (Story 58.4,
+    /// FR-356, AD-139).
+    ///
+    /// The `on_missed = skip` half of the policy, and it is a **write**, not a
+    /// silence. Returning `Action::None` from the gate would leave the past
+    /// window on the row, so the very next tick would decide about the same
+    /// window again and the task would sit enabled, scheduled and idle forever —
+    /// which is precisely the shape [`Self::arm_task_window`]'s `warn` above
+    /// exists to make visible.
+    ///
+    /// The next instant is computed from `now_ms` and not from the abandoned
+    /// window, which is the whole difference between skipping and catching up:
+    /// a `@daily` task whose host was away a month arms tonight, not thirty
+    /// times. And it goes through [`db::skip_task_window`] rather than
+    /// [`db::arm_task`], whose `WHERE next_due_ms IS NULL` a skip can never
+    /// satisfy — see that function for the compare-and-set that replaces it.
+    fn skip_task_window(
+        &self,
+        task: &db::TaskRow,
+        schedule: Option<&tasks::TaskSchedule>,
+        now_ms: i64,
+        utc_offset_minutes: i32,
+    ) {
+        // Unreachable through `decide`, which answers `Skip` only for a window
+        // that is `Some`. Total anyway, because a loop over stored rows that can
+        // panic on one of them is not a loop this tick may contain.
+        let Some(observed) = task.next_due_ms else {
+            return;
+        };
+        let Some(next) = schedule.and_then(|s| s.next_due_after(now_ms, utc_offset_minutes)) else {
+            // The same fact, and the same level, as `arm_task_window`'s: the row
+            // keeps its past window, so this decision repeats on every tick and
+            // the task reports itself enabled and scheduled while nothing runs.
+            tracing::warn!(
+                task = task.id,
+                schedule = task.schedule.as_deref().unwrap_or(""),
+                "this task's schedule has no next instant this keeper can find, so a \
+                 window it declined cannot be replaced and it will not run"
+            );
+            return;
+        };
+        match self.with_db(|conn| db::skip_task_window(conn, &task.id, observed, next, now_ms)) {
+            // `false` is not a fault: the other host sharing this `sync.db` armed,
+            // ran or skipped the same window between this tick's listing read and
+            // this write, and the compare-and-set is what stops us undoing it.
+            Ok(false) => tracing::debug!(
+                task = task.id,
+                "another host had already moved the window this tick meant to decline"
+            ),
+            Ok(true) => tracing::info!(
+                task = task.id,
+                declined_ms = observed,
+                next_due_ms = next,
+                "a window this task's policy declines was not run, and the next one is armed"
+            ),
+            Err(err) => {
+                tracing::debug!(task = task.id, error = %err, "cannot decline a task's window");
+            }
         }
     }
 
@@ -7864,8 +7929,14 @@ impl Engine {
     /// invisible-failure shape that state exists to close, reintroduced by the
     /// state itself. A created row clears it too, which is the forget-and-
     /// re-create path: the id is the same, the task is not.
-    pub fn save_task(&self, task: &db::TaskRow) -> Result<()> {
-        let effect = self.with_db(|conn| db::upsert_task(conn, task))?;
+    ///
+    /// `baseline_updated_ms` is the lost-update guard [`db::upsert_task`]
+    /// documents. `Some(at)` is for the one caller that writes a reading a
+    /// person took earlier — the app's edit form, through `sync_task_save` —
+    /// and `None` for every caller that reads the row and writes it back inside
+    /// one call.
+    pub fn save_task(&self, task: &db::TaskRow, baseline_updated_ms: Option<i64>) -> Result<()> {
+        let effect = self.with_db(|conn| db::upsert_task(conn, task, baseline_updated_ms))?;
         if matches!(effect, db::TaskSave::Created | db::TaskSave::Rearmed) {
             Self::lock(&self.task_faults).remove(&task.id);
         }
@@ -12708,6 +12779,7 @@ mod tests {
             updated_ms: 0,
             running_host: None,
             lease_until_ms: None,
+            on_missed: tasks::TaskMissedPolicy::RunNow,
         }
     }
 
@@ -12735,7 +12807,7 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01TICK", None, "every 5m"))
+            .save_task(&task("01TICK", None, "every 5m"), None)
             .expect("a five-minute schedule is savable");
 
         // First sight arms and declines: creating a task is not running it.
@@ -12819,7 +12891,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01BUSY", Some(&p.id), "every 5m"))
+            .save_task(&task("01BUSY", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -12863,7 +12935,7 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01NOW", None, "every 5m"))
+            .save_task(&task("01NOW", None, "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         let armed = engine
@@ -12975,10 +13047,10 @@ mod tests {
         };
         let mut off = task("01OFF", None, "@daily");
         off.mode = tasks::TaskMode::Off;
-        engine.save_task(&off).expect("save");
+        engine.save_task(&off, None).expect("save");
         let mut disabled = task("01DIS", None, "@daily");
         disabled.enabled = false;
-        engine.save_task(&disabled).expect("save");
+        engine.save_task(&disabled, None).expect("save");
 
         for id in ["01OFF", "01DIS", "01NOSUCHTASK"] {
             assert!(
@@ -13013,7 +13085,7 @@ mod tests {
         };
         for expression in ["every 30s", "0 3 * *", "@yearly"] {
             let err = engine
-                .save_task(&task("01BAD", None, expression))
+                .save_task(&task("01BAD", None, expression), None)
                 .expect_err("refused");
             assert!(
                 matches!(err, SyncError::Config(_)),
@@ -13044,7 +13116,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01RETRY", Some(&p.id), "@daily"))
+            .save_task(&task("01RETRY", Some(&p.id), "@daily"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -13103,7 +13175,7 @@ mod tests {
         p.enabled = false;
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01PAUSED", Some(&p.id), "every 5m"))
+            .save_task(&task("01PAUSED", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -13134,7 +13206,7 @@ mod tests {
         // reads as one.
         engine.forget_task("01PAUSED").expect("forget");
         engine
-            .save_task(&task("01GONE", Some("01NOSUCHPROFILE"), "every 5m"))
+            .save_task(&task("01GONE", Some("01NOSUCHPROFILE"), "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         platform.advance_ms(300_000);
@@ -13154,7 +13226,7 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01OPEN", None, "every 5m"))
+            .save_task(&task("01OPEN", None, "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         // Past the window, without a tick to serve it.
@@ -13172,6 +13244,272 @@ mod tests {
         );
     }
 
+    /// [`task`] under one of the two non-default missed-window policies.
+    fn task_on_missed(id: &str, schedule: &str, on_missed: tasks::TaskMissedPolicy) -> db::TaskRow {
+        db::TaskRow {
+            on_missed,
+            ..task(id, None, schedule)
+        }
+    }
+
+    /// AD-138 and NFR-44, asserted where the risk actually is: through the
+    /// store, the claim and the run loop, with **real elapsed time** driven
+    /// through the platform clock rather than one hand-set `next_due_ms`.
+    ///
+    /// A hand-set window would prove only that `decide` compares two integers,
+    /// which `tasks.rs` already asserts. What has to be proved here is that two
+    /// hundred windows of absence, followed by ticks, produce **one** run — and
+    /// that after that run the ticks stop producing them, because the next
+    /// window is computed from the finish and not from any of the instants that
+    /// went by.
+    #[tokio::test]
+    async fn a_host_absent_across_two_hundred_windows_runs_the_task_exactly_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01MANY", None, "every 5m"), None)
+            .expect("save");
+        // First sight arms and declines, so the window this test is about is one
+        // the engine itself computed.
+        let _ = engine.tick().await;
+
+        // Two hundred windows with nobody home. No tick, because a host that is
+        // not there does not tick — which is the whole premise.
+        platform.advance_ms(200 * 300_000);
+
+        // And now it comes back. Ten ticks, because the claim is what has to
+        // decline the nine that follow the first.
+        for _ in 0..10 {
+            let _ = engine.tick().await;
+        }
+        assert_eq!(
+            engine.task_history("01MANY", 250).expect("history").len(),
+            1,
+            "one run for two hundred missed windows — not two hundred, and not \
+             one per tick either"
+        );
+
+        // The next window was computed from the finish, so it is ahead of the
+        // clock and the ticks inside it are not runs.
+        let armed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+        assert!(
+            armed > platform.now_ms(),
+            "the catch-up run overwrote the window rather than working through a \
+             backlog of them"
+        );
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01MANY", 250).expect("history").len(),
+            2,
+            "and the cadence resumes at one run per window"
+        );
+    }
+
+    /// `skip` declines the window nobody served, re-arms **forward**, and runs
+    /// nothing (Story 58.4).
+    ///
+    /// The forward half is the claim that matters and it is asserted as an
+    /// instant rather than as an absence: returning `Action::None` would also
+    /// have produced zero runs here, and would have left the same past window on
+    /// the row to be decided about again on the very next tick, forever. So the
+    /// assertion is that the *next decision is about a different window*.
+    #[tokio::test]
+    async fn a_skipped_window_is_declined_forward_and_the_task_runs_on_the_next_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01SKIP", "every 5m", tasks::TaskMissedPolicy::Skip),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let missed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        // Two hundred windows of absence, well past the grace.
+        platform.advance_ms(200 * 300_000);
+        for _ in 0..5 {
+            let _ = engine.tick().await;
+        }
+        assert!(
+            engine
+                .task_history("01SKIP", 250)
+                .expect("history")
+                .is_empty(),
+            "a declined window runs nothing, whatever the tick count"
+        );
+        let rearmed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("still armed");
+        assert!(
+            rearmed > missed && rearmed > platform.now_ms(),
+            "the next decision must be about a LATER window than the one \
+             declined: {rearmed} against a declined {missed} and a clock at {}",
+            platform.now_ms()
+        );
+
+        // And the task is not broken by having skipped: the next window runs.
+        platform.advance_ms(rearmed - platform.now_ms());
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01SKIP", 10).expect("history").len(),
+            1,
+            "`skip` declines a window nobody served, not the schedule"
+        );
+    }
+
+    /// `delay` holds the window **even though `db::claim_task`'s own condition
+    /// already passes**, which is the whole reason the wait lives in `decide`
+    /// (Story 58.4, AD-139).
+    ///
+    /// The claim is asserted directly rather than inferred from the absence of a
+    /// run: `next_due_ms <= now` is true throughout the delay, so a guard placed
+    /// at the claim could not have implemented this and a `Requested` trigger —
+    /// which passes `due_at_most: None` — bypasses that condition outright.
+    #[tokio::test]
+    async fn a_delayed_window_waits_although_the_claim_would_already_admit_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01WAIT", "every 5m", tasks::TaskMissedPolicy::Delay),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let due = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        // One millisecond into the open window: due by every measure the store
+        // has, and not yet by the policy's.
+        platform.advance_ms(due + 1 - platform.now_ms());
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        assert!(
+            engine
+                .task_history("01WAIT", 10)
+                .expect("history")
+                .is_empty(),
+            "nothing ran inside the delay"
+        );
+        let row = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(
+            row.next_due_ms,
+            Some(due),
+            "and the window is untouched — a delay is a wait, not a re-arm"
+        );
+        assert!(
+            row.next_due_ms.is_some_and(|at| at <= platform.now_ms()),
+            "which means `claim_task`'s `next_due_ms <= now` condition is \
+             satisfied right now: the delay could not have been enforced there"
+        );
+
+        // Past the grace, it runs — once.
+        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS);
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        assert_eq!(
+            engine.task_history("01WAIT", 10).expect("history").len(),
+            1,
+            "the delayed window is served once the delay elapses, and only once"
+        );
+    }
+
+    /// A hand-run during a delay runs **at once**, as a requested run, and the
+    /// window is then consumed (Story 58.4).
+    ///
+    /// Both halves are the point. The request must not be blocked, deferred or
+    /// relabelled — the delay lives in `decide`, and a request never passes
+    /// through `decide`. And afterwards there must be exactly **one** run for
+    /// that window, because NFR-44 forbids two: the request served it, and
+    /// `next_task_window` re-arms an already-open window for precisely that
+    /// reason.
+    #[tokio::test]
+    async fn a_hand_run_during_a_delay_runs_at_once_and_serves_the_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01ASK", "every 5m", tasks::TaskMissedPolicy::Delay),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let due = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+        platform.advance_ms(due + 1 - platform.now_ms());
+
+        let run = engine
+            .run_task_now("01ASK")
+            .await
+            .expect("a person asking is not asking about a window");
+        assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
+
+        // Past the delay, with the ticks that would have served it.
+        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS);
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        assert_eq!(
+            engine.task_history("01ASK", 10).expect("history").len(),
+            1,
+            "one run for one window: the request served it, and NFR-44 forbids \
+             the policy serving it again afterwards"
+        );
+    }
+
     /// NFR-42 asks that a SIGTERM be a bounded finalize. A `systemctl restart`
     /// mid-run otherwise leaves the lease held by a pid that no longer exists
     /// for the whole hour, and the restarted daemon cannot prove that pid is
@@ -13184,7 +13522,7 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01TERM", None, "every 5m"))
+            .save_task(&task("01TERM", None, "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         // Claim it and abandon the run, as a killed process does.
@@ -13230,7 +13568,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01FAIL", Some(&p.id), "every 5m"))
+            .save_task(&task("01FAIL", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -13272,7 +13610,7 @@ mod tests {
         p.volume_id = Some("01NOSUCHVOLUME".to_owned());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01ABSENT", Some(&p.id), "every 5m"))
+            .save_task(&task("01ABSENT", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -13410,14 +13748,14 @@ mod tests {
                 .count()
         };
 
-        engine.save_task(&row).expect("save");
+        engine.save_task(&row, None).expect("save");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(toasts(), 1, "the first failure is an onset");
 
         // Leg 1: forget and re-create. The id is the same; the task is not, and
         // a brand-new record's first failure must never be silent.
         engine.forget_task("01BACK").expect("forget");
-        engine.save_task(&row).expect("re-create");
+        engine.save_task(&row, None).expect("re-create");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(
             toasts(),
@@ -13429,8 +13767,8 @@ mod tests {
         // `db::upsert_task` already treats as a fresh arming.
         let mut disabled = row.clone();
         disabled.enabled = false;
-        engine.save_task(&disabled).expect("disable");
-        engine.save_task(&row).expect("enable");
+        engine.save_task(&disabled, None).expect("disable");
+        engine.save_task(&row, None).expect("enable");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(
             toasts(),
@@ -13441,8 +13779,8 @@ mod tests {
         // Leg 3: the mode edge, with the schedule text unmoved.
         let mut manual = row.clone();
         manual.mode = tasks::TaskMode::Manual;
-        engine.save_task(&manual).expect("to manual");
-        engine.save_task(&row).expect("back to scheduled");
+        engine.save_task(&manual, None).expect("to manual");
+        engine.save_task(&row, None).expect("back to scheduled");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(toasts(), 4, "and so does one put back on its schedule");
 
@@ -13450,7 +13788,7 @@ mod tests {
         // rather than on "a save happened": an idle re-save is not a recovery,
         // so it must not re-arm the alarm and let an hour of failures notify
         // once per save.
-        engine.save_task(&row).expect("an identical save");
+        engine.save_task(&row, None).expect("an identical save");
         engine.note_task_outcome(&row, tasks::TaskOutcome::Failed, reason);
         assert_eq!(
             toasts(),
@@ -13476,7 +13814,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01STORM", Some(&p.id), "every 5m"))
+            .save_task(&task("01STORM", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         // Twelve windows is an hour of a `every 5m` task, each one served by one
@@ -13529,7 +13867,7 @@ mod tests {
             return;
         };
         engine
-            .save_task(&task("01QUIT", None, "every 5m"))
+            .save_task(&task("01QUIT", None, "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
 
@@ -13617,7 +13955,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01MIDRUN", Some(&p.id), "every 5m"))
+            .save_task(&task("01MIDRUN", Some(&p.id), "every 5m"), None)
             .expect("save");
         // First sight arms the window and declines; the next tick is the one
         // that claims and runs.
@@ -13718,7 +14056,7 @@ mod tests {
         let p = profile(dir.path());
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&task("01FASTRUN", Some(&p.id), "every 5m"))
+            .save_task(&task("01FASTRUN", Some(&p.id), "every 5m"), None)
             .expect("save");
         let _ = engine.tick().await;
         inner.advance_ms(300_000);
@@ -13800,7 +14138,7 @@ mod tests {
         // records from governing each other.
         let mut sync_off = task("01SYNCOFF", None, "@daily");
         sync_off.mode = tasks::TaskMode::Off;
-        engine.save_task(&sync_off).expect("save");
+        engine.save_task(&sync_off, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13813,7 +14151,7 @@ mod tests {
         // folder. Read as host-wide it would switch this one's sweep off.
         let mut elsewhere = release_task("01ELSEWHERE", Some("01JOTHERFOLDER"), "@daily");
         elsewhere.mode = tasks::TaskMode::Off;
-        engine.save_task(&elsewhere).expect("save");
+        engine.save_task(&elsewhere, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13827,7 +14165,7 @@ mod tests {
         // precedence is not a second safety rule.
         let mut host_wide = release_task("01HOSTOFF", None, "@daily");
         host_wide.mode = tasks::TaskMode::Off;
-        engine.save_task(&host_wide).expect("save");
+        engine.save_task(&host_wide, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13837,7 +14175,7 @@ mod tests {
         );
         let mut mine = release_task("01MINE", Some(&p.id), "@daily");
         mine.mode = tasks::TaskMode::Scheduled;
-        engine.save_task(&mine).expect("save");
+        engine.save_task(&mine, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13850,7 +14188,7 @@ mod tests {
         // not be what decides.
         let mut also_mine = release_task("01ALSOMINE", Some(&p.id), "@daily");
         also_mine.mode = tasks::TaskMode::Manual;
-        engine.save_task(&also_mine).expect("save");
+        engine.save_task(&also_mine, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13865,7 +14203,7 @@ mod tests {
         // handed straight back to the hourly success-edge sweep — the opposite
         // of what switching a task off means to whoever switched it off.
         also_mine.enabled = false;
-        engine.save_task(&also_mine).expect("save");
+        engine.save_task(&also_mine, None).expect("save");
         assert_eq!(
             engine
                 .release_governance(&p.id)
@@ -13940,7 +14278,7 @@ mod tests {
             (tasks::TaskMode::Scheduled, true, true),
         ] {
             row.mode = mode;
-            engine.save_task(&row).expect("save");
+            engine.save_task(&row, None).expect("save");
             assert_eq!(
                 engine.release_permits(&p, ReleaseTrigger::SuccessEdge),
                 on_edge,
@@ -13989,7 +14327,7 @@ mod tests {
 
         let mut off = release_task("01OFFNOW", Some(&p.id), "@daily");
         off.mode = tasks::TaskMode::Off;
-        engine.save_task(&off).expect("save");
+        engine.save_task(&off, None).expect("save");
 
         assert!(!engine.release_permits(&p, ReleaseTrigger::SuccessEdge));
         assert!(
@@ -14057,7 +14395,7 @@ mod tests {
         p.enabled = false;
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&release_task("01RELPAUSED", Some(&p.id), "every 5m"))
+            .save_task(&release_task("01RELPAUSED", Some(&p.id), "every 5m"), None)
             .expect("save");
 
         let _ = engine.tick().await;
@@ -14097,11 +14435,10 @@ mod tests {
             return;
         };
         engine
-            .save_task(&release_task(
-                "01RELGONE",
-                Some("01JNOSUCHPROFILE"),
-                "every 5m",
-            ))
+            .save_task(
+                &release_task("01RELGONE", Some("01JNOSUCHPROFILE"), "every 5m"),
+                None,
+            )
             .expect("save");
 
         let _ = engine.tick().await;
@@ -14145,7 +14482,7 @@ mod tests {
             p.volume_id = Some("01NOSUCHVOLUME".to_owned());
             engine.upsert_profile(&p).expect("upsert");
             engine
-                .save_task(&release_task("01RELABSENT", bound, "every 5m"))
+                .save_task(&release_task("01RELABSENT", bound, "every 5m"), None)
                 .expect("save");
 
             let _ = engine.tick().await;
@@ -14201,7 +14538,7 @@ mod tests {
         };
         let mut off = release_task("01RELOFF", None, "every 5m");
         off.mode = tasks::TaskMode::Off;
-        engine.save_task(&off).expect("save");
+        engine.save_task(&off, None).expect("save");
 
         for _ in 0..3 {
             let _ = engine.tick().await;
@@ -14259,7 +14596,7 @@ mod tests {
         p.lfs_mode = LfsMode::PointerOnly;
         engine.upsert_profile(&p).expect("upsert");
         engine
-            .save_task(&release_task("01RELALL", None, "every 5m"))
+            .save_task(&release_task("01RELALL", None, "every 5m"), None)
             .expect("the host-wide driver is scheduled and enabled");
 
         // Without the veto this folder really is swept, or the assertion below
@@ -14279,13 +14616,13 @@ mod tests {
         );
         engine.forget_task("01RELALL").expect("start again");
         engine
-            .save_task(&release_task("01RELALL", None, "every 5m"))
+            .save_task(&release_task("01RELALL", None, "every 5m"), None)
             .expect("the same driver, with a fresh history");
 
         let mut veto = release_task("01RELVETO", Some(&p.id), "every 5m");
         veto.mode = tasks::TaskMode::Off;
         engine
-            .save_task(&veto)
+            .save_task(&veto, None)
             .expect("and this folder says not to sweep it");
 
         let _ = engine.tick().await;

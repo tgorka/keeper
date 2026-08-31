@@ -541,18 +541,22 @@ impl Fixture {
     /// the modes against three different rows.
     fn release_task(&self, mode: TaskMode) {
         self.engine
-            .save_task(&db::TaskRow {
-                id: RELEASE_TASK_ID.to_owned(),
-                profile_id: Some(PROFILE_ID.to_owned()),
-                kind: TaskKind::Release,
-                schedule: Some("@daily".to_owned()),
-                mode,
-                next_due_ms: None,
-                enabled: true,
-                updated_ms: 0,
-                running_host: None,
-                lease_until_ms: None,
-            })
+            .save_task(
+                &db::TaskRow {
+                    id: RELEASE_TASK_ID.to_owned(),
+                    profile_id: Some(PROFILE_ID.to_owned()),
+                    kind: TaskKind::Release,
+                    schedule: Some("@daily".to_owned()),
+                    mode,
+                    next_due_ms: None,
+                    enabled: true,
+                    updated_ms: 0,
+                    running_host: None,
+                    lease_until_ms: None,
+                    on_missed: keeper_sync::tasks::TaskMissedPolicy::RunNow,
+                },
+                None,
+            )
             .expect("a release task with a parseable schedule is savable");
     }
 

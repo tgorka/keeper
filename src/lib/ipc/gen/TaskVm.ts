@@ -43,6 +43,18 @@ profile: string | null,
  */
 schedule: string | null, 
 /**
+ * What to do about a window that fell due while nobody was home: as
+ * stored, `"run_now"`, `"delay"`, `"skip"`, or a spelling this build does
+ * not know (Story 58.4).
+ *
+ * A `String` for [`Self::kind`]'s reason: a row a newer keeper wrote must
+ * reach the view as the spelling it has. An unreadable policy makes the row
+ * unreadable, so such a spelling only arrives here past a `list_tasks` that
+ * could read it — which is why the view may render it verbatim rather than
+ * having to guess.
+ */
+onMissed: string, 
+/**
  * When it next comes due: ms since the Unix epoch, `null` when never.
  */
 nextDueMs: number | null, 
@@ -54,6 +66,15 @@ runningHost: string | null,
  * When that lease expires: ms since the Unix epoch, `null` when idle.
  */
 leaseUntilMs: number | null, 
+/**
+ * When this row was last written: ms since the Unix epoch (UTC).
+ *
+ * On the wire for one reason and it is not display: it is the baseline an
+ * edit form sends back on [`TaskSaveReq::baseline_updated_ms`], so a save
+ * whose reading has gone stale is refused instead of reverting whatever
+ * another host moved meanwhile.
+ */
+updatedMs: number, 
 /**
  * The most recent recorded run, `null` when it has never run.
  */
