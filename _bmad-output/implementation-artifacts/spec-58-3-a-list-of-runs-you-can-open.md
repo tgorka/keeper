@@ -3,8 +3,8 @@ title: 'Story 58.3: a list of runs you can open'
 type: 'feature'
 created: '2026-08-31'
 status: 'done'
-baseline_revision: 'f8fbb90'
-final_revision: '4ac49e7'
+baseline_revision: 'a558ee5'
+final_revision: 'b120b6f'
 review_loop_iteration: 0
 followup_review_recommended: true
 context:
@@ -172,8 +172,8 @@ code first landed inside `feat(58.6): two hosts, one missed window, one run` rat
 of its own. The content was complete and green throughout; only the commit boundary was wrong, which
 matters because this epic ships as one PR per story.
 
-The coordinator split it before anything was pushed: `4ac49e7 feat(58.3): a list of runs you can
-open` now holds this story's four files and its spec, `2d37856 feat(58.6)` holds the seven
+The coordinator split it before anything was pushed: `b120b6f feat(58.3): a list of runs you can
+open` now holds this story's four files and its spec, `9de7aac feat(58.6)` holds the seven
 `src-tauri` paths, `deferred-work.md` and its own spec, and the three commits that sat on top were
 replayed onto the split. The proof the split lost nothing is that the resulting tree is byte-identical
 to the pre-split one (`HEAD^{tree}` compared directly), not that the diffs looked right.

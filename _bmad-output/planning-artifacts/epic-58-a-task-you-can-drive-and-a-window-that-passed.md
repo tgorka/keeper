@@ -230,7 +230,7 @@ Wave 1's three stories are **disjoint and parallelisable**: 58.1 owns the form a
 58.2 owns one `Field` on the row, 58.3 owns one expandable section. They collide only in
 `tasks-pane.tsx`, so one of them owns the file and the other two coordinate. **58.1 shipped first
 and widened `TaskRow`** with editing/deleting/writing props and a per-row edit disclosure
-(`e7beaa6`), so 58.2 and 58.3 inherit a larger row than this epic was written against; neither's
+(`1e8192f`), so 58.2 and 58.3 inherit a larger row than this epic was written against; neither's
 scope changes, but both extend that row rather than the one described here.
 
 58.4 → 58.5 is a strict chain: the outcome exists to make the policy observable, and a policy shipped

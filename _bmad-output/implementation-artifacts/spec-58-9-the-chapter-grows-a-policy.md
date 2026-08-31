@@ -3,8 +3,8 @@ title: 'Story 58.9: the chapter grows a policy'
 type: 'docs'
 created: '2026-08-31'
 status: 'done'
-baseline_revision: '99769f4'
-final_revision: 'b3955d2'
+baseline_revision: 'c6f04fa'
+final_revision: '7fbffff'
 review_loop_iteration: 1
 followup_review_recommended: true
 context:

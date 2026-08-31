@@ -3,8 +3,8 @@ title: 'Story 58.5: a window nobody ran is still a fact'
 type: 'feature'
 created: '2026-08-31'
 status: 'done'
-baseline_revision: 'e315918'
-final_revision: '7c8f805'
+baseline_revision: 'a3e27eb'
+final_revision: '43b0db2'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

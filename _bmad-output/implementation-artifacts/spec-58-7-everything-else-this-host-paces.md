@@ -3,8 +3,8 @@ title: 'Story 58.7: everything else this host paces'
 type: 'feature'
 created: '2026-08-31'
 status: 'done'
-baseline_revision: '3d8735a'
-final_revision: 'c0549ad'
+baseline_revision: 'ce9fc87'
+final_revision: '31ac03a'
 review_loop_iteration: 1
 followup_review_recommended: false
 context:
@@ -111,7 +111,7 @@ warnings: ['oversized']
 **Pass 1 — 2026-08-31, salvage.** The story's own review never ran: the session
 that implemented it ended before it, leaving `review_loop_iteration: 0` and this
 section empty while the code was complete and green. Two read-only lenses were
-run against commit `99769f4` (a blind lens and an edge-case lens); the blind
+run against commit `c6f04fa` (a blind lens and an edge-case lens); the blind
 lens' provider was out of credits and its half was done by hand. Nine findings
 from the lenses, plus a tenth that only rendering the section could produce —
 all triaged, two entered the deferred ledger as work that belongs elsewhere.

@@ -3,8 +3,8 @@ title: 'Story 58.6: two hosts, one missed window, one run'
 type: 'bugfix'
 created: '2026-08-31'
 status: 'done'
-baseline_revision: '8d921ff'
-final_revision: '2d37856'
+baseline_revision: '1da8af1'
+final_revision: '9de7aac'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
@@ -149,7 +149,7 @@ record of it. `Watch` would claim the engine's own tick did it; `Manual` would c
 Status: done
 
 **Rust:** 3783 passed / 0 failed (`-p keeper-sync -p keeper-core -p keeper-syncd`), against 3780 / 0
-at `8d921ff`. `cargo clippy` over the three crates with `-D warnings`: clean. `cargo fmt` applied.
+at `1da8af1`. `cargo clippy` over the three crates with `-D warnings`: clean. `cargo fmt` applied.
 
 **No frontend change, no bindings change.** `sync_task_run_now` passes `TaskRunDriver::Person` and
 its wire types are untouched.

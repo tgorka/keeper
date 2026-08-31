@@ -3,8 +3,8 @@ title: 'Story 58.4: a window that passed while nobody was home'
 type: 'feature'
 created: '2026-08-31'
 status: 'done'
-baseline_revision: 'f8fbb90'
-final_revision: 'e315918'
+baseline_revision: 'a558ee5'
+final_revision: 'a3e27eb'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
@@ -306,7 +306,7 @@ a strict chain rather than two independent stories.
 Status: done
 
 **Rust:** 3776 passed / 0 failed (`-p keeper-sync -p keeper-core -p keeper-syncd`), against a
-measured pre-story baseline of 3765 / 0 at `f8fbb90`. `cargo clippy` over the three crates with
+measured pre-story baseline of 3765 / 0 at `a558ee5`. `cargo clippy` over the three crates with
 `-D warnings`: clean. `cargo fmt` applied.
 
 **Frontend:** `src/components/sync/task-form.test.tsx` 17 passed / 17 (14 before). `bun run

@@ -3,8 +3,8 @@ title: 'Story 58.8: a sync task that governs instead of duplicating'
 type: 'feature'
 created: '2026-08-31'
 status: 'done'
-baseline_revision: '3d8735a'
-final_revision: '73aa857'
+baseline_revision: 'ce9fc87'
+final_revision: '1fb6db7'
 review_loop_iteration: 1
 followup_review_recommended: false
 context:
@@ -129,7 +129,7 @@ Design Notes.
 
 **Pass 1 — 2026-08-31, salvage.** This story's review never ran either: the
 session ended with `review_loop_iteration: 0` and this section absent while
-`73aa857` was already committed. Audited against the epic's own **58.8**
+`1fb6db7` was already committed. Audited against the epic's own **58.8**
 paragraph, claim by claim, read-only.
 
 | epic claim | verdict | evidence |

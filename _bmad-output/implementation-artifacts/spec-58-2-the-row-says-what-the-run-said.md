@@ -3,8 +3,8 @@ title: 'Story 58.2: the row says what the run said'
 type: 'feature'
 created: '2026-08-31'
 status: 'done'
-baseline_revision: 'f8fbb90'
-final_revision: 'd87514b'
+baseline_revision: 'a558ee5'
+final_revision: 'd1812b1'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
