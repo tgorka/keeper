@@ -392,9 +392,22 @@ const HOST_KIND_LABELS: Record<string, string> = {
 /**
  * The word for each recorded outcome.
  *
- * Three of the five are deliberately not failures — `busy` and `deferred` are a
- * run that did not happen, and `abandoned` is a lease the next host reclaimed —
- * so none of them is worded as one.
+ * Only one of the seven is a failure. `busy` and `deferred` are a run that did
+ * not happen, `abandoned` is a lease the next host reclaimed, and the two
+ * Stories 58.4/58.5 added are a window a policy did not run — so none of them is
+ * worded as one.
+ *
+ * **`declined` and `postponed` are not variants of one idea, and the difference
+ * is the whole reason they are two spellings.** A declined window will never be
+ * served: `skip` gave up on it and armed the next one. A postponed window WILL
+ * be served, later: `delay` is holding it back from the instant a host noticed
+ * it. Wording them as shades of the same thing would tell somebody their nightly
+ * sweep had been dropped when it had only been held.
+ *
+ * Both are closed, zero-duration rows, so neither may read as in flight — and
+ * neither carries the failure vocabulary, because nothing went wrong in either.
+ * The `detail` beside them names the declined or postponed instant and the
+ * policy that decided it, which the row's report cell renders unchanged.
  */
 const OUTCOME_LABELS: Record<string, string> = {
   ok: "Succeeded",
@@ -402,6 +415,8 @@ const OUTCOME_LABELS: Record<string, string> = {
   deferred: "Waited for a condition",
   failed: "Failed",
   abandoned: "Abandoned by the host that started it",
+  declined: "Not run — the next window was armed instead",
+  postponed: "Held back — it will run later",
 };
 
 /**

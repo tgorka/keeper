@@ -393,6 +393,21 @@ describe("the pane's own formatters", () => {
     expect(taskOutcomeText(run({ outcome: "deferred" }))).toBe("Waited for a condition");
     // A spelling this build knows nothing about renders as itself.
     expect(taskOutcomeText(run({ outcome: "sublimated" }))).toBe("sublimated");
+    // Stories 58.4/58.5's two, and the property is that they are DIFFERENT
+    // sentences: a declined window will never be served, a postponed one will be
+    // served later. Rendering them as shades of one idea would tell somebody a
+    // sweep had been dropped when it had only been held back.
+    const declined = taskOutcomeText(run({ outcome: "declined" }));
+    const postponed = taskOutcomeText(run({ outcome: "postponed" }));
+    expect(declined).not.toBe(postponed);
+    expect(declined).toMatch(/next window/);
+    expect(postponed).toMatch(/later/);
+    // Neither is worded as a failure, and neither reads as still running: both
+    // rows are closed and zero-duration.
+    for (const text of [declined, postponed]) {
+      expect(text).not.toMatch(/fail|abandon/i);
+      expect(text).not.toBe(TASK_IN_FLIGHT_TEXT);
+    }
   });
 
   it("says a schedule is absent rather than rendering an empty cell", async () => {
