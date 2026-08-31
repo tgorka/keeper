@@ -14289,11 +14289,18 @@ mod tests {
     #[tokio::test]
     async fn a_task_that_carries_its_own_delay_waits_that_long_and_not_the_constant() {
         const OWN_DELAY_MS: i64 = 4 * 3_600_000;
-        assert!(
-            OWN_DELAY_MS > tasks::TASK_MISSED_DELAY_MS,
-            "the fixture has to differ from the default in a direction the clock \
-             can distinguish, or this test cannot fail"
-        );
+        // A `const` block, so the guard is checked when this file compiles rather
+        // than when the test runs — which is both what clippy's
+        // `assertions_on_constants` asks for and the stronger thing: a fixture
+        // that stopped differing from the default would fail the build instead of
+        // waiting for somebody to run this test.
+        const {
+            assert!(
+                OWN_DELAY_MS > tasks::TASK_MISSED_DELAY_MS,
+                "the fixture has to differ from the default in a direction the \
+                 clock can distinguish, or this test cannot fail"
+            )
+        };
 
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));

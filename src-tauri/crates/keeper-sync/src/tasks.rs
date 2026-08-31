@@ -1889,7 +1889,11 @@ mod tests {
         );
         // And an override is honoured verbatim: the floor is a write-door rule,
         // so nothing on the read path may quietly raise a stored value to it.
-        for delay_ms in [TASK_MISSED_GRACE_MS, TASK_MISSED_DELAY_MS + 1, MAX_SCHEDULE_INTERVAL_MS] {
+        for delay_ms in [
+            TASK_MISSED_GRACE_MS,
+            TASK_MISSED_DELAY_MS + 1,
+            MAX_SCHEDULE_INTERVAL_MS,
+        ] {
             assert_eq!(effective_missed_delay_ms(Some(delay_ms)), delay_ms);
         }
     }

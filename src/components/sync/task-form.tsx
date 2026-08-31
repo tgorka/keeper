@@ -771,9 +771,7 @@ export function TaskForm({
           note shipped with, arrived at from the other side. An unparseable box
           falls back to the default's number rather than saying nothing, because
           the note explains the setting and the refusal below explains the box. */}
-      <p className="text-muted-foreground text-xs">
-        {taskFormOnMissedNote(effectiveDelayMinutes)}
-      </p>
+      <p className="text-muted-foreground text-xs">{taskFormOnMissedNote(effectiveDelayMinutes)}</p>
 
       {showMissedDelay && (
         <>
