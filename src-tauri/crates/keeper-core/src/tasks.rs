@@ -682,12 +682,12 @@ pub enum PacedWorkKind {
 
 /// Whether the clock really paces a projected row right now.
 ///
-/// [`Self::Paused`] and [`Self::Governed`] are two different reasons for the
-/// same absence of a cadence, and collapsing them would lose the actionable
-/// half: a paused folder is paused because somebody paused it, and a governed
-/// folder's scan happens on a *schedule the user can see and edit* in the task
-/// list above. Only [`Self::Paced`] ever carries a cadence — see
-/// [`PacedWorkVm::cadence`].
+/// The three non-paced variants are three different reasons for the same
+/// absence of a cadence, and collapsing them would lose the actionable half: a
+/// paused folder is paused because somebody paused it, a governed folder's scan
+/// happens on a *schedule the user can see and edit* in the task list above,
+/// and an unregistered vault is waiting on a folder that is not there. Only
+/// [`Self::Paced`] ever carries a cadence — see [`PacedWorkVm::cadence`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -699,6 +699,14 @@ pub enum PacedWorkStanding {
     /// A scheduled Sync task has taken this folder's paced backstop, so the
     /// backstop has stood down and the schedule above decides (Story 58.8).
     Governed,
+    /// The work is configured but nothing is registered to do it: a notes vault
+    /// whose folder could not be resolved when the registry was last built —
+    /// the drive is away, or the folder moved.
+    ///
+    /// Separate from [`Self::Paused`] because the remedy is different and
+    /// neither sentence would be true of the other: nobody paused this, and
+    /// re-enabling nothing would bring it back.
+    Unregistered,
 }
 
 /// One thing this host paces, projected at read time from the profile list.
@@ -787,6 +795,16 @@ pub const PACED_SENTENCE_SWEEP_PACED: &str =
 /// would be quietly leaving their notes uncommitted.
 pub const PACED_SENTENCE_NOTES_PACED: &str = "the app commits this vault after the quiet window and pushes within the deadline. Only the running app paces it — keeper-syncd never does.";
 
+/// A vault the registry does not hold, which is the honest answer whenever the
+/// vault folder could not be resolved when the registry was last built.
+///
+/// It names the remedy because the remedy is not obvious and is not "wait": the
+/// registry is rebuilt at launch and when a vault is flagged or unflagged, and
+/// by nothing else — so a drive that comes back mid-session does **not**
+/// re-register on its own. Saying "it resumes when the drive is back" would be
+/// the comfortable sentence and the false one.
+pub const PACED_SENTENCE_NOTES_UNREGISTERED: &str = "keeper has no vault registered for this folder, so nothing paces it: the vault folder could not be found when the registry was last built. The registry is rebuilt at launch, and when a vault is flagged or unflagged — not when a drive comes back.";
+
 /// Shared by all three kinds, because the reason is the folder's and not the
 /// work's: `tick` skips both the sweep and `tick_profile` for a profile that is
 /// not enabled, so one paused folder silences everything projected from it.
@@ -794,11 +812,12 @@ pub const PACED_SENTENCE_NOTES_PACED: &str = "the app commits this vault after t
 pub const PACED_SENTENCE_PAUSED: &str =
     "this folder is paused, so nothing here is paced and no cadence is in force.";
 
-/// Appended to the scan row's sentence for a folder on removable media, and to
-/// that row only: it is the *look* that finds nothing when the drive is away,
-/// and the honest thing to attach the fact to is the look. Never appended to a
-/// paused row, where the sentence already says nothing is paced and a second
-/// reason would read as a second cause.
+/// Appended to the scan and sweep sentences for a folder on removable media:
+/// both are work that finds nothing while the drive is away, and the honest
+/// thing to attach the fact to is the work that would have looked. Never
+/// appended to a paused row, where the sentence already says nothing is paced
+/// and a second reason would read as a second cause — nor to a notes row, whose
+/// unregistered sentence already names the missing folder as the reason.
 pub const PACED_SENTENCE_REMOVABLE_CLAUSE: &str =
     " The folder is on removable media, so nothing happens at all while the drive is away.";
 
@@ -815,6 +834,16 @@ pub struct PacedNotesFacts {
     pub commit_idle_ms: u64,
     /// How long a commit may sit locally before it is pushed.
     pub push_interval_ms: u64,
+    /// Whether the vault registry actually holds this vault.
+    ///
+    /// **A configured vault and a paced vault are two different facts**, and
+    /// this is the second one. `notes_vault::register_one` returns nothing when
+    /// the vault root cannot be canonicalized — the drive is away, the folder
+    /// moved — and an unregistered vault is reached by no cadence tick and no
+    /// flush. Projecting the *configuration* alone would tell somebody their
+    /// notes are being committed and pushed while nothing at all is doing it,
+    /// which is the over-claim [`PacedWorkVm`]'s missing keys exist to prevent.
+    pub registered: bool,
 }
 
 /// Exactly the facts [`paced_work`] needs about one folder, borrowed.
@@ -873,10 +902,19 @@ pub struct PacedFolderFacts<'a> {
 /// 2. An enabled folder whose scan is governed ⇒ [`PacedWorkStanding::Governed`]
 ///    with no cadence, on the scan row alone. The sweep and the notes rows are
 ///    untouched: a Sync task takes the *scan's* backstop and nothing else.
-/// 3. Otherwise [`PacedWorkStanding::Paced`], with the cadence phrase.
+/// 3. An enabled folder whose vault is not registered ⇒
+///    [`PacedWorkStanding::Unregistered`] with no cadence, on the notes row
+///    alone. The scan and the sweep do not go through the vault registry.
+/// 4. Otherwise [`PacedWorkStanding::Paced`], with the cadence phrase.
 ///
 /// The invariant *`cadence.is_some()` iff `standing == Paced`* is a property of
-/// this function, which is why no branch below constructs a row any other way.
+/// this function, asserted over every row it returns rather than only stated:
+/// `PacedWorkVm`'s two fields are independent and public, so a fourth kind added
+/// later can break the pairing, and the phrase it would put on screen —
+/// *"paused, about every 15 seconds"* — is exactly the one this class exists to
+/// make impossible. The assertion is `debug_assert!` because a release build
+/// must not lose the whole view over a wording fault, and every builder below is
+/// total: there is no input that reaches it.
 pub fn paced_work(folders: &[PacedFolderFacts<'_>]) -> Vec<PacedWorkVm> {
     // Three rows per folder is the ceiling, and the common shape on a machine
     // whose folders hold vaults.
@@ -888,6 +926,12 @@ pub fn paced_work(folders: &[PacedFolderFacts<'_>]) -> Vec<PacedWorkVm> {
             rows.push(paced_notes_row(folder, notes));
         }
     }
+    debug_assert!(
+        rows.iter()
+            .all(|row| { row.cadence.is_some() == (row.standing == PacedWorkStanding::Paced) }),
+        "a projected row carried a cadence without a paced standing, or a paced \
+         standing without a cadence"
+    );
     rows
 }
 
@@ -929,7 +973,7 @@ fn paced_scan_row(folder: &PacedFolderFacts<'_>) -> PacedWorkVm {
 /// The scratch sweep row. Governance cannot reach it: a scheduled Sync task
 /// takes the scan's backstop, and the sweep keeps its own hour.
 fn paced_sweep_row(folder: &PacedFolderFacts<'_>) -> PacedWorkVm {
-    let (standing, cadence, sentence) = if folder.enabled {
+    let (standing, cadence, mut sentence) = if folder.enabled {
         (
             PacedWorkStanding::Paced,
             Some(format!(
@@ -941,6 +985,14 @@ fn paced_sweep_row(folder: &PacedFolderFacts<'_>) -> PacedWorkVm {
     } else {
         paced_paused()
     };
+    // The same clause the scan row carries, for the same reason: with the drive
+    // away the sweep's own `read_dir` finds nothing, so an unhedged *"keeper
+    // deletes transfer scratch on this cadence"* claims a deletion that is not
+    // happening. Suppressed on a paused row, where the sentence already says
+    // nothing is paced.
+    if folder.removable && standing != PacedWorkStanding::Paused {
+        sentence.push_str(PACED_SENTENCE_REMOVABLE_CLAUSE);
+    }
     PacedWorkVm {
         id: format!("sweep:{}", folder.profile_id),
         kind: PacedWorkKind::ScratchSweep,
@@ -953,8 +1005,21 @@ fn paced_sweep_row(folder: &PacedFolderFacts<'_>) -> PacedWorkVm {
 }
 
 /// The notes row, which exists only for a folder that holds a vault.
+///
+/// Three answers, and the order matters. A paused folder comes first because
+/// pausing is the reason somebody would recognise; an unregistered vault comes
+/// second because it is a fact about the folder rather than about the pacer; and
+/// only a registered vault on an enabled folder is paced.
 fn paced_notes_row(folder: &PacedFolderFacts<'_>, notes: PacedNotesFacts) -> PacedWorkVm {
-    let (standing, cadence, sentence) = if folder.enabled {
+    let (standing, cadence, sentence) = if !folder.enabled {
+        paced_paused()
+    } else if !notes.registered {
+        (
+            PacedWorkStanding::Unregistered,
+            None,
+            PACED_SENTENCE_NOTES_UNREGISTERED.to_owned(),
+        )
+    } else {
         (
             PacedWorkStanding::Paced,
             Some(format!(
@@ -964,8 +1029,6 @@ fn paced_notes_row(folder: &PacedFolderFacts<'_>, notes: PacedNotesFacts) -> Pac
             )),
             PACED_SENTENCE_NOTES_PACED.to_owned(),
         )
-    } else {
-        paced_paused()
     };
     PacedWorkVm {
         id: format!("notes:{}", folder.profile_id),
@@ -1017,7 +1080,12 @@ fn duration_words(ms: u64) -> String {
     }
     // Round rather than truncate: 1_900 ms is nearer two seconds than one, and
     // truncating would under-state every cadence that is not a whole second.
-    plural_words((ms + SECOND / 2) / SECOND, "second")
+    // `saturating_add` because a stored interval is a `u64` a config file
+    // supplies: `ms + 500` overflows within 500 of `u64::MAX`, which panics a
+    // debug build and wraps a release one into an absurdly small cadence. No
+    // reachable interval is anywhere near it, and a panic in a projection that
+    // exists to be honest is worse than the two characters that prevent it.
+    plural_words(ms.saturating_add(SECOND / 2) / SECOND, "second")
 }
 
 /// `1 hour` / `2 hours`. English's own rule, in one place so no phrase above
@@ -1573,11 +1641,13 @@ mod tests {
         }
     }
 
-    /// The vault cadence the profile defaults ship with.
+    /// The vault cadence the profile defaults ship with, on a vault the registry
+    /// actually holds — the only shape that is paced.
     fn vault() -> PacedNotesFacts {
         PacedNotesFacts {
             commit_idle_ms: 2_000,
             push_interval_ms: 30_000,
+            registered: true,
         }
     }
 
@@ -1704,24 +1774,36 @@ mod tests {
         assert_eq!(scan.cadence.as_deref(), Some("about every 15 seconds"));
     }
 
+    /// The clause rides the two rows whose work would have *looked* at the
+    /// folder, and not the notes row.
+    ///
+    /// The sweep earned it after review: `sweep_scratch_if_due` does not check
+    /// `volume_ready`, so with the drive away its `read_dir` finds nothing and
+    /// deletes nothing — an unhedged *"keeper deletes transfer scratch on this
+    /// cadence"* was claiming work that was not happening. The notes row is still
+    /// excluded, because a vault on an absent drive is unregistered and its own
+    /// sentence already names the missing folder as the reason.
     #[test]
-    fn a_removable_folder_says_so_on_its_scan_row_and_only_there() {
+    fn a_removable_folder_says_so_on_the_rows_that_would_have_looked() {
         let rows = paced_work(&[PacedFolderFacts {
             removable: true,
             notes: Some(vault()),
             ..folder()
         }]);
-        let scan = row_of(&rows, PacedWorkKind::Scan);
         assert_eq!(
-            scan.sentence,
+            row_of(&rows, PacedWorkKind::Scan).sentence,
             format!("{PACED_SENTENCE_SCAN_PACED}{PACED_SENTENCE_REMOVABLE_CLAUSE}")
         );
-        for kind in [PacedWorkKind::ScratchSweep, PacedWorkKind::NotesCadence] {
-            assert!(
-                !row_of(&rows, kind).sentence.contains("removable media"),
-                "{kind:?} must not carry the removable clause"
-            );
-        }
+        assert_eq!(
+            row_of(&rows, PacedWorkKind::ScratchSweep).sentence,
+            format!("{PACED_SENTENCE_SWEEP_PACED}{PACED_SENTENCE_REMOVABLE_CLAUSE}")
+        );
+        assert!(
+            !row_of(&rows, PacedWorkKind::NotesCadence)
+                .sentence
+                .contains("removable media"),
+            "the notes row names the folder it cannot find, not the drive"
+        );
         // It rides governance too: the look is still what finds nothing.
         let governed = paced_work(&[PacedFolderFacts {
             removable: true,
@@ -1731,6 +1813,78 @@ mod tests {
         assert!(row_of(&governed, PacedWorkKind::Scan)
             .sentence
             .contains("removable media"));
+        // And a paused folder keeps its one reason: pausing, not the drive.
+        let paused = paced_work(&[PacedFolderFacts {
+            removable: true,
+            enabled: false,
+            ..folder()
+        }]);
+        for row in &paused {
+            assert_eq!(row.sentence, PACED_SENTENCE_PAUSED, "{:?}", row.kind);
+        }
+    }
+
+    /// The over-claim the registration fact exists to prevent: a configured
+    /// vault whose folder the registry could not resolve is reached by no
+    /// cadence tick and no flush, so it must not advertise one.
+    #[test]
+    fn an_unregistered_vault_advertises_no_cadence_and_names_the_registry() {
+        let rows = paced_work(&[PacedFolderFacts {
+            notes: Some(PacedNotesFacts {
+                registered: false,
+                ..vault()
+            }),
+            ..folder()
+        }]);
+        let notes = row_of(&rows, PacedWorkKind::NotesCadence);
+        assert_eq!(notes.standing, PacedWorkStanding::Unregistered);
+        assert_eq!(notes.cadence, None);
+        assert_eq!(notes.sentence, PACED_SENTENCE_NOTES_UNREGISTERED);
+        // Neither of the other two goes through the vault registry.
+        for kind in [PacedWorkKind::Scan, PacedWorkKind::ScratchSweep] {
+            assert_eq!(
+                row_of(&rows, kind).standing,
+                PacedWorkStanding::Paced,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// Pausing outranks registration: a paused folder gets one reason, and it is
+    /// the one somebody would recognise.
+    #[test]
+    fn a_paused_folder_with_an_unregistered_vault_reads_as_paused() {
+        let rows = paced_work(&[PacedFolderFacts {
+            enabled: false,
+            notes: Some(PacedNotesFacts {
+                registered: false,
+                ..vault()
+            }),
+            ..folder()
+        }]);
+        let notes = row_of(&rows, PacedWorkKind::NotesCadence);
+        assert_eq!(notes.standing, PacedWorkStanding::Paused);
+        assert_eq!(notes.sentence, PACED_SENTENCE_PAUSED);
+    }
+
+    /// An interval within rounding distance of `u64::MAX` used to panic a debug
+    /// build in `ms + 500` and wrap a release one to an absurdly small cadence.
+    /// Nothing shipped reaches it; a projection that exists to be honest simply
+    /// must not be able to panic on a number a config file can hold.
+    #[test]
+    fn an_absurd_interval_saturates_instead_of_overflowing() {
+        let rows = paced_work(&[PacedFolderFacts {
+            scan_interval_ms: u64::MAX,
+            ..folder()
+        }]);
+        let scan = row_of(&rows, PacedWorkKind::Scan);
+        // `u64::MAX` saturates rather than wrapping, so the rounding half is
+        // absorbed and the number is the truncated one. Either reading is
+        // nonsense to a person; the point is that neither is a panic.
+        assert_eq!(
+            scan.cadence.as_deref(),
+            Some("about every 18446744073709551 seconds")
+        );
     }
 
     /// The invariant, over every shape this projection can produce. It is the
@@ -1742,7 +1896,16 @@ mod tests {
         for enabled in [true, false] {
             for governed in [true, false] {
                 for removable in [true, false] {
-                    for notes in [Some(vault()), None] {
+                    // Every vault shape, including the unregistered one the
+                    // fourth standing exists for.
+                    for notes in [
+                        Some(vault()),
+                        Some(PacedNotesFacts {
+                            registered: false,
+                            ..vault()
+                        }),
+                        None,
+                    ] {
                         rows.extend(paced_work(&[PacedFolderFacts {
                             enabled,
                             scan_governed: governed,
@@ -1755,6 +1918,20 @@ mod tests {
             }
         }
         assert!(!rows.is_empty());
+        // Every standing this build can emit really did occur above, or the
+        // sweep would be asserting the invariant over a subset of the space
+        // while reading as if it covered all of it.
+        for standing in [
+            PacedWorkStanding::Paced,
+            PacedWorkStanding::Paused,
+            PacedWorkStanding::Governed,
+            PacedWorkStanding::Unregistered,
+        ] {
+            assert!(
+                rows.iter().any(|row| row.standing == standing),
+                "{standing:?} never occurred in the sweep"
+            );
+        }
         for row in &rows {
             assert_eq!(
                 row.cadence.is_some(),

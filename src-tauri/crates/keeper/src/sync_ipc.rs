@@ -2167,9 +2167,15 @@ pub async fn sync_paced_work(
                 Some(keeper_sync::tasks::TaskMode::Scheduled)
             ),
             sweep_interval_ms: keeper_sync::engine::SWEEP_EVERY_MS as u64,
+            // The vault registry, not the profile's vault *configuration*: an
+            // unregistered vault is reached by no cadence tick and no flush, so
+            // a row built from the configuration alone would claim a cadence
+            // nothing is keeping. `notes_vault::vault` is the same lookup every
+            // notes command resolves its id through.
             notes: profile.notes.as_ref().map(|notes| PacedNotesFacts {
                 commit_idle_ms: notes.cadence.commit_idle_ms,
                 push_interval_ms: notes.cadence.push_interval_ms,
+                registered: crate::notes_vault::vault(&profile.id).is_some(),
             }),
         })
         .collect();

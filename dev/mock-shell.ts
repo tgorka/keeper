@@ -1841,6 +1841,8 @@ const PACED_SENTENCES = {
     "keeper deletes transfer scratch this folder will never use again, on this cadence, while it is running.",
   notesPaced:
     "the app commits this vault after the quiet window and pushes within the deadline. Only the running app paces it — keeper-syncd never does.",
+  notesUnregistered:
+    "keeper has no vault registered for this folder, so nothing paces it: the vault folder could not be found when the registry was last built. The registry is rebuilt at launch, and when a vault is flagged or unflagged — not when a drive comes back.",
   paused: "this folder is paused, so nothing here is paced and no cadence is in force.",
   removableClause:
     " The folder is on removable media, so nothing happens at all while the drive is away.",
@@ -1898,6 +1900,9 @@ const PACED_WORK = [
     cadence: null,
     sentence: `${PACED_SENTENCES.scanGoverned}${PACED_SENTENCES.removableClause}`,
   },
+  // The sweep carries the same clause on removable media: with the drive away
+  // its own `read_dir` finds nothing, so an unhedged deletion claim would be
+  // describing work that is not happening.
   {
     id: "sweep:p2",
     kind: "scratchSweep",
@@ -1905,7 +1910,18 @@ const PACED_WORK = [
     profile: "photos",
     standing: "paced",
     cadence: "every 1 hour",
-    sentence: PACED_SENTENCES.sweepPaced,
+    sentence: `${PACED_SENTENCES.sweepPaced}${PACED_SENTENCES.removableClause}`,
+  },
+  // A vault the registry does not hold — the shape that used to claim a cadence
+  // while nothing at all was pacing it.
+  {
+    id: "notes:p2",
+    kind: "notesCadence",
+    profileId: "p2",
+    profile: "photos",
+    standing: "unregistered",
+    cadence: null,
+    sentence: PACED_SENTENCES.notesUnregistered,
   },
   // Paused, and every row of the folder says the same thing: `tick` skips a
   // disabled profile before it reaches any of this work.

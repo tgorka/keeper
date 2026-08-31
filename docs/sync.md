@@ -2291,18 +2291,43 @@ memory and are discarded when the process ends, and a finished journal unit is
 deleted rather than recorded — so the view under-claims deliberately rather than
 inventing a last-run line it could not stand behind.
 
-Three standings, and they are three different answers:
+Four standings, and they are four different answers:
 
 | standing | what it means |
 | --- | --- |
 | **paced** | the clock really is pacing this, and the cadence beside it is the one in force — `pollIntervalMs` after its floor is applied, never the number stored on the row |
 | **paused** | the folder is paused, so nothing paces it and **no cadence is shown**. A cadence beside *paused* would be a promise nothing is keeping |
 | **governed** | a `scheduled` **sync task** has taken this folder's paced walk over, so the task's schedule is the cadence — see below. No interval is shown, because none is in force |
+| **unregistered** | a notes row only: the folder holds a vault, but keeper has no vault *registered* for it, because the vault folder could not be found when the registry was last built. Nothing paces it, and it is not waiting on a clock |
+
+**A configured vault and a paced vault are two different facts**, which is why
+the fourth standing exists. The registry is rebuilt at launch and when a vault
+is flagged or unflagged — not when a drive comes back — so a vault on a disk
+that was away at launch stays unregistered for the session. The row says so
+rather than reciting a cadence nothing is keeping.
+
+**Pausing a folder pauses its vault too.** It did not always: the vault cadence
+is the app's own, and its push arm calls the same schedule-blind `sync_once`
+that **Sync now** calls, so a paused folder's notes were still committed and
+pushed on their cadence, and again when the window lost focus or the app quit.
+The gate now sits in the automatic callers — the cadence tick and the quit
+flush — and not in `sync_once`, because a person pressing Sync now on a paused
+folder is asking for exactly that and must still get it. Work that was owed when
+the folder was paused stays owed: the phase is left untouched, so resuming the
+folder serves it rather than losing it.
 
 Nothing here writes a `tasks` row, and nothing here registers a clock, an
 interval or a due-gate: every row is derived, at read time, from state the view
 had already fetched. If the projection cannot be read, the view shows the
 refusal and keeps the rows it had — and the task list above it is untouched.
+
+One thing the section says in words, because an absence is indistinguishable
+from a bug: these rows have **no buttons at all** — no Run now, no schedule
+field, no history. It says *none of it can be started from this section* rather
+than *nothing here can be run on demand*, because the latter is false: a
+folder's own **Sync now** is on the Sync pane, and a vault is flushed every time
+the window hides. A sentence written to stop somebody hunting for a control must
+not hide the control they were looking for.
 
 ### A window that passed while nobody was home
 

@@ -441,16 +441,22 @@ export const PACED_HEADING = "Also paced by this host";
 
 /**
  * What the section is, and — before anyone hunts for one — that the controls
- * every row above has cannot exist here.
+ * every row above has do not exist *here*.
  *
  * Said in words rather than left to the absence of buttons, because an absence
  * is indistinguishable from a bug: a reader who knows a Sync task can be run on
  * demand will read a row with no Run now as a row whose Run now failed to
- * render. The two clauses are the two things that are actually missing — a
- * schedule you can set, and a run you can ask for.
+ * render.
+ *
+ * **"…from this section", not "…at all".** The first draft said nothing here
+ * can be run on demand, which is false for two of the three kinds: the scan's
+ * work is what the Sync pane's **Sync now** runs, and a vault is flushed on
+ * demand every time the window hides or loses focus. A sentence written to stop
+ * somebody hunting for a control must not hide the control they were looking
+ * for, so it names where the scan can be asked for instead.
  */
 export const PACED_SUBTITLE =
-  "Work keeper paces on its own. These are not tasks: nothing here has a schedule you can set, and nothing here can be run on demand.";
+  "Work keeper paces on its own. These are not tasks: nothing here has a schedule you can set, and none of it can be started from this section — a folder's own Sync now is on the Sync pane.";
 
 /**
  * The badge on such a row, `TASKS_UNKNOWN_BADGE`'s idiom.
@@ -467,12 +473,16 @@ export const PACED_LOADING_TEXT = "Reading what this host paces…";
 /**
  * That keeper paces nothing here, and what would put a row in this section.
  *
- * Every projected row is per-folder, so an empty projection means exactly one
- * thing — there are no folders — and the sentence says so rather than leaving a
- * reader to wonder whether the feature is switched off somewhere.
+ * Every projected row is per-folder, so this sentence is about **what keeper
+ * paces** and deliberately not about what the machine has. It used to say a
+ * reader had no folders, which is a claim the projection cannot make: a profile
+ * row this build cannot deserialize is skipped by `list_profiles` rather than
+ * counted, so on a downgrade an empty projection and a machine full of folders
+ * look identical from here. The unknown-row surfaces above this section are
+ * where that fact belongs.
  */
 export const PACED_EMPTY_TEXT =
-  "keeper paces nothing on this machine yet. A folder gets a cadence as soon as it is added.";
+  "keeper paces nothing here. A folder gets a cadence as soon as it is added and enabled.";
 
 /** Column labels, so a projected row reads without a table header above it. */
 export const PACED_CADENCE_LABEL = "Cadence";
@@ -481,9 +491,10 @@ export const PACED_FOLDER_LABEL = "Folder";
 /**
  * What stands in for an absent cadence.
  *
- * `cadence` is null only when the standing is `paused` or `governed`, and in
- * both cases the row's sentence already says which — so this cell says the one
- * thing the *cadence* column can honestly say, and never guesses a reason.
+ * `cadence` is null only for a standing that is not `paced` — paused, governed
+ * or an unregistered vault — and in every case the row's sentence already says
+ * which, so this cell says the one thing the *cadence* column can honestly say
+ * and never guesses a reason.
  */
 export const PACED_NO_CADENCE_TEXT = "nothing paces it";
 
@@ -665,11 +676,20 @@ function Field({
   return (
     <div className={wide ? "col-span-2 min-w-0 sm:col-span-4" : "min-w-0"}>
       <dt className="text-muted-foreground text-xs uppercase tracking-wide">{label}</dt>
+      {/* `[overflow-wrap:anywhere]` on BOTH branches, and only
+          `whitespace-pre-wrap` is the wide cell's own. A narrow cell holds a
+          short value in every shape this build writes — except one: the paced
+          rows' Folder cell holds a **profile name**, which is user-typed and
+          validated only as non-empty, so a pasted path with no spaces in it is
+          an unbreakable token in a quarter-width track. `min-w-0` shrinks the
+          track and nothing breaks the word, so the row pushed the pane sideways.
+          Line breaks stay collapsed here, because a narrow value has no reason
+          to carry them and an engine sentence belongs in a wide cell. */}
       <dd
         className={
           wide
             ? "whitespace-pre-wrap text-foreground text-sm [overflow-wrap:anywhere]"
-            : "text-foreground text-sm"
+            : "text-foreground text-sm [overflow-wrap:anywhere]"
         }
       >
         {children}
@@ -1094,7 +1114,11 @@ function PacedWorkList({
   rows: PacedWorkVm[] | null;
   error: string | null;
 }) {
-  const fold = useFold(rows);
+  // Unfolds to every row, unlike the run history above it: Rust returned the
+  // whole projection rather than a page of it, so a cap on the expanded view
+  // would drop rows with no control left to reveal them — in the one section
+  // whose claim is that it lists everything this host paces.
+  const fold = useFold(rows, { unfoldToAll: true });
   return (
     <div className="flex flex-col gap-2 border-border border-t px-6 py-4">
       {/* The project's group-label treatment (`sync-pane.tsx`'s Activity

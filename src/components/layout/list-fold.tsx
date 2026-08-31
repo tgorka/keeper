@@ -39,17 +39,33 @@ export const LIST_FOLD_LESS_LABEL = "Show fewer";
  *
  * Takes `null` for an unread list so a caller may call it before its own early
  * return, which a hook must be.
+ *
+ * `unfoldToAll` is for a list Rust returned **whole**. The unfolded size is
+ * also the query limit for Activity and for a task's run history, so slicing to
+ * it there hides nothing that was ever fetched. A projection has no query
+ * behind it: every row is already in hand, and capping the expanded view at
+ * `unfolded` would drop rows silently — with no control left to reveal them and
+ * nothing on screen saying they exist. A list that claims to be a complete
+ * inventory must not be able to do that.
  */
-export function useFold<T>(rows: readonly T[] | null): {
+export function useFold<T>(
+  rows: readonly T[] | null,
+  options?: { unfoldToAll?: boolean },
+): {
   visible: readonly T[];
   hidden: number;
   expanded: boolean;
   toggle: () => void;
   limit: number;
+  unfoldedLimit: number;
 } {
   const [expanded, setExpanded] = useState(false);
   const { folded, unfolded } = syncListSizes();
-  const limit = expanded ? unfolded : folded;
+  // What a press will reveal: every row for a whole list, the global unfolded
+  // size otherwise. Returned as well as used, so the control's label promises
+  // the same number this hook will actually show.
+  const unfoldedLimit = options?.unfoldToAll ? (rows?.length ?? 0) : unfolded;
+  const limit = expanded ? unfoldedLimit : folded;
   // An unread list folds to nothing rather than to `null`: every caller already
   // branches on its own `rows === null` before reaching the rows, and a nullable
   // `visible` only moves that check somewhere it has to be repeated.
@@ -59,6 +75,7 @@ export function useFold<T>(rows: readonly T[] | null): {
     hidden: (rows?.length ?? 0) - visible.length,
     expanded,
     limit,
+    unfoldedLimit,
     toggle: () => setExpanded((v) => !v),
   };
 }
@@ -76,7 +93,13 @@ export function FoldToggle({
   label,
 }: {
   rows: readonly unknown[];
-  fold: { hidden: number; expanded: boolean; toggle: () => void; limit: number };
+  fold: {
+    hidden: number;
+    expanded: boolean;
+    toggle: () => void;
+    limit: number;
+    unfoldedLimit: number;
+  };
   label: string;
 }) {
   // Nothing folded and nothing to fold back: the control would do nothing in
@@ -86,10 +109,13 @@ export function FoldToggle({
   }
   // Capped at the list's own length: unfolding cannot reveal rows Rust was never
   // asked for, so "Show all 100" over a 12-row list would be a promise the query
-  // cannot keep.
+  // cannot keep. The ceiling comes from the hook rather than from the global
+  // setting, because a whole list unfolds to its own length — reading the
+  // setting here again would under-promise by exactly the rows the hook is about
+  // to show.
   const text = fold.expanded
     ? LIST_FOLD_LESS_LABEL
-    : LIST_FOLD_MORE_LABEL(Math.min(rows.length, syncListSizes().unfolded));
+    : LIST_FOLD_MORE_LABEL(Math.min(rows.length, fold.unfoldedLimit));
   return (
     <button
       type="button"

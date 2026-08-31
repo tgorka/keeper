@@ -2511,6 +2511,16 @@ impl Cadence {
         state.last_change_ms = now_ms();
     }
 
+    /// Release the in-flight claim without deciding anything about the phase.
+    ///
+    /// For work a caller claimed and then declined to run — a paused folder's
+    /// vault. `finish` cannot serve here: it would move `Ahead` to `Idle` on a
+    /// `false`, discarding a push that is still owed, and the whole point of
+    /// declining is that nothing happened.
+    fn stand_down(&self) {
+        self.lock().in_flight = false;
+    }
+
     /// An action finished. `ahead` means the vault now has local commits its
     /// remote does not, which is what schedules the push.
     fn finish(&self, ahead: bool, push_interval_ms: u64) {
@@ -2615,13 +2625,66 @@ fn dispatch_cadence(forced: bool) {
             }
         }
     }
+    if due.is_empty() {
+        return;
+    }
+    // **A paused folder is paused for its vault too**, and this is the only
+    // place that can say so. `Engine::tick` skips a disabled profile before it
+    // reaches the scan or the sweep, but the push arm below calls `sync_once`,
+    // which is deliberately schedule-blind — it is also the Sync now button, and
+    // a person asking for a run now must get one. So the gate belongs to the
+    // automatic caller, not to the engine: without it, pausing a folder still
+    // let keeper commit its vault and push to the remote on its own, which is
+    // the one thing pausing is for.
+    //
+    // Read here rather than at registration, and only when something is due: the
+    // registry is rebuilt at launch and on a vault flag, so a flag captured at
+    // registration would be stale for the whole session after a pause — and this
+    // path is reached only when a vault actually has work, not once a second.
+    // Outside the registry lock, because a profile read takes the database and
+    // holding both would order two locks nothing else orders.
+    let paused = paused_profile_ids();
     for (vault_id, action, push_interval_ms) in due {
+        if paused.contains(&vault_id) {
+            // The phase is left exactly as it was — `Dirty` stays `Dirty`, an
+            // armed push stays armed — so resuming the folder serves the work
+            // that was waiting instead of losing it. Only the in-flight claim is
+            // released, or this vault would never be considered again.
+            if let Some(slot) = registry().get(&vault_id) {
+                slot.cadence.stand_down();
+            }
+            continue;
+        }
         tauri::async_runtime::spawn(async move {
             let ahead = run_cadence_action(&vault_id, action).await;
             if let Some(slot) = registry().get(&vault_id) {
                 slot.cadence.finish(ahead, push_interval_ms);
             }
         });
+    }
+}
+
+/// The ids of every profile that is currently paused.
+///
+/// An unreadable profile set yields an empty set, which pauses nothing: the
+/// cadence's job is to commit and push the user's writing, and a database read
+/// that failed is not evidence that they paused anything. The projection in the
+/// Tasks view reads the same flag from the same rows, so the two agree by
+/// construction.
+fn paused_profile_ids() -> HashSet<String> {
+    let Some(engine) = crate::sync::engine_if_open() else {
+        return HashSet::new();
+    };
+    match engine.list_profiles() {
+        Ok(profiles) => profiles
+            .into_iter()
+            .filter(|profile| !profile.enabled)
+            .map(|profile| profile.id)
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "notes: could not read the profile set; pacing every vault");
+            HashSet::new()
+        }
     }
 }
 
@@ -2682,6 +2745,17 @@ pub fn flush_for_quit() {
     let Some(engine) = crate::sync::engine_if_open() else {
         return;
     };
+    // `dispatch_cadence`'s gate, on the one path that does not go through it:
+    // quit is automatic, and a folder somebody paused must not be committed and
+    // pushed because the app is closing.
+    let paused = paused_profile_ids();
+    let vault_ids: Vec<String> = vault_ids
+        .into_iter()
+        .filter(|id| !paused.contains(id))
+        .collect();
+    if vault_ids.is_empty() {
+        return;
+    }
     let flush = async {
         tokio::time::timeout(QUIT_FLUSH_BOUND, async {
             for vault_id in vault_ids {
@@ -3284,6 +3358,42 @@ mod tests {
         cadence.finish(false, 30_000);
         assert_eq!(cadence.lock().phase, Phase::Dirty);
         assert!(!cadence.lock().in_flight);
+    }
+
+    /// Declining a paused folder's vault must cost it nothing.
+    ///
+    /// `dispatch_cadence` claims a due vault (`in_flight = true`) before it
+    /// knows whether the folder is paused, because the claim has to happen under
+    /// the registry lock and the paused set is read outside it. So the decline
+    /// path releases the claim and touches nothing else: `finish(false, ..)`
+    /// cannot serve here, since it would move an `Ahead` vault to `Idle` and
+    /// discard a push that is still owed — and the whole point of declining is
+    /// that nothing happened.
+    #[test]
+    fn standing_down_releases_the_claim_and_keeps_the_work_that_was_owed() {
+        for phase in [Phase::Dirty, Phase::Ahead] {
+            let cadence = Cadence::default();
+            {
+                let mut state = cadence.lock();
+                state.phase = phase;
+                state.push_deadline_ms = 40_000;
+                state.in_flight = true;
+            }
+            cadence.stand_down();
+            let state = *cadence.lock();
+            assert!(!state.in_flight, "{phase:?}");
+            assert_eq!(state.phase, phase, "{phase:?}: the work is still owed");
+            assert_eq!(state.push_deadline_ms, 40_000, "{phase:?}");
+        }
+        // The contrast that makes the two methods two methods: `finish` decides.
+        let finished = Cadence::default();
+        {
+            let mut state = finished.lock();
+            state.phase = Phase::Ahead;
+            state.in_flight = true;
+        }
+        finished.finish(false, 30_000);
+        assert_eq!(finished.lock().phase, Phase::Idle);
     }
 
     #[test]

@@ -33,6 +33,7 @@ import {
   PACED_CADENCE_LABEL,
   PACED_EMPTY_TEXT,
   PACED_FOLDER_LABEL,
+  PACED_HEADING,
   PACED_KIND_LABELS,
   PACED_LOADING_TEXT,
   PACED_NO_CADENCE_TEXT,
@@ -133,6 +134,8 @@ const PACED_SENTENCE_SWEEP =
   "keeper deletes transfer scratch this folder will never use again, on this cadence, while it is running.";
 const PACED_SENTENCE_PAUSED =
   "this folder is paused, so nothing here is paced and no cadence is in force.";
+const PACED_SENTENCE_UNREGISTERED =
+  "keeper has no vault registered for this folder, so nothing paces it: the vault folder could not be found when the registry was last built. The registry is rebuilt at launch, and when a vault is flagged or unflagged — not when a drive comes back.";
 
 function run(over: Partial<TaskRunVm> = {}): TaskRunVm {
   return {
@@ -1968,10 +1971,17 @@ describe("the pane also lists what this host paces, and says it is not a task", 
     expect(within(row).queryByText(/about every/)).toBeNull();
   });
 
-  // THE STORY 58.8 CONTRACT TEST. It fails the day somebody reverts that
-  // story's stand-down and leaves the paced poll running underneath a scheduled
-  // Sync task — which is the exact moment this view would start advertising a
-  // cadence that no longer decides anything.
+  // NOT a contract test on Story 58.8, though it was labelled one. This test
+  // hands `syncPacedWork` a hardcoded governed row at the IPC boundary, so it
+  // exercises no Rust: reverting 58.8's stand-down leaves it green. What it does
+  // assert is this pane's half of the contract — that a governed row renders its
+  // sentence and invents no cadence to fill the empty column.
+  //
+  // The guard that would actually fail on such a revert lives where the decision
+  // does: `sync_poll_permits`' `Some(Scheduled) => false` arm and its tests in
+  // `keeper-sync`, and the projection's governed-row tests in `keeper-core`. A
+  // comment claiming coverage that a mock cannot provide is worse than no
+  // comment, because it is read as a reason not to write the real one.
   it("says a governed scan has stood down, and advertises no cadence for it", async () => {
     answer(listing());
     answerPaced([
@@ -1984,6 +1994,56 @@ describe("the pane also lists what this host paces, and says it is not a task", 
     expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
     // The event triggers survive governance: what stood down is the interval.
     expect(within(row).getByText(/watcher sees settle still brings a look forward/)).toBeVisible();
+  });
+
+  // The over-claim this row's registration fact exists to prevent: a folder can
+  // hold a vault keeper has nothing registered to pace, and the cadence cell
+  // must not recite an interval nobody is keeping.
+  it("says an unregistered vault is not paced, and names the registry rather than a cadence", async () => {
+    answer(listing());
+    answerPaced([
+      pacedRow({
+        id: "notes:p1",
+        kind: "notesCadence",
+        standing: "unregistered",
+        cadence: null,
+        sentence: PACED_SENTENCE_UNREGISTERED,
+      }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).getByText(PACED_SENTENCE_UNREGISTERED)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
+    expect(within(row).queryByText(/committed after/)).toBeNull();
+    // And it is still not a task: no control appeared with the new standing.
+    expect(within(row).queryAllByRole("button")).toHaveLength(0);
+  });
+
+  // The section's claim is completeness, so the fold may hide rows only while it
+  // is collapsed. Every other folding list in the app is capped by the query
+  // behind it; this one has no query, so a cap on the expanded view would drop
+  // rows with no control left to reveal them.
+  it("unfolds to every projected row rather than to the global unfolded size", async () => {
+    setSyncListSizes({ folded: 2, unfolded: 3 });
+    answer(listing());
+    const rows = Array.from({ length: 7 }, (_unused, index) =>
+      pacedRow({ id: `scan:p${index}`, profileId: `p${index}`, profile: `folder-${index}` }),
+    );
+    answerPaced(rows);
+    render(<TasksPane />);
+    await screen.findAllByTestId(PACED_ROW_TESTID);
+
+    expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(2);
+    // The control promises the list's own length, not the setting's.
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${LIST_FOLD_MORE_LABEL(7)}: ${PACED_HEADING}`,
+      }),
+    );
+    await waitFor(() => expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(7));
+
+    expect(screen.getByText("folder-6")).toBeVisible();
   });
 
   it("quotes a refused projection and leaves the task rows above it standing", async () => {

@@ -2,9 +2,9 @@
 title: 'Story 58.7: everything else this host paces'
 type: 'feature'
 created: '2026-08-31'
-status: 'in-review'
+status: 'done'
 baseline_revision: '3d8735a'
-review_loop_iteration: 0
+review_loop_iteration: 1
 followup_review_recommended: false
 context:
   - '{project-root}/docs/project-context.md'
@@ -93,7 +93,96 @@ warnings: ['oversized']
 
 ## Spec Change Log
 
+- 2026-08-31 -- the projection gained a fourth standing, `unregistered`, and
+  `PacedNotesFacts` gained `registered`. The spec's matrix said a folder with
+  `notes = Some` yields a paced notes row; review showed that a *configured*
+  vault and a *paced* vault are two different facts, so the matrix row now needs
+  the registry to agree. See the triage log below.
+
 ## Review Triage Log
+
+**Pass 1 — 2026-08-31, salvage.** The story's own review never ran: the session
+that implemented it ended before it, leaving `review_loop_iteration: 0` and this
+section empty while the code was complete and green. Two read-only lenses were
+run against commit `99769f4` (a blind lens and an edge-case lens); the blind
+lens' provider was out of credits and its half was done by hand. Nine findings,
+all triaged, none deferred.
+
+**Fixed — two claims that were false on somebody's machine.** These are the
+class that matters: a sentence the view states as fact.
+
+1. *A paused folder's notes vault was still committed and pushed.* The notes row
+   printed *"this folder is paused, so nothing here is paced"* while the vault
+   cadence had no `enabled` gate anywhere: `Engine::tick` skips a disabled
+   profile before the scan and the sweep, but the cadence's push arm calls
+   `sync_once` directly, and so does the quit flush. Fixed in the pacer rather
+   than in the wording, because pausing a folder is exactly a request not to
+   touch it — and the gate sits in the two automatic callers, not in `sync_once`,
+   which is also the Sync now button a person may press on a paused folder.
+   Declining leaves the phase untouched, so resuming serves the work that was
+   owed; `Cadence::stand_down` exists because `finish(false, …)` would have
+   discarded an owed push. The behaviour is documented in `docs/sync.md` §14.
+2. *A vault the registry does not hold advertised a cadence.* `register_one`
+   returns nothing when the vault root cannot be canonicalized — a drive that is
+   away, a folder that moved — and the row was built from the profile's vault
+   *configuration*, so it recited "committed after 2 seconds of quiet, pushed
+   within 30 seconds" while nothing at all was pacing it. The projection now
+   takes `registered` and answers with the fourth standing. Its sentence names
+   the remedy honestly: the registry is rebuilt at launch and on a vault flag,
+   **not** when a drive returns, so "it resumes on its own" would have been the
+   comfortable lie.
+
+**Fixed — four surfaces that under- or over-claimed.**
+
+3. *The subtitle said nothing here can be run on demand.* False for two of the
+   three kinds: the scan's work is what the Sync pane's **Sync now** runs, and a
+   vault is flushed whenever the window hides. A sentence written to stop
+   somebody hunting for a control was hiding the control they wanted; it now says
+   *none of it can be started from this section* and names where the scan can be.
+4. *The empty sentence claimed the machine has no folders.* `list_profiles`
+   skips a profile row this build cannot deserialize, so on a downgrade an empty
+   projection and a machine full of folders are indistinguishable from here. The
+   sentence now speaks only about what keeper paces.
+5. *The fold dropped rows.* Every other folding list is capped by the query
+   behind it; this projection has no query, so the expanded view silently lost
+   every row past the global unfolded size — in the one section whose claim is
+   completeness. `useFold` grew `unfoldToAll`, and the control's label now
+   promises the hook's own limit rather than the setting's.
+6. *The sweep row over-claimed on removable media.* `sweep_scratch_if_due` does
+   not check `volume_ready`, so with the drive away it deletes nothing while the
+   row said it deletes scratch on this cadence. The removable clause now rides
+   the sweep too — and still not the notes row, whose unregistered sentence
+   already names the missing folder.
+
+**Fixed — three that were not user-visible, and would have become so.**
+
+7. *The invariant was stated, not enforced.* `standing` and `cadence` are
+   independent public fields, so a fourth kind could have put *"paused, about
+   every 15 seconds"* on screen — the exact phrase this class exists to make
+   impossible. `paced_work` now `debug_assert!`s the pairing over every row it
+   returns, and the sweep test asserts that every standing really occurred in it.
+8. *A test comment claimed coverage a mock cannot provide.* The governed-row test
+   was labelled the Story 58.8 contract test; it feeds a hardcoded governed row
+   through the IPC mock, so reverting 58.8's stand-down leaves it green. The
+   comment now says what the test asserts and points at the guards that would
+   actually fail.
+9. *`duration_words` could panic.* `ms + 500` overflows within 500 of
+   `u64::MAX` — a debug panic, a release wrap to an absurdly small cadence — on a
+   number a config file can hold. Now `saturating_add`.
+
+**Judged and not changed.** The reviewer filed a React-key collision risk and a
+`duration_words` boundary sweep and then withdrew both with the reasoning shown:
+the three id prefixes are distinct literals so `scan:` + A can never equal
+`sweep:` + B, and every reachable interval is floored by
+`MIN_POLL_INTERVAL_MS` or by `NotesConfig::validate`. Both readings were checked
+against the same code and agreed with.
+
+**Mutation proof.** Each new guard was inverted and the failure observed:
+removing the registration gate fails the unregistered-vault test *and* the
+invariant sweep; capping the fold at the unfolded size fails the completeness
+test; making `stand_down` call `finish(false, …)` fails the owed-work test on
+macOS with `left: Idle, right: Ahead` — the exact state loss it exists to
+prevent. All three restored and re-verified green.
 
 ## Design Notes
 

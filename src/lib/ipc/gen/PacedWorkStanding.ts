@@ -3,11 +3,11 @@
 /**
  * Whether the clock really paces a projected row right now.
  *
- * [`Self::Paused`] and [`Self::Governed`] are two different reasons for the
- * same absence of a cadence, and collapsing them would lose the actionable
- * half: a paused folder is paused because somebody paused it, and a governed
- * folder's scan happens on a *schedule the user can see and edit* in the task
- * list above. Only [`Self::Paced`] ever carries a cadence — see
- * [`PacedWorkVm::cadence`].
+ * The three non-paced variants are three different reasons for the same
+ * absence of a cadence, and collapsing them would lose the actionable half: a
+ * paused folder is paused because somebody paused it, a governed folder's scan
+ * happens on a *schedule the user can see and edit* in the task list above,
+ * and an unregistered vault is waiting on a folder that is not there. Only
+ * [`Self::Paced`] ever carries a cadence — see [`PacedWorkVm::cadence`].
  */
-export type PacedWorkStanding = "paced" | "paused" | "governed";
+export type PacedWorkStanding = "paced" | "paused" | "governed" | "unregistered";

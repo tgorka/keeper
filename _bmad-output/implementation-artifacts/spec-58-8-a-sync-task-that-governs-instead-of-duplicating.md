@@ -2,9 +2,10 @@
 title: 'Story 58.8: a sync task that governs instead of duplicating'
 type: 'feature'
 created: '2026-08-31'
-status: 'in-review'
+status: 'done'
 baseline_revision: '3d8735a'
-review_loop_iteration: 0
+final_revision: '73aa857'
+review_loop_iteration: 1
 followup_review_recommended: false
 context:
   - '{project-root}/docs/project-context.md'
@@ -123,6 +124,43 @@ Design Notes.
   elapses, then `scan_due` is still true — the live half survives the stand-down.
 - Given a `scheduled` Sync task and the `&& self.sync_poll_permits(...)` conjunct mutated away, then
   the duplication test fails.
+
+## Review Triage Log
+
+**Pass 1 — 2026-08-31, salvage.** This story's review never ran either: the
+session ended with `review_loop_iteration: 0` and this section absent while
+`73aa857` was already committed. Audited against the epic's own **58.8**
+paragraph, claim by claim, read-only.
+
+| epic claim | verdict | evidence |
+| --- | --- | --- |
+| every `Sync` row folds into one least-permissive mode over an **explicit** rank, spelled where the claim is made, with `TaskMode` deriving no `Ord` | satisfied | the `rank` closure is local to `task_governance` (`engine.rs:8442-8446`) and the fold is a min over it (`:8467-8470`); `TaskMode` still derives no `Ord` |
+| the narrower statement wins over host-wide, and another folder's row is not folded in | satisfied | `engine.rs:8460-8473`, `mine.or(host_wide)`; `Some(_) => continue` for a third folder |
+| the fold **modulates** `scan_is_due` rather than adding a driver beside it | satisfied | `scan_due` is `self.scan_is_due(profile) && self.sync_poll_permits(profile)` (`:3310`) — one conjunct on the existing gate, no second caller |
+| a `scheduled` row must not leave the 15 s pacing running: **surrendered, not raced** | satisfied | `Some(Scheduled) => false` (`:8582`), and the hour-long tick test asserts `(0, 2)` where the pre-story shape was `(240, 2)` (`:15347`) |
+| an `off` row must not silently stop a folder nobody asked to stop | satisfied | `Some(Off) => true` and `Some(Manual) => true` (`:8580-8581`), asserted per mode (`:15215`); a *disabled* row ranks as `Off` (`:8455-8459`), so forgetting to delete one cannot stop a folder either |
+| a test asserts the negative directly | satisfied for drivers, **argued** for the run record | the test counts drivers over 3 600 ticks and deliberately elides `perform_task`. The run record's *"1 synced"* half is a consequence rather than an assertion: with zero paced walks there is no folder for the task to claim that the supervisor would have synced anyway. Asserting the bytes would need a real git fixture and would measure `perform_sync_task`, not this story's gate. Accepted as scoped, and named here so nobody reads the elision as coverage |
+| 58.7's dependency: `sync_governance_mode(profile_id) -> Option<TaskMode>` with `None` on a read error | satisfied | `:8491-8493`, `sync_governance(..).ok().flatten()`; `sync_poll_permits` permits on `Err` (`:8566-8576`), so an unreadable table leaves the poll running and 58.7's row printing its interval is true |
+
+**Failure edges audited beyond the claims, no findings.**
+
+- *A mode changed mid-tick.* Governance is re-read on each fired window rather
+  than cached, so staleness is bounded by one poll interval and the next window
+  sees the new mode.
+- *Governance stops applying.* Nothing is `remove`d: `scan_is_due` is asked first
+  and arms unconditionally, so a forgotten or demoted task leaves an armed window
+  at or behind `now` and the very next tick walks (`:8554-8564`).
+- *Neither driver.* Unreachable by construction: the only arm that stands the
+  poll down is `Some(Scheduled)`, which is a task with a schedule — and the
+  filesystem triggers are untouched in every arm (`:3311`).
+- *A host-wide `scheduled` sync row.* It governs every folder, so every folder's
+  paced poll stands down in favour of one schedule. That is the tier rule working
+  as written and matches `release_governance`'s shape; the watcher and settle
+  triggers still answer a file somebody saved.
+
+**Fixed elsewhere.** The audit of 58.7 (see that spec's triage log) found two
+false claims in the *view* over this story's data, not in this story's gate.
+Neither changes anything here.
 
 ## Design Notes
 
