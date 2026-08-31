@@ -987,14 +987,29 @@ development_status:
   # binary replacement, and that refusal stands.
   #
   # 57.4 is the story that closes the owner's ask and can ship before any UI.
-  epic-57: backlog
-  57-1-a-task-is-something-keeper-remembers: backlog
-  57-2-a-schedule-that-refuses-what-it-cannot-parse: backlog
-  57-3-the-verb-a-cron-can-call: backlog
-  57-4-release-becomes-a-task: backlog
-  57-5-the-app-runs-them-too: backlog
-  57-6-a-view-of-what-runs-and-when-it-last-did: backlog
-  57-7-packaging-and-the-chapter: backlog
+  #
+  # IMPLEMENTED 2026-08-30 as four PRs on the epic-56 stack, bottom to top:
+  #   #292  57.1 + 57.2  feat/57-1-a-task-is-something-keeper-remembers
+  #   #293  57.3 + 57.4  feat/57-3-the-verb-a-cron-can-call
+  #   #295  57.5 + 57.6 + 57.7 (and the review loopback all three nearly
+  #         shipped without: their step-04 fan-out was cut by a budget and the
+  #         spec recorded the pass as NOT RUN. Run afterwards: 17 findings, 14
+  #         after dedup, 1 high — the quit path freed a task lease while that
+  #         task's run was still executing.)
+  # Three claims the epic asserted turned out false against the code and are
+  # corrected in those PRs: `tasks run` performs its work unconditionally so
+  # `OnCalendar` IS the cadence (the first timer draft would have run a nightly
+  # sweep 24 times a day); `keeper-syncd` DOES build and ship for Darwin, the
+  # provable fact being that no launchd plist exists anywhere in the tree; and
+  # `enable-linger` was named in the architecture and present in no line of code.
+  epic-57: review
+  57-1-a-task-is-something-keeper-remembers: review
+  57-2-a-schedule-that-refuses-what-it-cannot-parse: review
+  57-3-the-verb-a-cron-can-call: review
+  57-4-release-becomes-a-task: review
+  57-5-the-app-runs-them-too: review
+  57-6-a-view-of-what-runs-and-when-it-last-did: review
+  57-7-packaging-and-the-chapter: review
   epic-57-retrospective: optional
 
   # -- EPIC 58, 2026-08-31: a task you can drive ------------------------------
@@ -1081,8 +1096,8 @@ development_status:
   # Wave 1's three stories are disjoint and parallelisable; they collide only in
   # tasks-pane.tsx, so one owns the file and the other two coordinate. 58.1
   # closes the loudest ask and needs no Rust at all.
-  epic-58: backlog
-  58-1-a-task-you-can-create-and-edit: backlog
+  epic-58: in-progress
+  58-1-a-task-you-can-create-and-edit: review
   58-2-the-row-says-what-the-run-said: backlog
   58-3-a-list-of-runs-you-can-open: backlog
   58-4-a-window-that-passed-while-nobody-was-home: backlog
