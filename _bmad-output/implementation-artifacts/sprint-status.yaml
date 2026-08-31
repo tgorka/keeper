@@ -1096,16 +1096,22 @@ development_status:
   # Wave 1's three stories are disjoint and parallelisable; they collide only in
   # tasks-pane.tsx, so one owns the file and the other two coordinate. 58.1
   # closes the loudest ask and needs no Rust at all.
-  epic-58: in-progress
-  58-1-a-task-you-can-create-and-edit: review
-  58-2-the-row-says-what-the-run-said: backlog
-  58-3-a-list-of-runs-you-can-open: backlog
-  58-4-a-window-that-passed-while-nobody-was-home: backlog
-  58-5-a-window-nobody-ran-is-still-a-fact: backlog
-  58-6-two-hosts-one-missed-window-one-run: backlog
-  58-7-everything-else-this-host-paces: backlog
-  58-8-a-sync-task-that-governs-instead-of-duplicating: backlog
-  58-9-the-chapter-grows-a-policy: backlog
+  #
+  # SYNCED 2026-08-31 from the story specs, which had run ahead of this table:
+  # every one of the nine carries `status: done` with a `final_revision`, and
+  # 58.7/58.8/58.9's review passes are recorded in their own triage logs. The
+  # epic reads `review` rather than `done` for epic-57's reason — the stories are
+  # finished, the epic has not been merged or retrospected.
+  epic-58: review
+  58-1-a-task-you-can-create-and-edit: done
+  58-2-the-row-says-what-the-run-said: done
+  58-3-a-list-of-runs-you-can-open: done
+  58-4-a-window-that-passed-while-nobody-was-home: done
+  58-5-a-window-nobody-ran-is-still-a-fact: done
+  58-6-two-hosts-one-missed-window-one-run: done
+  58-7-everything-else-this-host-paces: done
+  58-8-a-sync-task-that-governs-instead-of-duplicating: done
+  58-9-the-chapter-grows-a-policy: done
   epic-58-retrospective: optional
 
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------

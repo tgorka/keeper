@@ -2,10 +2,11 @@
 title: 'Story 58.9: the chapter grows a policy'
 type: 'docs'
 created: '2026-08-31'
-status: 'in-review'
+status: 'done'
 baseline_revision: '99769f4'
-review_loop_iteration: 0
-followup_review_recommended: false
+final_revision: 'b3955d2'
+review_loop_iteration: 1
+followup_review_recommended: true
 context:
   - '{project-root}/docs/project-context.md'
 warnings: ['written-from-implementation']
@@ -129,6 +130,39 @@ the constant that owns it; document a control the app does not have; edit
   a design that was reviewed before the work.
 
 ## Review Triage Log
+
+**Pass 1 — 2026-08-31, author-verified, and that is a weaker thing than the
+other two stories got.** The independent review lanes were unavailable (their
+provider was out of credits), so this chapter was not read by a second party.
+What was done instead, claim by claim, is stated here so the difference is
+visible rather than implied:
+
+- Every number was taken from the constant that decides it, and both prose
+  surfaces are now asserted against those constants by a test rather than by a
+  reader (`TASK_MISSED_GRACE_MS`, `TASK_MISSED_DELAY_MS`).
+- The three settings, the default's compatibility claim and the
+  `Persistent=true` reading were checked against `TaskMissedPolicy`'s own doc
+  and `tasks::decide` (`keeper-sync/src/tasks.rs:252-285`, `:1005-1042`).
+- `declined` / `postponed` were checked against `TaskOutcome` (`:435-450`) and
+  the detail composition in `Engine::move_task_window`
+  (`engine.rs:2297-2323`) — which is why the chapter says the detail names the
+  policy, the window and the replacing instant rather than just "the instant".
+- The **two silent edges** were found by reading that same function rather than
+  by trusting the general claim: the compare-and-set losing to the other host
+  (`:2334-2343`) and `skip` on a schedule with no next instant (`:2277-2292`)
+  both write no row. A first draft of the paragraph said *both settings that do
+  not run a window close a zero-duration run for it*, which those two edges make
+  false; the paragraph now states them.
+- The unknown-policy refusal was checked against `db.rs:3048-3052`, which turns
+  an unrecognised spelling into an `UnknownTask` — listed, not run.
+- The macOS paragraph the epic asks for was already correct in the chapter
+  (`docs/sync.md:2521-2526`) and was left alone.
+
+**What this pass cannot claim.** Nobody adversarial read the prose for the
+defect an author is worst at seeing: a sentence that is true of this build and
+false of a configuration the author does not run. `followup_review_recommended`
+is therefore set, and the next review loop should take this chapter first.
+
 
 ## Verification
 
