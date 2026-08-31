@@ -72,6 +72,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { type ReactNode, useEffect, useId, useMemo, useState } from "react";
+import { FoldToggle, useFold } from "@/components/layout/list-fold";
 import {
   SYNC_NOW_LABEL,
   SYNC_PAUSE_LABEL,
@@ -158,7 +159,6 @@ import {
   retrySyncParkedAll,
   startSyncDetailPolling,
   startSyncProgressStream,
-  syncListSizes,
   syncLiveFraction,
   syncLiveRate,
   useSyncDetailStore,
@@ -240,27 +240,6 @@ export const SYNC_UNSPELLABLE_SENTENCE =
 export const SYNC_UNSPELLABLE_NOTE =
   "The second line of each row is the name byte for byte, safe to paste into a terminal. Rename the file there and it will behave like any other.";
 
-/**
- * The fold control's labels.
- *
- * "Show all N" and not "Show more": the unfolded size is a fixed setting, so the
- * button reveals a known quantity and can say so. `{n}` is the count that will be
- * visible after the press, which for a list longer than the unfolded size is that
- * size rather than the list's length — the button must not promise rows the query
- * never asked Rust for.
- */
-export const SYNC_FOLD_MORE_LABEL = (n: number) => `Show all ${n}`;
-export const SYNC_FOLD_LESS_LABEL = "Show fewer";
-
-/**
- * How many rows a list shows, and the control to change it.
- *
- * Shared by all three lists on the card so one press-and-read habit works
- * everywhere, and so the folded/unfolded numbers cannot drift apart between them.
- * Collapsing is per-list state rather than per-card: a long Activity list and a
- * two-row Problems list have nothing to say to each other about how much of
- * themselves the user wants to see.
- */
 /** Test id for the footprint line. */
 export const SYNC_FOOTPRINT_TESTID = "sync-folder-footprint";
 
@@ -357,73 +336,6 @@ function SyncFolderFootprint({ profileId }: { profileId: string }): React.ReactE
       {footprint.onDiskLabel} on disk
       {parts.length > 0 ? ` — ${parts.join(", ")}` : null}
     </p>
-  );
-}
-
-function useFold<T>(rows: readonly T[] | null): {
-  visible: readonly T[];
-  hidden: number;
-  expanded: boolean;
-  toggle: () => void;
-  limit: number;
-} {
-  const [expanded, setExpanded] = useState(false);
-  const { folded, unfolded } = syncListSizes();
-  const limit = expanded ? unfolded : folded;
-  // An unread list folds to nothing rather than to `null`: every caller already
-  // branches on its own `rows === null` before reaching the rows, and a nullable
-  // `visible` only moves that check somewhere it has to be repeated.
-  const visible = (rows ?? []).slice(0, limit);
-  return {
-    visible,
-    hidden: (rows?.length ?? 0) - visible.length,
-    expanded,
-    limit,
-    toggle: () => setExpanded((v) => !v),
-  };
-}
-
-/**
- * The fold control, or nothing when the whole list already fits.
- *
- * Rendered below its list rather than beside the heading: it is about the rows,
- * and the row it sits under is the last one shown — which is where the eye
- * already is when it runs out of list.
- */
-function FoldToggle({
-  rows,
-  fold,
-  label,
-}: {
-  rows: readonly unknown[];
-  fold: { hidden: number; expanded: boolean; toggle: () => void; limit: number };
-  label: string;
-}) {
-  // Nothing folded and nothing to fold back: the control would do nothing in
-  // either direction.
-  if (fold.hidden === 0 && !fold.expanded) {
-    return null;
-  }
-  // Capped at the list's own length: unfolding cannot reveal rows Rust was never
-  // asked for, so "Show all 100" over a 12-row list would be a promise the query
-  // cannot keep.
-  const text = fold.expanded
-    ? SYNC_FOLD_LESS_LABEL
-    : SYNC_FOLD_MORE_LABEL(Math.min(rows.length, syncListSizes().unfolded));
-  return (
-    <button
-      type="button"
-      onClick={fold.toggle}
-      // A link-weight control, not a Button: it changes how much of a list is on
-      // screen, which is not an action on the folder and must not carry the same
-      // visual weight as Retry or Sync now.
-      className="self-start text-muted-foreground text-xs underline decoration-dotted hover:text-foreground"
-      // Named for its list: three folds on one card would otherwise be three
-      // buttons a screen reader calls the same thing.
-      aria-label={`${text}: ${label}`}
-    >
-      {text}
-    </button>
   );
 }
 

@@ -21,6 +21,7 @@ vi.mock("@/lib/ipc/client", () => ({
   syncProfiles: vi.fn(),
 }));
 
+import { LIST_FOLD_MORE_LABEL } from "@/components/layout/list-fold";
 import {
   formatTaskAgo,
   formatTaskDue,
@@ -30,6 +31,11 @@ import {
   TASK_FORGET_CONFIRM_BODY,
   TASK_FORGET_TESTID,
   TASK_FORGET_TEXT,
+  TASK_HISTORY_EMPTY_TEXT,
+  TASK_HISTORY_LOADING_TEXT,
+  TASK_HISTORY_NO_HOST_TEXT,
+  TASK_HISTORY_RETRY_NOTE,
+  TASK_HISTORY_TITLE,
   TASK_HOST_LABEL,
   TASK_IN_FLIGHT_TEXT,
   TASK_LAST_OUTCOME_LABEL,
@@ -42,7 +48,11 @@ import {
   TASK_REFRESH_TEXT,
   TASK_RUN_NOW_TEXT,
   TASK_SCHEDULE_LABEL,
+  TASK_UNREADABLE_OUTCOME_TEXT,
   TASKS_CLOCK_TICK_MS,
+  TASKS_HISTORY_REFUSAL_TESTID,
+  TASKS_HISTORY_ROW_TESTID,
+  TASKS_HISTORY_TESTID,
   TASKS_ORPHAN_REFUSAL_TESTID,
   TASKS_PANE_EMPTY_AFTER,
   TASKS_PANE_EMPTY_COMMAND,
@@ -56,6 +66,7 @@ import {
   TASKS_UNKNOWN_ROW_TESTID,
   TasksPane,
   taskForgetConfirmTitle,
+  taskHistoryUnshownText,
   taskOutcomeText,
 } from "@/components/layout/tasks-pane";
 import {
@@ -71,10 +82,17 @@ import type { TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
 import {
   syncProfiles,
   syncTaskForget,
+  syncTaskHistory,
   syncTaskRunNow,
   syncTaskSave,
   syncTasks,
 } from "@/lib/ipc/client";
+import {
+  SYNC_LIST_FOLDED_FALLBACK,
+  SYNC_LIST_UNFOLDED_FALLBACK,
+  setSyncListSizes,
+  syncListSizes,
+} from "@/lib/stores/sync-detail";
 
 const NOW = 1_760_000_000_000;
 
@@ -107,6 +125,12 @@ function task(over: Partial<TaskVm> = {}): TaskVm {
     profileId: null,
     profile: null,
     schedule: "@daily",
+    // Both required on `TaskVm` since Story 58.4: `onMissed` is the
+    // missed-window policy that story gave a control of its own, and
+    // `updatedMs` is the reading a save is checked against. Neither is rendered
+    // by this pane; the fixture carries them because the type does.
+    onMissed: "run_now",
+    updatedMs: NOW - 60_000,
     nextDueMs: NOW + 3_600_000,
     runningHost: null,
     leaseUntilMs: null,
@@ -1160,5 +1184,608 @@ describe("the row says what the last run reported", () => {
 
     const after = screen.getByTestId(TASKS_ROW_TESTID);
     expect(within(after).getByText("3 synced, 0 waiting")).toBeInTheDocument();
+  });
+});
+
+/**
+ * A list of runs you can open (Story 58.3).
+ *
+ * `db::task_runs`, `Engine::task_history` and `sync_task_history` were finished,
+ * clamped, typed, wrapped and mocked for a whole wave while the only reference
+ * to the wrapper under `src/` was the `vi.fn()` at the top of this file. So the
+ * property under test is not that the data arrives — it always did — but that a
+ * control reaches it, exactly once per deliberate press, and that the three
+ * states of a read never borrow each other's words.
+ *
+ * The first assertion here is the one that keeps the section from becoming a
+ * poll, and every other assertion is against a string a reader sees or an
+ * argument the command was called with. Cross-crate facts are named by symbol
+ * rather than by line: `src-tauri/` is edited by the same wave that reads this
+ * file.
+ */
+describe("a task's runs open on the row, and are read only when asked for", () => {
+  /**
+   * The answer `sync_task_history` gives, newest first as `db::task_runs` orders
+   * it.
+   *
+   * Timed from the real clock rather than from {@link NOW}, because the pane
+   * measures every relative time from `Date.now()` at the instant the listing
+   * landed — so a fixture pinned to a constant would render as years ago.
+   */
+  function runs(count: number, base: number = Date.now()): TaskRunVm[] {
+    return Array.from({ length: count }, (_, index) =>
+      run({
+        id: count - index,
+        startedMs: base - (index + 1) * 60_000,
+        detail: `run ${count - index} of ${count}`,
+      }),
+    );
+  }
+
+  /**
+   * The disclosure on one row. Its accessible name is its `aria-label` — the
+   * word alone would name ten controls the same thing on a list of ten tasks.
+   */
+  function disclosure(id: string): HTMLElement {
+    return screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: ${id}` });
+  }
+  /**
+   * The fold's row counts are mutable module state, and one test below changes
+   * them to reach a state the defaults cannot. Restored here so nothing after it
+   * inherits a two-row fold.
+   */
+  afterEach(() => {
+    setSyncListSizes({
+      folded: SYNC_LIST_FOLDED_FALLBACK,
+      unfolded: SYNC_LIST_UNFOLDED_FALLBACK,
+    });
+  });
+
+  it("reads no history at all until somebody opens a section", async () => {
+    // The property that keeps this section from becoming a poll: with the read
+    // on render, or on the listing, every row of every refresh would cost an
+    // IPC call and AD-62's sentence would be about this pane.
+    answer(listing({ tasks: [task({ id: "01SCHED" }), task({ id: "01OTHER" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    expect(syncTaskHistory).not.toHaveBeenCalled();
+    expect(screen.queryByTestId(TASKS_HISTORY_TESTID)).not.toBeInTheDocument();
+  });
+
+  it("reads that row's runs once when opened, and shows what each of them said", async () => {
+    const base = Date.now();
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue([
+      run({
+        id: 7,
+        host: "dev#1",
+        startedMs: base - 5 * 60_000,
+        detail: "3 synced, 0 already syncing, 0 waiting, 0 failed",
+      }),
+      run({
+        id: 6,
+        host: "laptop#2",
+        outcome: "failed",
+        startedMs: base - 65 * 60_000,
+        detail: "0 synced, 1 failed: could not resolve host git.tgorka.dev",
+      }),
+    ]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(2));
+
+    // One press, one call, with that row's id and no invented limit: the bound
+    // is `TASK_HISTORY_LIMIT_DEFAULT`, in Rust, where it already is.
+    expect(syncTaskHistory).toHaveBeenCalledTimes(1);
+    expect(syncTaskHistory).toHaveBeenCalledWith("01SCHED");
+
+    // The CLI's four columns, in the CLI's order, each asserted as the real
+    // string rather than as an element that exists.
+    const [newest, older] = screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID);
+    expect(within(newest).getByText("Succeeded")).toBeInTheDocument();
+    expect(within(newest).getByText("5 min ago")).toBeInTheDocument();
+    expect(within(newest).getByText("dev#1")).toBeInTheDocument();
+    expect(
+      within(newest).getByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
+    ).toBeInTheDocument();
+    // Two runs with different reports, so a section that drew one run's words on
+    // every row could not pass.
+    expect(within(older).getByText("Failed")).toBeInTheDocument();
+    expect(within(older).getByText("1 hr ago")).toBeInTheDocument();
+    expect(within(older).getByText("laptop#2")).toBeInTheDocument();
+    expect(
+      within(older).getByText("0 synced, 1 failed: could not resolve host git.tgorka.dev"),
+    ).toBeInTheDocument();
+  });
+
+  it("issues no second read when the clock ticks or the listing is re-read", async () => {
+    // The anti-poll property, driven rather than asserted in prose: the display
+    // clock and `refresh` are the two things that re-render an open section
+    // without anybody pressing anything, and a history read on either of them
+    // would be a poll per open row.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+      vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+      render(<TasksPane />);
+      await screen.findByTestId(TASKS_ROW_TESTID);
+
+      fireEvent.click(disclosure("01SCHED"));
+      await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(1));
+
+      await vi.advanceTimersByTimeAsync(TASKS_CLOCK_TICK_MS * 4);
+      fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+      await waitFor(() => expect(syncTasks).toHaveBeenCalledTimes(2));
+      // `waitFor` returns when the listing call is MADE, not when it has settled
+      // and re-rendered — and a regression that chained a history read onto that
+      // continuation would still be a microtask away. So the count is read after
+      // the settle has visibly landed and the timers have been flushed again.
+      await waitFor(() => expect(screen.getByText("run 1 of 1")).toBeInTheDocument());
+      await vi.advanceTimersByTimeAsync(TASKS_CLOCK_TICK_MS);
+
+      expect(syncTaskHistory).toHaveBeenCalledTimes(1);
+      // And the section is still open, still holding the rows it read.
+      expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes the first section when a second row is opened, and reads once for it", async () => {
+    answer(listing({ tasks: [task({ id: "01SCHED" }), task({ id: "01OTHER" })] }));
+    vi.mocked(syncTaskHistory).mockImplementation(async (id) => [
+      run({ id: 1, detail: `${id}'s own run` }),
+    ]);
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText("01SCHED's own run")).toBeInTheDocument();
+
+    fireEvent.click(disclosure("01OTHER"));
+    expect(await screen.findByText("01OTHER's own run")).toBeInTheDocument();
+
+    // One section open at a time, `editingId`'s rule: the first is gone rather
+    // than scrolled apart from the row it belongs to.
+    expect(screen.queryByText("01SCHED's own run")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId(TASKS_HISTORY_TESTID)).toHaveLength(1);
+    expect(syncTaskHistory).toHaveBeenCalledTimes(2);
+    expect(syncTaskHistory).toHaveBeenLastCalledWith("01OTHER");
+  });
+
+  it("cannot land a slow read in a section that has since moved to another row", async () => {
+    // `historyToken`'s whole reason. Without it the first row's read resolves
+    // into the one slot the second row is now drawing from, and a person reading
+    // `01OTHER`'s history is shown `01SCHED`'s.
+    let landFirst: (value: TaskRunVm[]) => void = () => {};
+    answer(listing({ tasks: [task({ id: "01SCHED" }), task({ id: "01OTHER" })] }));
+    vi.mocked(syncTaskHistory).mockImplementation((id) =>
+      id === "01SCHED"
+        ? new Promise<TaskRunVm[]>((resolve) => {
+            landFirst = resolve;
+          })
+        : Promise.resolve([run({ id: 2, detail: "01OTHER's own run" })]),
+    );
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText(TASK_HISTORY_LOADING_TEXT)).toBeInTheDocument();
+
+    fireEvent.click(disclosure("01OTHER"));
+    expect(await screen.findByText("01OTHER's own run")).toBeInTheDocument();
+
+    await act(async () => {
+      landFirst([run({ id: 1, detail: "01SCHED's own run" })]);
+    });
+
+    expect(screen.getByText("01OTHER's own run")).toBeInTheDocument();
+    expect(screen.queryByText("01SCHED's own run")).not.toBeInTheDocument();
+  });
+
+  it("re-reads when a section is closed and opened again", async () => {
+    // Closing forgets, so re-opening is a re-read rather than a cache hit — the
+    // list `task_runs` may have trimmed underneath it is not what gets shown.
+    let landSecond: (value: TaskRunVm[]) => void = () => {};
+    let calls = 0;
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockImplementation(() => {
+      calls += 1;
+      return calls === 1
+        ? Promise.resolve([run({ id: 1, detail: "the first read" })])
+        : new Promise<TaskRunVm[]>((resolve) => {
+            landSecond = resolve;
+          });
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText("the first read")).toBeInTheDocument();
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(screen.queryByTestId(TASKS_HISTORY_TESTID)).not.toBeInTheDocument();
+
+    fireEvent.click(disclosure("01SCHED"));
+    // The loading line again, and not the list it had: an unread section says so.
+    expect(await screen.findByText(TASK_HISTORY_LOADING_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText("the first read")).not.toBeInTheDocument();
+    expect(syncTaskHistory).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      landSecond([run({ id: 2, detail: "the second read" })]);
+    });
+    expect(screen.getByText("the second read")).toBeInTheDocument();
+  });
+
+  it("says no runs recorded for an empty history, and never the loading line", async () => {
+    // `[]` is a fact and `null` is not: the CLI answers this case with
+    // `"{task_id}: no runs recorded"` and so does this section.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue([]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText(TASK_HISTORY_EMPTY_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText(TASK_HISTORY_LOADING_TEXT)).not.toBeInTheDocument();
+    expect(screen.queryAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(0);
+  });
+
+  it("quotes a refused read and never claims the task has no runs", async () => {
+    // A failed read is a fault to report, not a fact to invent — and the
+    // rejection is an `IpcError` *value*, so `messageOf` rather than
+    // `instanceof Error` is what keeps this from rendering "[object Object]".
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    const refusal = await screen.findByTestId(TASKS_HISTORY_REFUSAL_TESTID);
+
+    expect(refusal).toHaveTextContent("database is locked");
+    expect(screen.queryByText(TASK_HISTORY_EMPTY_TEXT)).not.toBeInTheDocument();
+    expect(screen.queryByText(TASK_HISTORY_LOADING_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("keeps the runs it already had when a re-read is refused", async () => {
+    // `keepRows`: the rows on screen were read successfully and are still the
+    // best thing known about this task, so a refusal is added to them rather
+    // than substituted for them.
+    let calls = 0;
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskRunNow).mockResolvedValue(run());
+    vi.mocked(syncTaskHistory).mockImplementation(() => {
+      calls += 1;
+      return calls === 1
+        ? Promise.resolve([run({ id: 1, detail: "the read that worked" })])
+        : Promise.reject({
+            code: "internal",
+            message: "database is locked",
+            accountId: null,
+            retriable: false,
+          });
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText("the read that worked")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    const refusal = await screen.findByTestId(TASKS_HISTORY_REFUSAL_TESTID);
+
+    expect(refusal).toHaveTextContent("database is locked");
+    expect(screen.getByText("the read that worked")).toBeInTheDocument();
+    expect(screen.queryByText(TASK_HISTORY_EMPTY_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("re-reads the open row's history once after a Run now on that row", async () => {
+    // The one re-read a refresh does not do, and the reason it is not a poll:
+    // this run is what changed that task's history, and the person pressed the
+    // button themselves.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskRunNow).mockResolvedValue(run());
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(syncTaskHistory).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    // Two settles, not one: `waitFor` resolves the moment the count REACHES two,
+    // so a regression that read twice per Run now would slip past. The Run now
+    // button coming back enabled is the pane's own evidence that the whole
+    // settle — the run, the listing re-read and the history re-read — has run to
+    // completion.
+    await waitFor(() => expect(syncTaskHistory).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeEnabled(),
+    );
+
+    expect(vi.mocked(syncTaskHistory).mock.calls.map(([id]) => id)).toEqual(["01SCHED", "01SCHED"]);
+    expect(screen.getByText("run 1 of 1")).toBeInTheDocument();
+
+    // And a Run now on a row whose section is NOT open reads no history at all.
+    fireEvent.click(disclosure("01SCHED"));
+    fireEvent.click(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeEnabled(),
+    );
+    expect(syncTaskHistory).toHaveBeenCalledTimes(2);
+  });
+
+  it("closes a section whose row the listing no longer holds", async () => {
+    // `refresh`'s `editingId` pruning, verbatim: a section cannot belong to a
+    // row the record does not have, and the id is re-creatable by hand.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await screen.findByTestId(TASKS_HISTORY_TESTID);
+
+    answer(listing({ tasks: [task({ id: "01OTHER" })] }));
+    fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+
+    await waitFor(() => expect(screen.queryByTestId(TASKS_HISTORY_TESTID)).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: 01OTHER` })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it("offers no runs disclosure on a row this build cannot read", async () => {
+    // Not a `TaskVm`, and its id may be `""` — so `sync_task_history` has
+    // nothing to be asked about. The 58.3-specific claim is the named control's
+    // absence; the blanket no-buttons assertion is the pane's own, one block up.
+    answer(
+      listing({
+        tasks: [],
+        unknown: [{ id: "01FUTURE", reason: "unreadable task row: invalid kind 'teleport'" }],
+      }),
+    );
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_UNKNOWN_ROW_TESTID);
+
+    expect(
+      screen.queryByRole("button", { name: `${TASK_HISTORY_TITLE}: 01FUTURE` }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: new RegExp(`^${TASK_HISTORY_TITLE}:`) }),
+    ).toBeNull();
+  });
+
+  it("folds a long history to the folded size and unfolds it on one press", async () => {
+    // The shared fold rather than a third list idiom, and the control is named
+    // for its own list so ten rows do not offer ten controls a screen reader
+    // calls the same thing. The expected count is READ from the preference
+    // rather than written as 10: `syncListSizes()` is mutable module state, so a
+    // literal here would fail one day with a row count that looks unrelated to
+    // the fold.
+    const { folded } = syncListSizes();
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(20));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() =>
+      expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(folded),
+    );
+    expect(screen.getByText("run 20 of 20")).toBeInTheDocument();
+    expect(screen.queryByText("run 1 of 20")).not.toBeInTheDocument();
+
+    const unfold = screen.getByRole("button", {
+      name: `${LIST_FOLD_MORE_LABEL(20)}: ${TASK_HISTORY_TITLE}: 01SCHED`,
+    });
+    fireEvent.click(unfold);
+
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(20));
+    expect(screen.getByText("run 1 of 20")).toBeInTheDocument();
+    // Everything read is now on screen, so nothing is being held back.
+    expect(screen.queryByText(/more recorded and not shown/)).not.toBeInTheDocument();
+  });
+
+  it("counts the runs an unfolded list still holds back", async () => {
+    // The fold's unfolded size is a global preference with a floor of ten while
+    // a history page is twenty runs, so *Show all* can leave half the list
+    // hidden with `FoldToggle` saying only "Show fewer" — a reader who pressed
+    // it would believe they had seen everything.
+    setSyncListSizes({ folded: 2, unfolded: 3 });
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(5));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(2));
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${LIST_FOLD_MORE_LABEL(3)}: ${TASK_HISTORY_TITLE}: 01SCHED`,
+      }),
+    );
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(3));
+
+    expect(screen.getByText(taskHistoryUnshownText(2))).toBeInTheDocument();
+  });
+
+  it("drops the empty sentence once a refusal explains why it cannot know", async () => {
+    // The sharpest of the three-states rules. A task with no runs reads `[]`,
+    // then a Run now writes one — and if that re-read is refused, a section
+    // still saying "no runs recorded" beside "database is locked" states as a
+    // fact the thing the refusal has just said it cannot know.
+    let calls = 0;
+    answer(listing({ tasks: [task({ id: "01SCHED", lastRun: null })] }));
+    vi.mocked(syncTaskRunNow).mockResolvedValue(run());
+    vi.mocked(syncTaskHistory).mockImplementation(() => {
+      calls += 1;
+      return calls === 1
+        ? Promise.resolve([])
+        : Promise.reject({
+            code: "internal",
+            message: "database is locked",
+            accountId: null,
+            retriable: false,
+          });
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    expect(await screen.findByText(TASK_HISTORY_EMPTY_TEXT)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    await screen.findByTestId(TASKS_HISTORY_REFUSAL_TESTID);
+
+    expect(screen.queryByText(TASK_HISTORY_EMPTY_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("says how to ask again, because nothing re-reads a refusal on its own", async () => {
+    // Without this the refusal is a dead end: a listing refresh deliberately
+    // leaves the section alone, so the only retry is closing the disclosure and
+    // opening it — which the one obvious press looks like a dismissal of.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    const refusal = await screen.findByTestId(TASKS_HISTORY_REFUSAL_TESTID);
+    expect(refusal).toHaveTextContent(TASK_HISTORY_RETRY_NOTE);
+
+    // And that retry genuinely works: close, open, and the command is asked
+    // again rather than the section restoring what it had.
+    fireEvent.click(disclosure("01SCHED"));
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(syncTaskHistory).toHaveBeenCalledTimes(2));
+  });
+
+  it("names a run whose host or report the record left blank", async () => {
+    // `host` is `TEXT NOT NULL` with no non-empty constraint and `detail` is
+    // nullable, so the same foreign-writer class `taskReportText` exists for can
+    // leave either blank. Which host ran it is most of the point of this list, so
+    // a blank there is named; a blank report is silence.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    // Timed from the real clock, because the pane measures every relative time
+    // against `Date.now()` at the instant the listing landed.
+    const started = Date.now() - 5 * 60_000;
+    vi.mocked(syncTaskHistory).mockResolvedValue([
+      run({ id: 2, startedMs: started, host: "   ", detail: "   " }),
+      run({ id: 1, startedMs: started, host: "dev#1", detail: "3 synced" }),
+    ]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(2));
+    const [blank, named] = screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID);
+
+    expect(within(blank).getByText(TASK_HISTORY_NO_HOST_TEXT)).toBeInTheDocument();
+    // The blank report draws no cell at all: the row ends at its host, so its
+    // whole text is the outcome, the time and the stand-in for the host.
+    expect(blank.textContent).toBe(`Succeeded5 min ago${TASK_HISTORY_NO_HOST_TEXT}`);
+    // And the row beside it is unaffected.
+    expect(within(named).getByText("dev#1")).toBeInTheDocument();
+    expect(within(named).getByText("3 synced")).toBeInTheDocument();
+  });
+
+  it("names an outcome whose stored spelling is blank rather than rendering nothing", async () => {
+    // A spelling this build cannot read is rendered verbatim (NFR-43) — but `""`
+    // renders as nothing, and this is the leading word of the row. Falling
+    // through would be worse still: the next branch would call a closed run
+    // "running now".
+    expect(taskOutcomeText(run({ outcome: null, unknownOutcome: "  " }))).toBe(
+      TASK_UNREADABLE_OUTCOME_TEXT,
+    );
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue([
+      run({ id: 1, outcome: null, unknownOutcome: "" }),
+    ]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    const entry = await screen.findByTestId(TASKS_HISTORY_ROW_TESTID);
+    expect(within(entry).getByText(TASK_UNREADABLE_OUTCOME_TEXT)).toBeInTheDocument();
+    expect(within(entry).queryByText(TASK_IN_FLIGHT_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("names the region it opens, so the control is not a dead end for a screen reader", async () => {
+    // `aria-expanded` alone announces "collapsed" and offers nothing to jump to.
+    // The IDREF exists only while the section does (`note-editor.tsx`'s form), so
+    // it can never dangle.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(disclosure("01SCHED")).not.toHaveAttribute("aria-controls");
+    fireEvent.click(disclosure("01SCHED"));
+    const section = await screen.findByTestId(TASKS_HISTORY_TESTID);
+
+    expect(disclosure("01SCHED")).toHaveAttribute("aria-controls", section.id);
+    expect(section.id).not.toBe("");
+  });
+
+  it("keeps one of the runs and the edit form open on a row, never both", async () => {
+    // The one-at-a-time argument this section borrows from `editingId` is about
+    // height: a twenty-run list plus an eight-control form is exactly the wall
+    // that argument exists to forbid.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(disclosure("01SCHED"));
+    await screen.findByTestId(TASKS_HISTORY_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+    await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+    expect(screen.queryByTestId(TASKS_HISTORY_TESTID)).not.toBeInTheDocument();
+
+    fireEvent.click(disclosure("01SCHED"));
+    await screen.findByTestId(TASKS_HISTORY_TESTID);
+    expect(
+      screen.queryByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("refuses to open the runs while a save is on its way to that record", async () => {
+    // The guard Edit and Forget already carry, for this control's own reason:
+    // opening the runs closes the edit form, so pressing this mid-save would
+    // unmount the form Rust's refusal has to land in.
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskSave).mockImplementation(() => new Promise<TaskVm>(() => {}));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+    const form = await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+    fireEvent.click(within(form).getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() => expect(disclosure("01SCHED")).toBeDisabled());
+    fireEvent.click(disclosure("01SCHED"));
+    expect(syncTaskHistory).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
+    ).toBeInTheDocument();
   });
 });

@@ -63,8 +63,25 @@
  * cell naming it: a task that never ran, an in-flight run whose row
  * `claim_task` opens with `detail` unset, and a lease the next host reclaimed,
  * written as `abandoned` without touching `detail` at all.
+ *
+ * **Story 58.3 opened the run history.** `db::task_runs`, `Engine::task_history`
+ * and `sync_task_history` had been finished for a whole wave — clamped, typed,
+ * wrapped in `client.ts` and answered by the mock shell — while the only
+ * reference to the wrapper under `src/` was a `vi.fn()` in a test: a person
+ * could see that a task had ended and never what it had been doing. Each
+ * readable row now carries a quiet disclosure that reads that command **on
+ * open**: one press, one call, with that row's id. Never on render, never on a
+ * clock, and never on a listing refresh — `refresh()` fires from the mount,
+ * from the Refresh button and from every Run now settle, so a history read per
+ * open row per refresh is exactly the poll AD-62's sentence is about. A refresh
+ * therefore leaves an open section as it is: still open, still holding the rows
+ * it read. The one exception is a Run now **on the open row**, which is what
+ * changed that task's history and was pressed by the same person. Closing
+ * forgets the runs it held, so re-opening re-reads rather than showing a list
+ * `task_runs` may have trimmed underneath it (cap `TASK_RUNS_CAP`).
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { FoldToggle, useFold } from "@/components/layout/list-fold";
 // `TASK_HOST_WIDE_TEXT` is the form's rather than this file's: the picker's
 // first option and this pane's folder column are one fact, and the dependency
 // has to run this way round because the pane mounts the form. The other
@@ -85,7 +102,8 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
-import { syncTaskForget, syncTaskRunNow, syncTasks } from "@/lib/ipc/client";
+import { syncTaskForget, syncTaskHistory, syncTaskRunNow, syncTasks } from "@/lib/ipc/client";
+import { hydrateSyncListSizes } from "@/lib/stores/sync-detail";
 
 /** The heading, and the promise the pane makes in one line. */
 export const TASKS_PANE_TITLE = "Tasks";
@@ -264,6 +282,94 @@ export const TASKS_ERROR_TESTID = "tasks-error";
 export const TASK_FORGET_TESTID = "task-forget-confirm";
 
 /**
+ * The disclosure over one task's recorded runs, and the section it reveals.
+ *
+ * *Runs* is the CLI's word rather than this file's: `keeper-syncd tasks status`
+ * prints `"N run(s), newest first"` over this exact column set, so the app
+ * borrows a settled vocabulary instead of inventing a sixth word of its own.
+ * One constant for both the control and the section it opens, because the
+ * trigger and the thing it reveals are worded identically — the rule the
+ * header's Add control already follows (`add-folder-form.tsx`'s): a button
+ * called something else would be a second name for one list.
+ */
+export const TASK_HISTORY_TITLE = "Runs";
+
+/**
+ * An unread list is UNKNOWN, and not empty.
+ *
+ * That is the distinction this line exists to keep, and the one a failed read
+ * must not collapse: `null` means nobody has answered yet, `[]` means the record
+ * holds no runs, and a refusal means the question was refused. Rendering any two
+ * of those with the same words would let this pane claim — on a read that never
+ * landed — that a task has never run, which is the invisible-failure shape the
+ * whole epic exists to close.
+ */
+export const TASK_HISTORY_LOADING_TEXT = "Reading the runs…";
+
+/**
+ * That the record holds no runs, and what would put one here.
+ *
+ * The first clause is the CLI's own empty state — `task_run_lines` prints
+ * `"{task_id}: no runs recorded"` — so the two surfaces answer an empty history
+ * with the same phrase. The second is `SYNC_ACTIVITY_EMPTY_SENTENCE`'s rule: an
+ * empty list that only says it is empty leaves a reader unable to tell a
+ * feature with nothing to show from one that does not work, so this one says
+ * what would put a row here instead.
+ */
+export const TASK_HISTORY_EMPTY_TEXT =
+  "No runs recorded. A row appears here each time a host starts this task.";
+
+/**
+ * How a refused history read is retried, said out loud.
+ *
+ * Nothing else re-reads it: a listing refresh deliberately leaves an open
+ * section alone, so the only way to ask again is to close the disclosure and
+ * open it — which is discoverable only if it is stated. Without this line the
+ * refusal is a dead end whose single obvious press (the disclosure) looks like
+ * it dismisses the message rather than retrying the read.
+ */
+export const TASK_HISTORY_RETRY_NOTE = "Close Runs and open it again to ask once more.";
+
+/**
+ * A run whose host column is blank.
+ *
+ * `host` is `TEXT NOT NULL` with no non-empty constraint, so the same writer
+ * class {@link taskReportText} exists for can store `""` — and *which host ran
+ * this* is the column the history is largely for, so a blank there must read as
+ * unrecorded rather than as a gap in the row. `TASKS_UNKNOWN_NO_ID_TEXT` is the
+ * precedent: this file already names an absence rather than rendering a blank.
+ */
+export const TASK_HISTORY_NO_HOST_TEXT = "no host recorded";
+
+/**
+ * How many recorded runs the unfolded list still does not show.
+ *
+ * The fold's unfolded size is a global preference with a floor of ten, while a
+ * history page is `TASK_HISTORY_LIMIT_DEFAULT` runs — so a reader who has
+ * pressed *Show all* can still be looking at half of what was read, with
+ * `FoldToggle` saying only *Show fewer*. Counting the remainder out loud is the
+ * cheapest honest fix; the alternative is inventing a page size here, which
+ * would disagree with the one Rust already owns.
+ */
+export function taskHistoryUnshownText(count: number): string {
+  return `${count} more recorded and not shown.`;
+}
+
+/**
+ * The stand-in for an outcome whose stored spelling is blank.
+ *
+ * A newer keeper's spelling is rendered verbatim (NFR-43), but `""` renders as
+ * nothing at all — and this is the leading word of a run row, so an empty one
+ * reads as a broken renderer. Worded as the fact it is: something was recorded
+ * and this build cannot read it.
+ */
+export const TASK_UNREADABLE_OUTCOME_TEXT = "an outcome this build cannot read";
+
+export const TASKS_HISTORY_TESTID = "task-history";
+export const TASKS_HISTORY_ROW_TESTID = "task-run";
+export const TASKS_HISTORY_REFUSAL_TESTID = "task-history-refusal";
+
+/**
  * The word for each host verdict.
  *
  * A short label beside the full sentence, and the two say the same thing at
@@ -385,12 +491,42 @@ export function taskOutcomeText(run: TaskRunVm | null): string {
     return TASK_NEVER_RAN_TEXT;
   }
   if (run.unknownOutcome !== null) {
-    return run.unknownOutcome;
+    // Blank counts as unreadable, {@link taskReportText}'s rule applied to the
+    // one cell that must never be empty: a stored `outcome` of `""` does not
+    // parse either, so it arrives here as `unknownOutcome: ""` — and rendering
+    // it verbatim would leave a run row whose leading word is nothing at all,
+    // which reads as a rendering fault rather than as a spelling this build
+    // cannot read. Falling through instead would be worse: the next branch
+    // would call a closed run "running now".
+    return run.unknownOutcome.trim() === "" ? TASK_UNREADABLE_OUTCOME_TEXT : run.unknownOutcome;
   }
   if (run.outcome === null) {
     return TASK_IN_FLIGHT_TEXT;
   }
   return OUTCOME_LABELS[run.outcome] ?? run.outcome;
+}
+
+/**
+ * The run's own words, or `null` when there are none to draw.
+ *
+ * Blank counts as absent, and that is the guard rather than a nicety: `detail`
+ * is `TEXT NULL` with no non-empty constraint and `finish_task_run` binds
+ * whatever it is handed, so a writer this build never met — the NFR-43 case this
+ * file exists to tolerate — can store `""` or `" "`. On `!== null` alone that
+ * renders a LAST REPORT heading over nothing, which is the one shape a reader
+ * really would read as a failed read. Trimmed to decide, untrimmed to draw: what
+ * is stored is what is shown.
+ *
+ * A function rather than the row-local const Story 58.2 wrote, because two
+ * places now need this exact rule — the row's own cell and every row of the run
+ * history — and a row and the history hanging under it must not disagree about
+ * what *no report* means.
+ */
+export function taskReportText(run: TaskRunVm | null): string | null {
+  if (run === null || run.detail === null || run.detail.trim() === "") {
+    return null;
+  }
+  return run.detail;
 }
 
 /** One `label: value` cell, so a row reads without a table header above it. */
@@ -440,6 +576,149 @@ function Field({
   );
 }
 
+/**
+ * One task's recorded runs, newest first as Rust ordered them (Story 58.3).
+ *
+ * `SyncActivityList`'s idiom (`sync-pane.tsx`, module-private there so this is a
+ * citation and not a link), deliberately rather than by accident of
+ * copying: the loading line, the empty sentence and the `useFold`/`FoldToggle`
+ * truncation are all that list's, because this file's own header promises it
+ * reuses the Sync pane's list idioms *"rather than inventing a third"*. What it
+ * does not copy is that list's `aria-label`, and the reason is below.
+ *
+ * The columns are the CLI's, in the CLI's order — outcome word, relative time,
+ * host, report — as `task_run_lines` prints them, so a reader who has used
+ * `keeper-syncd tasks status` finds the same four facts in the same places.
+ * Cross-crate facts here are named by symbol and never by line: those crates are
+ * edited by the same wave that reads this file.
+ */
+function TaskRunList({
+  taskId,
+  regionId,
+  runs,
+  error,
+  now,
+}: {
+  taskId: string;
+  /** What the disclosure's `aria-controls` points at, so the pair is named once. */
+  regionId: string;
+  /** `null` until this section's read lands: unread, and not empty. */
+  runs: TaskRunVm[] | null;
+  error: string | null;
+  now: number;
+}) {
+  const fold = useFold(runs);
+  return (
+    <div id={regionId} data-testid={TASKS_HISTORY_TESTID} className="flex flex-col gap-2">
+      {/* Drawn INSTEAD of both sentences below and never instead of the rows: a
+          re-read that is refused leaves every row already on screen exactly
+          where it was and adds the engine's sentence about why it knows no more.
+          A failed read is a fault to report, not a fact to invent. */}
+      {error !== null && (
+        <p
+          role="alert"
+          data-testid={TASKS_HISTORY_REFUSAL_TESTID}
+          className="text-destructive text-xs"
+        >
+          {error}
+          {/* The only way to ask again, because nothing re-reads this on its
+              own. Inside the alert so it is announced with the refusal it is
+              about. */}
+          <span className="block text-muted-foreground">{TASK_HISTORY_RETRY_NOTE}</span>
+        </p>
+      )}
+      {/* Three states and three sets of words, which is the whole point of this
+          ternary's shape: `null` means unread, `[]` means the record holds no
+          runs, and they never render the same sentence.
+
+          BOTH sentences yield to a refusal, and the empty one for a sharper
+          reason than the loading line: a refused re-read keeps the rows it had,
+          so on a task that read `[]` and was then run, the section would say
+          "no runs recorded" beside "database is locked" at the exact instant
+          `claim_task` had written a run row. The refusal explains why the pane
+          knows no more; the sentence beside it would be a claim it cannot
+          support. `role="status"` on both, because a reader who presses Runs and
+          is told nothing has to go hunting for the answer. */}
+      {error === null &&
+        (runs === null ? (
+          <p role="status" className="text-muted-foreground text-xs">
+            {TASK_HISTORY_LOADING_TEXT}
+          </p>
+        ) : (
+          runs.length === 0 && (
+            <p role="status" className="text-muted-foreground text-xs">
+              {TASK_HISTORY_EMPTY_TEXT}
+            </p>
+          )
+        ))}
+      {runs !== null && runs.length > 0 && (
+        // Deliberately unnamed: the disclosure owns the accessible name and
+        // points here with `aria-controls`, and a list repeating that name would
+        // give a screen reader two targets called the same thing
+        // (`tag-combobox.tsx`'s rule for the same pairing). The Activity list's
+        // `aria-label` is safe only because its name comes from an `<h2>`.
+        <ul className="flex flex-col gap-1.5">
+          {fold.visible.map((entry) => {
+            const report = taskReportText(entry);
+            return (
+              // `task_runs.id` is an INTEGER PRIMARY KEY and `TaskRunVm` carries
+              // it, and this list is one `ORDER BY id DESC` over that column —
+              // so unlike the Activity list, whose rows have no identity of
+              // their own and are therefore keyed by timestamp, kind and path,
+              // this one needs no composite key.
+              <li
+                key={entry.id}
+                data-testid={TASKS_HISTORY_ROW_TESTID}
+                className="flex flex-wrap items-baseline gap-2 text-xs"
+              >
+                {/* The row above's own function, reused rather than re-worded:
+                    an in-flight run, a known outcome and a spelling a newer
+                    keeper wrote stay three distinct facts (NFR-43), and the
+                    history cannot word an outcome differently from the row it
+                    hangs under. */}
+                <span className="text-foreground">{taskOutcomeText(entry)}</span>
+                {/* The pane's existing display clock, threaded in — never a
+                    second one, so two times on one screen cannot disagree about
+                    what "now" is. */}
+                <span className="figures shrink-0 text-muted-foreground">
+                  {formatTaskAgo(entry.startedMs, now)}
+                </span>
+                {/* Which host ran it is most of the reason this list exists, so
+                    a blank is named rather than left as a gap, and the string is
+                    allowed to break: it is a stored id this build did not
+                    choose, so `shrink-0` on it would push the report out of the
+                    row at a narrow width. */}
+                <span className="font-mono text-muted-foreground [overflow-wrap:anywhere]">
+                  {entry.host.trim() === "" ? TASK_HISTORY_NO_HOST_TEXT : entry.host}
+                </span>
+                {/* Absent or blank is silence, `taskReportText`'s rule. The
+                    wrapping is the pair Story 58.2 established for engine prose,
+                    because this is the same unbounded string in a narrower
+                    place. */}
+                {report !== null && (
+                  <span className="min-w-0 flex-1 whitespace-pre-wrap [overflow-wrap:anywhere]">
+                    {report}
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {runs !== null && runs.length > 0 && (
+        <FoldToggle rows={runs} fold={fold} label={`${TASK_HISTORY_TITLE}: ${taskId}`} />
+      )}
+      {/* Unfolded and still holding rows back, which `FoldToggle` cannot say: it
+          renders "Show fewer" and nothing else, so a reader who pressed *Show
+          all* on a twenty-run history whose unfolded size is ten would believe
+          they had seen all of it. */}
+      {runs !== null && fold.expanded && fold.hidden > 0 && (
+        <p className="text-muted-foreground text-xs">{taskHistoryUnshownText(fold.hidden)}</p>
+      )}
+    </div>
+  );
+}
+
 function TaskRow({
   task,
   now,
@@ -448,11 +727,15 @@ function TaskRow({
   deleting,
   editing,
   writing,
+  historyOpen,
+  historyRuns,
+  historyError,
   onRunNow,
   onEditToggle,
   onSaved,
   onSavingChange,
   onForget,
+  onHistoryToggle,
 }: {
   task: TaskVm;
   now: number;
@@ -463,28 +746,31 @@ function TaskRow({
   editing: boolean;
   /** A save is in flight somewhere in the pane — see `formSaving`. */
   writing: boolean;
+  /** Whether this row's runs are the pane's one open section. */
+  historyOpen: boolean;
+  /**
+   * The runs read for this row: `null` while unread, `[]` for a task with none.
+   *
+   * The data rather than a rendered node, so this component stays a pure
+   * function of its task and no caller can hand a row the runs of another one.
+   */
+  historyRuns: TaskRunVm[] | null;
+  historyError: string | null;
   onRunNow: (id: string) => void;
   onEditToggle: (id: string) => void;
   onSaved: () => void;
   onSavingChange: (saving: boolean) => void;
   onForget: (id: string) => void;
+  onHistoryToggle: (id: string) => void;
 }) {
   const unhosted = task.host.kind === "unhosted";
-  /**
-   * The run's own words, or `null` when there are none to draw.
-   *
-   * Blank counts as none, and that is the guard rather than a nicety: `detail`
-   * is `TEXT NULL` with no non-empty constraint and `finish_task_run` binds
-   * whatever it is handed, so a writer this build never met — the NFR-43 case
-   * this file exists to tolerate — can store `""` or `" "`. On `!== null` alone
-   * that renders a LAST REPORT heading over nothing, which is the one shape a
-   * reader really would read as a failed read. Trimmed to decide, untrimmed to
-   * draw: what is stored is what is shown.
-   */
-  const report =
-    task.lastRun !== null && task.lastRun.detail !== null && task.lastRun.detail.trim() !== ""
-      ? task.lastRun.detail
-      : null;
+  const report = taskReportText(task.lastRun);
+  // Names the region the disclosure genuinely opens, which this project treats
+  // as a requirement rather than a nicety (`sidebar-pane.tsx`, `note-editor.tsx`
+  // and two guard tests): `aria-expanded` alone announces "collapsed" and gives
+  // a screen-reader user nothing to jump to. Passed only while the section
+  // exists, `note-editor.tsx`'s form, so there is never a dangling IDREF.
+  const historyRegionId = useId();
   // The header disclosure's rule, per row: the form is closed from inside
   // itself, so without this focus lands on `<body>`.
   const editTriggerRef = useRef<HTMLButtonElement>(null);
@@ -607,6 +893,58 @@ function TaskRow({
         </p>
       )}
 
+      {/* A link-weight control on its own line, and NOT a fourth `Button` in
+          the header cluster. `FoldToggle` states the rule that settles it: a
+          control that changes "how much of a list is on screen … is not an
+          action on the folder and must not carry the same visual weight as
+          Retry or Sync now" (`list-fold.tsx`). The second reason is the cluster
+          itself, which already holds Run now, Edit and Forget in a `shrink-0`
+          block — so at a narrow window this row's id is what truncates to pay
+          for each one, and jsdom performs no layout, so no component test in
+          this file could ever catch a control that had left the screen.
+
+          It wears `FoldToggle`'s own treatment for the same reason it borrows
+          its rule, and deliberately NOT `text-faint`: that tone is "reserved for
+          `aria-hidden` glyphs and section labels … and never carries a fact"
+          (`DESIGN.md`), and this control is the only route to a task's history,
+          which makes it the most load-bearing thing on the row. The section
+          below still prints no heading of its own, because the trigger names it.
+
+          Refused while a write is on its way, the rule Edit and Forget already
+          follow: opening this closes an edit form, so pressing it mid-save would
+          unmount the form Rust's answer has to land in — and a row whose Forget
+          is in flight is about to go, so answering "no runs recorded" about it
+          would be a claim about a record that is leaving.
+
+          No focus-return effect, unlike Edit: on the self-close path focus never
+          leaves the trigger, which is also why the section needs no close
+          control of its own. The section can also be destroyed without a press —
+          `refresh` prunes it when the row leaves the listing — but that takes
+          the whole row with it, which is the case the pane already accepts for
+          Edit and Forget. */}
+      <button
+        type="button"
+        aria-expanded={historyOpen}
+        aria-controls={historyOpen ? historyRegionId : undefined}
+        // Named for its task, `FoldToggle`'s reason: ten rows would otherwise
+        // offer ten controls a screen reader calls "Runs".
+        aria-label={`${TASK_HISTORY_TITLE}: ${task.id}`}
+        disabled={writing || deleting}
+        onClick={() => onHistoryToggle(task.id)}
+        className="self-start text-muted-foreground text-xs underline decoration-dotted hover:text-foreground"
+      >
+        {TASK_HISTORY_TITLE}
+      </button>
+      {historyOpen && (
+        <TaskRunList
+          taskId={task.id}
+          regionId={historyRegionId}
+          runs={historyRuns}
+          error={historyError}
+          now={now}
+        />
+      )}
+
       {/* Capped where the row is not, the Sync pane's reason: a form is read
           line by line, and a label-and-field pair stretched across a wide
           window is worse than one that sits still. */}
@@ -721,53 +1059,114 @@ export function TasksPane() {
    * backwards.
    */
   const readToken = useRef(0);
-
-  const refresh = useCallback(async (keepRefusals = false) => {
-    readToken.current += 1;
-    const mine = readToken.current;
-    try {
-      const next = await syncTasks();
-      if (mine !== readToken.current) {
-        return;
-      }
-      setListing(next);
-      setNow(Date.now());
-      setError(null);
-      // A disclosure cannot belong to a row the record no longer has. Left
-      // standing, the id is re-creatable — the Add form takes a typed id — so
-      // forgetting `nightly` and adding a new `nightly` rendered the new row
-      // with its edit form already expanded and `aria-expanded` set on a
-      // disclosure nobody had opened. `forgetSubject` is deliberately NOT
-      // pruned here: this read fires on every Run now settle too, and closing a
-      // question under the person answering it is worse than asking about a row
-      // that has gone — a confirm on a row that is gone is refused, and the
-      // refusal is rendered either way (see `orphanRefusals`).
-      setEditingId((open) =>
-        open !== null && next.tasks.some((t) => t.id === open) ? open : null,
-      );
-      // A listing read *after* an attempt is newer evidence than the attempt
-      // (finding 9). `refusals` used to be cleared at exactly one point — the
-      // top of `runNow`, for the one id being run — so a "the other host is
-      // doing this" alert kept asserting a task was busy elsewhere while the row
-      // above it showed the completed run and no holder, clearable only by
-      // running the task again.
-      //
-      // `keepRefusals` is the one exception, and it is not a hedge: the read
-      // `runNow`'s own settle issues is *contemporaneous* with the attempt, not
-      // later than it. Clearing there would erase the refusal in the same tick it
-      // appeared, which is the pane's whole answer to a refused Run now and an
-      // acceptance criterion of this story. Every other read — the mount, the
-      // Refresh button — is genuinely newer and clears.
-      if (!keepRefusals) {
-        setRefusals({});
-      }
-    } catch (cause) {
-      if (mine !== readToken.current) {
-        return;
-      }
-      setError(messageOf(cause));
-    }
+  /**
+   * The one open run-history section: which row it belongs to, and what has been
+   * read for it.
+   *
+   * One section at a time, {@link editingId}'s rule and its reason: a twenty-run
+   * list is taller than the eight-control form that argument was written for. A
+   * cache keyed by id would also make "one open, one call" depend on which row
+   * had been opened before, and would hold a run list `task_runs` may have
+   * trimmed underneath it.
+   *
+   * **One object rather than an id and two slots beside it**, so the id and the
+   * runs cannot be separately stale. Rendering with three states compared
+   * against each other is correct only while every writer happens to set them in
+   * one synchronous batch; the first edit that awaits between two of them draws
+   * row B's section with row A's runs, which is the one outcome
+   * {@link historyToken} exists to prevent and the one it cannot see.
+   */
+  const [history, setHistory] = useState<{
+    id: string;
+    /** `null` until this section's read lands: unread, and not empty. */
+    runs: TaskRunVm[] | null;
+    error: string | null;
+  } | null>(null);
+  /**
+   * The same value, readable without depending on it.
+   *
+   * `refresh` is a `useCallback` with an empty dependency list, because three
+   * independent triggers rely on its identity being stable — so giving it
+   * `history` would make the mount effect re-read the whole listing every time a
+   * section opened or closed. {@link openHistory} is the only writer of both, so
+   * the ref cannot drift from the state.
+   */
+  const historyRef = useRef<typeof history>(null);
+  const openHistory = useCallback((next: typeof history) => {
+    historyRef.current = next;
+    setHistory(next);
   }, []);
+  /**
+   * Which history read is the newest — {@link readToken}'s idiom, for the same
+   * reason: a slow read must not land in a section that has since closed or
+   * moved to another task.
+   */
+  const historyToken = useRef(0);
+
+  const refresh = useCallback(
+    async (keepRefusals = false) => {
+      readToken.current += 1;
+      const mine = readToken.current;
+      try {
+        const next = await syncTasks();
+        if (mine !== readToken.current) {
+          return;
+        }
+        setListing(next);
+        setNow(Date.now());
+        setError(null);
+        // A disclosure cannot belong to a row the record no longer has. Left
+        // standing, the id is re-creatable — the Add form takes a typed id — so
+        // forgetting `nightly` and adding a new `nightly` rendered the new row
+        // with its edit form already expanded and `aria-expanded` set on a
+        // disclosure nobody had opened. `forgetSubject` is deliberately NOT
+        // pruned here: this read fires on every Run now settle too, and closing a
+        // question under the person answering it is worse than asking about a row
+        // that has gone — a confirm on a row that is gone is refused, and the
+        // refusal is rendered either way (see `orphanRefusals`).
+        setEditingId((open) =>
+          open !== null && next.tasks.some((t) => t.id === open) ? open : null,
+        );
+        // The same pruning for an open history section, and the same reason: a
+        // section cannot belong to a row the record no longer has.
+        //
+        // Nothing else here touches it. A refresh must leave an open section
+        // exactly as it is — open, and holding the rows it read — because
+        // `refresh` fires from the mount, from the Refresh button and from every
+        // Run now settle, so a history read per open row per refresh is the poll
+        // AD-62's sentence is about.
+        const open = historyRef.current;
+        if (open !== null && !next.tasks.some((t) => t.id === open.id)) {
+          historyToken.current += 1;
+          openHistory(null);
+        }
+        // A listing read *after* an attempt is newer evidence than the attempt
+        // (finding 9). `refusals` used to be cleared at exactly one point — the
+        // top of `runNow`, for the one id being run — so a "the other host is
+        // doing this" alert kept asserting a task was busy elsewhere while the row
+        // above it showed the completed run and no holder, clearable only by
+        // running the task again.
+        //
+        // `keepRefusals` is the one exception, and it is not a hedge: the read
+        // `runNow`'s own settle issues is *contemporaneous* with the attempt, not
+        // later than it. Clearing there would erase the refusal in the same tick it
+        // appeared, which is the pane's whole answer to a refused Run now and an
+        // acceptance criterion of this story. Every other read — the mount, the
+        // Refresh button — is genuinely newer and clears.
+        if (!keepRefusals) {
+          setRefusals({});
+        }
+      } catch (cause) {
+        if (mine !== readToken.current) {
+          return;
+        }
+        setError(messageOf(cause));
+      }
+      // `openHistory` is itself a `useCallback([])`, so naming it here keeps this
+      // callback's identity stable and the mount effect a single read.
+    },
+    [openHistory],
+  );
 
   useEffect(() => {
     void refresh();
@@ -776,6 +1175,25 @@ export function TasksPane() {
   useEffect(() => {
     const clock = setInterval(() => setNow(Date.now()), TASKS_CLOCK_TICK_MS);
     return () => clearInterval(clock);
+  }, []);
+
+  /**
+   * Adopt the persisted row counts, so this pane's fold obeys the same
+   * preference the Sync pane's lists do.
+   *
+   * `syncListSizes()` is module state that only the Sync pane's mount and the
+   * settings form ever fill in, and the app shell renders these two views
+   * exclusively — so a person who goes straight to Tasks folded their run
+   * history at the built-in fallback rather than at the number they chose. That
+   * is exactly the "second place for one preference to be honoured differently"
+   * that `list-fold.tsx` was extracted to prevent.
+   *
+   * The rejection is ignored on purpose, `SyncPane`'s reason: the fallbacks equal
+   * the Rust defaults, and a list that folds at ten is not a failure worth a
+   * banner over.
+   */
+  useEffect(() => {
+    void hydrateSyncListSizes().catch(() => {});
   }, []);
 
   /**
@@ -797,8 +1215,87 @@ export function TasksPane() {
     wasAdding.current = adding;
   }, [adding]);
 
+  /**
+   * Read one task's runs, and land them only if this section is still the one
+   * asking.
+   *
+   * No `limit` argument, deliberately: the bound is `TASK_HISTORY_LIMIT_DEFAULT`
+   * in `sync_ipc.rs`, clamped there against `TASK_HISTORY_LIMIT_MAX`, and the
+   * store trims each task to `TASK_RUNS_CAP` regardless — so a number invented
+   * here could only disagree with Rust about a page size Rust already owns.
+   *
+   * `keepRows` is the re-read case. On a first open there is nothing on screen
+   * to keep and the loading line is the honest state; on a re-read the rows
+   * already read stay while the new read is in flight, and survive its refusal —
+   * a failed read is a fault to report, not a fact to invent.
+   */
+  const readHistory = useCallback(
+    async (id: string, keepRows: boolean) => {
+      historyToken.current += 1;
+      const mine = historyToken.current;
+      openHistory({
+        id,
+        runs: keepRows ? (historyRef.current?.runs ?? null) : null,
+        error: null,
+      });
+      try {
+        const runs = await syncTaskHistory(id);
+        if (mine !== historyToken.current) {
+          return;
+        }
+        openHistory({ id, runs, error: null });
+      } catch (cause) {
+        if (mine !== historyToken.current) {
+          return;
+        }
+        // The rows already read stay: they were read successfully and are still
+        // the best thing known about this task.
+        openHistory({
+          id,
+          runs: historyRef.current?.runs ?? null,
+          error: messageOf(cause),
+        });
+      }
+    },
+    [openHistory],
+  );
+
+  /** Open this row's runs and read them, or close the section already open. */
+  const toggleHistory = useCallback(
+    (id: string) => {
+      if (historyRef.current?.id === id) {
+        // Closing forgets: a read still in flight for this id must not land in a
+        // closed section, and re-opening should re-read rather than show a list
+        // `task_runs` may have trimmed underneath it. It is also the only retry
+        // a refused read has, which is why the refusal says so.
+        historyToken.current += 1;
+        openHistory(null);
+        return;
+      }
+      // Opening another row closes the first by replacing the one slot, and the
+      // token `readHistory` bumps is what keeps the first row's slow read out of
+      // the second row's section.
+      //
+      // It also closes an edit form on the row being opened, because the
+      // one-at-a-time argument this section borrows from `editingId` is about
+      // height, and a twenty-run list plus an eight-control form is exactly the
+      // wall that argument forbids. Safe to do unconditionally here: the
+      // disclosure is disabled while a save is in flight, so this can never
+      // unmount a form Rust's answer is still coming to.
+      setEditingId(null);
+      void readHistory(id, false);
+    },
+    [openHistory, readHistory],
+  );
+
   const runNow = useCallback(
     async (id: string) => {
+      // Whether this row's runs were on screen when the button was pressed.
+      // Checked at the press and again at the settle, because a section opened
+      // DURING the run already has a read of its own in flight — re-reading on
+      // its behalf would spend a second call for one deliberate press and throw
+      // the person's own read away mid-flight.
+      const openAtPress = historyRef.current?.id === id;
       setRunning((prior) => ({ ...prior, [id]: true }));
       // Cleared before the attempt, so a stale refusal cannot sit under a run
       // that has just succeeded.
@@ -826,9 +1323,16 @@ export function TasksPane() {
         // The refusal this attempt may just have recorded survives it — see
         // `refresh`.
         await refresh(true);
+        // The one re-read a listing refresh does not do, and it is not a poll:
+        // this run is precisely what changed that task's history, and the person
+        // asked for it by pressing the button. Only the open section, and only
+        // when it is this row's.
+        if (openAtPress && historyRef.current?.id === id) {
+          await readHistory(id, true);
+        }
       }
     },
-    [refresh],
+    [refresh, readHistory],
   );
 
   /**
@@ -982,8 +1486,23 @@ export function TasksPane() {
                   deleting={deleting[task.id] === true}
                   editing={editingId === task.id}
                   writing={formSaving}
+                  // All three read the ONE slot, so a row can never be handed
+                  // another row's runs: the id and the runs it belongs to move
+                  // together or not at all.
+                  historyOpen={history?.id === task.id}
+                  historyRuns={history?.id === task.id ? history.runs : null}
+                  historyError={history?.id === task.id ? history.error : null}
                   onRunNow={(id) => void runNow(id)}
-                  onEditToggle={(id) => setEditingId((open) => (open === id ? null : id))}
+                  // Opening an edit form closes this row's runs, the mirror of
+                  // `toggleHistory` closing the form: one of the two, never both,
+                  // on one row.
+                  onEditToggle={(id) => {
+                    setEditingId((open) => (open === id ? null : id));
+                    if (historyRef.current?.id === id) {
+                      historyToken.current += 1;
+                      openHistory(null);
+                    }
+                  }}
                   onSaved={() => {
                     setEditingId(null);
                     void refresh();
@@ -993,6 +1512,7 @@ export function TasksPane() {
                     setForgetSubject(id);
                     setForgetAsking(true);
                   }}
+                  onHistoryToggle={toggleHistory}
                 />
               ))}
             </ul>
