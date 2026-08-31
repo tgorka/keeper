@@ -2887,6 +2887,15 @@ mod tests {
     /// And the guard still fires when the scratch directory is there but nothing
     /// is being written into it — a filter that deadlocked rather than one that
     /// is slow. Same fixture as the test above, minus the writing.
+    ///
+    /// Waits for the flag rather than sleeping a fixed span, the way
+    /// [`a_walk_that_goes_still_is_interrupted`] does. Sleeping `FAST_LIMIT * 3`
+    /// asserted something stronger than the guard promises: not merely that
+    /// stillness sets the flag, but that the watchdog thread is SCHEDULED
+    /// promptly enough to notice within 600 ms of wall clock. On a CI runner
+    /// carrying four thousand tests at once it is not, and this test was the one
+    /// red check on `main`. The assertion below is unchanged and no weaker — a
+    /// guard that never fires still fails, five seconds later.
     #[test]
     fn a_dead_filter_with_a_scratch_dir_is_still_interrupted() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2904,7 +2913,11 @@ mod tests {
             FAST_LIMIT,
         );
 
-        std::thread::sleep(FAST_LIMIT * 3);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !interrupt.load(Ordering::Relaxed) {
+            std::thread::sleep(FAST_POLL);
+        }
+
         assert!(
             interrupt.load(Ordering::Relaxed),
             "a scratch file that stopped growing is a stalled filter, not work"
