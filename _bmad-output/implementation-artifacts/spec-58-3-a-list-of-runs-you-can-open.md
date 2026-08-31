@@ -2,10 +2,11 @@
 title: 'Story 58.3: a list of runs you can open'
 type: 'feature'
 created: '2026-08-31'
-status: 'in-progress'
+status: 'done'
 baseline_revision: 'f8fbb90'
+final_revision: '98f634f'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 context:
   - '{project-root}/docs/project-context.md'
 warnings: ['oversized']
@@ -164,3 +165,13 @@ Status: done
 - The fold's `unfolded` size and the command's page size are set independently, so the "N more recorded and not shown" line is load-bearing rather than decorative. A future page-size change should be checked against it.
 - `historyRef` still mirrors `history` by hand, now through a single writer. A future writer that sets the state directly would break the pane's ability to see the open section from a stable callback.
 - The disclosure's layout claim — a link-weight control on its own line rather than a fourth button in the header — cannot be tested here, because jsdom performs no layout.
+
+**One thing went wrong in the bookkeeping, and it is not recoverable from here.** This story's four
+files were staged and, in the same second, a sibling agent working the same worktree ran a plain
+`git commit` — so 58.3's code landed inside `98f634f feat(58.6): two hosts, one missed window, one
+run` rather than in a commit of its own. The content is complete, green and shippable; the subject
+is wrong and the commit mixes two stories. Splitting it needs history rewriting, which this session
+is forbidden from doing, so `final_revision` names where the code actually is and the coordinator
+owns the decision. The avoidable half was mine: staging early in a shared worktree leaves work in an
+index a sibling's next `git commit` will sweep up, so the pathspec form (`git commit -- <paths>`) is
+the only safe one there.
