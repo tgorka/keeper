@@ -318,6 +318,20 @@ pub struct TaskVm {
     /// could read it — which is why the view may render it verbatim rather than
     /// having to guess.
     pub on_missed: String,
+    /// How long **this** task holds a missed window back, in milliseconds, or
+    /// `null` to use keeper's own default (Story 59.6).
+    ///
+    /// Only meaningful while [`Self::on_missed`] is `"delay"`, and carried on
+    /// every row regardless, because the store keeps the number across a policy
+    /// change rather than forgetting what somebody typed.
+    ///
+    /// `null` is **not** the same fact as the default's own number: a row that
+    /// chose thirty minutes keeps thirty minutes if keeper's constant is ever
+    /// retuned, and a row that chose nothing follows it. A surface that wants to
+    /// state the effective wait therefore composes it from this value *or* the
+    /// mirrored default, and never substitutes one for the other.
+    #[ts(type = "number | null")]
+    pub missed_delay_ms: Option<i64>,
     /// When it next comes due: ms since the Unix epoch, `null` when never.
     #[ts(type = "number | null")]
     pub next_due_ms: Option<i64>,
@@ -404,6 +418,15 @@ pub struct TaskSaveReq {
     /// refused rather than coerced when this build cannot read it — the same
     /// answer `kind` and `mode` already get.
     pub on_missed: String,
+    /// The requested per-task missed-window delay in milliseconds, or `null` to
+    /// store none and so use keeper's default (Story 59.6).
+    ///
+    /// Refused rather than clamped when it is shorter than the grace period or
+    /// longer than a schedule may be — `keeper_sync::tasks::validate_missed_delay_ms`
+    /// owns both bounds and the sentences, and the caller renders whichever
+    /// arrives.
+    #[ts(type = "number | null")]
+    pub missed_delay_ms: Option<i64>,
     /// The `updated_ms` the caller's reading of this row carried, or `null`.
     ///
     /// The lost-update guard, and it is a **request** field rather than a

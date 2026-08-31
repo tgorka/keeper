@@ -53,6 +53,16 @@ description: string | null,
  */
 onMissed: string, 
 /**
+ * The requested per-task missed-window delay in milliseconds, or `null` to
+ * store none and so use keeper's default (Story 59.6).
+ *
+ * Refused rather than clamped when it is shorter than the grace period or
+ * longer than a schedule may be — `keeper_sync::tasks::validate_missed_delay_ms`
+ * owns both bounds and the sentences, and the caller renders whichever
+ * arrives.
+ */
+missedDelayMs: number | null, 
+/**
  * The `updated_ms` the caller's reading of this row carried, or `null`.
  *
  * The lost-update guard, and it is a **request** field rather than a

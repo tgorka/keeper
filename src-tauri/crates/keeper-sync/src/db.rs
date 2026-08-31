@@ -445,8 +445,9 @@ fn ensure_journal_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add the tasks table's late columns — `on_missed` and `description` so far —
-/// if they are not there yet (Stories 58.4 and 59.5, FR-356, AD-139).
+/// Add the tasks table's late columns — `on_missed`, `description` and
+/// `missed_delay_ms` so far — if they are not there yet (Stories 58.4, 59.5 and
+/// 59.6, FR-356, FR-366, AD-139).
 ///
 /// The helper the DDL above has demanded since Story 57.1 and nobody had needed
 /// yet. Written on [`ensure_journal_columns`]' shape and for its reasons: one
@@ -472,6 +473,17 @@ fn ensure_journal_columns(conn: &Connection) -> Result<()> {
 /// `""` as absence anyway. Nullable satisfies NFR-43's write half for free —
 /// SQLite fills a nullable column with `NULL` when an `INSERT` omits it — so
 /// there is nothing here for a default to buy.
+///
+/// **`missed_delay_ms` takes that same branch, and could not take the other
+/// one** (Story 59.6). It is nullable with no `DEFAULT` because the default is
+/// not a *value*: an absent delay means *"whatever this build's
+/// [`crate::tasks::TASK_MISSED_DELAY_MS`] is"*, which no SQL default can
+/// express. `DEFAULT 1800000` would freeze today's thirty minutes into every
+/// pre-existing row, so the next person to retune the constant would silently
+/// change it for new tasks only and leave every old one waiting the old number —
+/// a lie about rows nobody edited. `NULL` says *not chosen*, and
+/// [`crate::tasks::effective_missed_delay_ms`] is the one place that is turned
+/// into a duration.
 fn ensure_task_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(tasks)")?;
     let existing: Vec<String> = stmt
@@ -486,6 +498,9 @@ fn ensure_task_columns(conn: &Connection) -> Result<()> {
     }
     if !existing.iter().any(|c| c == "description") {
         conn.execute("ALTER TABLE tasks ADD COLUMN description TEXT", [])?;
+    }
+    if !existing.iter().any(|c| c == "missed_delay_ms") {
+        conn.execute("ALTER TABLE tasks ADD COLUMN missed_delay_ms INTEGER", [])?;
     }
     Ok(())
 }
@@ -2879,7 +2894,7 @@ pub const TASK_RUNS_CAP: usize = 50;
 /// constant so a reader added later cannot drift out of step with the decoder.
 const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
                             enabled, updated_ms, running_host, lease_until_ms, \
-                            on_missed, description";
+                            on_missed, description, missed_delay_ms";
 
 /// One stored task.
 ///
@@ -2920,6 +2935,20 @@ pub struct TaskRow {
     /// produce the second. Deciding that a blank one renders as nothing is a
     /// job for whatever draws it, not for the store.
     pub description: Option<String>,
+    /// How long **this** task holds a missed window back, or `None` to use
+    /// [`crate::tasks::TASK_MISSED_DELAY_MS`] (Story 59.6).
+    ///
+    /// Only [`crate::tasks::TaskMissedPolicy::Delay`] consults it, and it is
+    /// stored regardless of the policy on purpose: switching a task to `skip`
+    /// and back must not throw away the number somebody chose, which is the same
+    /// rule that keeps a `manual` task's [`Self::schedule`] on the row.
+    ///
+    /// A **duration**, not an instant, which is what keeps AD-139 intact: the
+    /// postponement is still written into [`Self::next_due_ms`] itself, so the
+    /// row still holds exactly one forward instant and nothing can enumerate
+    /// missed windows. Refused outside [`crate::tasks::validate_missed_delay_ms`]'
+    /// bounds at the write door, and honoured as stored on the read path.
+    pub missed_delay_ms: Option<i64>,
 }
 
 impl TaskRow {
@@ -3007,6 +3036,7 @@ type StoredTask = (
     Option<i64>,
     String,
     Option<String>,
+    Option<i64>,
 );
 
 /// Read one `tasks` row, tolerating every column but the primary key.
@@ -3024,12 +3054,15 @@ type StoredTask = (
 /// row whose primary key cannot be read cannot be named in a report either, and
 /// [`list_tasks`] handles that failure separately.
 ///
-/// `description` is the one column where the fallback is not a route to that
-/// path but the answer itself: it defaults to `None`, which is exactly what an
-/// absent description is, so a value stored under a type this build cannot read
-/// costs a name and never a run. That is the right trade for the only column on
-/// the row with no vocabulary to be wrong about — refusing the row over it would
-/// stop a task for a cosmetic reason, which is the outcome NFR-43 is about.
+/// `description` and `missed_delay_ms` are the two columns where the fallback is
+/// not a route to that path but the answer itself: both default to `None`, which
+/// is exactly what an absent description and an unchosen delay are, so a value
+/// stored under a type this build cannot read costs a name or a number and never
+/// a run. That is the right trade for the only two columns on the row with no
+/// vocabulary to be wrong about — refusing the row over either would stop a task
+/// for a reason that is cosmetic in one case and recoverable in the other, which
+/// is the outcome NFR-43 is about. An unreadable delay reads as *not chosen*, so
+/// the task falls back to the constant and keeps running.
 fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
     Ok((
         row.get(0)?,
@@ -3044,6 +3077,7 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
         row.get(9).unwrap_or_default(),
         row.get(10).unwrap_or_default(),
         row.get(11).unwrap_or_default(),
+        row.get(12).unwrap_or_default(),
     ))
 }
 
@@ -3069,6 +3103,7 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         lease_until_ms,
         on_missed,
         description,
+        missed_delay_ms,
     ) = stored;
     let unknown = |reason: String| UnknownTask {
         id: id.clone(),
@@ -3098,6 +3133,7 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         lease_until_ms,
         on_missed,
         description,
+        missed_delay_ms,
     };
     if let Err(err) = row.parsed_schedule() {
         return Err(unknown(format!("unreadable schedule: {err}")));
@@ -3203,6 +3239,12 @@ pub fn upsert_task(
             task.id
         )));
     }
+    // The delay's own two bounds, from the module that owns the constant they
+    // are derived from. Here rather than in `TaskSchedule::parse`'s neighbours
+    // because it is not a schedule, and here rather than in either writer
+    // because both writers reach this door and only one of them has a person
+    // standing at it.
+    crate::tasks::validate_missed_delay_ms(task.missed_delay_ms)?;
     let tx = conn.unchecked_transaction()?;
     let stored: Option<(String, String, Option<String>, i64, i64)> = tx
         .query_row(
@@ -3289,18 +3331,19 @@ pub fn upsert_task(
     tx.execute(
         "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
                             updated_ms, running_host, lease_until_ms, on_missed,
-                            description)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9, ?10)
+                            description, missed_delay_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9, ?10, ?11)
          ON CONFLICT(id) DO UPDATE SET
-             profile_id  = excluded.profile_id,
-             kind        = excluded.kind,
-             schedule    = excluded.schedule,
-             mode        = excluded.mode,
-             next_due_ms = CASE WHEN ?8 = 1 THEN NULL ELSE tasks.next_due_ms END,
-             enabled     = excluded.enabled,
-             updated_ms  = excluded.updated_ms,
-             on_missed   = excluded.on_missed,
-             description = excluded.description",
+             profile_id      = excluded.profile_id,
+             kind            = excluded.kind,
+             schedule        = excluded.schedule,
+             mode            = excluded.mode,
+             next_due_ms     = CASE WHEN ?8 = 1 THEN NULL ELSE tasks.next_due_ms END,
+             enabled         = excluded.enabled,
+             updated_ms      = excluded.updated_ms,
+             on_missed       = excluded.on_missed,
+             description     = excluded.description,
+             missed_delay_ms = excluded.missed_delay_ms",
         (
             &task.id,
             &task.profile_id,
@@ -3312,6 +3355,7 @@ pub fn upsert_task(
             i64::from(effect == TaskSave::Rearmed),
             task.on_missed.as_str(),
             &task.description,
+            task.missed_delay_ms,
         ),
     )?;
     tx.commit()?;
@@ -5860,6 +5904,7 @@ mod tests {
             lease_until_ms: None,
             on_missed: crate::tasks::TaskMissedPolicy::RunNow,
             description: None,
+            missed_delay_ms: None,
         }
     }
 
@@ -5945,10 +5990,11 @@ mod tests {
                 "lease_until_ms",
                 // Added by `ensure_task_columns` rather than by the batch, which
                 // is why these come last, in the order it adds them: a store that
-                // predates either reaches this same shape down the additive path
-                // (Stories 58.4 and 59.5).
+                // predates any of them reaches this same shape down the additive
+                // path (Stories 58.4, 59.5 and 59.6).
                 "on_missed",
                 "description",
+                "missed_delay_ms",
             ]
         );
         assert_eq!(
@@ -6762,6 +6808,157 @@ mod tests {
 
         // Idempotent, like its siblings: a second pass adds nothing.
         ensure_task_columns(&c).expect("a second pass");
+    }
+
+    /// A task stored before `missed_delay_ms` existed has **not chosen** a delay,
+    /// which means the constant — the whole compatibility claim of Story 59.6
+    /// (FR-366, NFR-43).
+    ///
+    /// The sibling of the test above, and it exists for a reason that one does
+    /// not have: `description`'s alternative was a `DEFAULT ''` that would have
+    /// been merely untidy, while this column's would have been a `DEFAULT
+    /// 1800000` that is *wrong the next time somebody retunes the constant* — new
+    /// rows would follow the new number and every existing row would keep waiting
+    /// the old one, with nothing anywhere saying so. `None` is what makes the
+    /// constant the single authority it is documented to be.
+    #[test]
+    fn the_missed_delay_column_is_additive_and_a_row_without_one_reads_as_unchosen() {
+        let c = conn();
+        let mut patient = task("01PATIENT", Some("@daily"), TaskMode::Scheduled);
+        patient.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        patient.missed_delay_ms = Some(4 * 3_600_000);
+        upsert_task(&c, &patient, None).expect("save");
+        c.execute("ALTER TABLE tasks DROP COLUMN missed_delay_ms", [])
+            .expect("a store from before the column existed");
+
+        // An older binary's write: the twelve columns it knows about.
+        c.execute(
+            "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
+                                updated_ms, running_host, lease_until_ms, on_missed, description)
+             VALUES ('01OLDER', NULL, 'sync', 'every 5m', 'scheduled', NULL, 1, 1, NULL, NULL,
+                     'delay', NULL)",
+            [],
+        )
+        .expect("an older binary's INSERT names only the columns it knows");
+
+        ensure_task_columns(&c).expect("the additive migration");
+        for id in ["01PATIENT", "01OLDER"] {
+            let row = get_task(&c, id).expect("get").expect("row");
+            assert_eq!(
+                row.missed_delay_ms, None,
+                "{id} predates the column, so it chose no delay"
+            );
+            assert_eq!(
+                crate::tasks::effective_missed_delay_ms(row.missed_delay_ms),
+                crate::tasks::TASK_MISSED_DELAY_MS,
+                "{id} therefore waits exactly what it waited before this column \
+                 existed, which is the only reading of an absent value that leaves \
+                 a shipped install alone"
+            );
+        }
+
+        // A delay written *after* the migration round-trips, which is what makes
+        // the `None` above a fact about the schema rather than about the column
+        // being ignored.
+        let mut chosen = task("01CHOSEN", Some("@daily"), TaskMode::Scheduled);
+        chosen.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        chosen.missed_delay_ms = Some(4 * 3_600_000);
+        upsert_task(&c, &chosen, None).expect("save");
+        assert_eq!(get_task(&c, "01CHOSEN").expect("get"), Some(chosen));
+
+        // And it is writable back to absence, which is the other half of the
+        // dead-knob rule this table already states about `on_missed`: a setting
+        // you can set and never unset is a dead knob. Back to `None`, not to
+        // `Some(TASK_MISSED_DELAY_MS)` — the difference is that a row which
+        // *chose* thirty minutes keeps thirty minutes if the constant moves, and
+        // a row that chose nothing follows it.
+        let mut cleared = task("01CHOSEN", Some("@daily"), TaskMode::Scheduled);
+        cleared.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        cleared.updated_ms = 2;
+        upsert_task(&c, &cleared, None).expect("save");
+        assert_eq!(
+            get_task(&c, "01CHOSEN")
+                .expect("get")
+                .expect("row")
+                .missed_delay_ms,
+            None
+        );
+
+        // Kept across a policy change, so switching to `skip` and back does not
+        // throw the number away — the rule a `manual` task's schedule already has.
+        let mut skipping = task("01CHOSEN", Some("@daily"), TaskMode::Scheduled);
+        skipping.on_missed = crate::tasks::TaskMissedPolicy::Skip;
+        skipping.missed_delay_ms = Some(2 * 3_600_000);
+        skipping.updated_ms = 3;
+        upsert_task(&c, &skipping, None).expect("save");
+        assert_eq!(
+            get_task(&c, "01CHOSEN")
+                .expect("get")
+                .expect("row")
+                .missed_delay_ms,
+            Some(2 * 3_600_000),
+            "stored under a policy that does not read it, because a policy is not \
+             a reason to forget what somebody typed"
+        );
+
+        // Idempotent, like its siblings: a second pass adds nothing.
+        ensure_task_columns(&c).expect("a second pass");
+    }
+
+    /// The write door refuses a delay that is not one, and says why in the
+    /// sentence a person reads (Story 59.6, FR-366).
+    ///
+    /// Asserted **here** and not only in `tasks.rs` because the pure rule being
+    /// right is worth nothing if the door does not call it: this is the test that
+    /// fails if `upsert_task` forgets the line, and the failure a person would
+    /// otherwise meet is a task silently storing a five-minute delay that behaves
+    /// as `run_now`.
+    #[test]
+    fn the_write_door_refuses_a_delay_shorter_than_the_grace_or_longer_than_a_year() {
+        let c = conn();
+        let mut impatient = task("01FAST", Some("@daily"), TaskMode::Scheduled);
+        impatient.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        impatient.missed_delay_ms = Some(crate::tasks::TASK_MISSED_GRACE_MS - 1);
+        let err = upsert_task(&c, &impatient, None)
+            .expect_err("a delay shorter than the interval that concludes nobody was home")
+            .to_string();
+        assert!(
+            err.contains("concludes nobody was home"),
+            "the refusal has to say why the grace period is the floor, not merely \
+             that a bound was crossed: {err}"
+        );
+        assert_eq!(
+            get_task(&c, "01FAST").expect("get"),
+            None,
+            "and nothing was stored — a refusal that half-wrote the row would be \
+             worse than no refusal"
+        );
+
+        let mut glacial = task("01SLOW", Some("@daily"), TaskMode::Scheduled);
+        glacial.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        glacial.missed_delay_ms = Some(i64::MAX);
+        let err = upsert_task(&c, &glacial, None)
+            .expect_err("a delay longer than a schedule may be")
+            .to_string();
+        assert!(err.contains("must not exceed a year"), "{err}");
+        assert_eq!(get_task(&c, "01SLOW").expect("get"), None);
+
+        // The floor is inclusive, and this is where that is pinned against the
+        // door rather than against the pure function alone.
+        let mut exact = task("01EXACT", Some("@daily"), TaskMode::Scheduled);
+        exact.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        exact.missed_delay_ms = Some(crate::tasks::TASK_MISSED_GRACE_MS);
+        upsert_task(&c, &exact, None).expect("equal to the grace is impatient, not incoherent");
+
+        // Refused for every policy, not only for `delay`. The column is stored
+        // regardless of the policy, so a value that is nonsense under `delay` must
+        // not be smuggled in under `skip` and become live the moment somebody
+        // changes one menu.
+        let mut smuggled = task("01SMUGGLE", Some("@daily"), TaskMode::Scheduled);
+        smuggled.on_missed = crate::tasks::TaskMissedPolicy::Skip;
+        smuggled.missed_delay_ms = Some(1);
+        upsert_task(&c, &smuggled, None)
+            .expect_err("the bound is a property of the number, not of the policy");
     }
 
     /// A policy spelling this build cannot read is **skipped and listed**, never

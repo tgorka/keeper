@@ -73,6 +73,21 @@ description: string | null,
  */
 onMissed: string, 
 /**
+ * How long **this** task holds a missed window back, in milliseconds, or
+ * `null` to use keeper's own default (Story 59.6).
+ *
+ * Only meaningful while [`Self::on_missed`] is `"delay"`, and carried on
+ * every row regardless, because the store keeps the number across a policy
+ * change rather than forgetting what somebody typed.
+ *
+ * `null` is **not** the same fact as the default's own number: a row that
+ * chose thirty minutes keeps thirty minutes if keeper's constant is ever
+ * retuned, and a row that chose nothing follows it. A surface that wants to
+ * state the effective wait therefore composes it from this value *or* the
+ * mirrored default, and never substitutes one for the other.
+ */
+missedDelayMs: number | null, 
+/**
  * When it next comes due: ms since the Unix epoch, `null` when never.
  */
 nextDueMs: number | null, 

@@ -1826,6 +1826,7 @@ fn task_vm(
         schedule: row.schedule.clone(),
         description: row.description.clone(),
         on_missed: row.on_missed.as_str().to_owned(),
+        missed_delay_ms: row.missed_delay_ms,
         next_due_ms: row.next_due_ms,
         running_host: row.running_host.clone(),
         lease_until_ms: row.lease_until_ms,
@@ -2304,6 +2305,12 @@ pub async fn sync_task_save(
         running_host: None,
         lease_until_ms: None,
         on_missed,
+        // Verbatim too, and refused rather than read: `upsert_task` calls
+        // `tasks::validate_missed_delay_ms`, so a value shorter than the grace or
+        // longer than a year arrives back at the form as the sentence Rust wrote.
+        // Bounding it here would be a second copy of the rule and would leave the
+        // CLI's door unguarded.
+        missed_delay_ms: req.missed_delay_ms,
     };
     // The one caller that passes a baseline, and the reason the parameter
     // exists: this form seeded its six values once, so every field it is about

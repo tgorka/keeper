@@ -205,7 +205,8 @@ export const TASK_MISSED_GRACE_MINUTES = 15;
 export const TASK_MISSED_DELAY_MINUTES = 30;
 
 /**
- * The three settings, accurate to `tasks::decide` and no longer than that.
+ * The three settings, accurate to `tasks::decide` and no longer than that,
+ * composed around whatever delay **this task** will actually wait (Story 59.6).
  *
  * Both numbers are named because a person choosing between the settings is
  * choosing about them, and the delay's **anchor** is stated because the number
@@ -213,8 +214,87 @@ export const TASK_MISSED_DELAY_MINUTES = 30;
  * than from the noticing would make `delay` and `run_now` the same option for
  * any host that was away longer than half an hour. Nothing here re-implements
  * the rule — this text is read by a human, and `decide` is what decides.
+ *
+ * A function rather than a constant since 59.6, and for the same defect class
+ * the constants above exist for, met from the other side: once a task may carry
+ * its own delay, a sentence with `30` baked into it is wrong for every task that
+ * chose otherwise. So the number comes from the effective value, and
+ * {@link TASK_FORM_ON_MISSED_NOTE} is this function at the default — which is
+ * what the mirror test keeps pinned to Rust.
+ *
+ * The grace is **not** a parameter: it is one boundary for the whole policy and
+ * no task may move it, which is why a delay below it is refused rather than
+ * offered.
  */
-export const TASK_FORM_ON_MISSED_NOTE = `A window that fell due while nothing was hosting this task. All three settings serve a window normally while a host is here, and differ only about one nobody was here to serve — which keeper concludes after ${TASK_MISSED_GRACE_MINUTES} minutes. run_now serves it on the first tick that sees it — once, however many windows went by, which is what an ordinary restart already does. delay runs it ${TASK_MISSED_DELAY_MINUTES} minutes after a host noticed it: the anchor is the noticing and not the window, so a host back two hours late genuinely waits. skip abandons a window nobody served within those ${TASK_MISSED_GRACE_MINUTES} minutes and arms the next one instead.`;
+export function taskFormOnMissedNote(delayMinutes: number): string {
+  return `A window that fell due while nothing was hosting this task. All three settings serve a window normally while a host is here, and differ only about one nobody was here to serve — which keeper concludes after ${TASK_MISSED_GRACE_MINUTES} minutes. run_now serves it on the first tick that sees it — once, however many windows went by, which is what an ordinary restart already does. delay runs it ${delayMinutes} minutes after a host noticed it: the anchor is the noticing and not the window, so a host back two hours late genuinely waits. skip abandons a window nobody served within those ${TASK_MISSED_GRACE_MINUTES} minutes and arms the next one instead.`;
+}
+
+/**
+ * The note as a task that has chosen no delay of its own reads it.
+ *
+ * The default composition, kept as a named export because it is what the 58.9
+ * mirror guard asserts against Rust's source text — the DEFAULT is the thing
+ * that must not drift from `TASK_MISSED_DELAY_MS`, and a per-task value cannot
+ * be checked against a constant that is not its authority.
+ */
+export const TASK_FORM_ON_MISSED_NOTE = taskFormOnMissedNote(TASK_MISSED_DELAY_MINUTES);
+
+export const TASK_FORM_MISSED_DELAY_LABEL = "Delay by (minutes)";
+/**
+ * What an empty delay box means, and what the floor is.
+ *
+ * The floor is stated because it is refused rather than clamped, and a person
+ * who is told the bound before they type is a person who does not have to read a
+ * refusal. Its *reason* is stated for the same argument the note above makes
+ * about the anchor: `15` alone is a number somebody would reasonably try to
+ * argue with, and the grace period being the interval that concludes nobody was
+ * home is what makes it not arbitrary.
+ */
+export const TASK_FORM_MISSED_DELAY_NOTE = `Leave it empty to use keeper's own ${TASK_MISSED_DELAY_MINUTES} minutes, which is what every task did before this box existed. At least ${TASK_MISSED_GRACE_MINUTES} minutes: that is how long a window must sit open before keeper concludes nobody was home, and a delay shorter than it would be over before the window it holds back counted as missed.`;
+
+/**
+ * What the form says when the delay box holds something that is not a number of
+ * minutes.
+ *
+ * The **one** refusal this form owns, and it is not a copy of a Rust rule: the
+ * wire type is `number | null`, so "this box does not contain a number" has no
+ * third state to be sent as. Reading it as `null` would silently discard what
+ * was typed and store *use keeper's default* instead, which is the failure this
+ * whole story is about — a setting that reports one thing and does another. The
+ * bounds themselves are still Rust's, and this sentence deliberately does not
+ * mention them.
+ */
+export const TASK_FORM_MISSED_DELAY_NOT_A_NUMBER =
+  "The delay must be a whole number of minutes, or empty to use keeper's own.";
+
+/**
+ * The delay box's contents as the wire wants them: milliseconds, `null` for an
+ * empty box, or `undefined` when it is not a number at all.
+ *
+ * Exported because it is the whole of the form's unit conversion and the thing
+ * worth asserting directly — a test that drove it only through a rendered box
+ * could not distinguish `null` from `undefined`, and those two are the
+ * difference between *use the default* and *tell them it is not a number*.
+ */
+export function taskFormMissedDelayMs(minutes: string): number | null | undefined {
+  // `=== ""` and not `.trim() === ""`, which is the rule the schedule field
+  // already states and its reason: a box holding only spaces is not an empty box,
+  // and reading it as absence would store *use keeper's default* where somebody
+  // typed something. `Number(" ")` is 0, so spaces reach the write door as a
+  // delay it refuses and quotes — which is the answer, rather than a silent one.
+  if (minutes === "") {
+    return null;
+  }
+  // `Number` and not `parseInt`: `parseInt("12abc")` is 12, which would store a
+  // delay somebody did not type. A trailing `.5` is refused for the same reason
+  // rather than rounded — the box asks for minutes.
+  const parsed = Number(minutes);
+  if (!Number.isInteger(parsed)) {
+    return undefined;
+  }
+  return parsed * 60_000;
+}
 
 export const TASK_FORM_ADD_SUBMIT_LABEL = "Add task";
 export const TASK_FORM_EDIT_SUBMIT_LABEL = "Save task";
@@ -228,10 +308,11 @@ const SELECT_CLASS =
   "h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
 
 /**
- * What the eight controls hold. `id`, `description` and `schedule` are strings
- * all the way: each has an empty-string state the wire type spells `null`, and
- * keeping them strings here is what lets the box hold exactly what was typed
- * until the moment {@link TaskForm}'s submit converts it.
+ * What the nine controls hold. `id`, `description`, `schedule` and
+ * `missedDelayMinutes` are strings all the way: each has an empty-string state
+ * the wire type spells `null`, and keeping them strings here is what lets the
+ * box hold exactly what was typed until the moment {@link TaskForm}'s submit
+ * converts it.
  */
 type TaskFormValues = {
   id: string;
@@ -244,6 +325,16 @@ type TaskFormValues = {
   /** `""` means "store no description" — converted on the way out, not here. */
   description: string;
   onMissed: string;
+  /**
+   * Minutes, as typed, `""` meaning *use keeper's own delay*.
+   *
+   * Minutes rather than the wire's milliseconds because minutes are what every
+   * sentence about this setting is written in, and the conversion is one
+   * multiplication in the submit — the same shape `schedule`'s `"" → null`
+   * conversion has. Held as a string, so a half-typed `"1"` on the way to
+   * `"120"` is not silently a two-minute delay the form then refuses.
+   */
+  missedDelayMinutes: string;
 };
 
 /**
@@ -296,6 +387,10 @@ export function TaskForm({
           // The store's own default, spelled here so a created task means what
           // a task created before this control existed meant.
           onMissed: "run_now",
+          // Empty: a new task uses keeper's own delay until somebody says
+          // otherwise, which is the same compatibility argument the policy above
+          // makes.
+          missedDelayMinutes: "",
         }
       : {
           id: task.id,
@@ -312,6 +407,18 @@ export function TaskForm({
           // already looked like.
           description: task.description ?? "",
           onMissed: task.onMissed,
+          // `null` seeds an empty box, which reads correctly: no delay of its
+          // own. A stored value is shown in minutes because minutes are the unit
+          // every sentence about this setting is written in, and the division is
+          // exact for anything either writer can store — the floor is fifteen
+          // whole minutes and neither door accepts a sub-minute value. A value
+          // from a newer keeper that is not a whole number of minutes is shown
+          // rounded, and saving would then store the rounded number: stated
+          // rather than hidden, and the alternative — a box that refuses to show
+          // what the row holds — is worse than a minute of drift on a value this
+          // build could not have written.
+          missedDelayMinutes:
+            task.missedDelayMs === null ? "" : String(Math.round(task.missedDelayMs / 60_000)),
         },
   );
   /**
@@ -404,8 +511,47 @@ export function TaskForm({
     storedProfileId !== "" && !listedProfiles.some((listed) => listed.id === storedProfileId);
   const unlistedProfileText = task?.profile ?? taskFormUnlistedProfileText(storedProfileId);
 
+  /**
+   * Whether the delay box is on screen.
+   *
+   * `delay` is the only setting that reads the number, so the control belongs to
+   * that setting — a box beside a `<select>` reading `skip` invites a value with
+   * no effect. But it is **also** shown whenever the box holds anything, and
+   * that is not a hedge: the store keeps a stored delay across a policy change
+   * (switching to `skip` and back must not throw away what somebody typed), and
+   * the write door refuses an incoherent number whatever the policy is. So a
+   * hidden non-empty box could refuse a save with its cause off screen. Nothing
+   * this form renders may be the reason for a refusal a person cannot see.
+   */
+  const showMissedDelay = form.onMissed === "delay" || form.missedDelayMinutes !== "";
+  /**
+   * The number of minutes the note should claim, which is the whole point of
+   * 59.6 reaching this file.
+   *
+   * The box's value when it holds one, keeper's default when it is empty — the
+   * TypeScript mirror of `tasks::effective_missed_delay_ms`, and the reason the
+   * note is composed rather than written. A box mid-typing or holding nonsense
+   * falls back to the default rather than blanking the sentence: the note is
+   * about the setting, and {@link TASK_FORM_MISSED_DELAY_NOT_A_NUMBER} is about
+   * the box.
+   */
+  const typedDelayMs = taskFormMissedDelayMs(form.missedDelayMinutes);
+  const effectiveDelayMinutes =
+    typedDelayMs === null || typedDelayMs === undefined
+      ? TASK_MISSED_DELAY_MINUTES
+      : typedDelayMs / 60_000;
+
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    // Converted before the save is announced, because a box that holds no number
+    // has nothing to send and `null` would mean something else entirely — see
+    // {@link TASK_FORM_MISSED_DELAY_NOT_A_NUMBER}. `setSaving` has not run yet,
+    // so the form is never left disabled by this exit.
+    const missedDelayMs = taskFormMissedDelayMs(form.missedDelayMinutes);
+    if (missedDelayMs === undefined) {
+      setError(TASK_FORM_MISSED_DELAY_NOT_A_NUMBER);
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -438,6 +584,11 @@ export function TaskForm({
         // note beside the box, which promises exactly that.
         description: form.description === "" ? null : form.description,
         onMissed: form.onMissed,
+        // In milliseconds, which is what the row and every instant on it are in;
+        // the box speaks minutes because every sentence about this setting does.
+        // Sent whatever the policy is, because the store keeps it across a policy
+        // change rather than forgetting what somebody typed.
+        missedDelayMs,
         // The reading this form started from, so a save whose row has moved
         // elsewhere is refused rather than reverting it. `null` on an add form:
         // there is no reading to be stale.
@@ -614,7 +765,35 @@ export function TaskForm({
           ))}
         </select>
       </div>
-      <p className="text-muted-foreground text-xs">{TASK_FORM_ON_MISSED_NOTE}</p>
+      {/* Composed, not written: the sentence has to describe the wait THIS task
+          will actually do, and a literal `30` in it would be false for every
+          task that chose otherwise — the same defect as the wrong number this
+          note shipped with, arrived at from the other side. An unparseable box
+          falls back to the default's number rather than saying nothing, because
+          the note explains the setting and the refusal below explains the box. */}
+      <p className="text-muted-foreground text-xs">
+        {taskFormOnMissedNote(effectiveDelayMinutes)}
+      </p>
+
+      {showMissedDelay && (
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-missed-delay`}>{TASK_FORM_MISSED_DELAY_LABEL}</Label>
+            <Input
+              id={`${fieldId}-missed-delay`}
+              className="w-56"
+              value={form.missedDelayMinutes}
+              disabled={saving}
+              inputMode="numeric"
+              placeholder={String(TASK_MISSED_DELAY_MINUTES)}
+              onChange={(event) =>
+                setForm((live) => ({ ...live, missedDelayMinutes: event.target.value }))
+              }
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{TASK_FORM_MISSED_DELAY_NOTE}</p>
+        </>
+      )}
 
       {/* Rust's sentence, corrected in no way, in the form that asked for it. */}
       {error !== null && (

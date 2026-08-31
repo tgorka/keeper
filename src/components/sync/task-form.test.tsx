@@ -40,6 +40,9 @@ import {
   TASK_FORM_ID_EDIT_NOTE,
   TASK_FORM_ID_LABEL,
   TASK_FORM_KIND_LABEL,
+  TASK_FORM_MISSED_DELAY_LABEL,
+  TASK_FORM_MISSED_DELAY_NOTE,
+  TASK_FORM_MISSED_DELAY_NOT_A_NUMBER,
   TASK_FORM_MODE_LABEL,
   TASK_FORM_ON_MISSED_LABEL,
   TASK_FORM_ON_MISSED_NOTE,
@@ -51,6 +54,8 @@ import {
   TASK_MISSED_DELAY_MINUTES,
   TASK_MISSED_GRACE_MINUTES,
   TaskForm,
+  taskFormMissedDelayMs,
+  taskFormOnMissedNote,
   taskFormUnlistedProfileText,
 } from "@/components/sync/task-form";
 import type { SyncProfileVm, TaskVm } from "@/lib/ipc/client";
@@ -76,6 +81,7 @@ function taskVm(over: Partial<TaskVm> = {}): TaskVm {
     leaseUntilMs: null,
     updatedMs: NOW - 60_000,
     onMissed: "run_now",
+    missedDelayMs: null,
     lastRun: null,
     host: {
       kind: "app",
@@ -159,7 +165,7 @@ describe("TaskForm, adding a task", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
-    // Exactly these nine keys, and `id: ""` above all: an id invented here
+    // Exactly these ten keys, and `id: ""` above all: an id invented here
     // would be a second minter, and `sync_ipc.rs` already has the only one.
     await waitFor(() =>
       expect(mockSave).toHaveBeenCalledWith({
@@ -173,6 +179,10 @@ describe("TaskForm, adding a task", () => {
         // rule the schedule two lines up follows.
         description: null,
         onMissed: "run_now",
+        // The control is not even on screen for `run_now`, so absence is the
+        // only thing it could send — and absence means keeper's own delay, which
+        // is what a task created before this box existed waited.
+        missedDelayMs: null,
         // No reading to be stale: a create has no baseline, and passing one
         // would make the store refuse a row it is about to insert.
         baselineUpdatedMs: null,
@@ -441,6 +451,8 @@ describe("TaskForm, editing a task", () => {
         schedule: "@weekly",
         description: null,
         onMissed: "run_now",
+        // Absent on the stored row, and this edit touched nothing about it.
+        missedDelayMs: null,
         // The reading this form opened on, which is what makes the store's
         // refusal possible at all.
         baselineUpdatedMs: NOW - 60_000,
@@ -609,6 +621,143 @@ describe("TaskForm, the missed-window policy", () => {
   });
 });
 
+describe("TaskForm, how long the delay is", () => {
+  it("offers the delay box only for delay, and never hides a value it holds", async () => {
+    // THE PROPERTY OF STORY 59.6's form half. `delay` is the one setting that
+    // reads the number, so a box beside a `<select>` reading `skip` would invite
+    // a value with no effect — and this form's whole history is about not telling
+    // somebody something untrue.
+    mockProfiles.mockResolvedValue([]);
+    render(<TaskForm task={taskVm({ onMissed: "run_now" })} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    expect(screen.queryByLabelText(TASK_FORM_MISSED_DELAY_LABEL)).toBeNull();
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL), {
+      target: { value: "delay" },
+    });
+    const box = screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL);
+    expect(box).toHaveValue("");
+    expect(screen.getByText(TASK_FORM_MISSED_DELAY_NOTE)).toBeInTheDocument();
+
+    // And the other half, which is not symmetry for its own sake: the store
+    // keeps a stored delay across a policy change and the write door refuses an
+    // incoherent one whatever the policy is, so a hidden non-empty box could
+    // refuse a save with its cause off screen.
+    fireEvent.change(box, { target: { value: "240" } });
+    fireEvent.change(screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL), {
+      target: { value: "skip" },
+    });
+    expect(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL)).toHaveValue("240");
+  });
+
+  it("seeds from the stored value in minutes and sends it back in milliseconds", async () => {
+    // The unit boundary, asserted in both directions in one test because it is
+    // one claim: the box speaks minutes because every sentence about this setting
+    // does, and the row speaks milliseconds because every instant on it does.
+    const stored = taskVm({ onMissed: "delay", missedDelayMs: 4 * 3_600_000 });
+    mockProfiles.mockResolvedValue([]);
+    mockSave.mockResolvedValue(stored);
+    render(<TaskForm task={stored} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    expect(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL)).toHaveValue("240");
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL), {
+      target: { value: "90" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ missedDelayMs: 90 * 60_000 }),
+      ),
+    );
+  });
+
+  it("sends an empty box as absence, which is what means keeper's own delay", async () => {
+    // `null`, never `TASK_MISSED_DELAY_MINUTES * 60_000`, and the difference is
+    // not cosmetic: a row that CHOSE thirty minutes keeps thirty minutes if the
+    // constant is ever retuned, and a row that chose nothing follows it. A form
+    // that helpfully filled in the default would silently opt every task it
+    // saved out of ever tracking the constant again.
+    const stored = taskVm({ onMissed: "delay", missedDelayMs: 4 * 3_600_000 });
+    mockProfiles.mockResolvedValue([]);
+    mockSave.mockResolvedValue(taskVm({ onMissed: "delay" }));
+    render(<TaskForm task={stored} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL), {
+      target: { value: "" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ missedDelayMs: null })),
+    );
+  });
+
+  it("refuses a box that holds no number rather than sending absence", async () => {
+    // The one refusal this form owns, and the reason it must: the wire type is
+    // `number | null`, so there is no third state for "not a number". Reading it
+    // as `null` would store *use keeper's default* while the person is looking at
+    // what they typed — a control that reports one thing and does another, which
+    // is the whole shape Story 59.6 exists to remove rather than add.
+    mockProfiles.mockResolvedValue([]);
+    render(<TaskForm task={taskVm({ onMissed: "delay" })} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    for (const nonsense of ["soon", "12abc", "1.5", ""]) {
+      mockSave.mockClear();
+      fireEvent.change(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL), {
+        target: { value: nonsense },
+      });
+      fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+      if (nonsense === "") {
+        // The control case, in the same loop so the assertion above cannot be
+        // passing because nothing ever saves: empty is absence and DOES save.
+        await waitFor(() => expect(mockSave).toHaveBeenCalled());
+        continue;
+      }
+      expect(await screen.findByTestId(TASK_FORM_ERROR_TESTID)).toHaveTextContent(
+        TASK_FORM_MISSED_DELAY_NOT_A_NUMBER,
+      );
+      expect(mockSave).not.toHaveBeenCalled();
+      // And what was typed survives, because the typed value is what a
+      // correction is driven from.
+      expect(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL)).toHaveValue(nonsense);
+    }
+  });
+
+  it("does not send a delay the bounds refuse, it renders Rust's refusal", async () => {
+    // The bounds are Rust's, and this asserts that they STAY Rust's: nothing here
+    // knows that fifteen minutes is the floor, and the sentence a person reads is
+    // the one `validate_missed_delay_ms` wrote.
+    mockProfiles.mockResolvedValue([]);
+    mockSave.mockRejectedValue({
+      code: "internal",
+      message:
+        "invalid sync configuration: task missed-window delay must be at least the grace period (900000 ms), because the grace period is the interval that concludes nobody was home — a shorter delay would elapse before the window it holds back counted as missed, which is run_now wearing delay's name, got 300000 ms",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TaskForm task={taskVm({ onMissed: "delay" })} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL), {
+      target: { value: "5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+
+    // Sent, not pre-refused: five minutes is a number, and whether it is a
+    // coherent delay is the write door's answer to give.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ missedDelayMs: 300_000 })),
+    );
+    expect(await screen.findByTestId(TASK_FORM_ERROR_TESTID)).toHaveTextContent(
+      /concludes nobody was home/,
+    );
+  });
+});
+
 describe("TaskForm, the task's description", () => {
   it("round-trips the stored description and sends what was typed, untrimmed", async () => {
     // THE PROPERTY OF STORY 59.5, and it has the same shape as the policy above:
@@ -730,6 +879,15 @@ describe("TaskForm, the task's description", () => {
  * repo's existing idiom for an invariant about a Rust file — `task-host-tick.test.ts`,
  * `command-registration.test.ts`, `tray-notes-labels.test.ts`.
  *
+ * **Re-pointed by Story 59.6, not deleted.** Once a task may carry its own delay
+ * the sentence has to be composed from the *effective* value, and a guard that
+ * only ever checked one fixed string would have stopped covering the sentence
+ * most people read. So it now pins two things: the DEFAULT composition against
+ * Rust's constants — still the only mechanical direction available — and the
+ * composed one against the value it was given. The second half is what catches a
+ * note that ignores its argument, which is the 59.6-shaped way to reintroduce
+ * exactly the defect above.
+ *
  * **What this does NOT prove:** that `decide` behaves as the sentence says.
  * `keeper-sync`'s own tests own that. This proves the sentence a person reads
  * carries the numbers that code is compiled with.
@@ -776,11 +934,62 @@ wording needs rewriting rather than this regex widening`,
     expect(TASK_FORM_ON_MISSED_NOTE).toContain("the anchor is the noticing and not the window");
   });
 
-  it("is the sentence the form actually renders", () => {
+  it("composes the delay's number from the value it is given, not from the constant", () => {
+    // The 59.6 half, and each number still asserted IN ITS ROLE for the reason
+    // above. A note that ignored its argument would pass a bare
+    // `toContain("240")` — the grace's 15 and the anchor clause are in the same
+    // sentence — so the assertion is the number together with the instant it is
+    // measured from.
+    const composed = taskFormOnMissedNote(240);
+    expect(composed).toContain("runs it 240 minutes after a host noticed it");
+    expect(composed).not.toContain(
+      `runs it ${TASK_MISSED_DELAY_MINUTES} minutes after a host noticed it`,
+    );
+    // The grace is NOT a parameter: one boundary for the whole policy, which no
+    // task may move, and a per-task grace would make "nobody was home" mean
+    // different things on two rows in one store.
+    expect(composed).toContain(`concludes after ${TASK_MISSED_GRACE_MINUTES} minutes`);
+    expect(composed).toContain(`those ${TASK_MISSED_GRACE_MINUTES} minutes`);
+    // And the default composition is exactly this function at the constant, so
+    // the mirror above is a claim about the sentence a real form renders.
+    expect(TASK_FORM_ON_MISSED_NOTE).toBe(taskFormOnMissedNote(TASK_MISSED_DELAY_MINUTES));
+  });
+
+  it("is the sentence the form actually renders, at the default and at a chosen value", () => {
     // The constants could be right and the note could be right while the form
-    // rendered some other string. One assertion closes that.
+    // rendered some other string. One assertion closes that — twice, because
+    // since 59.6 there are two sentences a person can be shown and only the
+    // second one is new.
     mockProfiles.mockResolvedValue([]);
     render(<TaskForm onSaved={vi.fn()} />);
     expect(screen.getByText(TASK_FORM_ON_MISSED_NOTE)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_ON_MISSED_LABEL), {
+      target: { value: "delay" },
+    });
+    fireEvent.change(screen.getByLabelText(TASK_FORM_MISSED_DELAY_LABEL), {
+      target: { value: "240" },
+    });
+    expect(screen.getByText(taskFormOnMissedNote(240))).toBeInTheDocument();
+    expect(screen.queryByText(TASK_FORM_ON_MISSED_NOTE)).toBeNull();
+  });
+
+  it("converts minutes to the wire's milliseconds, and keeps absence apart from zero", () => {
+    // The tri-state is the contract: `null` is *use the default*, `undefined` is
+    // *that is not a number*, and reading either as the other is the failure this
+    // whole story is about. Asserted directly because a test driving only the
+    // rendered box cannot tell them apart.
+    expect(taskFormMissedDelayMs("")).toBeNull();
+    expect(taskFormMissedDelayMs("240")).toBe(240 * 60_000);
+    // Zero and a box of spaces both convert to a number the write door refuses,
+    // rather than to absence. `Number(" ")` being 0 is JavaScript's, and keeping
+    // it is the schedule field's `=== ""`-not-`.trim()` rule applied here: a box
+    // holding spaces is not an empty box, and coercing it to *use the default*
+    // would store something other than what is on screen.
+    expect(taskFormMissedDelayMs("0")).toBe(0);
+    expect(taskFormMissedDelayMs(" ")).toBe(0);
+    for (const nonsense of ["soon", "12abc", "1.5", "1e999", "-"]) {
+      expect(taskFormMissedDelayMs(nonsense)).toBeUndefined();
+    }
   });
 });
