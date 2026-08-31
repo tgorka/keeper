@@ -17,8 +17,13 @@
 //! # Exit codes
 //!
 //! `0` success · `1` operational failure · `2` configuration error ·
-//! `3` a prerequisite is missing. A wrapper script can branch on those: `2` and
-//! `3` will never succeed on retry, `1` might.
+//! `3` a prerequisite is missing · `4` the work did not run, and that is not a
+//! failure. A wrapper script can branch on those: `2` and `3` will never
+//! succeed on retry, `1` might, and `4` says there was nothing wrong and
+//! nothing to alert about.
+//!
+//! `4` is reachable only from `tasks run` — see [`EXIT_DEFERRED`] for why
+//! deferral needs a number of its own rather than being folded into `0` or `1`.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::io::BufRead as _;
@@ -29,16 +34,17 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use keeper_sync::db::UnitStanding;
+use keeper_sync::db::{TaskListing, TaskRow, TaskRunRow, UnitStanding, UnknownTask};
 use keeper_sync::engine::{Engine, VerifyReport};
 use keeper_sync::lfs::audit::RemoteAudit;
 use keeper_sync::lfs::hydrate::{
-    ContentRefusal, Materialization, MaterializeOutcome, Pin, Release,
+    ContentRefusal, KeepFor, Materialization, MaterializeOutcome, Pin, Release,
 };
 use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
 use keeper_sync::provenance::SyncSource;
+use keeper_sync::tasks::{TaskKind, TaskMode, TaskOutcome};
 use keeper_sync::volume::{self, VolumeStatus};
 use keeper_sync::{
     ProfileState, Result as SyncResult, SyncDirection, SyncError, SyncLane, SyncPlatform,
@@ -57,6 +63,28 @@ pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_CONFIG: u8 = 2;
 /// A hard prerequisite is absent — in practice, `git` (AD-41).
 pub const EXIT_PREREQUISITE: u8 = 3;
+/// The task ran nothing, and that is not a failure (Story 57.3).
+///
+/// A cron wrapper needs **four** answers, not three: *worked* (`EXIT_OK`),
+/// *did not run, do not alert* (this), *failed, alert* (`EXIT_FAILURE`) and
+/// *fix your configuration* (`EXIT_CONFIG`). The three that existed could not
+/// express the second, and both ways of folding it in are wrong in a direction
+/// somebody pays for:
+///
+/// * Folding deferral into `EXIT_OK` makes an external drive that has been
+///   unplugged for a month indistinguishable from a nightly sweep that is
+///   working. Housekeeping that silently stopped is the invisible-failure shape
+///   this epic exists to close.
+/// * Folding it into `EXIT_FAILURE` pages somebody every night for AD-48's
+///   *"an unplugged volume is absence, never failure"* — and an alert that
+///   fires nightly for a normal condition is an alert nobody reads.
+///
+/// **Additive, so nothing that already works changes.** No pre-existing verb
+/// can return it: [`sync_exit_code`] never yields `4`, and the only producer is
+/// [`task_exit_code`] via `tasks run`. Story 57.7's `RestartPreventExitStatus`
+/// will therefore list it beside `2` and `3` — the three numbers that mean "a
+/// restart cannot help" — while `1` stays restartable.
+pub const EXIT_DEFERRED: u8 = 4;
 
 /// How long a stop signal waits for in-flight work to finalize.
 ///
@@ -146,6 +174,12 @@ pub fn sync_exit_code(err: &SyncError) -> u8 {
         // `EXIT_CONFIG` — nothing about the configuration is wrong when keeper
         // declines to overwrite a file the user edited.
         SyncError::Refused(_) => EXIT_FAILURE,
+        // A one-shot run against a folder whose working copy was never made
+        // did nothing it was asked to do, so `$?` has to say so — and
+        // `Restart=on-failure` is exactly right here: the repair is mechanical
+        // and the next run attempts it. Never `EXIT_CONFIG`: the configuration
+        // is fine, the checkout is not.
+        SyncError::CheckoutUnfinished { .. } => EXIT_FAILURE,
         SyncError::GitCommand { .. }
         | SyncError::Network { .. }
         | SyncError::Auth { .. }
@@ -293,7 +327,8 @@ pub enum Command {
         #[arg(long)]
         remote: bool,
     },
-    /// Ask for one virtual path's content (FR-338).
+    /// Ask for one virtual path's content, optionally for a stated time
+    /// (FR-338).
     ///
     /// Publishes the file inline when this machine already holds the object,
     /// and otherwise **fetches it before returning**: the verb performs its own
@@ -304,12 +339,27 @@ pub enum Command {
     /// wrapper can act on it. A path whose worktree bytes are neither the
     /// committed pointer nor the content it names is **refused by name** and
     /// left exactly as it is: keeper does not overwrite a local modification.
+    ///
+    /// With `--for`, this path is kept for the time you name and then let go on
+    /// the first successful sync after it runs out — whatever the folder's own
+    /// release interval says, in both directions.
     Materialize {
         /// Profile id or name. Required: materializing is a write, and "all
         /// folders" is not a thing anybody means by it.
         profile: String,
         /// The path inside the folder, as `ls-files` spells it.
         subpath: String,
+        /// How long to keep this one path's content: a whole number of
+        /// minutes, hours or days — `30m`, `2h`, `1d` — or `0` for no limit.
+        ///
+        /// It replaces this folder's own release interval for this path alone,
+        /// in both directions: an hour inside a day-long window goes sooner,
+        /// and a week stays longer. A pin still outranks it, and content this
+        /// machine wrote that nothing has confirmed the server holds is still
+        /// never released at any age. Omit it, or pass `0`, to leave the path
+        /// on the folder's own interval.
+        #[arg(long = "for", value_name = "DURATION", value_parser = parse_keep_for)]
+        keep_for: Option<u64>,
     },
     /// Release one path's content, leaving the pointer this folder committed
     /// (FR-332, FR-333).
@@ -382,6 +432,20 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Name, schedule, inspect and run keeper's own housekeeping tasks
+    /// (FR-347, FR-349, AD-136).
+    ///
+    /// The door onto the task record for a machine with no app attached: a
+    /// `cron` entry, a systemd timer or a person at a prompt all reach the same
+    /// `keeper_sync::engine::Engine` verbs the desktop host's own tick reaches,
+    /// so a requested run and a scheduled run leave the same row behind. There
+    /// is no scheduler here — this process exits — and nothing on this
+    /// subcommand creates a task, a schedule or a default: a box with no
+    /// `tasks` rows behaves exactly as it did before they existed.
+    Tasks {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
     /// git clean/smudge filter for LFS content. Invoked by git, not by hand.
     ///
     /// Registered as `filter.lfs.clean` / `filter.lfs.smudge` in each managed
@@ -423,6 +487,158 @@ pub enum LfsDirection {
         #[arg(long, value_name = "DIR")]
         repo: PathBuf,
     },
+}
+
+/// The seven things an operator does to a task.
+///
+/// Every doc comment below describes what the verb does **here**, in this
+/// build. Story 56.13 shipped a `--help` for `materialize` that still described
+/// the queue-and-exit behaviour it had stopped having, and it survived review
+/// precisely because this prose sits on a clap enum a long way from the code it
+/// claims to describe. So each of these was written against the function it
+/// dispatches to, and the test `tasks_run_help_names_the_exit_codes_it_can_produce`
+/// holds the one that a wrapper script cannot afford to have go stale.
+#[derive(Debug, Subcommand)]
+pub enum TaskCommand {
+    /// List every stored task, with its target, schedule and last run.
+    ///
+    /// A row this build cannot read — a `kind`, `mode` or schedule written by a
+    /// newer keeper on the other host — is listed as **unknown with its reason**
+    /// rather than hidden (NFR-43). Hiding it would make a machine with one
+    /// task nobody here can run look like a machine with no tasks, which is the
+    /// difference between "nothing is scheduled" and "something is scheduled
+    /// and this binary is too old to run it".
+    List,
+    /// Show one task and its recorded runs, newest first.
+    ///
+    /// Reads only. The history is capped at `keeper_sync::db::TASK_RUNS_CAP`
+    /// runs by the store itself, which is what answers "has this been working
+    /// lately" without letting `sync.db` grow because a schedule is doing its
+    /// job.
+    Status {
+        /// The task's id, exactly as `tasks list` spells it.
+        task: String,
+    },
+    // The exit codes below are one paragraph each, separated by blank lines,
+    // rather than a markdown list: clap collapses a list into a single
+    // paragraph, and the whole point of the block is that a person reading
+    // `--help` can find the number they got in `$?`.
+    /// Run one task now, and exit with what happened.
+    ///
+    /// The same engine path the scheduled tick takes: the same lease, the same
+    /// row in `task_runs`, the same refusals. The schedule is deliberately not
+    /// moved — asking for a run now is not asking to skip the next one.
+    ///
+    /// # Exit codes, which is what this verb is for
+    ///
+    /// `0` — the work ran and did what it was asked to.
+    ///
+    /// `4` — the work did NOT run, and nothing is wrong: its drive is
+    /// unplugged, its folder is paused, the folder was already syncing, or the
+    /// other host holds this task's lease. Recorded as `deferred` or `busy`. Do
+    /// not alert on this.
+    ///
+    /// `1` — the work ran and failed, or a stored outcome this build cannot
+    /// read was recorded. The reason is in the run's `detail`.
+    ///
+    /// `2` — the selector is wrong, or the task is off or disabled. Retrying
+    /// changes nothing; somebody has to edit something.
+    Run {
+        /// The task's id, exactly as `tasks list` spells it.
+        task: String,
+    },
+    /// Create a task, or change one that exists.
+    ///
+    /// On **create** `--kind` is required: a task with no kind is a row nothing
+    /// could ever run. On **update** every flag you omit keeps its stored value,
+    /// and the two clearing flags are what make a binding and a schedule
+    /// removable — a knob you can set but never unset is exactly the dead knob
+    /// this epic exists to close.
+    ///
+    /// A stored task's **kind cannot be changed**, and passing a different one
+    /// is refused: the armed window and the whole run history belong to the kind
+    /// that made them, so a `sync` task turned into a `release` task would
+    /// delete at an instant armed for a sync and show a sync's history as its
+    /// own. Forget it and create it again.
+    ///
+    /// Never writes `enabled`: `tasks enable` and `tasks disable` own that
+    /// column, so a settings-shaped read-modify-write here cannot silently
+    /// un-pause a task somebody paused. Bringing a task back into service —
+    /// enabling it, or putting it back on `--mode scheduled` — arms its schedule
+    /// afresh rather than firing a window that fell into the past while it was
+    /// out of service.
+    Set(TaskSetArgs),
+    /// Make a task live again, leaving its mode and schedule exactly as they are.
+    ///
+    /// `enabled` and `mode` answer different questions (AD-135): `mode` says who
+    /// may trigger the task, `enabled` says whether the row is live at all. A
+    /// disabled `scheduled` task keeps its schedule and resumes on it.
+    Enable {
+        /// The task's id, exactly as `tasks list` spells it.
+        task: String,
+    },
+    /// Take a task out of service without forgetting anything about it.
+    ///
+    /// Neither the tick nor `tasks run` will touch it while it is disabled — an
+    /// "off" that still runs when asked is not off — and its schedule, its
+    /// binding and its whole run history survive, so re-enabling it is one word.
+    Disable {
+        /// The task's id, exactly as `tasks list` spells it.
+        task: String,
+    },
+    /// Delete a task and everything it recorded.
+    ///
+    /// Its run history goes with it. This is the only destructive verb here, and
+    /// it destroys bookkeeping rather than content: nothing a task ever did is
+    /// undone by forgetting the task.
+    Forget {
+        /// The task's id, exactly as `tasks list` spells it.
+        task: String,
+    },
+}
+
+/// Everything `tasks set` can write, as one `Args` struct.
+///
+/// A struct rather than an inline variant, the shape [`AddArgs`] already has,
+/// because a verb with seven knobs read by one function is a verb whose
+/// arguments want a name — and because `conflicts_with` reads far better beside
+/// the field it contradicts than in a `#[command(group)]` somewhere else.
+#[derive(Debug, Args)]
+pub struct TaskSetArgs {
+    /// The task's id. Creates it when nothing is stored under that name.
+    pub task: String,
+    /// What the task does. Required to create one; kept as stored otherwise.
+    #[arg(long, value_enum)]
+    pub kind: Option<TaskKindArg>,
+    /// Bind the task to one folder, by id or name.
+    #[arg(long, value_name = "SEL")]
+    pub profile: Option<String>,
+    /// Unbind the task: it belongs to the machine, not to one folder.
+    ///
+    /// `--profile`'s inverse, and the reason a binding is not write-once.
+    #[arg(long, conflicts_with = "profile")]
+    pub host_wide: bool,
+    /// When the task is due: `every 30m`, `every 2h`, or a 5-field cron
+    /// expression like `0 3 * * *`.
+    ///
+    /// Refused at the write door when keeper cannot parse it, with the
+    /// expression quoted — a schedule nobody can read is a schedule that would
+    /// report itself enabled and never fire.
+    #[arg(long, value_name = "EXPR")]
+    pub schedule: Option<String>,
+    /// Forget the schedule. `--schedule`'s inverse.
+    ///
+    /// Refused together with `--mode scheduled`, by the write door rather than
+    /// by clap: a scheduled task with no schedule is the silent-no-op row
+    /// `keeper_sync::db::upsert_task` exists to refuse.
+    #[arg(long, conflicts_with = "schedule")]
+    pub no_schedule: bool,
+    /// Who may trigger the task: `off`, `manual` or `scheduled`.
+    ///
+    /// On create this defaults to `scheduled` when you gave a `--schedule` and
+    /// `manual` when you did not. On update it keeps its stored value.
+    #[arg(long, value_enum)]
+    pub mode: Option<TaskModeArg>,
 }
 
 #[derive(Debug, Args)]
@@ -519,6 +735,37 @@ pub enum LfsModeArg {
     Disabled,
 }
 
+/// `--kind`'s vocabulary, which is [`TaskKind`]'s and nothing more.
+///
+/// A separate enum for the same reason [`DirectionArg`] is one: clap's
+/// [`ValueEnum`] derive belongs to the CLI, and putting it on the engine's own
+/// type would let a `--help`-driven rename reach a stored `kind` column. The
+/// `From` impl below is the only bridge, and it is exhaustive, so a kind added
+/// to the engine is a compile error here rather than a flag value that silently
+/// does not exist.
+///
+/// **There is no `update` here and there must never be one.** `TaskKind` has no
+/// such variant by design — a schedule that replaces the keeper binary is what
+/// the anti-timer stance forbids — and adding one to this enum could not
+/// convert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TaskKindArg {
+    Sync,
+    Release,
+}
+
+/// `--mode`'s vocabulary, which is [`TaskMode`]'s and nothing more.
+///
+/// Kebab-case by clap's own convention, which costs nothing here: all three
+/// words are single ones, and they are the same three spellings the store uses,
+/// so `tasks list` output and `--mode` input read identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TaskModeArg {
+    Off,
+    Manual,
+    Scheduled,
+}
+
 impl From<DirectionArg> for SyncDirection {
     fn from(value: DirectionArg) -> Self {
         match value {
@@ -544,6 +791,25 @@ impl From<LfsModeArg> for LfsMode {
             LfsModeArg::Materialize => Self::Materialize,
             LfsModeArg::PointerOnly => Self::PointerOnly,
             LfsModeArg::Disabled => Self::Disabled,
+        }
+    }
+}
+
+impl From<TaskKindArg> for TaskKind {
+    fn from(value: TaskKindArg) -> Self {
+        match value {
+            TaskKindArg::Sync => Self::Sync,
+            TaskKindArg::Release => Self::Release,
+        }
+    }
+}
+
+impl From<TaskModeArg> for TaskMode {
+    fn from(value: TaskModeArg) -> Self {
+        match value {
+            TaskModeArg::Off => Self::Off,
+            TaskModeArg::Manual => Self::Manual,
+            TaskModeArg::Scheduled => Self::Scheduled,
         }
     }
 }
@@ -593,46 +859,64 @@ impl Printer {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-/// Run one command.
+/// Run one command, and answer with the exit code it earned.
 ///
 /// `config` arrives as a `Result` rather than being loaded here because
 /// `main` needs the configured log level before logging exists — and because
 /// `init`, `doctor` and `logs` must all work on a box whose config is missing
 /// or broken, which is exactly when an operator reaches for them.
+///
+/// # Why the code is part of the answer and not only of the failure
+///
+/// This used to return `Result<(), CliError>`, and `main` mapped `Ok` to
+/// [`EXIT_OK`] — which was true of every verb until `tasks run`, because
+/// `tasks run` can **succeed at doing nothing**: an unplugged drive is
+/// [`EXIT_DEFERRED`], and it is not an error in any sense a `CliError` could
+/// carry. Saying it through the error channel would have been wrong twice over:
+/// a deferral is not a failure, so nothing would log it correctly; and `main`
+/// prints a JSON failure envelope for every `Err`, which would have put a
+/// *second* document on stdout over the one the verb had already emitted —
+/// breaking `ls_files_document`'s own rule that one invocation produces exactly
+/// one JSON document.
+///
+/// So every other arm ends in `.map(|()| EXIT_OK)`, which says the same thing
+/// it always did, and the `Tasks` arm returns the number it measured.
 pub async fn run(
     cli: Cli,
     platform: LinuxPlatform,
     config_path: PathBuf,
     config: SyncResult<DaemonConfig>,
-) -> std::result::Result<(), CliError> {
+) -> std::result::Result<u8, CliError> {
     let printer = Printer::new(cli.json);
     match cli.command {
-        Command::Init { force } => cmd_init(&printer, &config_path, &platform, force),
-        Command::Logs { lines } => cmd_logs(&printer, &platform, lines),
+        Command::Init { force } => {
+            cmd_init(&printer, &config_path, &platform, force).map(|()| EXIT_OK)
+        }
+        Command::Logs { lines } => cmd_logs(&printer, &platform, lines).map(|()| EXIT_OK),
         // Runs inside a `git` invocation: it must write ONLY object bytes to
         // stdout, so it bypasses the printer entirely.
-        Command::Update { check } => cmd_update(&printer, check),
-        Command::Lfs { direction } => cmd_lfs_filter(direction),
-        Command::Doctor => cmd_doctor(&printer, &platform, &config_path, config),
+        Command::Update { check } => cmd_update(&printer, check).map(|()| EXIT_OK),
+        Command::Lfs { direction } => cmd_lfs_filter(direction).map(|()| EXIT_OK),
+        Command::Doctor => cmd_doctor(&printer, &platform, &config_path, config).map(|()| EXIT_OK),
         Command::Add(args) => {
             let engine = engine_for(&platform, config)?;
-            cmd_add(&printer, &engine, &config_path, args)
+            cmd_add(&printer, &engine, &config_path, args).map(|()| EXIT_OK)
         }
         Command::List => {
             let engine = engine_for(&platform, config)?;
-            cmd_list(&printer, &engine)
+            cmd_list(&printer, &engine).map(|()| EXIT_OK)
         }
         Command::Status { profile } => {
             let engine = engine_for(&platform, config)?;
-            cmd_status(&printer, &engine, profile.as_deref())
+            cmd_status(&printer, &engine, profile.as_deref()).map(|()| EXIT_OK)
         }
         Command::Pause { profile } => {
             let engine = engine_for(&platform, config)?;
-            cmd_set_enabled(&printer, &engine, &profile, false)
+            cmd_set_enabled(&printer, &engine, &profile, false).map(|()| EXIT_OK)
         }
         Command::Resume { profile } => {
             let engine = engine_for(&platform, config)?;
-            cmd_set_enabled(&printer, &engine, &profile, true)
+            cmd_set_enabled(&printer, &engine, &profile, true).map(|()| EXIT_OK)
         }
         Command::Verify {
             profile,
@@ -640,35 +924,69 @@ pub async fn run(
             repair,
         } => {
             let engine = engine_for(&platform, config)?;
-            cmd_verify(&printer, &engine, profile.as_deref(), remote, repair).await
+            cmd_verify(&printer, &engine, profile.as_deref(), remote, repair)
+                .await
+                .map(|()| EXIT_OK)
         }
         Command::LsFiles { profile, remote } => {
             let engine = engine_for(&platform, config)?;
-            cmd_ls_files(&printer, &engine, profile.as_deref(), remote).await
+            cmd_ls_files(&printer, &engine, profile.as_deref(), remote)
+                .await
+                .map(|()| EXIT_OK)
         }
-        Command::Materialize { profile, subpath } => {
+        Command::Materialize {
+            profile,
+            subpath,
+            keep_for,
+        } => {
             let engine = engine_for(&platform, config)?;
-            cmd_materialize(&printer, &engine, &profile, &subpath).await
+            cmd_materialize(&printer, &engine, &profile, &subpath, keep_for)
+                .await
+                .map(|()| EXIT_OK)
         }
         Command::Dehydrate { profile, subpath } => {
             let engine = engine_for(&platform, config)?;
-            cmd_dehydrate(&printer, &engine, &profile, &subpath).await
+            cmd_dehydrate(&printer, &engine, &profile, &subpath)
+                .await
+                .map(|()| EXIT_OK)
         }
         Command::Pin { profile, subpath } => {
             let engine = engine_for(&platform, config)?;
-            cmd_pin(&printer, &engine, &profile, &subpath, true)
+            cmd_pin(&printer, &engine, &profile, &subpath, true).map(|()| EXIT_OK)
         }
         Command::Unpin { profile, subpath } => {
             let engine = engine_for(&platform, config)?;
-            cmd_pin(&printer, &engine, &profile, &subpath, false)
+            cmd_pin(&printer, &engine, &profile, &subpath, false).map(|()| EXIT_OK)
         }
         Command::Sync { profile, once } => {
             let engine = engine_for(&platform, config)?;
-            cmd_sync(&printer, engine, profile.as_deref(), once).await
+            cmd_sync(&printer, engine, profile.as_deref(), once)
+                .await
+                .map(|()| EXIT_OK)
         }
         Command::Watch => {
             let engine = engine_for(&platform, config)?;
-            run_supervisor(&printer, engine).await
+            run_supervisor(&printer, engine).await.map(|()| EXIT_OK)
+        }
+        Command::Tasks { command } => {
+            let engine = engine_for(&platform, config)?;
+            // One instant for the whole invocation, so every countdown a verb
+            // renders is measured from the same "now" — and so the commands
+            // below need nothing from the platform but this number.
+            let now_ms = platform.now_ms();
+            match command {
+                TaskCommand::List => cmd_task_list(&printer, &engine, now_ms),
+                TaskCommand::Status { task } => cmd_task_status(&printer, &engine, now_ms, &task),
+                TaskCommand::Run { task } => cmd_task_run(&printer, &engine, now_ms, &task).await,
+                TaskCommand::Set(args) => cmd_task_set(&printer, &engine, now_ms, &args),
+                TaskCommand::Enable { task } => {
+                    cmd_task_set_enabled(&printer, &engine, now_ms, &task, true)
+                }
+                TaskCommand::Disable { task } => {
+                    cmd_task_set_enabled(&printer, &engine, now_ms, &task, false)
+                }
+                TaskCommand::Forget { task } => cmd_task_forget(&printer, &engine, &task),
+            }
         }
     }
 }
@@ -1540,6 +1858,64 @@ async fn cmd_ls_files(
 // materialize
 // ---------------------------------------------------------------------------
 
+/// `--for`'s value: a whole number of minutes, hours or days, in milliseconds
+/// (Story 56.17).
+///
+/// A clap `value_parser`, so a malformed duration is refused **before any
+/// engine is opened, any profile is resolved and any pointer is looked at** —
+/// the same discipline `SyncProfile::validate`'s `validate_quiet_time` applies
+/// to a quiet window, and for the same reason: a duration nobody can parse is
+/// a duration that would silently mean something else, and here the something
+/// else is when keeper deletes a copy of somebody's file.
+///
+/// **Refused rather than coerced, with the input quoted.** `1w` is not a week
+/// rounded to seven days, `1.5h` is not ninety minutes and `2` is not two of
+/// anything: each is somebody expecting a unit this verb does not have, and
+/// guessing which would be worse than saying so. The sentence names all four
+/// accepted forms, because the reader is looking at it precisely because they
+/// do not know them.
+///
+/// **`0` is accepted and means indefinite**, which is what the verb already
+/// does with no flag at all — see [`keeper_sync::lfs::hydrate::KeepFor`] for
+/// the one difference between saying it and not saying it.
+///
+/// Three units and no seconds: the shortest release window `SyncProfile`
+/// accepts is a minute (`MIN_RELEASE_TTL_MS`) and the sweep looks at most once
+/// an hour, so a duration in seconds would be a promise nothing keeps.
+/// Overflow is refused by the same sentence rather than saturating, for
+/// `validate`'s reason: a number that large is one somebody typed.
+fn parse_keep_for(value: &str) -> std::result::Result<u64, String> {
+    let malformed = || {
+        format!(
+            "--for must be a whole number of minutes, hours or days like 30m, 2h or 1d, \
+             or 0 for no limit, got {value}"
+        )
+    };
+    if value == "0" {
+        return Ok(0);
+    }
+    let (digits, unit_ms) = match value.as_bytes().last() {
+        Some(b'm') => (&value[..value.len() - 1], 60_000u64),
+        Some(b'h') => (&value[..value.len() - 1], 60 * 60_000),
+        Some(b'd') => (&value[..value.len() - 1], 24 * 60 * 60_000),
+        _ => return Err(malformed()),
+    };
+    // `str::parse::<u64>` accepts a leading `+` and rejects a leading `-`, but
+    // it would also accept `+2h`; the digit test is what keeps the accepted set
+    // exactly the four forms the sentence names.
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(malformed());
+    }
+    let count: u64 = digits.parse().map_err(|_| malformed())?;
+    if count == 0 {
+        // `0m` is a duration of zero, which is not "no limit" — it is a person
+        // asking for a window that has already closed. Refused rather than
+        // silently promoted to indefinite, because those are opposite answers.
+        return Err(malformed());
+    }
+    count.checked_mul(unit_ms).ok_or_else(malformed)
+}
+
 /// One materialization as a human reads it.
 ///
 /// Pure, and taking the profile's name rather than the profile, so the sentence
@@ -1696,6 +2072,7 @@ async fn cmd_materialize(
     engine: &Engine,
     wanted: &str,
     subpath: &str,
+    keep_for_ms: Option<u64>,
 ) -> std::result::Result<(), CliError> {
     let profiles = engine.list_profiles()?;
     let matched = select(&profiles, Some(wanted))?;
@@ -1713,7 +2090,12 @@ async fn cmd_materialize(
     };
 
     let done = engine
-        .materialize_entry_now(&profile.id, subpath, SyncSource::Cli)
+        .materialize_entry_now(
+            &profile.id,
+            subpath,
+            SyncSource::Cli,
+            KeepFor::from_ms(keep_for_ms),
+        )
         .await
         .map_err(|err| {
             // `Busy` is `EXIT_OK` for `sync --once`, where losing a race did no
@@ -2546,6 +2928,932 @@ fn cmd_update(printer: &Printer, check_only: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// tasks
+// ---------------------------------------------------------------------------
+
+/// Map one recorded outcome onto the number a wrapper script branches on
+/// (Story 57.3).
+///
+/// **Exhaustive with no `_` arm**, the discipline [`sync_exit_code`] already
+/// carries and for a sharper reason: a wildcard here would give a
+/// [`TaskOutcome`] added later a number silently, and the two numbers it could
+/// silently get are "everything is fine" and "wake somebody up". A compile
+/// error is the only acceptable way to learn that a new outcome exists.
+///
+/// # Why `Busy` defers here while `SyncError::Busy` succeeds elsewhere
+///
+/// [`sync_exit_code`] maps [`SyncError::Busy`] to [`EXIT_OK`] because a
+/// `sync --once` that lost a race did nothing wrong and must not earn a
+/// `Restart=on-failure`. This verb answers a different question — *did the work
+/// happen* — and `Engine::next_task_window` has already settled it: it groups
+/// [`TaskOutcome::Busy`] with [`TaskOutcome::Deferred`] as "the run did not
+/// happen, do not consume the window". The exit code says the same thing, so
+/// every "did not run" answer this verb can give is **one number** — including
+/// the `Err(SyncError::Busy)` that [`Engine::run_task_now`] raises for a lease
+/// held by the other host, which [`cmd_task_run`] remaps to
+/// [`EXIT_DEFERRED`] rather than letting it fall through to `EXIT_OK`.
+///
+/// [`TaskOutcome::Abandoned`] cannot arise from this verb's own run: the row
+/// [`cmd_task_run`] reports is the one it just closed, and an abandoned run is
+/// written *by the next host* when it reclaims an expired lease. It is mapped
+/// anyway because `tasks status` reports history, the map has to be total, and
+/// a run nobody closed is a run that failed to finish — which is a failure.
+pub fn task_exit_code(outcome: TaskOutcome) -> u8 {
+    match outcome {
+        // The work ran and did what it was asked to.
+        TaskOutcome::Ok => EXIT_OK,
+        // The target was already in use, which is NFR-42's one-operation-per-
+        // folder rule working rather than something to alert about.
+        TaskOutcome::Busy => EXIT_DEFERRED,
+        // A condition the work waits on was not met — an unplugged drive above
+        // all, which AD-48 settles by name: absence, never failure.
+        TaskOutcome::Deferred => EXIT_DEFERRED,
+        // It ran and failed. `detail` carries the reason.
+        TaskOutcome::Failed => EXIT_FAILURE,
+        // Nobody closed it, so nothing can claim it succeeded.
+        TaskOutcome::Abandoned => EXIT_FAILURE,
+    }
+}
+
+/// One recorded run's exit code, including the two cases that have no
+/// [`TaskOutcome`] at all.
+///
+/// Both of them are [`EXIT_FAILURE`], and the direction matters. A run whose
+/// outcome was spelled by a **newer keeper** (`unknown_outcome`) is a run that
+/// happened and whose result this build cannot classify — reading it as
+/// [`EXIT_OK`] would report an unknown result as a working nightly sweep, which
+/// is the invisible-failure shape this epic exists to close. A run with neither
+/// column set is still in flight, which [`Engine::run_task_now`] cannot return
+/// (it closes the run it opened) but which the map must still cover rather than
+/// leaving a `_` arm to decide.
+fn run_exit_code(run: &TaskRunRow) -> u8 {
+    match run.outcome {
+        Some(outcome) => task_exit_code(outcome),
+        None => EXIT_FAILURE,
+    }
+}
+
+/// The one error from [`Engine::run_task_now`] that means "did not run" rather
+/// than "went wrong", and the task it is about.
+///
+/// A live lease held by the other host arrives as [`SyncError::Busy`]: nothing
+/// failed, and nothing happened either. Left to [`sync_exit_code`] it would
+/// become [`EXIT_OK`] — correct about the absence of a fault and useless to a
+/// caller that needs to know whether the work was done.
+///
+/// A pure function with its own test, for exactly [`nothing_to_release`]'s
+/// reason: "this refusal really is distinguishable from a failure" is the claim
+/// being made, and it has to be distinguishable **by type**. Matching on the
+/// message would have been the other reading, and it is the one that stops
+/// working the first time a sentence is reworded. It also puts the branch
+/// somewhere a test can reach, which an `await`'s error arm is not: manufacturing
+/// a lease held by another process inside a unit test would mean racing two
+/// engines and asserting on which one won.
+fn lease_held_elsewhere(err: &SyncError) -> Option<&str> {
+    match err {
+        SyncError::Busy(task) => Some(task),
+        _ => None,
+    }
+}
+
+/// The word a run's outcome is called, in both renderings.
+///
+/// One function so the human line and the `--json` document cannot come to call
+/// one run two different things — the rule [`ls_files_lines`] follows for
+/// `LfsFileState`. A spelling this build cannot read is passed through **as
+/// stored** rather than replaced by a placeholder: it is what the other host
+/// actually recorded, and it is the only clue anybody has about what ran.
+fn run_outcome_word(run: &TaskRunRow) -> &str {
+    match (run.outcome, run.unknown_outcome.as_deref()) {
+        (Some(outcome), _) => outcome.as_str(),
+        (None, Some(stored)) => stored,
+        // Neither column set: opened and not yet closed.
+        (None, None) => "running",
+    }
+}
+
+/// The refusal for an id that names a row this build cannot read, or `None`.
+///
+/// Factored out because two callers need the identical sentence and the
+/// identical precedence: [`select_task`], where it is the third of three
+/// distinguishable answers, and [`cmd_task_set`], which must reach it *before*
+/// its own "a new task must name its kind" — otherwise somebody looking at a
+/// newer keeper's row is told to supply a `--kind`, which is the one instruction
+/// that cannot work. `db::upsert_task` refuses the write as well (the write half
+/// of NFR-43); this is what makes the CLI's advice right rather than merely
+/// making the write safe.
+fn unreadable_task(listing: &TaskListing, wanted: &str) -> Option<CliError> {
+    listing
+        .unknown
+        .iter()
+        .find(|row| row.id == wanted)
+        .map(|row| {
+            CliError::from(SyncError::Config(format!(
+                "task `{}` is stored, but this keeper cannot read it: {}",
+                row.id, row.reason
+            )))
+        })
+}
+
+/// Resolve a user-typed task selector to exactly one stored task.
+///
+/// **Three refusals, and they are three different sentences on purpose.** All
+/// are [`SyncError::Config`] and therefore [`EXIT_CONFIG`], which is what keeps
+/// a selector mistake distinct from an operational one: exit 2 says "retrying
+/// changes nothing, edit something", and a cron wrapper that got 2 must not
+/// treat it the way it treats 1.
+///
+/// 1. **Malformed** — a spelling [`keeper_sync::db::upsert_task`] could never
+///    have stored, so no list of known ids would help; the input itself is the
+///    problem. The rule is **not duplicated here**:
+///    [`keeper_sync::tasks::validate_id`] is the engine's own function, called
+///    by the write door as well, so a spelling this refuses is a spelling that
+///    could never have been stored. A second copy in the CLI would drift, and it
+///    would drift silently in the direction of accepting an id the write door
+///    refuses.
+/// 2. **Unknown** — well formed, but no such row, so the alternatives are
+///    exactly what helps. [`select`]'s own shape, down to listing what is known
+///    and saying so when there is nothing to list: "known tasks are: " with
+///    nothing after it reads as a rendering bug rather than as an empty store.
+/// 3. **Stored, but unreadable** — see [`unreadable_task`]. Reported with *that*
+///    reason rather than as "no task matches", because an unreadable row
+///    reported as absent is a row somebody will recreate on top of a newer
+///    keeper's task.
+///
+/// Unlike [`select`] this returns exactly one row and never a list: `id` is the
+/// primary key of the `tasks` table, so a match is one row by construction and
+/// there is no name to be ambiguous about.
+fn select_task<'a>(
+    listing: &'a TaskListing,
+    wanted: &str,
+) -> std::result::Result<&'a TaskRow, CliError> {
+    keeper_sync::tasks::validate_id(wanted)?;
+    if let Some(task) = listing.tasks.iter().find(|task| task.id == wanted) {
+        return Ok(task);
+    }
+    if let Some(refusal) = unreadable_task(listing, wanted) {
+        return Err(refusal);
+    }
+    let known = listing
+        .tasks
+        .iter()
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(SyncError::Config(if known.is_empty() {
+        format!("no task matches `{wanted}`; no tasks are stored on this host")
+    } else {
+        format!("no task matches `{wanted}`; known tasks are: {known}")
+    })
+    .into())
+}
+
+/// The name of the folder a task is bound to, when this engine has it.
+///
+/// `None` covers two facts the caller keeps apart: a **host-wide** task, which
+/// has no `profile_id` at all, and a task bound to a folder this engine does not
+/// know. [`task_json`] renders the first as `profileId: null, profile: null` and
+/// the second as `profileId: "01…", profile: null`, which is what makes them
+/// distinguishable on the wire.
+fn task_profile_name<'a>(profiles: &'a [SyncProfile], task: &TaskRow) -> Option<&'a str> {
+    let bound = task.profile_id.as_deref()?;
+    profiles
+        .iter()
+        .find(|profile| profile.id == bound)
+        .map(|profile| profile.name.as_str())
+}
+
+/// One minute, in milliseconds — the resolution below which a countdown is
+/// noise.
+const RELATIVE_MINUTE_MS: i64 = 60_000;
+/// One hour, in milliseconds.
+const RELATIVE_HOUR_MS: i64 = 60 * RELATIVE_MINUTE_MS;
+/// One day, in milliseconds, and the coarsest unit this renders.
+const RELATIVE_DAY_MS: i64 = 24 * RELATIVE_HOUR_MS;
+
+/// `in 4h`, `12m ago`, or `now` — one coarse unit, never two.
+///
+/// **Pure integer arithmetic, and the only date rendering in this crate.** There
+/// is no formatter here and no `chrono` dependency, and this deliberately does
+/// not become an excuse to add one: the wire carries the **absolute instant**
+/// (`nextDueMs`, `startedMs`, `finishedMs`, `leaseUntilMs`) and the countdown is
+/// subtracted where a clock ticks. That is the rule `keeper-sync`'s own
+/// `ReleaseSchedule` records for the same reason — a rendered duration is
+/// already stale by the time a consumer reads it, while an instant never is, so
+/// a UI that wants to keep counting can and one that does not need not.
+///
+/// One unit and no seconds, because the finest schedule the write door accepts
+/// is a minute (`MIN_SCHEDULE_INTERVAL_MS`) and the coarsest is a year: `in
+/// 4h 12m` would be precision about a fire time nothing promises to hit to the
+/// minute, and weeks would be a unit no accepted schedule can produce.
+///
+/// Saturating rather than wrapping, and `unsigned_abs` rather than `abs`,
+/// because `i64::MIN - i64::MAX` is exactly the arithmetic a clock that jumped
+/// produces and a panic in a rendering function is never the right answer.
+fn relative_ms(now_ms: i64, at_ms: i64) -> String {
+    let delta = at_ms.saturating_sub(now_ms);
+    let magnitude = i64::try_from(delta.unsigned_abs()).unwrap_or(i64::MAX);
+    let (count, unit) = if magnitude < RELATIVE_MINUTE_MS {
+        // Under a minute in either direction. `now` rather than `in 0m`, which
+        // reads as a rounding error instead of as an answer.
+        return "now".to_owned();
+    } else if magnitude < RELATIVE_HOUR_MS {
+        (magnitude / RELATIVE_MINUTE_MS, 'm')
+    } else if magnitude < RELATIVE_DAY_MS {
+        (magnitude / RELATIVE_HOUR_MS, 'h')
+    } else {
+        (magnitude / RELATIVE_DAY_MS, 'd')
+    };
+    if delta.is_negative() {
+        format!("{count}{unit} ago")
+    } else {
+        format!("in {count}{unit}")
+    }
+}
+
+/// One task plus the two things a rendering needs beside it.
+///
+/// Three borrows rather than three parallel slices, because the parallel-slice
+/// version is the shape where a `zip` in the wrong order silently reports one
+/// task's history against another's row. The profile name and the last run are
+/// carried rather than looked up because both renderers are **pure**: neither
+/// [`task_lines`] nor [`task_json`] may reach an engine, which is what lets a
+/// test that owns no database assert what this verb says — the discipline
+/// [`ls_files_entry`] and [`materialize_json`] already state.
+struct TaskView<'a> {
+    task: &'a TaskRow,
+    /// The bound folder's name, or `None` — see [`task_profile_name`].
+    profile_name: Option<&'a str>,
+    /// The newest recorded run, or `None` for a task that has never run.
+    last: Option<&'a TaskRunRow>,
+}
+
+/// A listing of tasks as a human reads it, unreadable rows included.
+///
+/// **Pure, and returning lines rather than printing them**, for
+/// [`ls_files_lines`]'s reason: [`Printer`] writes to process stdout, so an
+/// assertion about what this verb *says* would otherwise need the binary
+/// spawned.
+///
+/// Two claims are worth the length. **An empty store says so**, rather than
+/// printing nothing — a verb that prints nothing is indistinguishable from a
+/// verb that did not run. And **every unreadable row is a line** (NFR-43): a
+/// machine with one task this build cannot run must not read as a machine with
+/// no tasks, because those two states want opposite actions from the person
+/// looking.
+///
+/// The words are the store's own — [`TaskKind::as_str`], [`TaskMode::as_str`],
+/// [`run_outcome_word`] — so the human form and the `--json` document cannot
+/// come to disagree about what one row is called.
+fn task_lines(now_ms: i64, views: &[TaskView<'_>], unknown: &[UnknownTask]) -> Vec<String> {
+    if views.is_empty() && unknown.is_empty() {
+        return vec![
+            "No tasks. Create one with `keeper-syncd tasks set <id> --kind sync`.".to_owned(),
+        ];
+    }
+    let mut lines = Vec::with_capacity(views.len() * 2 + unknown.len());
+    for view in views {
+        let task = view.task;
+        let target = match (task.profile_id.as_deref(), view.profile_name) {
+            (None, _) => "host-wide".to_owned(),
+            (Some(_), Some(name)) => name.to_owned(),
+            // Bound to a folder this engine does not have. Named rather than
+            // rendered as host-wide, which is what dropping the id would make
+            // it look like — and "this task belongs to the machine" is not the
+            // same fact as "this task points at a folder somebody removed".
+            (Some(id), None) => format!("[no such folder: {id}]"),
+        };
+        lines.push(format!(
+            "{id}  {kind}  {mode}  {target}  {schedule}  {due}{disabled}{running}",
+            id = task.id,
+            kind = task.kind.as_str(),
+            mode = task.mode.as_str(),
+            schedule = task.schedule.as_deref().unwrap_or("no schedule"),
+            due = match task.next_due_ms {
+                Some(at) => format!("due {}", relative_ms(now_ms, at)),
+                // `Action::Arm` on first sight is why this is a state and not a
+                // fault: a task created at noon arms tonight rather than firing
+                // at noon.
+                None => "never armed".to_owned(),
+            },
+            disabled = if task.enabled { "" } else { "  [disabled]" },
+            running = match &task.running_host {
+                Some(host) => format!("  [running on {host}]"),
+                None => String::new(),
+            },
+        ));
+        lines.push(match view.last {
+            Some(run) => format!(
+                "  last: {outcome}  {when}{detail}",
+                outcome = run_outcome_word(run),
+                when = relative_ms(now_ms, run.started_ms),
+                detail = run
+                    .detail
+                    .as_deref()
+                    .map(|detail| format!("  {detail}"))
+                    .unwrap_or_default(),
+            ),
+            // Said rather than left blank: an empty column reads as a missing
+            // value, and "this has never run" is the answer somebody wants when
+            // they are asking why nothing has happened.
+            None => "  last: never run".to_owned(),
+        });
+    }
+    lines.extend(unknown.iter().map(|row| {
+        // `db::list_tasks` reports a row whose primary key itself will not read
+        // with an **empty** id, which would print as a line starting with a bare
+        // colon and tell the operator a row exists while naming nothing they
+        // could type. There is genuinely no id to give them — `validate_id`
+        // refuses `""` before any lookup, so `tasks forget` cannot reach it
+        // either — and saying that is better than implying an id was omitted.
+        let id = if row.id.is_empty() {
+            "<a row whose id will not read>"
+        } else {
+            row.id.as_str()
+        };
+        format!(
+            "{id}: stored, but this keeper cannot read it — {}",
+            row.reason
+        )
+    }));
+    lines
+}
+
+/// One task's run history as a human reads it.
+///
+/// Pure, taking the id rather than the row, for [`materialize_lines`]'s reason.
+/// An empty history is a **line**, not a silence: a task that has never run and
+/// a task whose history this verb failed to read must not look the same, and
+/// only one of them is normal.
+fn task_run_lines(now_ms: i64, task_id: &str, runs: &[TaskRunRow]) -> Vec<String> {
+    if runs.is_empty() {
+        return vec![format!("{task_id}: no runs recorded")];
+    }
+    let mut lines = Vec::with_capacity(runs.len() + 1);
+    lines.push(format!("{task_id}: {} run(s), newest first", runs.len()));
+    lines.extend(runs.iter().map(|run| {
+        format!(
+            "  {outcome:<10}  {when}  {host}{detail}",
+            outcome = run_outcome_word(run),
+            when = relative_ms(now_ms, run.started_ms),
+            host = run.host,
+            detail = run
+                .detail
+                .as_deref()
+                .map(|detail| format!("  {detail}"))
+                .unwrap_or_default(),
+        )
+    }));
+    lines
+}
+
+/// One task as the `--json` document carries it.
+///
+/// The key set is the contract, and it is **fixed**: all eleven keys are always
+/// present. Wave 3's Tasks view reads exactly this document, so a key that
+/// appears only sometimes would be a key every consumer has to guard.
+///
+/// camelCase, matching `sizeBytes` and `profileId` across `ls-files`, `verify`,
+/// `materialize` and `dehydrate`, so an operator reads every document the same
+/// way. Built by naming the keys rather than by serializing [`TaskRow`], for
+/// [`materialize_json`]'s reason and one of its own: the stored row carries the
+/// lease columns under their SQL names and has no idea what its folder is
+/// called.
+///
+/// # Why `profileId` and `profile` are null rather than absent
+///
+/// This is the case where the absent-versus-null rule comes out the *other*
+/// way. Elsewhere — [`ls_files_entry`]'s `remote`, [`materialize_json`]'s
+/// `unitId` — absence means "nobody asked" or "there is nothing here", which
+/// `null` cannot say. Here `null` is a **real value**: a host-wide task belongs
+/// to the machine rather than to a folder, and that is an answer, not a missing
+/// one. Making the keys absent would force every consumer to distinguish
+/// host-wide from a truncated document.
+///
+/// A binding whose folder is gone renders `profileId` **set** and `profile`
+/// null, which is how the two are told apart — see [`task_profile_name`].
+///
+/// `lastRun` is the newest run or `null`, and it is nested rather than flattened
+/// so `tasks list` and `tasks status` describe a run with one shape; see
+/// [`task_run_json`], which is the same function both reach.
+fn task_json(
+    task: &TaskRow,
+    profile_name: Option<&str>,
+    last: Option<&TaskRunRow>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": task.id,
+        "kind": task.kind.as_str(),
+        "mode": task.mode.as_str(),
+        "enabled": task.enabled,
+        "profileId": task.profile_id,
+        "profile": profile_name,
+        "schedule": task.schedule,
+        "nextDueMs": task.next_due_ms,
+        "runningHost": task.running_host,
+        "leaseUntilMs": task.lease_until_ms,
+        "lastRun": last.map(task_run_json),
+    })
+}
+
+/// One recorded run as the `--json` document carries it.
+///
+/// Seven keys always, plus `unknownOutcome` **only** when the store held a
+/// spelling this build cannot read — and that conditional key is the whole
+/// contract of this document. A consumer has to be able to tell:
+///
+/// * **still in flight** — `outcome: null`, no `unknownOutcome`;
+/// * **a newer keeper recorded something we cannot read** — `outcome: null`
+///   *plus* `unknownOutcome: "…"`.
+///
+/// Both have a null `outcome`, so `null` alone cannot separate them; the
+/// presence of the second key is the only signal, which is exactly why it is
+/// absent rather than null in the first case. The branch that decides absence
+/// lives here, in a function a test can call, rather than in an `if` around a
+/// print — [`materialize_json`]'s rule.
+///
+/// `startedMs` and `finishedMs` are absolute instants for [`relative_ms`]'s
+/// reason: a countdown is stale the moment it is serialized.
+fn task_run_json(run: &TaskRunRow) -> serde_json::Value {
+    let mut document = serde_json::json!({
+        "id": run.id,
+        "taskId": run.task_id,
+        "startedMs": run.started_ms,
+        "finishedMs": run.finished_ms,
+        "outcome": run.outcome.map(TaskOutcome::as_str),
+        "detail": run.detail,
+        "host": run.host,
+    });
+    if let Some(stored) = &run.unknown_outcome {
+        document["unknownOutcome"] = serde_json::json!(stored);
+    }
+    document
+}
+
+/// `tasks list`'s whole document, envelope included.
+///
+/// Built in a named function a test can call, for the reason
+/// [`ls_files_document`] states about its own: the envelope is as much of the
+/// contract as the rows are — renaming `tasks` or `unknown` breaks every
+/// consumer — and inline in [`cmd_task_list`] nothing could assert it.
+///
+/// `unknown` is always present, empty array included. An absent key would make
+/// "this build can read everything stored" indistinguishable from an older
+/// consumer's document, and the array is the one place NFR-43's forward
+/// compatibility is visible to a script.
+fn tasks_list_document(
+    tasks: Vec<serde_json::Value>,
+    unknown: &[UnknownTask],
+) -> serde_json::Value {
+    serde_json::json!({
+        "tasks": tasks,
+        "unknown": unknown
+            .iter()
+            .map(|row| serde_json::json!({ "id": row.id, "reason": row.reason }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `tasks status`'s whole document: the task, and its runs newest first.
+///
+/// A named function for [`ls_files_document`]'s reason. The task is nested under
+/// `task` rather than spliced into the top level so `runs` can never collide
+/// with a key [`task_json`] gains later.
+fn task_status_document(
+    task: serde_json::Value,
+    runs: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({ "task": task, "runs": runs })
+}
+
+/// `tasks run`'s whole document: what was asked, what happened, and `$?`.
+///
+/// `exit` is in the document as well as in the process status because a caller
+/// that captured stdout should not have to consult two channels to learn one
+/// fact — the shape `main`'s own failure envelope already has.
+///
+/// `run` is `Option` and **null** when a lease held elsewhere meant no run of
+/// ours was ever opened. Null rather than absent, and rather than a second
+/// document shape: "there is no row" is a real answer, and one verb emitting two
+/// key sets is what makes a `--json` consumer branch before it can parse.
+fn task_run_document(
+    task_id: &str,
+    run: Option<serde_json::Value>,
+    outcome: &str,
+    exit: u8,
+) -> serde_json::Value {
+    serde_json::json!({ "task": task_id, "run": run, "outcome": outcome, "exit": exit })
+}
+
+/// The document `tasks set`, `tasks enable` and `tasks disable` all emit.
+///
+/// One envelope for three verbs because all three answer the same question —
+/// *what does the row look like now* — and it is the row **read back from the
+/// store**, never the row that was submitted; see [`report_task`].
+fn task_saved_document(task: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "task": task })
+}
+
+/// `tasks forget`'s document.
+///
+/// The id and nothing else: the row is gone, so there is no row to describe, and
+/// echoing the fields of something that no longer exists would invite a consumer
+/// to believe it still does.
+fn task_forgotten_document(id: &str) -> serde_json::Value {
+    serde_json::json!({ "forgot": id })
+}
+
+/// Every stored task, with its target, schedule and last run.
+///
+/// The clock arrives as a **value**, not as a platform, and every function in
+/// this section takes it that way. One instant is sampled per invocation in
+/// [`run`], so a three-task listing renders every countdown against the same
+/// "now" rather than against three of them; and a command that needs nothing
+/// from a `SyncPlatform` but a timestamp does not have to be handed one to be
+/// callable from a test.
+fn cmd_task_list(
+    printer: &Printer,
+    engine: &Engine,
+    now_ms: i64,
+) -> std::result::Result<u8, CliError> {
+    let listing = engine.tasks()?;
+    let profiles = engine.list_profiles()?;
+    // One row per task, not the whole capped history: a listing answers "is this
+    // working", and fifty rows per task is the question `tasks status` asks.
+    let mut newest = Vec::with_capacity(listing.tasks.len());
+    for task in &listing.tasks {
+        newest.push(engine.task_history(&task.id, 1)?.into_iter().next());
+    }
+    let views: Vec<TaskView<'_>> = listing
+        .tasks
+        .iter()
+        .zip(newest.iter())
+        .map(|(task, last)| TaskView {
+            task,
+            profile_name: task_profile_name(&profiles, task),
+            last: last.as_ref(),
+        })
+        .collect();
+
+    for line in task_lines(now_ms, &views, &listing.unknown) {
+        printer.line(line);
+    }
+    let documents = views
+        .iter()
+        .map(|view| task_json(view.task, view.profile_name, view.last))
+        .collect();
+    printer.json(&tasks_list_document(documents, &listing.unknown));
+    Ok(EXIT_OK)
+}
+
+/// One task and everything it has recorded.
+fn cmd_task_status(
+    printer: &Printer,
+    engine: &Engine,
+    now_ms: i64,
+    wanted: &str,
+) -> std::result::Result<u8, CliError> {
+    let listing = engine.tasks()?;
+    let task = select_task(&listing, wanted)?;
+    let profiles = engine.list_profiles()?;
+    // The store caps this itself, so asking for the cap asks for everything
+    // there is rather than for a number this CLI invented.
+    let runs = engine.task_history(&task.id, keeper_sync::db::TASK_RUNS_CAP)?;
+    let view = TaskView {
+        task,
+        profile_name: task_profile_name(&profiles, task),
+        // Newest first, so the head of the history IS the last run — one read
+        // rather than a second query for a row already in hand.
+        last: runs.first(),
+    };
+
+    for line in task_lines(now_ms, std::slice::from_ref(&view), &[]) {
+        printer.line(line);
+    }
+    for line in task_run_lines(now_ms, &task.id, &runs) {
+        printer.line(line);
+    }
+    printer.json(&task_status_document(
+        task_json(task, view.profile_name, view.last),
+        runs.iter().map(task_run_json).collect(),
+    ));
+    Ok(EXIT_OK)
+}
+
+/// Run one task now, and exit with what happened.
+///
+/// [`Engine::run_task_now`] holds every decision — the lease, the mode and
+/// `enabled` gates, the target selection, the work itself and the recorded row —
+/// so a requested run and a scheduled run are the same code path taking the same
+/// reservation. This function selects, prints, and maps the outcome onto a
+/// number; a second implementation of any of that is what AD-52 exists to
+/// prevent.
+///
+/// The task is selected from [`Engine::tasks`] **before** the engine is asked to
+/// run anything, which is what makes a mistyped selector three distinguishable
+/// refusals ([`select_task`]) rather than `run_task_now`'s single "no such
+/// task": that door cannot tell a malformed id from an absent one, and cannot
+/// see an unreadable row at all.
+///
+/// # The one error that is not an error
+///
+/// A lease held by the other host arrives as `Err(SyncError::Busy)`. Left alone
+/// it would reach [`sync_exit_code`] and become [`EXIT_OK`] — "nothing went
+/// wrong", which is true and useless: the work did not happen and a wrapper has
+/// to know. It is remapped to [`EXIT_DEFERRED`] here, beside the recorded
+/// [`TaskOutcome::Busy`] that means the same thing, so every "did not run"
+/// answer this verb can give is one number. It is not turned into a `CliError`
+/// either, because `main` prints a failure envelope for every `Err` and that
+/// would put a second JSON document on stdout over this one.
+///
+/// # The clock this verb renders against is not the one it was handed
+///
+/// `run()` samples one instant before dispatching, so every countdown a verb
+/// prints is measured from the same `now` — which is right for `tasks list` and
+/// `tasks status`, whose rows all pre-date the sample. It is wrong here and
+/// only here: this is the verb that *performs work between the sample and the
+/// render*. `claim_and_run` opens the run a moment after `run()` read the
+/// clock, so `run.started_ms` always sits just *after* `now_ms` — and a nightly
+/// sweep that took five minutes therefore printed its finished run as having
+/// started `now`, whatever it had actually spent.
+///
+/// The render therefore uses `now_ms.max(run.finished_ms)`: the later of when
+/// this process read the clock and when the run actually ended, which is the
+/// earliest instant that provably is not in the past. Taking the maximum rather
+/// than re-reading a clock keeps this function callable from a test that owns no
+/// platform, and the `--json` document is unaffected either way because it
+/// carries absolute instants.
+async fn cmd_task_run(
+    printer: &Printer,
+    engine: &Engine,
+    now_ms: i64,
+    wanted: &str,
+) -> std::result::Result<u8, CliError> {
+    let listing = engine.tasks()?;
+    let id = select_task(&listing, wanted)?.id.clone();
+
+    let run = match engine.run_task_now(&id).await {
+        Ok(run) => run,
+        Err(err) => {
+            // The one error that is a deferral. See [`lease_held_elsewhere`].
+            let Some(task) = lease_held_elsewhere(&err) else {
+                return Err(err.into());
+            };
+            printer.line(format!(
+                "{task}: a run is already in flight elsewhere, so nothing ran here"
+            ));
+            printer.json(&task_run_document(
+                &id,
+                None,
+                TaskOutcome::Busy.as_str(),
+                EXIT_DEFERRED,
+            ));
+            return Ok(EXIT_DEFERRED);
+        }
+    };
+
+    // See this function's doc: the run happened between the sample and here, so
+    // rendering against the sample alone puts a finished run in the future.
+    let rendered_at = now_ms.max(run.finished_ms.unwrap_or(now_ms));
+    for line in task_run_lines(rendered_at, &id, std::slice::from_ref(&run)) {
+        printer.line(line);
+    }
+    let code = run_exit_code(&run);
+    printer.json(&task_run_document(
+        &id,
+        Some(task_run_json(&run)),
+        run_outcome_word(&run),
+        code,
+    ));
+    Ok(code)
+}
+
+/// Read a task back and report it, so what a write verb says is what the store
+/// now holds.
+///
+/// Deliberately **not** the row that was submitted.
+/// [`keeper_sync::db::upsert_task`] owns `next_due_ms`, `running_host` and
+/// `lease_until_ms` and ignores whatever a caller passes for them, and it clears
+/// the window when the schedule text changes — so echoing the submitted row
+/// would report a window that was never written. Re-reading is also the only
+/// rendering that can be trusted the moment the other host is writing too.
+fn report_task(
+    printer: &Printer,
+    engine: &Engine,
+    now_ms: i64,
+    id: &str,
+) -> std::result::Result<u8, CliError> {
+    let listing = engine.tasks()?;
+    let task = select_task(&listing, id)?;
+    let profiles = engine.list_profiles()?;
+    let newest = engine.task_history(id, 1)?;
+    let view = TaskView {
+        task,
+        profile_name: task_profile_name(&profiles, task),
+        last: newest.first(),
+    };
+    for line in task_lines(now_ms, std::slice::from_ref(&view), &[]) {
+        printer.line(line);
+    }
+    printer.json(&task_saved_document(task_json(
+        task,
+        view.profile_name,
+        view.last,
+    )));
+    Ok(EXIT_OK)
+}
+
+/// Create a task, or change the fields a caller named.
+///
+/// Every rule here is about *not* silently doing something else.
+///
+/// * **On create, `--kind` is required**, refused with the id quoted. A row with
+///   no kind is a row nothing can run, and there is no defensible default: the
+///   two kinds do opposite things, and one of them deletes content.
+/// * **On update, an omitted flag keeps its stored value.** The stored row is
+///   read from [`Engine::tasks`] rather than guessed, so a caller changing a
+///   schedule cannot unbind a folder by not mentioning it.
+/// * **`--host-wide` and `--no-schedule` are how a binding and a schedule get
+///   removed.** Without them either could be set and never unset, which is the
+///   dead-knob shape this epic exists to close; each `conflicts_with` its
+///   positive twin so a contradiction is refused by clap rather than resolved.
+/// * **`--mode` defaults, on create only**, to `scheduled` when a `--schedule`
+///   was given and `manual` otherwise. This is the only derived default here,
+///   and it is derivable *because* it cannot produce a refused row:
+///   [`keeper_sync::db::upsert_task`] refuses a `Scheduled` row with no
+///   schedule, and both branches respect that by construction. Defaulting to
+///   `scheduled` unconditionally would have made `tasks set nightly --kind sync`
+///   fail at the write door for a reason the caller never mentioned.
+/// * **`enabled` is `true` on create and untouched on update.** `tasks enable`
+///   and `tasks disable` own that column; writing it from here is exactly how
+///   [`reconcile`] would silently un-pause everything an operator paused, one
+///   layer down.
+///
+/// `--profile` resolves through the same [`select`] every other verb uses
+/// (story 56.14's exact-id-first selector) and requires **exactly one** match,
+/// refusing a two-folder name match by asking for the id — [`cmd_materialize`]'s
+/// rule, and it matters here because a `release` task bound to the wrong folder
+/// deletes from the wrong folder.
+fn cmd_task_set(
+    printer: &Printer,
+    engine: &Engine,
+    now_ms: i64,
+    args: &TaskSetArgs,
+) -> std::result::Result<u8, CliError> {
+    let listing = engine.tasks()?;
+    // Not [`select_task`]: this is the one verb for which "no such task" is not
+    // a refusal. Its other two answers still apply, in this order — a malformed
+    // id can never be stored, and a row this build cannot read must not be
+    // overwritten by a kind of ours — because reaching the `--kind`-is-required
+    // refusal first would tell somebody looking at a newer keeper's row to
+    // supply the one thing that cannot help.
+    keeper_sync::tasks::validate_id(&args.task)?;
+    if let Some(refusal) = unreadable_task(&listing, &args.task) {
+        return Err(refusal);
+    }
+    let existing = listing.tasks.iter().find(|row| row.id == args.task);
+
+    let kind = match (args.kind, existing) {
+        // Repurposing a stored task is refused rather than performed, and the
+        // reason is not tidiness. A `sync` task changed to `release` keeps its
+        // armed window, so the deletion fires at an instant armed for a sync —
+        // on the very next tick if that window is already open — with none of
+        // the fresh-arm delay a newly created release task gets. It also keeps
+        // its whole `task_runs` history, so `tasks status` renders `1 synced, 0
+        // already syncing…` as a release task's record. Neither is fixable by
+        // clearing a column: the history genuinely belongs to a different verb.
+        // `tasks forget` then `tasks set` says the same thing and leaves nothing
+        // mislabelled.
+        (Some(wanted), Some(row)) if TaskKind::from(wanted) != row.kind => {
+            return Err(SyncError::Config(format!(
+                "task `{}` is stored as kind `{}` and a task's kind cannot be \
+                 changed: its schedule window and its whole run history belong to \
+                 that kind. Use `keeper-syncd tasks forget {}` and create it again",
+                args.task,
+                row.kind.as_str(),
+                args.task
+            ))
+            .into());
+        }
+        (Some(kind), _) => TaskKind::from(kind),
+        (None, Some(row)) => row.kind,
+        (None, None) => {
+            return Err(SyncError::Config(format!(
+                "task `{}` does not exist yet, so a new one must name its kind: \
+                 pass --kind sync or --kind release",
+                args.task
+            ))
+            .into());
+        }
+    };
+
+    let profile_id = if args.host_wide {
+        None
+    } else if let Some(wanted) = args.profile.as_deref() {
+        let profiles = engine.list_profiles()?;
+        let matched = select(&profiles, Some(wanted))?;
+        let [profile] = matched[..] else {
+            return Err(SyncError::Config(format!(
+                "`{wanted}` matches {} folders; name the one you mean by its id",
+                matched.len()
+            ))
+            .into());
+        };
+        Some(profile.id.clone())
+    } else {
+        existing.and_then(|row| row.profile_id.clone())
+    };
+
+    let schedule = if args.no_schedule {
+        None
+    } else if args.schedule.is_some() {
+        args.schedule.clone()
+    } else {
+        existing.and_then(|row| row.schedule.clone())
+    };
+
+    let mode = match (args.mode, existing) {
+        (Some(mode), _) => TaskMode::from(mode),
+        (None, Some(row)) => row.mode,
+        (None, None) if schedule.is_some() => TaskMode::Scheduled,
+        (None, None) => TaskMode::Manual,
+    };
+
+    let row = TaskRow {
+        id: args.task.clone(),
+        profile_id,
+        kind,
+        schedule,
+        mode,
+        // Carried, not computed. The write door owns all three and ignores what
+        // it is handed for them; passing the stored values keeps this struct
+        // honest about the row it describes rather than claiming a task with no
+        // window and no lease.
+        next_due_ms: existing.and_then(|row| row.next_due_ms),
+        enabled: existing.is_none_or(|row| row.enabled),
+        updated_ms: now_ms,
+        running_host: existing.and_then(|row| row.running_host.clone()),
+        lease_until_ms: existing.and_then(|row| row.lease_until_ms),
+    };
+    engine.save_task(&row)?;
+    report_task(printer, engine, now_ms, &row.id)
+}
+
+/// Take a task in or out of service, leaving everything else exactly as stored.
+///
+/// One function for both verbs because they differ in one boolean, and the
+/// rest — read the row, keep every other column, write it back — is the part
+/// that must not diverge. `mode` and `schedule` survive untouched: AD-135 keeps
+/// `enabled` and `mode` apart because they answer different questions, so a
+/// disabled `scheduled` task keeps its schedule and resumes on it.
+fn cmd_task_set_enabled(
+    printer: &Printer,
+    engine: &Engine,
+    now_ms: i64,
+    wanted: &str,
+    enabled: bool,
+) -> std::result::Result<u8, CliError> {
+    let listing = engine.tasks()?;
+    let stored = select_task(&listing, wanted)?;
+    let row = TaskRow {
+        enabled,
+        updated_ms: now_ms,
+        ..stored.clone()
+    };
+    engine.save_task(&row)?;
+    printer.line(format!(
+        "{} task {}",
+        if enabled { "Enabled" } else { "Disabled" },
+        row.id
+    ));
+    report_task(printer, engine, now_ms, &row.id)
+}
+
+/// Forget a task and everything it recorded.
+///
+/// Selected through [`select_task`] first, so forgetting an id nobody stored is
+/// a refusal rather than a silent success: `db::delete_task` cannot tell "gone
+/// now" from "was never here", and a typo that reports success is how somebody
+/// comes to believe a task is deleted while it is still on a schedule.
+///
+/// That also means a row this build **cannot read** is refused rather than
+/// deleted, and that is the right way round: it belongs to a newer keeper on the
+/// other host, and deleting a task on somebody else's behalf because we cannot
+/// parse it is the "absence is deletion" mistake AD-48 exists to prevent.
+fn cmd_task_forget(
+    printer: &Printer,
+    engine: &Engine,
+    wanted: &str,
+) -> std::result::Result<u8, CliError> {
+    let listing = engine.tasks()?;
+    let id = select_task(&listing, wanted)?.id.clone();
+    engine.forget_task(&id)?;
+    printer.line(format!("Forgot task {id} and its run history"));
+    printer.json(&task_forgotten_document(&id));
+    Ok(EXIT_OK)
+}
+
 /// Run one clean or smudge pass for git.
 ///
 /// This is the seam that makes a keeper-managed folder behave correctly under
@@ -2629,9 +3937,117 @@ mod tests {
             &["keeper-syncd", "doctor"],
             &["keeper-syncd", "logs"],
             &["keeper-syncd", "logs", "-n", "20"],
+            &["keeper-syncd", "tasks", "list"],
+            &["keeper-syncd", "tasks", "status", "nightly"],
+            &["keeper-syncd", "tasks", "run", "nightly"],
+            &["keeper-syncd", "tasks", "set", "nightly", "--kind", "sync"],
+            &[
+                "keeper-syncd",
+                "tasks",
+                "set",
+                "nightly",
+                "--kind",
+                "release",
+            ],
+            &[
+                "keeper-syncd",
+                "tasks",
+                "set",
+                "nightly",
+                "--kind",
+                "sync",
+                "--profile",
+                "docs",
+                "--schedule",
+                "every 5m",
+                "--mode",
+                "scheduled",
+            ],
+            &["keeper-syncd", "tasks", "set", "nightly", "--host-wide"],
+            &["keeper-syncd", "tasks", "set", "nightly", "--no-schedule"],
+            &["keeper-syncd", "tasks", "set", "nightly", "--mode", "off"],
+            &[
+                "keeper-syncd",
+                "tasks",
+                "set",
+                "nightly",
+                "--mode",
+                "manual",
+            ],
+            &["keeper-syncd", "tasks", "enable", "nightly"],
+            &["keeper-syncd", "tasks", "disable", "nightly"],
+            &["keeper-syncd", "tasks", "forget", "nightly"],
         ];
         for args in invocations {
             assert!(parse(args).is_ok(), "must parse: {args:?}");
+        }
+    }
+
+    #[test]
+    fn a_task_selector_is_required_by_every_verb_that_names_one() {
+        // `tasks list` is the only verb that addresses no task; every other one
+        // acts on exactly one row, and a missing selector must be told rather
+        // than read as "all of them" — which for `run` and `forget` would be a
+        // fan-out nobody asked for.
+        for verb in ["status", "run", "set", "enable", "disable", "forget"] {
+            let err = parse(&["keeper-syncd", "tasks", verb])
+                .expect_err("a task id is required to name one");
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{verb}");
+        }
+        assert!(parse(&["keeper-syncd", "tasks", "list"]).is_ok());
+    }
+
+    #[test]
+    fn the_two_clearing_flags_conflict_with_their_positive_twins() {
+        // `--host-wide` and `--no-schedule` exist so a binding and a schedule
+        // can be UNSET; passing one beside the flag it clears is a contradiction
+        // clap must refuse rather than silently resolve in one direction. A knob
+        // whose two spellings disagree quietly is the dead-knob shape this epic
+        // exists to close.
+        for args in [
+            vec![
+                "keeper-syncd",
+                "tasks",
+                "set",
+                "nightly",
+                "--profile",
+                "docs",
+                "--host-wide",
+            ],
+            vec![
+                "keeper-syncd",
+                "tasks",
+                "set",
+                "nightly",
+                "--schedule",
+                "every 5m",
+                "--no-schedule",
+            ],
+        ] {
+            let err = parse(&args).expect_err("contradictory flags must be refused");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn tasks_run_help_names_the_exit_codes_it_can_produce() {
+        // Story 56.13 shipped a `--help` that described what `materialize` used
+        // to do, and it survived review because the prose sits on a clap enum
+        // far from the code it describes. `tasks run` is the verb whose whole
+        // purpose is to be called from a wrapper that branches on `$?`, so the
+        // help that omits a code is help that cannot be acted on — and this
+        // asserts the four numbers are actually named where the caller looks.
+        let mut cli = Cli::command();
+        let tasks = cli.find_subcommand_mut("tasks").expect("a `tasks` verb");
+        let run = tasks
+            .find_subcommand_mut("run")
+            .expect("a `tasks run` verb");
+        let help = run.render_long_help().to_string();
+        for expected in ["0", "1", "2", "4", "deferred"] {
+            assert!(
+                help.contains(expected),
+                "`tasks run --help` must name {expected}; got:\n{help}"
+            );
         }
     }
 
@@ -2905,10 +4321,20 @@ mod tests {
     }
 
     #[test]
-    fn the_four_exit_codes_are_distinct() {
+    fn the_five_exit_codes_are_distinct() {
         // A wrapper script branches on these; two of them colliding silently
         // would make "fix your config" indistinguishable from "retry later".
-        let codes = [EXIT_OK, EXIT_FAILURE, EXIT_CONFIG, EXIT_PREREQUISITE];
+        // `EXIT_DEFERRED` joined them in Story 57.3, and it is the one whose
+        // collision would be worst: sharing a number with `EXIT_OK` hides a
+        // month of unplugged drive, sharing one with `EXIT_FAILURE` pages
+        // somebody nightly for a condition AD-48 calls normal.
+        let codes = [
+            EXIT_OK,
+            EXIT_FAILURE,
+            EXIT_CONFIG,
+            EXIT_PREREQUISITE,
+            EXIT_DEFERRED,
+        ];
         let unique: BTreeSet<u8> = codes.iter().copied().collect();
         assert_eq!(unique.len(), codes.len());
     }
@@ -3635,16 +5061,119 @@ mod tests {
         );
     }
 
-    /// Two positionals, in that order, and neither optional.
+    /// Two positionals, in that order, and neither optional; `--for` is the
+    /// only thing that is.
     #[test]
     fn materialize_takes_a_folder_and_a_path_inside_it() {
         let cli =
             parse(&["keeper-syncd", "materialize", "docs", "40-media/clip.mp4"]).expect("parse");
-        let Command::Materialize { profile, subpath } = cli.command else {
+        let Command::Materialize {
+            profile,
+            subpath,
+            keep_for,
+        } = cli.command
+        else {
             panic!("expected materialize");
         };
         assert_eq!(profile, "docs");
         assert_eq!(subpath, "40-media/clip.mp4");
+        assert_eq!(
+            keep_for, None,
+            "no flag is no statement about how long, which is what every \
+             invocation written before Story 56.17 means"
+        );
+    }
+
+    /// `--for` reaches the verb as milliseconds, and a value nobody can read
+    /// is refused **at parse time** with the value quoted (Story 56.17).
+    ///
+    /// At parse time is the claim, not merely "refused": clap's `value_parser`
+    /// runs before `run` opens an engine, resolves a profile or looks at a
+    /// pointer, so a typo cannot half-materialize anything. The same discipline
+    /// `validate_quiet_time` applies to a quiet window, and here the cost of
+    /// guessing at a unit is when keeper deletes a copy of somebody's file.
+    #[test]
+    fn for_is_parsed_into_milliseconds_and_a_typo_is_refused_with_the_value_quoted() {
+        for (spelling, expected) in [
+            ("30m", Some(1_800_000)),
+            ("2h", Some(7_200_000)),
+            ("1d", Some(86_400_000)),
+            // Accepted, and it means indefinite — the folder's own interval and
+            // nothing else, which is what the verb does with no flag.
+            ("0", Some(0)),
+        ] {
+            let cli = parse(&[
+                "keeper-syncd",
+                "materialize",
+                "docs",
+                "clip.mp4",
+                "--for",
+                spelling,
+            ])
+            .unwrap_or_else(|err| panic!("`--for {spelling}` should parse: {err}"));
+            let Command::Materialize { keep_for, .. } = cli.command else {
+                panic!("expected materialize");
+            };
+            assert_eq!(keep_for, expected, "--for {spelling}");
+        }
+
+        // Every one of these is somebody expecting a unit this verb does not
+        // have, or a shape it does not read. Guessing at any of them would be
+        // worse than saying so.
+        for spelling in [
+            "1w",
+            "2",
+            "1.5h",
+            "2 h",
+            "h",
+            "",
+            "0m",
+            "+2h",
+            "1H",
+            "99999999999999999999d",
+        ] {
+            let err = parse(&[
+                "keeper-syncd",
+                "materialize",
+                "docs",
+                "clip.mp4",
+                "--for",
+                spelling,
+            ])
+            .expect_err(&format!("`--for {spelling}` must be refused"))
+            .to_string();
+            assert!(
+                err.contains(spelling),
+                "the refusal has to quote what was typed, or the person cannot \
+                 see their own typo: {err}"
+            );
+            assert!(
+                err.contains("30m") && err.contains("2h") && err.contains("1d"),
+                "and it has to name the forms that do work, because the reader \
+                 is looking at it precisely because they do not know them: {err}"
+            );
+        }
+
+        // `-1h` never reaches the parser: clap reads a leading `-` as short
+        // flags and refuses `-1` before any value parser runs. Still refused at
+        // parse time, which is the claim, but by clap's own message — asserted
+        // separately rather than folded into the loop above, because a test
+        // that expected THIS sentence to quote `-1h` would be asserting
+        // something clap does not do and would have to be weakened to pass.
+        let err = parse(&[
+            "keeper-syncd",
+            "materialize",
+            "docs",
+            "clip.mp4",
+            "--for",
+            "-1h",
+        ])
+        .expect_err("a negative duration is refused")
+        .to_string();
+        assert!(
+            err.contains("-1"),
+            "and it still shows what was typed: {err}"
+        );
     }
 
     // --- dehydrate: the two documents and the exit-0 branch (Story 56.4) ----
@@ -3908,5 +5437,902 @@ mod tests {
             },
         );
         assert_eq!(cleared["pinned"], serde_json::json!(false));
+    }
+
+    // -----------------------------------------------------------------------
+    // tasks (Story 57.3)
+    // -----------------------------------------------------------------------
+
+    /// A readable stored task, mutated per test rather than rebuilt.
+    fn a_task(id: &str) -> TaskRow {
+        TaskRow {
+            id: id.to_owned(),
+            profile_id: None,
+            kind: TaskKind::Sync,
+            schedule: None,
+            mode: TaskMode::Manual,
+            next_due_ms: None,
+            enabled: true,
+            updated_ms: 1_700_000_000_000,
+            running_host: None,
+            lease_until_ms: None,
+        }
+    }
+
+    /// One closed run of `task_id`.
+    fn a_run(task_id: &str, outcome: TaskOutcome) -> TaskRunRow {
+        TaskRunRow {
+            id: 7,
+            task_id: task_id.to_owned(),
+            started_ms: 1_700_000_000_000,
+            finished_ms: Some(1_700_000_001_000),
+            outcome: Some(outcome),
+            unknown_outcome: None,
+            detail: Some("1 synced, 0 already syncing, 0 waiting, 0 failed".to_owned()),
+            host: "server-a".to_owned(),
+        }
+    }
+
+    /// `tasks set` with nothing named — the shape every "an omitted flag keeps
+    /// what was stored" assertion starts from.
+    fn set_args(task: &str) -> TaskSetArgs {
+        TaskSetArgs {
+            task: task.to_owned(),
+            kind: None,
+            profile: None,
+            host_wide: false,
+            schedule: None,
+            no_schedule: false,
+            mode: None,
+        }
+    }
+
+    fn sorted_keys(value: &serde_json::Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn every_task_outcome_maps_to_the_number_a_wrapper_branches_on() {
+        // Arm by arm, because the classification is the contract and a single
+        // "they are all mapped" assertion would pass with every one of them
+        // wrong. `Busy` and `Deferred` share a number on purpose: `Engine::
+        // next_task_window` already groups them as "the run did not happen",
+        // and the exit code says the same thing to a cron wrapper.
+        assert_eq!(task_exit_code(TaskOutcome::Ok), EXIT_OK);
+        assert_eq!(task_exit_code(TaskOutcome::Busy), EXIT_DEFERRED);
+        assert_eq!(task_exit_code(TaskOutcome::Deferred), EXIT_DEFERRED);
+        assert_eq!(task_exit_code(TaskOutcome::Failed), EXIT_FAILURE);
+        assert_eq!(task_exit_code(TaskOutcome::Abandoned), EXIT_FAILURE);
+    }
+
+    #[test]
+    fn a_run_with_no_readable_outcome_is_a_failure_rather_than_a_success() {
+        // A newer keeper's spelling is a run that happened and whose result we
+        // cannot classify, so the safe number is the one that alerts: reading it
+        // as `EXIT_OK` would report an unknown result as a working nightly sweep.
+        let mut unreadable = a_run("nightly", TaskOutcome::Ok);
+        unreadable.outcome = None;
+        unreadable.unknown_outcome = Some("teleported".to_owned());
+        assert_eq!(run_exit_code(&unreadable), EXIT_FAILURE);
+        assert_eq!(run_outcome_word(&unreadable), "teleported");
+
+        // Neither column set is a row still in flight. This verb closes the run
+        // it opened so it cannot arise here, but the mapping must still be total.
+        let mut in_flight = unreadable.clone();
+        in_flight.unknown_outcome = None;
+        in_flight.finished_ms = None;
+        assert_eq!(run_exit_code(&in_flight), EXIT_FAILURE);
+        assert_eq!(run_outcome_word(&in_flight), "running");
+
+        assert_eq!(
+            run_exit_code(&a_run("nightly", TaskOutcome::Busy)),
+            EXIT_DEFERRED
+        );
+        assert_eq!(
+            run_outcome_word(&a_run("nightly", TaskOutcome::Busy)),
+            "busy"
+        );
+    }
+
+    #[test]
+    fn only_a_held_lease_is_the_deferral_that_arrives_as_an_error() {
+        // `Busy` is the ONE error `tasks run` answers with `EXIT_DEFERRED`
+        // rather than propagating, so the set has to be exactly that: every
+        // other error is a real failure whose code `sync_exit_code` decides.
+        assert_eq!(
+            lease_held_elsewhere(&SyncError::Busy("nightly".to_owned())),
+            Some("nightly"),
+            "and it names the task, so the sentence a person reads is about \
+             something they typed"
+        );
+        for other in [
+            SyncError::Config("off".to_owned()),
+            SyncError::MediaAbsent,
+            SyncError::Cancelled,
+            SyncError::Journal("locked".to_owned()),
+        ] {
+            assert_eq!(lease_held_elsewhere(&other), None, "{}", other.code());
+        }
+        // Distinguished by TYPE, never by the message: `Config` also mentions a
+        // task by name, and matching on prose would have caught it.
+        assert_eq!(
+            lease_held_elsewhere(&SyncError::Config(
+                "task nightly is off, so nothing runs it".to_owned()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn a_malformed_selector_an_unknown_id_and_an_unreadable_row_are_three_refusals() {
+        let listing = TaskListing {
+            tasks: vec![a_task("nightly")],
+            unknown: vec![UnknownTask {
+                id: "teleport-1".to_owned(),
+                reason: "kind 'teleport' is not one this keeper can run".to_owned(),
+            }],
+        };
+
+        // The one that resolves.
+        assert_eq!(
+            select_task(&listing, "nightly").expect("an exact id").id,
+            "nightly"
+        );
+
+        // 1. Malformed: a spelling `upsert_task` could never have stored, so no
+        //    list of known ids would help — the input itself is the problem.
+        let malformed = select_task(&listing, "nightly ").expect_err("a trailing space");
+        assert_eq!(malformed.exit_code(), EXIT_CONFIG);
+        assert!(
+            malformed.to_string().contains("nightly "),
+            "the input must be quoted: {malformed}"
+        );
+        assert!(
+            malformed.to_string().contains("whitespace"),
+            "and the rule named: {malformed}"
+        );
+        let blank = select_task(&listing, "   ").expect_err("blank");
+        assert_eq!(blank.exit_code(), EXIT_CONFIG);
+
+        // 2. Unknown: well formed, but no such row — so the alternatives are
+        //    exactly what helps.
+        let unknown = select_task(&listing, "nope").expect_err("no such task");
+        assert_eq!(unknown.exit_code(), EXIT_CONFIG);
+        assert!(unknown.to_string().contains("nope"), "{unknown}");
+        assert!(
+            unknown.to_string().contains("nightly"),
+            "the known ids must be listed: {unknown}"
+        );
+
+        // 3. Stored, but unreadable — a third answer, and hiding it would make
+        //    an unreadable row indistinguishable from an absent one.
+        let unreadable = select_task(&listing, "teleport-1").expect_err("an unreadable row");
+        assert_eq!(unreadable.exit_code(), EXIT_CONFIG);
+        assert!(
+            unreadable.to_string().contains("teleport-1"),
+            "{unreadable}"
+        );
+        assert!(
+            unreadable.to_string().contains("teleport"),
+            "the stored reason must survive: {unreadable}"
+        );
+        assert!(
+            !unreadable.to_string().contains("no task matches"),
+            "an unreadable row must not be reported as absent: {unreadable}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_selector_says_so_honestly_when_nothing_is_stored() {
+        // `select`'s own shape: "known tasks are: " with an empty list after it
+        // reads as a rendering bug, not as an empty database.
+        let err = select_task(&TaskListing::default(), "nightly").expect_err("nothing stored");
+        assert_eq!(err.exit_code(), EXIT_CONFIG);
+        assert!(err.to_string().contains("no tasks are stored"), "{err}");
+    }
+
+    #[test]
+    fn a_host_wide_task_document_carries_every_key_and_nulls_the_binding() {
+        let document = task_json(&a_task("nightly"), None, None);
+        assert_eq!(
+            sorted_keys(&document),
+            vec![
+                "enabled",
+                "id",
+                "kind",
+                "lastRun",
+                "leaseUntilMs",
+                "mode",
+                "nextDueMs",
+                "profile",
+                "profileId",
+                "runningHost",
+                "schedule",
+            ]
+        );
+        assert_eq!(document["id"], serde_json::json!("nightly"));
+        assert_eq!(document["kind"], serde_json::json!("sync"));
+        assert_eq!(document["mode"], serde_json::json!("manual"));
+        assert_eq!(document["enabled"], serde_json::json!(true));
+        // Null, not absent: "this task belongs to the machine" is a real value.
+        assert_eq!(document["profileId"], serde_json::Value::Null);
+        assert_eq!(document["profile"], serde_json::Value::Null);
+        assert_eq!(document["schedule"], serde_json::Value::Null);
+        assert_eq!(document["nextDueMs"], serde_json::Value::Null);
+        assert_eq!(document["runningHost"], serde_json::Value::Null);
+        assert_eq!(document["leaseUntilMs"], serde_json::Value::Null);
+        assert_eq!(document["lastRun"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_bound_scheduled_task_document_carries_the_values_it_was_given() {
+        let mut task = a_task("docs-nightly");
+        task.profile_id = Some("01DOCS".to_owned());
+        task.kind = TaskKind::Release;
+        task.mode = TaskMode::Scheduled;
+        task.schedule = Some("every 5m".to_owned());
+        task.next_due_ms = Some(1_700_000_300_000);
+        task.enabled = false;
+        task.running_host = Some("server-b".to_owned());
+        task.lease_until_ms = Some(1_700_000_060_000);
+
+        let last = a_run("docs-nightly", TaskOutcome::Deferred);
+        let document = task_json(&task, Some("docs"), Some(&last));
+        assert_eq!(document["profileId"], serde_json::json!("01DOCS"));
+        assert_eq!(document["profile"], serde_json::json!("docs"));
+        assert_eq!(document["kind"], serde_json::json!("release"));
+        assert_eq!(document["mode"], serde_json::json!("scheduled"));
+        assert_eq!(document["enabled"], serde_json::json!(false));
+        assert_eq!(document["schedule"], serde_json::json!("every 5m"));
+        assert_eq!(
+            document["nextDueMs"],
+            serde_json::json!(1_700_000_300_000i64)
+        );
+        assert_eq!(document["runningHost"], serde_json::json!("server-b"));
+        assert_eq!(
+            document["leaseUntilMs"],
+            serde_json::json!(1_700_000_060_000i64)
+        );
+        assert_eq!(document["lastRun"], task_run_json(&last));
+
+        // A binding whose folder is gone: the id survives and the name is null,
+        // which is what makes it distinguishable from host-wide.
+        let dangling = task_json(&task, None, None);
+        assert_eq!(dangling["profileId"], serde_json::json!("01DOCS"));
+        assert_eq!(dangling["profile"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_run_document_omits_unknown_outcome_unless_there_is_one() {
+        let readable = a_run("nightly", TaskOutcome::Ok);
+        let document = task_run_json(&readable);
+        assert_eq!(
+            sorted_keys(&document),
+            vec![
+                "detail",
+                "finishedMs",
+                "host",
+                "id",
+                "outcome",
+                "startedMs",
+                "taskId",
+            ],
+            "no `unknownOutcome` when the outcome was readable"
+        );
+        assert_eq!(document["id"], serde_json::json!(7));
+        assert_eq!(document["taskId"], serde_json::json!("nightly"));
+        assert_eq!(
+            document["startedMs"],
+            serde_json::json!(1_700_000_000_000i64)
+        );
+        assert_eq!(
+            document["finishedMs"],
+            serde_json::json!(1_700_000_001_000i64)
+        );
+        assert_eq!(document["outcome"], serde_json::json!("ok"));
+        assert_eq!(
+            document["detail"],
+            serde_json::json!("1 synced, 0 already syncing, 0 waiting, 0 failed")
+        );
+        assert_eq!(document["host"], serde_json::json!("server-a"));
+
+        // Still in flight: `outcome` null and NO `unknownOutcome`.
+        let mut flight = readable.clone();
+        flight.outcome = None;
+        flight.finished_ms = None;
+        flight.detail = None;
+        let document = task_run_json(&flight);
+        assert_eq!(
+            sorted_keys(&document),
+            vec![
+                "detail",
+                "finishedMs",
+                "host",
+                "id",
+                "outcome",
+                "startedMs",
+                "taskId",
+            ]
+        );
+        assert_eq!(document["outcome"], serde_json::Value::Null);
+        assert_eq!(document["finishedMs"], serde_json::Value::Null);
+
+        // A newer keeper's spelling: the key APPEARS, which is the only way a
+        // consumer can tell this from the row above.
+        let mut newer = readable.clone();
+        newer.outcome = None;
+        newer.unknown_outcome = Some("teleported".to_owned());
+        let document = task_run_json(&newer);
+        assert_eq!(
+            sorted_keys(&document),
+            vec![
+                "detail",
+                "finishedMs",
+                "host",
+                "id",
+                "outcome",
+                "startedMs",
+                "taskId",
+                "unknownOutcome",
+            ]
+        );
+        assert_eq!(document["outcome"], serde_json::Value::Null);
+        assert_eq!(document["unknownOutcome"], serde_json::json!("teleported"));
+    }
+
+    /// A row so corrupt its primary key will not read still has to be a line
+    /// somebody can make sense of (NFR-43).
+    ///
+    /// `db::list_tasks` reports it with an **empty** id, which rendered as a
+    /// line starting with a bare colon: it told the operator a row exists and
+    /// named nothing they could type. There genuinely is no id to give them —
+    /// `tasks::validate_id` refuses `""` before any lookup, so `tasks forget`
+    /// cannot reach it either — and the line has to say that rather than look
+    /// like a value went missing on the way to the screen.
+    #[test]
+    fn an_unreadable_row_with_no_readable_id_still_reads_as_something() {
+        let lines = task_lines(
+            1_700_000_000_000,
+            &[],
+            &[UnknownTask {
+                id: String::new(),
+                reason: "unreadable task row: Invalid column type".to_owned(),
+            }],
+        );
+        let rendered = lines.join("\n");
+        assert!(
+            !rendered.starts_with(':'),
+            "a bare colon is a value that went missing, not an answer: {rendered}"
+        );
+        assert!(
+            rendered.contains("id will not read"),
+            "the line says what is unknowable about it: {rendered}"
+        );
+        assert!(
+            rendered.contains("Invalid column type"),
+            "and still carries the reason: {rendered}"
+        );
+    }
+
+    #[test]
+    fn the_three_envelopes_are_the_contract_key_by_key() {
+        let task = a_task("nightly");
+        let run = a_run("nightly", TaskOutcome::Ok);
+        let rendered = task_json(&task, None, Some(&run));
+
+        let listing = tasks_list_document(
+            vec![rendered.clone()],
+            &[UnknownTask {
+                id: "teleport-1".to_owned(),
+                reason: "kind 'teleport'".to_owned(),
+            }],
+        );
+        assert_eq!(sorted_keys(&listing), vec!["tasks", "unknown"]);
+        assert_eq!(listing["tasks"], serde_json::json!([rendered]));
+        assert_eq!(
+            listing["unknown"],
+            serde_json::json!([{ "id": "teleport-1", "reason": "kind 'teleport'" }])
+        );
+
+        let status = task_status_document(rendered.clone(), vec![task_run_json(&run)]);
+        assert_eq!(sorted_keys(&status), vec!["runs", "task"]);
+        assert_eq!(status["task"], rendered);
+        assert_eq!(status["runs"], serde_json::json!([task_run_json(&run)]));
+
+        let performed = task_run_document(
+            "nightly",
+            Some(task_run_json(&run)),
+            run_outcome_word(&run),
+            EXIT_OK,
+        );
+        assert_eq!(
+            sorted_keys(&performed),
+            vec!["exit", "outcome", "run", "task"]
+        );
+        assert_eq!(performed["task"], serde_json::json!("nightly"));
+        assert_eq!(performed["run"], task_run_json(&run));
+        assert_eq!(performed["outcome"], serde_json::json!("ok"));
+        assert_eq!(performed["exit"], serde_json::json!(0));
+
+        // A lease held elsewhere opened no run of ours. Same key set, `run`
+        // null — a real value ("there is no row"), not "nobody asked".
+        let lost = task_run_document("nightly", None, "busy", EXIT_DEFERRED);
+        assert_eq!(sorted_keys(&lost), vec!["exit", "outcome", "run", "task"]);
+        assert_eq!(lost["run"], serde_json::Value::Null);
+        assert_eq!(lost["outcome"], serde_json::json!("busy"));
+        assert_eq!(lost["exit"], serde_json::json!(4));
+
+        let saved = task_saved_document(rendered.clone());
+        assert_eq!(sorted_keys(&saved), vec!["task"]);
+        assert_eq!(saved["task"], rendered);
+
+        let forgotten = task_forgotten_document("nightly");
+        assert_eq!(sorted_keys(&forgotten), vec!["forgot"]);
+        assert_eq!(forgotten["forgot"], serde_json::json!("nightly"));
+    }
+
+    #[test]
+    fn a_countdown_is_one_coarse_unit_at_every_boundary() {
+        let now = 1_700_000_000_000i64;
+        // Under a minute in either direction is not worth a unit.
+        assert_eq!(relative_ms(now, now), "now");
+        assert_eq!(relative_ms(now, now + 59_999), "now");
+        assert_eq!(relative_ms(now, now - 59_999), "now");
+        // Minutes.
+        assert_eq!(relative_ms(now, now + 60_000), "in 1m");
+        assert_eq!(relative_ms(now, now - 60_000), "1m ago");
+        assert_eq!(relative_ms(now, now - 12 * 60_000), "12m ago");
+        assert_eq!(relative_ms(now, now + 3_599_999), "in 59m");
+        // Hours.
+        assert_eq!(relative_ms(now, now + 3_600_000), "in 1h");
+        assert_eq!(relative_ms(now, now + 4 * 3_600_000), "in 4h");
+        assert_eq!(relative_ms(now, now + 86_399_999), "in 23h");
+        // Days, and no unit above them: a schedule slower than a year is
+        // refused at the write door, so weeks would be a unit nothing produces.
+        assert_eq!(relative_ms(now, now + 86_400_000), "in 1d");
+        assert_eq!(relative_ms(now, now - 30 * 86_400_000), "30d ago");
+        // A clock that moved backwards past the epoch must not overflow.
+        assert_eq!(relative_ms(i64::MAX, i64::MIN), "106751991167d ago");
+    }
+
+    #[test]
+    fn the_human_listing_is_honest_when_there_is_nothing_to_show() {
+        let now = 1_700_000_000_000i64;
+        let lines = task_lines(now, &[], &[]);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("No tasks"), "{lines:?}");
+
+        // An unreadable row is a LINE, not a silence: a folder with one task
+        // this build cannot run must not read as a folder with no tasks.
+        let lines = task_lines(
+            now,
+            &[],
+            &[UnknownTask {
+                id: "teleport-1".to_owned(),
+                reason: "kind 'teleport' is not one this keeper can run".to_owned(),
+            }],
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("teleport-1")
+                && line.contains("cannot read")
+                && line.contains("kind 'teleport'")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_rendered_task_line_names_its_target_its_schedule_and_its_last_run() {
+        let now = 1_700_000_000_000i64;
+        let mut task = a_task("nightly");
+        task.mode = TaskMode::Scheduled;
+        task.schedule = Some("0 3 * * *".to_owned());
+        task.next_due_ms = Some(now + 4 * 3_600_000);
+        let last = a_run("nightly", TaskOutcome::Deferred);
+
+        let host_wide = task_lines(
+            now,
+            &[TaskView {
+                task: &task,
+                profile_name: None,
+                last: Some(&last),
+            }],
+            &[],
+        );
+        let joined = host_wide.join("\n");
+        assert!(joined.contains("nightly"), "{joined}");
+        assert!(joined.contains("sync"), "{joined}");
+        assert!(joined.contains("scheduled"), "{joined}");
+        assert!(joined.contains("host-wide"), "{joined}");
+        assert!(joined.contains("0 3 * * *"), "{joined}");
+        assert!(joined.contains("in 4h"), "{joined}");
+        assert!(joined.contains("deferred"), "{joined}");
+        assert!(!joined.contains("[disabled]"), "{joined}");
+
+        // Bound AND disabled. The binding has to be set for the folder's name
+        // to be the target at all: `profile_id: None` is host-wide whatever
+        // name is passed beside it, which is the renderer refusing to invent a
+        // folder for a task that belongs to the machine.
+        task.enabled = false;
+        task.profile_id = Some("01DOCS".to_owned());
+        let paused = task_lines(
+            now,
+            &[TaskView {
+                task: &task,
+                profile_name: Some("docs"),
+                last: None,
+            }],
+            &[],
+        )
+        .join("\n");
+        assert!(paused.contains("docs"), "{paused}");
+        assert!(paused.contains("[disabled]"), "{paused}");
+        assert!(
+            paused.contains("never run"),
+            "a task with no history says so rather than showing an empty column: {paused}"
+        );
+
+        // A binding whose folder this engine does not have: named, never
+        // silently rendered as host-wide.
+        let dangling = task_lines(
+            now,
+            &[TaskView {
+                task: &task,
+                profile_name: None,
+                last: None,
+            }],
+            &[],
+        )
+        .join("\n");
+        assert!(dangling.contains("no such folder: 01DOCS"), "{dangling}");
+        assert!(!dangling.contains("host-wide"), "{dangling}");
+    }
+
+    #[test]
+    fn the_history_rendering_is_honest_when_there_is_none() {
+        let now = 1_700_000_000_000i64;
+        let empty = task_run_lines(now, "nightly", &[]);
+        assert_eq!(empty.len(), 1, "{empty:?}");
+        assert!(empty[0].contains("no runs"), "{empty:?}");
+
+        let mut newer = a_run("nightly", TaskOutcome::Ok);
+        newer.outcome = None;
+        newer.unknown_outcome = Some("teleported".to_owned());
+        let lines = task_run_lines(
+            now,
+            "nightly",
+            &[a_run("nightly", TaskOutcome::Failed), newer],
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("failed"), "{joined}");
+        assert!(joined.contains("server-a"), "{joined}");
+        assert!(
+            joined.contains("teleported"),
+            "a spelling this build cannot read is still a run that happened: {joined}"
+        );
+    }
+
+    /// End to end over a real engine: the verb's own path, and the row it left.
+    ///
+    /// The claim worth making here is the one no pure test can: a run this CLI
+    /// requested is recorded exactly as a scheduled one is — closed, with a
+    /// host, an outcome and a detail — and the number the verb returns is the
+    /// mapped one. A host-wide `sync` task on a box with no folders configured
+    /// is the smallest shape that reaches `claim_and_run` and comes back `Ok`.
+    #[tokio::test]
+    async fn a_requested_run_is_recorded_and_its_exit_code_is_the_mapped_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        // The idiom `keeper-sync`'s own tests use: a box with no usable git
+        // cannot open an engine, and that is not this test's claim.
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut task = a_task("nightly");
+        task.updated_ms = platform.now_ms();
+        engine.save_task(&task).expect("a host-wide sync task");
+
+        // `Printer::new(false)` prints the human form to this test's stdout,
+        // which is exactly what `cargo test` captures and discards.
+        let printer = Printer::new(false);
+        let code = cmd_task_run(&printer, &engine, platform.now_ms(), "nightly")
+            .await
+            .expect("the verb itself must not fail");
+        assert_eq!(code, EXIT_OK);
+
+        let runs = engine.task_history("nightly", 10).expect("history");
+        let [run] = &runs[..] else {
+            panic!("exactly one run, got {}", runs.len());
+        };
+        assert_eq!(run.task_id, "nightly");
+        assert_eq!(run.outcome, Some(TaskOutcome::Ok));
+        assert!(run.unknown_outcome.is_none());
+        assert!(
+            run.finished_ms.is_some(),
+            "a requested run is closed by the host that opened it, exactly as a \
+             scheduled one is"
+        );
+        assert!(!run.host.is_empty(), "the host is recorded either way");
+        assert_eq!(run.detail.as_deref(), Some("no folders to sync"));
+        assert_eq!(
+            task_exit_code(run.outcome.expect("an outcome")),
+            code,
+            "the number the verb returned is the recorded outcome's own"
+        );
+
+        let listing = engine.tasks().expect("tasks");
+        let stored = select_task(&listing, "nightly").expect("the row survives");
+        assert!(
+            stored.running_host.is_none() && stored.lease_until_ms.is_none(),
+            "the lease is released"
+        );
+        assert_eq!(
+            stored.next_due_ms, None,
+            "asking for a run now is not asking to skip the next one"
+        );
+    }
+
+    /// Every flag `tasks set` can be given, against a real store.
+    ///
+    /// The claims a pure test cannot make: what `--kind`-on-create refuses,
+    /// which columns an omitted flag preserves, that the two clearing flags
+    /// really clear, and that `set` cannot resurrect a task somebody disabled.
+    #[test]
+    fn set_requires_a_kind_to_create_and_preserves_everything_omitted_to_update() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+        let stored = |id: &str| -> TaskRow {
+            let listing = engine.tasks().expect("tasks");
+            select_task(&listing, id).expect("a stored row").clone()
+        };
+
+        // A folder to bind to, so `--profile` and `--host-wide` are exercised
+        // against a real selector rather than against a literal id.
+        let folder = SyncProfile::new(
+            "01DOCS",
+            "docs",
+            dir.path().join("docs"),
+            "https://example.com/docs.git",
+        );
+        engine.upsert_profile(&folder).expect("a folder");
+
+        // 1. Create with no kind: refused, quoting the id and naming the flag.
+        let err = cmd_task_set(&printer, &engine, now, &set_args("nightly"))
+            .expect_err("a new task must name its kind");
+        assert_eq!(err.exit_code(), EXIT_CONFIG);
+        assert!(err.to_string().contains("nightly"), "{err}");
+        assert!(err.to_string().contains("--kind"), "{err}");
+
+        // 2. Create with a schedule: `mode` derives to `scheduled`, and
+        //    `enabled` is true because nothing stored says otherwise.
+        let mut args = set_args("nightly");
+        args.kind = Some(TaskKindArg::Release);
+        args.schedule = Some("every 30m".to_owned());
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &args).expect("create"),
+            EXIT_OK
+        );
+        let row = stored("nightly");
+        assert_eq!(row.kind, TaskKind::Release);
+        assert_eq!(row.mode, TaskMode::Scheduled);
+        assert_eq!(row.schedule.as_deref(), Some("every 30m"));
+        assert!(row.enabled);
+        assert_eq!(row.profile_id, None, "no --profile means host-wide");
+
+        // 3. Create WITHOUT a schedule: `manual`, because `upsert_task` refuses
+        //    a scheduled row with nothing to schedule — the one derived default
+        //    that cannot produce a refused row.
+        let mut args = set_args("adhoc");
+        args.kind = Some(TaskKindArg::Sync);
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &args).expect("create"),
+            EXIT_OK
+        );
+        assert_eq!(stored("adhoc").mode, TaskMode::Manual);
+
+        // 4. Update naming nothing: every stored value survives.
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &set_args("nightly")).expect("update"),
+            EXIT_OK
+        );
+        let row = stored("nightly");
+        assert_eq!(row.kind, TaskKind::Release);
+        assert_eq!(row.mode, TaskMode::Scheduled);
+        assert_eq!(row.schedule.as_deref(), Some("every 30m"));
+
+        // 5. `--profile` binds through `select`, by NAME as an operator types it.
+        let mut args = set_args("nightly");
+        args.profile = Some("docs".to_owned());
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &args).expect("bind"),
+            EXIT_OK
+        );
+        assert_eq!(stored("nightly").profile_id.as_deref(), Some("01DOCS"));
+        // ...and a selector nothing matches is refused rather than silently
+        // binding the task to nothing.
+        let mut args = set_args("nightly");
+        args.profile = Some("nope".to_owned());
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &args)
+                .expect_err("no such folder")
+                .exit_code(),
+            EXIT_CONFIG
+        );
+
+        // 6. `--host-wide` unbinds it again. A knob that could only be set is
+        //    the dead knob this epic exists to close.
+        let mut args = set_args("nightly");
+        args.host_wide = true;
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &args).expect("unbind"),
+            EXIT_OK
+        );
+        assert_eq!(stored("nightly").profile_id, None);
+
+        // 7. `--no-schedule` clears the expression. The mode has to come down
+        //    with it, and the write door is what says so.
+        let mut args = set_args("nightly");
+        args.no_schedule = true;
+        args.mode = Some(TaskModeArg::Manual);
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &args).expect("clear the schedule"),
+            EXIT_OK
+        );
+        let row = stored("nightly");
+        assert_eq!(row.schedule, None);
+        assert_eq!(row.mode, TaskMode::Manual);
+
+        // 8. `disable` touches one column, and `set` must not undo it: writing
+        //    `enabled` from a settings-shaped update is exactly how a restart
+        //    un-pauses everything somebody paused.
+        assert_eq!(
+            cmd_task_set_enabled(&printer, &engine, now, "nightly", false).expect("disable"),
+            EXIT_OK
+        );
+        let row = stored("nightly");
+        assert!(!row.enabled);
+        assert_eq!(row.kind, TaskKind::Release, "and nothing else moved");
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &set_args("nightly")).expect("update"),
+            EXIT_OK
+        );
+        assert!(
+            !stored("nightly").enabled,
+            "`set` must not resurrect a disabled task"
+        );
+        assert_eq!(
+            cmd_task_set_enabled(&printer, &engine, now, "nightly", true).expect("enable"),
+            EXIT_OK
+        );
+        assert!(stored("nightly").enabled);
+
+        // 9. `forget` refuses an id nobody stored, and takes the row when it is
+        //    real.
+        assert_eq!(
+            cmd_task_forget(&printer, &engine, "nope")
+                .expect_err("no such task")
+                .exit_code(),
+            EXIT_CONFIG
+        );
+        assert_eq!(
+            cmd_task_forget(&printer, &engine, "nightly").expect("forget"),
+            EXIT_OK
+        );
+        let listing = engine.tasks().expect("tasks");
+        assert!(select_task(&listing, "nightly").is_err(), "the row is gone");
+
+        // 10. And both read verbs run over a real store, so a rendering that
+        //     panics on a stored row is caught here rather than by an operator.
+        assert_eq!(
+            cmd_task_list(&printer, &engine, now).expect("list"),
+            EXIT_OK
+        );
+        assert_eq!(
+            cmd_task_status(&printer, &engine, now, "adhoc").expect("status"),
+            EXIT_OK
+        );
+    }
+
+    /// A stored task cannot be repurposed into another kind.
+    ///
+    /// Two things would go wrong if it could, and neither is cosmetic. The
+    /// armed window survives — `upsert_task` clears it only when the schedule
+    /// *text* moves — so a `sync` task whose window is already open becomes a
+    /// `release` task that **deletes** on the very next tick, at an instant
+    /// nobody armed for a deletion. And the run history survives, so a sync's
+    /// `1 synced, 0 already syncing…` renders as a release task's own record.
+    #[test]
+    fn a_stored_tasks_kind_cannot_be_changed_out_from_under_its_window_and_history() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+
+        let mut args = set_args("nightly");
+        args.kind = Some(TaskKindArg::Sync);
+        args.schedule = Some("every 30m".to_owned());
+        cmd_task_set(&printer, &engine, now, &args).expect("create a sync task");
+
+        let mut repurpose = set_args("nightly");
+        repurpose.kind = Some(TaskKindArg::Release);
+        let err = cmd_task_set(&printer, &engine, now, &repurpose)
+            .expect_err("a task's kind is not a knob");
+        assert_eq!(err.exit_code(), EXIT_CONFIG);
+        let message = err.to_string();
+        assert!(message.contains("nightly"), "{message}");
+        assert!(
+            message.contains("sync"),
+            "the refusal names what it IS stored as: {message}"
+        );
+        assert!(
+            message.contains("forget"),
+            "and the one instruction that works: {message}"
+        );
+
+        let listing = engine.tasks().expect("tasks");
+        assert_eq!(
+            select_task(&listing, "nightly").expect("the row").kind,
+            TaskKind::Sync,
+            "and nothing was written"
+        );
+
+        // Naming the kind it already has is not a change, so it is not refused:
+        // a wrapper script that always passes `--kind` still works.
+        let mut same = set_args("nightly");
+        same.kind = Some(TaskKindArg::Sync);
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &same).expect("a no-op kind"),
+            EXIT_OK
+        );
+    }
+
+    /// A finished run is never rendered in the future tense.
+    ///
+    /// `run()` samples one instant before dispatching, and `tasks run` is the
+    /// only verb that performs work between that sample and its render — so
+    /// `run.started_ms` is always at or after the sample, and a sweep that took
+    /// five minutes printed `in 5m` for work that had already finished. The
+    /// render therefore measures from `now_ms.max(run.finished_ms)`.
+    ///
+    /// Both renderings are built from **one** run, so the only difference
+    /// between them is the instant they are measured against — which is exactly
+    /// the line `cmd_task_run` changed.
+    #[test]
+    fn a_run_that_took_minutes_is_not_printed_as_having_just_started() {
+        let now = 1_700_000_000_000i64;
+        // A five-minute run. `claim_and_run` opens it a moment after `run()`
+        // read the clock, so `started_ms` sits just *after* the sample — which
+        // is what makes the stale rendering say "now" however long the run took.
+        let mut run = a_run("nightly", TaskOutcome::Ok);
+        run.started_ms = now + 20;
+        run.finished_ms = Some(run.started_ms + 5 * 60_000);
+
+        let stale = task_run_lines(now, "nightly", std::slice::from_ref(&run)).join("\n");
+        assert!(
+            stale.contains("  now  "),
+            "the defect has to be reproducible or the fix proves nothing: {stale}"
+        );
+
+        let rendered_at = now.max(run.finished_ms.expect("a closed run"));
+        let honest = task_run_lines(rendered_at, "nightly", &[run]).join("\n");
+        assert!(
+            honest.contains("5m ago"),
+            "a run that finished five minutes later started five minutes before \
+             the render: {honest}"
+        );
     }
 }

@@ -37,7 +37,13 @@ vi.mock("@/lib/ipc/client", () => ({
   syncCreateEntry: (id: unknown, subpath: unknown, name: unknown) =>
     syncCreateEntry(id, subpath, name),
   revealPath: (path: unknown) => revealPath(path),
-  syncMaterializeEntry: (id: unknown, subpath: unknown) => syncMaterializeEntry(id, subpath),
+  // Three arguments and not two (story 56.17): the duration is the whole point
+  // of the submenu, and a factory that dropped it would let every assertion
+  // about one pass against a pane that never sent it. The promoted control's
+  // two-argument call arrives here as a third `undefined`, which is what the
+  // hover-button test asserts.
+  syncMaterializeEntry: (id: unknown, subpath: unknown, keepForMs: unknown) =>
+    syncMaterializeEntry(id, subpath, keepForMs),
   syncReleaseEntry: (id: unknown, subpath: unknown) => syncReleaseEntry(id, subpath),
   syncPinEntry: (id: unknown, subpath: unknown, pinned: unknown) =>
     syncPinEntry(id, subpath, pinned),
@@ -55,6 +61,7 @@ import {
   FILES_CREATE_LABEL,
   FILES_DELETE_LABEL,
   FILES_EMPTY_FOLDER_SENTENCE,
+  FILES_MATERIALIZE_DURATIONS,
   FILES_MATERIALIZE_LABEL,
   FILES_MTIME_SLOT,
   FILES_NAME_FLOOR_PX,
@@ -1036,6 +1043,12 @@ const FILE_LEVEL = 2;
  *
  * At module scope for {@link withTreeWidth}'s reason: two suites read a row's
  * cluster now (Story 56.9), and two allow-lists is two things to keep in step.
+ *
+ * Story 56.17's four durations are listed too even though they belong to a
+ * context-menu SUBMENU and can never legitimately appear here. That is the
+ * point: the cluster is icons, an icon has no room to say "8 hours", and a
+ * duration promoted onto the row would otherwise be filtered out of every
+ * assertion in this file and so be invisible exactly where it is wrong.
  */
 function verbs(row: HTMLElement): string[] {
   return within(row)
@@ -1049,6 +1062,7 @@ function verbs(row: HTMLElement): string[] {
         FILES_MATERIALIZE_LABEL,
         FILES_RELEASE_LABEL,
         FILES_PIN_LABEL,
+        ...FILES_MATERIALIZE_DURATIONS.map((choice) => choice.label),
       ].includes(label),
     );
 }
@@ -3692,14 +3706,32 @@ describe("FilesPane — the state verbs and the release clock", () => {
     restoreWidth = null;
   });
 
-  /** A materialized file on a live release clock. */
-  function counting(name: string, releasesAfterMs: number): FilesEntryVm {
+  /** Rust's sentence for `ReleaseSchedule::DueByRequest` — the variant story
+   *  56.17 added — VERBATIM, for {@link DUE_SENTENCE}'s reason.
+   *
+   *  It is its OWN sentence, and that is the point of the variant: `Due` above
+   *  says the folder's interval is what is holding the file, which is exactly the
+   *  thing a per-path duration makes untrue. Both fill `releasesAfterMs` with an
+   *  instant and leave `hold` `null`, so the cell, the tick and the formatter
+   *  cannot tell them apart — only these words differ, and the pane neither
+   *  parses nor rewords them. */
+  const REQUEST_SENTENCE =
+    "You asked keeper to keep this content for a set time; it goes on the first sync after that runs out, whatever this folder's own release interval says";
+
+  /** A materialized file on a live release clock.
+   *
+   *  `detail` is Rust's sentence for WHOSE clock that is, defaulted to the
+   *  folder's window because that is what every row here meant before story
+   *  56.17. A per-path duration reaches this pane as the same three fields with
+   *  {@link REQUEST_SENTENCE} in the third — no new wire field — so the fixture
+   *  grows a parameter rather than a twin. */
+  function counting(name: string, releasesAfterMs: number, detail = DUE_SENTENCE): FilesEntryVm {
     return entry(
       name,
       "file",
       name,
       { status: "materialized", detail: null },
-      { release: { releasesAfterMs, hold: null, detail: DUE_SENTENCE } },
+      { release: { releasesAfterMs, hold: null, detail } },
     );
   }
 
@@ -3908,11 +3940,169 @@ describe("FilesPane — the state verbs and the release clock", () => {
     );
 
     // The profile id and the subpath the LISTING handed over, never a path this
-    // surface composed (AD-65).
-    expect(syncMaterializeEntry).toHaveBeenCalledWith("01VAULT", "40-media/gone.mp4");
+    // surface composed (AD-65) — and no duration, which since story 56.17 is a
+    // third argument the wrapper carries and this control deliberately omits.
+    expect(syncMaterializeEntry).toHaveBeenCalledWith("01VAULT", "40-media/gone.mp4", undefined);
     // And the folder is re-read, because the row's own mark is the feedback: it
     // becomes `materializing`, and nothing else on this surface would notice.
     await waitFor(() => expect(rootBrowses()).toBe(before + 1));
+  });
+
+  /**
+   * Story 56.17 — the choice is at the click, and the click is the row's own
+   * menu.
+   *
+   * The four durations are read from the pane's own exported list rather than
+   * typed out here: this suite is allowed to assert WHICH duration the pane sent
+   * and how it spells the offer, not to hold a second copy of the numbers that
+   * would go on passing after the list changed. What is hardcoded is the one
+   * thing this test is about — that choosing the second of them sends eight hours
+   * in milliseconds, and not eight.
+   *
+   * A submenu and not a modal: the row's verbs are one typed array feeding the
+   * cluster and this menu, so the choice lives on the verb that already exists.
+   */
+  it("a virtual row offers the four durations under Materialize, and choosing one asks for it", async () => {
+    await tree([
+      entry("gone.mp4", "file", "40-media/gone.mp4", { status: "virtual", detail: null }),
+    ]);
+    const row = screen.getByRole("treeitem", { name: "gone.mp4" });
+
+    await act(async () => {
+      fireEvent.contextMenu(row);
+      await Promise.resolve();
+    });
+    // Materialize is still one item in the menu's one list, reading exactly the
+    // word it always did — the submenu hangs off THAT item rather than adding a
+    // sixth verb beside it.
+    await click(
+      within(await screen.findByRole("menu")).getByRole("menuitem", {
+        name: FILES_MATERIALIZE_LABEL,
+      }),
+    );
+
+    // All four, in the order the pane offers them: an hour, a working day, the
+    // folder's own default, and the indefinite this verb has always meant.
+    const offered = (await screen.findAllByRole("menuitem"))
+      .map((item) => item.textContent)
+      .filter((text) => FILES_MATERIALIZE_DURATIONS.some((choice) => choice.label === text));
+    expect(offered).toEqual(FILES_MATERIALIZE_DURATIONS.map((choice) => choice.label));
+
+    const eightHours = FILES_MATERIALIZE_DURATIONS[1];
+    expect(eightHours?.keepForMs).toBe(28_800_000);
+    await click(screen.getByRole("menuitem", { name: eightHours?.label ?? "" }));
+
+    // The subpath the listing handed over, and the duration the person chose, in
+    // milliseconds. The number is written out because that IS the claim.
+    expect(syncMaterializeEntry).toHaveBeenCalledWith("01VAULT", "40-media/gone.mp4", 28_800_000);
+    // And through `runRowVerb` like every other verb, so the folder is re-read —
+    // the row's own mark is the feedback, and a refusal would reach the pane's
+    // one alert rather than a surface of the submenu's own.
+    await waitFor(() => expect(rootBrowses()).toBe(2));
+  });
+
+  /**
+   * And the promoted control is untouched by all of it.
+   *
+   * An icon button has no room to say a duration, and Materialize has meant
+   * "indefinitely" since story 56.9 — so the cluster goes on firing the verb's
+   * DEFAULT `onSelect`, which sends none. Asserted as an explicit third
+   * `undefined` rather than by counting arguments, because `undefined` is what
+   * the wrapper forwards and what Rust reads as *this caller said nothing about
+   * retention*: `KeepFor::Unspecified`, which writes no deadline and disturbs no
+   * standing one.
+   *
+   * The menu's own last choice is deliberately NOT that: `Indefinitely` sends an
+   * explicit `0`, which withdraws a deadline somebody set earlier. On a path
+   * nobody has named a time for the two are indistinguishable, which is why the
+   * button can keep its single meaning — but they are two answers and this
+   * asserts they stay two.
+   */
+  it("the promoted Materialize control still asks for no duration at all", async () => {
+    await tree([
+      entry("gone.mp4", "file", "40-media/gone.mp4", { status: "virtual", detail: null }),
+    ]);
+
+    await click(
+      within(screen.getByRole("treeitem", { name: "gone.mp4" })).getByRole("button", {
+        name: FILES_MATERIALIZE_LABEL,
+      }),
+    );
+
+    expect(syncMaterializeEntry).toHaveBeenCalledWith("01VAULT", "40-media/gone.mp4", undefined);
+    expect(FILES_MATERIALIZE_DURATIONS[FILES_MATERIALIZE_DURATIONS.length - 1]?.keepForMs).toBe(0);
+  });
+
+  /**
+   * Story 56.17 — a duration the person named is drawn by the cell that was
+   * already there and ticked by the interval that was already there.
+   *
+   * Nothing on the wire is new: `DueByRequest` fills `releasesAfterMs`, `hold`
+   * and `detail`, so a row kept for an hour is the same three fields as a row on
+   * the folder's window with a different sentence in the third. That is the claim
+   * worth a test, because the thing anybody would reach for instead — a second
+   * formatter, a second cell or a per-row timer for "the user's own deadline" —
+   * passes every other assertion in this suite and fails here.
+   *
+   * The TOTAL count is pinned beside the filtered one, for the reason the
+   * one-interval test above gives: a mutation that changed the period would arm a
+   * timer no filtered assertion in this file ever looks at. The baseline is the
+   * same pane with the deadline taken off, so what is compared is one pane
+   * against itself.
+   */
+  it("a row counts a chosen deadline down through the one cell and the one interval", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const spy = vi.spyOn(globalThis, "setInterval");
+    try {
+      vi.setSystemTime(BASE_MS);
+      await tree([counting("kept.mp4", BASE_MS + 3_600_000, REQUEST_SENTENCE)]);
+
+      // The ONE cell: drawn rather than merely spoken, and carrying Rust's
+      // sentence for whose clock this is beside the figure.
+      const cell = releaseCell("kept.mp4");
+      expect(cell?.className).not.toContain("sr-only");
+      expect(cell?.textContent).toContain(REQUEST_SENTENCE);
+      expect(releaseFigure("kept.mp4")).not.toBe("");
+
+      // The ONE interval, at the pane's own period.
+      await waitFor(() =>
+        expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(1),
+      );
+      const armedWhileCounting = spy.mock.calls.length;
+
+      // Half of the hour he asked for, spent by moving the CLOCK and letting one
+      // tick land: the deadline is an absolute instant, so the figure has to fall
+      // with the listing entirely unchanged.
+      const browsed = rootBrowses();
+      vi.setSystemTime(BASE_MS + 1_800_000);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FILES_TICK_MS);
+      });
+
+      expect(releaseFigure("kept.mp4")).toBe("29 min");
+      // And the tick asked Rust for nothing.
+      expect(rootBrowses()).toBe(browsed);
+      // Still one, and still the same one: a re-render must not re-arm it.
+      expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(1);
+
+      // The baseline. Unmounted and reset first — the expansion is a module-level
+      // store — and the width stub restored so the second render is not stacked
+      // on top of it.
+      cleanup();
+      restoreWidth?.();
+      restoreWidth = null;
+      resetFilesTreeForTest();
+      spy.mockClear();
+      await tree([entry("kept.mp4", "file")]);
+
+      await waitFor(() =>
+        expect(spy.mock.calls.filter(([, ms]) => ms === FILES_TICK_MS)).toHaveLength(0),
+      );
+      expect(armedWhileCounting).toBe(spy.mock.calls.length + 1);
+    } finally {
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
   });
 
   it("shows a refused Release as Rust's own sentence, verbatim", async () => {

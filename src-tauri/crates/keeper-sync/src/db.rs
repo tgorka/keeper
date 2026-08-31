@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, SyncError};
 use crate::profile::{self, ProfileState, SyncProfile};
 use crate::stability::{FileSample, PersistedEntry};
+use crate::tasks::{TaskKind, TaskMode, TaskOutcome, TaskSchedule, TaskState};
 
 pub const DB_FILE_NAME: &str = "sync.db";
 
@@ -44,6 +45,17 @@ pub fn open(data_dir: &Path) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // No `busy_timeout` is set here, and that is not an omission: `rusqlite`'s
+    // own `Connection::open` already arms a five-second one, which the test
+    // `the_shared_database_waits_for_a_writer_rather_than_failing_at_once` pins
+    // so nobody has to take it on trust. It matters because this file is shared
+    // by two processes — the app's in-process engine and `keeper-syncd` — and a
+    // writer that failed instantly would, for a task lease, leave the run
+    // recorded nowhere and the lease held until it expired. WAL keeps readers
+    // out of the contention entirely, so the timeout only ever paces two
+    // writers, and a deadlock-prone upgrade still returns at once: SQLite
+    // answers `SQLITE_BUSY_SNAPSHOT` without consulting the handler, so a write
+    // here can be delayed but never hangs.
     migrate(&conn)?;
     Ok(conn)
 }
@@ -152,6 +164,67 @@ fn migrate(conn: &Connection) -> Result<()> {
             PRIMARY KEY (profile_id, path)
         );
 
+        -- What keeper remembers about work it is supposed to do (Story 57.1,
+        -- AD-135). Neither existing table can be this record: `db::complete`
+        -- is `DELETE FROM journal WHERE id = ?1`, so a finished unit leaves no
+        -- trace at all, and `WorkKind` is a closed vocabulary of transfer
+        -- primitives with no room for "sync this folder nightly"; `activity`
+        -- is by its own doc above "a human-facing log, not a source of truth"
+        -- and is capped per profile, so a schedule kept there would be
+        -- forgotten by the thousandth file.
+        --
+        -- `profile_id IS NULL` means host-wide: a task that belongs to the
+        -- machine rather than to one folder.
+        --
+        -- `running_host` + `lease_until_ms` are the lease, and they are on the
+        -- task rather than in a lock file because the affected-row count of one
+        -- conditional `UPDATE` is the only arbiter two hosts sharing this file
+        -- can both trust.
+        --
+        -- Any column added to either table later MUST be nullable or carry a
+        -- DEFAULT, and MUST go through an additive `ensure_task_columns` rather
+        -- than into this batch. The read side is carefully tolerant — an unknown
+        -- kind, mode, schedule or outcome is skipped and listed — but every
+        -- INSERT here names its columns, so a NOT NULL column with no default
+        -- would make an older binary's writes fail against a newer schema. That
+        -- is NFR-43's other half and it is only a rule if it is written down.
+        CREATE TABLE IF NOT EXISTS tasks (
+            id             TEXT PRIMARY KEY,
+            profile_id     TEXT,
+            kind           TEXT NOT NULL,
+            schedule       TEXT,
+            mode           TEXT NOT NULL,
+            next_due_ms    INTEGER,
+            enabled        INTEGER NOT NULL DEFAULT 1,
+            updated_ms     INTEGER NOT NULL,
+            running_host   TEXT,
+            lease_until_ms INTEGER
+        );
+
+        -- One row per attempt, appended and bounded exactly the way `activity`
+        -- is — but unlike `activity` this one IS the source of truth for "when
+        -- did this last run and what happened", which is the whole question a
+        -- task exists to answer.
+        --
+        -- Deliberately no foreign key, in either direction. A host-wide task
+        -- has a NULL profile, so there is no parent to point at; and a deleted
+        -- profile must not silently take a task's history with it as a side
+        -- effect nobody wrote down. `delete_task` removes both halves itself.
+        CREATE TABLE IF NOT EXISTS task_runs (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id     TEXT NOT NULL,
+            started_ms  INTEGER NOT NULL,
+            finished_ms INTEGER,
+            outcome     TEXT,
+            detail      TEXT,
+            host        TEXT NOT NULL
+        );
+        -- Newest-first per task is the only way this table is ever read, and
+        -- it is also how the cap is trimmed. By `id` rather than `started_ms`
+        -- for `activity_recent`'s reason: two runs can share a millisecond.
+        CREATE INDEX IF NOT EXISTS task_runs_recent
+            ON task_runs (task_id, id DESC);
+
         CREATE TABLE IF NOT EXISTS meta (
             key         TEXT PRIMARY KEY,
             value       TEXT NOT NULL
@@ -254,23 +327,25 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 }
 
 /// Add the late nullable columns `materialized` has grown, if they are not
-/// there yet (Stories 56.2, 56.5 and 56.14).
+/// there yet (Stories 56.2, 56.5, 56.14 and 56.17).
 ///
-/// Seven facts the ledger has to hold before anything can decide what to
+/// Eight facts the ledger has to hold before anything can decide what to
 /// release: when the content was last *read* (`last_used_ms`), when the remote
 /// last confirmed it holds the object (`synced_at_ms`), whether the owner has
 /// asked for this path to stay on the machine (`pinned`), the object's
 /// identity and length (`oid`, `size_bytes`) so a row still answers after the
 /// worktree stops holding a pointer to consult, which way the content
 /// travelled (`local_origin`, Story 56.5) so the release sweep knows which of
-/// the two clocks applies to this path, and when the content was released
-/// (`released_at_ms`, Story 56.14) so those facts survive the release.
+/// the two clocks applies to this path, when the content was released
+/// (`released_at_ms`, Story 56.14) so those facts survive the release, and the
+/// instant the owner asked for this one path to be let go again
+/// (`release_at_ms`, Story 56.17).
 ///
 /// Literally [`ensure_activity_columns`]'s shape, including the `drop(stmt)`
 /// before the first `conn.execute` — `rusqlite` holds the connection while a
 /// prepared statement lives, so an `ALTER TABLE` issued with the PRAGMA
 /// statement still alive is a borrow error, not a runtime surprise. The one
-/// difference is that these seven columns are not all the same type, so the
+/// difference is that these eight columns are not all the same type, so the
 /// loop carries the type beside the name rather than hard-coding `INTEGER`.
 ///
 /// **Nullable and without a `DEFAULT`, and no `meta` marker.** `NULL` is the
@@ -296,6 +371,17 @@ fn ensure_activity_columns(conn: &Connection) -> Result<()> {
 /// used to `DELETE` the row, so the column's absence and its `NULL` say the
 /// same thing about historical data, and [`forget_materialized`] is the only
 /// writer that ever fills it.
+///
+/// **`NULL` in `release_at_ms` means *this path is on the folder's own
+/// window*** (Story 56.17), which is what every row written before that story
+/// meant by existing at all. A non-`NULL` value is an absolute epoch-ms
+/// instant somebody named — `keeper-syncd materialize --for 2h`, or the Files
+/// row's own choice — and [`crate::engine::release_due_at`] reads it *instead
+/// of* the folder's `releaseTtlMs` arithmetic, in both directions. Two
+/// timestamps that look alike and are not: `released_at_ms` is when content
+/// left, `release_at_ms` is when it may. [`set_release_at`] is the only writer
+/// that fills it and [`forget_materialized`] is the only one that clears it,
+/// because the instruction is spent the moment the content goes.
 fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(materialized)")?;
     // Column 1 of `table_info` is the column name.
@@ -311,6 +397,7 @@ fn ensure_materialized_columns(conn: &Connection) -> Result<()> {
         ("size_bytes", "INTEGER"),
         ("local_origin", "INTEGER"),
         ("released_at_ms", "INTEGER"),
+        ("release_at_ms", "INTEGER"),
     ] {
         if !existing.iter().any(|c| c == column) {
             conn.execute(
@@ -911,6 +998,82 @@ pub fn set_pinned(
     Ok(())
 }
 
+/// Record the instant the owner asked for one path's content to be let go
+/// again, or withdraw that instruction (Story 56.17, `release_at_ms`).
+///
+/// One column either way, naming exactly `release_at_ms`, in [`set_pinned`]'s
+/// two-direction shape and for its reasons: it must not disturb either clock,
+/// `local_origin`, the recorded identity, `pinned` or `at_ms`. `at_ms` on
+/// insert is the instant the instruction was given, which is the only
+/// timestamp this call knows.
+///
+/// `at_ms` here is an absolute epoch-ms **deadline**, not a duration: a
+/// duration serialized into a ledger would be stale by however long the row
+/// sat there, and [`crate::engine::release_due_at`] compares against a clock.
+/// The caller resolves the person's `2h` against the injected clock once, so a
+/// verb that writes this twice — `Engine::materialize_entry_now` observes its
+/// own request a second time after draining — writes the same instant rather
+/// than a later one.
+///
+/// # Why the insert stamps `released_at_ms`, and the conflict arm never does
+///
+/// A duration is recorded when the person asks, and for an object this machine
+/// does not hold yet that is *before* any content lands: the ask queues a
+/// download and the row has to be waiting when the bytes arrive. An inserted
+/// row with `released_at_ms` `NULL` would then tell [`materialized_paths`],
+/// [`materialized_rows`] and `lfs::listing::collect` that this clone holds
+/// content it does not — the phantom-row loss [`set_pinned`]'s own doc records
+/// for its pin arm. The honest value is available for free here, because that
+/// column's documented meaning is exactly *the content is not here*, which for
+/// a queued path is true; and [`remember_materialized`],
+/// [`observe_materialized`] and [`note_local_authorship`] all clear it the
+/// moment content does land, so nothing else has to know.
+///
+/// The conflict arm must **not** carry it: a row that already exists is a row
+/// about content whose presence somebody else established, and marking it
+/// released would hide a materialized path from every present-tense reader.
+///
+/// # Withdrawing is UPDATE-only
+///
+/// [`set_pinned`]'s asymmetry verbatim. Withdrawing an instruction the ledger
+/// never recorded is nothing at all, and an upsert here would insert a row
+/// asserting "content landed here now" for content that is not here — which
+/// [`crate::engine::release_due_at`] reads as a candidate forever.
+///
+/// `None` is also what *indefinite* writes: a materialize with no duration,
+/// `--for 0`, and the row's own Indefinitely are three spellings of one
+/// instruction — put this path back on the folder's window — and they must not
+/// mean three things. On a path nobody ever named a time for the statement
+/// sets `NULL` to `NULL`, which is why the plain verb's behaviour is unchanged.
+pub fn set_release_at(
+    conn: &Connection,
+    profile_id: &str,
+    path: &str,
+    at_ms: Option<i64>,
+    now_ms: i64,
+) -> Result<()> {
+    match at_ms {
+        Some(at_ms) => {
+            conn.execute(
+                "INSERT INTO materialized
+                     (profile_id, path, at_ms, release_at_ms, released_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?3)
+                 ON CONFLICT(profile_id, path)
+                 DO UPDATE SET release_at_ms = excluded.release_at_ms",
+                (profile_id, path, now_ms, at_ms),
+            )?;
+        }
+        None => {
+            conn.execute(
+                "UPDATE materialized SET release_at_ms = NULL
+                  WHERE profile_id = ?1 AND path = ?2",
+                (profile_id, path),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Every path this clone holds content for **right now**.
 ///
 /// Read whole rather than asked per row: the caller is deciding a mark for a
@@ -939,11 +1102,11 @@ pub fn materialized_paths(
     Ok(out)
 }
 
-/// One row of the `materialized` ledger, late columns included (Stories 56.2
-/// and 56.5).
+/// One row of the `materialized` ledger, late columns included (Stories 56.2,
+/// 56.5 and 56.17).
 ///
-/// A struct rather than a tuple because five of the eight fields are
-/// `Option`s of two types and four of them are timestamps: a transposition
+/// A struct rather than a tuple because six of the nine fields are
+/// `Option`s of two types and five of them are timestamps: a transposition
 /// between `last_used_ms` and `synced_at_ms` would compile, pass every type
 /// check, and make a release decision on the wrong fact.
 ///
@@ -989,6 +1152,20 @@ pub struct MaterializedRow {
     /// this machine authored and has not yet pushed is never eligible, and
     /// `last_used_ms` for content that came from the remote.
     pub local_origin: bool,
+    /// The absolute epoch-ms instant the owner asked for this one path's
+    /// content to be let go again (Story 56.17), or `None` for a path on the
+    /// folder's own `releaseTtlMs` window — which is every path nobody has
+    /// named a time for, and every row written before the column existed.
+    ///
+    /// [`crate::engine::release_due_at`] reads it **instead of** the folder's
+    /// window, in both directions: an hour chosen inside a day-long window
+    /// goes sooner, and two days chosen inside it stay longer. It does not
+    /// outrank [`Self::pinned`], and it does not reach past FR-341 — a path
+    /// this clone authored that nothing has confirmed the remote holds is
+    /// still on no clock at any age, because a chosen duration must not become
+    /// a way around the barrier that stops keeper deleting bytes which exist
+    /// on one machine.
+    pub release_at_ms: Option<i64>,
 }
 
 /// Every `materialized` row whose content this profile **still holds**, whole.
@@ -1010,7 +1187,8 @@ pub struct MaterializedRow {
 /// bounded only by the byte budget.
 pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<MaterializedRow>> {
     let mut stmt = conn.prepare(
-        "SELECT path, at_ms, last_used_ms, synced_at_ms, oid, size_bytes, pinned, local_origin
+        "SELECT path, at_ms, last_used_ms, synced_at_ms, oid, size_bytes, pinned, local_origin,
+                release_at_ms
            FROM materialized
           WHERE profile_id = ?1 AND released_at_ms IS NULL
           ORDER BY path",
@@ -1025,11 +1203,13 @@ pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<Mate
             r.get::<_, Option<i64>>(5)?,
             r.get::<_, Option<i64>>(6)?,
             r.get::<_, Option<i64>>(7)?,
+            r.get::<_, Option<i64>>(8)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (path, at_ms, last_used_ms, synced_at_ms, oid, size, pinned, local_origin) = row?;
+        let (path, at_ms, last_used_ms, synced_at_ms, oid, size, pinned, local_origin, release_at) =
+            row?;
         out.push(MaterializedRow {
             path,
             at_ms,
@@ -1043,6 +1223,9 @@ pub fn materialized_rows(conn: &Connection, profile_id: &str) -> Result<Vec<Mate
             // `NULL` is *arrived from the remote*: see the column's own note
             // in [`ensure_materialized_columns`].
             local_origin: local_origin.unwrap_or(0) != 0,
+            // `NULL` is *this path is on the folder's own window*, which is
+            // the only reading of a row nobody named a time for (Story 56.17).
+            release_at_ms: release_at,
         });
     }
     Ok(out)
@@ -1141,6 +1324,18 @@ pub fn is_pinned(conn: &Connection, profile_id: &str, path: &str) -> Result<bool
 /// that, whatever a future caller does. `COALESCE` because a `NULL` **is**
 /// unpinned — [`MaterializedRow::pinned`]'s documented rule, and every row
 /// written before the column existed reads back that way.
+///
+/// # Why `release_at_ms` is the one column it clears (Story 56.17)
+///
+/// A chosen release time is a standing instruction, and this is the moment it
+/// is **served**: the content the owner asked to keep for two hours is gone.
+/// Left standing it would be a deadline in the past, so the same path
+/// materialized again with no duration — [`remember_materialized`] clears
+/// `released_at_ms`, and the row comes back live — would be eligible for
+/// release on the very next sweep, hours before the folder's own window says
+/// so. It is cleared beside the stamp rather than by a second statement
+/// because the two are one fact: this content left, and nobody is any longer
+/// waiting for it to.
 pub fn forget_materialized(
     conn: &Connection,
     profile_id: &str,
@@ -1148,7 +1343,7 @@ pub fn forget_materialized(
     now_ms: i64,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE materialized SET released_at_ms = ?3
+        "UPDATE materialized SET released_at_ms = ?3, release_at_ms = NULL
           WHERE profile_id = ?1 AND path = ?2 AND COALESCE(pinned, 0) = 0",
         (profile_id, path, now_ms),
     )?;
@@ -1379,21 +1574,67 @@ pub fn delete_profile(conn: &Connection, id: &str) -> Result<()> {
     // Otherwise a re-created profile reusing the id would inherit the deleted
     // one's history, and a removed profile would leave its file names behind.
     conn.execute("DELETE FROM activity WHERE profile_id = ?1", [id])?;
+    // A task naming a folder that no longer exists is a task whose every run
+    // fails permanently, on a schedule, forever — and 57.6 will notify on the
+    // onset of that. There is deliberately no foreign key (see the schema), so
+    // the history goes first and by hand.
+    conn.execute(
+        "DELETE FROM task_runs
+          WHERE task_id IN (SELECT id FROM tasks WHERE profile_id = ?1)",
+        [id],
+    )?;
+    conn.execute("DELETE FROM tasks WHERE profile_id = ?1", [id])?;
     conn.execute("DELETE FROM profiles WHERE id = ?1", [id])?;
     Ok(())
 }
 
-pub fn set_profile_runtime(
-    conn: &Connection,
-    id: &str,
-    state: &str,
-    last_error: Option<&str>,
-) -> Result<()> {
+/// Record the sentence a person reads beside this folder, or clear it
+/// (Story 56.15).
+///
+/// # This column had no writer at all
+///
+/// `profiles.last_error` has existed since the schema was written and nothing
+/// ever set it: [`set_profile_state`] writes `state` only, and the sole
+/// function that touched `last_error` — a `set_profile_runtime` this replaces
+/// — had no callers in any crate. So the column was `NULL` for every profile
+/// in every state, which is exactly what the owner's `sync.db` was measured
+/// holding for a folder whose first clone had died three minutes in:
+/// `state = 'idle'`, `last_error = NULL`, and no other record anywhere that
+/// anything had gone wrong.
+///
+/// Split from [`set_profile_state`] rather than folded into it because they
+/// answer different questions and change at different moments: a folder can
+/// go `Syncing → Watching` a hundred times while one error stands, and a
+/// state write that also cleared the error would erase the reason on the very
+/// next tick.
+pub fn set_profile_error(conn: &Connection, id: &str, last_error: Option<&str>) -> Result<()> {
     conn.execute(
-        "UPDATE profiles SET state = ?2, last_error = ?3 WHERE id = ?1",
-        (id, state, last_error),
+        "UPDATE profiles SET last_error = ?2 WHERE id = ?1",
+        (id, last_error),
     )?;
     Ok(())
+}
+
+/// Whether this profile owns a journal unit that is claimable right now.
+///
+/// One indexed lookup on `journal_ready` (`state, not_before_ms`), stopping at
+/// the first row: the question is "is there work due", never "how much".
+///
+/// Exists so an offline profile's tick can be paced by the queue rather than
+/// by a clock of its own — see `Engine::remote_within_reach`. A unit that
+/// failed on the network is rescheduled with the engine's backoff, so "a unit
+/// is due" is precisely "the backoff says try the remote again now".
+pub fn has_ready_unit(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM journal
+              WHERE profile_id = ?1 AND state = 'pending' AND not_before_ms <= ?2
+              LIMIT 1",
+            (profile_id, now_ms),
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,6 +1648,16 @@ pub fn set_profile_runtime(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum WorkKind {
+    /// Make this folder's working copy exist: clone it, adopt it, or finish a
+    /// checkout that stopped part-way (Story 56.15).
+    ///
+    /// Journaled, where the rest of `open_repo` is not, because it is the one
+    /// piece of repository setup that can fail *after* touching the network
+    /// and must be retried on a backoff rather than on the scan cadence. A
+    /// profile whose first clone never finished is not idle and has no tree to
+    /// scan, so `scan_is_due` — which decides whether a walk is worth its cost
+    /// — is the wrong authority for whether it is retried at all.
+    Checkout,
     /// Fetch from the remote and apply what is fast-forwardable.
     Pull,
     /// Stage, commit and push local changes.
@@ -1436,6 +1687,10 @@ impl WorkKind {
     /// The `kind` column spelling for a pull. Same reason — a rejected push
     /// queues one and has to be able to assert it did (DW-207).
     pub const PULL: &'static str = "pull";
+    /// The `kind` column spelling for a checkout. Same reason —
+    /// [`crate::engine::Engine::tick_profile`] drains this kind ALONE for a
+    /// folder with no working copy, and has to name it to do that.
+    pub const CHECKOUT: &'static str = "checkout";
 
     /// Whether an identical unit ALREADY RUNNING covers this work.
     ///
@@ -1453,7 +1708,14 @@ impl WorkKind {
     /// The visible symptom is a queue that never shrinks; the invisible one is
     /// the same bytes fetched twice.
     pub fn covered_while_running(&self) -> bool {
-        matches!(self, Self::LfsUpload { .. } | Self::LfsDownload { .. })
+        matches!(
+            self,
+            // A clone of a 16 GB folder runs for minutes and is idempotent:
+            // the second unit could only clone what the first one is cloning,
+            // and queueing one per tick would put an hour of duplicate rows
+            // behind a single running checkout.
+            Self::Checkout | Self::LfsUpload { .. } | Self::LfsDownload { .. }
+        )
     }
 
     /// Discriminant used as the journal's `kind` column, so a row can be
@@ -1461,6 +1723,7 @@ impl WorkKind {
     pub fn tag(&self) -> &'static str {
         match self {
             Self::Pull => Self::PULL,
+            Self::Checkout => Self::CHECKOUT,
             Self::Push => Self::PUSH,
             Self::LfsUpload { .. } => Self::LFS_UPLOAD,
             Self::LfsDownload { .. } => Self::LFS_DOWNLOAD,
@@ -2519,6 +2782,663 @@ pub fn list_activity(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Tasks (Story 57.1, AD-135)
+// ---------------------------------------------------------------------------
+
+/// How many runs of ONE task are kept, for [`ACTIVITY_CAP`]'s reason: a task
+/// that fires every five minutes writes a row every five minutes forever, and
+/// `sync.db` must not grow because a schedule is doing its job. Fifty is what
+/// answers "has this been working lately", which is the only question the
+/// history is ever asked.
+pub const TASK_RUNS_CAP: usize = 50;
+
+/// Every column of `tasks`, in the order [`read_task`] decodes them. One
+/// constant so a reader added later cannot drift out of step with the decoder.
+const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
+                            enabled, updated_ms, running_host, lease_until_ms";
+
+/// One stored task.
+///
+/// `schedule` holds the expression **as written**, never a normalized form: it
+/// is what the operator typed and what a refusal has to be able to quote back,
+/// and re-rendering a parsed schedule would silently rewrite `@daily` into
+/// something the person who typed it did not choose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRow {
+    pub id: String,
+    /// `None` means host-wide: this task belongs to the machine, not a folder.
+    pub profile_id: Option<String>,
+    pub kind: TaskKind,
+    /// The expression as written, or `None` for a task nothing schedules.
+    pub schedule: Option<String>,
+    pub mode: TaskMode,
+    /// `None` means never armed, which is what makes a first sight arm rather
+    /// than run.
+    pub next_due_ms: Option<i64>,
+    pub enabled: bool,
+    pub updated_ms: i64,
+    /// The host holding the lease, if a run is in flight.
+    pub running_host: Option<String>,
+    pub lease_until_ms: Option<i64>,
+}
+
+impl TaskRow {
+    /// Project the row onto exactly the four facts [`crate::tasks::decide`]
+    /// reads, so the pure gate never sees a `Connection` or a whole row it
+    /// could be tempted to consult.
+    pub fn state(&self) -> TaskState {
+        TaskState {
+            enabled: self.enabled,
+            mode: self.mode,
+            next_due_ms: self.next_due_ms,
+            lease_until_ms: self.lease_until_ms,
+        }
+    }
+
+    /// The parsed schedule, or `Ok(None)` when nothing schedules this task.
+    ///
+    /// A parse error propagates unchanged rather than becoming `None`: "no
+    /// schedule" and "a schedule this build cannot read" are different facts,
+    /// and treating the second as the first would quietly disarm a task the
+    /// operator believes is running.
+    pub fn parsed_schedule(&self) -> Result<Option<TaskSchedule>> {
+        match self.schedule.as_deref() {
+            None => Ok(None),
+            Some(expression) => TaskSchedule::parse(expression).map(Some),
+        }
+    }
+}
+
+/// A stored task this build cannot act on, and why (NFR-43).
+///
+/// Reported beside the readable ones rather than swallowed, so a UI can say
+/// "this folder has a task your keeper is too old to understand" instead of
+/// showing a folder with no tasks at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownTask {
+    pub id: String,
+    pub reason: String,
+}
+
+/// What [`list_tasks`] found: the rows this build can run, and the rows it
+/// cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskListing {
+    pub tasks: Vec<TaskRow>,
+    pub unknown: Vec<UnknownTask>,
+}
+
+/// One attempt at one task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunRow {
+    pub id: i64,
+    pub task_id: String,
+    pub started_ms: i64,
+    /// `None` means still in flight — or that the host running it died, which
+    /// is why [`claim_task`] closes what it reclaims.
+    pub finished_ms: Option<i64>,
+    /// The outcome, when this build has a variant for it.
+    ///
+    /// `None` together with a `None` [`Self::unknown_outcome`] means the run is
+    /// still in flight.
+    pub outcome: Option<TaskOutcome>,
+    /// The stored spelling, when this build has no variant for it (NFR-43).
+    ///
+    /// A run recorded by a newer keeper is still a run that happened, and the
+    /// newest one is the one every surface reports as "last": it is carried
+    /// here rather than dropped so nothing shows an older attempt as current.
+    pub unknown_outcome: Option<String>,
+    pub detail: Option<String>,
+    pub host: String,
+}
+
+/// The `tasks` row as SQLite hands it over, before the vocabulary is applied.
+type StoredTask = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    String,
+    Option<i64>,
+    i64,
+    i64,
+    Option<String>,
+    Option<i64>,
+);
+
+/// Read one `tasks` row, tolerating every column but the primary key.
+///
+/// SQLite is dynamically typed, so a row written by a keeper that changed a
+/// column's type — or by a hand at a prompt — hands back a value this build's
+/// `get` refuses. Strict reads here would make `query_map` yield an error for
+/// that one row and, before Story 57.2's review, took the whole listing with
+/// it: one unreadable row and **no task on the host ever ran again**. That is
+/// precisely the outcome NFR-43 forbids.
+///
+/// So every column but `id` falls back to its default, which routes the row
+/// straight to [`decode_task`]'s unknown path: a defaulted `kind` or `mode` is
+/// an empty string, and no variant answers to that. `id` stays strict because a
+/// row whose primary key cannot be read cannot be named in a report either, and
+/// [`list_tasks`] handles that failure separately.
+fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
+    Ok((
+        row.get(0)?,
+        row.get(1).unwrap_or_default(),
+        row.get(2).unwrap_or_default(),
+        row.get(3).unwrap_or_default(),
+        row.get(4).unwrap_or_default(),
+        row.get(5).unwrap_or_default(),
+        row.get(6).unwrap_or_default(),
+        row.get(7).unwrap_or_default(),
+        row.get(8).unwrap_or_default(),
+        row.get(9).unwrap_or_default(),
+    ))
+}
+
+/// Apply this build's vocabulary to a stored row, or say why it cannot be.
+///
+/// Three ways a row can be unreadable and all three are the same answer: a
+/// `kind` with no variant here, a `mode` with no variant here, and a schedule
+/// this parser rejects. Running any of them would mean guessing what somebody
+/// else's keeper meant.
+fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> {
+    let (
+        id,
+        profile_id,
+        kind,
+        schedule,
+        mode,
+        next_due_ms,
+        enabled,
+        updated_ms,
+        running_host,
+        lease_until_ms,
+    ) = stored;
+    let unknown = |reason: String| UnknownTask {
+        id: id.clone(),
+        reason,
+    };
+    let Some(kind) = TaskKind::from_stored(&kind) else {
+        return Err(unknown(format!("unknown task kind '{kind}'")));
+    };
+    let Some(mode) = TaskMode::from_stored(&mode) else {
+        return Err(unknown(format!("unknown task mode '{mode}'")));
+    };
+    let row = TaskRow {
+        id: id.clone(),
+        profile_id,
+        kind,
+        schedule,
+        mode,
+        next_due_ms,
+        enabled: enabled != 0,
+        updated_ms,
+        running_host,
+        lease_until_ms,
+    };
+    if let Err(err) = row.parsed_schedule() {
+        return Err(unknown(format!("unreadable schedule: {err}")));
+    }
+    Ok(row)
+}
+
+/// The write door, and therefore the refusal point (FR-347).
+///
+/// Validation runs before any SQL, the way [`set_device_label`] and
+/// [`upsert_profile`] validate first: a schedule is refused *when it is saved*,
+/// with the expression quoted, because the alternative is a row that reports
+/// itself enabled and silently never fires.
+///
+/// The id rule itself lives in [`crate::tasks::validate_id`] rather than here
+/// (Story 57.3). It is the same rule 57.3's CLI selector has to apply before it
+/// opens a database — to tell a spelling this keeper could never have stored
+/// from a well-formed id that names no row — and two copies of it would drift
+/// in the direction of a selector accepting an id this function refuses.
+///
+/// # Runtime state is not the caller's to write
+///
+/// `running_host`, `lease_until_ms` and `next_due_ms` are owned by
+/// [`claim_task`], [`finish_task_run`] and [`arm_task`]. This function binds the
+/// lease columns to `NULL` on insert and never touches them on conflict, and it
+/// ignores the caller's `next_due_ms` entirely. Every one of those was a real
+/// hole before Story 57.2's review: a `TaskRow` carrying a stale window — which
+/// is exactly what a read-modify-write from a settings form produces — rewound
+/// the schedule and re-ran the window on the next tick, or, with a fresh
+/// `next_due_ms: None` saved on every keystroke, postponed an `every 5m` task a
+/// full interval per save and so *never* fired it; and a row inserted with a
+/// future `lease_until_ms` and no `running_host` was held off by
+/// [`crate::tasks::decide`] forever.
+///
+/// # A task coming back into service arms afresh, and never catches up
+///
+/// The window is cleared on three edges, and every one of them is a way a
+/// stored `next_due_ms` in the *past* would otherwise fire the moment the row
+/// became live again — which is catch-up, and Epic 57 rules catch-up out:
+/// *a task whose host was off for a week runs once when it returns, not seven
+/// times*.
+///
+/// * The **schedule text changes**, so a new schedule takes effect on the next
+///   tick rather than after the old one's window elapses.
+/// * The row goes from **disabled to enabled**. `tasks disable nightly` on a
+///   `@daily` release task, then `tasks enable nightly` a month later, left a
+///   window a month old, and [`crate::tasks::decide`] runs a task whose window
+///   is in the past — so re-enabling fired a *deletion sweep* on the very next
+///   1 Hz tick instead of at 03:00.
+/// * The **mode becomes `scheduled`** when it was not. Same story by the other
+///   door: `scheduled` → `manual` for a month → `scheduled` keeps a frozen past
+///   window, because the schedule text never moved.
+///
+/// `IS NOT` rather than `<>` throughout because SQLite's `<>` is NULL-poisoned
+/// and a task gaining or losing its schedule is precisely the case that must be
+/// noticed.
+pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<()> {
+    crate::tasks::validate_id(&task.id)?;
+    // The parser's own refusal, propagated unchanged: it already names the
+    // rule and quotes the expression, and a second layer of prose around it
+    // would bury the one line that says what is wrong.
+    let schedule = task.parsed_schedule()?;
+    if task.mode == TaskMode::Scheduled && schedule.is_none() {
+        return Err(SyncError::Config(format!(
+            "task '{}' is scheduled with no schedule: it would report itself enabled and never run",
+            task.id
+        )));
+    }
+    // A row this build cannot read belongs to a newer keeper, and overwriting it
+    // would rewrite its kind to one of ours — the write half of NFR-43, which
+    // the read half is useless without. `get_task` answers `None` for such a
+    // row, so a create-if-absent caller would walk straight into it.
+    let stored_kind: Option<String> = conn
+        .query_row("SELECT kind FROM tasks WHERE id = ?1", [&task.id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if let Some(kind) = stored_kind {
+        if TaskKind::from_stored(&kind).is_none() {
+            return Err(SyncError::Config(format!(
+                "task '{}' is stored as kind '{kind}', which this keeper cannot read: \
+                 refusing to overwrite it",
+                task.id
+            )));
+        }
+    }
+    conn.execute(
+        "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
+                            updated_ms, running_host, lease_until_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL)
+         ON CONFLICT(id) DO UPDATE SET
+             profile_id  = excluded.profile_id,
+             kind        = excluded.kind,
+             schedule    = excluded.schedule,
+             mode        = excluded.mode,
+             next_due_ms = CASE WHEN excluded.schedule IS NOT tasks.schedule
+                                  OR (excluded.enabled = 1 AND tasks.enabled = 0)
+                                  OR (excluded.mode = 'scheduled'
+                                      AND tasks.mode IS NOT 'scheduled')
+                                THEN NULL ELSE tasks.next_due_ms END,
+             enabled     = excluded.enabled,
+             updated_ms  = excluded.updated_ms",
+        (
+            &task.id,
+            &task.profile_id,
+            task.kind.as_str(),
+            &task.schedule,
+            task.mode.as_str(),
+            i64::from(task.enabled),
+            task.updated_ms,
+        ),
+    )?;
+    Ok(())
+}
+
+/// Every task, by id, with the unreadable rows listed rather than dropped.
+///
+/// A row this build cannot read is skipped and named, never fatal — the same
+/// tolerance [`list_activity`] and [`list_profiles`] already give: a newer
+/// keeper's task must not brick an older one's list, and both binaries share
+/// one `sync.db` on purpose.
+pub fn list_tasks(conn: &Connection) -> Result<TaskListing> {
+    let mut stmt = conn.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY id"))?;
+    let rows = stmt.query_map([], read_task)?;
+    let mut listing = TaskListing::default();
+    for row in rows {
+        // A per-row error, not a listing error. The mapping closure only fails
+        // when even `id` will not read, and the statement is still stepping, so
+        // the remaining rows are still worth having: one corrupt row must not be
+        // able to stop every task on the host.
+        let decoded = match row {
+            Ok(stored) => decode_task(stored),
+            Err(err) => Err(UnknownTask {
+                id: String::new(),
+                reason: format!("unreadable task row: {err}"),
+            }),
+        };
+        match decoded {
+            Ok(task) => listing.tasks.push(task),
+            Err(unknown) => {
+                tracing::debug!(
+                    task = unknown.id,
+                    reason = unknown.reason,
+                    "skipping a task this build cannot read"
+                );
+                listing.unknown.push(unknown);
+            }
+        }
+    }
+    Ok(listing)
+}
+
+/// One task by id, or `Ok(None)`.
+///
+/// An unreadable row answers `Ok(None)` for [`list_tasks`]'s reason: a caller
+/// asking for one row by id wants to know whether there is something here it
+/// can act on, and the honest answer for a row from a newer keeper is "no" —
+/// not an error that would poison every tick the engine takes.
+pub fn get_task(conn: &Connection, id: &str) -> Result<Option<TaskRow>> {
+    let stored = conn
+        .query_row(
+            &format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"),
+            [id],
+            read_task,
+        )
+        .optional()?;
+    Ok(stored.and_then(|stored| match decode_task(stored) {
+        Ok(task) => Some(task),
+        Err(unknown) => {
+            tracing::debug!(
+                task = unknown.id,
+                reason = unknown.reason,
+                "a task this build cannot read reads as absent"
+            );
+            None
+        }
+    }))
+}
+
+/// Arm an **unarmed** task's first window, and nothing else.
+///
+/// Arming is not running: the tick that first sees a task computes its window
+/// and stops there, so this must not touch the lease, the mode or the schedule.
+///
+/// `WHERE next_due_ms IS NULL` is what makes it safe on a machine with two
+/// hosts. A decision computed from a listing read earlier in this tick can
+/// arrive after the other host has already armed and even run the task, and an
+/// unconditional write would then rewind the window to a past instant and run it
+/// twice. First sight can only happen once, so the statement says so.
+pub fn arm_task(conn: &Connection, id: &str, next_due_ms: Option<i64>, now_ms: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET next_due_ms = ?2, updated_ms = ?3
+          WHERE id = ?1 AND next_due_ms IS NULL",
+        (id, next_due_ms, now_ms),
+    )?;
+    Ok(())
+}
+
+/// Take the lease and open a run, or report that somebody else has it.
+///
+/// The arbiter is the affected-row count of ONE conditional `UPDATE`. Two hosts
+/// sharing `sync.db` need no lock file and no coordinator, because SQLite
+/// serializes the two statements and the second one's `WHERE` then fails.
+/// `Ok(None)` is not an error: it means the task is off or disabled, its window
+/// is not open, or a live lease is held elsewhere.
+///
+/// `due_at_most` is the instant the window must already have opened by. The
+/// due-gate passes `Some(now)`, which closes the hole a lease alone cannot: two
+/// hosts ticking together on a task whose work is fast both see a free lease,
+/// and the first one's release lets the second run **the same window** a
+/// millisecond later. A requested run passes `None`, because a person asking is
+/// not asking about a window.
+///
+/// `mode` is checked in SQL and not only in the caller. The claim is the door
+/// the design calls the only arbiter, so the invariant "an off task runs for
+/// nobody" has to hold at the door rather than in whichever caller remembered.
+///
+/// Claim, abandonment and the run row share one transaction. A crash between
+/// them would otherwise leave a lease with no run (a task that looks busy
+/// forever) or a run with no lease (two hosts doing the same work).
+pub fn claim_task(
+    conn: &Connection,
+    id: &str,
+    host: &str,
+    now_ms: i64,
+    lease_ms: i64,
+    due_at_most: Option<i64>,
+) -> Result<Option<i64>> {
+    // `unchecked_transaction` for [`record_activity`]'s reason: the engine
+    // holds this connection behind a `Mutex` and hands out `&Connection`.
+    let tx = conn.unchecked_transaction()?;
+    let lease_until_ms = now_ms.saturating_add(lease_ms);
+    let won = match tx.execute(
+        "UPDATE tasks SET running_host = ?2, lease_until_ms = ?3
+         WHERE id = ?1 AND enabled = 1 AND mode <> 'off'
+           AND (running_host IS NULL OR lease_until_ms IS NULL OR lease_until_ms <= ?4)
+           AND (?5 IS NULL OR (next_due_ms IS NOT NULL AND next_due_ms <= ?5))",
+        (id, host, lease_until_ms, now_ms, due_at_most),
+    ) {
+        Ok(rows) => rows,
+        Err(err) if is_row_contention(&err) => {
+            tracing::debug!(task = id, host, error = %err, "another host is claiming this task");
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if won == 0 {
+        return Ok(None);
+    }
+    // A host that was killed mid-run leaves `finished_ms IS NULL` forever.
+    // Reclaiming the lease has to record what happened to that attempt, or the
+    // history claims a run that never ended. If the previous holder was in fact
+    // alive and merely overran its lease, its own `finish_task_run` will write
+    // the true outcome over this one when it returns — the run really did end,
+    // and the later fact is the better one.
+    tx.execute(
+        "UPDATE task_runs SET finished_ms = ?2, outcome = ?3
+         WHERE task_id = ?1 AND finished_ms IS NULL",
+        (id, now_ms, TaskOutcome::Abandoned.as_str()),
+    )?;
+    tx.execute(
+        "INSERT INTO task_runs (task_id, started_ms, host) VALUES (?1, ?2, ?3)",
+        (id, now_ms, host),
+    )?;
+    let run_id = tx.last_insert_rowid();
+    // Trim in the same transaction as the insert, for `record_activity`'s
+    // reason: a reader must never see the table above its cap. By `id` because
+    // two runs of one task can share a millisecond.
+    //
+    // `finished_ms IS NOT NULL` because a run still in flight is not history: a
+    // frequent task whose one long run outlives fifty later claims would
+    // otherwise have the row it is about to close deleted underneath it, and
+    // `finish_task_run` would update nothing and say nothing.
+    tx.execute(
+        "DELETE FROM task_runs
+         WHERE task_id = ?1
+           AND finished_ms IS NOT NULL
+           AND id <= COALESCE(
+                 (SELECT id FROM task_runs WHERE task_id = ?1
+                  ORDER BY id DESC LIMIT 1 OFFSET ?2),
+                 -1)",
+        (id, TASK_RUNS_CAP as i64),
+    )?;
+    tx.commit()?;
+    Ok(Some(run_id))
+}
+
+/// Hand back every lease this host holds, closing the runs it was executing.
+///
+/// Called from the supervisor's shutdown path. Without it a
+/// `systemctl restart keeper-syncd` in the middle of a run left the lease held
+/// by `{device}#{a pid that no longer exists}` for the whole of
+/// `TASK_LEASE_MS` — and the restarted daemon cannot tell that pid is dead,
+/// because on Linux the app shares the device row and may legitimately be
+/// holding one. NFR-42 asks for a bounded finalize, and this is what bounds it.
+///
+/// Returns how many leases were released, so a caller can log the fact rather
+/// than assume it.
+pub fn release_host_leases(conn: &Connection, host: &str, now_ms: i64) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE task_runs SET finished_ms = ?2, outcome = ?3
+          WHERE host = ?1 AND finished_ms IS NULL",
+        (host, now_ms, TaskOutcome::Abandoned.as_str()),
+    )?;
+    let released = tx.execute(
+        "UPDATE tasks SET running_host = NULL, lease_until_ms = NULL, updated_ms = ?2
+          WHERE running_host = ?1",
+        (host, now_ms),
+    )?;
+    tx.commit()?;
+    Ok(released)
+}
+
+/// `SQLITE_BUSY`/`SQLITE_LOCKED` on the claiming `UPDATE` means "not mine".
+///
+/// A connection from [`open`] carries a five-second `busy_timeout` (rusqlite's
+/// own default; see that function), so reaching this means a writer held the row
+/// for longer than any statement in this module takes — or that the caller
+/// opened its own connection and disarmed it. Either way the failure carries
+/// exactly the fact the claim was asking for: another host is writing this row,
+/// so this host does not hold the lease. Every other code is a real fault and
+/// propagates.
+fn is_row_contention(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// Everything one finished run records.
+///
+/// A struct rather than seven positional arguments, for [`ActivityEntry`]'s
+/// reason: two `&str`s, an `Option<&str>` and two integers in a row is a call
+/// site nobody can read or safely reorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskRunClose<'a> {
+    /// The `task_runs` row this closes.
+    pub run_id: i64,
+    pub task_id: &'a str,
+    /// The host that took the lease. The release only touches the task row
+    /// while that is still the holder — see this struct's function.
+    pub host: &'a str,
+    pub finished_ms: i64,
+    pub outcome: TaskOutcome,
+    pub detail: Option<&'a str>,
+    /// The window the task should carry afterwards.
+    pub next_due_ms: Option<i64>,
+}
+
+/// Close the run and release the lease, in one transaction.
+///
+/// Recording what happened and letting the next host in are one fact: a
+/// released lease with no outcome invites a repeat that reports nothing, and an
+/// outcome with the lease still held wedges the task until it expires.
+///
+/// `WHERE running_host = ?host` on the task half is load-bearing and was absent
+/// until Story 57.2's review. A host whose pass outlived its lease finds the row
+/// already reclaimed; releasing it unconditionally would have freed the **new**
+/// holder's lease while it was running, and overwritten its window with a stale
+/// one — turning one overrun into any number of concurrent passes over one git
+/// working tree. Affecting no task row here is therefore normal, not an error:
+/// the run row is still closed with the truth, which is this call's other half.
+pub fn finish_task_run(conn: &Connection, close: TaskRunClose<'_>) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE task_runs SET finished_ms = ?2, outcome = ?3, detail = ?4 WHERE id = ?1",
+        (
+            close.run_id,
+            close.finished_ms,
+            close.outcome.as_str(),
+            close.detail,
+        ),
+    )?;
+    tx.execute(
+        "UPDATE tasks
+            SET running_host = NULL, lease_until_ms = NULL,
+                next_due_ms = ?2, updated_ms = ?3
+          WHERE id = ?1 AND running_host = ?4",
+        (
+            close.task_id,
+            close.next_due_ms,
+            close.finished_ms,
+            close.host,
+        ),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// The newest `limit` runs of one task, most recent first.
+///
+/// Three states, and they are three because conflating any two of them tells a
+/// reader something false. A NULL `outcome` is a run **still in flight**. A
+/// stored outcome with a variant here is that outcome. A stored outcome from a
+/// newer keeper is reported as `outcome: None` **with** `unknown_outcome` set,
+/// which is [`list_tasks`]' skip-and-list discipline applied to history: dropping
+/// the row instead — as this did until Story 57.2's review — silently removed the
+/// *newest* run and made a surface report an older attempt as the current one.
+pub fn task_runs(conn: &Connection, task_id: &str, limit: usize) -> Result<Vec<TaskRunRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, task_id, started_ms, finished_ms, outcome, detail, host
+         FROM task_runs WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
+    )?;
+    // A negative `LIMIT` means "every row" to SQLite, which is what
+    // `limit as i64` produced for a `usize` above `i64::MAX`.
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = stmt.query_map((task_id, limit), |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, task_id, started_ms, finished_ms, stored, detail, host) = row?;
+        let mut outcome = None;
+        let mut unknown_outcome = None;
+        if let Some(stored) = stored {
+            match TaskOutcome::from_stored(&stored) {
+                Some(known) => outcome = Some(known),
+                None => {
+                    tracing::debug!(run = id, outcome = stored, "an unreadable task outcome");
+                    unknown_outcome = Some(stored);
+                }
+            }
+        }
+        out.push(TaskRunRow {
+            id,
+            task_id,
+            started_ms,
+            finished_ms,
+            outcome,
+            unknown_outcome,
+            detail,
+            host,
+        });
+    }
+    Ok(out)
+}
+
+/// Forget a task and its history together.
+///
+/// There is deliberately no foreign key (see the schema), so the history has to
+/// be removed here — and in the same transaction, or a re-created task reusing
+/// the id inherits a stranger's last result.
+pub fn delete_task(conn: &Connection, id: &str) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM task_runs WHERE task_id = ?1", [id])?;
+    tx.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3163,6 +4083,7 @@ mod tests {
                 size_bytes: None,
                 pinned: false,
                 local_origin: false,
+                release_at_ms: None,
             }],
             "the old row survives with its timestamp untouched, and every late \
              column reads as absent rather than as zero, epoch or unpinned-by-record"
@@ -3229,6 +4150,7 @@ mod tests {
                 size_bytes: Some(4_194_304),
                 pinned: true,
                 local_origin: false,
+                release_at_ms: None,
             }],
             "only the timestamp moved: an upsert that named more than `at_ms`, \
              or a REPLACE that named less, fails here"
@@ -3296,6 +4218,7 @@ mod tests {
                 size_bytes: None,
                 pinned: true,
                 local_origin: false,
+                release_at_ms: None,
             },
             "four writers, four facts, none of them disturbing another"
         );
@@ -3477,6 +4400,7 @@ mod tests {
                 size_bytes: Some(4_096),
                 pinned: false,
                 local_origin: false,
+                release_at_ms: None,
             },
             "the floor is gone and nothing else moved: both clocks, the \
              provenance, the identity and the landing instant are exactly where \
@@ -3493,6 +4417,119 @@ mod tests {
             1_700,
             "and re-pinning a row that exists does not restamp the landing instant"
         );
+    }
+
+    /// A chosen release time is recorded as one column, withdrawn as one
+    /// column, and disturbs nothing else (Story 56.17).
+    #[test]
+    fn set_release_at_writes_one_fact_and_withdrawing_it_writes_one_fact() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_700).expect("landing");
+        note_arrival(&c, "p", "clip.mp4", 1_700, "aaa111", 4_096).expect("arrival");
+        note_synced(&c, "p", "clip.mp4", 1_750).expect("the remote holds it");
+        set_pinned(&c, "p", "clip.mp4", true, 1_800).expect("pin");
+
+        set_release_at(&c, "p", "clip.mp4", Some(9_000), 1_900).expect("keep it two hours");
+        assert_eq!(
+            materialized_rows(&c, "p").expect("read").remove(0),
+            MaterializedRow {
+                path: "clip.mp4".to_owned(),
+                at_ms: 1_700,
+                last_used_ms: Some(1_700),
+                synced_at_ms: Some(1_750),
+                oid: Some("aaa111".to_owned()),
+                size_bytes: Some(4_096),
+                pinned: true,
+                local_origin: false,
+                release_at_ms: Some(9_000),
+            },
+            "one column: neither clock, the provenance, the identity, the pin \
+             nor the landing instant may move for an instruction about when \
+             the content may go"
+        );
+
+        // A later instruction replaces an earlier one rather than joining it.
+        set_release_at(&c, "p", "clip.mp4", Some(20_000), 2_000).expect("make it eight hours");
+        assert_eq!(
+            materialized_rows(&c, "p")
+                .expect("read")
+                .remove(0)
+                .release_at_ms,
+            Some(20_000)
+        );
+
+        set_release_at(&c, "p", "clip.mp4", None, 2_100).expect("indefinitely, after all");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(row.release_at_ms, None, "withdrawn");
+        assert!(row.pinned, "and the pin is still the pin");
+        assert_eq!(row.at_ms, 1_700, "and the landing instant never moved");
+    }
+
+    /// Naming a time for content that is not here yet writes a row **no
+    /// present-tense reader can see** (Story 56.17).
+    ///
+    /// The queued case is the whole reason the instruction is recorded when it
+    /// is asked for rather than when the bytes land, and it is also where a
+    /// naive upsert does real damage: a row with `released_at_ms` `NULL` claims
+    /// this clone holds the content. `Engine::pending` reads that as the
+    /// `replacing` flag, the sweep reads it as a candidate that can only refuse
+    /// `AlreadyPointer`, and the listing reads it as a materialized path. So
+    /// the insert says what is true — the content is not here — and the landing
+    /// writers clear it.
+    #[test]
+    fn a_deadline_for_content_that_has_not_landed_is_invisible_until_it_does() {
+        let c = conn();
+        set_release_at(&c, "p", "coming.mp4", Some(9_000), 1_000).expect("keep it two hours");
+
+        assert!(
+            materialized_paths(&c, "p").expect("read").is_empty(),
+            "nothing here claims this machine holds the content"
+        );
+        assert!(
+            materialized_rows(&c, "p").expect("read").is_empty(),
+            "and the sweep has no candidate to spend a budget slot refusing"
+        );
+
+        // The download lands, through the writer the arrival path uses.
+        remember_materialized(&c, "p", "coming.mp4", 5_000).expect("landing");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(
+            row.at_ms, 5_000,
+            "and the landing instant is the truth, not the instant the \
+             instruction was given"
+        );
+        assert_eq!(
+            row.release_at_ms,
+            Some(9_000),
+            "the deadline was waiting for the bytes, which is the point of \
+             recording it when the person asked"
+        );
+    }
+
+    /// Releasing content spends the instruction that was waiting for it
+    /// (Story 56.17).
+    ///
+    /// Left standing it would be a deadline in the past, so the same path
+    /// materialized again with no duration — `remember_materialized` clears
+    /// `released_at_ms`, so the row comes back live — would be eligible on the
+    /// very next sweep, hours before the folder's own window says so.
+    #[test]
+    fn releasing_a_path_withdraws_the_deadline_that_asked_for_it() {
+        let c = conn();
+        remember_materialized(&c, "p", "clip.mp4", 1_000).expect("landing");
+        set_release_at(&c, "p", "clip.mp4", Some(2_000), 1_000).expect("keep it an hour");
+
+        forget_materialized(&c, "p", "clip.mp4", 2_500).expect("released");
+        assert!(materialized_rows(&c, "p").expect("read").is_empty());
+
+        remember_materialized(&c, "p", "clip.mp4", 9_000).expect("asked for again, indefinitely");
+        let row = materialized_rows(&c, "p").expect("read").remove(0);
+        assert_eq!(
+            row.release_at_ms, None,
+            "the served instruction is gone, so this path is on the folder's \
+             own window and not on a deadline that expired hours ago"
+        );
+        assert_eq!(row.at_ms, 9_000);
     }
 
     /// A length SQLite's signed integer cannot hold saturates, and never wraps
@@ -3561,6 +4598,7 @@ mod tests {
                 size_bytes: None,
                 pinned: false,
                 local_origin: false,
+                release_at_ms: None,
             },
             "the neighbour folder's row at the same path is untouched"
         );
@@ -4349,5 +5387,1031 @@ mod tests {
             .expect("rows");
         assert_eq!(rows, vec![kept], "the copy goes, the queue's place stays");
         assert!(!rows.contains(&copy));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tasks (Story 57.1)
+    // -----------------------------------------------------------------------
+
+    /// A profile-scoped `Sync` task, armed by nobody yet.
+    fn task(id: &str, schedule: Option<&str>, mode: TaskMode) -> TaskRow {
+        TaskRow {
+            id: id.to_owned(),
+            profile_id: Some("p".to_owned()),
+            kind: TaskKind::Sync,
+            schedule: schedule.map(str::to_owned),
+            mode,
+            next_due_ms: None,
+            enabled: true,
+            updated_ms: 1,
+            running_host: None,
+            lease_until_ms: None,
+        }
+    }
+
+    /// A row written the only way a row this build cannot read ever arrives:
+    /// past the typed write door, by a newer keeper or by hand.
+    fn raw_task(c: &Connection, id: &str, kind: &str, mode: &str, schedule: Option<&str>) {
+        c.execute(
+            "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled, updated_ms)
+             VALUES (?1, NULL, ?2, ?3, ?4, NULL, 1, 1)",
+            (id, kind, schedule, mode),
+        )
+        .expect("insert a raw task row");
+    }
+
+    fn columns_of(c: &Connection, table: &str) -> Vec<String> {
+        c.prepare(&format!("PRAGMA table_info({table})"))
+            .expect("pragma")
+            .query_map([], |r| r.get::<_, String>(1))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("columns")
+    }
+
+    fn meta_keys(c: &Connection) -> Vec<String> {
+        c.prepare("SELECT key FROM meta ORDER BY key")
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("keys")
+    }
+
+    #[test]
+    fn a_pre_57_database_gains_the_task_tables_and_no_new_meta_key() {
+        // The pre-57 schema by hand, including the one-shot marker such a
+        // binary had already applied — otherwise `ensure_prune_default` writes
+        // its own key and the meta comparison below would be testing that.
+        let c = Connection::open_in_memory().expect("bare db");
+        c.execute_batch(
+            r#"
+            CREATE TABLE profiles (
+                id          TEXT PRIMARY KEY,
+                json        TEXT NOT NULL,
+                state       TEXT NOT NULL DEFAULT 'idle',
+                last_error  TEXT,
+                updated_ms  INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE journal (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id  TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                payload     TEXT NOT NULL,
+                state       TEXT NOT NULL,
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                not_before_ms INTEGER NOT NULL DEFAULT 0,
+                created_ms  INTEGER NOT NULL,
+                last_error  TEXT
+            );
+            CREATE TABLE meta (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL
+            );
+            INSERT INTO meta (key, value)
+                 VALUES ('lfs_prune_local_default_on', '0');
+            "#,
+        )
+        .expect("pre-57 schema");
+        let meta_before = meta_keys(&c);
+
+        migrate(&c).expect("an old database migrates in place");
+        assert_eq!(
+            columns_of(&c, "tasks"),
+            vec![
+                "id",
+                "profile_id",
+                "kind",
+                "schedule",
+                "mode",
+                "next_due_ms",
+                "enabled",
+                "updated_ms",
+                "running_host",
+                "lease_until_ms",
+            ]
+        );
+        assert_eq!(
+            columns_of(&c, "task_runs"),
+            vec![
+                "id",
+                "task_id",
+                "started_ms",
+                "finished_ms",
+                "outcome",
+                "detail",
+                "host",
+            ]
+        );
+        let tasks_after_first = columns_of(&c, "tasks");
+
+        migrate(&c).expect("second migrate");
+        migrate(&c).expect("third migrate");
+        assert_eq!(columns_of(&c, "tasks"), tasks_after_first);
+        assert_eq!(
+            meta_keys(&c),
+            meta_before,
+            "a table addition is schema, not content, and writes no marker"
+        );
+    }
+
+    #[test]
+    fn a_task_round_trips_through_the_write_door_including_the_host_wide_case() {
+        let c = conn();
+        let mut cron = task("01A", Some("0 3 * * *"), TaskMode::Scheduled);
+        // Offered, and deliberately ignored: the window is runtime state owned
+        // by `arm_task`/`finish_task_run`, so a caller's copy of it — which is
+        // what a read-modify-write from a form carries — must never reach the
+        // row and rewind the schedule.
+        cron.next_due_ms = Some(9_000);
+        upsert_task(&c, &cron).expect("save");
+        let stored = TaskRow {
+            next_due_ms: None,
+            ..cron.clone()
+        };
+        let host_wide = TaskRow {
+            profile_id: None,
+            ..task("01B", None, TaskMode::Manual)
+        };
+        upsert_task(&c, &host_wide).expect("save the host-wide task");
+
+        assert_eq!(
+            get_task(&c, "01A").expect("get"),
+            Some(stored.clone()),
+            "everything the caller owns round-trips, and the window it does not own is unarmed"
+        );
+        assert_eq!(
+            get_task(&c, "01B").expect("get"),
+            Some(host_wide.clone()),
+            "a host-wide task carries no profile and must survive the round trip as one"
+        );
+        let listing = list_tasks(&c).expect("list");
+        assert_eq!(listing.tasks, vec![stored, host_wide]);
+        assert!(listing.unknown.is_empty());
+        assert_eq!(
+            cron.state(),
+            TaskState {
+                enabled: true,
+                mode: TaskMode::Scheduled,
+                next_due_ms: Some(9_000),
+                lease_until_ms: None,
+            },
+            "the row projects into exactly the four facts the pure gate reads"
+        );
+    }
+
+    #[test]
+    fn an_upsert_over_a_running_task_does_not_free_its_lease() {
+        let c = conn();
+        upsert_task(&c, &task("01U", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        claim_task(&c, "01U", "hostA", 0, 60_000, None)
+            .expect("claim")
+            .expect("the first claim wins");
+
+        let mut edited = task("01U", Some("every 10m"), TaskMode::Scheduled);
+        edited.updated_ms = 42;
+        upsert_task(&c, &edited).expect("save again while the run is in flight");
+
+        let row = get_task(&c, "01U").expect("get").expect("row");
+        assert_eq!(row.schedule.as_deref(), Some("every 10m"));
+        assert_eq!(row.updated_ms, 42);
+        assert_eq!(
+            row.running_host.as_deref(),
+            Some("hostA"),
+            "a save must not silently free a lease somebody is running under"
+        );
+        assert_eq!(row.lease_until_ms, Some(60_000));
+    }
+
+    #[test]
+    fn a_malformed_schedule_is_refused_by_the_write_door_and_nothing_is_stored() {
+        let c = conn();
+        let bad = task("01M", Some("0 3 * *"), TaskMode::Scheduled);
+        assert!(
+            matches!(upsert_task(&c, &bad), Err(SyncError::Config(_))),
+            "refusal, never coercion, and it happens where the row is written"
+        );
+        assert!(
+            get_task(&c, "01M").expect("get").is_none(),
+            "a refused schedule leaves nothing behind: a row that got written anyway would run"
+        );
+    }
+
+    #[test]
+    fn a_scheduled_task_with_no_schedule_is_refused() {
+        let c = conn();
+        let nonsense = task("01N", None, TaskMode::Scheduled);
+        assert!(matches!(
+            upsert_task(&c, &nonsense),
+            Err(SyncError::Config(_))
+        ));
+        assert!(get_task(&c, "01N").expect("get").is_none());
+    }
+
+    #[test]
+    fn an_empty_task_id_is_refused() {
+        let c = conn();
+        assert!(matches!(
+            upsert_task(&c, &task("", Some("every 5m"), TaskMode::Scheduled)),
+            Err(SyncError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn a_task_kind_this_build_cannot_read_is_skipped_and_listed_not_fatal() {
+        // A newer keeper's task must not brick an older one's list.
+        let c = conn();
+        upsert_task(&c, &task("01A", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        raw_task(&c, "01T", "teleport", "scheduled", Some("every 5m"));
+        // `update` is the one refusal the spec calls structural: `TaskKind` has
+        // no such variant, so raw SQL is the only way to write one — and it
+        // gets exactly the treatment a fictional kind gets.
+        raw_task(&c, "01X", "update", "scheduled", Some("0 3 * * *"));
+
+        let listing = list_tasks(&c).expect("list");
+        assert_eq!(
+            listing
+                .tasks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["01A"]
+        );
+        assert_eq!(
+            listing
+                .unknown
+                .iter()
+                .map(|u| u.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["01T", "01X"]
+        );
+        assert!(
+            get_task(&c, "01X").expect("get").is_none(),
+            "asking for one row by id answers 'nothing here I can act on', never a poisoned engine"
+        );
+    }
+
+    #[test]
+    fn an_unknown_mode_or_an_unparseable_schedule_is_skipped_and_listed_too() {
+        let c = conn();
+        raw_task(&c, "01M", "sync", "whenever", None);
+        raw_task(&c, "01S", "sync", "scheduled", Some("every 5x"));
+
+        let listing = list_tasks(&c).expect("list");
+        assert!(
+            listing.tasks.is_empty(),
+            "neither row is one this build could honestly run"
+        );
+        assert_eq!(
+            listing
+                .unknown
+                .iter()
+                .map(|u| u.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["01M", "01S"]
+        );
+        assert!(
+            listing.unknown.iter().all(|u| !u.reason.is_empty()),
+            "the reason is what a caller shows in place of the task"
+        );
+    }
+
+    #[test]
+    fn the_lease_admits_exactly_one_of_two_connections_racing_over_one_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let created = open(dir.path()).expect("open");
+        upsert_task(
+            &created,
+            &task("01R", Some("every 5m"), TaskMode::Scheduled),
+        )
+        .expect("save");
+        drop(created);
+
+        let path = db_path(dir.path());
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut racers = Vec::new();
+        for host in ["hostA", "hostB"] {
+            let path = path.clone();
+            let gate = std::sync::Arc::clone(&gate);
+            racers.push(std::thread::spawn(move || {
+                let c = Connection::open(&path).expect("second connection");
+                // Both `UPDATE`s must genuinely execute against the row: the
+                // WHERE clause, not the lock, is what has to exclude the loser.
+                c.busy_timeout(std::time::Duration::from_secs(5))
+                    .expect("busy timeout");
+                gate.wait();
+                claim_task(&c, "01R", host, 1_000, 60_000, None).expect("claim")
+            }));
+        }
+        let claims: Vec<Option<i64>> = racers
+            .into_iter()
+            .map(|r| r.join().expect("racer"))
+            .collect();
+
+        assert_eq!(
+            claims.iter().filter(|c| c.is_some()).count(),
+            1,
+            "the affected-row count is the arbiter, so exactly one host may hold the lease"
+        );
+        let reader = Connection::open(&path).expect("reader");
+        let runs: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id = '01R'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(runs, 1, "the losing claim must not open a run either");
+    }
+
+    #[test]
+    fn a_dead_holders_lease_is_reclaimable_at_the_expiry_instant_and_not_before() {
+        let c = conn();
+        upsert_task(&c, &task("01L", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        let abandoned = claim_task(&c, "01L", "hostA", 0, 1_000, None)
+            .expect("claim")
+            .expect("hostA claims a free task");
+
+        // The expiry instant is a boundary, so it is asserted exactly.
+        assert_eq!(
+            claim_task(&c, "01L", "hostB", 999, 1_000, None).expect("claim"),
+            None,
+            "one millisecond before it expires the lease is still hostA's"
+        );
+        let taken = claim_task(&c, "01L", "hostB", 1_000, 1_000, None)
+            .expect("claim")
+            .expect("at the instant it expires the lease is reclaimable");
+
+        let runs = task_runs(&c, "01L", 10).expect("runs");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, taken);
+        assert_eq!(runs[0].outcome, None, "the new run is still in flight");
+        assert_eq!(runs[0].finished_ms, None);
+        assert_eq!(runs[1].id, abandoned);
+        assert_eq!(
+            runs[1].outcome,
+            Some(TaskOutcome::Abandoned),
+            "a killed host's run is closed with the truth, not left open forever"
+        );
+        assert_eq!(runs[1].finished_ms, Some(1_000));
+        let row = get_task(&c, "01L").expect("get").expect("row");
+        assert_eq!(row.running_host.as_deref(), Some("hostB"));
+        assert_eq!(row.lease_until_ms, Some(2_000));
+    }
+
+    #[test]
+    fn a_disabled_task_cannot_be_claimed_at_all() {
+        let c = conn();
+        let mut off = task("01D", Some("every 5m"), TaskMode::Scheduled);
+        off.enabled = false;
+        upsert_task(&c, &off).expect("save");
+
+        assert_eq!(
+            claim_task(&c, "01D", "hostA", 0, 60_000, None).expect("claim"),
+            None,
+            "`enabled` decides whether the row is live, and a dead row runs for nobody"
+        );
+        assert!(
+            task_runs(&c, "01D", 10).expect("runs").is_empty(),
+            "a refused claim must not open a run"
+        );
+    }
+
+    #[test]
+    fn finishing_a_run_releases_the_lease_and_records_the_outcome_and_the_next_window() {
+        let c = conn();
+        upsert_task(&c, &task("01F", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        let run = claim_task(&c, "01F", "hostA", 0, 60_000, None)
+            .expect("claim")
+            .expect("claimed");
+
+        finish_task_run(
+            &c,
+            TaskRunClose {
+                run_id: run,
+                task_id: "01F",
+                host: "hostA",
+                finished_ms: 5_000,
+                outcome: TaskOutcome::Failed,
+                detail: Some("remote hung up"),
+                next_due_ms: Some(300_000),
+            },
+        )
+        .expect("finish");
+
+        let row = get_task(&c, "01F").expect("get").expect("row");
+        assert_eq!(row.running_host, None);
+        assert_eq!(row.lease_until_ms, None);
+        assert_eq!(row.next_due_ms, Some(300_000));
+        assert_eq!(row.updated_ms, 5_000);
+        let runs = task_runs(&c, "01F", 10).expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome, Some(TaskOutcome::Failed));
+        assert_eq!(runs[0].finished_ms, Some(5_000));
+        assert_eq!(runs[0].detail.as_deref(), Some("remote hung up"));
+        assert_eq!(runs[0].host, "hostA");
+        assert!(
+            claim_task(&c, "01F", "hostB", 6_000, 60_000, None)
+                .expect("claim")
+                .is_some(),
+            "releasing the lease and recording the result is one fact, so nothing is half-written"
+        );
+    }
+
+    /// Three states, and the newest run is the one every surface calls "last":
+    /// dropping a run this build cannot read would report an older attempt as
+    /// the current one, which is worse than saying "a newer keeper recorded
+    /// something here".
+    #[test]
+    fn an_unreadable_run_outcome_is_carried_not_dropped_and_a_null_one_is_in_flight() {
+        let c = conn();
+        upsert_task(&c, &task("01O", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        let in_flight = claim_task(&c, "01O", "hostA", 0, 60_000, None)
+            .expect("claim")
+            .expect("claimed");
+        c.execute(
+            "INSERT INTO task_runs (task_id, started_ms, finished_ms, outcome, host)
+             VALUES ('01O', 1, 2, 'teleported', 'hostZ')",
+            [],
+        )
+        .expect("insert junk");
+
+        let runs = task_runs(&c, "01O", 10).expect("runs");
+        assert_eq!(runs.len(), 2, "neither row is dropped and nothing is fatal");
+        assert_eq!(
+            (runs[0].outcome, runs[0].unknown_outcome.as_deref()),
+            (None, Some("teleported")),
+            "the NEWEST row is the unreadable one, and it is carried rather than \
+             dropped: dropping it would report the older attempt as the last run"
+        );
+        assert_eq!(runs[1].id, in_flight);
+        assert_eq!(
+            (runs[1].outcome, runs[1].unknown_outcome.as_deref()),
+            (None, None),
+            "a NULL outcome with no stored spelling is a run still going"
+        );
+    }
+
+    #[test]
+    fn the_task_runs_cap_trims_the_oldest_and_keeps_the_newest() {
+        let c = conn();
+        upsert_task(&c, &task("01C", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        let mut ids = Vec::new();
+        for n in 0..TASK_RUNS_CAP + 5 {
+            let now = 1_000 * (n as i64 + 1);
+            let run = claim_task(&c, "01C", "hostA", now, 60_000, None)
+                .expect("claim")
+                .expect("claimed");
+            finish_task_run(
+                &c,
+                TaskRunClose {
+                    run_id: run,
+                    task_id: "01C",
+                    host: "hostA",
+                    finished_ms: now + 1,
+                    outcome: TaskOutcome::Ok,
+                    detail: None,
+                    next_due_ms: Some(now + 60_000),
+                },
+            )
+            .expect("finish");
+            ids.push(run);
+        }
+
+        let runs = task_runs(&c, "01C", TASK_RUNS_CAP * 2).expect("runs");
+        assert_eq!(runs.len(), TASK_RUNS_CAP, "the history is bounded");
+        assert_eq!(
+            runs[0].id,
+            ids[TASK_RUNS_CAP + 4],
+            "the newest run survives"
+        );
+        assert_eq!(
+            runs[TASK_RUNS_CAP - 1].id,
+            ids[5],
+            "exactly the oldest 5 were dropped"
+        );
+    }
+
+    #[test]
+    fn deleting_a_task_takes_its_runs_with_it() {
+        let c = conn();
+        upsert_task(&c, &task("01G", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        claim_task(&c, "01G", "hostA", 0, 60_000, None)
+            .expect("claim")
+            .expect("claimed");
+
+        delete_task(&c, "01G").expect("delete");
+        assert!(get_task(&c, "01G").expect("get").is_none());
+        assert!(
+            task_runs(&c, "01G", 10).expect("runs").is_empty(),
+            "there is deliberately no foreign key to do this, so the function must"
+        );
+    }
+
+    /// The lease alone cannot stop one window yielding two runs: two hosts whose
+    /// ticks coincide both find it free, because the first host's release lands
+    /// before the second host's claim. The window predicate in the same statement
+    /// is what closes that.
+    #[test]
+    fn the_claim_refuses_a_window_that_is_not_open_yet() {
+        let c = conn();
+        upsert_task(&c, &task("01W", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        arm_task(&c, "01W", Some(10_000), 0).expect("arm");
+
+        assert_eq!(
+            claim_task(&c, "01W", "hostA", 9_999, 60_000, Some(9_999)).expect("claim"),
+            None,
+            "one millisecond before the window opens there is nothing to claim"
+        );
+        assert!(
+            claim_task(&c, "01W", "hostA", 10_000, 60_000, Some(10_000))
+                .expect("claim")
+                .is_some(),
+            "and at the instant it opens the claim succeeds"
+        );
+        // The requested door passes `None` and does not care about the window,
+        // which is what makes run-now work on a task that is not due.
+        finish_task_run(
+            &c,
+            TaskRunClose {
+                run_id: 1,
+                task_id: "01W",
+                host: "hostA",
+                finished_ms: 11_000,
+                outcome: TaskOutcome::Ok,
+                detail: None,
+                next_due_ms: Some(999_999),
+            },
+        )
+        .expect("finish");
+        assert!(
+            claim_task(&c, "01W", "hostB", 12_000, 60_000, None)
+                .expect("claim")
+                .is_some(),
+            "a request is not a window, so it claims a task that is not due"
+        );
+    }
+
+    /// The sharpest edge in the whole design. A host whose pass outlives its
+    /// lease finds the row already reclaimed; releasing it unconditionally freed
+    /// the NEW holder's lease mid-run and rewound the window with a stale value,
+    /// which turns one overrun into any number of concurrent passes over one git
+    /// working tree.
+    #[test]
+    fn an_overrunning_host_cannot_free_the_lease_that_replaced_it() {
+        let c = conn();
+        upsert_task(&c, &task("01X", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        arm_task(&c, "01X", Some(0), 0).expect("arm");
+        let slow = claim_task(&c, "01X", "hostA", 0, 1_000, Some(0))
+            .expect("claim")
+            .expect("hostA claims it");
+        let taken = claim_task(&c, "01X", "hostB", 2_000, 60_000, None)
+            .expect("claim")
+            .expect("hostB reclaims the expired lease");
+
+        // hostA finally returns, long after it lost the row.
+        finish_task_run(
+            &c,
+            TaskRunClose {
+                run_id: slow,
+                task_id: "01X",
+                host: "hostA",
+                finished_ms: 3_000,
+                outcome: TaskOutcome::Ok,
+                detail: Some("finished at last"),
+                next_due_ms: Some(4_000),
+            },
+        )
+        .expect("finish");
+
+        let row = get_task(&c, "01X").expect("get").expect("row");
+        assert_eq!(
+            row.running_host.as_deref(),
+            Some("hostB"),
+            "the overrunning host must not free the lease it no longer holds"
+        );
+        assert_eq!(row.lease_until_ms, Some(62_000));
+        assert_ne!(
+            row.next_due_ms,
+            Some(4_000),
+            "nor rewind the window with the value it computed before it lost the row"
+        );
+
+        let runs = task_runs(&c, "01X", 10).expect("runs");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs[0].id, taken,
+            "hostB's run is the newest and still open"
+        );
+        assert_eq!(runs[0].outcome, None);
+        assert_eq!(
+            (runs[1].id, runs[1].outcome, runs[1].detail.as_deref()),
+            (slow, Some(TaskOutcome::Ok), Some("finished at last")),
+            "the run row still records the truth: it really did end, and later"
+        );
+    }
+
+    /// The claim is the door the design calls the only arbiter, so `off` has to
+    /// hold at the door — not only in whichever caller remembered to check.
+    #[test]
+    fn an_off_task_cannot_be_claimed_even_by_a_caller_that_did_not_check() {
+        let c = conn();
+        upsert_task(&c, &task("01Z", Some("every 5m"), TaskMode::Off)).expect("save");
+        arm_task(&c, "01Z", Some(0), 0).expect("arm");
+
+        assert_eq!(
+            claim_task(&c, "01Z", "hostA", 1_000, 60_000, None).expect("claim"),
+            None,
+            "an `off` that still runs when asked is not off"
+        );
+        assert!(task_runs(&c, "01Z", 10).expect("runs").is_empty());
+    }
+
+    /// One row SQLite hands back with an unexpected type used to fail the whole
+    /// listing, and `run_due_tasks` returns on that error — so a single corrupt
+    /// row stopped every task on the host. That is the outcome NFR-43 forbids.
+    #[test]
+    fn a_row_whose_columns_will_not_read_is_listed_not_fatal() {
+        let c = conn();
+        upsert_task(&c, &task("01A", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        // A BLOB, which TEXT affinity does not convert, in `kind` — so the
+        // vocabulary column really does hand back a value this build's reader
+        // refuses, and the tolerant read is what routes it to the unknown path
+        // instead of failing the whole listing.
+        c.execute(
+            "INSERT INTO tasks (id, kind, mode, enabled, updated_ms)
+             VALUES ('01T', x'00ff', 'scheduled', 1, 0)",
+            [],
+        )
+        .expect("insert a typed-wrong row");
+        // And one whose PRIMARY KEY will not read either. `id` is strict on
+        // purpose — a row that cannot be named cannot be reported — so this
+        // takes the per-row error arm rather than the tolerant one.
+        c.execute(
+            "INSERT INTO tasks (id, kind, mode, enabled, updated_ms)
+             VALUES (x'dead', 'sync', 'scheduled', 1, 0)",
+            [],
+        )
+        .expect("insert an unnameable row");
+
+        let listing = list_tasks(&c).expect("the listing must survive both");
+        assert_eq!(
+            listing
+                .tasks
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["01A"],
+            "the readable task is still there, which is the whole point: one \
+             corrupt row must not stop every task on the host"
+        );
+        assert_eq!(listing.unknown.len(), 2, "and both are named as unknown");
+        assert!(
+            listing.unknown.iter().any(|u| u.id == "01T"),
+            "the row whose kind will not read is reported by id"
+        );
+        assert!(
+            listing
+                .unknown
+                .iter()
+                .any(|u| u.id.is_empty() && u.reason.contains("unreadable task row")),
+            "and the row whose id will not read is reported without one"
+        );
+    }
+
+    /// A schedule change has to take effect on the next tick, not after the old
+    /// schedule's window elapses — and an unrelated save must not move a window
+    /// at all, which is what a settings form re-saving a whole row does.
+    #[test]
+    fn changing_the_schedule_rearms_and_an_unrelated_save_leaves_the_window_alone() {
+        let c = conn();
+        upsert_task(&c, &task("01S", Some("@daily"), TaskMode::Scheduled)).expect("save");
+        arm_task(&c, "01S", Some(50_000), 0).expect("arm");
+
+        let mut renamed = task("01S", Some("@daily"), TaskMode::Scheduled);
+        renamed.profile_id = Some("elsewhere".to_owned());
+        upsert_task(&c, &renamed).expect("save");
+        assert_eq!(
+            get_task(&c, "01S").expect("get").expect("row").next_due_ms,
+            Some(50_000),
+            "the schedule did not change, so neither does the window"
+        );
+
+        upsert_task(&c, &task("01S", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        assert_eq!(
+            get_task(&c, "01S").expect("get").expect("row").next_due_ms,
+            None,
+            "a new schedule is unarmed, so the next tick computes its first window"
+        );
+    }
+
+    /// A task coming back into service arms afresh, and never catches up.
+    ///
+    /// Both edges, and both were the same defect wearing different clothes: a
+    /// `next_due_ms` that fell into the past while the row was not live, and
+    /// `crate::tasks::decide` runs a task whose window is past. So `tasks
+    /// disable nightly` on a `@daily` **release** task, then `tasks enable
+    /// nightly` a month later, fired a deletion sweep on the very next 1 Hz tick
+    /// instead of at 03:00 — catch-up, which Epic 57 rules out by name, and
+    /// which for the release kind means a deletion at an instant nobody chose.
+    ///
+    /// The window is asserted `None` rather than "not the old value", because
+    /// `None` is what makes the next tick take `Action::Arm` and compute the
+    /// real next instant.
+    #[test]
+    fn a_task_coming_back_into_service_arms_afresh_rather_than_catching_up() {
+        let c = conn();
+        let live = task("01E", Some("@daily"), TaskMode::Scheduled);
+        upsert_task(&c, &live).expect("save");
+        arm_task(&c, "01E", Some(50_000), 0).expect("arm");
+
+        let mut disabled = live.clone();
+        disabled.enabled = false;
+        upsert_task(&c, &disabled).expect("disable");
+        assert_eq!(
+            get_task(&c, "01E").expect("get").expect("row").next_due_ms,
+            Some(50_000),
+            "going out of service changes nothing: the row is simply not live"
+        );
+
+        upsert_task(&c, &live).expect("enable");
+        assert_eq!(
+            get_task(&c, "01E").expect("get").expect("row").next_due_ms,
+            None,
+            "but coming back into service must not fire a month-old window on \
+             the next tick"
+        );
+
+        // The other door: the schedule text never moves, so only the mode edge
+        // can clear the window here.
+        arm_task(&c, "01E", Some(50_000), 0).expect("arm");
+        let mut manual = live.clone();
+        manual.mode = TaskMode::Manual;
+        upsert_task(&c, &manual).expect("to manual");
+        assert_eq!(
+            get_task(&c, "01E").expect("get").expect("row").next_due_ms,
+            Some(50_000),
+            "a manual task keeps its remembered window; nothing obeys it"
+        );
+        upsert_task(&c, &live).expect("back to scheduled");
+        assert_eq!(
+            get_task(&c, "01E").expect("get").expect("row").next_due_ms,
+            None,
+            "and putting it back on its schedule arms afresh too"
+        );
+    }
+
+    /// The id is a primary key, it is what a CLI reads from argv, and it is what
+    /// `task_runs.task_id` joins on. Three spellings of one intended task is
+    /// worse than a refusal.
+    #[test]
+    fn a_task_id_that_is_padded_with_whitespace_is_refused() {
+        let c = conn();
+        for id in [" 01A", "01A ", "\t01A"] {
+            let padded = TaskRow {
+                id: id.to_owned(),
+                ..task("01A", Some("every 5m"), TaskMode::Scheduled)
+            };
+            assert!(
+                matches!(upsert_task(&c, &padded), Err(SyncError::Config(_))),
+                "{id:?} must be refused"
+            );
+        }
+        assert!(list_tasks(&c).expect("list").tasks.is_empty());
+    }
+
+    /// The two-host design rests on a writer *waiting* rather than failing at
+    /// once: `is_row_contention` is the last resort, not the normal path. Before
+    /// Story 57.2 this file had no timeout at all, so every cross-process
+    /// collision failed instantly — which for the release half of a task run
+    /// means the outcome is recorded nowhere and the lease is held out.
+    #[test]
+    fn the_shared_database_waits_for_a_writer_rather_than_failing_at_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = open(dir.path()).expect("open");
+        let timeout: i64 = c
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("pragma");
+        assert!(
+            timeout >= 1_000,
+            "a `sync.db` two processes write must wait for a writer, got {timeout} ms"
+        );
+    }
+
+    /// First sight happens once. A decision computed from a listing read before
+    /// the other host armed the row would otherwise rewind the window into the
+    /// past and run the task again.
+    #[test]
+    fn arming_a_task_that_is_already_armed_changes_nothing() {
+        let c = conn();
+        upsert_task(&c, &task("01AA", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        arm_task(&c, "01AA", Some(50_000), 1_000).expect("arm");
+
+        arm_task(&c, "01AA", Some(10), 2_000).expect("a stale decision arrives");
+
+        let row = get_task(&c, "01AA").expect("get").expect("row");
+        assert_eq!(
+            row.next_due_ms,
+            Some(50_000),
+            "a stale first-sight decision cannot rewind an armed window"
+        );
+        assert_eq!(row.updated_ms, 1_000, "and the row is not touched at all");
+    }
+
+    /// NFR-43's write half. `get_task` answers `None` for a row this build
+    /// cannot read, so a create-if-absent caller walks straight into overwriting
+    /// a newer keeper's task and rewriting its kind to one of ours.
+    #[test]
+    fn a_task_this_build_cannot_read_is_never_overwritten() {
+        let c = conn();
+        raw_task(&c, "01N", "teleport", "scheduled", Some("every 5m"));
+
+        let mine = task("01N", Some("every 5m"), TaskMode::Scheduled);
+        assert!(
+            matches!(upsert_task(&c, &mine), Err(SyncError::Config(_))),
+            "refusing to overwrite is the only honest answer"
+        );
+        let stored: String = c
+            .query_row("SELECT kind FROM tasks WHERE id = '01N'", [], |r| r.get(0))
+            .expect("kind");
+        assert_eq!(
+            stored, "teleport",
+            "and the newer keeper's row is untouched"
+        );
+    }
+
+    /// The run a claim has just opened must survive the trim in that same
+    /// transaction: it is the row [`finish_task_run`] is about to close, and a
+    /// trim that took it would leave a completed run recorded nowhere and
+    /// `run_task_now` reporting a `Journal` error for work that succeeded.
+    /// Reachable whenever the cap is already full, which for a frequent task is
+    /// most of the time.
+    #[test]
+    fn the_trim_never_takes_the_run_the_claim_just_opened() {
+        let c = conn();
+        upsert_task(&c, &task("01I", Some("every 1m"), TaskMode::Scheduled)).expect("save");
+        for n in 0..TASK_RUNS_CAP as i64 {
+            let run = claim_task(&c, "01I", "hostA", n * 10, 1, None)
+                .expect("claim")
+                .expect("claimed");
+            finish_task_run(
+                &c,
+                TaskRunClose {
+                    run_id: run,
+                    task_id: "01I",
+                    host: "hostA",
+                    finished_ms: n * 10 + 1,
+                    outcome: TaskOutcome::Ok,
+                    detail: None,
+                    next_due_ms: None,
+                },
+            )
+            .expect("finish");
+        }
+        assert_eq!(
+            task_runs(&c, "01I", TASK_RUNS_CAP * 2).expect("runs").len(),
+            TASK_RUNS_CAP,
+            "the cap is full before the run under test is opened"
+        );
+
+        let opened = claim_task(&c, "01I", "hostB", 999_000, 60_000, None)
+            .expect("claim")
+            .expect("claimed");
+        let runs = task_runs(&c, "01I", TASK_RUNS_CAP * 2).expect("runs");
+        assert_eq!(runs.len(), TASK_RUNS_CAP, "and it still holds afterwards");
+        assert_eq!(
+            (runs[0].id, runs[0].finished_ms),
+            (opened, None),
+            "the newest row is the one still in flight, not a casualty of its own trim"
+        );
+
+        finish_task_run(
+            &c,
+            TaskRunClose {
+                run_id: opened,
+                task_id: "01I",
+                host: "hostB",
+                finished_ms: 999_500,
+                outcome: TaskOutcome::Ok,
+                detail: Some("done"),
+                next_due_ms: None,
+            },
+        )
+        .expect("finish");
+        assert_eq!(
+            task_runs(&c, "01I", 1).expect("runs")[0].detail.as_deref(),
+            Some("done"),
+            "so the outcome lands on a row that still exists"
+        );
+    }
+
+    /// NFR-42 asks that a SIGTERM be a bounded finalize. Without this a
+    /// `systemctl restart` mid-run left the lease held by a pid that no longer
+    /// exists for the whole of the lease, and the restarted daemon cannot prove
+    /// that pid is dead — the app shares the device row and may hold one.
+    #[test]
+    fn releasing_a_hosts_leases_closes_its_runs_and_frees_its_tasks() {
+        let c = conn();
+        for id in ["01P", "01Q"] {
+            upsert_task(&c, &task(id, Some("every 5m"), TaskMode::Scheduled)).expect("save");
+            claim_task(&c, id, "dying", 0, 3_600_000, None)
+                .expect("claim")
+                .expect("claimed");
+        }
+        upsert_task(&c, &task("01R2", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        claim_task(&c, "01R2", "other", 0, 3_600_000, None)
+            .expect("claim")
+            .expect("claimed");
+
+        assert_eq!(release_host_leases(&c, "dying", 9_000).expect("release"), 2);
+        for id in ["01P", "01Q"] {
+            let row = get_task(&c, id).expect("get").expect("row");
+            assert_eq!(row.running_host, None, "{id} is claimable again at once");
+            assert_eq!(row.lease_until_ms, None);
+            let runs = task_runs(&c, id, 10).expect("runs");
+            assert_eq!(
+                (runs[0].outcome, runs[0].finished_ms),
+                (Some(TaskOutcome::Abandoned), Some(9_000)),
+                "{id}'s open run is closed with the truth rather than left open"
+            );
+        }
+        assert_eq!(
+            get_task(&c, "01R2")
+                .expect("get")
+                .expect("row")
+                .running_host
+                .as_deref(),
+            Some("other"),
+            "and another host's lease is none of this one's business"
+        );
+    }
+
+    /// The `SQLITE_BUSY` mapping the two-host story rests on, exercised for
+    /// real: a connection with no `busy_timeout` meeting a held write lock.
+    /// `db::open` sets a timeout, so this is the last-resort path — and a design
+    /// that reads a lock as "not mine" has to prove it does.
+    #[test]
+    fn a_claim_that_meets_a_held_write_lock_reads_as_not_mine_rather_than_as_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let created = open(dir.path()).expect("open");
+        upsert_task(
+            &created,
+            &task("01B2", Some("every 5m"), TaskMode::Scheduled),
+        )
+        .expect("save");
+
+        // A writer holding the lock, on its own connection.
+        let holder = Connection::open(db_path(dir.path())).expect("holder");
+        holder
+            .execute_batch("BEGIN IMMEDIATE; UPDATE tasks SET updated_ms = 1 WHERE id = '01B2';")
+            .expect("hold the write lock");
+
+        // No `busy_timeout`, so the claim fails immediately rather than waiting.
+        let contender = Connection::open(db_path(dir.path())).expect("contender");
+        contender
+            .busy_timeout(std::time::Duration::from_millis(0))
+            .expect("no timeout");
+        assert_eq!(
+            claim_task(&contender, "01B2", "hostB", 0, 60_000, None)
+                .expect("contention is an answer about the lease, not a fault to propagate"),
+            None
+        );
+
+        holder.execute_batch("COMMIT;").expect("release");
+        assert!(
+            task_runs(&created, "01B2", 10).expect("runs").is_empty(),
+            "and the refused claim opened no run"
+        );
+    }
+
+    /// A task naming a folder that is gone fails permanently, on a schedule,
+    /// forever — so the folder's removal has to take it.
+    #[test]
+    fn deleting_a_folder_takes_its_tasks_and_their_history() {
+        let c = conn();
+        upsert_profile(&c, &profile("p"), 0).expect("profile");
+        let mut owned = task("01Y", Some("every 5m"), TaskMode::Scheduled);
+        owned.profile_id = Some("p".to_owned());
+        upsert_task(&c, &owned).expect("save");
+        claim_task(&c, "01Y", "hostA", 0, 60_000, None)
+            .expect("claim")
+            .expect("claimed");
+        let host_wide = TaskRow {
+            profile_id: None,
+            ..task("01HW", Some("every 5m"), TaskMode::Scheduled)
+        };
+        upsert_task(&c, &host_wide).expect("save");
+
+        delete_profile(&c, "p").expect("delete");
+
+        assert!(get_task(&c, "01Y").expect("get").is_none());
+        assert!(
+            task_runs(&c, "01Y", 10).expect("runs").is_empty(),
+            "its history goes with it, since no foreign key does that here"
+        );
+        assert!(
+            get_task(&c, "01HW").expect("get").is_some(),
+            "a host-wide task belongs to the machine and survives"
+        );
     }
 }

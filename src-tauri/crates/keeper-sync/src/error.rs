@@ -211,6 +211,33 @@ pub enum SyncError {
     #[error("{0} is already syncing; the run already in progress will finish it")]
     Busy(String),
 
+    /// This folder's working copy was never finished (Story 56.15).
+    ///
+    /// `HEAD` holds a tree and the index holds nothing, which git itself never
+    /// leaves behind: a checkout writes both together, and even `git rm -r .`
+    /// writes an index full of removals rather than an index with no entries.
+    /// The two ways in are a clone or checkout killed between the fetch and
+    /// the index write, and a human deleting `.git/index`.
+    ///
+    /// It is a variant of its own — rather than a `Git(String)` — because the
+    /// two things that must happen are opposite to everything else in this
+    /// taxonomy: the folder must be **refused** (a status walk from that state
+    /// reports every tracked path as deleted, so a commit made from it deletes
+    /// the entire tree) and simultaneously **retried**, because the repair is
+    /// mechanical and keeper owns it. `Transient` is what buys the retry;
+    /// [`crate::engine::Engine::do_checkout`] is what makes the folder say so
+    /// in the meantime, since a network cause would otherwise resolve to
+    /// `Offline` with no error recorded at all — which is precisely the state
+    /// the owner's machine was found in.
+    ///
+    /// `detail` carries the specifics, because the two shapes differ: a clone
+    /// that never produced a repository at all, and a repository whose
+    /// checkout stopped between the fetch and the index write. The head of the
+    /// sentence is fixed because it is what is true of both, and it is what a
+    /// person needs first: **this folder's first copy never finished.**
+    #[error("{}: this folder's first copy never finished. {detail}", .path.display())]
+    CheckoutUnfinished { path: PathBuf, detail: String },
+
     /// The operation was cancelled — by the user, by shutdown, or by a volume
     /// disappearing mid-flight. Never surfaced as a failure.
     #[error("operation cancelled")]
@@ -266,6 +293,12 @@ impl SyncError {
             // gets the same answer. A retry could only succeed by overwriting
             // the very thing the refusal protects.
             Self::Refused(_) => Retriability::Permanent,
+            // Transient, and the classification IS the retry: the repair —
+            // writing the `HEAD` paths the interrupted checkout never wrote —
+            // is mechanical, owned by keeper, and needs nobody. Parking it
+            // would leave a folder that downloads nothing until a human finds
+            // a button, which is the failure this variant exists to end.
+            Self::CheckoutUnfinished { .. } => Retriability::Transient,
         }
     }
 
@@ -317,6 +350,7 @@ impl SyncError {
             Self::Config(_) => "config",
             Self::Busy(_) => "busy",
             Self::Refused(_) => "refused",
+            Self::CheckoutUnfinished { .. } => "checkoutUnfinished",
             Self::Cancelled => "cancelled",
         }
     }

@@ -48,6 +48,7 @@ use crate::progress::{
 use crate::provenance::{commit_message, Provenance, SyncSource};
 use crate::sparse::SparseCone;
 use crate::stability::{FileSample, StabilityGate, StabilityVerdict};
+use crate::tasks;
 use crate::volume::{self, VolumeMarker, VolumeStatus};
 use crate::watch::{FolderWatcher, WatchConfig, WatchEvent};
 
@@ -147,6 +148,16 @@ pub struct EngineCounters {
     /// engine did, and an unreachable remote must not make it read as though
     /// the policy never fired.
     pub pushes: u64,
+    /// Full-tree status walks STARTED for this profile, counted at the one
+    /// door every one of them goes through ([`Engine::claim_walk`]).
+    ///
+    /// Counted because the walk is the single most expensive thing the engine
+    /// does — measured on the owner's folder, 4.3 s of tree diff per pass at a
+    /// two-second cadence — and "did this tick walk?" is otherwise only
+    /// answerable by reading a log line, which is not an assertion. A gate
+    /// that stops a walk can therefore be pinned by a test that counts ZERO
+    /// rather than by one that eyeballs `status walk finished`.
+    pub status_walks: u64,
 }
 
 /// How safe one recorded file already is, read locally (Story 41.6, FR-138).
@@ -480,6 +491,148 @@ pub const RELEASE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 /// literal there would silently stop reaching one if this changed.
 pub const RELEASE_LOOK_EVERY_MS: i64 = 3_600_000;
 
+/// How long a host holds a task's lease (Story 57.2, AD-136).
+///
+/// An hour, and the two failures it sits between are asymmetric. A lease that
+/// is too short lets a second host start a run the first one is still doing —
+/// two passes over one working tree, which is the concurrent-index-lock failure
+/// AD-62 exists to prevent. A lease that is too long only delays the retry
+/// after a host is killed. So it is sized by the longest thing a task does,
+/// which is a whole sync pass over a large folder, and the cost of overshooting
+/// is paid by the rarer case.
+///
+/// Nothing renews it, deliberately: a run that outlives its lease is reclaimed
+/// and its attempt recorded as `abandoned`, which is a fact a reader can act on
+/// rather than a lease that quietly follows a process that may already be dead.
+const TASK_LEASE_MS: i64 = 3_600_000;
+
+/// How soon a task retries after a run that did not happen.
+///
+/// A [`tasks::TaskOutcome::Busy`] or [`tasks::TaskOutcome::Deferred`] run did no
+/// work, so it must not consume the schedule's window: a `@daily` sweep that
+/// collided with the supervisor's own pass at 03:00 would otherwise lose the
+/// whole day. A minute is the schedule floor, so retrying at it cannot fire
+/// faster than any schedule this dialect can express, and it is short enough
+/// that a folder whose drive returns is served in the minute after.
+const TASK_RETRY_MS: i64 = 60_000;
+
+/// Why a task is running: because its window opened, or because somebody asked.
+///
+/// Two things hang off it and neither is cosmetic. The claim only demands an
+/// open window for a scheduled run, and the provenance a commit carries names
+/// the engine's own policy for a scheduled run and a person for a requested one
+/// — the distinction `SyncSource` already draws, and one a commit message keeps
+/// forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskTrigger {
+    /// The due-gate on this host's tick opened the window.
+    Scheduled,
+    /// A person, a CLI verb or an IPC command asked for it.
+    Requested,
+}
+
+impl TaskTrigger {
+    /// What a commit this run creates should say about who caused it.
+    ///
+    /// `Watch` for a scheduled run, for the reason the recordings push already
+    /// records at its own call site: *"not a person asking, but the engine
+    /// acting on a policy the folder carries"*. `Manual` for a requested one,
+    /// because that is precisely what it is. `Cli` is deliberately not used:
+    /// it would make an in-process due-gate indistinguishable from the real
+    /// `keeper-syncd` verb 57.3 adds, in a fact git keeps forever.
+    fn source(self) -> SyncSource {
+        match self {
+            Self::Scheduled => SyncSource::Watch,
+            Self::Requested => SyncSource::Manual,
+        }
+    }
+}
+
+/// Why the release sweep is running: because a sync just succeeded, or because
+/// a task named it (Story 57.4, FR-349, FR-350).
+///
+/// Beside [`TaskTrigger`] because it answers the same shape of question about a
+/// different verb, and it names its two callers exactly:
+/// [`Engine::mark_synced`] passes [`Self::SuccessEdge`] and
+/// [`Engine::perform_release_task`] passes [`Self::Task`]. There is no third.
+///
+/// **Only two things hang off it**, and both are about *when* the pass may look
+/// rather than about what it may delete:
+///
+/// 1. whether the stored release task's [`tasks::TaskMode`] may veto the pass
+///    ([`Engine::release_permits`]), and
+/// 2. whether [`Engine::release_is_due`]'s hourly **look** gate applies.
+///
+/// Every Epic 56 refusal is untouched by it — the pause, a faulted folder
+/// config, a zero TTL, the mode gate, the pin, both AD-131 clocks, 56.17's
+/// per-file `release_at_ms`, the per-path policy and both budgets are reached
+/// identically on both triggers, because **a task is not a privileged caller**.
+/// A trigger that could unlock a deletion would make `tasks run release` a
+/// second, more permissive implementation of the sweep, which is the one thing
+/// this story may not build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseTrigger {
+    /// [`Engine::mark_synced`]: a sync of this folder has just succeeded, which
+    /// is the only edge Epic 56 ever rode.
+    SuccessEdge,
+    /// [`Engine::perform_release_task`]: a stored task named this folder, on its
+    /// schedule or because somebody asked.
+    Task,
+}
+
+/// What one release pass did, as something its caller can report (Story 57.4).
+///
+/// [`Engine::release_expired`] used to answer `Ok(())`, which is enough for
+/// [`Engine::mark_synced`] — it logs and swallows — and is not enough for a
+/// task: `task_runs.detail` is the only place a headless box ever learns what a
+/// nightly sweep achieved, and "it ran" is not an answer to "did it reclaim
+/// anything". Both counters are ones the pass already accumulated for its own
+/// `info!` line, so nothing new is measured here; they are returned rather than
+/// logged and dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReleaseSweep {
+    /// Whether the pass got past every gate and actually examined this folder's
+    /// ledger, as opposed to declining before it looked.
+    ///
+    /// Seven refusals answer `Ok(ReleaseSweep::default())` — a paused folder, a
+    /// faulted folder config, a zero TTL, `LfsMode::Disabled`, a mode this
+    /// folder's release task vetoes, an uncompilable policy, and an empty
+    /// candidate set — and only the last of those is a folder that was swept.
+    /// Without this flag they are indistinguishable in the record: a host-wide
+    /// run over ten folders that every one of them vetoed reports "0 released
+    /// from 10 folders", which reads exactly like ten folders swept with nothing
+    /// due. The operator who most needs to know is the one who asked for a run
+    /// and got silence, so [`Engine::perform_release_task`] counts declines
+    /// beside sweeps and defers on a run where nothing looked at all.
+    looked: bool,
+    /// How many paths gave up their content.
+    released: usize,
+    /// How many bytes those paths were holding, by the ledger's own numbers —
+    /// the same column [`RELEASE_BUDGET_BYTES`] is spent against, so a row
+    /// written before Story 56.5 recorded no size and contributes nothing. That
+    /// residual is stated rather than left silent, and it is the honest one:
+    /// inventing a size for such a row would report space that never came back.
+    reclaimed_bytes: u64,
+}
+
+/// A release pass that hit a hard error, and everything it had already done
+/// when it did (Story 57.4).
+///
+/// A `Result<ReleaseSweep>` cannot carry both, and the pass genuinely produces
+/// both: [`Engine::release_expired`] continues past a candidate it could not
+/// resolve and goes on releasing the rest of the window, so the error and the
+/// count of deleted paths are two facts about one pass. Returning only the
+/// error made `task_runs.detail` read `released 0 paths (0 bytes)` for a run
+/// that had deleted content — the record lying about a deletion, which is the
+/// one thing this epic's record may not do.
+struct SweepFailure {
+    /// What the pass had achieved before it gave up on the failing candidate.
+    swept: ReleaseSweep,
+    /// The first hard error, which is what [`Engine::mark_synced`] logs and what
+    /// the task record quotes.
+    error: SyncError,
+}
+
 /// How many consecutive transient failures before a profile stops calling
 /// itself healthy.
 ///
@@ -644,6 +797,33 @@ enum WhenAbsent {
     /// Write nothing; report [`lfs::hydrate::MaterializeOutcome::Queued`] with
     /// no unit, and let the caller name the row it already queued.
     Report,
+}
+
+/// What a materialize request asks the `materialized` ledger to record about
+/// when this path may be let go, with the clock already read (Story 56.17).
+///
+/// [`lfs::hydrate::KeepFor`]'s three answers, resolved: the caller's `2h` has
+/// become an absolute instant, because a ledger holding a duration would be
+/// stale the moment the row sat still and [`release_due_at`] compares against
+/// a clock. Resolved at the door rather than at the writer so that
+/// [`Engine::materialize_entry_now`], which runs
+/// [`Engine::materialize_held`] twice around a drain, records the same instant
+/// both times instead of one moved forward by the transfer.
+///
+/// Three variants rather than an `Option<i64>`, and the third is the one that
+/// matters: *write nothing* is not *clear it*. The copy planner hydrates a
+/// path so `copy` can read real bytes and has no opinion about retention, so
+/// duplicating a file must not withdraw the two hours its owner asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseInstruction {
+    /// Do not touch the column at all. Every caller that predates Story 56.17
+    /// means this, so their behaviour is unchanged down to the statement count.
+    Leave,
+    /// Withdraw any standing deadline: this path goes back on the folder's own
+    /// `releaseTtlMs` window.
+    Clear,
+    /// Let this path go no earlier than this absolute epoch-ms instant.
+    At(i64),
 }
 
 pub struct Engine {
@@ -1069,13 +1249,24 @@ impl Engine {
     /// commit pass defers to the supervisor's next tick, and the poll answers
     /// from the index and the gate, which is what it does anyway whenever a
     /// repair backlog exists.
+    ///
+    /// It is also where [`EngineCounters::status_walks`] is counted, because
+    /// this is the one door every full-tree walk in the engine goes through
+    /// and a claim that is granted is always spent: both callers walk
+    /// immediately afterwards. Counting here rather than at the two call sites
+    /// means a gate added in front of either cannot be tested against a
+    /// counter that was never reached.
     fn claim_walk(&self, profile_id: &str) -> Option<WalkClaim<'_>> {
-        Self::lock(&self.walking)
-            .insert(profile_id.to_owned())
-            .then(|| WalkClaim {
-                walking: &self.walking,
-                profile_id: profile_id.to_owned(),
-            })
+        if !Self::lock(&self.walking).insert(profile_id.to_owned()) {
+            return None;
+        }
+        self.bump_counters(profile_id, |counters| {
+            counters.status_walks = counters.status_walks.saturating_add(1);
+        });
+        Some(WalkClaim {
+            walking: &self.walking,
+            profile_id: profile_id.to_owned(),
+        })
     }
 
     /// What a Pending poll asks of the walk it is about to run.
@@ -1502,6 +1693,34 @@ impl Engine {
         }
     }
 
+    /// The state word this profile is currently wearing, if the engine holds a
+    /// snapshot for it at all.
+    fn state_of(&self, profile_id: &str) -> Option<ProfileState> {
+        Self::lock(&self.status).get(profile_id).map(|s| s.state)
+    }
+
+    /// Record — or retire — the sentence a person reads beside this folder,
+    /// on **both** surfaces that carry it (Story 56.15).
+    ///
+    /// The in-process snapshot is what the app polls; `profiles.last_error` is
+    /// what survives the process, and what `keeper-syncd status` and a fresh
+    /// launch read. Before this the two were not two: nothing anywhere wrote
+    /// the column (see [`db::set_profile_error`]), so a folder that had
+    /// stopped could only say so for as long as the process that noticed
+    /// stayed up — and the owner's `sync.db` was found with `last_error = NULL`
+    /// beside a repository that had been broken for a day.
+    ///
+    /// Best-effort on the durable half, like [`Self::set_state`]: failing to
+    /// record a problem must never become a second problem.
+    fn set_error(&self, profile_id: &str, error: Option<&str>) {
+        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
+            snapshot.error = error.map(str::to_owned);
+        }
+        if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, error)) {
+            tracing::debug!(error = %err, "could not persist the sync profile's error");
+        }
+    }
+
     /// Record a sticky warning and notify exactly once per onset (Story 29.6).
     ///
     /// **Onset means `None → Some` on the snapshot's `warning` — the presence
@@ -1582,10 +1801,23 @@ impl Engine {
     /// field is what re-arms it, so a cleared-then-recurring problem notifies
     /// again (Story 29.6's second acceptance clause) without a separate
     /// "already notified" flag that a future caller could forget to clear here.
+    ///
+    /// The durable half of the error goes with it, and **only when there was
+    /// one**: this runs after every successful unit, so an unconditional
+    /// `UPDATE` would put a write on the journal's hot path to clear a column
+    /// that is already `NULL` on every healthy folder.
     fn clear_warning(&self, profile_id: &str) {
-        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
-            snapshot.warning = None;
-            snapshot.error = None;
+        let had_error = match Self::lock(&self.status).get_mut(profile_id) {
+            Some(snapshot) => {
+                snapshot.warning = None;
+                snapshot.error.take().is_some()
+            }
+            None => false,
+        };
+        if had_error {
+            if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, None)) {
+                tracing::debug!(error = %err, "could not retire the sync profile's error");
+            }
         }
     }
 
@@ -1635,9 +1867,15 @@ impl Engine {
         Ok(())
     }
 
-    /// Return in-flight units to the queue so a restart resumes them.
+    /// Return in-flight units to the queue, and in-flight task leases to
+    /// whoever comes next, so a restart resumes rather than waits.
+    ///
+    /// The lease half is released first and never fails the finalize: a lease
+    /// this process cannot hand back expires on its own, while a journal unit
+    /// that is not requeued waits for the next startup to notice it.
     fn finalize(&self) -> Result<()> {
         let now = self.platform.now_ms();
+        self.release_task_leases();
         self.with_db(|conn| db::recover_running(conn, now))
             .map(drop)
     }
@@ -1652,6 +1890,16 @@ impl Engine {
         // removing one is visible only from here: `tick_profile` never runs for
         // a disabled profile, so it cannot be the thing that notices.
         self.retain_watchers(&profiles);
+        // Host-wide, and outside the `enabled` filter below: a task belongs to
+        // the machine rather than to one folder, so a paused profile must not be
+        // what decides whether the machine's nightly housekeeping happens.
+        //
+        // On the tick that already exists, which is the whole of AD-136. There
+        // is no task thread, no second interval and no `.timer` inside this
+        // process — AD-62 forbids a second clock over one git repository, and a
+        // due-gate on the supervisor's own tick has exactly the resolution a
+        // one-minute schedule floor needs.
+        self.run_due_tasks(&profiles).await;
         for profile in profiles {
             if !profile.enabled {
                 continue;
@@ -1665,6 +1913,554 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Tasks (Story 57.1, Story 57.2 — AD-135, AD-136)
+    // -----------------------------------------------------------------------
+
+    /// Ask every task whether it is due, and run what is.
+    ///
+    /// A due-gate, not a scheduler. This function owns no clock, no thread and
+    /// no interval: it reads [`SyncPlatform::now_ms`] exactly as
+    /// [`Self::scan_is_due`] and [`Self::sweep_is_due`] do, which is what makes
+    /// a schedule something a test can advance rather than something a test has
+    /// to wait for. The decision itself is [`tasks::decide`], which is pure.
+    ///
+    /// Never fails the tick, following [`Self::drain_finished_assertions`]:
+    /// housekeeping that could stop a folder syncing would be a far worse
+    /// bargain than housekeeping that occasionally does not happen.
+    async fn run_due_tasks(&self, profiles: &[SyncProfile]) {
+        let offset = self.platform.utc_offset_minutes();
+        let listing = match self.with_db(db::list_tasks) {
+            Ok(listing) => listing,
+            Err(err) => {
+                tracing::debug!(error = %err, "cannot read the task list this tick");
+                return;
+            }
+        };
+        // Logged, not raised. A row this build cannot read is the other host
+        // writing a task a newer keeper understands, which is a fact about the
+        // fleet and not a fault in this process (NFR-43).
+        for unknown in &listing.unknown {
+            tracing::debug!(
+                task = unknown.id,
+                reason = unknown.reason,
+                "this host cannot run one of the stored tasks"
+            );
+        }
+        for task in &listing.tasks {
+            // The clock is read per task, not once for the loop. A task ahead of
+            // this one in the list may have spent forty minutes inside a sync
+            // pass, and a `now` from before it would arm the next task's window
+            // in the past and — worse — stamp its lease already expired, which
+            // the other host would reclaim while this one was running it.
+            let now = self.platform.now_ms();
+            // Re-read from the row rather than cached across ticks: the other
+            // host writing this same `sync.db` may have rewritten it since.
+            let schedule = match task.parsed_schedule() {
+                Ok(schedule) => schedule,
+                // Unreachable — `list_tasks` already lists such a row as
+                // unknown — but total, because a loop over stored rows that can
+                // panic on one of them is not a loop this tick may contain.
+                Err(_) => continue,
+            };
+            match tasks::decide(&task.state(), schedule.as_ref(), now) {
+                tasks::Action::None => {}
+                tasks::Action::Arm => self.arm_task_window(task, schedule.as_ref(), now, offset),
+                tasks::Action::Run => {
+                    let run = self
+                        .claim_and_run(task, profiles, now, offset, TaskTrigger::Scheduled)
+                        .await;
+                    if let Err(err) = run {
+                        tracing::warn!(task = task.id, error = %err, "a due task could not run");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compute a first window and stop there.
+    ///
+    /// First sight arms and declines, the discipline [`Self::release_is_due`]
+    /// already keeps for a sweep that deletes: a nightly task saved at noon must
+    /// run tonight, not the moment it was saved. Anything else would make
+    /// "create a task" and "run a task" the same gesture.
+    fn arm_task_window(
+        &self,
+        task: &db::TaskRow,
+        schedule: Option<&tasks::TaskSchedule>,
+        now_ms: i64,
+        utc_offset_minutes: i32,
+    ) {
+        let Some(next) = schedule.and_then(|s| s.next_due_after(now_ms, utc_offset_minutes)) else {
+            // `warn`, not `debug`, and this is the one place in the feature where
+            // the level is load-bearing: the row stays unarmed, so the next tick
+            // decides `Arm` again and the task reports itself enabled and
+            // scheduled while nothing ever runs. That is exactly the shape this
+            // epic exists to close, and the default log level is `info`, so a
+            // `debug` line here would have made it invisible in a shipped
+            // install. The parser refuses a schedule that names no real date, so
+            // reaching this means a newer keeper wrote one whose next instant is
+            // beyond this build's eight-year search window.
+            tracing::warn!(
+                task = task.id,
+                schedule = task.schedule.as_deref().unwrap_or(""),
+                "this task's schedule has no next instant this keeper can find, so it \
+                 is enabled and will not run"
+            );
+            return;
+        };
+        if let Err(err) = self.with_db(|conn| db::arm_task(conn, &task.id, Some(next), now_ms)) {
+            tracing::debug!(task = task.id, error = %err, "cannot arm a task's window");
+        }
+    }
+
+    /// Take the lease, do the work, record what happened.
+    ///
+    /// The order is not negotiable. **The claim is first and is the only
+    /// arbiter**: on a Linux box the daemon and the app both write this
+    /// `sync.db`, so both reach this line for the same due task and exactly one
+    /// may pass — see [`db::claim_task`], whose single conditional `UPDATE` is
+    /// what decides. **Recording is last and unconditional**: a run nobody
+    /// recorded is indistinguishable from a task that never came due, which is
+    /// the invisible-failure shape this whole epic exists to close.
+    ///
+    /// `Ok(None)` means the claim was declined — a live lease elsewhere, or a
+    /// window this host has already lost to the other one. Neither is a failure,
+    /// and [`Self::run_due_tasks`] treats it as one host's ordinary answer on a
+    /// machine with two.
+    async fn claim_and_run(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+        now_ms: i64,
+        utc_offset_minutes: i32,
+        trigger: TaskTrigger,
+    ) -> Result<Option<i64>> {
+        let host = self.task_host();
+        let due_at_most = match trigger {
+            // The window must already be open, and the claim checks it in the
+            // same statement that takes the lease. Without it, two hosts whose
+            // ticks coincide on a task with fast work both see a free lease —
+            // the first one's release lands before the second one's claim — and
+            // one window yields two runs.
+            TaskTrigger::Scheduled => Some(now_ms),
+            TaskTrigger::Requested => None,
+        };
+        let Some(run_id) = self.with_db(|conn| {
+            db::claim_task(conn, &task.id, &host, now_ms, TASK_LEASE_MS, due_at_most)
+        })?
+        else {
+            return Ok(None);
+        };
+        let (outcome, detail) = self.perform_task(task, profiles, trigger.source()).await;
+        // The clock is read again rather than reused: a sync pass takes as long
+        // as it takes, and a window computed from the instant the task became
+        // due would come due again the moment a run that overran it finished.
+        let finished = self.platform.now_ms();
+        let next_due_ms =
+            self.next_task_window(task, finished, utc_offset_minutes, trigger, outcome);
+        tracing::info!(
+            task = task.id,
+            kind = task.kind.as_str(),
+            outcome = outcome.as_str(),
+            detail = detail,
+            "task run finished"
+        );
+        self.with_db(|conn| {
+            db::finish_task_run(
+                conn,
+                db::TaskRunClose {
+                    run_id,
+                    task_id: &task.id,
+                    host: &host,
+                    finished_ms: finished,
+                    outcome,
+                    detail: Some(detail.as_str()),
+                    next_due_ms,
+                },
+            )
+        })?;
+        Ok(Some(run_id))
+    }
+
+    /// When the task should next come due, given how this run ended.
+    ///
+    /// Three rules, and each of them was a way to lose housekeeping silently.
+    ///
+    /// * A run that **did not happen** — [`tasks::TaskOutcome::Busy`] because the
+    ///   folder was already syncing, or [`tasks::TaskOutcome::Deferred`] because
+    ///   its drive is unplugged — must not consume the window. Advancing to the
+    ///   next scheduled instant would have cost a `@daily` task a whole day for
+    ///   a collision the design calls normal. It retries after
+    ///   [`TASK_RETRY_MS`], or at the scheduled instant if that comes sooner.
+    /// * A **requested** run leaves the schedule alone, because asking for a run
+    ///   now is not asking to skip the next one — unless the window it found was
+    ///   already open, in which case that window has just been served and
+    ///   writing it back would run the task again on the very next tick.
+    /// * Otherwise the next instant is computed from when this run **finished**,
+    ///   which is what [`tasks::TaskSchedule::Every`]'s own doc records.
+    fn next_task_window(
+        &self,
+        task: &db::TaskRow,
+        finished_ms: i64,
+        utc_offset_minutes: i32,
+        trigger: TaskTrigger,
+        outcome: tasks::TaskOutcome,
+    ) -> Option<i64> {
+        let scheduled = task
+            .parsed_schedule()
+            .ok()
+            .flatten()
+            .and_then(|schedule| schedule.next_due_after(finished_ms, utc_offset_minutes));
+        if matches!(
+            outcome,
+            tasks::TaskOutcome::Busy | tasks::TaskOutcome::Deferred
+        ) {
+            let retry = finished_ms.saturating_add(TASK_RETRY_MS);
+            return Some(scheduled.map_or(retry, |at| at.min(retry)));
+        }
+        match trigger {
+            TaskTrigger::Scheduled => scheduled,
+            TaskTrigger::Requested => match task.next_due_ms {
+                Some(at) if at > finished_ms => Some(at),
+                _ => scheduled,
+            },
+        }
+    }
+
+    /// Do the work one task names.
+    ///
+    /// Exhaustive with no `_` arm, so a kind added later has to decide what it
+    /// does rather than inherit silence — and so the kind that must never exist
+    /// has nowhere to be added by accident: `update` has no
+    /// [`tasks::TaskKind`] variant, and `docs/sync.md` refuses unattended
+    /// replacement of this binary.
+    async fn perform_task(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+        source: SyncSource,
+    ) -> (tasks::TaskOutcome, String) {
+        match task.kind {
+            tasks::TaskKind::Sync => self.perform_sync_task(task, profiles, source).await,
+            // No `source`: a release moves no bytes to or from a remote and
+            // writes no commit, so there is no provenance for one to name. The
+            // parameter stays on this function for the `Sync` arm, where a
+            // commit message keeps the answer forever.
+            tasks::TaskKind::Release => self.perform_release_task(task, profiles).await,
+        }
+    }
+
+    /// One sync pass over the named folder, or over every enabled folder when
+    /// the task is host-wide.
+    ///
+    /// [`Self::sync_once`] is the whole implementation, and that is the point.
+    /// It opens by taking the very reservation [`Self::tick_profile`] takes, so
+    /// NFR-42's "a task never holds a git index concurrently with its host's
+    /// sync pass" is a structural fact about this code rather than a convention
+    /// a reviewer has to trust — within this process, which is what NFR-42 asks
+    /// for; across two hosts the lease is what serializes them.
+    ///
+    /// Idempotent and safely abandonable for the same borrowed reason: a sync
+    /// pass is what the supervisor does every few seconds anyway, everything it
+    /// queues goes through the journal, and `db::recover_running` re-drives at
+    /// startup whatever a killed host left `running`.
+    ///
+    /// A **paused** folder is not synced, by either route.
+    /// [`Self::sync_once`] deliberately ignores `enabled` — it is the door a
+    /// person's explicit request comes through — so the check has to be here, or
+    /// a task would be the one thing on the machine that overrides a pause.
+    async fn perform_sync_task(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+        source: SyncSource,
+    ) -> (tasks::TaskOutcome, String) {
+        let targets: Vec<String> = match &task.profile_id {
+            Some(id) => match profiles.iter().find(|profile| profile.id == *id) {
+                // Named a folder that is gone. A real misconfiguration and the
+                // only one this kind can have, so it is reported as a failure
+                // rather than as a quiet pass — though `db::delete_profile` now
+                // takes a folder's tasks with it, so it should not arise.
+                None => {
+                    return (tasks::TaskOutcome::Failed, format!("no such folder: {id}"));
+                }
+                // A pause is an answer, not an error.
+                Some(profile) if !profile.enabled => {
+                    return (
+                        tasks::TaskOutcome::Deferred,
+                        format!("{} is paused, so nothing was synced", profile.name),
+                    );
+                }
+                Some(profile) => vec![profile.id.clone()],
+            },
+            None => profiles
+                .iter()
+                .filter(|profile| profile.enabled)
+                .map(|profile| profile.id.clone())
+                .collect(),
+        };
+        if targets.is_empty() {
+            return (tasks::TaskOutcome::Ok, "no folders to sync".to_owned());
+        }
+        let mut synced = 0usize;
+        let mut busy = 0usize;
+        let mut deferred = 0usize;
+        let mut failure: Option<String> = None;
+        for id in &targets {
+            match self.sync_once(id, source).await {
+                Ok(_) => synced += 1,
+                Err(SyncError::Busy(_)) => busy += 1,
+                // Not failures, and this tree already decided which are which:
+                // `MediaAbsent` and `LfsUploadPending` are
+                // `Retriability::Deferred`, and AD-48 settles the first by name
+                // — "an unplugged volume is absence, never failure". Recording
+                // them as failures would have a nightly task on an external
+                // drive raise a failure notification every night it is unplugged.
+                Err(SyncError::Cancelled) => deferred += 1,
+                Err(err) if err.retriability() == Retriability::Deferred => {
+                    deferred += 1;
+                }
+                // The first failure is what the record carries, and the pass
+                // continues: one unreachable remote must not hide whether the
+                // other folders were served.
+                Err(err) => {
+                    failure.get_or_insert_with(|| err.to_string());
+                }
+            }
+        }
+        let failed = targets
+            .len()
+            .saturating_sub(synced)
+            .saturating_sub(busy)
+            .saturating_sub(deferred);
+        let detail =
+            format!("{synced} synced, {busy} already syncing, {deferred} waiting, {failed} failed");
+        match failure {
+            Some(reason) => (tasks::TaskOutcome::Failed, format!("{detail}: {reason}")),
+            // Nothing ran, and nothing went wrong: the reservation held, or a
+            // drive is not here. Either way the window is retried rather than
+            // consumed — see [`Self::next_task_window`].
+            None if synced == 0 && deferred > 0 => (tasks::TaskOutcome::Deferred, detail),
+            None if synced == 0 => (tasks::TaskOutcome::Busy, detail),
+            None => (tasks::TaskOutcome::Ok, detail),
+        }
+    }
+
+    /// One release sweep over the named folder, or over every enabled folder
+    /// when the task is host-wide (Story 57.4, FR-349, FR-350).
+    ///
+    /// [`Self::release_expired`] is the whole implementation, and that is the
+    /// point: the sweep gains a **driver** without gaining a second body. Every
+    /// Epic 56 refusal, both AD-131 clocks, the pin, 56.17's per-file deadline,
+    /// the per-path policy and both budgets therefore apply to `tasks run
+    /// release` identically — a task is not a privileged caller.
+    ///
+    /// Target selection mirrors [`Self::perform_sync_task`] exactly, because the
+    /// two kinds answer to one record and a reader comparing them should find no
+    /// difference to explain: a named folder that is gone is
+    /// [`tasks::TaskOutcome::Failed`], a paused one is
+    /// [`tasks::TaskOutcome::Deferred`], and `profile_id: None` means every
+    /// enabled folder. The pause is answered here as well as inside
+    /// [`Self::release_expired`] — which refuses a paused folder before it reads
+    /// a clock — because only here can the record say *which* fact it was.
+    ///
+    /// # Why an absent volume is a deferral and never a failure
+    ///
+    /// [`Self::volume_ready`] is asked **first**, before the sweep, and its
+    /// `Ok(false)` counts as a folder that is not here rather than as something
+    /// wrong: AD-48 settles it by name — *"an unplugged volume is absence, never
+    /// failure"*. A nightly release task on an external drive would otherwise
+    /// raise a failure notification every night the drive is out, which is the
+    /// crying-wolf shape [`tasks::TaskOutcome::Deferred`] exists to prevent. And
+    /// deferring costs nothing: [`Self::next_task_window`] retries a `Deferred`
+    /// run within [`TASK_RETRY_MS`] rather than consuming the window, exactly as
+    /// it does for `Busy`, so the sweep happens in the minute after the drive
+    /// returns instead of tomorrow night.
+    ///
+    /// An `Err` from that same call is the **first failure**, not a deferral: a
+    /// stranger's volume mounted where this folder lives, or a scan that could
+    /// not run at all, is a fact somebody has to resolve rather than a folder
+    /// that is simply away.
+    ///
+    /// # Why this takes the reservation, when the success edge does not have to
+    ///
+    /// [`Self::release_expired`] deletes files, rewrites the index and calls
+    /// `refresh_index_stat`. Its original caller, [`Self::mark_synced`], runs
+    /// **inside** the reservation the sync pass already holds, so NFR-42's "a
+    /// task never holds a git index concurrently with its host's sync pass" was
+    /// structurally true and nobody had to arrange it. This is a second driver
+    /// and it runs outside any pass, so it has to arrange it: `keeper-syncd
+    /// tasks run release` from cron while `keeper-syncd watch` is mid-checkout
+    /// on the same folder would otherwise be two writers on one working tree
+    /// and one index. [`Self::reserve`] is the same gate
+    /// [`Self::tick_profile`] and [`Self::sync_once`] take, and holding it
+    /// across the sweep makes the guarantee structural here too rather than a
+    /// convention a reviewer has to trust.
+    ///
+    /// It is also what makes [`tasks::TaskOutcome::Busy`] reachable for this
+    /// kind, and therefore what makes `tasks run --help`'s promise — exit 4 when
+    /// "the folder was already syncing" — true rather than aspirational.
+    ///
+    /// # The record distinguishes swept from declined
+    ///
+    /// A folder can answer `Ok` without having looked at anything: a zero TTL,
+    /// large-file support off, a faulted folder config, or its own release row
+    /// saying `off`. Counting those as swept made "released 0 paths from 10
+    /// folders" mean either "ten folders had nothing due" or "ten folders
+    /// refused", and the operator who most needs the difference is the one who
+    /// asked for a run and got silence. [`ReleaseSweep::looked`] carries it, and
+    /// a run where **nothing** looked is [`tasks::TaskOutcome::Deferred`]: the
+    /// work did not happen, nothing is wrong, and the window is retried rather
+    /// than consumed.
+    async fn perform_release_task(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+    ) -> (tasks::TaskOutcome, String) {
+        // Borrowed, never cloned: `profiles` outlives this call and a host-wide
+        // task on a machine with many folders would otherwise copy every
+        // profile's strings to learn nothing.
+        let targets: Vec<&SyncProfile> = match &task.profile_id {
+            Some(id) => match profiles.iter().find(|profile| profile.id == *id) {
+                // Named a folder that is gone: the one real misconfiguration
+                // this kind can have, so it is reported as a failure rather than
+                // as a quiet pass — though `db::delete_profile` takes a folder's
+                // tasks with it, so it should not arise.
+                None => {
+                    return (tasks::TaskOutcome::Failed, format!("no such folder: {id}"));
+                }
+                // A pause is an answer, not an error.
+                Some(profile) if !profile.enabled => {
+                    return (
+                        tasks::TaskOutcome::Deferred,
+                        format!("{} is paused, so nothing was released", profile.name),
+                    );
+                }
+                Some(profile) => vec![profile],
+            },
+            None => profiles.iter().filter(|profile| profile.enabled).collect(),
+        };
+        if targets.is_empty() {
+            // Two different facts, and only one of them is a run that worked. A
+            // host with no folders has nothing to sweep and never will until
+            // somebody adds one; a host whose every folder is paused has work
+            // waiting behind a pause, which is the `Deferred` the folder-scoped
+            // branch above already reports for one folder. Collapsing them made
+            // "the sweep can never run here" exit 0, indistinguishable from a
+            // nightly sweep that is working — the exact indistinguishability
+            // `EXIT_DEFERRED` was added to close.
+            return if profiles.is_empty() {
+                (
+                    tasks::TaskOutcome::Ok,
+                    "no folders are configured, so there is nothing to release".to_owned(),
+                )
+            } else {
+                (
+                    tasks::TaskOutcome::Deferred,
+                    "every folder is paused, so nothing was released".to_owned(),
+                )
+            };
+        }
+        let mut swept = 0usize;
+        let mut declined = 0usize;
+        let mut unavailable = 0usize;
+        let mut busy = 0usize;
+        let mut total = ReleaseSweep::default();
+        let mut failure: Option<String> = None;
+        for profile in targets {
+            // The volume first, and before anything opens a repository: a
+            // detached drive is indistinguishable from a mass deletion once you
+            // start reading a tree (AD-48), and this pass deletes.
+            match self.volume_ready(profile) {
+                Ok(true) => {}
+                Ok(false) => {
+                    unavailable += 1;
+                    continue;
+                }
+                Err(err) => {
+                    failure.get_or_insert_with(|| err.to_string());
+                    continue;
+                }
+            }
+            // NFR-42, arranged rather than inherited — see this method's doc.
+            // Held for the whole sweep of this folder and dropped before the
+            // next, so a host-wide run does not hold every folder at once.
+            let Some(_reservation) = self.reserve(&profile.id) else {
+                busy += 1;
+                continue;
+            };
+            let (sweep, error) = match self.release_expired(profile, ReleaseTrigger::Task).await {
+                Ok(sweep) => (sweep, None),
+                // The first failure is what the record carries, and the pass
+                // continues: one unreadable file in one folder must not hide
+                // whether the others were swept. The counters come with it, so a
+                // folder that released three paths and then failed is not
+                // reported as having released none.
+                Err(failed) => (failed.swept, Some(failed.error.to_string())),
+            };
+            if sweep.looked {
+                swept += 1;
+            } else {
+                declined += 1;
+            }
+            total.released += sweep.released;
+            total.reclaimed_bytes = total.reclaimed_bytes.saturating_add(sweep.reclaimed_bytes);
+            if let Some(error) = error {
+                failure.get_or_insert(error);
+            }
+        }
+        let detail = format!(
+            "released {} paths ({} bytes) from {swept} folders, \
+             {declined} declined, {busy} already syncing, {unavailable} unavailable",
+            total.released, total.reclaimed_bytes
+        );
+        match failure {
+            Some(reason) => (tasks::TaskOutcome::Failed, format!("{detail}: {reason}")),
+            // Nothing looked, and nothing went wrong: every folder is away,
+            // busy, or told this sweep not to run. The window is retried rather
+            // than consumed — see [`Self::next_task_window`].
+            None if swept == 0 => (tasks::TaskOutcome::Deferred, detail),
+            None => (tasks::TaskOutcome::Ok, detail),
+        }
+    }
+
+    /// Who holds a lease, as something a reader can act on.
+    ///
+    /// The device id alone will not do: on Linux the daemon and the app share
+    /// one data dir's `sync.db` and therefore one `device` row, so a lease
+    /// naming only the device could not say which of the two processes holds it.
+    /// The process id is what separates them, and it is also the only part a
+    /// person can check against a process list to see whether the holder is
+    /// still alive.
+    fn task_host(&self) -> String {
+        format!("{}#{}", self.device().id, std::process::id())
+    }
+
+    /// Hand back every task lease this process holds.
+    ///
+    /// Called from [`Self::finalize`], which is the supervisor's shutdown path.
+    /// A `systemctl restart` in the middle of a run would otherwise leave the
+    /// lease held by a pid that no longer exists for the whole of
+    /// [`TASK_LEASE_MS`], and the restarted daemon cannot prove that pid is dead
+    /// — on Linux the app shares the device row and may legitimately hold one.
+    /// NFR-42 asks that a SIGTERM be a bounded finalize; this is what bounds it.
+    fn release_task_leases(&self) {
+        let now = self.platform.now_ms();
+        let host = self.task_host();
+        match self.with_db(|conn| db::release_host_leases(conn, &host, now)) {
+            Ok(0) => {}
+            Ok(released) => {
+                tracing::info!(released, host, "handed back this host's task leases");
+            }
+            Err(err) => {
+                // The lease expires on its own, so this costs a delay rather
+                // than a wedge — but it is a real fault and says so.
+                tracing::warn!(error = %err, "cannot hand back this host's task leases");
+            }
+        }
     }
 
     async fn tick_profile(&self, profile: &SyncProfile) -> Result<()> {
@@ -1690,10 +2486,132 @@ impl Engine {
         self.ensure_watcher(profile);
         self.fold_watch_events(profile)?;
 
+        // Before anything reads this folder's tree, because a folder whose
+        // first copy was never made HAS no tree to read (Story 56.15). One
+        // kind is drained and the tick ends: `WorkKind::Checkout` is the only
+        // work such a profile can do, and everything else in a tick — the
+        // scan, `commit_local`, `do_pull`'s clean-tree commit — walks a
+        // repository whose empty index makes every tracked path read as
+        // deleted.
+        //
+        // The journal is deliberately what paces this, not `scan_is_due`. A
+        // profile that has never completed a clone is not idle, so the gate
+        // that exists to decide whether a WALK is worth its cost is the wrong
+        // authority for whether the clone is retried at all; and the unit's
+        // own `reschedule_after` backoff is the engine's existing discipline
+        // for "the remote was not there, try again later" — no second timer.
+        if self.first_checkout_is_unfinished(profile) {
+            self.enqueue_first_checkout(profile)?;
+            return self
+                .drain_kind(profile, WorkKind::CHECKOUT, SyncSource::Watch)
+                .await;
+        }
+
+        // The volume gate's other half, and the same sentence for the same
+        // reason: `Ok(false)` means "skip this profile, nothing is wrong".
+        if !self.remote_within_reach(profile)? {
+            return Ok(());
+        }
+
         let scan = self.scan_due(profile);
         // The supervisor's own pass. Nobody asked for this one — the clock
         // did — so it is the only genuinely `Watch` caller (AD-34-12).
         self.drain_journal(profile, scan, SyncSource::Watch).await
+    }
+
+    /// Whether this profile's first working copy has still not been made
+    /// (Story 56.15).
+    ///
+    /// Two shapes, one meaning:
+    ///
+    /// * **No repository at all.** `.git` is absent, so the clone (or the
+    ///   adoption of an existing folder) has not happened or did not survive.
+    /// * **A checkout that stopped.** `HEAD` holds a tree and the index holds
+    ///   nothing — see [`git::repo::checkout_is_unfinished`] for why git never
+    ///   leaves a repository there, and for what the status walk does with it.
+    ///
+    /// Asked on **every tick of every profile**, so the healthy answer has to
+    /// be nearly free: one `exists()` plus a 12-byte read of the index header
+    /// ([`git::repo::index_entry_count`]). Only a folder that fails that screen
+    /// pays for a repository open.
+    ///
+    /// Not a `Result`. A repository this cannot look at is a condition the
+    /// ordinary legs report properly, with their own words, and answering
+    /// "false" hands it straight to them — where raising here would replace
+    /// every one of those sentences with this one.
+    fn first_checkout_is_unfinished(&self, profile: &SyncProfile) -> bool {
+        let git_dir = profile.local_path.join(".git");
+        if !git_dir.exists() {
+            return true;
+        }
+        if git::repo::index_entry_count(&git_dir) > 0 {
+            return false;
+        }
+        match self.open_repo(profile) {
+            Ok(repo) => git::repo::checkout_is_unfinished(&repo).unwrap_or(false),
+            Err(err) => {
+                tracing::debug!(
+                    profile = profile.name,
+                    error = %err,
+                    "could not tell whether this folder's first copy finished"
+                );
+                false
+            }
+        }
+    }
+
+    /// Queue the one unit such a profile can act on, if it does not already
+    /// own one.
+    ///
+    /// `enqueue_unique` plus [`db::WorkKind::covered_while_running`] is what
+    /// keeps a 16 GB clone from collecting one duplicate row per tick for the
+    /// whole time it runs.
+    fn enqueue_first_checkout(&self, profile: &SyncProfile) -> Result<()> {
+        let now = self.platform.now_ms();
+        self.with_db(|conn| {
+            db::enqueue_unique(conn, &profile.id, &WorkKind::Checkout, now, now).map(drop)
+        })
+    }
+
+    /// Whether this tick may spend the folder's tree on a remote that is not
+    /// answering (Story 56.15, D2).
+    ///
+    /// `Ok(false)` means "skip this profile, nothing is wrong" —
+    /// [`Self::volume_ready`]'s contract, deliberately word for word, because
+    /// this is the same decision about the other half of what a sync needs.
+    ///
+    /// # What this is for
+    ///
+    /// Measured on the owner's machine: an `offline` profile publishing one
+    /// `status walk finished … elapsed_ms=4274 … deleted=155625` line every two
+    /// seconds, for ever. The walk is the single most expensive thing the
+    /// engine does and it was being bought at 0.5 Hz by a folder that could
+    /// not publish a byte.
+    ///
+    /// # Why the queue and not a clock
+    ///
+    /// AD-49 makes `Offline` a state rather than a failure, and the state is
+    /// *sticky*: nothing in the supervisor's tick clears it except work
+    /// succeeding. A gate that read the word alone would therefore be a trap —
+    /// a folder that went offline with an empty queue could never walk again,
+    /// so nothing would ever be enqueued, so nothing would ever succeed, so the
+    /// word would never change.
+    ///
+    /// The journal closes that loop, and it closes it without a second timer.
+    /// `Offline` is only ever written by a transient network failure, and a
+    /// transient failure re-queues its own unit through
+    /// [`Self::reschedule_after`]'s backoff — so **the row that made the
+    /// profile offline is the row that will clear it**, and "a unit is due" is
+    /// exactly "the backoff says try the remote again now". A first clone that
+    /// died on the network is the one case where no such row would exist, and
+    /// [`Self::enqueue_first_checkout`] writes one *above this gate* precisely
+    /// so that it does.
+    fn remote_within_reach(&self, profile: &SyncProfile) -> Result<bool> {
+        if self.state_of(&profile.id) != Some(ProfileState::Offline) {
+            return Ok(true);
+        }
+        let now = self.platform.now_ms();
+        self.with_db(|conn| db::has_ready_unit(conn, &profile.id, now))
     }
 
     /// Whether this profile's tree may be walked on this tick, arming the next
@@ -3455,16 +4373,12 @@ impl Engine {
                     // could see. A folder that has failed this many times in a
                     // row is not idle, and the sentence belongs beside it.
                     self.set_state(&profile.id, ProfileState::NeedsAttention);
-                    if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
-                        snapshot.error = Some(err.to_string());
-                    }
+                    self.set_error(&profile.id, Some(&err.to_string()));
                 }
             }
             Retriability::Permanent => {
                 self.set_state(&profile.id, ProfileState::NeedsAttention);
-                if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
-                    snapshot.error = Some(err.to_string());
-                }
+                self.set_error(&profile.id, Some(&err.to_string()));
                 if err.needs_user_action() {
                     self.warn(&profile.id, &profile.name, err.to_string());
                 }
@@ -3675,6 +4589,7 @@ impl Engine {
         source: SyncSource,
     ) -> Result<()> {
         match kind {
+            WorkKind::Checkout => self.do_checkout(profile).await,
             // The conflict copies are already recorded and warned about;
             // a journaled pull has no caller to hand them back to.
             WorkKind::Pull => {
@@ -3698,6 +4613,92 @@ impl Engine {
             WorkKind::OpenPullRequest { branch } => self.do_open_pr(profile, branch).await,
             WorkKind::Verify => self.verify(&profile.id).await.map(drop),
         }
+    }
+
+    /// Make this folder's working copy exist, and say so plainly when it
+    /// cannot (Story 56.15).
+    ///
+    /// The unit behind [`WorkKind::Checkout`]. Two shapes reach it and it
+    /// handles both with the machinery that already exists:
+    /// [`Self::open_repo`] clones an empty destination, adopts a non-empty one
+    /// and is idempotent once `.git` is there, and
+    /// [`git::repo::restore_missing_checkout`] finishes a checkout that
+    /// stopped, writing only what is missing.
+    ///
+    /// # Why the failure is stated here rather than left to `record_failure`
+    ///
+    /// Because the retriability of the *cause* decides the state word, and for
+    /// the cause that actually happened — the network going away three minutes
+    /// into a 16 GB clone — that word is `Offline`, whose arm records no error
+    /// at all. AD-49 is right about an ordinary folder: offline is a state, not
+    /// a failure, because local git keeps working. It is wrong about this one,
+    /// because there is no local git here: the folder holds nothing, can do
+    /// nothing, and will keep saying "idle, no error" while its owner waits for
+    /// a download that never starts. That is the exact row measured in the
+    /// owner's `sync.db`.
+    ///
+    /// So the fact is written to both surfaces before the error is returned,
+    /// and the error is returned unchanged in kind so
+    /// [`Self::reschedule_after`] still applies the ordinary backoff. The
+    /// `warn` — the sticky banner and the one native toast — is deliberately
+    /// NOT raised here: a blip during a first clone is ordinary, and
+    /// `record_failure`'s existing run-of-failures threshold is what decides a
+    /// folder has stopped rather than stumbled.
+    async fn do_checkout(&self, profile: &SyncProfile) -> Result<()> {
+        match self.finish_first_checkout(profile) {
+            Ok(()) => {
+                // `drain`'s success path calls `clear_warning`, which retires
+                // the sentence on both surfaces. Nothing to do but succeed.
+                Ok(())
+            }
+            Err(cause) => {
+                let stated = match cause {
+                    // Already the right sentence, from the repair itself.
+                    known @ SyncError::CheckoutUnfinished { .. } => known,
+                    other => SyncError::CheckoutUnfinished {
+                        path: profile.local_path.clone(),
+                        detail: format!("keeper could not make it: {other}"),
+                    },
+                };
+                self.set_state(&profile.id, ProfileState::NeedsAttention);
+                self.set_error(&profile.id, Some(&stated.to_string()));
+                Err(stated)
+            }
+        }
+    }
+
+    /// The blocking half of [`Self::do_checkout`].
+    ///
+    /// Split out so the error handling above reads as the one decision it is,
+    /// and so both exits from the repair — "there was nothing to finish" and
+    /// "it could not be finished" — are visible side by side.
+    fn finish_first_checkout(&self, profile: &SyncProfile) -> Result<()> {
+        let repo = self.open_repo(profile)?;
+        if !git::repo::checkout_is_unfinished(&repo)? {
+            // The clone or the adoption above was the whole job.
+            return Ok(());
+        }
+        tracing::warn!(
+            profile = profile.name,
+            "this folder has commits but no index: finishing the checkout that stopped"
+        );
+        let repair = git::repo::restore_missing_checkout(&repo, &self.interrupt)?;
+        if let Some(reason) = repair.unfinished {
+            return Err(SyncError::CheckoutUnfinished {
+                path: profile.local_path.clone(),
+                detail: format!(
+                    "It has commits but an empty index, and keeper could not finish it: \
+                     {reason}. Nothing was deleted and nothing on disk was overwritten."
+                ),
+            });
+        }
+        tracing::info!(
+            profile = profile.name,
+            restored = repair.restored,
+            kept = repair.kept,
+            "finished the interrupted checkout"
+        );
+        Ok(())
     }
 
     /// Record that a pass finished without error.
@@ -3754,11 +4755,22 @@ impl Engine {
                 );
             }
         }
-        if let Err(err) = self.release_expired(profile).await {
+        // The edge Epic 56 rode and the only one it had. The stored release
+        // task's mode may veto this pass (Story 57.4); the swallow below is
+        // unchanged, because a folder whose sweep is switched off is not a
+        // folder whose sync failed.
+        if let Err(failure) = self
+            .release_expired(profile, ReleaseTrigger::SuccessEdge)
+            .await
+        {
+            // The count comes with the error now, and the line says both: a pass
+            // that released three paths and then met an unreadable fourth is not
+            // a pass that "released no expired content".
             tracing::warn!(
                 profile = profile.name,
-                error = %err,
-                "released no expired content this pass",
+                released = failure.swept.released,
+                error = %failure.error,
+                "the release sweep did not finish this pass",
             );
         }
     }
@@ -4918,6 +5930,27 @@ impl Engine {
     /// or enqueues the push.
     fn collect_stable_changes(&self, profile: &SyncProfile) -> Result<git::commit::StagedChange> {
         let repo = self.open_repo(profile)?;
+        // Refused before the walk, not after it (Story 56.15).
+        //
+        // `git::commit::stage_and_commit` is where the refusal is a
+        // GUARANTEE — it sits at the one place a commit is made and no caller
+        // can route around it. This one is here for the cost: a walk of a
+        // repository with an empty index diffs `HEAD`'s whole tree against
+        // nothing and emits one deletion per tracked path, which on the folder
+        // this was written for is 4.3 s and 155 625 emitted items to reach a
+        // conclusion that is already known from two integers. Reaching the
+        // inner guard would mean paying that on every pass while the repair
+        // ran.
+        if git::repo::checkout_is_unfinished(&repo)? {
+            return Err(SyncError::CheckoutUnfinished {
+                path: profile.local_path.clone(),
+                detail: "It has commits but an empty index, so a walk of it would report \
+                         every tracked file as deleted. Nothing was scanned and nothing was \
+                         committed. keeper restores the missing files from the last commit \
+                         on its next pass."
+                    .to_owned(),
+            });
+        }
         // One walk per folder. If a Pending poll is already inside one, this
         // pass has nothing to add by starting a second: it would read the same
         // tree, reach the same verdicts, and halve the throughput of the walk
@@ -6531,6 +7564,78 @@ impl Engine {
     // Public operations
     // -----------------------------------------------------------------------
 
+    /// Save a task, refusing a schedule this build cannot parse (FR-347).
+    ///
+    /// The refusal happens **here**, where the person who typed the expression
+    /// is, rather than at the tick that would otherwise accept it and silently
+    /// never fire. [`db::upsert_task`] carries the whole rule; this is the door
+    /// every host reaches it through.
+    pub fn save_task(&self, task: &db::TaskRow) -> Result<()> {
+        self.with_db(|conn| db::upsert_task(conn, task))
+    }
+
+    /// Every stored task, with the rows this build cannot read listed beside
+    /// them rather than dropped (NFR-43).
+    pub fn tasks(&self) -> Result<db::TaskListing> {
+        self.with_db(db::list_tasks)
+    }
+
+    /// One task's run history, newest first.
+    pub fn task_history(&self, id: &str, limit: usize) -> Result<Vec<db::TaskRunRow>> {
+        self.with_db(|conn| db::task_runs(conn, id, limit))
+    }
+
+    /// Forget a task and everything it recorded.
+    pub fn forget_task(&self, id: &str) -> Result<()> {
+        self.with_db(|conn| db::delete_task(conn, id))
+    }
+
+    /// Run one task now, recording it exactly as a scheduled run is recorded
+    /// (FR-349).
+    ///
+    /// The same code path as the due-gate, which is what makes the owner's *"it
+    /// does not have to be automatic, it can be a script"* true rather than
+    /// approximated: a cron wrapper, a systemd timer and a person at a prompt
+    /// all reach [`Self::claim_and_run`], take the same lease, and leave the
+    /// same row in `task_runs`.
+    ///
+    /// The schedule is deliberately **not** moved: somebody asking for a run now
+    /// is not asking to skip tonight's.
+    ///
+    /// Refuses, by type: [`SyncError::Config`] for a task that does not exist
+    /// and for one that is off or disabled — an "off" that still runs when asked
+    /// is not off — and [`SyncError::Busy`] when a live lease is held, which the
+    /// CLI's exit taxonomy already reads as "somebody else is doing this" rather
+    /// than as a failure.
+    pub async fn run_task_now(&self, id: &str) -> Result<db::TaskRunRow> {
+        let Some(task) = self.with_db(|conn| db::get_task(conn, id))? else {
+            return Err(SyncError::Config(format!("no such task: {id}")));
+        };
+        if !task.enabled || task.mode == tasks::TaskMode::Off {
+            return Err(SyncError::Config(format!(
+                "task {id} is off, so nothing runs it — not even a request"
+            )));
+        }
+        let profiles = self.list_profiles()?;
+        let now = self.platform.now_ms();
+        let offset = self.platform.utc_offset_minutes();
+        let Some(run_id) = self
+            .claim_and_run(&task, &profiles, now, offset, TaskTrigger::Requested)
+            .await?
+        else {
+            return Err(SyncError::Busy(id.to_owned()));
+        };
+        // The run is fetched by its own id, not as "the newest": the other host
+        // sharing this database may have opened one of its own in between, and
+        // handing back its row would report somebody else's work as this call's.
+        self.with_db(|conn| db::task_runs(conn, id, db::TASK_RUNS_CAP))?
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .ok_or_else(|| {
+                SyncError::Journal(format!("task {id} ran, but its run was not recorded"))
+            })
+    }
+
     /// Run one complete sync for a profile, ignoring the schedule.
     pub async fn sync_once(&self, id: &str, source: SyncSource) -> Result<SyncOutcome> {
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, id))? else {
@@ -6694,6 +7799,207 @@ impl Engine {
         Ok(())
     }
 
+    /// Which stored release task, if any, governs this folder's sweep — and in
+    /// what mode (Story 57.4, FR-350).
+    ///
+    /// `None` means **no release task governs this folder**, and that answer is
+    /// Epic 56 unchanged: the success edge sweeps exactly as it ships today. It
+    /// is the answer every `sync.db` in the field gives, because nothing in this
+    /// story creates a row on migration, on open or on first tick.
+    ///
+    /// # Which row wins
+    ///
+    /// A row naming **this profile** beats a host-wide row (`profile_id IS
+    /// NULL`): the narrower statement is the more specific instruction, the same
+    /// precedence the committed folder config layer takes over the profile
+    /// record. Precedence is deliberately *not* a second safety rule — a folder
+    /// row saying `scheduled` beats a host-wide `off`, because otherwise a
+    /// host-wide default could not be overridden for one folder, which is the
+    /// only reason to have two tiers.
+    ///
+    /// Within one tier the **least permissive** mode wins — `Off` before
+    /// `Manual` before `Scheduled` — because the safe reading of two rows
+    /// disagreeing about a deletion is the one that deletes less. Two rows in
+    /// one tier is a muddle a person made, and the answer to a muddle about
+    /// deleting content is not to pick the row that deletes. The alternative,
+    /// "whichever sorted first by id", would make the answer depend on a name.
+    ///
+    /// `enabled == false` reads as [`tasks::TaskMode::Off`] rather than as
+    /// *absent*: a row that is not live must not leave a knob that does nothing.
+    /// Read as absent, disabling a `manual` release task would hand the folder
+    /// straight back to the hourly success-edge sweep — the opposite of what
+    /// switching a task off means to whoever switched it off.
+    ///
+    /// # A row this build cannot read does not govern
+    ///
+    /// NFR-43 already skips it: such a row never appears in
+    /// [`db::TaskListing::tasks`], so this method never sees it and the folder
+    /// falls back to `None`. **That fallback is today's behaviour, not a new
+    /// one** — the folder keeps sweeping as Epic 56 ships it. Stated explicitly
+    /// because the other reading is superficially the safer one and is not: if
+    /// an unreadable row disabled the sweep, one hand-written or newer-keeper
+    /// row could silently stop housekeeping on a whole host, with nothing
+    /// anywhere saying so.
+    ///
+    /// # A table this pass could not read declines the pass
+    ///
+    /// That is the opposite answer from an unreadable *row*, and the two really
+    /// are different questions. An unreadable row is a row somebody deliberately
+    /// wrote that this build cannot parse, and NFR-43 settles it: skip it, do
+    /// not let it brick the host. A [`db::list_tasks`] **error** — `SQLITE_BUSY`
+    /// from the other host holding a write lock, a `sync.db` briefly unreadable
+    /// — means this pass does not know whether an operator switched the sweep
+    /// off. The honest answer to "may I delete content" when the governing
+    /// instruction cannot be read is no, and it costs nothing: the next
+    /// successful sync sweeps. So this returns a `Result` and
+    /// [`Self::release_permits`] declines on `Err`, rather than letting the
+    /// failure fall into the `None` arm — where the pass would delete content a
+    /// stored `off` row forbids, on exactly the machine where two hosts contend
+    /// for one database.
+    fn release_governance(&self, profile_id: &str) -> Result<Option<tasks::TaskMode>> {
+        let listing = self.with_db(db::list_tasks)?;
+        // Least permissive wins, so the fold is a `min` over an order
+        // [`tasks::TaskMode`] deliberately does not derive: its three variants
+        // are three answers rather than a scale, and an `Ord` on the type would
+        // invite some other caller to read a ranking into them. The rank is
+        // spelled here, where the claim being made with it is visible.
+        let rank = |mode: tasks::TaskMode| match mode {
+            tasks::TaskMode::Off => 0u8,
+            tasks::TaskMode::Manual => 1,
+            tasks::TaskMode::Scheduled => 2,
+        };
+        let mut mine: Option<tasks::TaskMode> = None;
+        let mut host_wide: Option<tasks::TaskMode> = None;
+        for task in &listing.tasks {
+            if task.kind != tasks::TaskKind::Release {
+                continue;
+            }
+            // A row that is not live is a knob set to off, not a knob that is
+            // absent. See this method's doc.
+            let mode = if task.enabled {
+                task.mode
+            } else {
+                tasks::TaskMode::Off
+            };
+            let tier = match task.profile_id.as_deref() {
+                Some(id) if id == profile_id => &mut mine,
+                // Another folder's decision is about another folder. Folded in
+                // here it would read as host-wide and switch this one off.
+                Some(_) => continue,
+                None => &mut host_wide,
+            };
+            *tier = Some(match *tier {
+                Some(existing) if rank(existing) <= rank(mode) => existing,
+                _ => mode,
+            });
+        }
+        // The narrower statement first.
+        Ok(mine.or(host_wide))
+    }
+
+    /// Whether a release pass may proceed on this folder, given who is asking
+    /// (Story 57.4, FR-350).
+    ///
+    /// The whole table, exhaustive and with no `_` arm, so a fourth mode or a
+    /// third trigger added later has to state what it means here rather than
+    /// inherit a deletion:
+    ///
+    /// * `(None, _)` — no release task governs this folder: **Epic 56,
+    ///   unchanged**. This is the arm an un-migrated `sync.db` takes, and it is
+    ///   the whole reason upgrading into this story changes nothing.
+    /// * `(Some(Off), _)` — off is off both ways. [`Self::run_task_now`] already
+    ///   refuses an off or disabled task by name, so in practice only the
+    ///   success edge reaches this arm; it is written for both triggers because
+    ///   an "off" that answered differently depending on who asked would not be
+    ///   off.
+    /// * `(Some(Manual), ReleaseTrigger::SuccessEdge)` — the owner's ask,
+    ///   exactly: *deletion does not have to be automatic, it can be a script
+    ///   run at the right time*. The sweep stops riding the sync.
+    /// * `(Some(Manual), ReleaseTrigger::Task)` — and when it is called, it
+    ///   runs.
+    /// * `(Some(Scheduled), _)` — the schedule drives it **and** the success
+    ///   edge keeps working. A `scheduled` release task adds a driver; it does
+    ///   not take the existing one away, because somebody who put the sweep on a
+    ///   schedule did not thereby ask for less housekeeping than they had.
+    ///
+    /// `(None, ReleaseTrigger::Task)` is unreachable in practice — a running
+    /// release task is itself a stored release row, so it cannot find `None` for
+    /// a folder it targets — and `true` is still the right answer for the one
+    /// race that reaches it, a host-wide row forgotten between the claim and the
+    /// sweep. The run was authorized when it was claimed, and it has already
+    /// been through [`Self::run_task_now`]'s own off/disabled refusal; treating
+    /// a row that no longer exists as a veto would refuse work nobody withdrew.
+    ///
+    /// # A refusal CLEARS the folder's look window, and that is not tidiness
+    ///
+    /// Being placed above [`Self::release_is_due`] stops a refused folder from
+    /// *arming* a window, which is only half of what the placement claims.
+    /// Without the `remove` below, a folder that had been sweeping normally
+    /// keeps whatever window was already armed while it is switched off — and
+    /// the entry does not expire, it just sits there — so switching the task
+    /// back to `scheduled` hours later meets an open window and deletes on the
+    /// very next sync, with none of the [`RELEASE_LOOK_EVERY_MS`] grace. That is
+    /// exactly the failure this placement exists to prevent, and it is the same
+    /// one [`Self::release_is_due`]'s zero-TTL arm already `remove`s an entry to
+    /// avoid. Turning a knob back on must not delete immediately.
+    fn release_permits(&self, profile: &SyncProfile, trigger: ReleaseTrigger) -> bool {
+        let governance = match self.release_governance(&profile.id) {
+            Ok(governance) => governance,
+            // The table could not be read, so this pass does not know whether
+            // somebody switched the sweep off. See [`Self::release_governance`]:
+            // the honest answer about a deletion is no.
+            Err(err) => {
+                tracing::debug!(
+                    profile = profile.name,
+                    error = %err,
+                    "cannot read this host's tasks, so the release sweep declines \
+                     this pass rather than guess that nobody switched it off",
+                );
+                self.forget_release_window(&profile.id);
+                return false;
+            }
+        };
+        let permitted = match (governance, trigger) {
+            (None, _) => true,
+            (Some(tasks::TaskMode::Off), _) => false,
+            (Some(tasks::TaskMode::Manual), ReleaseTrigger::SuccessEdge) => false,
+            (Some(tasks::TaskMode::Manual), ReleaseTrigger::Task) => true,
+            (Some(tasks::TaskMode::Scheduled), _) => true,
+        };
+        if !permitted {
+            self.forget_release_window(&profile.id);
+        }
+        permitted
+    }
+
+    /// Forget when this folder's release candidates were last looked at.
+    ///
+    /// One line, named, because two callers reach for it and both are about the
+    /// same promise: a folder whose sweep is not permitted must arm no window
+    /// **and keep none**, so that permitting it again starts a fresh
+    /// [`RELEASE_LOOK_EVERY_MS`] rather than firing on the next sync. The idiom
+    /// is [`Self::release_is_due`]'s own zero-TTL `remove`, and the test there
+    /// asserts the map is empty rather than only that the answer was `false`,
+    /// for the reason that only the first of those survives re-enabling.
+    fn forget_release_window(&self, profile_id: &str) {
+        Self::lock(&self.next_release_ms).remove(profile_id);
+    }
+
+    /// Record that this folder's release candidates have just been looked at.
+    ///
+    /// [`ReleaseTrigger::Task`] skips [`Self::release_is_due`] — see
+    /// [`Self::release_expired`] — and therefore never takes the side effect
+    /// that gate has of stamping the next look. Without this, a nightly task
+    /// that has just drained a folder's candidate set leaves the map saying the
+    /// folder has not been looked at, and the first successful sync inside the
+    /// hour repeats the whole pass — a `materialized_rows` read and up to
+    /// [`RELEASE_BUDGET_OBJECTS`] repository opens — over a ledger the task
+    /// already drained. A look happened; the map should say so.
+    fn note_release_look(&self, profile_id: &str) {
+        let armed = self.platform.now_ms().saturating_add(RELEASE_LOOK_EVERY_MS);
+        Self::lock(&self.next_release_ms).insert(profile_id.to_owned(), armed);
+    }
+
     /// Let go of content whose release clock has run out (Story 56.5, FR-341,
     /// FR-342, AD-126, AD-131).
     ///
@@ -6815,13 +8121,68 @@ impl Engine {
     /// `OpenUnknown` — meant paths 33..n were never attempted once. Both
     /// [`RELEASE_BUDGET_OBJECTS`]' own doc and `docs/sync.md` promise the next
     /// pass takes the remainder; the rotation is what makes that true.
-    async fn release_expired(&self, profile: &SyncProfile) -> Result<()> {
+    ///
+    /// # Who may drive it, and who may veto it (Story 57.4)
+    ///
+    /// [`Self::release_permits`] is asked **immediately above the due gate**,
+    /// and the placement is the same one the `enabled` and zero-TTL checks
+    /// already occupy for the same reason: an `off` or `manual` folder must arm
+    /// no window, and must keep none either — `release_permits` `remove`s an
+    /// entry that is already there, which is what makes the rest of this
+    /// sentence true. Below the due gate, switching a folder to `scheduled` an
+    /// hour later would find a window already open and delete on the very next
+    /// sync — exactly the failure [`Self::release_is_due`]'s own doc records for
+    /// a zero TTL, and the opposite of what turning a knob on should mean.
+    ///
+    /// The placement costs one `tasks` read per pass that gets this far, which
+    /// is one small indexed `SELECT` under the engine's connection mutex on the
+    /// tail of a git sync pass that has just done network and disk I/O. The
+    /// cheaper ordering — the hash-lookup due gate first — was rejected because
+    /// [`Self::release_is_due`] *arms as a side effect of being asked*, so a
+    /// vetoed folder's window would advance while its sweep was switched off.
+    ///
+    /// A [`ReleaseTrigger::Task`] pass **skips the due gate entirely**, both of
+    /// the rules it carries, and the second half of that is worth saying out
+    /// loud. The *look interval* is skipped because a schedule replaces it:
+    /// honouring both would make the first scheduled run a silent no-op — the
+    /// invisible-failure shape Epic 57 exists to close — and a nightly task
+    /// would release only on whichever night its 03:00 happened to land more
+    /// than an hour after the last successful sync had looked. The *first-sight
+    /// arm-and-decline grace* is skipped because it **cannot** be honoured here:
+    /// `next_release_ms` is an in-process map, and `keeper-syncd tasks run
+    /// release` is a fresh process every time cron starts one, so a task that
+    /// respected first sight would arm, decline, exit, and release **never**.
+    /// A grace keyed to process lifetime cannot gate a scheduled deletion
+    /// without making the schedule a lie. What is lost is defence in depth on a
+    /// folder nothing has swept yet; what is kept is every refusal that actually
+    /// decides whether a byte may go — the five, both AD-131 clocks, the pin,
+    /// the per-path policy and both budgets.
+    ///
+    /// A task pass does [`Self::note_release_look`] once it is past the gates,
+    /// so the map still records that a look happened and the next sync inside
+    /// the hour does not repeat the pass the task just made.
+    ///
+    /// # What it answers
+    ///
+    /// A [`ReleaseSweep`] rather than `Ok(())`, because
+    /// [`Self::perform_release_task`] has to be able to say what the pass did
+    /// and `Ok(())` cannot. Every refusal above answers
+    /// `ReleaseSweep::default()` — nothing looked at, nothing released, which is
+    /// the truth about a pass that declined. The error path carries the same
+    /// counters in a [`SweepFailure`], because a pass that released three paths
+    /// and then hit an unreadable fourth did both things and the record has to
+    /// say both.
+    async fn release_expired(
+        &self,
+        profile: &SyncProfile,
+        trigger: ReleaseTrigger,
+    ) -> std::result::Result<ReleaseSweep, SweepFailure> {
         // The pause, first and before anything reads a clock. See this method's
         // doc: `sync_once` does not check `enabled`, so this is the only thing
         // standing between a paused folder and a deletion — and it is ahead of
         // the due gate so such a folder arms no window either.
         if !profile.enabled {
-            return Ok(());
+            return Ok(ReleaseSweep::default());
         }
         // Fail closed on a folder whose own config layer will not parse. A `0`
         // in a committed `.keeper/keeper.toml` means "never release my
@@ -6834,22 +8195,39 @@ impl Engine {
                 "release sweep declines a folder whose own config layer is faulted: \
                  `releaseTtlMs` may be set there and could not be read",
             );
-            return Ok(());
+            return Ok(ReleaseSweep::default());
         }
         // Before the clock: a zero TTL must not even arm a window. See
         // `release_is_due`, which repeats the check because it is the gate's own
         // invariant and not this caller's courtesy.
         let Some(ttl_ms) = profile.effective_release_ttl_ms() else {
-            return Ok(());
+            return Ok(ReleaseSweep::default());
         };
         // The mode alone, with no I/O at all, for the one mode that can never
         // release: a folder with large-file support off neither compiles a
         // policy nor arms a window.
         if profile.lfs_mode == LfsMode::Disabled {
-            return Ok(());
+            return Ok(ReleaseSweep::default());
         }
-        if !self.release_is_due(profile) {
-            return Ok(());
+        // Above the due gate, so an `off` or `manual` folder arms no window and
+        // keeps none. See this method's doc: below it, switching a folder to
+        // `scheduled` an hour later would find a window already open and delete
+        // on the very next sync.
+        if !self.release_permits(profile, trigger) {
+            return Ok(ReleaseSweep::default());
+        }
+        // A task's schedule REPLACES the whole due gate — the look interval AND
+        // the first-sight grace, which is not honourable from a one-shot process
+        // at all. See this method's doc.
+        if trigger == ReleaseTrigger::SuccessEdge && !self.release_is_due(profile) {
+            return Ok(ReleaseSweep::default());
+        }
+        if trigger == ReleaseTrigger::Task {
+            // The gate above stamps the next look as a side effect of being
+            // asked, and a task pass never asks it. Recording the look here is
+            // what stops the first sync inside the hour from repeating the pass
+            // this task is about to make.
+            self.note_release_look(&profile.id);
         }
         // The same gate the request door runs, so a mode that refuses one
         // refuses the other — but swallowed here rather than propagated. A
@@ -6881,12 +8259,23 @@ impl Engine {
                     reason = %err,
                     "release sweep has nothing to do in this folder",
                 );
-                return Ok(());
+                return Ok(ReleaseSweep::default());
             }
         };
 
         let now = self.platform.now_ms();
-        let rows = self.with_db(|conn| db::materialized_rows(conn, &profile.id))?;
+        // Past every gate: this folder really was looked at, whatever the
+        // candidate set turns out to hold. See [`ReleaseSweep::looked`].
+        let looked = ReleaseSweep {
+            looked: true,
+            ..ReleaseSweep::default()
+        };
+        let rows = self
+            .with_db(|conn| db::materialized_rows(conn, &profile.id))
+            .map_err(|error| SweepFailure {
+                swept: looked,
+                error,
+            })?;
         let candidates: Vec<&db::MaterializedRow> = rows
             .iter()
             .filter(|row| release_due_at(row, ttl_ms).is_some_and(|due| now >= due))
@@ -6920,7 +8309,9 @@ impl Engine {
             })
             .collect();
         if candidates.is_empty() {
-            return Ok(());
+            // Looked, and there was nothing due. Distinct from every gate above,
+            // which declined before looking at all.
+            return Ok(looked);
         }
 
         // Rotate the window, mirroring `repair_cursor`/`REPAIR_WINDOW`: take
@@ -7060,13 +8451,24 @@ impl Engine {
                 "released content whose retention window had expired",
             );
         }
+        // The counters go with the error rather than being dropped by it: a pass
+        // that released three paths and then met an unreadable fourth did both
+        // things, and reporting only the second made `task_runs.detail` say
+        // "released 0 paths" about a run that deleted content.
+        let swept = ReleaseSweep {
+            looked: true,
+            released,
+            reclaimed_bytes: reclaimed,
+        };
         // `mark_synced` swallows this into one `warn!` line and the sync still
         // succeeds; every candidate after the failing one has already had its
         // attempt.
-        if let Some(err) = first_error {
-            return Err(err);
+        if let Some(error) = first_error {
+            return Err(SweepFailure { swept, error });
         }
-        Ok(())
+        // The two counters the `info!` line above already had in hand, handed
+        // to the caller instead of only logged: see this method's doc.
+        Ok(swept)
     }
 
     /// Forget everything this profile remembers about its own tree and look again.
@@ -7576,6 +8978,15 @@ impl Engine {
     /// its next tick, and which must not block a UI thread on a four-gigabyte
     /// transfer.
     ///
+    /// # `keep_for` is how long the person wants the file, not a policy
+    ///
+    /// [`lfs::hydrate::KeepFor::Unspecified`] is what every caller that
+    /// predates this story means and what they all keep getting: no deadline is
+    /// written, no standing one is disturbed, and the path is governed by the
+    /// folder's own `releaseTtlMs` window exactly as before.
+    /// [`lfs::hydrate::KeepFor::Ms`] is resolved **once** here against the
+    /// injected clock — see [`Self::release_instruction`].
+    ///
     /// Blocking, like every other repository caller: a `gix::Repository` is
     /// neither `Send` nor cheap to hold, so each open is scoped to a block and
     /// never spans an await point.
@@ -7583,14 +8994,43 @@ impl Engine {
         &self,
         id: &str,
         subpath: &str,
+        keep_for: lfs::hydrate::KeepFor,
     ) -> Result<lfs::hydrate::Materialization> {
         let (profile, rela, path) = self.materialize_request(id, subpath)?;
         let _reservation = self
             .reserve(&profile.id)
             .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        let instruction = self.release_instruction(keep_for);
         // Queueing, always: this door's whole contract is that the supervisor
         // delivers what it did not find here.
-        self.materialize_held(&profile, &rela, path, WhenAbsent::Queue)
+        self.materialize_held(&profile, &rela, path, WhenAbsent::Queue, instruction)
+    }
+
+    /// [`lfs::hydrate::KeepFor`] with the clock already read: what this request
+    /// asks the ledger to record, if anything (Story 56.17).
+    ///
+    /// **Resolved at the door and passed down**, so the two calls
+    /// [`Self::materialize_entry_now`] makes to [`Self::materialize_held`] —
+    /// one to queue, one to observe what the drain achieved — record the same
+    /// deadline rather than a second one however long the transfer took. A
+    /// ledger holding a duration instead of an instant would be stale the
+    /// moment the row sat still, and [`release_due_at`] compares against a
+    /// clock.
+    ///
+    /// Saturating rather than wrapping, for [`db::note_arrival`]'s reason: a
+    /// duration so large it overflows the clock means "essentially never", and
+    /// wrapping it negative would mean "immediately" — the one direction that
+    /// deletes something.
+    fn release_instruction(&self, keep_for: lfs::hydrate::KeepFor) -> ReleaseInstruction {
+        match keep_for {
+            lfs::hydrate::KeepFor::Unspecified => ReleaseInstruction::Leave,
+            lfs::hydrate::KeepFor::Indefinitely => ReleaseInstruction::Clear,
+            lfs::hydrate::KeepFor::Ms(ms) => ReleaseInstruction::At(
+                self.platform
+                    .now_ms()
+                    .saturating_add(i64::try_from(ms).unwrap_or(i64::MAX)),
+            ),
+        }
     }
 
     /// Everything a materialize request settles **before** it needs the
@@ -7684,12 +9124,27 @@ impl Engine {
     ///
     /// `rela` and `path` are [`Self::materialize_request`]'s two spellings of
     /// the same path; `path` is consumed because every answer carries it.
+    ///
+    /// `keep_until` is [`Self::release_instruction`]'s already-resolved answer,
+    /// recorded **before the three arms diverge** (Story 56.17). All three are
+    /// a person naming a time for this path: the content is already here, it
+    /// is published from the store here and now, or a transfer is queued and
+    /// the deadline has to be waiting when the bytes land. Writing it once,
+    /// above the split, is also what keeps the second call
+    /// [`Self::materialize_entry_now`] makes from meaning anything different
+    /// from the first.
+    ///
+    /// It is written **after** the pointer is resolved and the cone is
+    /// checked, and that is deliberate: a deadline recorded for a path this
+    /// folder does not track would be a ledger row nothing will ever consult —
+    /// the phantom [`db::set_pinned`]'s own doc records the cost of.
     fn materialize_held(
         &self,
         profile: &SyncProfile,
         rela: &Path,
         path: String,
         absent: WhenAbsent,
+        keep_until: ReleaseInstruction,
     ) -> Result<lfs::hydrate::Materialization> {
         use lfs::hydrate::{ContentRefusal, Materialization, MaterializeOutcome, Plan};
 
@@ -7723,6 +9178,33 @@ impl Engine {
         // content the profile exists to keep away (Story 27.2).
         if !SparseCone::new(&profile.subpaths).includes(rela) {
             return Err(SyncError::Refused(ContentRefusal::OutsideSubpaths { path }));
+        }
+
+        // The person's own answer to "and for how long?", recorded before the
+        // three arms below diverge (Story 56.17). All three are somebody naming
+        // a time for this path: the content is already here, it is published
+        // from the store here and now, or a transfer is queued and the deadline
+        // has to be waiting when the bytes land.
+        //
+        // Propagated rather than swallowed, unlike the best-effort memos
+        // further down: nothing has been published or queued yet, so a ledger
+        // that could not take the instruction fails the request whole instead
+        // of delivering content on a schedule nobody asked for.
+        match keep_until {
+            // No statement about retention, so no statement is written — which
+            // is what keeps every pre-56.17 caller, the copy planner included,
+            // exactly as it was.
+            ReleaseInstruction::Leave => {}
+            ReleaseInstruction::Clear => {
+                let now = self.platform.now_ms();
+                self.with_db(|conn| db::set_release_at(conn, &profile.id, &path, None, now))?;
+            }
+            ReleaseInstruction::At(at_ms) => {
+                let now = self.platform.now_ms();
+                self.with_db(|conn| {
+                    db::set_release_at(conn, &profile.id, &path, Some(at_ms), now)
+                })?;
+            }
         }
 
         let smudge = match lfs::hydrate::plan(&profile.local_path, rela, &indexed)? {
@@ -8007,11 +9489,17 @@ impl Engine {
     /// unplugged mid-transfer would otherwise be reported as
     /// `ContentRefusal::NotTracked` — "your file is not tracked by git" —
     /// rather than as the absence AD-48 requires.
+    ///
+    /// `keep_for` is [`Self::materialize_entry`]'s, resolved to an instant
+    /// **once** before the first pass so the observing pass records the same
+    /// deadline rather than one moved forward by however long the transfer
+    /// took (Story 56.17).
     pub async fn materialize_entry_now(
         &self,
         id: &str,
         subpath: &str,
         source: SyncSource,
+        keep_for: lfs::hydrate::KeepFor,
     ) -> Result<lfs::hydrate::Materialization> {
         use lfs::hydrate::MaterializeOutcome;
 
@@ -8019,8 +9507,10 @@ impl Engine {
         let _reservation = self
             .reserve(&profile.id)
             .ok_or_else(|| SyncError::Busy(profile.name.clone()))?;
+        let keep_until = self.release_instruction(keep_for);
 
-        let queued = self.materialize_held(&profile, &rela, path.clone(), WhenAbsent::Queue)?;
+        let queued =
+            self.materialize_held(&profile, &rela, path.clone(), WhenAbsent::Queue, keep_until)?;
         let (MaterializeOutcome::Queued, Some(unit)) = (queued.outcome, queued.unit_id) else {
             return Ok(queued);
         };
@@ -8064,7 +9554,11 @@ impl Engine {
         if !self.volume_ready(&profile)? {
             return Err(SyncError::MediaAbsent);
         }
-        let settled = self.materialize_held(&profile, &rela, path, WhenAbsent::Report)?;
+        // The same instant, not a fresh one: `keep_until` was resolved before
+        // the drain, so a two-hour ask is two hours from when it was asked
+        // rather than two hours from when the bytes happened to arrive.
+        let settled =
+            self.materialize_held(&profile, &rela, path, WhenAbsent::Report, keep_until)?;
         if settled.outcome == MaterializeOutcome::Queued {
             tracing::warn!(
                 profile = profile.name,
@@ -10126,7 +11620,7 @@ fn release_path_gate(
 }
 
 /// The instant this row becomes releasable, or `None` for *never* (Story 56.5,
-/// FR-341, AD-131).
+/// FR-341, AD-131; Story 56.17).
 ///
 /// A free function with no `self`, no I/O and no clock, because this is where
 /// the whole feature's safety lives: the sweep reads rows, asks this, and
@@ -10149,6 +11643,24 @@ fn release_path_gate(
 /// `at_ms`: that column is `NOT NULL` and is a real instant the content was
 /// here, so a folder whose rows predate this story is not inert.
 ///
+/// **`row.release_at_ms` replaces the folder's window, in both directions**
+/// (Story 56.17). It is the absolute instant somebody named for this one path
+/// — `keeper-syncd materialize --for 2h`, or the Files row's own choice — and
+/// a chosen hour inside a day-long window goes twenty-three hours sooner while
+/// a chosen week stays six days longer. A replacement and never a `min` or a
+/// `max`: the person said how long they want the file, and a folder-wide knob
+/// they may not even know about must not quietly overrule them either way.
+///
+/// **It is read AFTER the provenance branch, and that ordering is the whole
+/// safety of this story.** The `?` above has already run by the time a chosen
+/// deadline is looked at, so a locally authored path the remote has never been
+/// observed holding is still on no clock at any age — asking for such a file
+/// "for an hour" records the wish and changes nothing about its eligibility.
+/// A deadline read first would turn a duration into a way past FR-341, which
+/// is the one barrier standing between the sweep and bytes that exist on
+/// exactly one machine. Reading it below the pin's early return says the same
+/// thing about the other floor.
+///
 /// `pub` rather than `pub(crate)` because AC 2 asks for the candidate set to be
 /// asserted *as a set*, over the rows a real repository and a real sync
 /// actually produced — and `tests/release_sweep.rs` cannot do that without
@@ -10163,7 +11675,10 @@ pub fn release_due_at(row: &db::MaterializedRow, ttl_ms: u64) -> Option<i64> {
     } else {
         row.last_used_ms.unwrap_or(row.at_ms)
     };
-    Some(since.saturating_add(ttl_ms as i64))
+    Some(
+        row.release_at_ms
+            .unwrap_or_else(|| since.saturating_add(ttl_ms as i64)),
+    )
 }
 
 /// Why a materialized row will or will not be released, in the shape a surface
@@ -10202,8 +11717,23 @@ pub fn release_due_at(row: &db::MaterializedRow, ttl_ms: u64) -> Option<i64> {
 /// meaning a surface acts on: a request will be refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseSchedule {
-    /// Releases no earlier than this absolute epoch-ms instant.
+    /// Releases no earlier than this absolute epoch-ms instant, off the
+    /// folder's own `releaseTtlMs` window.
     Due { at_ms: i64 },
+    /// Releases no earlier than this absolute epoch-ms instant, because
+    /// somebody named it for **this path** (Story 56.17).
+    ///
+    /// The same instant, drawn by the same cell through the same countdown —
+    /// [`Self::instant_or_words`] answers `Ok` for both, so nothing downstream
+    /// branches on which of the two it is. What differs is the sentence, and
+    /// that is the whole reason this is a variant rather than a narrowing of
+    /// [`Self::Due`]: [`Self::Due`]'s sentence describes a folder-wide window
+    /// the person may never have heard of, and repeating it over a file they
+    /// personally asked to keep for two hours would attribute their own
+    /// instruction to a setting. This enum's five wordy variants already exist
+    /// because each is a different sentence to the person who asked; a sixth
+    /// instant is the same rule applied to a row that does have a clock.
+    DueByRequest { at_ms: i64 },
     /// The path is pinned, so keeper keeps its content until the pin is
     /// lifted. The one reason that outranks every other, and the only one the
     /// person holding it can undo from the row itself.
@@ -10266,7 +11796,10 @@ impl ReleaseSchedule {
     /// variant is a compile error in exactly one place, here.
     fn instant_or_words(&self) -> std::result::Result<i64, &'static str> {
         match self {
-            Self::Due { at_ms } => Ok(*at_ms),
+            // Two instants, one wire shape: whose clock it is changes the
+            // sentence and nothing else, so no surface has to know which of
+            // the two it is drawing. See [`Self::DueByRequest`].
+            Self::Due { at_ms } | Self::DueByRequest { at_ms } => Ok(*at_ms),
             Self::Pinned => Err("Pinned"),
             Self::Unconfirmed => Err("Not sent"),
             // "Manual" is a releasable row and "Kept" is a refused one; the
@@ -10280,7 +11813,7 @@ impl ReleaseSchedule {
     }
 
     /// The absolute instant a surface counts down to — `Some` exactly for
-    /// [`Self::Due`].
+    /// [`Self::Due`] and [`Self::DueByRequest`].
     ///
     /// This and [`Self::hold`] are the mapping onto the wire, and they are two
     /// complementary `Option`s rather than one enum because the consumer is a
@@ -10300,7 +11833,7 @@ impl ReleaseSchedule {
     }
 
     /// The one or two words a surface draws when there is no instant — `None`
-    /// exactly for [`Self::Due`].
+    /// exactly for [`Self::Due`] and [`Self::DueByRequest`].
     ///
     /// Short because it stands where a figure would stand, in a cell sized for
     /// `23 hr`; the whole reason is [`Self::sentence`]'s job. "Not sent" rather
@@ -10328,7 +11861,7 @@ impl ReleaseSchedule {
 
     /// The sentence, written for the person who asked. Always present.
     ///
-    /// Present for [`Self::Due`] too, and that one is load-bearing: the sweep
+    /// Present for the two instants too, and that is load-bearing: the sweep
     /// runs on the first successful sync after an hourly due-gate and is
     /// budgeted to [`RELEASE_BUDGET_OBJECTS`] objects a pass, so a countdown
     /// reaching zero means *eligible*, never *released*. A cell that let the
@@ -10344,6 +11877,14 @@ impl ReleaseSchedule {
             Self::Due { .. } => {
                 "keeper lets this content go on the first sync after the time runs out; \
                  the copy stays here until then"
+            }
+            // Named for this one path, so the sentence says so: the person is
+            // owed the fact that this is THEIR instruction and that it beats
+            // the folder's own interval, and it carries `Due`'s caveat because
+            // the sweep it waits on is the same one.
+            Self::DueByRequest { .. } => {
+                "You asked keeper to keep this content for a set time; it goes on the first \
+                 sync after that runs out, whatever this folder's own release interval says"
             }
             Self::Pinned => {
                 "This path is pinned, so keeper keeps its content on this computer until \
@@ -10435,13 +11976,27 @@ pub fn release_schedule(
         LfsMode::Disabled => return ReleaseSchedule::LfsOff,
     }
     let Some(ttl_ms) = ttl_ms else {
+        // Story 56.17 does NOT reach past this: a folder whose automatic
+        // release is switched off has no clock at all, so a chosen deadline has
+        // no window to override and nothing would ever fire it — the sweep
+        // returns before it reads a clock and its gate arms no window. The
+        // instruction stays recorded and starts being honoured the moment the
+        // folder's interval is switched on; until then "Manual" is the true
+        // answer, and it is the word that keeps the row's Release control.
         return ReleaseSchedule::Indefinite;
     };
     match release_due_at(row, ttl_ms) {
+        // Whose clock it is (Story 56.17). `release_due_at` has already
+        // decided the instant; this only names where it came from, so the two
+        // can never disagree about the number and the sentence can be honest
+        // about the instruction.
+        Some(at_ms) if row.release_at_ms.is_some() => ReleaseSchedule::DueByRequest { at_ms },
         Some(at_ms) => ReleaseSchedule::Due { at_ms },
         // `release_due_at` answers `None` for exactly two rows: a pinned one,
         // refused above, and FR-341's locally-authored row the remote has never
-        // been observed holding. So this arm is that row and only that row.
+        // been observed holding. So this arm is that row and only that row —
+        // and a chosen deadline does not move it, because the provenance branch
+        // runs above the deadline inside that function.
         None => ReleaseSchedule::Unconfirmed,
     }
 }
@@ -10591,7 +12146,10 @@ impl crate::copy::ContentSource for Engine {
             }
         }
 
-        match self.materialize_entry(&profile.id, &subpath)?.outcome {
+        match self
+            .materialize_entry(&profile.id, &subpath, lfs::hydrate::KeepFor::Unspecified)?
+            .outcome
+        {
             MaterializeOutcome::Materialized | MaterializeOutcome::AlreadyMaterialized => Ok(()),
             // Belt and braces for the check above: a download queued between
             // the two means the object is not on this machine, a copy cannot
@@ -10748,6 +12306,1160 @@ mod tests {
             "https://git.invalid/x/y.git",
         )
     }
+
+    /// A task fixture. `profile_id: None` is host-wide, which is the shape that
+    /// exercises the record and the gate without needing a real repository.
+    fn task(id: &str, profile_id: Option<&str>, schedule: &str) -> db::TaskRow {
+        db::TaskRow {
+            id: id.to_owned(),
+            profile_id: profile_id.map(str::to_owned),
+            kind: tasks::TaskKind::Sync,
+            schedule: Some(schedule.to_owned()),
+            mode: tasks::TaskMode::Scheduled,
+            next_due_ms: None,
+            enabled: true,
+            updated_ms: 0,
+            running_host: None,
+            lease_until_ms: None,
+        }
+    }
+
+    /// [`task`] for Story 57.4's second kind.
+    ///
+    /// Spelled as an override of [`task`] rather than as a second literal so
+    /// the two kinds cannot drift apart in anything but the one field the
+    /// tests below are about.
+    fn release_task(id: &str, profile_id: Option<&str>, schedule: &str) -> db::TaskRow {
+        db::TaskRow {
+            kind: tasks::TaskKind::Release,
+            ..task(id, profile_id, schedule)
+        }
+    }
+
+    /// AD-136's central claim, asserted the only way it honestly can be: by
+    /// **tick count**, never by elapsed wall time. A test that proved a schedule
+    /// by sleeping would be asserting that a timer exists, which is precisely
+    /// what must not (AD-62).
+    #[tokio::test]
+    async fn a_due_task_runs_on_the_tick_and_never_on_the_clock_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01TICK", None, "every 5m"))
+            .expect("a five-minute schedule is savable");
+
+        // First sight arms and declines: creating a task is not running it.
+        let _ = engine.tick().await;
+        assert!(
+            engine
+                .task_history("01TICK", 10)
+                .expect("history")
+                .is_empty(),
+            "the tick that first sees a task computes its window and stops there"
+        );
+        assert!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("the row is readable")
+                .next_due_ms
+                .is_some(),
+            "and the window it computed is on the row, where the other host can \
+             see it, not in this process"
+        );
+
+        // An hour of clock and no tick. There is no interval anywhere to fire,
+        // so nothing fires — this is what "no second clock" means, measured.
+        platform.advance_ms(3_600_000);
+        assert!(
+            engine
+                .task_history("01TICK", 10)
+                .expect("history")
+                .is_empty(),
+            "the clock alone is not a scheduler: only the tick reads it"
+        );
+
+        let _ = engine.tick().await;
+        let runs = engine.task_history("01TICK", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the first tick after the window ran it, once"
+        );
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            runs[0].detail.as_deref(),
+            Some("no folders to sync"),
+            "and it really performed the kind rather than only recording it"
+        );
+        assert!(runs[0].finished_ms.is_some(), "and closed the attempt");
+
+        // Five more ticks inside the fresh window.
+        for _ in 0..5 {
+            let _ = engine.tick().await;
+        }
+        assert_eq!(
+            engine.task_history("01TICK", 10).expect("history").len(),
+            1,
+            "the tick count is not the schedule: ticks inside a window are not runs"
+        );
+
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01TICK", 10).expect("history").len(),
+            2,
+            "one run per window, on the first tick that follows it"
+        );
+    }
+
+    /// NFR-42's first half, and it is structural rather than promised: the work
+    /// goes through [`Engine::sync_once`], which opens by taking the very
+    /// reservation [`Engine::tick_profile`] takes. So a folder already syncing
+    /// answers `Busy` before anything reaches its index.
+    #[tokio::test]
+    async fn a_task_cannot_touch_a_folder_its_host_is_already_syncing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01BUSY", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+
+        // Held for the whole of the tick that follows, exactly as a sync pass
+        // from a previous tick would still be holding it.
+        let held = engine
+            .reserve(&p.id)
+            .expect("the reservation is free to take before the tick");
+        let _ = engine.tick().await;
+        drop(held);
+
+        let runs = engine.task_history("01BUSY", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the task came due and the attempt is recorded"
+        );
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Busy),
+            "a folder already syncing is the one-operation-per-profile rule \
+             working, and `Busy` is not a failure"
+        );
+    }
+
+    /// The requested run reaches the same code path as the due-gate — which is
+    /// what makes *"it does not have to be automatic, it can be a script"* true
+    /// rather than approximated — and it does not move the schedule.
+    ///
+    /// The clock is advanced between the arming and the request on purpose: with
+    /// the clock standing still, recomputing the window would land on the same
+    /// instant and the assertion below would pass over a run-now that *did* move
+    /// it.
+    #[tokio::test]
+    async fn a_requested_run_is_recorded_like_a_scheduled_one_and_leaves_the_window_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01NOW", None, "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+        let armed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms;
+        assert!(armed.is_some(), "the first window is armed");
+
+        // A minute in, well inside the window: this run is a request and
+        // nothing else.
+        platform.advance_ms(60_000);
+
+        let run = engine.run_task_now("01NOW").await.expect("a requested run");
+        assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
+        assert!(
+            run.host.contains('#'),
+            "the lease names the process and not only the device, because the \
+             daemon and the app share one device row"
+        );
+        assert_eq!(
+            engine.task_history("01NOW", 10).expect("history").len(),
+            1,
+            "recorded identically to a scheduled run — one row, same table"
+        );
+
+        let row = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(
+            row.next_due_ms, armed,
+            "asking for a run now is not asking to skip the next scheduled one"
+        );
+        assert_eq!(row.running_host, None, "and the lease is handed back");
+    }
+
+    /// NFR-43, and the epic's one structural refusal, at the level that decides
+    /// it: a row naming a kind this build does not have is listed and never run,
+    /// however due it looks. `update` above all — `docs/sync.md` refuses
+    /// unattended replacement of this binary, and there is no
+    /// [`tasks::TaskKind`] variant that could name it.
+    #[tokio::test]
+    async fn a_kind_this_build_does_not_have_is_listed_and_never_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        for (id, kind) in [("01UPD", "update"), ("01TEL", "teleport")] {
+            engine
+                .with_db(|conn| {
+                    // Past the typed door on purpose: `save_task` takes a
+                    // `TaskKind`, so raw SQL is the only way such a row exists —
+                    // which is what a newer keeper writing this file looks like.
+                    conn.execute(
+                        "INSERT INTO tasks (id, kind, schedule, mode, next_due_ms,
+                                            enabled, updated_ms)
+                         VALUES (?1, ?2, 'every 5m', 'scheduled', 0, 1, 0)",
+                        (id, kind),
+                    )?;
+                    Ok(())
+                })
+                .expect("a row written past the typed door");
+        }
+
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+
+        let listing = engine.tasks().expect("tasks");
+        assert!(
+            listing.tasks.is_empty(),
+            "neither row is one this build could honestly run"
+        );
+        assert_eq!(
+            listing.unknown.len(),
+            2,
+            "and both are listed rather than swallowed"
+        );
+        assert!(
+            engine
+                .task_history("01UPD", 10)
+                .expect("history")
+                .is_empty(),
+            "a schedule may never replace this binary, and no variant exists \
+             through which it could"
+        );
+        assert!(
+            engine
+                .task_history("01TEL", 10)
+                .expect("history")
+                .is_empty(),
+            "a task from a newer keeper is skipped, not attempted"
+        );
+    }
+
+    /// `Off` and `enabled = false` are the two ways a task is switched off, and
+    /// an "off" that still runs when asked is not off.
+    #[tokio::test]
+    async fn a_task_that_is_off_refuses_the_request_to_run_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut off = task("01OFF", None, "@daily");
+        off.mode = tasks::TaskMode::Off;
+        engine.save_task(&off).expect("save");
+        let mut disabled = task("01DIS", None, "@daily");
+        disabled.enabled = false;
+        engine.save_task(&disabled).expect("save");
+
+        for id in ["01OFF", "01DIS", "01NOSUCHTASK"] {
+            assert!(
+                matches!(engine.run_task_now(id).await, Err(SyncError::Config(_))),
+                "{id} must refuse by type, not fail silently"
+            );
+        }
+
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        assert!(
+            engine
+                .task_history("01OFF", 10)
+                .expect("history")
+                .is_empty()
+                && engine
+                    .task_history("01DIS", 10)
+                    .expect("history")
+                    .is_empty(),
+            "and neither is ever due either"
+        );
+    }
+
+    /// The refusal is at the door every host writes through, not only in the
+    /// parser: a schedule keeper cannot honour must never reach the table.
+    #[test]
+    fn the_engine_door_refuses_a_schedule_it_cannot_parse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        for expression in ["every 30s", "0 3 * *", "@yearly"] {
+            let err = engine
+                .save_task(&task("01BAD", None, expression))
+                .expect_err("refused");
+            assert!(
+                matches!(err, SyncError::Config(_)),
+                "{expression} must be a typed configuration refusal"
+            );
+            assert!(
+                err.to_string().contains(expression),
+                "and the refusal must quote what was written, got {err}"
+            );
+        }
+        assert!(
+            engine.tasks().expect("tasks").tasks.is_empty(),
+            "a refused schedule stores nothing at all"
+        );
+    }
+
+    /// A collision is not the day's answer. Recording `Busy` and advancing to
+    /// the next scheduled instant would have cost a `@daily` sweep the whole day
+    /// for a clash the design calls normal, so a run that did not happen retries
+    /// inside the minute instead of consuming the window.
+    #[tokio::test]
+    async fn a_run_that_did_not_happen_retries_within_the_minute_instead_of_losing_the_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01RETRY", Some(&p.id), "@daily"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        let nightly = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+        // Straight to the window, with the folder's reservation held for the
+        // whole of the tick that finds it open.
+        platform.advance_ms(nightly - platform.now_ms());
+        let held = engine.reserve(&p.id).expect("free before the tick");
+        let _ = engine.tick().await;
+        drop(held);
+
+        let runs = engine.task_history("01RETRY", 10).expect("history");
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Busy));
+        let next = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("rearmed");
+        assert_eq!(
+            next,
+            platform.now_ms() + 60_000,
+            "a minute, not tomorrow: the window was not served, so it is not spent"
+        );
+
+        platform.advance_ms(60_000);
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01RETRY", 10).expect("history").len(),
+            2,
+            "and the retry really is reached on the tick after it"
+        );
+    }
+
+    /// The two branches of `perform_sync_task` used to disagree: the host-wide
+    /// one filtered `enabled`, the profile-scoped one did not, and `sync_once`
+    /// deliberately ignores it — so a task was the one thing on the machine that
+    /// could override a pause and sync a folder at 03:00 anyway.
+    #[tokio::test]
+    async fn a_task_naming_a_paused_folder_syncs_nothing_and_says_so() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.enabled = false;
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01PAUSED", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01PAUSED", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the task came due and the attempt is recorded"
+        );
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Deferred),
+            "a pause is an answer, so it is not a failure either"
+        );
+        assert!(
+            runs[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("paused")),
+            "and the record says which fact it was, got {:?}",
+            runs[0].detail
+        );
+
+        // The same task on a folder that is gone is a real misconfiguration, and
+        // reads as one.
+        engine.forget_task("01PAUSED").expect("forget");
+        engine
+            .save_task(&task("01GONE", Some("01NOSUCHPROFILE"), "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+        let gone = engine.task_history("01GONE", 10).expect("history");
+        assert_eq!(gone[0].outcome, Some(tasks::TaskOutcome::Failed));
+    }
+
+    /// A requested run on a task whose window is already open has served that
+    /// window. Writing it back unchanged — "a request does not move the
+    /// schedule" taken too literally — made the very next tick run it again.
+    #[tokio::test]
+    async fn a_requested_run_that_finds_its_window_open_does_not_run_again_next_tick() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01OPEN", None, "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+        // Past the window, without a tick to serve it.
+        platform.advance_ms(400_000);
+
+        engine
+            .run_task_now("01OPEN")
+            .await
+            .expect("a requested run");
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01OPEN", 10).expect("history").len(),
+            1,
+            "the request served the open window, so the tick after it has nothing to do"
+        );
+    }
+
+    /// NFR-42 asks that a SIGTERM be a bounded finalize. A `systemctl restart`
+    /// mid-run otherwise leaves the lease held by a pid that no longer exists
+    /// for the whole hour, and the restarted daemon cannot prove that pid is
+    /// dead — on Linux the app shares the device row and may hold one.
+    #[tokio::test]
+    async fn shutting_down_hands_back_this_hosts_task_leases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01TERM", None, "every 5m"))
+            .expect("save");
+        let _ = engine.tick().await;
+        // Claim it and abandon the run, as a killed process does.
+        let host = engine.task_host();
+        let now = platform.now_ms();
+        engine
+            .with_db(|conn| db::claim_task(conn, "01TERM", &host, now, TASK_LEASE_MS, None))
+            .expect("claim")
+            .expect("claimed");
+
+        engine.finalize().expect("finalize");
+
+        let row = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(
+            (row.running_host, row.lease_until_ms),
+            (None, None),
+            "the next host does not wait out an hour for a process that is gone"
+        );
+        assert_eq!(
+            engine.task_history("01TERM", 10).expect("history")[0].outcome,
+            Some(tasks::TaskOutcome::Abandoned),
+            "and the attempt is closed with the truth rather than left open"
+        );
+    }
+
+    /// The `Failed` arm and the tally, reached through the real dispatch: a
+    /// folder whose remote does not resolve. Everything above this asserts a
+    /// pass that had nothing to do, and a dispatch that only ever answers "no
+    /// folders" is a dispatch nothing has exercised.
+    #[tokio::test]
+    async fn a_folder_whose_remote_cannot_be_reached_records_a_failed_run_with_the_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01FAIL", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01FAIL", 10).expect("history");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Failed),
+            "an unresolvable remote is a failure and reads as one"
+        );
+        let detail = runs[0].detail.clone().expect("a reason");
+        assert!(
+            detail.starts_with("0 synced, 0 already syncing, 0 waiting, 1 failed:"),
+            "the tally is what a reader needs first, got {detail}"
+        );
+        assert!(
+            detail.len() > 50,
+            "and the reason is carried after it, got {detail}"
+        );
+    }
+
+    /// An unplugged drive is not a failure, and this tree settles that by name:
+    /// AD-48's *"an unplugged volume is absence, never failure"*, and
+    /// `SyncError::MediaAbsent` is `Retriability::Deferred` for exactly that
+    /// reason. Recording it as a failure would have a nightly task on an
+    /// external drive raise a failure notification every night it is unplugged.
+    #[tokio::test]
+    async fn a_task_on_an_unplugged_drive_waits_rather_than_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.removable = true;
+        p.volume_id = Some("01NOSUCHVOLUME".to_owned());
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&task("01ABSENT", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01ABSENT", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the task came due and the attempt is recorded"
+        );
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Deferred),
+            "absence is not failure, so nothing here is worth a notification"
+        );
+        assert_eq!(
+            runs[0].detail.as_deref(),
+            Some("0 synced, 0 already syncing, 1 waiting, 0 failed"),
+            "and the tally says which of the four it was"
+        );
+    }
+
+    /// Which release row governs a folder's sweep, over every case that can
+    /// disagree (Story 57.4, FR-350).
+    ///
+    /// Each half fails for a different real bug: a host-wide default silently
+    /// overriding a folder's own decision, two rows in one tier resolved by
+    /// whichever happened to sort first rather than by which deletes less, a
+    /// switched-off row read as *absent* and so handing the folder straight back
+    /// to the hourly success-edge sweep, a sync task deciding something about
+    /// deletions, and a row from a newer keeper deciding anything at all.
+    #[test]
+    fn a_folders_release_governance_is_the_narrowest_row_and_the_least_permissive_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert_eq!(
+            engine
+                .release_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "no rows at all is the un-migrated database, and it has to read as \
+             `Epic 56, unchanged` rather than as anything new"
+        );
+
+        // A sync task is not a release task, however host-wide and however
+        // switched off. The kind filter is the only thing keeping the two
+        // records from governing each other.
+        let mut sync_off = task("01SYNCOFF", None, "@daily");
+        sync_off.mode = tasks::TaskMode::Off;
+        engine.save_task(&sync_off).expect("save");
+        assert_eq!(
+            engine
+                .release_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "a sync task says nothing about whether content may be deleted"
+        );
+
+        // A release row naming a DIFFERENT folder is a decision about that
+        // folder. Read as host-wide it would switch this one's sweep off.
+        let mut elsewhere = release_task("01ELSEWHERE", Some("01JOTHERFOLDER"), "@daily");
+        elsewhere.mode = tasks::TaskMode::Off;
+        engine.save_task(&elsewhere).expect("save");
+        assert_eq!(
+            engine
+                .release_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "another folder's row governs another folder"
+        );
+
+        // Host-wide, then the folder's own — which wins even though it is the
+        // MORE permissive of the two, because narrower is more specific and
+        // precedence is not a second safety rule.
+        let mut host_wide = release_task("01HOSTOFF", None, "@daily");
+        host_wide.mode = tasks::TaskMode::Off;
+        engine.save_task(&host_wide).expect("save");
+        assert_eq!(
+            engine
+                .release_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Off),
+            "a host-wide row is the default every folder takes"
+        );
+        let mut mine = release_task("01MINE", Some(&p.id), "@daily");
+        mine.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&mine).expect("save");
+        assert_eq!(
+            engine
+                .release_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Scheduled),
+            "and a row naming this folder beats the host's default"
+        );
+
+        // Two rows in the SAME tier, and the order they were written in must
+        // not be what decides.
+        let mut also_mine = release_task("01ALSOMINE", Some(&p.id), "@daily");
+        also_mine.mode = tasks::TaskMode::Manual;
+        engine.save_task(&also_mine).expect("save");
+        assert_eq!(
+            engine
+                .release_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Manual),
+            "the safe reading of two rows disagreeing about a deletion is the one \
+             that deletes less"
+        );
+
+        // `enabled = 0` is a knob set to off, not a knob that is absent. Read as
+        // absent, this falls back to `01MINE`'s `scheduled` and the folder is
+        // handed straight back to the hourly success-edge sweep — the opposite
+        // of what switching a task off means to whoever switched it off.
+        also_mine.enabled = false;
+        engine.save_task(&also_mine).expect("save");
+        assert_eq!(
+            engine
+                .release_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Off),
+            "a row that is not live must not leave a knob that does nothing"
+        );
+
+        // A row a newer keeper wrote governs nothing, and the fallback is
+        // TODAY's behaviour rather than a new one (NFR-43). The other reading —
+        // an unreadable row disables the sweep — would let one bad row silently
+        // stop housekeeping on a whole host.
+        for id in ["01MINE", "01ALSOMINE", "01HOSTOFF"] {
+            engine.forget_task(id).expect("forget");
+        }
+        engine
+            .with_db(|conn| {
+                // Past the typed door on purpose: `save_task` takes a
+                // `TaskKind`, so raw SQL is the only way such a row exists —
+                // which is what a newer keeper writing this file looks like.
+                conn.execute(
+                    "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms,
+                                        enabled, updated_ms)
+                     VALUES ('01TEL', ?1, 'teleport', 'every 5m', 'off', 0, 1, 0)",
+                    [&p.id],
+                )?;
+                Ok(())
+            })
+            .expect("a row written past the typed door");
+        assert_eq!(
+            engine
+                .release_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "one row this build cannot read must not be able to stop housekeeping"
+        );
+    }
+
+    /// The governance table, arm by arm, with no arm left to inference
+    /// (Story 57.4, FR-350).
+    ///
+    /// `(Some(Manual), SuccessEdge) == false` beside `(Some(Manual), Task) ==
+    /// true` is the owner's ask itself — *deletion does not have to be
+    /// automatic, it can be a script run at the right time* — and
+    /// `(Some(Scheduled), SuccessEdge) == true` is the claim that putting the
+    /// sweep on a schedule ADDS a driver rather than taking the existing one
+    /// away.
+    #[test]
+    fn release_permits_answers_every_mode_and_trigger_pair_the_table_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        // `(None, _)`: no row governs, so both triggers sweep exactly as Epic 56
+        // ships it. This is the arm an un-migrated `sync.db` takes.
+        assert!(
+            engine.release_permits(&p, ReleaseTrigger::SuccessEdge),
+            "(None, SuccessEdge)"
+        );
+        assert!(
+            engine.release_permits(&p, ReleaseTrigger::Task),
+            "(None, Task): unreachable in practice, and `true` is still right"
+        );
+
+        let mut row = release_task("01GOV", Some(&p.id), "@daily");
+        for (mode, on_edge, on_task) in [
+            (tasks::TaskMode::Off, false, false),
+            (tasks::TaskMode::Manual, false, true),
+            (tasks::TaskMode::Scheduled, true, true),
+        ] {
+            row.mode = mode;
+            engine.save_task(&row).expect("save");
+            assert_eq!(
+                engine.release_permits(&p, ReleaseTrigger::SuccessEdge),
+                on_edge,
+                "(Some({}), SuccessEdge)",
+                mode.as_str()
+            );
+            assert_eq!(
+                engine.release_permits(&p, ReleaseTrigger::Task),
+                on_task,
+                "(Some({}), Task)",
+                mode.as_str()
+            );
+        }
+    }
+
+    /// A refusal does not merely decline to arm a window — it **clears** one
+    /// that is already armed (Story 57.4).
+    ///
+    /// Being above the due gate stops a vetoed folder from arming, which is only
+    /// half the promise. A folder that had been sweeping normally already has an
+    /// entry, and the entry does not expire: without the `remove`, switching the
+    /// task back to `scheduled` hours later meets a window that opened long ago
+    /// and deletes on the very next sync, with none of the
+    /// [`RELEASE_LOOK_EVERY_MS`] grace the gate exists to give — the exact
+    /// failure the placement claims to prevent, and the one
+    /// [`Engine::release_is_due`]'s zero-TTL arm already `remove`s an entry to
+    /// avoid.
+    ///
+    /// The map is asserted **empty**, not merely that the answer was `false`,
+    /// because only the first of those survives re-enabling.
+    #[test]
+    fn a_refused_release_forgets_the_window_the_folder_had_already_armed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        // The folder has been sweeping: first sight arms a window.
+        assert!(!engine.release_is_due(&p), "first sight arms and declines");
+        assert!(
+            Engine::lock(&engine.next_release_ms).contains_key(&p.id),
+            "so there is a window to lose"
+        );
+
+        let mut off = release_task("01OFFNOW", Some(&p.id), "@daily");
+        off.mode = tasks::TaskMode::Off;
+        engine.save_task(&off).expect("save");
+
+        assert!(!engine.release_permits(&p, ReleaseTrigger::SuccessEdge));
+        assert!(
+            Engine::lock(&engine.next_release_ms).is_empty(),
+            "turning the sweep off must leave no window for turning it back on \
+             to walk straight into"
+        );
+    }
+
+    /// A `tasks` table this pass could not read declines the pass (Story 57.4).
+    ///
+    /// The opposite answer from an unreadable *row*, and deliberately so. A row
+    /// is skipped because somebody deliberately wrote it and NFR-43 says an
+    /// older binary must not brick on it. A failure to read the table at all —
+    /// `SQLITE_BUSY` from the other host holding a write lock past the timeout,
+    /// a briefly unreadable `sync.db` — means this pass does not know whether an
+    /// operator switched the sweep off, and the honest answer to "may I delete
+    /// content" when the instruction cannot be read is no.
+    ///
+    /// The table is dropped to produce the failure, which is the one way to make
+    /// `list_tasks` error without racing a second connection: what is under test
+    /// is the `Err` arm, not any particular cause of it.
+    #[test]
+    fn an_unreadable_tasks_table_declines_the_sweep_instead_of_assuming_nobody_said_stop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        assert!(
+            engine.release_permits(&p, ReleaseTrigger::SuccessEdge),
+            "with a readable and empty table this folder sweeps as it always did"
+        );
+
+        engine
+            .with_db(|conn| {
+                conn.execute("DROP TABLE tasks", [])?;
+                Ok(())
+            })
+            .expect("drop the table this pass needs");
+
+        assert!(
+            engine.release_governance(&p.id).is_err(),
+            "the read really did fail, or the rest of this proves nothing"
+        );
+        assert!(
+            !engine.release_permits(&p, ReleaseTrigger::SuccessEdge),
+            "a pass that cannot read the instruction does not delete"
+        );
+    }
+
+    /// A release task on a paused folder is the shape
+    /// `perform_sync_task` already settled for its own kind, and it must answer
+    /// the same way: a pause means keeper is not touching this folder, and a
+    /// deletion is the most touching thing it does.
+    #[tokio::test]
+    async fn a_release_task_naming_a_paused_folder_defers_and_sweeps_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.enabled = false;
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&release_task("01RELPAUSED", Some(&p.id), "every 5m"))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01RELPAUSED", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "the task came due and the attempt is recorded"
+        );
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Deferred),
+            "a pause is an answer, so it is not a failure either"
+        );
+        assert!(
+            runs[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("paused")),
+            "and the record says which fact it was, got {:?}",
+            runs[0].detail
+        );
+    }
+
+    /// A release task naming a folder that is gone is the one real
+    /// misconfiguration this kind can have, and it reads as one rather than as a
+    /// quiet pass — `db::delete_profile` takes a folder's tasks with it, so it
+    /// should not arise, which is exactly why it must be loud if it does.
+    #[tokio::test]
+    async fn a_release_task_naming_a_folder_that_is_gone_records_a_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&release_task(
+                "01RELGONE",
+                Some("01JNOSUCHPROFILE"),
+                "every 5m",
+            ))
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01RELGONE", 10).expect("history");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Failed));
+        assert_eq!(
+            runs[0].detail.as_deref(),
+            Some("no such folder: 01JNOSUCHPROFILE"),
+            "and the record names the folder, which is the only thing a person \
+             can act on"
+        );
+    }
+
+    /// An unplugged drive is absence, never failure (AD-48) — and a release task
+    /// is where that matters most: a nightly sweep on an external drive would
+    /// otherwise raise a failure notification every night the drive is out.
+    ///
+    /// **Both target shapes**, because both reach [`Engine::volume_ready`] in
+    /// the same loop. The folder-scoped branch's early return fires only for a
+    /// folder that is *paused*; an enabled folder-scoped target falls straight
+    /// through to the volume gate, and a task bound to one removable folder is
+    /// the overwhelmingly likely way somebody schedules a sweep on an external
+    /// drive — so asserting only the host-wide shape would have left the row
+    /// this story's matrix actually names uncovered. Modelled on
+    /// [`a_task_on_an_unplugged_drive_waits_rather_than_failing`], which makes
+    /// the same claim for the sync kind.
+    #[tokio::test]
+    async fn a_release_task_on_an_unplugged_drive_waits_rather_than_failing() {
+        for bound in [None, Some("01JTESTPROFILE")] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let platform = Arc::new(TestPlatform::new(dir.path()));
+            let Ok(engine) = Engine::open(platform.clone()) else {
+                return;
+            };
+            let mut p = profile(dir.path());
+            p.removable = true;
+            p.volume_id = Some("01NOSUCHVOLUME".to_owned());
+            engine.upsert_profile(&p).expect("upsert");
+            engine
+                .save_task(&release_task("01RELABSENT", bound, "every 5m"))
+                .expect("save");
+
+            let _ = engine.tick().await;
+            platform.advance_ms(300_000);
+            let _ = engine.tick().await;
+
+            let runs = engine.task_history("01RELABSENT", 10).expect("history");
+            assert_eq!(
+                runs.len(),
+                1,
+                "the task came due and the attempt is recorded ({bound:?})"
+            );
+            assert_eq!(
+                runs[0].outcome,
+                Some(tasks::TaskOutcome::Deferred),
+                "absence is not failure, so nothing here is worth a notification \
+                 ({bound:?})"
+            );
+            assert_eq!(
+                runs[0].detail.as_deref(),
+                Some(
+                    "released 0 paths (0 bytes) from 0 folders, \
+                     0 declined, 0 already syncing, 1 unavailable"
+                ),
+                "and the record says which of the four it was ({bound:?})"
+            );
+        }
+    }
+
+    /// The tick half of `off`, and it is honest about what it defends.
+    ///
+    /// Everything asserted here is decided by Story 57.1's [`tasks::decide`] and
+    /// [`Engine::run_task_now`], which refuse a non-`Scheduled` mode before
+    /// anything in Story 57.4 is reached — so this would still pass with
+    /// [`Engine::release_permits`] deleted, and it is filed as "the release kind
+    /// inherits the mode gate every kind has" rather than as a proof of this
+    /// story's governance. The governance path on the tick is
+    /// [`a_second_row_switches_one_folder_off_under_a_host_wide_release_run`]
+    /// below, which reaches `release_permits` because the *task* is scheduled
+    /// and enabled and a different row is what vetoes the folder.
+    ///
+    /// Here rather than in `tests/release_sweep.rs` because [`Engine::tick`] is
+    /// private and widening the engine's surface for a test would be the wrong
+    /// trade. That file owns the other two halves — the success edge releasing
+    /// nothing and the request being refused — on the real repository, where a
+    /// byte can be counted.
+    #[tokio::test]
+    async fn a_release_task_that_is_off_never_comes_due() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut off = release_task("01RELOFF", None, "every 5m");
+        off.mode = tasks::TaskMode::Off;
+        engine.save_task(&off).expect("save");
+
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+            platform.advance_ms(300_000);
+        }
+
+        assert!(
+            engine
+                .task_history("01RELOFF", 10)
+                .expect("history")
+                .is_empty(),
+            "an `off` release task is never due, however far past its window the \
+             clock is"
+        );
+        assert!(
+            matches!(
+                engine.run_task_now("01RELOFF").await,
+                Err(SyncError::Config(_))
+            ),
+            "and an `off` that still runs when asked is not off"
+        );
+    }
+
+    /// The governance veto, reached on the tick by a task nothing else refuses.
+    ///
+    /// A host-wide release task that is `scheduled` and `enabled` comes due and
+    /// claims its lease, so [`tasks::decide`] and [`Engine::run_task_now`]'s
+    /// mode guards are both satisfied and neither can account for the result. A
+    /// **second** row — this folder's own, in mode `off` — is what stops the
+    /// sweep, and it can only stop it inside [`Engine::release_permits`]. Delete
+    /// `release_governance` or `release_permits` and this test fails, which is
+    /// the property `a_release_task_that_is_off_never_comes_due` does not have.
+    ///
+    /// The record is the other half of the claim: the run is `deferred` rather
+    /// than a cheerful `ok`, and the detail says a folder declined, because an
+    /// operator who asked for a sweep and got nothing needs to be told which of
+    /// "nothing was due" and "something refused" it was.
+    ///
+    /// **`LfsMode::PointerOnly` is load-bearing here, not scenery.** The
+    /// fixture's default mode is `Materialize`, whose folder authorizes nothing,
+    /// so [`release_mode_gate`] would refuse the pass on its own and the test
+    /// would report `1 declined` with the governance gate deleted — passing for
+    /// a reason that has nothing to do with what it claims. `PointerOnly` is the
+    /// one mode that reaches the ledger with no repository on disk, so this
+    /// folder is swept unless something vetoes it, and the only thing that can
+    /// is [`Engine::release_permits`]. That is what makes the mutation bite.
+    #[tokio::test]
+    async fn a_second_row_switches_one_folder_off_under_a_host_wide_release_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.lfs_mode = LfsMode::PointerOnly;
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&release_task("01RELALL", None, "every 5m"))
+            .expect("the host-wide driver is scheduled and enabled");
+
+        // Without the veto this folder really is swept, or the assertion below
+        // proves nothing about the veto.
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01RELALL", 10).expect("history")[0]
+                .detail
+                .as_deref(),
+            Some(
+                "released 0 paths (0 bytes) from 1 folders, \
+                 0 declined, 0 already syncing, 0 unavailable"
+            ),
+            "the control: one folder swept, nothing due in it"
+        );
+        engine.forget_task("01RELALL").expect("start again");
+        engine
+            .save_task(&release_task("01RELALL", None, "every 5m"))
+            .expect("the same driver, with a fresh history");
+
+        let mut veto = release_task("01RELVETO", Some(&p.id), "every 5m");
+        veto.mode = tasks::TaskMode::Off;
+        engine
+            .save_task(&veto)
+            .expect("and this folder says not to sweep it");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01RELALL", 10).expect("history");
+        assert_eq!(runs.len(), 1, "the host-wide task really did come due");
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Deferred),
+            "a run every one of whose folders refused did not happen, and the \
+             window is retried rather than consumed"
+        );
+        assert_eq!(
+            runs[0].detail.as_deref(),
+            Some(
+                "released 0 paths (0 bytes) from 0 folders, \
+                 1 declined, 0 already syncing, 0 unavailable"
+            ),
+            "and the record says a folder refused rather than that one was swept \
+             and had nothing due"
+        );
+        assert!(
+            engine
+                .task_history("01RELVETO", 10)
+                .expect("history")
+                .is_empty(),
+            "the vetoing row is `off`, so it never runs anything itself either"
+        );
+    }
+
     /// A shared branch overtaken by the other machine is weather, not a
     /// decision — and the reconcile happens *in this unit* (DW-207).
     ///
@@ -10919,6 +13631,7 @@ mod tests {
             size_bytes: None,
             pinned: false,
             local_origin: false,
+            release_at_ms: None,
         }
     }
 
@@ -11003,6 +13716,142 @@ mod tests {
         let mut row = ledger_row("clip.mp4", 1_000);
         row.last_used_ms = Some(4_000);
         assert_eq!(release_due_at(&row, 0), Some(4_000));
+    }
+
+    /// A deadline chosen for one path replaces the folder's window in both
+    /// directions, and reaches past neither floor (Story 56.17).
+    ///
+    /// Over hand-built rows and beside the provenance test rather than folded
+    /// into it, because the claim is about *precedence* between four facts —
+    /// the pin, the provenance, the chosen instant and the folder's window —
+    /// and every wrong ordering of them is a different file deleted at a
+    /// different wrong moment.
+    #[test]
+    fn a_chosen_deadline_replaces_the_window_without_reaching_past_either_floor() {
+        const TTL: u64 = 24 * 60 * 60 * 1_000;
+
+        // Shorter than the folder's day: it goes at the hour that was asked
+        // for, not twenty-three hours later.
+        let mut sooner = ledger_row("clip.mp4", 1_000);
+        sooner.last_used_ms = Some(5_000);
+        sooner.release_at_ms = Some(5_000 + 60 * 60 * 1_000);
+        assert_eq!(
+            release_due_at(&sooner, TTL),
+            Some(5_000 + 60 * 60 * 1_000),
+            "a replacement, not a floor under the folder's window"
+        );
+
+        // Longer than it: it stays, rather than being capped at the folder's
+        // day. Both directions, because a `min` and a `max` each look right
+        // from one side.
+        let mut later = ledger_row("clip.mp4", 1_000);
+        later.last_used_ms = Some(5_000);
+        later.release_at_ms = Some(5_000 + 7 * TTL as i64);
+        assert_eq!(
+            release_due_at(&later, TTL),
+            Some(5_000 + 7 * TTL as i64),
+            "a replacement, not a ceiling over the folder's window"
+        );
+
+        // The pin is above it, as it is above every clock.
+        let mut pinned = later.clone();
+        pinned.pinned = true;
+        pinned.release_at_ms = Some(0);
+        assert_eq!(
+            release_due_at(&pinned, TTL),
+            None,
+            "the pin is read before any clock, and a chosen deadline is a clock"
+        );
+
+        // FR-341 is above it too, and this is the line the whole story turns
+        // on: a duration must not be a way of putting content that exists on
+        // one machine onto a release clock.
+        let mut unconfirmed = ledger_row("clip.mp4", 1_000);
+        unconfirmed.local_origin = true;
+        unconfirmed.synced_at_ms = None;
+        unconfirmed.last_used_ms = Some(9_000_000);
+        unconfirmed.release_at_ms = Some(0);
+        assert_eq!(
+            release_due_at(&unconfirmed, TTL),
+            None,
+            "never confirmed upstream, so never eligible — at any age, and \
+             whatever deadline was asked for"
+        );
+
+        // And once it IS confirmed, the chosen deadline is the clock behind
+        // that barrier rather than the folder's window.
+        let mut confirmed = unconfirmed.clone();
+        confirmed.synced_at_ms = Some(2_000);
+        assert_eq!(
+            release_due_at(&confirmed, TTL),
+            Some(0),
+            "the confirmation opens the gate; the instruction sets the time"
+        );
+    }
+
+    /// The classifier names whose clock a row is on, so the sentence can
+    /// (Story 56.17).
+    ///
+    /// The instant is [`release_due_at`]'s in both cases and is asserted to be
+    /// the same number, because the two variants must never disagree about
+    /// *when* — only about who said so.
+    #[test]
+    fn a_chosen_deadline_is_classified_as_the_persons_own_and_not_the_folders() {
+        use lfs::virtual_policy::Virtualization;
+        const TTL: u64 = 24 * 60 * 60 * 1_000;
+
+        let mut folders = ledger_row("clip.mp4", 1_000);
+        folders.last_used_ms = Some(5_000);
+        assert_eq!(
+            release_schedule(
+                &folders,
+                Some(TTL),
+                LfsMode::PointerOnly,
+                Virtualization::Virtual
+            ),
+            ReleaseSchedule::Due {
+                at_ms: 5_000 + TTL as i64
+            },
+        );
+
+        let mut asked = folders.clone();
+        asked.release_at_ms = Some(5_000 + 60 * 60 * 1_000);
+        let schedule = release_schedule(
+            &asked,
+            Some(TTL),
+            LfsMode::PointerOnly,
+            Virtualization::Virtual,
+        );
+        assert_eq!(
+            schedule,
+            ReleaseSchedule::DueByRequest {
+                at_ms: 5_000 + 60 * 60 * 1_000
+            },
+            "the same row with an instruction on it is the person's clock, not \
+             the folder's — and the cell says so"
+        );
+        assert_eq!(
+            schedule.releases_after_ms(),
+            release_due_at(&asked, TTL),
+            "and the number is the predicate's own, so the pane and the sweep \
+             cannot disagree about when this file goes"
+        );
+        assert_eq!(
+            schedule.hold(),
+            None,
+            "it counts down through the cell every other deadline uses"
+        );
+
+        // The folder's automatic release switched off is still off. See
+        // `release_schedule`'s own note: there is no window for a deadline to
+        // override, and the sweep returns before it reads a clock.
+        assert_eq!(
+            release_schedule(&asked, None, LfsMode::PointerOnly, Virtualization::Virtual),
+            ReleaseSchedule::Indefinite,
+            "a folder that releases nothing on its own releases nothing on its \
+             own, and the row says `Manual` rather than promising a countdown \
+             nothing will honour"
+        );
     }
 
     /// Every branch of the surface classifier, in the order it asks them
@@ -11250,6 +14099,7 @@ mod tests {
     fn release_schedule_pairs_an_instant_with_words_exactly_one_way() {
         let all = [
             ReleaseSchedule::Due { at_ms: 1_700_000 },
+            ReleaseSchedule::DueByRequest { at_ms: 1_700_000 },
             ReleaseSchedule::Pinned,
             ReleaseSchedule::Unconfirmed,
             ReleaseSchedule::Indefinite,
@@ -11280,8 +14130,8 @@ mod tests {
         assert_eq!(
             sentences.len(),
             distinct,
-            "six reasons, six sentences — a shared one would tell somebody the wrong \
-             thing about their own file"
+            "seven reasons, seven sentences — a shared one would tell somebody the \
+             wrong thing about their own file"
         );
 
         // Story 56.14. The Files pane's Release control is withheld on exactly
@@ -18588,7 +21438,11 @@ mod tests {
         let p = adoptable(dir.path());
         engine.upsert_profile(&p).expect("upsert");
 
-        let refusal = |subpath: &str| match engine.materialize_entry(&p.id, subpath) {
+        let refusal = |subpath: &str| match engine.materialize_entry(
+            &p.id,
+            subpath,
+            lfs::hydrate::KeepFor::Unspecified,
+        ) {
             Err(SyncError::Refused(refusal)) => refusal,
             other => panic!("expected a refusal for {subpath:?}, got {other:?}"),
         };
@@ -18611,7 +21465,7 @@ mod tests {
             ));
             assert!(
                 matches!(
-                    engine.materialize_entry(&p.id, "clip.mp4"),
+                    engine.materialize_entry(&p.id, "clip.mp4", lfs::hydrate::KeepFor::Unspecified),
                     Err(SyncError::Busy(_))
                 ),
                 "and a path that IS askable answers busy while the folder is"
@@ -18696,7 +21550,11 @@ mod tests {
         .expect("commit the pointer");
         drop(repo);
         assert!(matches!(
-            match engine.materialize_entry(&coned.id, "media/clip.mp4") {
+            match engine.materialize_entry(
+                &coned.id,
+                "media/clip.mp4",
+                lfs::hydrate::KeepFor::Unspecified
+            ) {
                 Err(SyncError::Refused(refusal)) => refusal,
                 other => panic!("expected a refusal, got {other:?}"),
             },
@@ -18719,9 +21577,284 @@ mod tests {
         // An unknown profile is a configuration error, not a refusal: the
         // caller named something that does not exist.
         assert!(matches!(
-            engine.materialize_entry("01NOSUCHPROFILE", "clip.mp4"),
+            engine.materialize_entry(
+                "01NOSUCHPROFILE",
+                "clip.mp4",
+                lfs::hydrate::KeepFor::Unspecified
+            ),
             Err(SyncError::Config(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Story 56.15: a clone that stopped says so
+    // -----------------------------------------------------------------------
+
+    /// The profile row's own `last_error` column, which is what
+    /// `keeper-syncd status` and a fresh app launch read — as opposed to the
+    /// in-process snapshot, which dies with the process that made it.
+    fn stored_last_error(engine: &Engine, id: &str) -> Option<String> {
+        engine
+            .with_db(|conn| {
+                conn.query_row(
+                    "SELECT last_error FROM profiles WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .map_err(SyncError::from)
+            })
+            .expect("the profile row is readable")
+    }
+
+    /// How many journal rows of one kind this profile owns.
+    fn units_of_kind(engine: &Engine, id: &str, kind: &str) -> u32 {
+        engine
+            .with_db(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM journal WHERE profile_id = ?1 AND kind = ?2",
+                    (id, kind),
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(SyncError::from)
+            })
+            .expect("the journal is readable") as u32
+    }
+
+    /// A folder with two committed files and a clean tree, which is what an
+    /// interrupted first clone was *supposed* to leave behind.
+    fn committed_fixture(
+        engine: &Engine,
+        platform: &TestPlatform,
+        dir: &Path,
+    ) -> (SyncProfile, gix::hash::ObjectId) {
+        let p = adoptable(dir);
+        std::fs::write(p.local_path.join("a.txt"), b"alpha").expect("write a");
+        std::fs::write(p.local_path.join("b.txt"), b"beta").expect("write b");
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("the first pass opens the settle window");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit the fixture"),
+            2,
+            "the fixture must actually have a commit for the guard to be about"
+        );
+        let repo = engine.open_repo(&p).expect("open");
+        let head = git::repo::head_commit_id(&repo)
+            .expect("head")
+            .expect("the fixture has a commit");
+        drop(repo);
+        (p, head)
+    }
+
+    /// Put the repository into the exact state the owner's `/Users/tgorka/tgdrive`
+    /// was measured in: `HEAD` holds a tree, the index holds nothing, and the
+    /// worktree files the checkout never got to are absent.
+    fn interrupt_the_checkout(p: &SyncProfile, remove_worktree: bool) {
+        std::fs::remove_file(p.local_path.join(".git/index")).expect("drop the index");
+        if remove_worktree {
+            for name in ["a.txt", "b.txt"] {
+                std::fs::remove_file(p.local_path.join(name)).expect("drop the worktree file");
+            }
+        }
+    }
+
+    /// D1. A first clone that stopped mid-checkout must say so where a human
+    /// and the UI can read it, and the next tick must re-drive it.
+    ///
+    /// Measured on the owner's machine (0.8.23, 2026-08-29 07:31): the clone
+    /// log line, then silence — `profiles.state = 'idle'`, `last_error = NULL`,
+    /// zero journal rows, and a `.git` whose index holds nothing while `HEAD`
+    /// holds 155 625 paths. Nothing recorded the failure and nothing retried.
+    #[tokio::test]
+    async fn an_interrupted_first_clone_says_so_and_is_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, head) = committed_fixture(&engine, &platform, dir.path());
+        interrupt_the_checkout(&p, true);
+
+        // A directory where `HEAD` holds a file: the repair collides with
+        // something it may never overwrite, so it cannot finish. That is the
+        // half of this behaviour that has to be *recorded* rather than fixed.
+        std::fs::create_dir(p.local_path.join("a.txt")).expect("block one path");
+
+        engine.tick_profile(&p).await.expect("a tick never raises");
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_ne!(
+            snapshot.state,
+            ProfileState::Idle,
+            "a folder with no working copy is not idle"
+        );
+        let shown = snapshot
+            .error
+            .expect("a clone that did not finish must leave an error the UI can read");
+        assert!(
+            shown.contains("never finished"),
+            "the sentence must name what happened, got: {shown}"
+        );
+        assert_eq!(
+            stored_last_error(&engine, &p.id).as_deref(),
+            Some(shown.as_str()),
+            "and it must be in the profile row, not only in this process"
+        );
+        assert_eq!(
+            units_of_kind(&engine, &p.id, "checkout"),
+            1,
+            "the retry is a journal unit, so it rides the engine's own backoff"
+        );
+        assert_eq!(
+            git::repo::head_commit_id(&engine.open_repo(&p).expect("open")).expect("head"),
+            Some(head),
+            "nothing may be committed out of a half-made checkout"
+        );
+
+        // Unblock it and let the backoff elapse. The next tick finishes the
+        // job: the files come back from the commit that already exists here,
+        // and nothing is deleted to do it.
+        std::fs::remove_dir(p.local_path.join("a.txt")).expect("unblock");
+        platform.advance_ms(60_000);
+        engine.tick_profile(&p).await.expect("the retry tick");
+
+        assert_eq!(
+            std::fs::read(p.local_path.join("a.txt")).expect("a.txt is back"),
+            b"alpha",
+            "the retry restores what the interrupted checkout never wrote"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("b.txt")).expect("b.txt is back"),
+            b"beta"
+        );
+        let repo = engine.open_repo(&p).expect("open");
+        assert!(
+            !git::repo::index_is_unpopulated(&repo).expect("index"),
+            "and it leaves an index, or the very next walk reads a mass deletion"
+        );
+        assert_eq!(
+            git::repo::head_commit_id(&repo).expect("head"),
+            Some(head),
+            "a repair commits nothing"
+        );
+        drop(repo);
+        assert_eq!(
+            stored_last_error(&engine, &p.id),
+            None,
+            "and the folder stops claiming to be broken once it is not"
+        );
+    }
+
+    /// D1. A repository with commits on `HEAD` and an empty index is a broken
+    /// checkout, never a user deleting everything — and keeper must refuse it
+    /// without staging a single deletion.
+    ///
+    /// The assertion that matters is the ABSENCE of a commit. A returned error
+    /// proves nothing on its own: `stage_and_commit` writes the index before it
+    /// writes the commit, so a guard placed one line too late would still have
+    /// staged 155 625 removals by the time it raised.
+    #[tokio::test]
+    async fn an_empty_index_is_refused_and_stages_no_deletion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, head) = committed_fixture(&engine, &platform, dir.path());
+        // The worktree files STAY. This is the owner's folder: 16 GB on disk,
+        // an empty index, and `git status` reading every tracked path as `D`.
+        interrupt_the_checkout(&p, false);
+
+        let walks_before = engine.counters(&p.id).status_walks;
+        let err = engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect_err("keeper must not commit out of an empty index");
+        let said = err.to_string();
+        assert!(
+            said.contains("never finished") && said.contains("empty"),
+            "the refusal has to name what happened, got: {said}"
+        );
+
+        let repo = engine.open_repo(&p).expect("open");
+        assert_eq!(
+            git::repo::head_commit_id(&repo).expect("head"),
+            Some(head),
+            "NO COMMIT: the whole point. A deletion of every tracked path must \
+             never reach the object database"
+        );
+        drop(repo);
+        assert!(
+            p.local_path.join("a.txt").exists() && p.local_path.join("b.txt").exists(),
+            "and nothing on disk is touched"
+        );
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            walks_before,
+            "the refusal is taken before the walk: on the owner's folder that \
+             walk is 4.3 s of tree diff producing 155 625 deletions"
+        );
+    }
+
+    /// D2. A profile the engine has marked offline pays for no status walk.
+    ///
+    /// Counted, not eyeballed: the owner's log carried one
+    /// `status walk finished … elapsed_ms=4274 deleted=155625` line every two
+    /// seconds, for ever, on a folder nothing could publish.
+    #[tokio::test]
+    async fn an_offline_profile_walks_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, _head) = committed_fixture(&engine, &platform, dir.path());
+
+        // The only thing in the engine that produces `Offline`: a transient
+        // network failure (AD-49).
+        engine.record_failure(
+            &p,
+            &SyncError::Network {
+                host: "git.invalid".to_owned(),
+                reason: "no route to host".to_owned(),
+            },
+        );
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+
+        let before = engine.counters(&p.id).status_walks;
+        engine.tick_profile(&p).await.expect("a tick never raises");
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            before,
+            "an offline folder must not buy a full-tree walk it can do nothing with"
+        );
+    }
+
+    /// D2's other half. A folder that is merely idle — nothing queued, nothing
+    /// wrong, remote reachable as far as anything knows — still walks exactly
+    /// as it did before, or the gate above has turned sync off.
+    #[tokio::test]
+    async fn an_idle_online_profile_still_walks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (p, _head) = committed_fixture(&engine, &platform, dir.path());
+
+        let before = engine.counters(&p.id).status_walks;
+        engine.tick_profile(&p).await.expect("a tick never raises");
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            before + 1,
+            "the ordinary tick of an ordinary folder walks once"
+        );
     }
 }
 

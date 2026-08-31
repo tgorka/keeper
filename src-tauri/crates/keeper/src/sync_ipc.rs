@@ -107,13 +107,23 @@ pub struct SyncProfileVm {
     /// An empty list is *silence* rather than a withdrawal:
     /// `lfs::virtual_policy::VirtualPolicy::compile` judges the profile list on
     /// what it parses to, so `[]` leaves the committed `.keepervirtual` deciding.
+    /// That is silence about the *pattern* question only — since Story 56.16 an
+    /// empty list no longer leaves `virtual_over_bytes` inert, because a floor
+    /// with no permissive pattern in force anywhere is itself the selector.
     pub virtual_patterns: Vec<String>,
-    /// The smallest size, in bytes, a matched path may stay unmaterialized at
+    /// The smallest size, in bytes, a path may stay unmaterialized at
     /// (inclusive).
+    ///
+    /// A floor under the whole policy and, when no permissive pattern is in
+    /// force from any source, the selector itself (Story 56.16). It read "a
+    /// matched path" until then, and that word described a match that never
+    /// happened: the owner's `virtualPatterns: []` with a 1 MiB floor selected
+    /// nothing and his whole folder downloaded.
     ///
     /// `0` is keeper's documented "no floor" and not an absence, which is why
     /// this is a plain `u64` and not an `Option`: no value of this field means
-    /// "unset", so there is nothing for a `None` to say.
+    /// "unset", so there is nothing for a `None` to say. It stays silent under
+    /// 56.16 too — a zero floor selects nothing, whatever the pattern list.
     #[ts(type = "number")]
     pub virtual_over_bytes: u64,
     /// How long content may stay on this machine after its release clock last
@@ -678,9 +688,12 @@ pub struct SyncProfileReq {
     /// the stored list exactly as it is.
     #[serde(default)]
     pub virtual_patterns: Option<Vec<String>>,
-    /// The size floor to store, in bytes. `0` is keeper's documented "no floor"
-    /// and is a value like any other, so a blank box sends `0` rather than
-    /// omitting the key; `None` here is still only "no control for this".
+    /// The size floor to store, in bytes — the smallest size a path may stay
+    /// unmaterialized at, and, when no permissive pattern is in force from any
+    /// source, the thing that decides which paths do (Story 56.16). `0` is
+    /// keeper's documented "no floor" and is a value like any other, so a blank
+    /// box sends `0` rather than omitting the key; `None` here is still only
+    /// "no control for this".
     #[serde(default)]
     #[ts(type = "number | null")]
     pub virtual_over_bytes: Option<u64>,
@@ -921,6 +934,12 @@ pub fn sync_ipc_error(err: &SyncError) -> IpcError {
         // verbatim. `retriable` is `false` from `Retriability::Permanent`,
         // which is correct: asking again unchanged gets the same answer.
         SyncError::Refused(_) => IpcErrorCode::Internal,
+        // The fourth of the same shape (Story 56.15): this folder's working
+        // copy was never finished, so sync genuinely cannot continue right
+        // now — and keeper is already retrying it on the journal's backoff.
+        // `syncUnavailable` says exactly that, where `internal` would dress a
+        // condition keeper is fixing as a defect in front of the user.
+        SyncError::CheckoutUnfinished { .. } => IpcErrorCode::SyncUnavailable,
         // Everything else keeps the `internal` this funnel has always given it.
         // Spelled out rather than defaulted so that growing the taxonomy asks
         // the question here instead of answering it.
@@ -2647,6 +2666,18 @@ pub async fn sync_open_entry(
 /// is a separate process and its own reservation, which is stated on
 /// `Engine::materialize_entry`.
 ///
+/// **`keep_for_ms` is how long the person wants the file** (Story 56.17), in
+/// milliseconds, and it is the row's submenu rather than a setting: absent
+/// means the caller named no duration and any standing one is left exactly as
+/// it is, `0` means *indefinitely* and withdraws one, and a positive value
+/// keeps this path's content that long whatever the folder's own release
+/// interval says — shorter goes sooner, longer stays longer. The reading of
+/// those three cases is `keeper_sync::lfs::hydrate::KeepFor::from_ms`, shared
+/// with `keeper-syncd materialize --for`, because a zero must not mean two
+/// things on two surfaces. Every rule behind it — the pin's floor, FR-341's
+/// refusal to put unconfirmed local content on any clock at all — is the
+/// engine's and is unchanged here.
+///
 /// Rejects with: `syncUnavailable` (the folder is already syncing), `internal`
 /// (no such profile, an unplugged removable volume, a subpath that escapes the
 /// root — including through a symlinked parent, a path that is not a tracked
@@ -2658,15 +2689,18 @@ pub async fn sync_materialize_entry(
     state: tauri::State<'_, AppState>,
     id: String,
     subpath: String,
+    keep_for_ms: Option<u64>,
 ) -> Result<(), IpcError> {
     // The owned `Arc` `engine_of` hands back is moved into the blocking task
     // rather than borrowed: `Engine` lives behind an `Arc` precisely so a call
     // that may copy gigabytes can hold it without holding `state`.
     let engine = engine_of(&state)?;
     let asked = subpath.clone();
-    let done = tokio::task::spawn_blocking(move || engine.materialize_entry(&id, &subpath))
-        .await
-        .map_err(|err| open_failure(format!("could not materialize {asked}: {err}")))?;
+    let keep_for = keeper_sync::lfs::hydrate::KeepFor::from_ms(keep_for_ms);
+    let done =
+        tokio::task::spawn_blocking(move || engine.materialize_entry(&id, &subpath, keep_for))
+            .await
+            .map_err(|err| open_failure(format!("could not materialize {asked}: {err}")))?;
     match done {
         Ok(outcome) => {
             tracing::info!(

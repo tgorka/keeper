@@ -6,7 +6,11 @@
 //! question that has to be settled before any of that is reachable: *may this
 //! path's content be absent?* It compiles the repository's committed pattern
 //! file plus whatever the resolved profile says into two pattern sets and a size
-//! floor, and answers per path.
+//! floor, and answers per path. The floor is a floor under the other terms and,
+//! when no permissive pattern is in force from any source, the selector itself
+//! (Story 56.16): a size is a statement about which files may stay away, and
+//! requiring a pattern beside it made "keep the big ones away" a control that
+//! silently did nothing.
 //!
 //! # The separation this module is on the safe side of
 //!
@@ -95,16 +99,15 @@ pub enum Virtualization {
     Materialize,
 }
 
-/// Which source the **pattern list** in force came from.
+/// What the policy in force came from.
 ///
 /// AD-132 wants a surface that can show which tier is speaking, and a user
-/// debugging "why is this file not here" needs to be told which file to edit.
-/// Two honest limits, stated here so no caller reads more into it than it
-/// knows: the size floor is always the profile's (a size has no spelling in
-/// gitignore dialect, so the committed file cannot carry one), and the
-/// protections are the *union* of every source, so neither of those is what
-/// this answers. It answers exactly one question — which list decided what
-/// *may* stay away.
+/// debugging "why is this file not here" needs to be told which knob to
+/// change. Two honest limits, stated here so no caller reads more into it than
+/// it knows: a size has no spelling in gitignore dialect, so a floor can only
+/// ever come from a profile tier, and the protections are the *union* of every
+/// source, so this never answers which source protected a path. It answers
+/// exactly one question — what decided that anything at all *may* stay away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VirtualPolicyTier {
     /// No source said anything: nothing may stay away.
@@ -114,10 +117,32 @@ pub enum VirtualPolicyTier {
     /// The resolved profile — its stored row or a folder TOML layer above it —
     /// replaced the file's list.
     Profile,
+    /// No pattern list authorized anything, and the profile's size floor is the
+    /// selector (Story 56.16).
+    ///
+    /// Its own variant rather than a reuse of `Profile`, and not for tidiness:
+    /// `Profile` would claim `virtualPatterns` decided what may stay away, and
+    /// that list is empty in this state — so a regression that stopped the
+    /// floor selecting could still pass a `Profile` assertion while nothing
+    /// stayed away at all. It cannot pass one that names this.
+    ///
+    /// Reaching this variant also changes what [`crate::engine`]'s `verify`
+    /// calls a fault: it excuses an absent object whenever the tier is anything
+    /// but `Unset`, so a folder whose only control is the floor stops reporting
+    /// every absent object as missing content and starts counting those above
+    /// the floor as virtual. That is the answer the owner asked for — under the
+    /// old reading his floor selected nothing, so absent content in that folder
+    /// really was unexplained — and it is also, stated plainly, a signal going
+    /// quiet: anybody who set a floor while the setting was inert loses the
+    /// fault report that would have told them content had gone missing for some
+    /// other reason. The trade is narrow by construction, because the floor's
+    /// default is `0` and a zero floor never reaches this variant: only a
+    /// folder where a person typed a positive floor is affected at all.
+    SizeFloor,
 }
 
-/// The compiled policy: two pattern sets, a size floor, and which tier they came
-/// from.
+/// The compiled policy: two pattern sets, a size floor that may itself be the
+/// selector, and what the answers came from.
 ///
 /// Fields are private, as [`crate::lfs::stage::LfsPolicy`]'s are: the compiled
 /// sets are an implementation of the question, and a caller that reached into
@@ -141,7 +166,17 @@ pub struct VirtualPolicy {
     /// exactly.
     never: PatternSet,
     /// Smallest size that may stay away, inclusive. `0` means no floor.
+    ///
+    /// A floor under every other term of the policy and, when `floor_selects`
+    /// holds, the term that selects.
     over_bytes: u64,
+    /// Whether the floor is the only thing selecting anything (Story 56.16).
+    ///
+    /// True exactly when the effective permissive set is empty and the floor is
+    /// positive. The owner who saved a 1 MiB floor and no patterns had stated a
+    /// policy about size; `resolve` demanding a pattern match on top of it made
+    /// the setting accept-and-ignore, and his whole 16 GB folder downloaded.
+    floor_selects: bool,
     tier: VirtualPolicyTier,
 }
 
@@ -213,6 +248,17 @@ impl VirtualPolicy {
         };
         let patterns = PatternSet::anchored(&Parsed::entries(source, positive))?;
 
+        // The floor selects on its own when no permissive line is in force
+        // anywhere (Story 56.16). Computed from the **effective** set, after
+        // the precedence above has run, so a folder that already names files
+        // keeps naming exactly those and the floor never widens a zone some
+        // source did name — it keeps its old job of holding the small ones
+        // back inside that zone. A zero floor stays silent: `0` is the
+        // documented spelling of "no floor" and every profile ever written
+        // carries it, so reading it as a selector would authorize dehydrating
+        // every unconfigured folder in existence on the next sync.
+        let floor_selects = patterns.is_empty() && profile.virtual_over_bytes > 0;
+
         // Protections accumulate across every source; only the permissive half
         // is either-or. AD-123: a policy edit may widen what may leave and may
         // never narrow what is kept, so a machine restating the repository's
@@ -221,13 +267,22 @@ impl VirtualPolicy {
         never.extend(Parsed::entries(PROFILE_SOURCE, &from_profile.never));
         let never = PatternSet::anchored(&never)?;
 
-        // Which tier the list in force came from, in the order it is decided
-        // above: the profile when it supplied the permissive list, the file when
-        // it did, and the profile again when it is the only source that spoke at
-        // all — a protections-only profile list over no file is a policy, and
-        // reporting `Unset` for it would say nothing configured anything.
+        // What the policy in force came from, in the order it is decided above:
+        // the profile when it supplied the permissive list, the floor when no
+        // list authorized anything and a positive floor therefore does, the
+        // file when it stated the list, and the profile again when it is the
+        // only source that spoke at all — a protections-only profile list over
+        // no file is a policy, and reporting `Unset` for it would say nothing
+        // configured anything.
+        //
+        // `overrides` and `floor_selects` are mutually exclusive — `overrides`
+        // implies a non-empty `patterns` — so their order relative to each
+        // other is immaterial, and it reads best with the two pattern-list
+        // answers kept together.
         let tier = if overrides {
             VirtualPolicyTier::Profile
+        } else if floor_selects {
+            VirtualPolicyTier::SizeFloor
         } else if file.says_something() {
             VirtualPolicyTier::PatternFile
         } else if from_profile.says_something() {
@@ -243,6 +298,7 @@ impl VirtualPolicy {
             // expressible in gitignore dialect, so the committed file has no
             // spelling for it at all.
             over_bytes: profile.virtual_over_bytes,
+            floor_selects,
             tier,
         })
     }
@@ -267,6 +323,13 @@ impl VirtualPolicy {
     /// bytes and the only safe direction to err in is keeping them. Same shape,
     /// and same reason, as [`crate::lfs::stage::LfsPolicy::applies`].
     ///
+    /// The size floor is a floor under every other term and, when nothing else
+    /// selects, the term that selects: with no permissive line in force from
+    /// any source and a positive floor, every path at or above it may stay away
+    /// (Story 56.16). It never reaches past the two gates above it — a
+    /// protection and a control file each still win unconditionally — so the
+    /// widest configuration keeper can express is still inside AD-123's rule.
+    ///
     /// A `Virtual` answer is an authorization, never an instruction, and it says
     /// nothing about whether the path is an LFS candidate at all: the caller
     /// hands over paths that already hold pointer text, so a path this profile
@@ -280,14 +343,15 @@ impl VirtualPolicy {
         if size < self.over_bytes || self.never.matches(rela) {
             return Virtualization::Materialize;
         }
-        if self.patterns.matches(rela) {
+        if self.floor_selects || self.patterns.matches(rela) {
             Virtualization::Virtual
         } else {
             Virtualization::Materialize
         }
     }
 
-    /// Which tier the pattern list in force came from.
+    /// What the policy in force came from — which pattern list, or the size
+    /// floor when no list authorized anything.
     pub fn tier(&self) -> VirtualPolicyTier {
         self.tier
     }
@@ -296,21 +360,44 @@ impl VirtualPolicy {
     /// all.
     ///
     /// Distinct from [`Self::tier`], and the distinction is load-bearing rather
-    /// than pedantic. `tier` answers *which list decided what may stay away*,
-    /// and it is `Unset` only when no source said anything — but a source that
-    /// consists of nothing but `!` protections **does** say something, so a
-    /// committed `.keepervirtual` holding only `!30-masters/**` compiles to an
-    /// empty permissive set and a tier of
+    /// than pedantic. `tier` answers *what decided that anything may stay
+    /// away*, and it is `Unset` only when no source said anything — but a
+    /// source that consists of nothing but `!` protections **does** say
+    /// something, so a committed `.keepervirtual` holding only `!30-masters/**`
+    /// compiles to an empty permissive set and a tier of
     /// [`VirtualPolicyTier::PatternFile`]. A caller asking "is there any point
     /// consulting me?" — [`crate::engine`]'s release gate is the one that must,
     /// because the alternative is opening the repository and reading the index
     /// once per candidate row to be told no — has to ask this, not the tier.
     ///
-    /// It answers about the permissive half only. A protection cannot make a
-    /// path virtual, so a policy that authorizes nothing answers `Materialize`
-    /// for every path however many protections it carries.
+    /// It answers about the permissive half only — a protection cannot make a
+    /// path virtual, so a policy carrying nothing but protections answers
+    /// `Materialize` for every path however many it carries — plus the floor,
+    /// which since Story 56.16 selects on its own when no list authorized
+    /// anything. The floor has to participate here: it is what says something
+    /// in that state, and a gate that asked only about patterns would skip
+    /// precisely the folder whose only control is the floor.
+    ///
+    /// Answering yes is not only a cost question, and counting the floor is
+    /// where that stops being a detail. `engine::release_mode_gate` refuses a
+    /// whole `LfsMode::Materialize` folder with
+    /// `ContentRefusal::AlwaysMaterializes` when this answers false, so
+    /// including the floor here **arms the release sweep** — the pass that
+    /// removes local content — for folders that were exempt from it before.
+    /// That is the point rather than a side effect: a folder that may never let
+    /// go of a byte can never become light, and light is what `tgdrive-light`
+    /// was named and configured for. What the sweep gains is permission to
+    /// consider the folder, never permission to delete — every individual
+    /// deletion is still gated by its own per-object proof (the committed
+    /// pointer's identity hash, `remote_serves` re-checked at the moment of
+    /// deletion, the pin read taken twice, the fail-closed open-file probe), so
+    /// AD-123 is exactly where it was. And the folders whose behaviour moves
+    /// are precisely those with a positive floor and no permissive pattern from
+    /// any source: folders whose floor was until now a dead control, typed
+    /// deliberately by a person, since the default is `0` and `0` never makes
+    /// `floor_selects` true.
     pub fn authorizes_anything(&self) -> bool {
-        !self.patterns.is_empty()
+        self.floor_selects || !self.patterns.is_empty()
     }
 }
 
@@ -492,11 +579,35 @@ fn anchor_line(body: &str) -> Option<String> {
 /// silently drops a root component — so `/home/u/tgdrive/a.mp4` would be matched
 /// as `home/u/tgdrive/a.mp4` and a basename pattern would answer `Virtual` for
 /// a file this repository does not contain.
+///
+/// A path with no `Normal` component at all — `""`, `"."` — is the third
+/// violation of the same frame, and the one Story 56.16 made reachable. Both
+/// are relative and neither carries a `..`, so they used to pass this guard,
+/// and they still answered `Materialize` only because `exclude::match_string`
+/// renders both to the empty string and `PatternSet::matches` refuses an empty
+/// candidate. A floor that selects on its own short-circuits ahead of the
+/// pattern set, so under a floor-only policy the repository root itself
+/// answered `Virtual`. Requiring one named component is the fix, and it belongs
+/// here rather than downstream: `engine`'s release scan reaches `resolve` with a
+/// ledger-supplied `Path::new(&row.path)` whose contents this module does not
+/// get to choose, and the module's own stated position is that a precondition
+/// only warned about in a comment is one a caller breaks.
 fn is_inside_the_repository(rela: &Path) -> bool {
-    rela.is_relative()
-        && !rela
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
+    if !rela.is_relative() {
+        return false;
+    }
+    // One walk, because both remaining answers come from the same components: a
+    // `..` anywhere leaves the frame, and a path that never names anything is
+    // not a path inside it.
+    let mut names_something = false;
+    for part in rela.components() {
+        match part {
+            Component::ParentDir => return false,
+            Component::Normal(_) => names_something = true,
+            _ => {}
+        }
+    }
+    names_something
 }
 
 /// Files whose own bytes carry the rules, and which therefore may never be
@@ -1495,5 +1606,298 @@ mod tests {
             !text.contains("**/!"),
             "and must not quote the glob keeper derived, got: {text}"
         );
+    }
+
+    /// The owner's own stored row, verbatim, and the defect this story exists
+    /// for (Story 56.16):
+    ///
+    /// ```json
+    /// {"name":"tgdrive-light","lfsMode":"materialize","lfsThresholdBytes":262144,"virtualPatterns":[],"virtualOverBytes":1048576}
+    /// ```
+    ///
+    /// He named the folder for what he wanted from it and set a 1 MiB floor,
+    /// which can only mean "don't fetch the big files". Without the fix
+    /// `resolve` demanded `self.patterns.matches(rela)` before it would answer
+    /// `Virtual`, and with no permissive line in any source the compiled set is
+    /// empty and matches nothing — so the 4 MiB assertion below read
+    /// `Materialize`, `tier()` read `Unset`, `authorizes_anything()` was false,
+    /// and all 16 GB of the folder downloaded. A control that silently did
+    /// nothing, with a form note describing a match that never happens.
+    #[test]
+    fn the_owners_stored_configuration_keeps_his_large_files_away() {
+        let dir = worktree(None);
+        let mut p = profile(dir.path());
+        p.lfs_mode = crate::profile::LfsMode::Materialize;
+        p.lfs_threshold_bytes = 262_144;
+        p.virtual_patterns = vec![];
+        p.virtual_over_bytes = 1024 * 1024;
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+
+        assert_eq!(
+            policy.resolve(Path::new("40-media/holiday.mov"), 4 * 1024 * 1024),
+            Virtualization::Virtual,
+            "a file above the floor is what the floor was set to keep away"
+        );
+        assert_eq!(
+            policy.resolve(Path::new("10-notes/scan.png"), 64 * 1024),
+            Virtualization::Materialize,
+            "and one below it is still fetched: the floor is the whole selector"
+        );
+        assert_eq!(
+            policy.resolve(Path::new("40-media/exact.mov"), 1024 * 1024),
+            Virtualization::Virtual,
+            "exactly at the floor stays away — the boundary is inclusive, as \
+             `LfsPolicy`'s threshold is"
+        );
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::SizeFloor,
+            "the floor is the source that decided, and the surface must be able \
+             to say so rather than report nothing configured"
+        );
+        assert!(
+            policy.authorizes_anything(),
+            "the engine's release gate skips a policy that authorizes nothing, \
+             so a floor that selects has to answer yes here or it never runs"
+        );
+    }
+
+    /// A floor that selects on its own is still only an authorization, so a
+    /// protection committed to the repository beats it exactly as it beats a
+    /// pattern (AD-123, Story 56.16).
+    ///
+    /// This is the assertion that keeps the new selector inside the existing
+    /// safety rule rather than beside it. Written before the fix it passed
+    /// vacuously — nothing was virtual at all — so it is only load-bearing
+    /// once the floor selects: a fix that answered `Virtual` from the floor
+    /// *before* consulting `never` would have dehydrated the one zone the
+    /// repository explicitly named.
+    #[test]
+    fn a_committed_protection_still_wins_over_a_floor_that_selects_on_its_own() {
+        let dir = worktree(Some("!30-masters\n"));
+        let mut p = profile(dir.path());
+        p.virtual_over_bytes = 1024 * 1024;
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+
+        assert_eq!(
+            policy.resolve(Path::new("30-masters/a.mov"), 4 * 1024 * 1024),
+            Virtualization::Materialize,
+            "the committed protection wins over the floor, unconditionally"
+        );
+        assert_eq!(
+            policy.resolve(Path::new("40-media/a.mov"), 4 * 1024 * 1024),
+            Virtualization::Virtual,
+            "and it protects only what it names: the floor still selects the rest"
+        );
+    }
+
+    /// The same, from the machine's own list — and the tier is the interesting
+    /// half (Story 56.16 over 56.14).
+    ///
+    /// A `!`-only list does not override anything (Story 56.14: the override is
+    /// decided on the permissive half alone), so the effective permissive set
+    /// is empty and the floor is what selects. `tier()` must therefore say
+    /// `SizeFloor` and not `Profile`: `Profile` would claim `virtualPatterns`
+    /// decided what may stay away, which is the empty list, and a regression
+    /// that stopped the floor selecting could then still pass a tier assertion.
+    /// Without the fix this test failed on the `40-media` line — `Materialize`,
+    /// nothing selected anything — and on the tier, which read `Profile`.
+    #[test]
+    fn a_profile_protection_still_wins_over_a_floor_that_selects_on_its_own() {
+        let dir = worktree(None);
+        let mut p = profile(dir.path());
+        p.virtual_patterns = vec!["!30-masters".into()];
+        p.virtual_over_bytes = 1024 * 1024;
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+
+        assert_eq!(
+            policy.resolve(Path::new("30-masters/a.mov"), 4 * 1024 * 1024),
+            Virtualization::Materialize,
+            "the machine's own protection wins over the floor too"
+        );
+        assert_eq!(
+            policy.resolve(Path::new("40-media/a.mov"), 4 * 1024 * 1024),
+            Virtualization::Virtual,
+            "and the floor selects everything it did not name"
+        );
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::SizeFloor,
+            "a `!`-only list overrides nothing, so the permissive set is empty \
+             and the floor is the source that decided"
+        );
+    }
+
+    /// The floor never widens a zone some source already named (Story 56.16).
+    ///
+    /// `floor_selects` is computed from the *effective* permissive set, after
+    /// precedence has run, so a folder that names files keeps naming exactly
+    /// those and the floor keeps its old job of holding the small ones back.
+    /// The `50-iso` line is what a floor computed before precedence — or one
+    /// that ignored the pattern set entirely — would have failed: it would
+    /// have read `Virtual` for a zone the committed file never mentions, which
+    /// is a folder silently dehydrating on upgrade.
+    #[test]
+    fn a_floor_never_widens_a_zone_a_pattern_file_already_named() {
+        let dir = worktree(Some("40-media/**\n"));
+        let mut p = profile(dir.path());
+        p.virtual_over_bytes = 1024 * 1024;
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+
+        assert_eq!(
+            policy.resolve(Path::new("50-iso/big.iso"), 4 * 1024 * 1024),
+            Virtualization::Materialize,
+            "a zone no source named must not gain a selector from the floor"
+        );
+        assert_eq!(
+            policy.resolve(Path::new("40-media/a.mov"), 4 * 1024 * 1024),
+            Virtualization::Virtual,
+            "the named zone is unchanged"
+        );
+        assert_eq!(
+            policy.resolve(Path::new("40-media/small.mov"), 64 * 1024),
+            Virtualization::Materialize,
+            "and inside it the floor still does its old job of holding the \
+             small ones back"
+        );
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::PatternFile,
+            "the file supplied the list in force, so that is still the file to edit"
+        );
+    }
+
+    /// A floor of `0` with no patterns says nothing, and has to keep saying
+    /// nothing (Story 56.16).
+    ///
+    /// This is the other silent reading, and the one the fix must not create.
+    /// `0` is the default every profile ever written carries, and it is the
+    /// documented spelling of "no floor" — so if the floor is now what selects,
+    /// zero must select nothing at all. A `floor_selects` computed as
+    /// `patterns.is_empty()` alone would have made every unconfigured folder in
+    /// existence answer `Virtual` for every LFS path on the next sync, which is
+    /// the whole 16 GB failure inverted and running on everybody's machine.
+    #[test]
+    fn a_floor_of_zero_with_no_patterns_still_says_nothing() {
+        let dir = worktree(None);
+        let mut p = profile(dir.path());
+        p.virtual_over_bytes = 0;
+        assert!(
+            p.virtual_patterns.is_empty(),
+            "the default is an empty list"
+        );
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::Unset,
+            "no source said anything, and a zero floor is not a source saying \
+             something"
+        );
+        assert!(
+            !policy.authorizes_anything(),
+            "so there is no point consulting this policy at all"
+        );
+        assert_eq!(
+            policy.resolve(Path::new("40-media/a.mov"), 10_000_000),
+            Virtualization::Materialize,
+            "and nothing of any size may stay away"
+        );
+    }
+
+    /// The sharpest hazard the new selector opens (Story 56.16).
+    ///
+    /// A floor-only policy authorizes by size and by nothing else, so it names
+    /// no path and excludes none either — and a repository whose own
+    /// `.gitattributes` had grown past the floor would have had its LFS routing
+    /// rules turned into pointer text, `.keepervirtual` would have become a
+    /// policy that erased itself, and the next `compile` would read
+    /// `version https://git-lfs.github.com/spec/v1` as a pattern. The control
+    /// carve-out already sits ahead of every other term in `resolve` and this
+    /// pins it there against a fix that answered from the floor first.
+    #[test]
+    fn a_control_file_is_never_virtual_under_a_floor_that_selects_on_its_own() {
+        let dir = worktree(None);
+        let mut p = profile(dir.path());
+        p.virtual_over_bytes = 1024 * 1024;
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::SizeFloor,
+            "the fixture really is a floor-only policy"
+        );
+
+        for control in [VIRTUAL_PATTERN_FILE, ".gitattributes", ".lfsconfig"] {
+            assert_eq!(
+                policy.resolve(Path::new(control), 4 * 1024 * 1024),
+                Virtualization::Materialize,
+                "{control} carries the rules; a floor must not be able to make \
+                 its own bytes optional"
+            );
+        }
+    }
+
+    /// The frame guard survives the new selector too (Story 56.16).
+    ///
+    /// `exclude::match_string` silently drops a root component, which is why an
+    /// absolute path used to be matched as a relative one; under a floor-only
+    /// policy there is no pattern to mismatch at all, so *nothing but* this
+    /// guard stands between a path outside the repository and a `Virtual`
+    /// answer. Anything the caller hands over that is not repository-relative
+    /// has to be refused on the frame violation, not on the size.
+    #[test]
+    fn a_path_outside_the_repository_is_still_never_virtual_under_a_floor() {
+        let dir = worktree(None);
+        let mut p = profile(dir.path());
+        p.virtual_over_bytes = 1024 * 1024;
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+
+        for outside in ["/home/u/tgdrive/40-media/a.mov", "40-media/../../etc/a.mov"] {
+            assert_eq!(
+                policy.resolve(Path::new(outside), 4 * 1024 * 1024),
+                Virtualization::Materialize,
+                "{outside} is outside the frame the policy is written against, \
+                 and a floor-only policy has no pattern to reject it for"
+            );
+        }
+    }
+
+    /// A path that names nothing is not a path a floor may select (Story
+    /// 56.16).
+    ///
+    /// `""` and `"."` are relative and carry no `..`, so the frame guard used
+    /// to admit them, and they resolved `Materialize` only by accident:
+    /// `exclude::match_string` renders both to the empty string and
+    /// `PatternSet::matches` refuses an empty candidate. `resolve`'s
+    /// `floor_selects ||` short-circuits ahead of the pattern set, so under a
+    /// floor-only policy both answered `Virtual` — the repository root itself
+    /// classified as releasable. No byte is deleted today, because
+    /// `release_target` refuses an empty subpath further down, but the
+    /// classification is already wrong at the point it is made, and leaning on
+    /// a downstream guard is exactly what this module refuses to do: the
+    /// consumers that reach `resolve` do it with a ledger-supplied
+    /// `Path::new(&row.path)`, whose contents this module does not get to
+    /// choose.
+    #[test]
+    fn a_path_with_no_components_is_not_selected_by_a_floor() {
+        let dir = worktree(None);
+        let mut p = profile(dir.path());
+        p.virtual_over_bytes = 1024 * 1024;
+        let policy = VirtualPolicy::compile(&p).expect("compiles");
+        assert_eq!(
+            policy.tier(),
+            VirtualPolicyTier::SizeFloor,
+            "the fixture really is a floor-only policy, or the assertions below \
+             would pass with nothing selecting anything at all"
+        );
+
+        for nothing in ["", "."] {
+            assert_eq!(
+                policy.resolve(Path::new(nothing), 4 * 1024 * 1024),
+                Virtualization::Materialize,
+                "{nothing:?} names no file in the repository, so there is \
+                 nothing here for a floor to authorize"
+            );
+        }
     }
 }

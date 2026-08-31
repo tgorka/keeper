@@ -3289,11 +3289,37 @@ export async function syncReadText(id: string, subpath: string): Promise<TextFil
  * off. Each rejection's message is Rust's own sentence, written to be shown
  * verbatim.
  *
+ * **A duration is optional, and it is milliseconds** (FR-341, Story 56.17).
+ * A positive value REPLACES the folder's own `releaseTtlMs` window for this one
+ * path, in BOTH directions: shorter and the content goes sooner than the folder
+ * would have let it, longer and it stays after the folder would have let it go.
+ * It is not a `min`, not a `max` and not added to the folder's interval.
+ *
+ * **Omitted and `0` are not quite the same, and the difference is one row.**
+ * Omitted means *this caller has no opinion about retention*: nothing is
+ * written and any deadline this path already carries is left standing, which is
+ * what this verb has meant since Story 56.3 and what every existing caller
+ * keeps. `0` means *indefinitely*, explicitly, and withdraws such a deadline.
+ * Both leave the path on the folder's own window, so on a path nobody has named
+ * a time for they are indistinguishable; they differ on a path asked for "for
+ * two hours" whose bytes have not landed yet.
+ *
+ * **What it cannot buy.** A pin still outranks it — a pinned path is released on
+ * no clock at all, whatever duration was named. And content this clone authored
+ * that nothing has confirmed the server holds is never released at any age
+ * (FR-341), so naming a short duration is not a way to make keeper throw away
+ * the only copy of something. Both refusals are decided in Rust, above the
+ * deadline, exactly as they were before this argument existed.
+ *
  * Rejects with: `syncUnavailable` (the folder is already syncing — the run in
  * progress will finish first), `unsupported`, `internal`.
  */
-export async function syncMaterializeEntry(id: string, subpath: string): Promise<void> {
-  await invoke<void>("sync_materialize_entry", { id, subpath });
+export async function syncMaterializeEntry(
+  id: string,
+  subpath: string,
+  keepForMs?: number,
+): Promise<void> {
+  await invoke<void>("sync_materialize_entry", { id, subpath, keepForMs });
 }
 
 /**

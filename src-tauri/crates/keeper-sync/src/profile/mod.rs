@@ -879,8 +879,19 @@ pub struct SyncProfile {
     /// upgrade, and a row written by this keeper still loads on the older one.
     #[serde(default)]
     pub virtual_patterns: Vec<String>,
-    /// Smallest size, in bytes, a matched path may stay unmaterialized at
-    /// (inclusive). `0` means no floor.
+    /// Smallest size, in bytes, a path may stay unmaterialized at (inclusive).
+    /// `0` means no floor, and no floor means nothing stays away.
+    ///
+    /// A floor under the whole policy and, when no permissive pattern is in
+    /// force from any source, the **selector** itself (Story 56.16): a size is
+    /// a statement about which files may stay away, so a folder carrying only
+    /// this key authorizes every LFS path at or above it, under
+    /// `VirtualPolicyTier::SizeFloor`. It used to read "a matched path", and
+    /// that word was the whole defect — the owner who saved a 1 MiB floor with
+    /// an empty `virtual_patterns` had a control that silently did nothing and
+    /// downloaded all 16 GB. `0` is untouched by that: it is the default every
+    /// row ever written carries, so it still means silence rather than "every
+    /// file", and `tier()` still reports `Unset` for it.
     ///
     /// Every term of the policy has to be answerable from the LFS pointer and
     /// never from the bytes (AD-122) — reading the bytes to decide whether the

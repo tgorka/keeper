@@ -2038,6 +2038,256 @@ pub fn head_commit_id(repo: &gix::Repository) -> Result<Option<gix::hash::Object
     Ok(id.map(gix::Id::detach))
 }
 
+/// Whether this repository's index holds no entries at all.
+///
+/// A repository that has never been staged answers `true` and so does one
+/// whose index file is missing; both are the same fact and neither is an
+/// error. See [`checkout_is_unfinished`] for the condition this is half of.
+pub fn index_is_unpopulated(repo: &gix::Repository) -> Result<bool> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    Ok(index.entries().is_empty())
+}
+
+/// How many entries `.git/index` claims, read from its 12-byte header
+/// (Story 56.15).
+///
+/// `0` for an index that is absent, truncated, or not a `DIRC` file at all —
+/// all of which mean the same thing to the only caller: this repository has no
+/// working copy recorded.
+///
+/// # Why not `index_or_empty`
+///
+/// Because the supervisor asks once per second per profile, and
+/// [`index_is_unpopulated`] maps and *parses* the whole file to answer: on the
+/// folder this was written for that is 155 625 entries and roughly 10 MB, to
+/// learn a number the header states in four bytes. The header is `DIRC`, a
+/// big-endian version, and a big-endian entry count, and git has never written
+/// it otherwise.
+///
+/// This is a *screen*, never the verdict: a non-zero answer ends the question,
+/// and a zero answer sends the caller to [`checkout_is_unfinished`], which
+/// opens the repository and asks properly.
+pub fn index_entry_count(git_dir: &Path) -> u32 {
+    use std::io::Read as _;
+
+    let Ok(mut file) = std::fs::File::open(git_dir.join("index")) else {
+        return 0;
+    };
+    let mut header = [0u8; 12];
+    if file.read_exact(&mut header).is_err() || &header[..4] != b"DIRC" {
+        return 0;
+    }
+    u32::from_be_bytes([header[8], header[9], header[10], header[11]])
+}
+
+/// Whether this repository is a checkout that never finished: `HEAD` holds a
+/// tree with content in it, and the index holds nothing (Story 56.15).
+///
+/// # Why this exact shape, and why it cannot be anything else
+///
+/// git never leaves a repository here. A checkout writes the index and the
+/// worktree together; a `git rm -r .` writes an index with the removals in it,
+/// not an index with no entries. The only ways in are a clone or a checkout
+/// killed between the fetch and [`gix::clone::PrepareCheckout::main_worktree`]
+/// writing the index, and somebody deleting `.git/index` by hand. Both mean
+/// the same thing: **this working copy was never made**.
+///
+/// It matters because of what the status walk does with it. `gix::status`
+/// diffs `HEAD`'s tree against the index before it looks at the worktree at
+/// all, so every path in `HEAD` comes back as
+/// `gix::diff::index::Change::Deletion` — see [`push_item`], which files those
+/// into `RepoStatus::deleted`. On the folder this was written for that is
+/// 155 625 deletions per pass, out of an index that could not contribute one,
+/// which is exactly the arithmetic the field log shows:
+/// `entries=155625 scanned=0 … deleted=155625` — `scanned` counts index
+/// entries compared against the worktree, and an empty index compares none.
+///
+/// The `HEAD` tree is required to be non-empty so that a repository whose
+/// first commit is genuinely empty is not accused of anything.
+pub fn checkout_is_unfinished(repo: &gix::Repository) -> Result<bool> {
+    let Some(head) = head_commit_id(repo)? else {
+        // Unborn: nothing has been checked out because nothing exists yet.
+        return Ok(false);
+    };
+    if !index_is_unpopulated(repo)? {
+        return Ok(false);
+    }
+    let commit = repo.find_commit(head).map_err(|err| {
+        SyncError::Git(format!(
+            "could not read the HEAD commit: {}",
+            super::fetch::flatten(&err)
+        ))
+    })?;
+    let tree = commit.tree().map_err(|err| {
+        SyncError::Git(format!(
+            "could not read the HEAD tree: {}",
+            super::fetch::flatten(&err)
+        ))
+    })?;
+    let has_content = tree.iter().next().is_some();
+    Ok(has_content)
+}
+
+/// What [`restore_missing_checkout`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutRepair {
+    /// Paths written into the worktree from `HEAD` because nothing was there.
+    pub restored: usize,
+    /// Paths left exactly as they were, because something already was.
+    pub kept: usize,
+    /// Why this repair is not finished, when it is not. `None` means the
+    /// index was written and the working copy is whole.
+    pub unfinished: Option<String>,
+}
+
+/// Finish a checkout that stopped, **writing only what is missing**
+/// (Story 56.15).
+///
+/// The repair for [`checkout_is_unfinished`]: build the index `HEAD` implies,
+/// write into the worktree every path that is not there, and save the index —
+/// but only once every entry provably has a file behind it.
+///
+/// # Refuse first, repair second — and why this order is the safety argument
+///
+/// Repairing is what the owner wants and refusing is what is safe, so this
+/// does both, in an order a later caller cannot reverse.
+///
+/// * The **refusal** ([`super::commit::stage_and_commit`]'s empty-index guard)
+///   is unconditional and lives at the one place a commit is made. It does not
+///   consult this function and this function cannot switch it off. A repair
+///   that half-worked, crashed, or was never reached therefore leaves the
+///   refusal standing.
+/// * The **repair** only ever ADDS. `destination_is_initially_empty` is set
+///   `true`, which makes `gix_worktree_state` open every destination with
+///   `create_new` — so a path that already exists fails with `AlreadyExists`
+///   and is recorded as a collision rather than truncated. That is the whole
+///   safety property, and the OS enforces it rather than a check here: with
+///   `destination_is_initially_empty = false` the same call opens with
+///   `create(true).truncate(true)` and would overwrite a user's files with
+///   whatever `HEAD` happens to hold. There is no freshness filter anywhere in
+///   that code path — every entry is written — so `overwrite_existing = false`
+///   alone does **not** protect the bytes, whatever its own doc suggests.
+/// * The index is written **last, and only when the repair is whole**. An
+///   index built from `HEAD` names every path; a worktree that received only
+///   half of them would then read the other half as deleted, which is the very
+///   catastrophe this exists to prevent. So an interrupt, an IO error, or a
+///   collision that is not "a file is already here" all leave the index
+///   untouched and the repository exactly as it was — refused, and retried on
+///   the next pass.
+///
+/// The clone that produces this state only ever runs against an EMPTY
+/// destination (`Engine::open_repo` checks), so in the ordinary case every
+/// file this writes is one keeper's own checkout was supposed to have written
+/// from this same commit. A collision means somebody put something there
+/// since, and leaving it alone is the only defensible answer.
+pub fn restore_missing_checkout(
+    repo: &gix::Repository,
+    interrupt: &AtomicBool,
+) -> Result<CheckoutRepair> {
+    let workdir = workdir(repo)?;
+    let Some(head) = head_commit_id(repo)? else {
+        return Ok(CheckoutRepair {
+            restored: 0,
+            kept: 0,
+            unfinished: Some("this folder has no commits to restore from".to_owned()),
+        });
+    };
+    let tree = repo
+        .find_commit(head)
+        .map_err(|err| {
+            SyncError::Git(format!(
+                "could not read the HEAD commit: {}",
+                super::fetch::flatten(&err)
+            ))
+        })?
+        .tree_id()
+        .map_err(|err| SyncError::Git(format!("could not read the HEAD tree: {err}")))?
+        .detach();
+    let mut index = repo
+        .index_from_tree(&tree)
+        .map_err(|err| SyncError::Git(format!("could not rebuild the index from HEAD: {err}")))?;
+
+    let mut options = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(|err| SyncError::Git(format!("could not read checkout options: {err}")))?;
+    // The two lines the whole safety argument rests on. See the doc above.
+    options.destination_is_initially_empty = true;
+    options.overwrite_existing = false;
+    // One failure must not abandon the rest: a repair that stops at the first
+    // unreadable path leaves a worktree *more* incomplete than it found, and
+    // the errors are counted rather than raised so the decision below is taken
+    // over all of them at once.
+    options.keep_going = true;
+
+    let objects = repo
+        .objects
+        .clone()
+        .into_arc()
+        .map_err(|err| SyncError::io("open the object database", repo.git_dir(), err))?;
+    let outcome = gix::worktree::state::checkout(
+        &mut index,
+        &workdir,
+        objects,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        interrupt,
+        options,
+    )
+    .map_err(|err| {
+        SyncError::Git(format!(
+            "could not finish the checkout: {}",
+            super::fetch::flatten(&err)
+        ))
+    })?;
+
+    // A collision means the path was left alone, so the index entry about to
+    // claim it is only true if a FILE is what is standing there. That has to
+    // be measured rather than read off the error kind: a directory where
+    // `HEAD` holds a file collides with `AlreadyExists` on Linux, exactly like
+    // a real file does, and writing an index over it would leave an entry
+    // whose worktree object is a directory — which the very next status walk
+    // reads as a deletion. One `lstat` per collision, and collisions are the
+    // exception, so this is bounded by them and not by the tree.
+    let (kept, blocked): (Vec<&_>, Vec<&_>) = outcome.collisions.iter().partition(|collision| {
+        let rela: &gix::bstr::BStr = collision.path.as_ref();
+        let path = workdir.join(gix::path::from_bstr(rela));
+        std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file() || meta.is_symlink())
+    });
+    let kept = kept.len();
+    let unfinished = if interrupt.load(Ordering::Relaxed) {
+        Some("it was interrupted before every file was written".to_owned())
+    } else if let Some(first) = outcome.errors.first() {
+        Some(format!(
+            "{} of its files could not be written (first: {}: {})",
+            outcome.errors.len(),
+            first.path,
+            first.error
+        ))
+    } else {
+        blocked.first().map(|first| {
+            format!(
+                "{} of its paths are blocked by something else on disk (first: {})",
+                blocked.len(),
+                first.path
+            )
+        })
+    };
+    if unfinished.is_none() {
+        index
+            .write(gix::index::write::Options::default())
+            .map_err(|err| SyncError::Git(format!("could not write the restored index: {err}")))?;
+    }
+    Ok(CheckoutRepair {
+        restored: outcome
+            .files_updated
+            .saturating_sub(outcome.collisions.len()),
+        kept,
+        unfinished,
+    })
+}
+
 /// Whether the index or the working tree differs from `HEAD`.
 ///
 /// Untracked files do **not** make a repository dirty, matching `git status`.
@@ -3359,6 +3609,85 @@ mod tests {
         // supervisor would on its next pass.
         let repo = open(dir.path(), true).expect("reopen");
         (dir, repo)
+    }
+
+    /// The load-bearing safety property of the repair (Story 56.15): it writes
+    /// what is MISSING and never a byte over what is there.
+    ///
+    /// The owner's folder holds 16 GB beside an index that holds nothing. A
+    /// repair that re-checked-out the whole tree would replace every one of
+    /// those files with whatever `HEAD` happens to carry — which is not a
+    /// deletion, but is the same class of loss, and it is what
+    /// `gix_worktree_state::checkout` does by default: there is no freshness
+    /// filter in that path, and `overwrite_existing = false` alone still opens
+    /// with `create(true).truncate(true)`.
+    #[test]
+    fn a_repair_writes_what_is_missing_and_overwrites_nothing() {
+        let (dir, _fixture) = repo_with_two_files();
+        // The interrupted-checkout state, plus the thing that makes it
+        // dangerous: one tracked path holds bytes that are NOT what HEAD says.
+        std::fs::remove_file(dir.path().join(".git/index")).expect("drop the index");
+        std::fs::remove_file(dir.path().join("b.txt")).expect("drop one worktree file");
+        std::fs::write(dir.path().join("a.txt"), "the owner's own bytes").expect("diverge a");
+        let repo = open(dir.path(), true).expect("reopen without an index");
+        assert!(checkout_is_unfinished(&repo).expect("classify"));
+
+        let interrupt = AtomicBool::new(false);
+        let repair = restore_missing_checkout(&repo, &interrupt).expect("repair");
+        assert_eq!(
+            repair.unfinished, None,
+            "a plain file collision is not a block"
+        );
+        assert_eq!(
+            repair.kept, 1,
+            "the path that was already there was left alone"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).expect("a.txt"),
+            "the owner's own bytes",
+            "NOT OVERWRITTEN: the whole reason this is safe to run unattended"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).expect("b.txt"),
+            "beta",
+            "and the missing one is restored from the commit that already exists here"
+        );
+        let repo = open(dir.path(), true).expect("reopen");
+        assert!(
+            !index_is_unpopulated(&repo).expect("index"),
+            "the index is written, so the next walk stops reading a mass deletion"
+        );
+    }
+
+    /// And when it cannot finish, it leaves the index alone — because an index
+    /// naming paths the worktree does not hold IS the mass deletion.
+    #[test]
+    fn a_repair_that_cannot_finish_writes_no_index() {
+        let (dir, _repo) = repo_with_two_files();
+        std::fs::remove_file(dir.path().join(".git/index")).expect("drop the index");
+        std::fs::remove_file(dir.path().join("a.txt")).expect("drop a");
+        std::fs::remove_file(dir.path().join("b.txt")).expect("drop b");
+        // A directory where HEAD holds a file: the write is refused and the
+        // path stays absent as a file, so an index claiming it would be false.
+        std::fs::create_dir(dir.path().join("a.txt")).expect("block a");
+        let repo = open(dir.path(), true).expect("reopen");
+
+        let interrupt = AtomicBool::new(false);
+        let repair = restore_missing_checkout(&repo, &interrupt).expect("repair");
+        assert!(
+            repair
+                .unfinished
+                .as_deref()
+                .is_some_and(|why| why.contains("blocked")),
+            "it has to say why, got: {:?}",
+            repair.unfinished
+        );
+        assert!(
+            !dir.path().join(".git/index").exists(),
+            "NO INDEX: half a checkout plus a full index is exactly the state \
+             that reads as a mass deletion"
+        );
     }
 
     /// Zero the stat data of one index entry, the way a plumbing write leaves

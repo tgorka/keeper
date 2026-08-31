@@ -171,6 +171,35 @@ pub fn stage_and_commit(
     // was sorted when we started. Everything pushed below lands after it.
     let sorted_len = index.entries().len();
 
+    // The last line of defence against the 2026-08-29 field failure, and the
+    // reason it is HERE rather than only at the caller (Story 56.15).
+    //
+    // An index with no entries cannot itself contribute a deletion — there is
+    // nothing in it to remove — so every path in `changes.deleted` reached
+    // this call from the tree↔index half of the walk
+    // (`gix::diff::index::Change::Deletion`, filed by
+    // `super::repo::push_item`). That is `HEAD`'s whole tree, read as though
+    // the user had deleted every tracked file: 155 625 of them on the folder
+    // this was written for. It is a checkout that never finished, never a
+    // deletion, and committing it would replace the tree with nothing.
+    //
+    // Placed above `index.write` and above the staging loop because the guard
+    // has to prevent the STAGING, not merely the commit: this function writes
+    // the index first on purpose (a crash between the two is meant to be
+    // re-driven), so a check taken any later would already have persisted the
+    // removals. Two integers, on a path that reads the index anyway.
+    if sorted_len == 0 && !changes.deleted.is_empty() {
+        return Err(SyncError::CheckoutUnfinished {
+            path: workdir.clone(),
+            detail: format!(
+                "It has commits but an empty index, so every tracked file reads as deleted — \
+                 {} of them. Nothing was committed and nothing on disk was touched. keeper \
+                 restores the missing files from the last commit on its next pass.",
+                changes.deleted.len()
+            ),
+        });
+    }
+
     // `files_done` counts paths this loop has finished, so a report names the
     // path being read next to the number already behind it — which is exactly
     // the pairing the engine publishes before staging starts, so the stream
@@ -685,6 +714,64 @@ mod tests {
         )
         .expect("no error");
         assert_eq!(got, None);
+    }
+
+    /// The innermost guarantee (Story 56.15): the one place a commit is made
+    /// refuses a deletion that came out of an empty index, whatever the caller
+    /// believed.
+    ///
+    /// Asserted HERE and not only through the engine, because the engine's own
+    /// refusal sits in front of the walk and would answer first — so a
+    /// mutation that removed this guard would leave every engine-level test
+    /// still green while the last line of defence was gone. This test reaches
+    /// past that door on purpose.
+    #[test]
+    fn a_deletion_out_of_an_empty_index_is_refused_and_never_staged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let head = commit_files(dir.path(), &repo, &[("a.txt", "alpha"), ("b.txt", "beta")])
+            .expect("a commit");
+
+        // The state an interrupted checkout leaves: HEAD holds the tree, the
+        // index holds nothing. `gix::status` then reports every tracked path
+        // as deleted, which is what a caller would hand in here.
+        std::fs::remove_file(dir.path().join(".git/index")).expect("drop the index");
+        let repo = gix::open(dir.path()).expect("reopen without an index");
+        let changes = StagedChange {
+            deleted: vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")],
+            ..Default::default()
+        };
+
+        let err = stage_and_commit(
+            &repo,
+            &changes,
+            &provenance(),
+            &profile(),
+            &signature(),
+            &no_lfs(),
+            None,
+        )
+        .expect_err("an empty index cannot authorize a deletion");
+        assert!(
+            matches!(err, SyncError::CheckoutUnfinished { .. }),
+            "the refusal has to be typed, got: {err:?}"
+        );
+
+        assert_eq!(
+            super::super::repo::head_commit_id(&repo).expect("head"),
+            Some(head),
+            "NO COMMIT: a tree with every path removed must never be written"
+        );
+        assert!(
+            !dir.path().join(".git/index").exists(),
+            "and NO INDEX either — this function writes the index before the \
+             commit, so a guard placed any later would already have staged the \
+             removals durably"
+        );
+        assert!(
+            dir.path().join("a.txt").exists() && dir.path().join("b.txt").exists(),
+            "nothing on disk is touched"
+        );
     }
 
     #[test]

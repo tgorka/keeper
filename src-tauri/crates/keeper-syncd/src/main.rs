@@ -31,7 +31,7 @@ use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
-use crate::commands::{Cli, Printer, EXIT_CONFIG, EXIT_OK};
+use crate::commands::{Cli, Printer, EXIT_CONFIG};
 use crate::platform::LinuxPlatform;
 
 #[tokio::main]
@@ -73,7 +73,11 @@ async fn main() -> ExitCode {
     init_logging(&platform.log_path(), verbose, configured_level.as_deref());
 
     let code = match commands::run(cli, platform, config_path, config).await {
-        Ok(()) => EXIT_OK,
+        // The verb's own answer, not a fixed `EXIT_OK`: since Story 57.3
+        // `tasks run` can succeed at doing nothing — an unplugged drive is
+        // `EXIT_DEFERRED`, which is neither a failure nor a plain success — and
+        // the number it measured is the one a cron wrapper branches on.
+        Ok(code) => code,
         Err(err) => {
             let code = err.exit_code();
             tracing::error!(error = %err, code = err.code(), exit = u64::from(code), "keeper-syncd failed");
