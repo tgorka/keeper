@@ -2157,7 +2157,9 @@ pub async fn sync_task_run_now(
 ) -> Result<TaskRunVm, IpcError> {
     let engine = engine_of(&state)?;
     let run = engine
-        .run_task_now(&id)
+        // Always a person: this command is the pane's Run now button, and 58.6's
+        // timer distinction is the CLI's to make.
+        .run_task_now(&id, keeper_sync::tasks::TaskRunDriver::Person)
         .await
         .map_err(|err| sync_ipc_error(&err))?;
     Ok(task_run_vm(&run))

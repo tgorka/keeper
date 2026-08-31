@@ -309,6 +309,42 @@ impl TaskMissedPolicy {
     }
 }
 
+/// Who asked for a run through the explicit run verb (Story 58.6, FR-358).
+///
+/// The engine's own `TaskTrigger` is private, and deliberately: `Scheduled` is
+/// the due-gate's to pass and nobody outside may claim to be it. This is the
+/// half a caller *may* choose, and it exists because **a timer is not a person**.
+///
+/// Nothing about the process can tell the two apart. `keeper-syncd-tasks@.service`
+/// runs the same binary with the same argv shape somebody would type, and a
+/// person may equally run the verb from a script — so an environment probe, a
+/// parent-process check or a TTY test would all be heuristics that are wrong
+/// silently, on the one box where the defect this distinction fixes exists. Only
+/// the caller knows, so the caller says.
+///
+/// A type rather than a `bool`, at every call site, for the reason this tree
+/// already states about two adjacent booleans: `run_task_now(id, true)` is a call
+/// nobody can read and anybody can invert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskRunDriver {
+    /// A person, or the app's Run now button, or a script somebody wrote.
+    ///
+    /// Asking for a run **now**, which is not asking whether one is due: the
+    /// claim demands no open window, and that is the whole point of it.
+    #[default]
+    Person,
+    /// A scheduled external driver — Story 57.7's `Persistent=true` timer —
+    /// wearing a manual verb.
+    ///
+    /// It gets the *window* discipline a scheduled run gets whenever an
+    /// in-process host is pacing the same task, because otherwise one missed
+    /// window yields two runs: the timer's request bypasses `db::claim_task`'s
+    /// window condition while the daemon's next tick claims the same past window
+    /// independently. When nothing in-process paces the task, this timer **is**
+    /// the schedule and claims like a request.
+    Timer,
+}
+
 /// How one run ended — or, for two of the seven, why there was no run at all.
 ///
 /// Five of the seven are deliberately **not** failures, and keeping them apart

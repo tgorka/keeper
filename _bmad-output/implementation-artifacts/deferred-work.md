@@ -5040,6 +5040,40 @@ status: open
     past — so a requested run landing on an overdue window is reachable in normal
     operation, not only in theory. Pre-existing: the doc and `next_task_window` both
     shipped before story 57.5's diff.
+  status: done 2026-08-31
+  resolution: |
+    Resolved by story 58.6 (FR-358, AD-138). The behaviour was right and the doc was
+    incomplete, but the ENTRY's second half named a real defect and that is what was
+    fixed: a box running both `keeper-syncd watch` and the `Persistent=true` timer got
+    TWO runs for one missed window, because the timer's `tasks run` arrived as
+    `TaskTrigger::Requested` and so passed `due_at_most: None`, bypassing
+    `db::claim_task`'s window condition, while the daemon's next tick claimed the same
+    past window as `Scheduled`.
+    The fix does not narrow what a request may claim — `due_at_most: None` exists so
+    that a person asking is not asking about a window, and a hand-run with nothing due
+    still runs, asserted by
+    `a_hand_run_with_nothing_due_still_runs_and_a_timer_does_not`. It stops calling a
+    TIMER a person: a third `TaskTrigger::Timer`, reached through an explicit
+    `--timer` flag on `tasks run` that the shipped `keeper-syncd-tasks@.service` now
+    passes, claims like the due-gate when an in-process host is pacing the same task
+    (`mode == Scheduled`) and like a request when nothing else paces it — so the
+    unit's own first recommended arrangement, timer-only with `--mode manual`, keeps
+    working. Explicit rather than inferred because nothing about the process can tell
+    a timer from a person: the service runs the same binary with the same argv shape
+    somebody would type.
+    Tests: `one_missed_window_and_both_drivers_yield_exactly_one_run` drives both
+    trigger kinds against ONE overdue window (not two connections against one lease,
+    which is 57.2's test and proves something else);
+    `a_timer_is_the_whole_schedule_when_nothing_in_process_paces_the_task` guards the
+    manual arrangement a naive fix would silently remove; and
+    `the_shipped_task_service_runs_a_verb_this_binary_has` now asserts `timer: true`
+    out of the real `ExecStart=` through the real clap parser, because no other test
+    in the tree reads that line and dropping the flag would restore the defect
+    silently. The CLI doc omission this entry opened with is also corrected, in the
+    `Run` verb's clap prose and in both packaging units.
+    macOS is unaffected and no test pretends otherwise: `keeper-syncd` has no launchd
+    plist anywhere in the tree, so the app is the only host there and two drivers
+    cannot arise.
 
 - source_spec: `{project-root}/_bmad-output/implementation-artifacts/spec-58-1-a-task-you-can-create-and-edit.md`
   summary: A task edit form left open across a listing change writes its seed-time values back over whatever another host changed meanwhile, because `upsert_task` has no compare-and-set.

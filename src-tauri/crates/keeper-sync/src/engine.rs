@@ -555,6 +555,16 @@ enum TaskTrigger {
     Scheduled,
     /// A person, a CLI verb or an IPC command asked for it.
     Requested,
+    /// An external **scheduled** driver asked for it through the manual verb —
+    /// Story 57.7's `Persistent=true` timer (Story 58.6, FR-358).
+    ///
+    /// Between the other two on purpose, because that is where it sits: it is a
+    /// request in its shape and a schedule in its intent. Without it one missed
+    /// window yielded TWO runs on a box running both `keeper-syncd watch` and
+    /// the timer — the request bypassed `db::claim_task`'s window condition while
+    /// the daemon's next tick claimed the same past window independently
+    /// (`deferred-work.md:5023-5042`).
+    Timer,
 }
 
 impl TaskTrigger {
@@ -570,6 +580,11 @@ impl TaskTrigger {
         match self {
             Self::Scheduled => SyncSource::Watch,
             Self::Requested => SyncSource::Manual,
+            // `Cli`, and the paragraph above argues FOR it here rather than
+            // against it: a timer run really is the `keeper-syncd` verb, driven
+            // by policy rather than by a person. `Watch` would claim the engine's
+            // own tick did it and `Manual` would claim somebody was there.
+            Self::Timer => SyncSource::Cli,
         }
     }
 }
@@ -2366,6 +2381,24 @@ impl Engine {
             // one window yields two runs.
             TaskTrigger::Scheduled => Some(now_ms),
             TaskTrigger::Requested => None,
+            // THE ONE RULE, and it is stated here because here is the only place
+            // it is read (Story 58.6). A timer demands an open window exactly
+            // when an in-process host is pacing the same task — `mode ==
+            // Scheduled` — because that is the only arrangement in which two
+            // drivers can both reach one window. Both of the arrangements the
+            // shipped unit documents fall out of it:
+            //
+            //   `--mode scheduled` beside `watch`: the timer and the daemon race
+            //   for one window, `claim_task`'s single conditional UPDATE gives it
+            //   to exactly one, and the loser records nothing.
+            //
+            //   `--mode manual` with no daemon: nothing in-process paces the
+            //   task, `next_due_ms` is NULL, and demanding a window would make
+            //   the timer never fire — which is the unit's own FIRST recommended
+            //   arrangement, so breaking it would be a fix that silently removes
+            //   the configuration it was documented alongside.
+            TaskTrigger::Timer if task.mode == tasks::TaskMode::Scheduled => Some(now_ms),
+            TaskTrigger::Timer => None,
         };
         let Some(run_id) = self.with_db(|conn| {
             db::claim_task(conn, &task.id, &host, now_ms, TASK_LEASE_MS, due_at_most)
@@ -2453,7 +2486,10 @@ impl Engine {
             return Some(scheduled.map_or(retry, |at| at.min(retry)));
         }
         match trigger {
-            TaskTrigger::Scheduled => scheduled,
+            // A timer is grouped with the due-gate rather than with a request:
+            // when it claimed at all it claimed a window, so that window has been
+            // served and the next instant is computed from this run's finish.
+            TaskTrigger::Scheduled | TaskTrigger::Timer => scheduled,
             TaskTrigger::Requested => match task.next_due_ms {
                 Some(at) if at > finished_ms => Some(at),
                 _ => scheduled,
@@ -8072,7 +8108,11 @@ impl Engine {
     /// is not off — and [`SyncError::Busy`] when a live lease is held, which the
     /// CLI's exit taxonomy already reads as "somebody else is doing this" rather
     /// than as a failure.
-    pub async fn run_task_now(&self, id: &str) -> Result<db::TaskRunRow> {
+    pub async fn run_task_now(
+        &self,
+        id: &str,
+        driver: tasks::TaskRunDriver,
+    ) -> Result<db::TaskRunRow> {
         let Some(task) = self.with_db(|conn| db::get_task(conn, id))? else {
             return Err(SyncError::Config(format!("no such task: {id}")));
         };
@@ -8084,10 +8124,19 @@ impl Engine {
         let profiles = self.list_profiles()?;
         let now = self.platform.now_ms();
         let offset = self.platform.utc_offset_minutes();
+        let trigger = match driver {
+            tasks::TaskRunDriver::Person => TaskTrigger::Requested,
+            tasks::TaskRunDriver::Timer => TaskTrigger::Timer,
+        };
         let Some(run_id) = self
-            .claim_and_run(&task, &profiles, now, offset, TaskTrigger::Requested)
+            .claim_and_run(&task, &profiles, now, offset, trigger)
             .await?
         else {
+            // For a `Person` this is only ever a lease held elsewhere. For a
+            // `Timer` on a scheduled task it is also the ordinary "nothing is
+            // due", which is the whole fix: the CLI maps both onto its
+            // did-not-run exit code, so a wrapper cannot tell them apart and does
+            // not need to.
             return Err(SyncError::Busy(id.to_owned()));
         };
         // The run is fetched by its own id, not as "the newest": the other host
@@ -13039,7 +13088,10 @@ mod tests {
         // nothing else.
         platform.advance_ms(60_000);
 
-        let run = engine.run_task_now("01NOW").await.expect("a requested run");
+        let run = engine
+            .run_task_now("01NOW", tasks::TaskRunDriver::Person)
+            .await
+            .expect("a requested run");
         assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
         assert!(
             run.host.contains('#'),
@@ -13142,7 +13194,10 @@ mod tests {
 
         for id in ["01OFF", "01DIS", "01NOSUCHTASK"] {
             assert!(
-                matches!(engine.run_task_now(id).await, Err(SyncError::Config(_))),
+                matches!(
+                    engine.run_task_now(id, tasks::TaskRunDriver::Person).await,
+                    Err(SyncError::Config(_))
+                ),
                 "{id} must refuse by type, not fail silently"
             );
         }
@@ -13321,7 +13376,7 @@ mod tests {
         platform.advance_ms(400_000);
 
         engine
-            .run_task_now("01OPEN")
+            .run_task_now("01OPEN", tasks::TaskRunDriver::Person)
             .await
             .expect("a requested run");
         let _ = engine.tick().await;
@@ -13801,7 +13856,7 @@ mod tests {
         // A person asks, inside the delay. It runs, immediately, and is recorded
         // as its own run rather than as the one being held back.
         let run = engine
-            .run_task_now("01ASK")
+            .run_task_now("01ASK", tasks::TaskRunDriver::Person)
             .await
             .expect("a person asking is not asking about a window");
         assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
@@ -13835,6 +13890,215 @@ mod tests {
             runs.iter()
                 .filter(|r| r.outcome == Some(tasks::TaskOutcome::Postponed))
                 .count(),
+            1
+        );
+    }
+
+    /// **One missed window, two drivers, one run** (Story 58.6, FR-358).
+    ///
+    /// The defect this story exists to close, and the epic is explicit that a
+    /// straight copy of 57.2's test would miss it: that one proves two
+    /// *connections* cannot share one lease. This is **one host, two triggers**.
+    /// Story 57.7's `Persistent=true` timer fires `tasks run` at boot with no
+    /// ordering against `keeper-syncd watch` reaching its first tick, and before
+    /// this fix the timer's run claimed with `due_at_most: None` — bypassing
+    /// `db::claim_task`'s window condition entirely — while the daemon's tick
+    /// claimed the same past window as `Scheduled`. Both succeeded.
+    ///
+    /// Driven in the order the boot actually produces: the timer first, because
+    /// `Persistent=true` fires before a freshly started daemon has ticked.
+    #[tokio::test]
+    async fn one_missed_window_and_both_drivers_yield_exactly_one_run() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01BOTH", None, "@hourly"), None)
+            .expect("save");
+        let _ = engine.tick().await;
+        let window = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        // The machine was off across the window and has just come back.
+        platform.advance_ms(window + 60_000 - platform.now_ms());
+
+        // THE ORDER MATTERS, and this is the one that reveals the defect. The
+        // daemon's tick gets there first, serves the missed window and moves it
+        // forward; the timer then fires with no ordering against that tick,
+        // because `Persistent=true` and `keeper-syncd watch` know nothing about
+        // each other. Before this story the timer's run passed
+        // `due_at_most: None` and so claimed anyway, on a window that had already
+        // been served — one missed window, two runs.
+        //
+        // (The reverse order was ALSO asserted while this test was being written
+        // and it passes with or without the fix, because `next_task_window` moves
+        // the window on the first run whichever driver made it. An assertion that
+        // holds under the mutation proves nothing, so the order below is the
+        // whole test.)
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine.task_history("01BOTH", 20).expect("history").len(),
+            1,
+            "the daemon served the missed window"
+        );
+        let served = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("re-armed");
+        assert!(served > platform.now_ms(), "and moved it forward");
+
+        // Now the timer, as the shipped unit invokes it.
+        let refused = engine
+            .run_task_now("01BOTH", tasks::TaskRunDriver::Timer)
+            .await
+            .expect_err("no window is open for a scheduled driver to claim");
+        assert!(
+            matches!(refused, SyncError::Busy(_)),
+            "declined as a deferral, which the CLI maps onto exit 4 — the work \
+             did not happen and nothing is wrong: {refused}"
+        );
+
+        let runs = engine.task_history("01BOTH", 20).expect("history");
+        assert_eq!(
+            runs.len(),
+            1,
+            "ONE missed window, ONE run. Before this story the timer's request \
+             bypassed `claim_task`'s window condition and this was 2: {runs:?}"
+        );
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("row")
+                .next_due_ms,
+            Some(served),
+            "and the declined claim moved nothing"
+        );
+    }
+
+    /// The other half, and the half a careless fix breaks: **a hand-run with
+    /// nothing due still runs** (Story 58.6).
+    ///
+    /// `due_at_most: None` exists for this, and its own doc says why — *a person
+    /// asking is not asking about a window*. The fix may not turn *run it now*
+    /// into *run it if due*, so the two drivers are asserted side by side on the
+    /// same closed window: the person runs, the timer does not.
+    #[tokio::test]
+    async fn a_hand_run_with_nothing_due_still_runs_and_a_timer_does_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(&task("01BYHAND", None, "@daily"), None)
+            .expect("save");
+        let _ = engine.tick().await;
+        let armed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+        assert!(armed > platform.now_ms(), "nothing is due");
+
+        // A person, on a task whose window is hours away.
+        let run = engine
+            .run_task_now("01BYHAND", tasks::TaskRunDriver::Person)
+            .await
+            .expect("a person asking is not asking about a window");
+        assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("row")
+                .next_due_ms,
+            Some(armed),
+            "and asking for a run now is not asking to skip tonight's"
+        );
+
+        // The same closed window, asked by a timer on a scheduled task: refused,
+        // because an in-process host is pacing this task and the timer must not
+        // add a second cadence to it.
+        let refused = engine
+            .run_task_now("01BYHAND", tasks::TaskRunDriver::Timer)
+            .await
+            .expect_err("no window is open for a scheduled driver to claim");
+        assert!(
+            matches!(refused, SyncError::Busy(_)),
+            "reported as a deferral rather than a fault, which is what the CLI \
+             maps onto exit 4: {refused}"
+        );
+        assert_eq!(
+            engine.task_history("01BYHAND", 10).expect("history").len(),
+            1,
+            "the person's run, and nothing from the timer"
+        );
+    }
+
+    /// The timer-only arrangement the shipped unit recommends FIRST keeps
+    /// working: `--mode manual`, no daemon, so the timer **is** the schedule
+    /// (Story 58.6).
+    ///
+    /// This is the case a naive fix silently removes. A manual task has
+    /// `next_due_ms IS NULL`, so a timer that demanded an open window
+    /// unconditionally would never fire — and the unit's header tells operators
+    /// to prefer exactly this arrangement.
+    #[tokio::test]
+    async fn a_timer_is_the_whole_schedule_when_nothing_in_process_paces_the_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut manual = task("01TIMERONLY", None, "@daily");
+        manual.mode = tasks::TaskMode::Manual;
+        engine.save_task(&manual, None).expect("save");
+
+        // Nothing arms a manual task, so there is no window at all.
+        let _ = engine.tick().await;
+        assert_eq!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("row")
+                .next_due_ms,
+            None,
+            "a manual task's schedule is remembered, not obeyed"
+        );
+
+        let run = engine
+            .run_task_now("01TIMERONLY", tasks::TaskRunDriver::Timer)
+            .await
+            .expect("the timer is this task's only cadence, so it claims");
+        assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            engine
+                .task_history("01TIMERONLY", 10)
+                .expect("history")
+                .len(),
             1
         );
     }
@@ -14884,7 +15148,9 @@ mod tests {
         );
         assert!(
             matches!(
-                engine.run_task_now("01RELOFF").await,
+                engine
+                    .run_task_now("01RELOFF", tasks::TaskRunDriver::Person)
+                    .await,
                 Err(SyncError::Config(_))
             ),
             "and an `off` that still runs when asked is not off"

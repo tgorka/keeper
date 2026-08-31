@@ -44,7 +44,7 @@ use keeper_sync::lfs::listing::{LfsFile, LfsFileState};
 use keeper_sync::profile::LfsMode;
 use keeper_sync::progress::status_line;
 use keeper_sync::provenance::SyncSource;
-use keeper_sync::tasks::{TaskKind, TaskMissedPolicy, TaskMode, TaskOutcome};
+use keeper_sync::tasks::{TaskKind, TaskMissedPolicy, TaskMode, TaskOutcome, TaskRunDriver};
 use keeper_sync::volume::{self, VolumeStatus};
 use keeper_sync::{
     ProfileState, Result as SyncResult, SyncDirection, SyncError, SyncLane, SyncPlatform,
@@ -556,6 +556,26 @@ pub enum TaskCommand {
     Run {
         /// The task's id, exactly as `tasks list` spells it.
         task: String,
+        /// Say that a **timer** is asking, not a person (Story 58.6).
+        ///
+        /// Set by the shipped `keeper-syncd-tasks@.service` unit and by nothing
+        /// else. It exists because a box running both this timer and
+        /// `keeper-syncd watch` against a `--mode scheduled` task otherwise gets
+        /// TWO runs for one missed window: an ordinary request deliberately
+        /// claims without asking whether a window is open, while the daemon's
+        /// next tick claims the same past window independently.
+        ///
+        /// With this flag the run claims like the daemon's own due-gate **when
+        /// the task is `--mode scheduled`**, so the two drivers race for one
+        /// window and exactly one wins. On a `--mode manual` task — the
+        /// timer-only arrangement, where this timer IS the schedule — it changes
+        /// nothing and the run happens as always.
+        ///
+        /// The consequence a wrapper should know: on a `--mode scheduled` task
+        /// whose window is not open, this exits 4 rather than doing the work.
+        /// That is the point, and 4 already means "did not run, nothing wrong".
+        #[arg(long)]
+        timer: bool,
     },
     /// Create a task, or change one that exists.
     ///
@@ -1027,7 +1047,14 @@ pub async fn run(
             match command {
                 TaskCommand::List => cmd_task_list(&printer, &engine, now_ms),
                 TaskCommand::Status { task } => cmd_task_status(&printer, &engine, now_ms, &task),
-                TaskCommand::Run { task } => cmd_task_run(&printer, &engine, now_ms, &task).await,
+                TaskCommand::Run { task, timer } => {
+                    let driver = if timer {
+                        TaskRunDriver::Timer
+                    } else {
+                        TaskRunDriver::Person
+                    };
+                    cmd_task_run(&printer, &engine, now_ms, &task, driver).await
+                }
                 TaskCommand::Set(args) => cmd_task_set(&printer, &engine, now_ms, &args),
                 TaskCommand::Enable { task } => {
                     cmd_task_set_enabled(&printer, &engine, now_ms, &task, true)
@@ -3665,20 +3692,31 @@ async fn cmd_task_run(
     engine: &Engine,
     now_ms: i64,
     wanted: &str,
+    driver: TaskRunDriver,
 ) -> std::result::Result<u8, CliError> {
     let listing = engine.tasks()?;
     let id = select_task(&listing, wanted)?.id.clone();
 
-    let run = match engine.run_task_now(&id).await {
+    let run = match engine.run_task_now(&id, driver).await {
         Ok(run) => run,
         Err(err) => {
             // The one error that is a deferral. See [`lease_held_elsewhere`].
             let Some(task) = lease_held_elsewhere(&err) else {
                 return Err(err.into());
             };
-            printer.line(format!(
-                "{task}: a run is already in flight elsewhere, so nothing ran here"
-            ));
+            // One sentence for both shapes of "did not run", because a wrapper
+            // branches on the number and a person reads the line: for a person
+            // the only cause is a lease held elsewhere, and for a timer on a
+            // scheduled task the ordinary cause is that no window was open — the
+            // other host had it, or nothing was due (Story 58.6).
+            printer.line(match driver {
+                TaskRunDriver::Person => {
+                    format!("{task}: a run is already in flight elsewhere, so nothing ran here")
+                }
+                TaskRunDriver::Timer => {
+                    format!("{task}: no window was open for a timer to claim, so nothing ran here")
+                }
+            });
             printer.json(&task_run_document(
                 &id,
                 None,
@@ -6189,9 +6227,15 @@ mod tests {
         // `Printer::new(false)` prints the human form to this test's stdout,
         // which is exactly what `cargo test` captures and discards.
         let printer = Printer::new(false);
-        let code = cmd_task_run(&printer, &engine, platform.now_ms(), "nightly")
-            .await
-            .expect("the verb itself must not fail");
+        let code = cmd_task_run(
+            &printer,
+            &engine,
+            platform.now_ms(),
+            "nightly",
+            TaskRunDriver::Person,
+        )
+        .await
+        .expect("the verb itself must not fail");
         assert_eq!(code, EXIT_OK);
 
         let runs = engine.task_history("nightly", 10).expect("history");
@@ -6791,13 +6835,20 @@ mod tests {
             .unwrap_or_else(|err| panic!("{argv:?} must parse as a keeper-syncd command:\n{err}"));
         match cli.command {
             Command::Tasks {
-                command: TaskCommand::Run { task },
+                // `timer: true` is an assertion, not a pattern that happens to
+                // fit (Story 58.6). The flag is what tells keeper a SCHEDULED
+                // driver is asking, and nothing about the process can reveal
+                // that — a person types the same argv. Dropping it from
+                // `ExecStart=` would silently restore the two-runs-for-one-
+                // missed-window defect on every box running this timer beside
+                // `keeper-syncd watch`, and no other test in the tree reads this
+                // line.
+                command: TaskCommand::Run { task, timer: true },
             } => assert_eq!(
                 task, INSTANCE,
-                "the INSTANCE NAME must be the task selector — a hard-coded id \
-                 here makes every instance of the template run one task"
+                "the unit must ask for the task its instance names: {argv:?}"
             ),
-            other => panic!("the unit must run one task and nothing else, got {other:?}"),
+            other => panic!("{argv:?} must be `tasks run --timer <task>`, not {other:?}"),
         }
     }
 

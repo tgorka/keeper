@@ -564,7 +564,7 @@ impl Fixture {
     /// release` will, and hand back the row it recorded.
     async fn run_the_release_task(&self) -> db::TaskRunRow {
         self.engine
-            .run_task_now(RELEASE_TASK_ID)
+            .run_task_now(RELEASE_TASK_ID, keeper_sync::tasks::TaskRunDriver::Person)
             .await
             .expect("the task is stored and is not off")
     }
@@ -2282,7 +2282,7 @@ async fn a_release_task_in_mode_off_stops_the_success_edge_and_refuses_the_reque
 
     let err = f
         .engine
-        .run_task_now(RELEASE_TASK_ID)
+        .run_task_now(RELEASE_TASK_ID, keeper_sync::tasks::TaskRunDriver::Person)
         .await
         .expect_err("an `off` that still runs when asked is not off");
     assert!(
