@@ -1232,4 +1232,58 @@ mod tests {
              got \"nightly \""
         );
     }
+
+    /// **Every schedule the dev harness shows must be one this parser accepts**
+    /// (Story 57.5's review, finding 12).
+    ///
+    /// `dev/mock-shell.ts` is the only place a developer on a Linux host can see
+    /// the Tasks view at all, and its own header promises that "what a browser on
+    /// Linux shows is what the real command would answer". Three fixtures read
+    /// `@daily 03:00`, and this function strips the `@` and matches the *entire*
+    /// remainder against `hourly|daily|weekly` — so no such row can exist in a
+    /// real `sync.db` and the harness was teaching a syntax the dialect does not
+    /// have. The dialect's way to say 03:00 daily is `0 3 * * *`.
+    ///
+    /// Asserted from the engine's own parser over the harness's own text, rather
+    /// than by a second list of expected strings, because a second list is the
+    /// thing that goes stale. Precedent: `keeper-syncd`'s tests read the shipped
+    /// unit files and feed their `ExecStart` through clap.
+    #[test]
+    fn every_schedule_the_dev_harness_shows_is_one_this_dialect_accepts() {
+        let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../dev/mock-shell.ts")
+            .canonicalize()
+            .expect("dev/mock-shell.ts is in this repository");
+        let source = std::fs::read_to_string(&harness).expect("read the harness");
+
+        // `schedule: "…"`, which is how the fixtures spell it. A `null` schedule
+        // and the passthrough `schedule: req.schedule` are not literals and are
+        // not matched, which is correct: neither describes a dialect expression.
+        let mut found = Vec::new();
+        for rest in source.split("schedule: \"").skip(1) {
+            let Some(literal) = rest.split('"').next() else {
+                continue;
+            };
+            found.push(literal.to_owned());
+        }
+
+        // Before anything is asserted about the contents: a renamed field or a
+        // reshaped fixture would otherwise make this test pass over nothing.
+        assert!(
+            found.len() >= 5,
+            "the extraction found {} schedule literals in {}, which is too few to \
+             be the fixture block — has the field been renamed?",
+            found.len(),
+            harness.display()
+        );
+
+        for literal in &found {
+            let parsed = TaskSchedule::parse(literal);
+            assert!(
+                parsed.is_ok(),
+                "the dev harness shows {literal:?}, which this dialect refuses: {}",
+                parsed.expect_err("refused")
+            );
+        }
+    }
 }

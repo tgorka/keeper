@@ -1,0 +1,87 @@
+# keeper-syncd tasks — the trigger half of the pair (Epic 57, AD-136).
+#
+# **OnCalendar below IS the cadence for this driver, so set it to when you want
+# the work to happen.** `keeper-syncd tasks run` performs the task it is given
+# every time it is called: asking for a run now is not asking whether a run is
+# due, and the task's own `schedule` column is read by the in-process hosts (the
+# `keeper-syncd watch` daemon and the desktop app), not by this verb. An hourly
+# trigger on a task whose schedule reads `0 3 * * *` therefore does the work
+# twenty-four times a day, not once.
+#
+# Which mode to give the task depends on who else is driving it:
+#
+#   * **timer only, no daemon** — `--mode manual`. Nothing schedules the task, so
+#     this timer is the whole schedule and there is exactly one cadence to read.
+#     This is the arrangement for a box with no app and no `watch` service.
+#   * **timer AND `keeper-syncd watch`** — `--mode scheduled` with a schedule.
+#     Both drivers run and the lease keeps them from overlapping. A run this
+#     timer triggered leaves the daemon's next window alone in the ordinary
+#     case, but `Engine::next_task_window` has TWO exceptions and both move it:
+#       - the window was already open when this run finished: it has just been
+#         served, so it is re-armed to the following instant. Reachable via
+#         Persistent=true, which fires a catch-up with no ordering against the
+#         daemon's first tick after boot.
+#       - the run recorded `busy` or `deferred`: that arm is taken BEFORE the
+#         trigger is even looked at, and it rewrites the window to the sooner of
+#         the next scheduled instant and one minute from now. So a timer run
+#         that did nothing at 00:00 because the folder was mid-sync can leave the
+#         daemon sweeping at 00:01 instead of at the 03:00 the operator chose.
+#     Give the timer the coarser cadence unless you mean the work to happen
+#     twice, and prefer `--mode manual` plus this timer if you want exactly one
+#     cadence in exactly one place.
+#   * **neither, for now** — `--mode off`. The task refuses every trigger, this
+#     one included, and the unit exits 2 without retrying.
+#
+# The schedule keeper *validates, displays and reports on* is still the task's
+# own, which is what AD-136 asked for and why a timer as the ONLY mechanism was
+# rejected: a schedule written here alone would be invisible to `tasks list`, to
+# the Tasks view, and to anything asking keeper what it intends to do.
+#
+# A template, matching keeper-syncd-tasks@.service. systemd derives the service
+# from the timer's own name, so `keeper-syncd-tasks@nightly.timer` triggers
+# `keeper-syncd-tasks@nightly.service` with no Unit= line to keep in step.
+#
+# Install:  see the header of keeper-syncd-tasks@.service. Enable THIS unit.
+#   systemctl --user enable --now keeper-syncd-tasks@nightly.timer
+#
+# **`loginctl enable-linger "$USER"` is required**, not a nicety: a `--user` unit
+# is stopped when its user's last session ends, so without it this timer works
+# until you log out and then silently never again. Verify it printed:
+#   loginctl show-user "$USER" --property=Linger   # must be Linger=yes
+#
+# To change the cadence without editing a shipped file:
+#   systemctl --user edit keeper-syncd-tasks@nightly.timer
+#   # [Timer]
+#   # OnCalendar=            <- the empty assignment clears the list below
+#   # OnCalendar=*-*-* 03:00:00
+
+[Unit]
+Description=Ask keeper to run task %i
+Documentation=https://github.com/tgorka/keeper
+
+[Timer]
+# Once a day, at midnight local time. A deliberately conservative default: this
+# verb does the work every time it fires, and housekeeping that runs once a day
+# is the shape both built-in kinds were sized for — a release pass is bounded at
+# 32 objects and a gigabyte of hashing, and takes the remainder next time.
+OnCalendar=daily
+
+# A trigger missed while the machine was off or asleep fires once when it comes
+# back, rather than waiting for tomorrow. Once, not once per missed day: a laptop
+# shut for a week must not wake up and run seven times, which is also the
+# catch-up rule Epic 57 deferred at the keeper end.
+Persistent=true
+
+# Spread the wake over an hour. Nothing here is deadline work, and a fleet of
+# boxes all hitting one forge at exactly 00:00 is a self-inflicted thundering
+# herd. It also means the run does not land on the same second as every other
+# `OnCalendar=daily` unit on the machine.
+RandomizedDelaySec=3600
+
+# One minute, matching keeper's own MIN_SCHEDULE_INTERVAL_MS: keeper refuses a
+# schedule finer than a minute, so waking more precisely than that buys nothing
+# and costs a timer systemd cannot coalesce with anything else.
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

@@ -969,6 +969,17 @@ pub fn run() {
         sync_ipc::sync_clear_credential,
         sync_ipc::sync_device,
         sync_ipc::sync_device_set_label,
+        // The Tasks surface (Epic 57, FR-351, AD-137): the five verbs the ⌘8
+        // view drives, over the engine door Stories 57.1–57.4 built. Desktop
+        // only with the rest of sync — `mod sync_ipc` is itself
+        // `#[cfg(desktop)]`, so none of them has a `#[cfg(not(desktop))]` twin
+        // to name, and iOS is not a task host at all (AD-137: the OS owns the
+        // runtime, `pause_all()` runs on backgrounding).
+        sync_ipc::sync_tasks,
+        sync_ipc::sync_task_history,
+        sync_ipc::sync_task_run_now,
+        sync_ipc::sync_task_save,
+        sync_ipc::sync_task_forget,
         copy_ipc::copy_start,
         copy_ipc::copy_status,
         copy_ipc::copy_cancel,
@@ -1237,8 +1248,34 @@ pub fn run() {
                 // below: the engine finishes the unit it holds and leaves its
                 // journal row intact, so an interrupted push is re-driven next
                 // launch instead of being killed mid-write.
+                //
+                // ...and hand this host's task leases back in the same call
+                // (Story 57.5, AD-137, NFR-42). Signalling alone was not enough
+                // and the gap was a race the app loses: `start_supervisor` drops
+                // the spawned task's `JoinHandle` (`sync.rs:445-451`), nothing
+                // here awaits it, and `Engine::run`'s post-loop `finalize()` —
+                // which is what reaches `db::release_host_leases` — therefore
+                // may never be polled before the process exits. A task holding
+                // a lease at quit would then be unrunnable by ANY host for the
+                // whole of `TASK_LEASE_MS`, and the lease names a pid the next
+                // launch cannot prove dead.
+                //
+                // Releasing them the instant the signal is sent was not the fix
+                // either, and this arm is why: the process does NOT exit here —
+                // the bounded `shutdown_all` below runs first — so a supervisor
+                // already inside a task run keeps going, with a git child that
+                // has no `kill_on_drop`. `finalize_for_quit` therefore settles
+                // in-flight runs within a bounded budget and only then releases,
+                // and it never releases a lease whose run is still executing:
+                // freeing that one let the daemon on a shared `sync.db` start a
+                // second concurrent run over the same working tree.
+                //
+                // Deliberately NOT on the window-close path: closing hides the
+                // window and keeps the host (`WindowEvent::CloseRequested`
+                // above), so releasing there would stop tasks the user never
+                // asked to stop.
                 #[cfg(desktop)]
-                sync::stop_supervisor();
+                sync::finalize_for_quit();
                 // A short, bounded graceful shutdown: `shutdown_all` awaits each
                 // account's `sync.stop()`. Bounding it keeps quit responsive even if a
                 // network teardown hangs.

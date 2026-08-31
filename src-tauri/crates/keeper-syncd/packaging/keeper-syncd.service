@@ -12,7 +12,17 @@
 #   systemctl --user enable --now keeper-syncd
 #   systemctl --user status keeper-syncd
 #
-# To keep syncing after logout:  loginctl enable-linger $USER
+# **Lingering is required to keep syncing after logout**, not a nicety: enabling
+# a `--user` unit makes systemd start it at login, not keep it past the end of
+# your last session. Without these two lines this daemon — and every schedule it
+# hosts — stops when you log out:
+#   loginctl enable-linger "$USER"
+#   loginctl show-user "$USER" --property=Linger    # must print Linger=yes
+#
+# The app's Tasks view reads the same fact (it stats /var/lib/systemd/linger/
+# $USER, which is the file `enable-linger` creates and the one logind's own
+# Linger property checks), so with lingering off a row hosted here says its
+# schedule stops at logout rather than claiming "logged in or not".
 #
 # Credentials never belong in this file — anything in Environment= is visible to
 # `systemctl show`. Use a 0600 file under ~/.config/keeper-sync/secrets/, or an

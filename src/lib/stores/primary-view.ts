@@ -34,6 +34,12 @@ import { createStore } from "zustand/vanilla";
  * it", and folding the second into the first would bury a browser under a
  * diagnostics pane. Where folder sync cannot run there is no synced folder to
  * browse, so the entry is absent rather than empty.
+ *
+ * "tasks" is the third surface over that same `sync` capability (Epic 57,
+ * FR-351, FR-352, AD-137). It answers a question neither of the other two does:
+ * *which host will actually run this, and when*. It is its own view rather than
+ * a tab inside Sync because the schedule is host-wide — a task can belong to the
+ * machine and to no folder at all — so a per-folder pane has nowhere to put it.
  */
 export type PrimaryView =
   | "inbox"
@@ -46,6 +52,7 @@ export type PrimaryView =
   | "files"
   | "notes"
   | "sessions"
+  | "tasks"
   | "settings";
 
 export interface PrimaryViewState {

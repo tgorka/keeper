@@ -45,6 +45,13 @@ const NOTES_CATEGORY: &str = "Notes";
 /// The sessions verbs' category (Phase 7, FR-251), gated whole like Notes.
 const SESSIONS_CATEGORY: &str = "Sessions";
 
+/// The tasks verbs' category (Epic 57, FR-351/FR-352, AD-137), gated whole like
+/// Notes and Sessions and on the same fact: `sync && desktop`. iOS is not a task
+/// host at all (`lifecycle.rs` pauses everything on backgrounding), and a build
+/// without folder sync has no `sync.db` to keep a task record in — so there is
+/// nothing to show rather than something to grey out.
+const TASKS_CATEGORY: &str = "Tasks";
+
 /// The registry ids of the three Recording verbs (Story 20.4, FR-48), named
 /// because a fourth surface now dispatches on them.
 ///
@@ -669,6 +676,36 @@ pub fn palette_actions() -> Vec<PaletteActionVm> {
             Some("⌘⌥L"),
             false,
         ),
+        // --- Tasks (Epic 57, FR-351/FR-352, AD-137): gated by category like
+        // Notes and Sessions, on the same `sync && desktop` fact.
+        //
+        // This entry is the fix, not decoration. The complaint that opened the
+        // epic was literally "nie widzę w menu croon like job schedules" — *I
+        // do not see it in the menu* — and the native macOS menu bar is built
+        // by looping `registry_sections` and making one `Submenu` per category
+        // (`keeper/src/menu.rs:108-127`). So registering here is what puts a
+        // `Tasks` menu on the bar, a `Tasks` block on the ⌘? cheat sheet and a
+        // `Tasks` row in ⌘K, from one string each.
+        //
+        // ⌘8 is the first free number: ⌘1–⌘7 are taken (sessions holds ⌘7), and
+        // the chip is a display-only label here as everywhere in this registry
+        // — the frontend hook owns the binding.
+        action(
+            "tasks-view",
+            "Tasks",
+            TASKS_CATEGORY,
+            &[
+                "task",
+                "schedule",
+                "cron",
+                "job",
+                "housekeeping",
+                "release",
+                "timer",
+            ],
+            Some("⌘8"),
+            false,
+        ),
         // --- Global actions (dialogs / commands) ---
         action(
             "new-chat",
@@ -855,6 +892,10 @@ const CATEGORY_ORDER: &[&str] = &[
     // The capability-gated sessions verbs (Phase 7), directly after Notes —
     // the sibling surface over the same sync substrate (FR-251).
     SESSIONS_CATEGORY,
+    // The capability-gated tasks view (Epic 57, FR-351/FR-352), directly after
+    // Sessions: the third surface over that same sync substrate, and the third
+    // category this one flag opens or closes whole.
+    TASKS_CATEGORY,
     "Chat",
 ];
 
@@ -874,18 +915,25 @@ const CATEGORY_ORDER: &[&str] = &[
 /// registry keeps all three surfaces consistent without any per-platform logic.
 /// `notes` does the same for the whole [`NOTES_CATEGORY`] section (Phase 5,
 /// FR-122): with it off the section is absent from the cheat sheet and the native
-/// menu bar, not greyed out in them. The sessions section rides the SAME flag
-/// (Phase 7, FR-223): `CapabilitiesVm.sessions` is computed from the identical
-/// condition as `notes` (sync && desktop), so one gate parameter serves both —
-/// a second boolean here would be two names for one fact until the day the two
-/// capabilities diverge, and that day amends this signature with the AD it
-/// arrives on.
+/// menu bar, not greyed out in them. The sessions and tasks sections ride the
+/// SAME flag (Phase 7, FR-223; Epic 57, FR-352): `CapabilitiesVm.sessions` is
+/// computed from the identical condition as `notes` (sync && desktop), and
+/// AD-137 gates tasks on that very condition too — iOS is not a task host and a
+/// build without folder sync has no `sync.db` to keep a task record in. So one
+/// gate parameter serves all three categories: a second boolean here would be
+/// two names for one fact, and it would change this signature and both call
+/// sites (`menu.rs`'s builder and the `cheat_sheet_sections` command) to say
+/// nothing new. The day these capabilities genuinely diverge is the day that
+/// amends this signature, with the AD it arrives on.
 pub fn registry_sections(recording: bool, notes: bool) -> Vec<MenuSectionVm> {
     let actions: Vec<PaletteActionVm> = palette_actions()
         .into_iter()
         .filter(|action| recording || !action.requires_recording)
         .filter(|action| {
-            notes || (action.category != NOTES_CATEGORY && action.category != SESSIONS_CATEGORY)
+            notes
+                || (action.category != NOTES_CATEGORY
+                    && action.category != SESSIONS_CATEGORY
+                    && action.category != TASKS_CATEGORY)
         })
         .collect();
 
@@ -1632,6 +1680,81 @@ mod tests {
             assert!(!action.requires_open_chat, "{id} does not need a chat");
             assert!(!action.requires_recording, "{id} is not a recording action");
         }
+    }
+
+    #[test]
+    fn the_tasks_section_is_present_iff_the_tasks_capability_is_on() {
+        // FR-352, AD-137: tasks are desktop-gated the way notes and sessions
+        // are, so on a build without them the whole section is *absent* from the
+        // ⌘? cheat sheet and the native menu bar rather than greyed out in them
+        // — both are built from this one projection.
+        let off = registry_sections(false, false);
+        assert!(
+            !off.iter().any(|s| s.category == TASKS_CATEGORY),
+            "no Tasks section when the gate is off"
+        );
+        assert!(
+            !off.iter()
+                .flat_map(|s| s.items.iter())
+                .any(|i| i.id == "tasks-view"),
+            "and tasks-view reached no other section either"
+        );
+
+        let on = registry_sections(false, true);
+        let tasks = on
+            .iter()
+            .find(|s| s.category == TASKS_CATEGORY)
+            .expect("Tasks section present when the gate is on");
+        let ids: Vec<&str> = tasks.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["tasks-view"],
+            "the whole section projects, and nothing else joins it"
+        );
+        assert!(
+            !on.iter().any(|s| s.category == "Recording"),
+            "the tasks gate does not drag the recording section in with it"
+        );
+    }
+
+    #[test]
+    fn the_tasks_view_carries_the_cmd_8_chip_the_menu_bar_renders() {
+        // The complaint that opened epic 57 was "nie widzę w menu croon like
+        // job schedules" — *I do not see it in the menu*. `menu.rs` builds one
+        // native submenu per `registry_sections` category and labels each item
+        // `title  shortcut`, so this registry row IS the fix: the title and the
+        // chip asserted here are the two strings the owner reads off the macOS
+        // menu bar.
+        let actions = palette_actions();
+        let tasks = actions
+            .iter()
+            .find(|a| a.id == "tasks-view")
+            .expect("tasks-view is registered");
+        assert_eq!(tasks.title, "Tasks");
+        assert_eq!(tasks.category, TASKS_CATEGORY);
+        assert_eq!(tasks.shortcut.as_deref(), Some("⌘8"), "⌘8 is the chip");
+        assert!(!tasks.requires_open_chat, "a task list needs no open chat");
+        assert!(!tasks.requires_recording, "not a recording verb");
+        assert_eq!(tasks.toggle_group, None, "one direction, not a pair");
+
+        // Exactly one action claims ⌘8: a chip the cheat sheet prints twice
+        // teaches a chord that does one of two things.
+        let claimants: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.shortcut.as_deref() == Some("⌘8"))
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(claimants, vec!["tasks-view"], "⌘8 has a single owner");
+
+        // And it survives into the projection the menu builder consumes, chip
+        // and all — the registry entry alone would prove nothing about menu.rs.
+        let item = registry_sections(false, true)
+            .into_iter()
+            .find(|s| s.category == TASKS_CATEGORY)
+            .and_then(|s| s.items.into_iter().find(|i| i.id == "tasks-view"))
+            .expect("tasks-view projects into the Tasks submenu");
+        assert_eq!(item.title, "Tasks");
+        assert_eq!(item.shortcut.as_deref(), Some("⌘8"));
     }
 
     #[test]

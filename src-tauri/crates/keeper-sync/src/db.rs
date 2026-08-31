@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -1524,6 +1524,12 @@ pub fn upsert_profile(conn: &Connection, profile: &SyncProfile, now_ms: i64) -> 
 
 /// Every profile **as it is in force**: the stored row with the folder's own
 /// config layered on top (Story 46.8).
+///
+/// A row this build cannot deserialize is skipped, so a profile a newer keeper
+/// wrote cannot brick an older keeper's whole listing. That skip is invisible to
+/// the answer, which is why [`unreadable_profile_ids`] exists: a caller whose
+/// verdict turns on "absent" versus "unreadable" must ask, and must not read
+/// this function's silence as "no such folder".
 pub fn list_profiles(conn: &Connection) -> Result<Vec<SyncProfile>> {
     let mut stmt = conn.prepare("SELECT json FROM profiles ORDER BY id")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -1535,6 +1541,36 @@ pub fn list_profiles(conn: &Connection) -> Result<Vec<SyncProfile>> {
             // A profile written by a newer keeper must not brick an older one.
             // Skip it loudly rather than failing the whole listing.
             Err(err) => tracing::warn!(error = %err, "skipping unreadable sync profile row"),
+        }
+    }
+    Ok(out)
+}
+
+/// The ids of profile rows this build **cannot read**, which [`list_profiles`]
+/// silently drops.
+///
+/// The companion to that skip, and the reason it exists is a lie the skip told
+/// (Story 57.5's review, finding 3). Dropping the row is right for every caller
+/// that wants folders to sync: a profile a newer keeper wrote must not brick an
+/// older keeper's whole listing. It is wrong for a caller whose *verdict*
+/// depends on the difference — a task scoped to that folder rendered
+/// *"it names a folder keeper does not sync"*, in red, permanently, for a folder
+/// that was there and actively syncing.
+///
+/// Deliberately **not** folded into [`list_profiles`]' return type. Twenty-odd
+/// call sites want the folders and nothing else, and widening their answer to
+/// carry a second list would make every one of them decide what to do about
+/// something only the task projection can act on. This is one extra bounded
+/// `SELECT` over a table counted in single digits, asked by the two commands
+/// whose answer changes.
+pub fn unreadable_profile_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id, json FROM profiles ORDER BY id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, json) = row?;
+        if serde_json::from_str::<SyncProfile>(&json).is_err() {
+            out.push(id);
         }
     }
     Ok(out)
@@ -3029,10 +3065,21 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
 ///   door: `scheduled` → `manual` for a month → `scheduled` keeps a frozen past
 ///   window, because the schedule text never moved.
 ///
-/// `IS NOT` rather than `<>` throughout because SQLite's `<>` is NULL-poisoned
-/// and a task gaining or losing its schedule is precisely the case that must be
+/// The three are decided **here, in Rust**, and the answer is both bound into
+/// the statement and returned to the caller (Story 57.5's review, finding 4).
+/// It used to be a SQL `CASE` — correct, but private to one statement, so
+/// `Engine::note_task_outcome`'s process-local fault state had no way to learn
+/// about the same edges and a task that came back into service kept a stale
+/// fault, making its next failure silent for the life of the process. One rule,
+/// one place, two consumers. `Option<String>` inequality also says what SQL's
+/// `<>` cannot: `IS NOT` was needed there because `<>` is NULL-poisoned and a
+/// task *gaining or losing* its schedule is precisely the case that must be
 /// noticed.
-pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<()> {
+///
+/// The pre-read and the write share one transaction, so nothing decides these
+/// edges against a row the other host has since rewritten — the discipline
+/// [`claim_task`] already keeps.
+pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<TaskSave> {
     crate::tasks::validate_id(&task.id)?;
     // The parser's own refusal, propagated unchanged: it already names the
     // rule and quotes the expression, and a second layer of prose around it
@@ -3044,25 +3091,55 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<()> {
             task.id
         )));
     }
-    // A row this build cannot read belongs to a newer keeper, and overwriting it
-    // would rewrite its kind to one of ours — the write half of NFR-43, which
-    // the read half is useless without. `get_task` answers `None` for such a
-    // row, so a create-if-absent caller would walk straight into it.
-    let stored_kind: Option<String> = conn
-        .query_row("SELECT kind FROM tasks WHERE id = ?1", [&task.id], |row| {
-            row.get(0)
-        })
+    let tx = conn.unchecked_transaction()?;
+    let stored: Option<(String, String, Option<String>, i64)> = tx
+        .query_row(
+            "SELECT kind, mode, schedule, enabled FROM tasks WHERE id = ?1",
+            [&task.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
         .optional()?;
-    if let Some(kind) = stored_kind {
-        if TaskKind::from_stored(&kind).is_none() {
+    // A row this build cannot read belongs to a newer keeper, and overwriting it
+    // would rewrite it to one of ours — the write half of NFR-43, which the read
+    // half is useless without. `get_task` answers `None` for such a row, so a
+    // create-if-absent caller would walk straight into it.
+    //
+    // Both columns, not just `kind` (DW entry from Story 57.5's review): the
+    // guard was kind-only, so a save over a row whose **mode** a newer keeper
+    // wrote silently rewrote that mode to one of ours — the same silent
+    // downgrade by the other door, and reachable the moment an arbitrary-id
+    // write verb exists, which this story registered.
+    if let Some((kind, mode, _, _)) = &stored {
+        if TaskKind::from_stored(kind).is_none() {
             return Err(SyncError::Config(format!(
                 "task '{}' is stored as kind '{kind}', which this keeper cannot read: \
                  refusing to overwrite it",
                 task.id
             )));
         }
+        if TaskMode::from_stored(mode).is_none() {
+            return Err(SyncError::Config(format!(
+                "task '{}' is stored with mode '{mode}', which this keeper cannot read: \
+                 refusing to overwrite it",
+                task.id
+            )));
+        }
     }
-    conn.execute(
+    let effect = match &stored {
+        None => TaskSave::Created,
+        Some((_, mode, stored_schedule, enabled)) => {
+            let schedule_changed = stored_schedule.as_deref() != task.schedule.as_deref();
+            let came_alive = task.enabled && *enabled == 0;
+            let became_scheduled =
+                task.mode == TaskMode::Scheduled && mode.as_str() != TaskMode::Scheduled.as_str();
+            if schedule_changed || came_alive || became_scheduled {
+                TaskSave::Rearmed
+            } else {
+                TaskSave::Updated
+            }
+        }
+    };
+    tx.execute(
         "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
                             updated_ms, running_host, lease_until_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL)
@@ -3071,11 +3148,7 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<()> {
              kind        = excluded.kind,
              schedule    = excluded.schedule,
              mode        = excluded.mode,
-             next_due_ms = CASE WHEN excluded.schedule IS NOT tasks.schedule
-                                  OR (excluded.enabled = 1 AND tasks.enabled = 0)
-                                  OR (excluded.mode = 'scheduled'
-                                      AND tasks.mode IS NOT 'scheduled')
-                                THEN NULL ELSE tasks.next_due_ms END,
+             next_due_ms = CASE WHEN ?8 = 1 THEN NULL ELSE tasks.next_due_ms END,
              enabled     = excluded.enabled,
              updated_ms  = excluded.updated_ms",
         (
@@ -3086,9 +3159,24 @@ pub fn upsert_task(conn: &Connection, task: &TaskRow) -> Result<()> {
             task.mode.as_str(),
             i64::from(task.enabled),
             task.updated_ms,
+            i64::from(effect == TaskSave::Rearmed),
         ),
     )?;
-    Ok(())
+    tx.commit()?;
+    Ok(effect)
+}
+
+/// What [`upsert_task`] did, for the callers that keep state keyed on a task's
+/// readiness rather than on its columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSave {
+    /// There was no such row; this save created it.
+    Created,
+    /// The row existed and keeps the armed window it had.
+    Updated,
+    /// The row **came back into service** — see [`upsert_task`]'s three edges.
+    /// Its window was cleared and it arms afresh on the next tick.
+    Rearmed,
 }
 
 /// Every task, by id, with the unreadable rows listed rather than dropped.
@@ -3263,7 +3351,8 @@ pub fn claim_task(
     Ok(Some(run_id))
 }
 
-/// Hand back every lease this host holds, closing the runs it was executing.
+/// Hand back the leases this host holds, except the ones it is still running,
+/// closing every run it was executing.
 ///
 /// Called from the supervisor's shutdown path. Without it a
 /// `systemctl restart keeper-syncd` in the middle of a run left the lease held
@@ -3272,20 +3361,62 @@ pub fn claim_task(
 /// because on Linux the app shares the device row and may legitimately be
 /// holding one. NFR-42 asks for a bounded finalize, and this is what bounds it.
 ///
+/// `hold` names the tasks whose run the caller is **still executing** — see
+/// [`Engine::release_task_leases`](crate::Engine::release_task_leases), which is
+/// the only thing that can know. Their run rows are closed `abandoned` like
+/// everyone else's, because a host that stops mid-run really did abandon that
+/// attempt and the history has to say so; their task rows keep `running_host`,
+/// so the other host sharing this `sync.db` cannot satisfy
+/// [`claim_task`]'s `running_host IS NULL` and start a second concurrent run
+/// over a working tree the first host's git child may still be writing. Those
+/// leases expire the ordinary `TASK_LEASE_MS` way — the floor the whole scheme
+/// already stands on, and the safe direction: an unreleased lease costs a delay,
+/// a released one costs the serialization [`claim_task`] exists for.
+///
+/// Scoped to `host` throughout, in both statements: this can never release a
+/// lease another host holds, however this is called.
+///
 /// Returns how many leases were released, so a caller can log the fact rather
 /// than assume it.
-pub fn release_host_leases(conn: &Connection, host: &str, now_ms: i64) -> Result<usize> {
+pub fn release_host_leases(
+    conn: &Connection,
+    host: &str,
+    now_ms: i64,
+    hold: &HashSet<String>,
+) -> Result<usize> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE task_runs SET finished_ms = ?2, outcome = ?3
           WHERE host = ?1 AND finished_ms IS NULL",
         (host, now_ms, TaskOutcome::Abandoned.as_str()),
     )?;
-    let released = tx.execute(
+    // Built rather than constant because the exclusion list is a runtime set.
+    // `id NOT IN ()` on an empty list is not portable SQL, so the clause is
+    // omitted entirely when nothing is held — which is also every call from the
+    // supervisor's own post-loop `finalize`, where the loop has already broken.
+    let mut sql = String::from(
         "UPDATE tasks SET running_host = NULL, lease_until_ms = NULL, updated_ms = ?2
           WHERE running_host = ?1",
-        (host, now_ms),
-    )?;
+    );
+    if !hold.is_empty() {
+        sql.push_str(" AND id NOT IN (");
+        for index in 0..hold.len() {
+            if index > 0 {
+                sql.push(',');
+            }
+            // `?1` and `?2` are taken; `params_from_iter` binds positionally, so
+            // the numbering and the iteration order below are the same order.
+            sql.push_str(&format!("?{}", index + 3));
+        }
+        sql.push(')');
+    }
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(2 + hold.len());
+    params.push(&host);
+    params.push(&now_ms);
+    for id in hold {
+        params.push(id);
+    }
+    let released = tx.execute(&sql, rusqlite::params_from_iter(params))?;
     tx.commit()?;
     Ok(released)
 }
@@ -3491,6 +3622,53 @@ mod tests {
         )
         .expect("insert junk");
         assert_eq!(list_profiles(&c).expect("list").len(), 1);
+    }
+
+    /// The skip above is right for every caller that wants folders to sync, and
+    /// it told one lie: a task scoped to that folder rendered *"it names a folder
+    /// keeper does not sync"*, in red, permanently (Story 57.5's review, finding
+    /// 3). So the drop has to be answerable, and this is the query that answers
+    /// it — over a hand-written row, because a row this build cannot read is by
+    /// definition one it cannot write.
+    #[test]
+    fn a_profile_row_this_build_cannot_read_is_nameable_rather_than_merely_absent() {
+        let c = conn();
+        upsert_profile(&c, &profile("01READABLE"), 1).expect("insert");
+        // Well-formed JSON that is not a profile, and outright malformed JSON:
+        // both reach `serde_json::from_str::<SyncProfile>` as an error, and a
+        // real newer-keeper row is the first shape rather than the second.
+        c.execute(
+            "INSERT INTO profiles (id, json, updated_ms) VALUES
+                 ('01NEWER', '{\"id\":\"01NEWER\",\"teleport\":true}', 0),
+                 ('01BROKEN', '{oops', 0)",
+            [],
+        )
+        .expect("insert two rows this build cannot read");
+
+        let readable = list_profiles(&c).expect("list");
+        assert_eq!(
+            readable.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["01READABLE"],
+            "the listing still refuses to be bricked by either row"
+        );
+
+        assert_eq!(
+            unreadable_profile_ids(&c).expect("ids"),
+            ["01BROKEN", "01NEWER"],
+            "but the ids it dropped are recoverable, so a task scoped to one of \
+             them can be told the truth instead of that its folder is gone"
+        );
+
+        // The discriminator, and the whole point: an id nothing ever stored is
+        // absent, not unreadable. Conflating the two puts every folder-scoped
+        // task into the fault sentence.
+        assert!(
+            !unreadable_profile_ids(&c)
+                .expect("ids")
+                .iter()
+                .any(|id| id == "01GONE" || id == "01READABLE"),
+            "a deleted folder and a healthy one are both readable-or-absent"
+        );
     }
 
     #[test]
@@ -6161,6 +6339,97 @@ mod tests {
         );
     }
 
+    /// The returned [`TaskSave`] and the window the statement wrote must agree on
+    /// every edge, because they are the same rule read by two consumers: the
+    /// store clears `next_due_ms`, and `Engine::save_task` clears the
+    /// process-local fault (Story 57.5's review, finding 4). A drift between them
+    /// is silent in the worst direction — a task that arms afresh while its
+    /// stale fault keeps its next failure quiet.
+    #[test]
+    fn what_a_save_reports_is_exactly_what_it_did_to_the_window() {
+        let c = conn();
+        let live = task("01SAVE", Some("@daily"), TaskMode::Scheduled);
+
+        assert_eq!(
+            upsert_task(&c, &live).expect("save"),
+            TaskSave::Created,
+            "there was no row"
+        );
+
+        arm_task(&c, "01SAVE", Some(50_000), 0).expect("arm");
+        assert_eq!(
+            upsert_task(&c, &live).expect("save"),
+            TaskSave::Updated,
+            "an identical save moves nothing"
+        );
+        assert_eq!(
+            get_task(&c, "01SAVE")
+                .expect("get")
+                .expect("row")
+                .next_due_ms,
+            Some(50_000),
+            "so the armed window survives — the half the report has to match"
+        );
+
+        // Edge 1: the schedule text moves.
+        let mut rescheduled = live.clone();
+        rescheduled.schedule = Some("every 5m".to_owned());
+        assert_eq!(
+            upsert_task(&c, &rescheduled).expect("save"),
+            TaskSave::Rearmed
+        );
+        assert_eq!(
+            get_task(&c, "01SAVE")
+                .expect("get")
+                .expect("row")
+                .next_due_ms,
+            None
+        );
+
+        // Edge 2: disabled → enabled. Going out of service is not an edge.
+        arm_task(&c, "01SAVE", Some(50_000), 0).expect("arm");
+        let mut disabled = rescheduled.clone();
+        disabled.enabled = false;
+        assert_eq!(
+            upsert_task(&c, &disabled).expect("save"),
+            TaskSave::Updated,
+            "a task going quiet has not come back into service"
+        );
+        assert_eq!(
+            upsert_task(&c, &rescheduled).expect("save"),
+            TaskSave::Rearmed
+        );
+        assert_eq!(
+            get_task(&c, "01SAVE")
+                .expect("get")
+                .expect("row")
+                .next_due_ms,
+            None
+        );
+
+        // Edge 3: the mode becomes `scheduled`, with the schedule text unmoved.
+        arm_task(&c, "01SAVE", Some(50_000), 0).expect("arm");
+        let mut manual = rescheduled.clone();
+        manual.mode = TaskMode::Manual;
+        assert_eq!(upsert_task(&c, &manual).expect("save"), TaskSave::Updated);
+        assert_eq!(
+            upsert_task(&c, &rescheduled).expect("save"),
+            TaskSave::Rearmed
+        );
+
+        // A task LOSING its schedule is an edge too, which is why the comparison
+        // is `Option` inequality and not SQL's NULL-poisoned `<>`.
+        arm_task(&c, "01SAVE", Some(50_000), 0).expect("arm");
+        let mut unscheduled = rescheduled.clone();
+        unscheduled.mode = TaskMode::Manual;
+        unscheduled.schedule = None;
+        assert_eq!(
+            upsert_task(&c, &unscheduled).expect("save"),
+            TaskSave::Rearmed,
+            "losing a schedule must be noticed, not swallowed by a NULL comparison"
+        );
+    }
+
     /// The id is a primary key, it is what a CLI reads from argv, and it is what
     /// `task_runs.task_id` joins on. Three spellings of one intended task is
     /// worse than a refusal.
@@ -6236,6 +6505,34 @@ mod tests {
             .expect("kind");
         assert_eq!(
             stored, "teleport",
+            "and the newer keeper's row is untouched"
+        );
+    }
+
+    /// The same guard by the other door (re-triaged out of Story 57.5's review
+    /// `defer` entry). The refusal read `kind` only, so a save over a row
+    /// whose **mode** a newer keeper wrote rewrote that mode to one of ours —
+    /// silent, and reachable the moment an arbitrary-id write verb exists, which
+    /// Story 57.5 registered. Fixed here rather than deferred because
+    /// `upsert_task` now reads the stored mode anyway, for the re-arm edges.
+    #[test]
+    fn a_task_whose_mode_this_build_cannot_read_is_never_overwritten_either() {
+        let c = conn();
+        raw_task(&c, "01NM", "sync", "teleport", Some("every 5m"));
+
+        let mine = task("01NM", Some("every 5m"), TaskMode::Scheduled);
+        assert!(
+            matches!(upsert_task(&c, &mine), Err(SyncError::Config(_))),
+            "a readable kind is not permission to rewrite an unreadable mode"
+        );
+        let (kind, mode): (String, String) = c
+            .query_row("SELECT kind, mode FROM tasks WHERE id = '01NM'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("row");
+        assert_eq!(
+            (kind.as_str(), mode.as_str()),
+            ("sync", "teleport"),
             "and the newer keeper's row is untouched"
         );
     }
@@ -6323,7 +6620,10 @@ mod tests {
             .expect("claim")
             .expect("claimed");
 
-        assert_eq!(release_host_leases(&c, "dying", 9_000).expect("release"), 2);
+        assert_eq!(
+            release_host_leases(&c, "dying", 9_000, &HashSet::new()).expect("release"),
+            2
+        );
         for id in ["01P", "01Q"] {
             let row = get_task(&c, id).expect("get").expect("row");
             assert_eq!(row.running_host, None, "{id} is claimable again at once");
@@ -6343,6 +6643,127 @@ mod tests {
                 .as_deref(),
             Some("other"),
             "and another host's lease is none of this one's business"
+        );
+    }
+
+    /// A lease whose run the caller is **still executing** is not handed back,
+    /// however the release is reached (Story 57.5's review, finding 1).
+    ///
+    /// The lease half is what excludes a second concurrent run over one working
+    /// tree; the run half still records the truth, because a host that stops
+    /// mid-run really did abandon that attempt. Both halves are asserted here
+    /// because getting either backwards is silent: hold the run row open and the
+    /// history claims a run that never ended, free the lease and the other host
+    /// starts a second pass over a tree an orphaned git child is still writing.
+    #[test]
+    fn a_run_still_in_flight_keeps_its_lease_while_every_other_one_is_handed_back() {
+        let c = conn();
+        for id in ["01RUNNING", "01IDLE"] {
+            upsert_task(&c, &task(id, Some("every 5m"), TaskMode::Scheduled)).expect("save");
+            claim_task(&c, id, "quitting", 0, 3_600_000, None)
+                .expect("claim")
+                .expect("claimed");
+        }
+
+        let hold = HashSet::from(["01RUNNING".to_owned()]);
+        assert_eq!(
+            release_host_leases(&c, "quitting", 9_000, &hold).expect("release"),
+            1,
+            "one lease handed back, not both"
+        );
+
+        let running = get_task(&c, "01RUNNING").expect("get").expect("row");
+        assert_eq!(
+            running.running_host.as_deref(),
+            Some("quitting"),
+            "the lease of a run still executing is left held, so no other host can claim it"
+        );
+        assert_eq!(
+            running.lease_until_ms,
+            Some(3_600_000),
+            "and it expires the ordinary TASK_LEASE_MS way rather than never"
+        );
+        assert!(
+            claim_task(&c, "01RUNNING", "other", 9_001, 3_600_000, None)
+                .expect("the claim statement runs")
+                .is_none(),
+            "which is the property: the other host cannot start a second run"
+        );
+
+        let idle = get_task(&c, "01IDLE").expect("get").expect("row");
+        assert_eq!(
+            idle.running_host, None,
+            "a lease with nothing in flight is still handed back at once"
+        );
+        assert_eq!(idle.lease_until_ms, None);
+
+        // The run rows: both closed, because quitting mid-run IS abandoning it.
+        for id in ["01RUNNING", "01IDLE"] {
+            let runs = task_runs(&c, id, 10).expect("runs");
+            assert_eq!(
+                (runs[0].outcome, runs[0].finished_ms),
+                (Some(TaskOutcome::Abandoned), Some(9_000)),
+                "{id}'s attempt is recorded abandoned rather than left open forever"
+            );
+        }
+    }
+
+    /// Holding back every lease this host has must still leave the statement
+    /// valid and touch nothing — the shape a quit takes when the one task the
+    /// host owns is the one it is running.
+    #[test]
+    fn holding_back_every_lease_releases_none_and_is_not_an_error() {
+        let c = conn();
+        upsert_task(&c, &task("01ONLY", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        claim_task(&c, "01ONLY", "quitting", 0, 3_600_000, None)
+            .expect("claim")
+            .expect("claimed");
+
+        let hold = HashSet::from(["01ONLY".to_owned()]);
+        assert_eq!(
+            release_host_leases(&c, "quitting", 9_000, &hold).expect("release"),
+            0
+        );
+        assert_eq!(
+            get_task(&c, "01ONLY")
+                .expect("get")
+                .expect("row")
+                .running_host
+                .as_deref(),
+            Some("quitting")
+        );
+    }
+
+    /// An id in `hold` that this host does not hold a lease for changes nothing.
+    /// Reachable for real: the in-flight set is registered on the claim and the
+    /// row's lease may have been reclaimed by another host in between, which
+    /// `finish_task_run`'s own `WHERE running_host = ?` already tolerates.
+    #[test]
+    fn holding_back_a_lease_this_host_does_not_hold_is_a_no_op() {
+        let c = conn();
+        upsert_task(&c, &task("01MINE", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        claim_task(&c, "01MINE", "quitting", 0, 3_600_000, None)
+            .expect("claim")
+            .expect("claimed");
+        upsert_task(&c, &task("01THEIRS", Some("every 5m"), TaskMode::Scheduled)).expect("save");
+        claim_task(&c, "01THEIRS", "other", 0, 3_600_000, None)
+            .expect("claim")
+            .expect("claimed");
+
+        let hold = HashSet::from(["01THEIRS".to_owned(), "01GONE".to_owned()]);
+        assert_eq!(
+            release_host_leases(&c, "quitting", 9_000, &hold).expect("release"),
+            1,
+            "this host's own idle lease is still released"
+        );
+        assert_eq!(
+            get_task(&c, "01THEIRS")
+                .expect("get")
+                .expect("row")
+                .running_host
+                .as_deref(),
+            Some("other"),
+            "and another host's lease is untouched either way"
         );
     }
 

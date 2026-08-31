@@ -115,8 +115,15 @@ is anything that **remembers**: no task table, no name, no schedule, no last-run
 - **Binds:** FR-350, FR-351, FR-352; Epic 57
 - **The facts, because they are asymmetric and the asymmetry is load-bearing.**
   - **Linux** has a packaged background host: the systemd **user** unit whose `ExecStart` is
-    `keeper-syncd watch` (`keeper-syncd/packaging/keeper-syncd.service`), with `loginctl
-    enable-linger` for post-logout. Tasks run whether or not anybody is logged into a desktop.
+    `keeper-syncd watch` (`keeper-syncd/packaging/keeper-syncd.service`). Tasks run whether or not
+    anybody is logged into a desktop — **conditional on `loginctl enable-linger`**, and the
+    condition is load-bearing rather than a footnote: `systemctl --user is-enabled` answers *wanted
+    at login*, so an enabled unit without lingering is torn down with its user's last session and
+    the schedule stops there. That makes lingering a *fact about the machine* the surface has to
+    establish, not an install note it may assume: it is the difference between two true sentences,
+    and assuming it produced an over-claim in Story 57.5 (see the Always rule below). The app reads
+    it as logind does, by stat-ing `/var/lib/systemd/linger/$USER` — the file `enable-linger`
+    creates and the only thing logind's own `Linger` property checks.
   - **macOS has no daemon at all.** There is no launchd plist for `keeper-syncd` anywhere in the
     repository, and `keeper-syncd/src/platform.rs:11-19` states the daemon is *"Linux-first,
     unix-only"* and *"deliberately does not pretend to build"* elsewhere. On macOS the **only**
@@ -132,9 +139,11 @@ is anything that **remembers**: no task table, no name, no schedule, no last-run
     `notes` already are in `CapabilitiesVm` (`keeper-core/src/vm.rs:129-137`).
 - **Decision.** A task declares which hosts may run it, and the Tasks view states, per task, **the
   host that will actually run it and when it last did** — including the honest negative: *"only
-  while keeper is running"* on macOS without a daemon, and *"the daemon runs this"* on a Linux box
-  where the unit is enabled. A task that no present host can run is shown as **unhosted**, not as
-  enabled-and-quiet.
+  while keeper is running"* on macOS without a daemon, and, on a Linux box where the unit is
+  enabled, *whichever* daemon sentence is true of that box: *"logged in or not"* where the user
+  lingers, and *"while you are logged in — lingering is off, so its schedule stops when your
+  session ends"* where they do not. A task that no present host can run is shown as **unhosted**,
+  not as enabled-and-quiet.
 - **Why this is an architecture decision and not UI copy.** The alternative is the failure this
   tree has already paid for twice: a feature that looks enabled and does nothing
   (`sprint-status.yaml`'s recurring `incorrect` lesson; DW-140/DW-206). A schedule is exactly the

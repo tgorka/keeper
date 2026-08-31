@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Stub the IPC client and the shared recording-control module so dispatch is
@@ -107,5 +109,37 @@ describe("the Recordings archive entry (Story 45.20, FR-198)", () => {
     ]) {
       expect(paletteActionHandlers[id], `handler for ${id}`).toBeTypeOf("function");
     }
+  });
+});
+
+describe("the tasks palette verb (Epic 57, FR-351, FR-352)", () => {
+  /**
+   * The registry entry and its handler are in two languages, and only the id
+   * string joins them.
+   *
+   * This is the assertion that answers the owner's complaint. `keeper-core`'s
+   * own tests prove the registry carries `tasks-view` with its `⌘8` chip in a
+   * gated `Tasks` category — and since `keeper/src/menu.rs` builds one native
+   * submenu per `registry_sections` category, that IS the macOS menu bar, the
+   * ⌘? cheat sheet and the ⌘K row. What no Rust test can see is this map: an id
+   * the registry ships with no handler here is a menu item that logs a warning
+   * and does nothing, which from the outside is indistinguishable from the menu
+   * item not being there at all.
+   */
+  it("is registered in the Rust registry and dispatched here, under the same id", () => {
+    const palette = readFileSync(
+      resolve(import.meta.dirname, "../../../src-tauri/crates/keeper-core/src/palette.rs"),
+      "utf8",
+    );
+    // Read from the Rust source rather than hard-coded twice: a rename in the
+    // registry has to fail here rather than silently orphan the handler.
+    expect(palette).toContain('"tasks-view"');
+    expect(palette).toContain('Some("⌘8")');
+    expect(paletteActionHandlers["tasks-view"], "handler for tasks-view").toBeTypeOf("function");
+  });
+
+  it("opens the Tasks view", () => {
+    void dispatchPaletteAction("tasks-view", null);
+    expect(primaryViewStore.getState().view).toBe("tasks");
   });
 });

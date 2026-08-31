@@ -1,6 +1,7 @@
 import {
   Archive,
   Cable,
+  CalendarClock,
   Film,
   FlaskConical,
   FolderSync,
@@ -113,6 +114,17 @@ const NOTES_VIEW: SidebarView = { label: "Notes", icon: NotebookPen, view: "note
  * sessions root is a folder keeper already syncs plus a flag (AD-107) — and a
  * user who knows one gate already knows the other (UX-DR92). */
 const SESSIONS_VIEW: SidebarView = { label: "Sessions", icon: FlaskConical, view: "sessions" };
+
+/** The capability-gated Tasks nav entry (Epic 57, FR-351, FR-352, AD-137).
+ * Beside Sessions and gated on the same fact, because it is the same substrate:
+ * a task record lives in the `sync.db` folder sync opens, and iOS is not a task
+ * host at all. Absent rather than disabled, the rule every entry above it
+ * follows.
+ *
+ * Before Settings, which is where the epic's complaint points: the owner could
+ * not see schedules anywhere in the app, and this row plus the palette
+ * registry's `Tasks` category are the two places that answer him. */
+const TASKS_VIEW: SidebarView = { label: "Tasks", icon: CalendarClock, view: "tasks" };
 
 /** Settings sits last, after every primary-view entry. */
 const SETTINGS_VIEW: SidebarView = { label: "Settings", icon: Settings, view: "settings" };
@@ -253,6 +265,10 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
     ...(sync ? [SYNC_VIEW, FILES_VIEW] : []),
     ...(notes ? [NOTES_VIEW] : []),
     ...(sessions ? [SESSIONS_VIEW] : []),
+    // The task record lives in the same `sync.db` (AD-137), so it rides the
+    // same gate — and it is last before Settings, which is where a person who
+    // cannot find their schedules goes looking.
+    ...(sessions ? [TASKS_VIEW] : []),
     SETTINGS_VIEW,
   ];
 

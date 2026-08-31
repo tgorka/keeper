@@ -39,6 +39,7 @@ pub mod send;
 pub mod sessions;
 pub mod signals;
 pub mod size;
+pub mod tasks;
 pub mod text_file;
 pub mod timeline;
 pub mod vault_link;
