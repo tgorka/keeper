@@ -4,6 +4,7 @@ type: 'feature'
 created: '2026-08-31'
 status: 'done'
 baseline_revision: 'e315918'
+final_revision: '7c8f805'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
@@ -43,7 +44,8 @@ reused, and the story states why against their own doc comments.
   a wrapper script.
 - The cap is respected: a declined row is trimmed by the same statement every other run row is, so
   a `skip` task cannot grow `sync.db` by declining every window forever.
-- Only `skip` declines. `delay` does not — see Design Notes.
+- `skip` records `Declined`; `delay` records `Postponed`. **Superseded the first draft, which
+  recorded nothing for `delay` — see the Spec Change Log.**
 
 **Block If:** the record cannot be written in the same transaction as the window write.
 
@@ -106,6 +108,36 @@ never reached — nothing claimed a lease); write a declined row for a `delay`; 
 - Given that same row, when any surface renders it, then nothing reports it as a run that succeeded,
   a run that failed, or a run still in flight.
 - Given two hundred declined windows, when the history is read, then it holds one declined row.
+
+## Spec Change Log
+
+### 2026-08-31 — `delay` DOES leave a record, because its action became a write
+
+**Finding.** This spec argued that *"only `skip` permanently declines a window, and only a permanent
+decline is a fact that needs a row; a delayed window's record is the run it eventually gets"*, and
+that recording one would mean nine hundred rows for one fifteen-minute delay. Both were true of the
+`decide`-side wait this spec was written against, and both stopped being true when 58.4's anchor
+moved: a postponement is now a **single write**, taken once, so there is exactly one row to record
+and no per-tick decision to record at all. The coordinator also named the reader-facing half
+directly — during the delay a person looking at ⌘8 must be able to tell *held back by policy* from
+*nothing happened*, and with no row those two states were identical.
+
+**Amended.** A seventh `TaskOutcome`, `Postponed`, written by the same closed, zero-duration,
+leaseless row `Declined` uses. `db::skip_task_window` became `db::move_task_window` and carries the
+outcome it records, because both policies move a window forward and differ only in the instant and
+the word — a second copy of that compare-and-set would be a second chance to get it wrong.
+`task_exit_code` maps it to `EXIT_DEFERRED` beside `Busy`, `Deferred` and `Declined`.
+
+**The two are deliberately not interchangeable**, and it is now a tested claim rather than a naming
+preference: a declined window will **never** be served, a postponed one **will** be, at the instant
+its `detail` names. Conflating them would tell somebody their nightly sweep had been dropped when it
+had only been held back. `Postponed` also stays out of `next_task_window`'s `Busy | Deferred` retry
+group, for the reason `Declined` does: that group rewinds the window, which would collapse a
+thirty-minute postponement into a one-minute one.
+
+**KEEP.** Everything about `Declined` — the `affected == 1` branch it hangs off, the shared
+`trim_task_runs` cap, the four properties that stop it reading as a run that happened, and the
+argument from the other five variants' own doc comments. None of it was the objection.
 
 ## Design Notes
 

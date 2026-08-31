@@ -53,10 +53,10 @@ is the same table, the same write path and the same story that opens this write 
   mode and schedule already are (NFR-43, `db.rs:3019`).
 - `db::arm_task` is **not** reused for the skip write. It is `WHERE id = ?1 AND next_due_ms IS NULL`
   because *"first sight can only happen once, so the statement says so"* (`db.rs:3256-3260`).
-- The delay is enforced in **`decide`**, never at the claim: `claim_task`'s
-  `next_due_ms <= now` condition (`db.rs:3303`) passes throughout the delay, so a claim-side guard
-  could not implement it and a `Requested` trigger bypasses that condition entirely
-  (`engine.rs:2215`).
+- The delay is anchored on the instant a host **noticed**, written into `next_due_ms` through the
+  forward-only compare-and-set, so `claim_task`'s `next_due_ms <= now` condition holds the run back
+  for the length of the delay on every host. **Superseded the first draft — see the Spec Change
+  Log.**
 - `delay` adds **no column**. Lateness is `now_ms - next_due_ms`, already on the row.
 - `run_due_tasks`'s match (`engine.rs:2133-2148`) is **extended**, never defaulted with a `_` arm.
 - The policy ships with its CLI flag **and** its form control in this story. Hard criterion.
@@ -157,6 +157,60 @@ list in the `TASK_KINDS`/`TASK_MODES` pattern, and nothing else); touch
   instant than the one abandoned.
 - Given a `--on-missed` spelling clap accepts, when `tasks set` writes it, then `tasks list`,
   `tasks list --json`, `tasks status` and the app's edit form all read it back.
+
+## Spec Change Log
+
+### 2026-08-31 — `Delay`'s anchor rejected by the coordinator, and replaced
+
+**Finding.** This spec stated the defect itself: *"because the anchor is the stored window, `delay`
+on a window already open for two hours runs at once. It is a floor on how soon, not a
+postponement."* Read against the sentence the setting exists for — *"jak jest zaschedulowany np co
+godzine a keeper sie uruchomi za 2h … moze byc opcja czy uruchomic or razu, z opiznieniem czy
+wogole"* — that is not a documented trade-off. The owner's scenario **is** an hourly task and a host
+back two hours late, so `next_due_ms + delay` was already an hour in the past and `delay` behaved
+identically to `run_now`. Two of his three options were one option, in the one scenario he named.
+The option did not exist.
+
+**Amended.** The anchor is the instant a host **noticed** the missed window, not the instant the
+window opened. It still costs no second column, so AD-139's rule is intact: the postponement is
+written into `next_due_ms` itself as `now_ms + TASK_MISSED_DELAY_MS`, through the same forward-only
+compare-and-set `skip` already used (`?3 > ?2`). Consequences, each now asserted:
+
+- `db::claim_task`'s `next_due_ms <= now` condition correctly **fails** for the length of the delay,
+  so the run is held back **by the arbiter** rather than beside it. This spec's previous rule — *"the
+  wait MUST be enforced in `decide`, not at the claim"* — is inverted, and was the wrong instinct: it
+  described a constraint the bad anchor imposed rather than a property worth having.
+- A restart inside the delay **respects** it, because the instant is persisted rather than recomputed
+  by a process that has just started. A `decide`-side wait could not offer that.
+- AD-138 is untouched: still exactly one stored forward instant, so nothing can enumerate.
+- `TASK_MISSED_GRACE_MS` narrows to one job — detecting that nobody was home — and now gates **all
+  three** settings, so a window that opens while a host is present is served normally under every
+  policy. That is what makes `on_missed` a policy about *missed* windows rather than a re-timing of
+  the schedule, which is the owner's own qualifier *"w takiej sytuacji"*.
+- `TASK_MISSED_DELAY_MS` is its own constant (30 min), deliberately longer than the grace: the
+  minutes after a machine comes back are its busiest, and housekeeping over a git remote should not
+  join a boot storm.
+- The action is a fourth `Action` variant, `Postpone`, so `run_due_tasks`' exhaustive match forces
+  every host to decide rather than inherit silence — the same argument `Action::Skip` was added on.
+
+**When `now + delay` lands past the next natural window** — asked for explicitly. Still one forward
+instant, so exactly-once is safe. The run that eventually happens is understood to be serving **the
+missed window**, not the one it overtook: the postponed instant replaced the missed window's, and
+the run's completion then computes the next window from its finish, as every run does. A `@hourly`
+task noticed five minutes before the next hour therefore runs once, thirty minutes later, and
+resumes hourly from there — it does not run twice.
+
+**Visibility** — the other follow-up. A postponement is recorded as `TaskOutcome::Postponed`, so
+*held back by policy* is distinguishable from *nothing happened* during the delay, and the row's
+next-due has moved forward so the pane's existing next-due line is legible without a second surface.
+See spec 58.5's change log for the vocabulary argument.
+
+**KEEP.** `Skip`'s grace, its compare-and-set, the `?3 > ?2` forward-only guard, `run_now`'s
+textually-unchanged arm, `ensure_task_columns` and the `updated_ms` compare-and-set are all unchanged
+and were not the objection.
+
+**Known-bad state avoided.** Shipping a three-way policy whose middle setting is a synonym for its
+default in the only scenario the owner described.
 
 ## Design Notes
 

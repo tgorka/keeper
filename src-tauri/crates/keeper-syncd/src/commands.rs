@@ -3029,6 +3029,9 @@ pub fn task_exit_code(outcome: TaskOutcome) -> u8 {
         // through the due-gate, so no policy declines it. Mapped anyway because
         // `tasks status` reports history and this map has to be total.
         TaskOutcome::Declined => EXIT_DEFERRED,
+        // Held back rather than dropped, and still "the work did not happen" to
+        // the only caller that reads this number (Story 58.5).
+        TaskOutcome::Postponed => EXIT_DEFERRED,
         // It ran and failed. `detail` carries the reason.
         TaskOutcome::Failed => EXIT_FAILURE,
         // Nobody closed it, so nothing can claim it succeeded.
@@ -6064,6 +6067,25 @@ mod tests {
         assert!(history.contains("was not run"), "{history}");
         assert_eq!(run_outcome_word(&declined), "declined");
         assert_eq!(task_exit_code(TaskOutcome::Declined), EXIT_DEFERRED);
+
+        // And its twin, which a reader must be able to tell apart from it: one
+        // window will never be served, the other will be. Same exit code,
+        // because to a wrapper script both mean "the work did not happen".
+        let mut postponed = a_run("nightly", TaskOutcome::Postponed);
+        postponed.finished_ms = Some(postponed.started_ms);
+        postponed.detail = Some(
+            "delay: the window at 1700000000000 is held back, and will be run at 1700001800000"
+                .to_owned(),
+        );
+        let held = task_run_lines(now, "nightly", std::slice::from_ref(&postponed)).join("\n");
+        assert!(held.contains("postponed"), "{held}");
+        assert!(
+            held.contains("will be run at"),
+            "the one fact that separates a postponement from a decline has to \
+             survive into the rendering: {held}"
+        );
+        assert_eq!(run_outcome_word(&postponed), "postponed");
+        assert_eq!(task_exit_code(TaskOutcome::Postponed), EXIT_DEFERRED);
         let row = task_lines(
             now,
             &[TaskView {

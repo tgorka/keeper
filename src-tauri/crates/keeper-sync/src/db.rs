@@ -3375,47 +3375,57 @@ pub fn arm_task(conn: &Connection, id: &str, next_due_ms: Option<i64>, now_ms: i
     Ok(())
 }
 
-/// Abandon an **open** window and arm the next one, and nothing else
-/// (Story 58.4, FR-356, AD-139).
+/// Move an **open** window forward and record why, and nothing else
+/// (Story 58.4 and Story 58.5, FR-356, FR-357, AD-139, AD-140).
 ///
-/// [`arm_task`] cannot be reused for this and the reason is in its own `WHERE`:
-/// `next_due_ms IS NULL` is a condition a skip can never satisfy, because a skip
-/// is by definition about a window that is *there*. So this statement carries the
-/// same protection for the opposite precondition — a compare-and-set on the
-/// window the caller **decided about**:
+/// One function for both non-default missed-window policies, because both do the
+/// same two things and differ only in the instant and the word: `skip` moves the
+/// window to the next natural one and records [`TaskOutcome::Declined`]; `delay`
+/// moves it to `now + TASK_MISSED_DELAY_MS` and records
+/// [`TaskOutcome::Postponed`]. A second copy of the statement below would be a
+/// second chance to get the compare-and-set wrong, and getting it wrong is
+/// silent.
+///
+/// [`arm_task`] cannot be reused for either, and the reason is in its own
+/// `WHERE`: `next_due_ms IS NULL` is a condition these can never satisfy,
+/// because both are by definition about a window that is *there*. So this
+/// statement carries the same protection for the opposite precondition — a
+/// compare-and-set on the window the caller **decided about**:
 ///
 /// * `next_due_ms = ?2` is the observed window. A decision computed from a
 ///   listing read earlier in this tick cannot clobber a window the other host
-///   has since armed, run or skipped; the `UPDATE` simply affects no row.
+///   has since armed, run or moved; the `UPDATE` simply affects no row.
 /// * `?3 > ?2` makes the write **forward-only by construction** rather than by
-///   the caller's care. A skip that moved a window backwards would be catch-up
-///   wearing the name of its opposite.
+///   the caller's care. Moving a window backwards would be catch-up wearing the
+///   name of its opposite, and it is also what makes AD-138 safe here: one
+///   forward instant, whatever the policy, so nothing can enumerate missed
+///   windows.
 ///
-/// # The record is written here, and only when this host is the one declining
+/// # The record is written here, and only when this host is the one deciding
 ///
-/// A declined window is a **fact**, and before Story 58.5 it left no row
+/// A window a policy moved is a **fact**, and before Story 58.5 it left no row
 /// anywhere: `task_runs` rows were minted only by [`claim_task`], which runs
-/// only when a host is present *and takes the lease*. So `on_missed = skip` went
-/// quiet — the Tasks view's *last run* stayed stale and the run list said
-/// nothing, which is the invisible-non-execution shape this feature exists to
-/// close. The row is closed and zero-duration, and it takes **no lease**,
-/// because nothing ran and nothing needed serializing.
+/// only when a host is present *and takes the lease*. So the two non-default
+/// policies went quiet — the Tasks view's *last run* stayed stale and the run
+/// list said nothing, which is the invisible-non-execution shape this feature
+/// exists to close. The row is closed and zero-duration, and it takes **no
+/// lease**, because nothing ran and nothing needed serializing.
 ///
 /// It hangs off the `affected == 1` branch on purpose. `false` means the other
-/// host armed, ran or skipped this window between this tick's listing read and
-/// this write; recording anyway would claim this host declined a window it did
+/// host armed, ran or moved this window between this tick's listing read and
+/// this write; recording anyway would claim this host decided something it did
 /// not. Both statements share the one transaction the compare-and-set opens, so
 /// a moved window and the record of moving it cannot come apart.
-pub fn skip_task_window(conn: &Connection, skip: TaskWindowSkip<'_>) -> Result<bool> {
+pub fn move_task_window(conn: &Connection, moved: TaskWindowMove<'_>) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
     let affected = tx.execute(
         "UPDATE tasks SET next_due_ms = ?3, updated_ms = ?4
           WHERE id = ?1 AND next_due_ms = ?2 AND ?3 > ?2",
         (
-            skip.task_id,
-            skip.observed_due_ms,
-            skip.next_due_ms,
-            skip.now_ms,
+            moved.task_id,
+            moved.observed_due_ms,
+            moved.next_due_ms,
+            moved.now_ms,
         ),
     )?;
     if affected != 1 {
@@ -3425,44 +3435,51 @@ pub fn skip_task_window(conn: &Connection, skip: TaskWindowSkip<'_>) -> Result<b
         "INSERT INTO task_runs (task_id, started_ms, finished_ms, outcome, detail, host)
          VALUES (?1, ?2, ?2, ?3, ?4, ?5)",
         (
-            skip.task_id,
-            skip.now_ms,
-            TaskOutcome::Declined.as_str(),
-            skip.detail,
-            skip.host,
+            moved.task_id,
+            moved.now_ms,
+            moved.outcome.as_str(),
+            moved.detail,
+            moved.host,
         ),
     )?;
-    trim_task_runs(&tx, skip.task_id)?;
+    trim_task_runs(&tx, moved.task_id)?;
     tx.commit()?;
     Ok(true)
 }
 
-/// Everything one declined window records (Story 58.5, FR-357, AD-140).
+/// Everything one moved window records (Story 58.5, FR-357, AD-140).
 ///
-/// A struct rather than six positional arguments, for [`TaskRunClose`]'s reason:
-/// two `&str`s and three adjacent `i64`s is a call site nobody can read, and
-/// swapping `observed_due_ms` with `next_due_ms` would turn a forward-only write
-/// into one the statement silently declines.
+/// A struct rather than seven positional arguments, for [`TaskRunClose`]'s
+/// reason: two `&str`s and three adjacent `i64`s is a call site nobody can read,
+/// and swapping `observed_due_ms` with `next_due_ms` would turn a forward-only
+/// write into one the statement silently refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TaskWindowSkip<'a> {
+pub struct TaskWindowMove<'a> {
     pub task_id: &'a str,
     /// The host that took the decision.
     ///
     /// Recorded on the run row like every other host, and it is **not** a lease:
     /// `running_host` stays `NULL` throughout, because nothing ran. Naming the
     /// host anyway is what lets somebody reading a two-machine history see
-    /// *which* keeper declined the window.
+    /// *which* keeper made the decision.
     pub host: &'a str,
     /// The open window this decision was about — the compare-and-set's baseline.
     pub observed_due_ms: i64,
     /// The window armed in its place. Must be later; the statement enforces it.
     pub next_due_ms: i64,
     /// When the decision was taken. The row's `started_ms` **and** its
-    /// `finished_ms`: a decline is closed the instant it is made, and zero
+    /// `finished_ms`: the decision is closed the instant it is made, and zero
     /// duration is the honest length of something that did not run.
     pub now_ms: i64,
+    /// Which decision this was: [`TaskOutcome::Declined`] for a `skip`,
+    /// [`TaskOutcome::Postponed`] for a `delay`.
+    ///
+    /// Carried rather than derived, because the store does not read policies —
+    /// and because the two are not interchangeable to a reader: one window will
+    /// never be served and the other will be.
+    pub outcome: TaskOutcome,
     /// What the row says happened, composed by the engine from the two instants
-    /// above and the policy that declined.
+    /// above and the policy that decided.
     pub detail: &'a str,
 }
 
@@ -6658,13 +6675,14 @@ mod tests {
 
     /// A skip fixture, so the calls below differ only in the two instants they
     /// are about.
-    fn a_skip(observed: i64, next: i64, now: i64) -> TaskWindowSkip<'static> {
-        TaskWindowSkip {
+    fn a_skip(observed: i64, next: i64, now: i64) -> TaskWindowMove<'static> {
+        TaskWindowMove {
             task_id: "01SK",
             host: "hostA",
             observed_due_ms: observed,
             next_due_ms: next,
             now_ms: now,
+            outcome: TaskOutcome::Declined,
             detail: "skip: the window at 50000 was not run, and 90000 is armed in its place",
         }
     }
@@ -6683,7 +6701,7 @@ mod tests {
         arm_task(&c, "01SK", Some(50_000), 0).expect("arm");
 
         assert!(
-            !skip_task_window(&c, a_skip(40_000, 90_000, 1)).expect("write"),
+            !move_task_window(&c, a_skip(40_000, 90_000, 1)).expect("write"),
             "a decision about a window this row does not carry affects nothing: \
              the other host has moved on since this tick's listing read"
         );
@@ -6694,12 +6712,12 @@ mod tests {
         );
 
         assert!(
-            !skip_task_window(&c, a_skip(50_000, 50_000, 1)).expect("write"),
+            !move_task_window(&c, a_skip(50_000, 50_000, 1)).expect("write"),
             "and a replacement that is not later is refused by the statement \
              rather than by the caller's care — a skip that moved a window \
              backwards would be catch-up wearing the name of its opposite"
         );
-        assert!(!skip_task_window(&c, a_skip(50_000, 10_000, 1)).expect("write"));
+        assert!(!move_task_window(&c, a_skip(50_000, 10_000, 1)).expect("write"));
         assert_eq!(
             get_task(&c, "01SK").expect("get").expect("row").next_due_ms,
             Some(50_000)
@@ -6712,7 +6730,7 @@ mod tests {
         );
 
         assert!(
-            skip_task_window(&c, a_skip(50_000, 90_000, 60_000)).expect("write"),
+            move_task_window(&c, a_skip(50_000, 90_000, 60_000)).expect("write"),
             "the window it did see, replaced by a later one"
         );
         let row = get_task(&c, "01SK").expect("get").expect("row");
@@ -6755,7 +6773,7 @@ mod tests {
             "nothing has run, which is what makes the next line the whole story"
         );
 
-        assert!(skip_task_window(&c, a_skip(50_000, 90_000, 60_000)).expect("write"));
+        assert!(move_task_window(&c, a_skip(50_000, 90_000, 60_000)).expect("write"));
 
         let runs = task_runs(&c, "01SK", 10).expect("runs");
         assert_eq!(runs.len(), 1, "one declined window, one row");
@@ -6832,9 +6850,9 @@ mod tests {
                 ("01SK", observed),
             )
             .expect("stage the next open window");
-            assert!(skip_task_window(
+            assert!(move_task_window(
                 &c,
-                TaskWindowSkip {
+                TaskWindowMove {
                     observed_due_ms: observed,
                     next_due_ms: observed + 500,
                     now_ms: observed,

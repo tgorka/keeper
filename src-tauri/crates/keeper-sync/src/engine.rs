@@ -1980,7 +1980,8 @@ impl Engine {
             tasks::TaskOutcome::Busy
             | tasks::TaskOutcome::Deferred
             | tasks::TaskOutcome::Abandoned
-            | tasks::TaskOutcome::Declined => None,
+            | tasks::TaskOutcome::Declined
+            | tasks::TaskOutcome::Postponed => None,
         };
         if let Some(message) = raised {
             tracing::warn!(
@@ -2138,13 +2139,24 @@ impl Engine {
                 // panic on one of them is not a loop this tick may contain.
                 Err(_) => continue,
             };
-            match tasks::decide(&task.state(), schedule.as_ref(), now) {
+            let decision = tasks::decide(&task.state(), schedule.as_ref(), now);
+            match decision {
                 tasks::Action::None => {}
                 tasks::Action::Arm => self.arm_task_window(task, schedule.as_ref(), now, offset),
                 // The variant that forced this match to grow. `Action::None`
                 // could not carry it: the past window would stay standing, so
                 // the next tick would decide about it again, forever.
-                tasks::Action::Skip => self.skip_task_window(task, schedule.as_ref(), now, offset),
+                // Both non-default policies act by WRITING, and the write is
+                // one function: `Action::None` could carry neither, because the
+                // past window would stay standing and the next tick would decide
+                // about it again, forever.
+                tasks::Action::Skip | tasks::Action::Postpone => self.move_task_window(
+                    task,
+                    schedule.as_ref(),
+                    now,
+                    offset,
+                    matches!(decision, tasks::Action::Skip),
+                ),
                 tasks::Action::Run => {
                     let run = self
                         .claim_and_run(task, profiles, now, offset, TaskTrigger::Scheduled)
@@ -2222,69 +2234,103 @@ impl Engine {
     /// rather than an omission: a declined window is not a fault and raises no
     /// toast. It is also not a run, so there is no lease to release and no
     /// [`db::finish_task_run`] to reach.
-    fn skip_task_window(
+    fn move_task_window(
         &self,
         task: &db::TaskRow,
         schedule: Option<&tasks::TaskSchedule>,
         now_ms: i64,
         utc_offset_minutes: i32,
+        declining: bool,
     ) {
-        // Unreachable through `decide`, which answers `Skip` only for a window
-        // that is `Some`. Total anyway, because a loop over stored rows that can
+        // Unreachable through `decide`, which answers neither action for a window
+        // that is `None`. Total anyway, because a loop over stored rows that can
         // panic on one of them is not a loop this tick may contain.
         let Some(observed) = task.next_due_ms else {
             return;
         };
-        let Some(next) = schedule.and_then(|s| s.next_due_after(now_ms, utc_offset_minutes)) else {
-            // The same fact, and the same level, as `arm_task_window`'s: the row
-            // keeps its past window, so this decision repeats on every tick and
-            // the task reports itself enabled and scheduled while nothing runs.
-            tracing::warn!(
-                task = task.id,
-                schedule = task.schedule.as_deref().unwrap_or(""),
-                "this task's schedule has no next instant this keeper can find, so a \
-                 window it declined cannot be replaced and it will not run"
-            );
-            return;
+        // The two policies differ here and nowhere else: `skip` gives up on this
+        // window and arms the next natural one, `delay` keeps this window's work
+        // and arms it for `TASK_MISSED_DELAY_MS` from **now** — the instant this
+        // host noticed, which is the only anchor that survives a two-hour
+        // absence. `saturating_add` because a stored window from a newer keeper
+        // can be any `i64`.
+        let next = if declining {
+            let Some(scheduled) =
+                schedule.and_then(|s| s.next_due_after(now_ms, utc_offset_minutes))
+            else {
+                // The same fact, and the same level, as `arm_task_window`'s: the
+                // row keeps its past window, so this decision repeats on every
+                // tick and the task reports itself enabled and scheduled while
+                // nothing runs.
+                tracing::warn!(
+                    task = task.id,
+                    schedule = task.schedule.as_deref().unwrap_or(""),
+                    "this task's schedule has no next instant this keeper can find, so a \
+                     window it declined cannot be replaced and it will not run"
+                );
+                return;
+            };
+            scheduled
+        } else {
+            now_ms.saturating_add(tasks::TASK_MISSED_DELAY_MS)
+        };
+        let outcome = if declining {
+            tasks::TaskOutcome::Declined
+        } else {
+            tasks::TaskOutcome::Postponed
         };
         // Composed here rather than in the store, for the reason
         // `perform_sync_task`'s summary is: `detail` is the one line a person
         // reads to find out what happened, and the two instants plus the policy
-        // that declined are exactly the three facts this decision holds. The
-        // relative form is deliberate — `relative_ms` lives in the CLI and the
-        // pane renders its own — so the stored line carries the absolute instant
-        // a reader can compare against anything else in the row.
-        let detail = format!(
-            "{policy}: the window at {observed} was not run, and {next} is armed in its place",
-            policy = task.on_missed.as_str(),
-        );
+        // that decided are exactly the three facts this decision holds. Absolute
+        // instants, not relative ones — `relative_ms` lives in the CLI and the
+        // pane renders its own — so the stored line stays true however long after
+        // the fact it is read.
+        //
+        // The two sentences say different things on purpose. A reader's question
+        // is *will my housekeeping happen*, and the answer is "no" for one of
+        // these and "yes, later" for the other.
+        let detail = if declining {
+            format!(
+                "{policy}: the window at {observed} was not run, and {next} is armed in its place",
+                policy = task.on_missed.as_str(),
+            )
+        } else {
+            format!(
+                "{policy}: the window at {observed} is held back, and will be run at {next}",
+                policy = task.on_missed.as_str(),
+            )
+        };
         let host = self.task_host();
-        let skip = db::TaskWindowSkip {
+        let moved = db::TaskWindowMove {
             task_id: &task.id,
             host: &host,
             observed_due_ms: observed,
             next_due_ms: next,
             now_ms,
+            outcome,
             detail: &detail,
         };
-        match self.with_db(|conn| db::skip_task_window(conn, skip)) {
+        match self.with_db(|conn| db::move_task_window(conn, moved)) {
             // `false` is not a fault: the other host sharing this `sync.db` armed,
-            // ran or skipped the same window between this tick's listing read and
+            // ran or moved the same window between this tick's listing read and
             // this write, and the compare-and-set is what stops us undoing it. No
-            // record either — a row here would claim this host declined a window
+            // record either — a row here would claim this host decided something
             // it did not.
             Ok(false) => tracing::debug!(
                 task = task.id,
-                "another host had already moved the window this tick meant to decline"
+                "another host had already moved the window this tick meant to decide about"
             ),
             Ok(true) => tracing::info!(
                 task = task.id,
-                declined_ms = observed,
+                outcome = outcome.as_str(),
+                missed_ms = observed,
                 next_due_ms = next,
-                "a window this task's policy declines was not run, and the next one is armed"
+                "a window nobody was home to serve was not run, and the policy has \
+                 armed the next one"
             ),
             Err(err) => {
-                tracing::debug!(task = task.id, error = %err, "cannot decline a task's window");
+                tracing::debug!(task = task.id, error = %err, "cannot move a task's window");
             }
         }
     }
@@ -13524,16 +13570,18 @@ mod tests {
         assert_eq!(row.lease_until_ms, None);
     }
 
-    /// `delay` holds the window **even though `db::claim_task`'s own condition
-    /// already passes**, which is the whole reason the wait lives in `decide`
-    /// (Story 58.4, AD-139).
+    /// `delay` holds a **missed** window back to `noticed + delay`, serves it
+    /// once, and is genuinely distinct from both siblings (Story 58.4, AD-139).
     ///
-    /// The claim is asserted directly rather than inferred from the absence of a
-    /// run: `next_due_ms <= now` is true throughout the delay, so a guard placed
-    /// at the claim could not have implemented this and a `Requested` trigger —
-    /// which passes `due_at_most: None` — bypasses that condition outright.
+    /// This is the assertion the first draft of the story could not make. With
+    /// the delay anchored on `next_due_ms`, an hourly task whose host returned
+    /// two hours late had `next_due_ms + delay` an hour in the past, so `delay`
+    /// ran the window immediately and was indistinguishable from `run_now` — two
+    /// of the owner's three options collapsing into one, in exactly the scenario
+    /// he described. So the anchor is the instant a host **noticed**, and the
+    /// test drives that scenario rather than a convenient one.
     #[tokio::test]
-    async fn a_delayed_window_waits_although_the_claim_would_already_admit_it() {
+    async fn a_delayed_window_is_held_back_from_when_it_was_noticed_and_then_runs_once() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));
         let Ok(engine) = Engine::open(platform.clone()) else {
@@ -13541,12 +13589,12 @@ mod tests {
         };
         engine
             .save_task(
-                &task_on_missed("01WAIT", "every 5m", tasks::TaskMissedPolicy::Delay),
+                &task_on_missed("01WAIT", "@hourly", tasks::TaskMissedPolicy::Delay),
                 None,
             )
             .expect("save");
         let _ = engine.tick().await;
-        let due = engine
+        let missed = engine
             .tasks()
             .expect("tasks")
             .tasks
@@ -13555,18 +13603,141 @@ mod tests {
             .next_due_ms
             .expect("armed");
 
-        // One millisecond into the open window: due by every measure the store
-        // has, and not yet by the policy's.
-        platform.advance_ms(due + 1 - platform.now_ms());
+        // The owner's scenario, literally: an hourly task, and a host back two
+        // hours after the window opened.
+        platform.advance_ms(missed + 2 * 3_600_000 - platform.now_ms());
+        let noticed = platform.now_ms();
+        let _ = engine.tick().await;
+
+        assert!(
+            engine.task_history("01WAIT", 10).expect("history").len() == 1,
+            "the tick that noticed recorded the postponement and ran nothing"
+        );
+        let held = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(
+            held.next_due_ms,
+            Some(noticed + tasks::TASK_MISSED_DELAY_MS),
+            "anchored on the noticing, not on the window: a window already two \
+             hours old is past any instant derived from itself, which is what \
+             made the first draft of this option identical to run_now"
+        );
+        assert!(
+            held.next_due_ms.is_some_and(|at| at > platform.now_ms()),
+            "and it is in the FUTURE, so `claim_task`'s `next_due_ms <= now` \
+             condition now correctly refuses the run for the length of the delay \
+             — the arbiter holds it back rather than something beside the arbiter"
+        );
+
+        // Ticks throughout the delay run nothing, and — the property a
+        // `decide`-side wait could not have offered — a host that restarts
+        // inside the delay still respects it, because the instant is on the row.
+        platform.advance_ms(tasks::TASK_MISSED_DELAY_MS - 1_000);
         for _ in 0..3 {
             let _ = engine.tick().await;
         }
+        assert_eq!(
+            engine.task_history("01WAIT", 10).expect("history").len(),
+            1,
+            "still only the postponement: nothing has run"
+        );
+        let Ok(restarted) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let _ = restarted.tick().await;
+        assert_eq!(
+            restarted.task_history("01WAIT", 10).expect("history").len(),
+            1,
+            "a fresh engine reads the stored instant and honours the remaining \
+             delay rather than starting one of its own"
+        );
+
+        // And then it runs. Once.
+        platform.advance_ms(2_000);
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        let runs = engine.task_history("01WAIT", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            2,
+            "the postponement, then the run it was holding back — and only one \
+             run, however many ticks follow (AD-138)"
+        );
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Ok),
+            "the newest row is the run, so `delay` really does serve the window \
+             rather than dropping it — which is the whole difference from `skip`"
+        );
+        assert_eq!(runs[1].outcome, Some(tasks::TaskOutcome::Postponed));
+    }
+
+    /// A postponement is a **recorded, readable** fact, and it is not the same
+    /// fact as a decline (Story 58.5, AD-140).
+    ///
+    /// Main's second follow-up, and the reason it matters: during the delay a
+    /// person looking at ⌘8 must be able to tell *held back by policy* from
+    /// *nothing happened*. Those two states looked identical while the wait lived
+    /// in `decide`, because nothing was written.
+    #[tokio::test]
+    async fn a_postponement_is_readable_and_says_the_run_is_still_coming() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01HELD", "every 5m", tasks::TaskMissedPolicy::Delay),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let missed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS + 300_000);
+        let _ = engine.tick().await;
+
+        let last = engine.task_history("01HELD", 1).expect("history");
+        assert_eq!(last.len(), 1, "the last-run line has something to say");
+        let held = &last[0];
+        assert_eq!(held.outcome, Some(tasks::TaskOutcome::Postponed));
+        assert_ne!(
+            held.outcome,
+            Some(tasks::TaskOutcome::Declined),
+            "and it is NOT a decline: a declined window will never be served, a \
+             postponed one will, and telling somebody their nightly sweep was \
+             dropped when it was only held back is the confusion this separation \
+             exists to prevent"
+        );
+        assert_eq!(
+            held.finished_ms,
+            Some(held.started_ms),
+            "closed and zero-duration: nothing ran"
+        );
+        let detail = held.detail.clone().expect("a detail");
         assert!(
-            engine
-                .task_history("01WAIT", 10)
-                .expect("history")
-                .is_empty(),
-            "nothing ran inside the delay"
+            detail.contains("delay") && detail.contains(&missed.to_string()),
+            "the detail names the policy and the window it is about: {detail}"
+        );
+        assert!(
+            detail.contains("will be run"),
+            "and says the run is still coming, which is the one fact that \
+             separates this row from a declined one to a person reading it: \
+             {detail}"
         );
         let row = engine
             .tasks()
@@ -13575,40 +13746,31 @@ mod tests {
             .first()
             .cloned()
             .expect("row");
-        assert_eq!(
-            row.next_due_ms,
-            Some(due),
-            "and the window is untouched — a delay is a wait, not a re-arm"
-        );
+        assert_eq!(row.running_host, None, "no lease was taken");
         assert!(
-            row.next_due_ms.is_some_and(|at| at <= platform.now_ms()),
-            "which means `claim_task`'s `next_due_ms <= now` condition is \
-             satisfied right now: the delay could not have been enforced there"
-        );
-
-        // Past the grace, it runs — once.
-        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS);
-        for _ in 0..3 {
-            let _ = engine.tick().await;
-        }
-        assert_eq!(
-            engine.task_history("01WAIT", 10).expect("history").len(),
-            1,
-            "the delayed window is served once the delay elapses, and only once"
+            row.next_due_ms.is_some_and(|at| at > platform.now_ms()),
+            "and the row's next-due has moved forward, so the pane's own \
+             next-due line is legible during the delay without a second surface"
         );
     }
 
-    /// A hand-run during a delay runs **at once**, as a requested run, and the
-    /// window is then consumed (Story 58.4).
+    /// A hand-run **during** a postponement runs at once, and does not silently
+    /// become the postponed run (Story 58.4).
     ///
-    /// Both halves are the point. The request must not be blocked, deferred or
-    /// relabelled — the delay lives in `decide`, and a request never passes
-    /// through `decide`. And afterwards there must be exactly **one** run for
-    /// that window, because NFR-44 forbids two: the request served it, and
-    /// `next_task_window` re-arms an already-open window for precisely that
-    /// reason.
+    /// This is the epic's own acceptance sentence, and with the delay anchored on
+    /// the noticing it is now literally true rather than approximately true. The
+    /// request must not be blocked, deferred or relabelled — a request never
+    /// passes through `decide` — and the postponed run still happens afterwards,
+    /// because the postponed instant is in the future and
+    /// `Engine::next_task_window` preserves a future window for exactly the
+    /// documented reason: *asking for a run now is not asking to skip the next
+    /// one*.
+    ///
+    /// NFR-44 is untouched by that second run: it forbids a **policy**
+    /// enumerating missed windows, and there is still exactly one postponement
+    /// for one missed window. The extra run is one a person asked for by hand.
     #[tokio::test]
-    async fn a_hand_run_during_a_delay_runs_at_once_and_serves_the_window() {
+    async fn a_hand_run_during_a_postponement_runs_at_once_and_does_not_consume_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));
         let Ok(engine) = Engine::open(platform.clone()) else {
@@ -13621,32 +13783,59 @@ mod tests {
             )
             .expect("save");
         let _ = engine.tick().await;
-        let due = engine
+
+        // Missed, then noticed: the tick records the postponement and moves the
+        // window into the future.
+        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS + 300_000);
+        let _ = engine.tick().await;
+        let held = engine
             .tasks()
             .expect("tasks")
             .tasks
             .first()
             .expect("row")
             .next_due_ms
-            .expect("armed");
-        platform.advance_ms(due + 1 - platform.now_ms());
+            .expect("held");
+        assert!(held > platform.now_ms(), "we are inside the delay");
 
+        // A person asks, inside the delay. It runs, immediately, and is recorded
+        // as its own run rather than as the one being held back.
         let run = engine
             .run_task_now("01ASK")
             .await
             .expect("a person asking is not asking about a window");
         assert_eq!(run.outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            engine
+                .tasks()
+                .expect("tasks")
+                .tasks
+                .first()
+                .expect("row")
+                .next_due_ms,
+            Some(held),
+            "and the postponed instant is untouched: the request was not \
+             converted into the delayed run"
+        );
 
-        // Past the delay, with the ticks that would have served it.
-        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS);
+        // Then the delay elapses and the held run happens, once.
+        platform.advance_ms(held - platform.now_ms());
         for _ in 0..3 {
             let _ = engine.tick().await;
         }
+        let runs = engine.task_history("01ASK", 10).expect("history");
         assert_eq!(
-            engine.task_history("01ASK", 10).expect("history").len(),
-            1,
-            "one run for one window: the request served it, and NFR-44 forbids \
-             the policy serving it again afterwards"
+            runs.len(),
+            3,
+            "the postponement, the hand-run, and the held run — and only one \
+             postponement for the one missed window, which is what NFR-44 is \
+             about: {runs:?}"
+        );
+        assert_eq!(
+            runs.iter()
+                .filter(|r| r.outcome == Some(tasks::TaskOutcome::Postponed))
+                .count(),
+            1
         );
     }
 
