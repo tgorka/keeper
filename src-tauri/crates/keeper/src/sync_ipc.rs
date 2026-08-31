@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use keeper_core::tasks::{
-    task_host, DaemonPresence, TaskHostFacts, TaskListingVm, TaskRunVm, TaskSaveReq, TaskVm,
-    UnknownTaskVm,
+    paced_work, task_host, DaemonPresence, PacedFolderFacts, PacedNotesFacts, PacedWorkVm,
+    TaskHostFacts, TaskListingVm, TaskRunVm, TaskSaveReq, TaskVm, UnknownTaskVm,
 };
 use keeper_core::vm::{
     ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
@@ -2116,6 +2116,64 @@ pub async fn sync_tasks(state: tauri::State<'_, AppState>) -> Result<TaskListing
             })
             .collect(),
     })
+}
+
+/// Everything else this host paces, projected at read time from the folder list
+/// (Story 58.7, AD-141, AD-142).
+///
+/// **A projection, and it registers no clock.** Nothing here starts an interval,
+/// arms a due-gate or writes a `tasks` row: every field is derived from state
+/// the engine already holds, on a read a person asked for. That is AD-142's rule
+/// and it is also why the answer carries no next run — see [`PacedWorkVm`], whose
+/// missing keys are the AD-141 half of the same argument.
+///
+/// **The read propagates**, `sync_tasks`'s rule and for its reason (that
+/// command's finding 3): a swallowed `list_profiles` fault here would return an
+/// empty list, and an empty list means *"keeper paces nothing on this machine"* —
+/// a claim, on a machine that may pace a dozen things. A failed read is a fault
+/// to report, not a fact to invent.
+///
+/// `sync_governance_mode` is deliberately NOT propagated, because it cannot be:
+/// it answers `None` both for a folder no task governs and for a tasks-table it
+/// could not read, and both of those mean the paced poll is still running. An
+/// error is not a governance state.
+///
+/// Rejects with: `unsupported`, `internal`.
+#[tauri::command]
+pub async fn sync_paced_work(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<PacedWorkVm>, IpcError> {
+    let engine = engine_of(&state)?;
+    // Kept alive for the whole projection: the facts borrow their two strings
+    // from these rows rather than cloning them, so the vector must outlive the
+    // slice built from it.
+    let profiles = engine.list_profiles().map_err(|err| sync_ipc_error(&err))?;
+    let facts: Vec<PacedFolderFacts<'_>> = profiles
+        .iter()
+        .map(|profile| PacedFolderFacts {
+            profile_id: &profile.id,
+            profile: &profile.name,
+            enabled: profile.enabled,
+            removable: profile.removable,
+            // The floor, never the stored column: a profile may hold a zero
+            // there and the engine polls at `MIN_POLL_INTERVAL_MS` regardless.
+            scan_interval_ms: profile.effective_poll_interval_ms(),
+            // `Some(Scheduled)` is the only answer that means the paced backstop
+            // has stood down (Story 58.8). `Some(Off)`, `Some(Manual)` and the
+            // `None` a failed table read also produces all leave the poll
+            // running, so the row keeps its cadence and stays true.
+            scan_governed: matches!(
+                engine.sync_governance_mode(&profile.id),
+                Some(keeper_sync::tasks::TaskMode::Scheduled)
+            ),
+            sweep_interval_ms: keeper_sync::engine::SWEEP_EVERY_MS as u64,
+            notes: profile.notes.as_ref().map(|notes| PacedNotesFacts {
+                commit_idle_ms: notes.cadence.commit_idle_ms,
+                push_interval_ms: notes.cadence.push_interval_ms,
+            }),
+        })
+        .collect();
+    Ok(paced_work(&facts))
 }
 
 /// One task's run history, newest first.

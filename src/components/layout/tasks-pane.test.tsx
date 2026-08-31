@@ -17,6 +17,10 @@ vi.mock("@/lib/ipc/client", () => ({
   syncTaskHistory: vi.fn(),
   syncTaskSave: vi.fn(),
   syncTaskForget: vi.fn(),
+  // Story 58.7's read. Mocked here and answered in `beforeEach`, because the
+  // pane now reads it in the SAME settled pass as `syncTasks` — an unanswered
+  // mock resolves `undefined` and the section would render rows out of it.
+  syncPacedWork: vi.fn(),
   // The mounted form's own read (Story 58.1): the folder picker.
   syncProfiles: vi.fn(),
 }));
@@ -25,6 +29,16 @@ import { LIST_FOLD_MORE_LABEL } from "@/components/layout/list-fold";
 import {
   formatTaskAgo,
   formatTaskDue,
+  PACED_BADGE,
+  PACED_CADENCE_LABEL,
+  PACED_EMPTY_TEXT,
+  PACED_FOLDER_LABEL,
+  PACED_KIND_LABELS,
+  PACED_LOADING_TEXT,
+  PACED_NO_CADENCE_TEXT,
+  PACED_REFUSAL_TESTID,
+  PACED_ROW_TESTID,
+  PACED_SUBTITLE,
   TASK_DUE_NOW_TEXT,
   TASK_EDIT_TEXT,
   TASK_FORGET_CANCEL_TEXT,
@@ -50,6 +64,7 @@ import {
   TASK_SCHEDULE_LABEL,
   TASK_UNREADABLE_OUTCOME_TEXT,
   TASKS_CLOCK_TICK_MS,
+  TASKS_ERROR_TESTID,
   TASKS_HISTORY_REFUSAL_TESTID,
   TASKS_HISTORY_ROW_TESTID,
   TASKS_HISTORY_TESTID,
@@ -78,8 +93,9 @@ import {
   TASK_FORM_SCHEDULE_LABEL,
   TASK_HOST_WIDE_TEXT,
 } from "@/components/sync/task-form";
-import type { TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
+import type { PacedWorkVm, TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
 import {
+  syncPacedWork,
   syncProfiles,
   syncTaskForget,
   syncTaskHistory,
@@ -101,6 +117,22 @@ const SENTENCE_APP = "keeper runs this — only while keeper is running";
 const SENTENCE_DAEMON = "the keeper-syncd unit on this machine runs this, logged in or not";
 const SENTENCE_UNHOSTED = "nothing will run this";
 const REASON_FOLDER_GONE = "it names a folder keeper does not sync, so no host here can run it";
+
+/**
+ * The `PACED_SENTENCE_*` constants `keeper_core::tasks` composes, verbatim.
+ *
+ * Spelled out here rather than imported, for the reason the four above are: the
+ * pane renders Rust's words and must not be allowed to agree with itself. A
+ * paraphrase in Rust would leave these tests green while the screen changed.
+ */
+const PACED_SENTENCE_SCAN =
+  "keeper looks for changes on this cadence while it is running. The cadence is a backstop and not the only trigger: a file the watcher sees settle, or a write that closes, brings the next look forward.";
+const PACED_SENTENCE_GOVERNED =
+  "a scheduled sync task decides when this folder is looked at, so the paced backstop has stood down. A file the watcher sees settle still brings a look forward.";
+const PACED_SENTENCE_SWEEP =
+  "keeper deletes transfer scratch this folder will never use again, on this cadence, while it is running.";
+const PACED_SENTENCE_PAUSED =
+  "this folder is paused, so nothing here is paced and no cadence is in force.";
 
 function run(over: Partial<TaskRunVm> = {}): TaskRunVm {
   return {
@@ -148,10 +180,33 @@ function answer(value: TaskListingVm): void {
   vi.mocked(syncTasks).mockResolvedValue(value);
 }
 
+/** A paced scan row — the projection's canonical shape (Story 58.7). */
+function pacedRow(over: Partial<PacedWorkVm> = {}): PacedWorkVm {
+  return {
+    id: "scan:p1",
+    kind: "scan",
+    profileId: "p1",
+    profile: "keeper",
+    standing: "paced",
+    cadence: "about every 15 seconds",
+    sentence: PACED_SENTENCE_SCAN,
+    ...over,
+  };
+}
+
+function answerPaced(rows: PacedWorkVm[]): void {
+  vi.mocked(syncPacedWork).mockResolvedValue(rows);
+}
+
 beforeEach(() => {
   // Every form this pane reveals reads the folder list as it mounts, so a test
   // that opens one needs an answer here or the read never resolves.
   vi.mocked(syncProfiles).mockResolvedValue([]);
+  // The projection is read in the same pass as the listing, so every test needs
+  // an answer for it. `[]` and not a row: the 63 tests that predate Story 58.7
+  // are about the task list, and a projected row in each of them would put a
+  // second `Cadence` cell inside reach of their queries.
+  answerPaced([]);
 });
 
 afterEach(() => {
@@ -1802,5 +1857,201 @@ describe("a task's runs open on the row, and are read only when asked for", () =
     expect(
       screen.getByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("the pane also lists what this host paces, and says it is not a task", () => {
+  it("states, per projected row, its kind, its folder, its cadence and Rust's sentence", async () => {
+    answer(listing());
+    answerPaced([pacedRow()]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(row).toHaveAttribute("data-paced-id", "scan:p1");
+    expect(within(row).getByText(PACED_BADGE)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_KIND_LABELS.scan)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_FOLDER_LABEL)).toBeInTheDocument();
+    expect(within(row).getByText("keeper")).toBeInTheDocument();
+    expect(within(row).getByText(PACED_CADENCE_LABEL)).toBeInTheDocument();
+    expect(within(row).getByText("about every 15 seconds")).toBeInTheDocument();
+    // Rust's, verbatim — the two filesystem triggers included, which is the one
+    // thing the interval alone would be read as denying.
+    expect(within(row).getByText(PACED_SENTENCE_SCAN)).toBeInTheDocument();
+  });
+
+  it("renders a kind this build does not know as its own spelling", async () => {
+    // `HOST_KIND_LABELS`'s rule, applied to the class that grows next:
+    // `PacedWorkKind` can gain a variant in Rust, and a blank label would hide
+    // a row this build was still handed.
+    answer(listing());
+    answerPaced([
+      pacedRow({
+        id: "teleport:p1",
+        // A spelling only a newer keeper writes. Cast because the union in the
+        // generated binding is this build's, which is exactly the drift the
+        // fallback exists for.
+        kind: "teleportSweep" as PacedWorkVm["kind"],
+      }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+    expect(within(row).getByText("teleportSweep")).toBeInTheDocument();
+  });
+
+  it("offers no control of any kind on a projected row, and says so in words first", async () => {
+    // The absence, asserted in BOTH shapes. By name, because those four are the
+    // controls a reader of the list above will look for; and by role over the
+    // whole row, because a fifth control added later would pass the by-name
+    // assertions while putting a button on a row nothing can run.
+    //
+    // Not a disabled button either: a disabled control says *not now* and the
+    // truth is *not ever*.
+    answer(listing());
+    answerPaced([pacedRow()]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).queryAllByRole("button")).toEqual([]);
+    for (const name of [TASK_RUN_NOW_TEXT, TASK_EDIT_TEXT, TASK_FORGET_TEXT, TASK_HISTORY_TITLE]) {
+      expect(within(row).queryByRole("button", { name })).toBeNull();
+    }
+    // And the absence is EXPLAINED rather than merely present: a reader who
+    // knows a Sync task can be run on demand would otherwise read a row with no
+    // Run now as a row whose Run now failed to render.
+    expect(screen.getByText(PACED_SUBTITLE)).toBeInTheDocument();
+  });
+
+  it("does not re-read the projection when the pane's display clock ticks", async () => {
+    // AD-142: the projection registers no clock and is not polled. It rides the
+    // pane's existing read, so the tick that moves every relative time on screen
+    // must not cost a second call.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      answer(listing());
+      answerPaced([pacedRow()]);
+      render(<TasksPane />);
+      await screen.findByTestId(PACED_ROW_TESTID);
+
+      for (let tick = 0; tick < 3; tick += 1) {
+        await vi.advanceTimersByTimeAsync(TASKS_CLOCK_TICK_MS);
+      }
+
+      expect(syncPacedWork).toHaveBeenCalledTimes(1);
+      // The listing is not re-read either: one pass read both.
+      expect(syncTasks).toHaveBeenCalledTimes(1);
+      expect(screen.getByTestId(PACED_ROW_TESTID)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says a paused folder is paused, and shows no cadence beside it", async () => {
+    // The invariant is enforced in Rust — `cadence` is `Some` only for `paced` —
+    // so what this asserts is that the view does not invent one to fill the cell.
+    answer(listing());
+    answerPaced([
+      pacedRow({
+        id: "sweep:p3",
+        kind: "scratchSweep",
+        profile: "archive",
+        profileId: "p3",
+        standing: "paused",
+        cadence: null,
+        sentence: PACED_SENTENCE_PAUSED,
+      }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).getByText(PACED_SENTENCE_PAUSED)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
+    expect(within(row).queryByText(/about every/)).toBeNull();
+  });
+
+  // THE STORY 58.8 CONTRACT TEST. It fails the day somebody reverts that
+  // story's stand-down and leaves the paced poll running underneath a scheduled
+  // Sync task — which is the exact moment this view would start advertising a
+  // cadence that no longer decides anything.
+  it("says a governed scan has stood down, and advertises no cadence for it", async () => {
+    answer(listing());
+    answerPaced([
+      pacedRow({ standing: "governed", cadence: null, sentence: PACED_SENTENCE_GOVERNED }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).getByText(PACED_SENTENCE_GOVERNED)).toBeInTheDocument();
+    expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
+    // The event triggers survive governance: what stood down is the interval.
+    expect(within(row).getByText(/watcher sees settle still brings a look forward/)).toBeVisible();
+  });
+
+  it("quotes a refused projection and leaves the task rows above it standing", async () => {
+    // `Promise.allSettled` is what makes this true: `all` would reject on the
+    // first failure and throw the listing away with it. A failed read is a fault
+    // to report, not a fact to invent — and never a reason to blank a list that
+    // read successfully.
+    answer(listing());
+    vi.mocked(syncPacedWork).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+
+    const refusal = await screen.findByTestId(PACED_REFUSAL_TESTID);
+    expect(refusal).toHaveTextContent("database is locked");
+    expect(refusal).toHaveAttribute("role", "alert");
+    // The section's own sentences yield to it: neither may claim anything about
+    // a machine whose projection did not read.
+    expect(screen.queryByText(PACED_EMPTY_TEXT)).toBeNull();
+    expect(screen.queryByText(PACED_LOADING_TEXT)).toBeNull();
+    // And the task list is untouched.
+    const row = screen.getByTestId(TASKS_ROW_TESTID);
+    expect(within(row).getByText("01SCHED")).toBeInTheDocument();
+    expect(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeInTheDocument();
+    expect(screen.queryByTestId(TASKS_ERROR_TESTID)).toBeNull();
+  });
+
+  it("says unread and says empty in different words, and never both", async () => {
+    // `null` is unread and `[]` is "keeper paces nothing here". A single
+    // falsy check would have said one of those two things about the other.
+    answer(listing());
+    // Never resolves: the section stays at `null` for the whole of this half.
+    vi.mocked(syncPacedWork).mockImplementation(() => new Promise<PacedWorkVm[]>(() => {}));
+    const unread = render(<TasksPane />);
+    expect(await screen.findByText(PACED_LOADING_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText(PACED_EMPTY_TEXT)).toBeNull();
+    unread.unmount();
+
+    answerPaced([]);
+    render(<TasksPane />);
+    expect(await screen.findByText(PACED_EMPTY_TEXT)).toBeInTheDocument();
+    expect(screen.queryByText(PACED_LOADING_TEXT)).toBeNull();
+    expect(screen.queryAllByTestId(PACED_ROW_TESTID)).toEqual([]);
+  });
+
+  it("lists every projected row for a folder, and the sweep reads the engine's hour", async () => {
+    answer(listing());
+    answerPaced([
+      pacedRow(),
+      pacedRow({
+        id: "sweep:p1",
+        kind: "scratchSweep",
+        cadence: "every 1 hour",
+        sentence: PACED_SENTENCE_SWEEP,
+      }),
+    ]);
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(2));
+
+    const sweep = screen
+      .getAllByTestId(PACED_ROW_TESTID)
+      .find((candidate) => candidate.getAttribute("data-paced-id") === "sweep:p1");
+    expect(sweep).toBeDefined();
+    expect(within(sweep as HTMLElement).getByText(PACED_KIND_LABELS.scratchSweep)).toBeVisible();
+    expect(within(sweep as HTMLElement).getByText("every 1 hour")).toBeVisible();
+    expect(within(sweep as HTMLElement).getByText(PACED_SENTENCE_SWEEP)).toBeVisible();
   });
 });

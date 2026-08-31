@@ -52,6 +52,7 @@ import type {
   FilesEntryVm,
   FilesListingVm,
   FilesReleaseVm,
+  PacedWorkVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
   SessionSpaceVm,
@@ -1826,6 +1827,108 @@ const TASK_LISTING: TaskListingVm = {
   ],
 };
 
+/**
+ * The sentences `keeper_core::tasks` composes for the paced class (Story 58.7),
+ * copied verbatim for `HOST_SENTENCES`'s reason: this file renders what Rust
+ * would send, and a paraphrase here would show a screen the app never draws.
+ */
+const PACED_SENTENCES = {
+  scanPaced:
+    "keeper looks for changes on this cadence while it is running. The cadence is a backstop and not the only trigger: a file the watcher sees settle, or a write that closes, brings the next look forward.",
+  scanGoverned:
+    "a scheduled sync task decides when this folder is looked at, so the paced backstop has stood down. A file the watcher sees settle still brings a look forward.",
+  sweepPaced:
+    "keeper deletes transfer scratch this folder will never use again, on this cadence, while it is running.",
+  notesPaced:
+    "the app commits this vault after the quiet window and pushes within the deadline. Only the running app paces it — keeper-syncd never does.",
+  paused: "this folder is paused, so nothing here is paced and no cadence is in force.",
+  removableClause:
+    " The folder is on removable media, so nothing happens at all while the drive is away.",
+} as const;
+
+/**
+ * What this host paces, as the projection would answer it: two folders, one of
+ * them holding a vault and one of them paused.
+ *
+ * The shapes worth looking at are the negatives — a paused folder whose rows
+ * carry no cadence at all, and a governed scan row whose backstop has stood
+ * down (Story 58.8) — because those are the two the section's wording exists
+ * for. `satisfies PacedWorkVm[]` for `sync_profiles`'s reason: `dev/` is inside
+ * the typecheck, so a field added in Rust breaks the build here rather than
+ * blanking a section at run time.
+ */
+const PACED_WORK = [
+  {
+    id: "scan:p1",
+    kind: "scan",
+    profileId: "p1",
+    profile: "keeper",
+    standing: "paced",
+    cadence: "about every 15 seconds",
+    sentence: PACED_SENTENCES.scanPaced,
+  },
+  {
+    id: "sweep:p1",
+    kind: "scratchSweep",
+    profileId: "p1",
+    profile: "keeper",
+    standing: "paced",
+    cadence: "every 1 hour",
+    sentence: PACED_SENTENCES.sweepPaced,
+  },
+  // A vault, and the one row in the pane that says keeper-syncd will not do it.
+  {
+    id: "notes:p1",
+    kind: "notesCadence",
+    profileId: "p1",
+    profile: "keeper",
+    standing: "paced",
+    cadence: "committed after 2 seconds of quiet, pushed within 30 seconds",
+    sentence: PACED_SENTENCES.notesPaced,
+  },
+  // Governed: a scheduled Sync task took this folder's paced backstop, so the
+  // row advertises no cadence and says which surface decides instead. On
+  // removable media too, so the clause rides the governed sentence.
+  {
+    id: "scan:p2",
+    kind: "scan",
+    profileId: "p2",
+    profile: "photos",
+    standing: "governed",
+    cadence: null,
+    sentence: `${PACED_SENTENCES.scanGoverned}${PACED_SENTENCES.removableClause}`,
+  },
+  {
+    id: "sweep:p2",
+    kind: "scratchSweep",
+    profileId: "p2",
+    profile: "photos",
+    standing: "paced",
+    cadence: "every 1 hour",
+    sentence: PACED_SENTENCES.sweepPaced,
+  },
+  // Paused, and every row of the folder says the same thing: `tick` skips a
+  // disabled profile before it reaches any of this work.
+  {
+    id: "scan:p3",
+    kind: "scan",
+    profileId: "p3",
+    profile: "archive",
+    standing: "paused",
+    cadence: null,
+    sentence: PACED_SENTENCES.paused,
+  },
+  {
+    id: "sweep:p3",
+    kind: "scratchSweep",
+    profileId: "p3",
+    profile: "archive",
+    standing: "paused",
+    cadence: null,
+    sentence: PACED_SENTENCES.paused,
+  },
+] satisfies PacedWorkVm[];
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   // --- Tasks (Epic 57, Story 57.6) ---------------------------------------
   //
@@ -1833,6 +1936,10 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // WHICH task was asked about — and because the flow worth looking at is
   // pressing Run now on a task the engine refuses. A table could not refuse.
   sync_tasks: () => TASK_LISTING,
+  // Not a task, and answered beside the tasks because the pane reads both in one
+  // pass. A static answer: nothing about it depends on the payload, and nothing
+  // in the app can change it — the class is read-only by construction.
+  sync_paced_work: () => PACED_WORK,
   sync_task_history: (payload) => {
     const runs = TASK_RUNS[String(payload.id)] ?? [];
     // The clamp the command applies, mirrored so a caller asking for two rows

@@ -101,8 +101,14 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
-import { syncTaskForget, syncTaskHistory, syncTaskRunNow, syncTasks } from "@/lib/ipc/client";
+import type { PacedWorkVm, TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
+import {
+  syncPacedWork,
+  syncTaskForget,
+  syncTaskHistory,
+  syncTaskRunNow,
+  syncTasks,
+} from "@/lib/ipc/client";
 import { hydrateSyncListSizes } from "@/lib/stores/sync-detail";
 
 /** The heading, and the promise the pane makes in one line. */
@@ -417,6 +423,87 @@ const OUTCOME_LABELS: Record<string, string> = {
   abandoned: "Abandoned by the host that started it",
   declined: "Not run — the next window was armed instead",
   postponed: "Held back — it will run later",
+};
+
+// ---------------------------------------------------------------------------
+// The paced class (Story 58.7): what this host paces, which is not a task
+// ---------------------------------------------------------------------------
+
+/**
+ * The heading over the projected rows.
+ *
+ * *Also* because the section sits under the task list and is the answer to the
+ * question the list above raises — "is this everything keeper does on a clock?"
+ * — and *paced by this host* because that is the honest verb: nothing here is
+ * scheduled, and the pacing stops when the process does.
+ */
+export const PACED_HEADING = "Also paced by this host";
+
+/**
+ * What the section is, and — before anyone hunts for one — that the controls
+ * every row above has cannot exist here.
+ *
+ * Said in words rather than left to the absence of buttons, because an absence
+ * is indistinguishable from a bug: a reader who knows a Sync task can be run on
+ * demand will read a row with no Run now as a row whose Run now failed to
+ * render. The two clauses are the two things that are actually missing — a
+ * schedule you can set, and a run you can ask for.
+ */
+export const PACED_SUBTITLE =
+  "Work keeper paces on its own. These are not tasks: nothing here has a schedule you can set, and nothing here can be run on demand.";
+
+/**
+ * The badge on such a row, `TASKS_UNKNOWN_BADGE`'s idiom.
+ *
+ * *Paced* and not *Automatic* or *Internal*: it is the one word that says the
+ * clock in this process drives it, which is exactly what distinguishes the row
+ * from every task above it.
+ */
+export const PACED_BADGE = "Paced";
+
+/** Before this section's read lands the projection is unknown, not empty. */
+export const PACED_LOADING_TEXT = "Reading what this host paces…";
+
+/**
+ * That keeper paces nothing here, and what would put a row in this section.
+ *
+ * Every projected row is per-folder, so an empty projection means exactly one
+ * thing — there are no folders — and the sentence says so rather than leaving a
+ * reader to wonder whether the feature is switched off somewhere.
+ */
+export const PACED_EMPTY_TEXT =
+  "keeper paces nothing on this machine yet. A folder gets a cadence as soon as it is added.";
+
+/** Column labels, so a projected row reads without a table header above it. */
+export const PACED_CADENCE_LABEL = "Cadence";
+export const PACED_FOLDER_LABEL = "Folder";
+
+/**
+ * What stands in for an absent cadence.
+ *
+ * `cadence` is null only when the standing is `paused` or `governed`, and in
+ * both cases the row's sentence already says which — so this cell says the one
+ * thing the *cadence* column can honestly say, and never guesses a reason.
+ */
+export const PACED_NO_CADENCE_TEXT = "nothing paces it";
+
+export const PACED_ROW_TESTID = "paced-row";
+export const PACED_REFUSAL_TESTID = "paced-refusal";
+
+/**
+ * The short label for each projected kind, `HOST_KIND_LABELS`'s idiom and its
+ * fallback rule: a kind this build does not know renders as its own spelling
+ * rather than as a blank, because `PacedWorkKind` can grow in Rust.
+ *
+ * Each label is a verb phrase and not a noun, because these are things keeper
+ * *does* rather than records it keeps — and *Look for changes* rather than
+ * *Scan* for the reason the row's sentence spells out at length: the interval is
+ * a backstop behind the watcher, and "scan" reads like the only route in.
+ */
+export const PACED_KIND_LABELS: Record<string, string> = {
+  scan: "Look for changes",
+  scratchSweep: "Sweep transfer scratch",
+  notesCadence: "Notes commit and push",
 };
 
 /**
@@ -979,9 +1066,128 @@ function TaskRow({
   );
 }
 
+/**
+ * What this host paces, as its own list (Story 58.7).
+ *
+ * **Its own component and its own list, never a widened {@link TaskRow}.** The
+ * two classes share a pane and nothing else: a task has a mode, a schedule, a
+ * window, a lease and a history, and a projected row has none of those and can
+ * never grow them. One component serving both would have to branch on the class
+ * at every cell, and the first branch anybody forgot would put a Run now on a
+ * row nothing can run — which is the one failure this section's subtitle exists
+ * to promise against.
+ *
+ * **No interactive element inside a row, of any kind.** Not a disabled button,
+ * either: a disabled control says *not now*, and the truth is *not ever*. The
+ * only control this section owns is `FoldToggle`, which belongs to the list
+ * rather than to any row and changes nothing but how much is on screen.
+ *
+ * The loading/empty/refusal shape is {@link TaskRunList}'s, deliberately rather
+ * than by accident of copying — this file's header promises it reuses the Sync
+ * pane's list idioms rather than inventing a third.
+ */
+function PacedWorkList({
+  rows,
+  error,
+}: {
+  /** `null` until this section's read lands: unread, and not empty. */
+  rows: PacedWorkVm[] | null;
+  error: string | null;
+}) {
+  const fold = useFold(rows);
+  return (
+    <div className="flex flex-col gap-2 border-border border-t px-6 py-4">
+      {/* The project's group-label treatment (`sync-pane.tsx`'s Activity
+          heading), so this section reads as a second class in one view rather
+          than as a second view. */}
+      <div className="min-w-0">
+        <h2 className="label-caps text-faint">{PACED_HEADING}</h2>
+        <p className="text-muted-foreground text-xs">{PACED_SUBTITLE}</p>
+      </div>
+      {/* Drawn INSTEAD of both sentences below and never instead of rows already
+          on screen: a refused re-read leaves every projected row exactly where
+          it was. A failed read is a fault to report, not a fact to invent — and
+          it must not blank the task list above, which is why the pane reads the
+          two commands through `Promise.allSettled`. */}
+      {error !== null && (
+        <p role="alert" data-testid={PACED_REFUSAL_TESTID} className="text-destructive text-xs">
+          {error}
+        </p>
+      )}
+      {/* Two states and two sets of words, `TaskRunList`'s rule: `null` is
+          unread and `[]` is "keeper paces nothing here", and they never render
+          the same sentence. Both yield to a refusal, because a kept `[]` beside
+          a refusal would claim this machine paces nothing on the strength of a
+          read that failed. */}
+      {error === null &&
+        (rows === null ? (
+          <p role="status" className="text-muted-foreground text-xs">
+            {PACED_LOADING_TEXT}
+          </p>
+        ) : (
+          rows.length === 0 && (
+            <p role="status" className="text-muted-foreground text-xs">
+              {PACED_EMPTY_TEXT}
+            </p>
+          )
+        ))}
+      {rows !== null && rows.length > 0 && (
+        <ul aria-label={PACED_HEADING} className="flex flex-col gap-3">
+          {fold.visible.map((row) => (
+            // `id` is the projection's own composite key — `scan:<profileId>`
+            // and its two siblings — so unlike the unknown-task list below, this
+            // one needs no index in its key: one folder contributes at most one
+            // row of each kind.
+            <li
+              key={row.id}
+              data-testid={PACED_ROW_TESTID}
+              data-paced-id={row.id}
+              className="flex flex-col gap-1"
+            >
+              <span className="flex items-center gap-2">
+                <Badge variant="outline">{PACED_BADGE}</Badge>
+                <span className="font-medium text-foreground text-sm">
+                  {PACED_KIND_LABELS[row.kind] ?? row.kind}
+                </span>
+              </span>
+              <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <Field label={PACED_FOLDER_LABEL}>{row.profile}</Field>
+                {/* Null only for a paused or a governed row, and the sentence
+                    below says which — so this cell never guesses a reason. */}
+                <Field label={PACED_CADENCE_LABEL}>{row.cadence ?? PACED_NO_CADENCE_TEXT}</Field>
+              </dl>
+              {/* Rust's, verbatim. Each of these carries a fact the browser
+                  cannot re-derive — that a saved file brings the next look
+                  forward, that a governed folder's backstop has stood down, that
+                  only the running app paces a vault — so nothing here composes,
+                  trims or re-words it. */}
+              <p className="whitespace-pre-wrap text-muted-foreground text-sm [overflow-wrap:anywhere]">
+                {row.sentence}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+      {rows !== null && rows.length > 0 && (
+        <FoldToggle rows={rows} fold={fold} label={PACED_HEADING} />
+      )}
+    </div>
+  );
+}
+
 export function TasksPane() {
   const [listing, setListing] = useState<TaskListingVm | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * The projected paced class, held beside the listing rather than inside it.
+   *
+   * Two slots because they are two reads that can disagree: one command may
+   * refuse while the other lands, and the section that refused must keep its
+   * last good rows without taking the other list down with it. `null` is unread
+   * and `[]` is "keeper paces nothing here" — see {@link PacedWorkList}.
+   */
+  const [paced, setPaced] = useState<PacedWorkVm[] | null>(null);
+  const [pacedError, setPacedError] = useState<string | null>(null);
   /** Per-task refusals from a Run now or a Forget, keyed by task id. */
   const [refusals, setRefusals] = useState<Record<string, string>>({});
   /** Whether the header's add form is revealed. */
@@ -1122,60 +1328,77 @@ export function TasksPane() {
     async (keepRefusals = false) => {
       readToken.current += 1;
       const mine = readToken.current;
-      try {
-        const next = await syncTasks();
-        if (mine !== readToken.current) {
-          return;
-        }
-        setListing(next);
-        setNow(Date.now());
-        setError(null);
-        // A disclosure cannot belong to a row the record no longer has. Left
-        // standing, the id is re-creatable — the Add form takes a typed id — so
-        // forgetting `nightly` and adding a new `nightly` rendered the new row
-        // with its edit form already expanded and `aria-expanded` set on a
-        // disclosure nobody had opened. `forgetSubject` is deliberately NOT
-        // pruned here: this read fires on every Run now settle too, and closing a
-        // question under the person answering it is worse than asking about a row
-        // that has gone — a confirm on a row that is gone is refused, and the
-        // refusal is rendered either way (see `orphanRefusals`).
-        setEditingId((open) =>
-          open !== null && next.tasks.some((t) => t.id === open) ? open : null,
-        );
-        // The same pruning for an open history section, and the same reason: a
-        // section cannot belong to a row the record no longer has.
-        //
-        // Nothing else here touches it. A refresh must leave an open section
-        // exactly as it is — open, and holding the rows it read — because
-        // `refresh` fires from the mount, from the Refresh button and from every
-        // Run now settle, so a history read per open row per refresh is the poll
-        // AD-62's sentence is about.
-        const open = historyRef.current;
-        if (open !== null && !next.tasks.some((t) => t.id === open.id)) {
-          historyToken.current += 1;
-          openHistory(null);
-        }
-        // A listing read *after* an attempt is newer evidence than the attempt
-        // (finding 9). `refusals` used to be cleared at exactly one point — the
-        // top of `runNow`, for the one id being run — so a "the other host is
-        // doing this" alert kept asserting a task was busy elsewhere while the row
-        // above it showed the completed run and no holder, clearable only by
-        // running the task again.
-        //
-        // `keepRefusals` is the one exception, and it is not a hedge: the read
-        // `runNow`'s own settle issues is *contemporaneous* with the attempt, not
-        // later than it. Clearing there would erase the refusal in the same tick it
-        // appeared, which is the pane's whole answer to a refused Run now and an
-        // acceptance criterion of this story. Every other read — the mount, the
-        // Refresh button — is genuinely newer and clears.
-        if (!keepRefusals) {
-          setRefusals({});
-        }
-      } catch (cause) {
-        if (mine !== readToken.current) {
-          return;
-        }
-        setError(messageOf(cause));
+      // BOTH commands in ONE settled pass (Story 58.7). One pass because the
+      // projection must cost no read the pane did not already make — a section
+      // with a `useEffect` of its own would re-read on every mount the pane's
+      // own triggers cause, which is the poll AD-62's sentence is about.
+      // `allSettled` and not `all` because the two answers are independent: a
+      // refused projection must not blank the task list, and a refused listing
+      // must not take down rows the projection read successfully. `all` would
+      // reject on the first failure and throw both away.
+      const [tasksRead, pacedRead] = await Promise.allSettled([syncTasks(), syncPacedWork()]);
+      if (mine !== readToken.current) {
+        return;
+      }
+      // Landed before the listing is even looked at, and unconditionally: this
+      // is the half that must survive the other half's refusal.
+      if (pacedRead.status === "fulfilled") {
+        setPaced(pacedRead.value);
+        setPacedError(null);
+      } else {
+        // The rows already read STAY. They were read successfully and are still
+        // the best thing known about this machine; the refusal explains why the
+        // pane knows no more.
+        setPacedError(messageOf(pacedRead.reason));
+      }
+      if (tasksRead.status === "rejected") {
+        setError(messageOf(tasksRead.reason));
+        return;
+      }
+      const next = tasksRead.value;
+      setListing(next);
+      setNow(Date.now());
+      setError(null);
+      // A disclosure cannot belong to a row the record no longer has. Left
+      // standing, the id is re-creatable — the Add form takes a typed id — so
+      // forgetting `nightly` and adding a new `nightly` rendered the new row
+      // with its edit form already expanded and `aria-expanded` set on a
+      // disclosure nobody had opened. `forgetSubject` is deliberately NOT
+      // pruned here: this read fires on every Run now settle too, and closing a
+      // question under the person answering it is worse than asking about a row
+      // that has gone — a confirm on a row that is gone is refused, and the
+      // refusal is rendered either way (see `orphanRefusals`).
+      setEditingId((open) =>
+        open !== null && next.tasks.some((t) => t.id === open) ? open : null,
+      );
+      // The same pruning for an open history section, and the same reason: a
+      // section cannot belong to a row the record no longer has.
+      //
+      // Nothing else here touches it. A refresh must leave an open section
+      // exactly as it is — open, and holding the rows it read — because
+      // `refresh` fires from the mount, from the Refresh button and from every
+      // Run now settle, so a history read per open row per refresh is the poll
+      // AD-62's sentence is about.
+      const open = historyRef.current;
+      if (open !== null && !next.tasks.some((t) => t.id === open.id)) {
+        historyToken.current += 1;
+        openHistory(null);
+      }
+      // A listing read *after* an attempt is newer evidence than the attempt
+      // (finding 9). `refusals` used to be cleared at exactly one point — the
+      // top of `runNow`, for the one id being run — so a "the other host is
+      // doing this" alert kept asserting a task was busy elsewhere while the row
+      // above it showed the completed run and no holder, clearable only by
+      // running the task again.
+      //
+      // `keepRefusals` is the one exception, and it is not a hedge: the read
+      // `runNow`'s own settle issues is *contemporaneous* with the attempt, not
+      // later than it. Clearing there would erase the refusal in the same tick it
+      // appeared, which is the pane's whole answer to a refused Run now and an
+      // acceptance criterion of this story. Every other read — the mount, the
+      // Refresh button — is genuinely newer and clears.
+      if (!keepRefusals) {
+        setRefusals({});
       }
       // `openHistory` is itself a `useCallback([])`, so naming it here keeps this
       // callback's identity stable and the mount effect a single read.
@@ -1573,6 +1796,13 @@ export function TasksPane() {
               </ul>
             </>
           )}
+          {/* Last in the body and inside the same `ScrollArea`, because it is a
+              second class in ONE view and not a second view: the question it
+              answers — "is that everything keeper does on a clock?" — is only
+              asked once the task list above has been read. Rendered
+              unconditionally, so its own loading line and its own empty sentence
+              are reachable rather than hidden behind the tasks' states. */}
+          <PacedWorkList rows={paced} error={pacedError} />
         </div>
       </ScrollArea>
 
