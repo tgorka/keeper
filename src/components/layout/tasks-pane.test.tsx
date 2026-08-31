@@ -33,6 +33,7 @@ import {
   TASK_HOST_LABEL,
   TASK_IN_FLIGHT_TEXT,
   TASK_LAST_OUTCOME_LABEL,
+  TASK_LAST_REPORT_LABEL,
   TASK_LAST_RUN_LABEL,
   TASK_NEVER_DUE_TEXT,
   TASK_NEVER_RAN_TEXT,
@@ -134,7 +135,7 @@ afterEach(() => {
 });
 
 describe("the Tasks pane", () => {
-  it("states, per row, the kind, schedule, host, next due, last run and last outcome", async () => {
+  it("states, per row, the kind, schedule, host, next due, last run, outcome and report", async () => {
     answer(listing());
     render(<TasksPane />);
     const row = await screen.findByTestId(TASKS_ROW_TESTID);
@@ -149,12 +150,21 @@ describe("the Tasks pane", () => {
       TASK_NEXT_DUE_LABEL,
       TASK_LAST_RUN_LABEL,
       TASK_LAST_OUTCOME_LABEL,
+      // Added by Story 58.2, and added HERE and not only in that story's own
+      // block: this is the test a reader opens to learn what a row says, so a
+      // row that says six things and a test that enumerates five is the pane's
+      // contract understating itself — and deleting the cell would leave this
+      // test green.
+      TASK_LAST_REPORT_LABEL,
       TASK_HOST_LABEL,
     ]) {
       expect(within(row).getByText(label)).toBeInTheDocument();
     }
     expect(within(row).getByText("@daily")).toBeInTheDocument();
     expect(within(row).getByText("Succeeded")).toBeInTheDocument();
+    // The default fixture's own run reports this, so the canonical row carries
+    // the run's words too.
+    expect(within(row).getByText("no folders to sync")).toBeInTheDocument();
     expect(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeInTheDocument();
   });
 
@@ -920,5 +930,235 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
     expect(
       screen.queryByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
     ).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * The row says what the run said (Story 58.2).
+ *
+ * One property, asserted ten ways: the sentence Rust composed for a run is on
+ * the row in its own words, and where a run recorded nothing the row is silent
+ * rather than blank or invented. Every assertion here is against the real string
+ * a reader sees, never against the presence of an element — the data was already
+ * typed, served and mocked for a whole wave, and it was the *reading* that was
+ * missing, so an assertion that only proves a cell exists would prove nothing.
+ *
+ * Cross-crate facts are named by symbol rather than by line: `src-tauri/` is
+ * being rewritten by the same wave that reads this file, so a line number here
+ * is wrong within the day.
+ */
+describe("the row says what the last run reported", () => {
+  it("shows the summary the run recorded, in the engine's own words", async () => {
+    // The whole story: `perform_sync_task` has composed this sentence on every
+    // completed run since wave 2, `TaskRunVm.detail` carried it to the frontend,
+    // and no control in this pane read it.
+    answer(
+      listing({
+        tasks: [
+          task({ lastRun: run({ detail: "3 synced, 0 already syncing, 0 waiting, 0 failed" }) }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).getByText(TASK_LAST_REPORT_LABEL)).toBeInTheDocument();
+    expect(
+      within(row).getByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
+    ).toBeInTheDocument();
+    // Beside keeper's verdict on the run, not instead of it.
+    expect(within(row).getByText("Succeeded")).toBeInTheDocument();
+  });
+
+  it("keeps a failure's reason whole, reason included", async () => {
+    // The reason is the actionable half — `perform_sync_task` wraps its counts
+    // as `"{detail}: {reason}"` on failure — so truncating this cell would be
+    // the one clipping on the row that actually costs the reader something.
+    const detail =
+      "0 synced, 0 already syncing, 0 waiting, 1 failed: could not resolve host git.tgorka.dev";
+    answer(listing({ tasks: [task({ lastRun: run({ outcome: "failed", detail }) })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).getByText(detail)).toBeInTheDocument();
+    expect(
+      within(row).getByText("could not resolve host git.tgorka.dev", { exact: false }),
+    ).toBeInTheDocument();
+    expect(within(row).getByText("Failed")).toBeInTheDocument();
+  });
+
+  it("says nothing for a run still in flight, and lets the outcome cell explain", async () => {
+    // `claim_task` opens the run row with `detail` unset, so an unfinished run
+    // has genuinely reported nothing yet — and the cell beside this one already
+    // accounts for the silence.
+    answer(
+      listing({
+        tasks: [
+          task({
+            lastRun: run({ finishedMs: null, outcome: null, unknownOutcome: null, detail: null }),
+          }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
+    expect(within(row).getByText(TASK_IN_FLIGHT_TEXT)).toBeInTheDocument();
+  });
+
+  it("says nothing for a reclaimed lease, which is a real state and not a failed read", async () => {
+    // Both `claim_task` and `release_host_leases` write `abandoned` without
+    // touching `detail`, so an absent report here means the run was taken away
+    // rather than that this pane failed to read one — and the outcome cell names
+    // it.
+    answer(listing({ tasks: [task({ lastRun: run({ outcome: "abandoned", detail: null }) })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
+    expect(within(row).getByText("Abandoned by the host that started it")).toBeInTheDocument();
+  });
+
+  it("adds no third copy of never run to a row that has not run", async () => {
+    // The count itself belongs to the refusal test — *"shows a refused Run now
+    // on the row, and no row claims the task ran"* — which asserts that a
+    // never-ran row says the words exactly twice. What is asserted here is the
+    // report cell's own half of that: a "nothing recorded" sentence in this cell
+    // would have been the third copy.
+    answer(listing({ tasks: [task({ lastRun: null })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
+    expect(within(row).queryByText(/nothing recorded|no report/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps both a newer keeper's spelling and its report", async () => {
+    // NFR-43 on both halves at once: an outcome this build cannot read renders
+    // as itself, and the detail beside it is still the run's own words.
+    answer(
+      listing({
+        tasks: [
+          task({
+            lastRun: run({
+              outcome: null,
+              unknownOutcome: "sublimated",
+              detail: "recorded by keeper 0.9.0",
+            }),
+          }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).getByText("sublimated")).toBeInTheDocument();
+    expect(within(row).getByText("recorded by keeper 0.9.0")).toBeInTheDocument();
+    expect(within(row).queryByText(TASK_IN_FLIGHT_TEXT)).not.toBeInTheDocument();
+  });
+
+  it("draws no cell at all rather than an empty one when there is no report", async () => {
+    // Counted by the label rather than by a total: the host block renders a
+    // `<dt>` of its own outside the `<dl>`, so a row-wide `<dt>` total is one
+    // higher than the grid's, and a magic total would also have to move every
+    // time another story adds a cell to this row. Counting the cells whose
+    // heading IS the report label says what the test is about and needs no
+    // defensive note telling a later reader not to touch the numbers.
+    const reportCells = (row: HTMLElement): number =>
+      within(row).queryAllByText(TASK_LAST_REPORT_LABEL).length;
+
+    answer(listing({ tasks: [task({ lastRun: run({ outcome: "abandoned", detail: null }) })] }));
+    const silent = render(<TasksPane />);
+    expect(reportCells(await screen.findByTestId(TASKS_ROW_TESTID))).toBe(0);
+    silent.unmount();
+
+    answer(listing({ tasks: [task()] }));
+    render(<TasksPane />);
+    expect(reportCells(await screen.findByTestId(TASKS_ROW_TESTID))).toBe(1);
+  });
+
+  it("stays silent for a stored report that is blank rather than absent", async () => {
+    // `detail` is `TEXT NULL` with no non-empty constraint and `finish_task_run`
+    // binds whatever it is handed, so a writer this build never met — the NFR-43
+    // case this pane exists to tolerate — can store `""` or `"   "`. On a
+    // `!== null` guard that renders a LAST REPORT heading over nothing, which is
+    // the one shape a reader really would read as a failed read. Both spellings,
+    // because `getByText` normalises whitespace and would not tell them apart.
+    for (const detail of ["", "   "]) {
+      answer(listing({ tasks: [task({ lastRun: run({ detail }) })] }));
+      const view = render(<TasksPane />);
+      const row = await screen.findByTestId(TASKS_ROW_TESTID);
+      expect(within(row).queryByText(TASK_LAST_REPORT_LABEL), detail).not.toBeInTheDocument();
+      // And the row still says everything else it said.
+      expect(within(row).getByText("Succeeded")).toBeInTheDocument();
+      view.unmount();
+    }
+  });
+
+  it("gives the report the whole row rather than a quarter of it", async () => {
+    // The only assertion in this file that reads a class, and deliberately: the
+    // claim the `wide` prop makes is about layout, jsdom performs no layout, and
+    // dropping `wide` at the callsite is a silent omission rather than a type
+    // error — the prop defaults to `false`. Without this, half the change has no
+    // test and a git error goes back to wrapping five lines in a quarter column.
+    answer(listing({ tasks: [task({ lastRun: run({ detail: "3 synced" }) })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    const cell = within(row).getByText(TASK_LAST_REPORT_LABEL).parentElement;
+    expect(cell).toHaveClass("col-span-2", "sm:col-span-4");
+    // And the engine's own line breaks survive, which is what "verbatim" means
+    // once HTML is involved.
+    expect(within(row).getByText("3 synced")).toHaveClass("whitespace-pre-wrap");
+  });
+
+  it("draws the report on the row it belongs to and on no other", async () => {
+    // Two rows, one loud and one silent, because every other test here renders a
+    // single task: a cell drawn from the wrong row's run, or drawn on every row,
+    // would pass all of them.
+    answer(
+      listing({
+        tasks: [
+          task({
+            id: "A",
+            lastRun: run({ detail: "3 synced, 0 already syncing, 0 waiting, 0 failed" }),
+          }),
+          task({ id: "B", lastRun: run({ outcome: "abandoned", detail: null }) }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+    const [loud, silent] = screen.getAllByTestId(TASKS_ROW_TESTID);
+
+    expect(
+      within(loud).getByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
+    ).toBeInTheDocument();
+    expect(within(silent).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
+    expect(
+      within(silent).queryByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the report a row already had when a Run now is refused", async () => {
+    // The row's stated invariant is that a refusal changes nothing else on it,
+    // and the pane's own refusal test pins `lastRun: null` — so the fifth cell
+    // was the one value that invariant was never asserted for.
+    answer(listing({ tasks: [task({ lastRun: run({ detail: "3 synced, 0 waiting" }) })] }));
+    vi.mocked(syncTaskRunNow).mockRejectedValue({
+      code: "busy",
+      message: "task 01SCHED is being run by another host on this machine",
+      accountId: null,
+      retriable: true,
+    });
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT }));
+    await screen.findByTestId(TASKS_REFUSAL_TESTID);
+
+    const after = screen.getByTestId(TASKS_ROW_TESTID);
+    expect(within(after).getByText("3 synced, 0 waiting")).toBeInTheDocument();
   });
 });

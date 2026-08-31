@@ -49,6 +49,20 @@
  * full-bleed column of rows separated by rules. The whole surface is
  * capability-gated at the app-shell and sidebar level, so a machine that cannot
  * keep a task record gets no Tasks entry at all rather than an empty one.
+ *
+ * **Story 58.2 put the run's own report on the row.** Every completed run
+ * already recorded what it did — `perform_task` composes the sentence, either
+ * the sync counts or a release sweep's tally, and `finish_task_run` persists it
+ * with the outcome in one statement — and `TaskRunVm.detail` carried it all the
+ * way to this file (`keeper-core/src/tasks.rs:262-263`) while nothing here read
+ * it: the row said a run had ended and never what the run said. That string is
+ * Rust's and is rendered verbatim — unclipped, unparsed and with its own line
+ * breaks kept — in the column `keeper-syncd tasks status` has printed all
+ * along. A report that is absent or blank is silence rather than a sentence
+ * this file invented, because each of the states that reach it already has a
+ * cell naming it: a task that never ran, an in-flight run whose row
+ * `claim_task` opens with `detail` unset, and a lease the next host reclaimed,
+ * written as `abandoned` without touching `detail` at all.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 // `TASK_HOST_WIDE_TEXT` is the form's rather than this file's: the picker's
@@ -211,6 +225,27 @@ export const TASK_HOST_LABEL = "Host";
 export const TASK_NEXT_DUE_LABEL = "Next due";
 export const TASK_LAST_RUN_LABEL = "Last run";
 export const TASK_LAST_OUTCOME_LABEL = "Last outcome";
+/**
+ * What the run itself said, as distinct from keeper's verdict on it.
+ *
+ * {@link TASK_LAST_OUTCOME_LABEL} is keeper's judgement of the run. This is the
+ * run's own report, in the engine's words, and there is one per task kind:
+ * `perform_sync_task` composes
+ * `"{synced} synced, {busy} already syncing, {deferred} waiting, {failed} failed"`,
+ * `perform_release_task` composes
+ * `"released N paths (N bytes) from N folders, N declined, …"`, and both wrap it
+ * as `"{detail}: {reason}"` when something failed — so a release row's sentence
+ * is roughly twice a sync row's and neither has a bound. `finish_task_run`
+ * persists it and `TaskRunVm.detail` carries it here
+ * (`keeper-core/src/tasks.rs:262-263`).
+ *
+ * The names rather than line numbers into `src-tauri/` on purpose: those crates
+ * are edited by the same wave that reads this file, and a line number is wrong
+ * within the day. `keeper-syncd tasks status` already prints this column beside
+ * the same outcome, host and time (`task_run_lines`), so the row borrows a
+ * settled vocabulary rather than inventing a fifth word of its own.
+ */
+export const TASK_LAST_REPORT_LABEL = "Last report";
 
 /** What a null in each of those columns honestly means. */
 export const TASK_NO_SCHEDULE_TEXT = "none stored";
@@ -359,11 +394,48 @@ export function taskOutcomeText(run: TaskRunVm | null): string {
 }
 
 /** One `label: value` cell, so a row reads without a table header above it. */
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({
+  label,
+  wide = false,
+  children,
+}: {
+  label: string;
+  /**
+   * Hold an engine sentence rather than a short value: span the whole grid, and
+   * wrap the way the rest of the app wraps engine text.
+   *
+   * The other four cells are short in every shape this build writes — a cron
+   * expression, a coarse relative time, an outcome label. `detail` has no bound
+   * at all, so a quarter-width column wraps a git error to five lines and
+   * pushes the host claim off the fold. (The claim is only that they are short,
+   * not that they cannot grow: `taskOutcomeText` renders an unknown spelling
+   * verbatim and the schedule cell renders whatever is stored, so NFR-43 can
+   * make either of them long.)
+   *
+   * Width alone is not enough, and both extra classes are the Sync pane's,
+   * copied because this is the same input: `[overflow-wrap:anywhere]` because
+   * `min-w-0` shrinks the track but nothing breaks an unbreakable token like
+   * `fatal: unable to access 'https://…/long/path.git/'` (`sync-pane.tsx:1444`
+   * renders a git failure that way for this exact reason), and
+   * `whitespace-pre-wrap` because a git reason arrives with line breaks in it
+   * and HTML would collapse them — which would make this file's promise to
+   * render the string verbatim false (`sync-git-row.tsx:170`).
+   */
+  wide?: boolean;
+  children: React.ReactNode;
+}) {
   return (
-    <div className="min-w-0">
+    <div className={wide ? "col-span-2 min-w-0 sm:col-span-4" : "min-w-0"}>
       <dt className="text-muted-foreground text-xs uppercase tracking-wide">{label}</dt>
-      <dd className="text-foreground text-sm">{children}</dd>
+      <dd
+        className={
+          wide
+            ? "whitespace-pre-wrap text-foreground text-sm [overflow-wrap:anywhere]"
+            : "text-foreground text-sm"
+        }
+      >
+        {children}
+      </dd>
     </div>
   );
 }
@@ -398,6 +470,21 @@ function TaskRow({
   onForget: (id: string) => void;
 }) {
   const unhosted = task.host.kind === "unhosted";
+  /**
+   * The run's own words, or `null` when there are none to draw.
+   *
+   * Blank counts as none, and that is the guard rather than a nicety: `detail`
+   * is `TEXT NULL` with no non-empty constraint and `finish_task_run` binds
+   * whatever it is handed, so a writer this build never met — the NFR-43 case
+   * this file exists to tolerate — can store `""` or `" "`. On `!== null` alone
+   * that renders a LAST REPORT heading over nothing, which is the one shape a
+   * reader really would read as a failed read. Trimmed to decide, untrimmed to
+   * draw: what is stored is what is shown.
+   */
+  const report =
+    task.lastRun !== null && task.lastRun.detail !== null && task.lastRun.detail.trim() !== ""
+      ? task.lastRun.detail
+      : null;
   // The header disclosure's rule, per row: the form is closed from inside
   // itself, so without this focus lands on `<body>`.
   const editTriggerRef = useRef<HTMLButtonElement>(null);
@@ -474,6 +561,23 @@ function TaskRow({
           {task.lastRun === null ? TASK_NEVER_RAN_TEXT : formatTaskAgo(task.lastRun.startedMs, now)}
         </Field>
         <Field label={TASK_LAST_OUTCOME_LABEL}>{taskOutcomeText(task.lastRun)}</Field>
+        {/* Absence, never an empty cell and never a sentence this file invented.
+            The states that arrive with no report are all already named by a cell
+            beside this one: `lastRun === null` — never ran, and a third copy of
+            that one fact is exactly what the refusal test's *never run appears
+            twice* count protects; an in-flight run, whose row `claim_task` opens
+            with `detail` unset, so it has reported nothing yet; and a reclaimed
+            lease, which both `claim_task` and `release_host_leases` write as
+            `abandoned` without touching `detail` — so nothing here is a failed
+            read. `SyncActivityList` settled the rule for this shape: "A size
+            nobody measured shows nothing at all: `0 B` would claim the file was
+            empty, and `unknown` is noise on a line already busy answering
+            when." */}
+        {report !== null && (
+          <Field label={TASK_LAST_REPORT_LABEL} wide>
+            {report}
+          </Field>
+        )}
       </dl>
 
       {/* The host claim, and the one place on screen it comes from. The label
