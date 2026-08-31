@@ -5106,3 +5106,35 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/spec-58-3-a-list-of-runs-you-can-open.md`
   summary: A readable `tasks` row whose `id` is the empty string is unnamed everywhere on the Tasks pane, not only on the new runs disclosure.
   evidence: `tasks.id` is `TEXT` and `validate_id` only refuses an empty id on the save path, so a row written outside keeper decodes fine and is NOT diverted to the unknown list. `tasks-pane.tsx` renders `{task.id}` raw in the row header, in the Forget confirmation title, and now in the disclosure's `aria-label` — which degrades to "Runs:" naming nothing, and asks `sync_task_history("")`. The fix belongs to the row (one absent-name constant used everywhere the id is shown), not to the new control.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-58-7-everything-else-this-host-paces.md`
+  summary: A notes vault that goes unregistered because its folder was absent stays unregistered for the whole session — the registry is never rebuilt on the drive's return.
+  evidence: |
+    `notes_vault::register_one` returns `None` when the vault root cannot be canonicalized,
+    and `notes_vault::refresh` — the only thing that rebuilds the registry — is called from
+    exactly two places: `start` at launch, and the flag/unflag commands in `notes_ipc.rs`
+    (`:940`, `:988`). Nothing watches for the drive coming back, so a vault on removable
+    media that was away at launch is not paced until the app is relaunched or some vault is
+    flagged. Story 58.7's new `unregistered` standing makes this visible for the first time
+    and its sentence states it rather than promising a recovery that does not happen — which
+    is why this is a ledger entry and not a lie on screen.
+    Deferred rather than fixed inside 58.7: the honest fix is a re-registration trigger
+    (the volume-ready signal the sync engine already has, or a refresh on the profile-write
+    path), which is a change to the app's vault lifecycle rather than to a read-only
+    projection. Doing it under a story whose boundary is *project, never schedule* would
+    have added the one thing that story forbids itself.
+
+- source_spec: none
+  summary: `keeper-syncd`'s `durability_matrix::a_kill_during_a_large_object_transfer_leaves_the_object_recoverable` is load-sensitive: it kills the sync at a fixed 120 ms and fails intermittently under a full-suite run on macOS.
+  evidence: |
+    Observed 2026-08-31 during the epic-58 salvage gate on hesperia: the test failed inside
+    `bun run check:rust:macos` (full workspace run) and then passed twice in isolation on the
+    same commit, and had passed in a full run of the same code minutes earlier. The instant is
+    a literal — `let at = Duration::from_millis(120); peer.kill_sync_after(at)` — chosen so the
+    kill lands mid-transfer of a 24 MiB object. On a loaded host the transfer can be either
+    not yet started or already finished at 120 ms, so the interruption the test is about does
+    not happen and a later assertion reports the consequence rather than the cause.
+    Unrelated to epic 58 (nothing in it touches the transfer path). The fix is the deadline-poll
+    idiom the rest of the tree uses — kill on an observed condition (bytes in flight, a `tmp/`
+    object present) rather than on an elapsed duration — so the guard still fails when the
+    kill-sweep is broken and cannot fail because the machine was busy.
