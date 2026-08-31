@@ -161,12 +161,19 @@ function task(over: Partial<TaskVm> = {}): TaskVm {
     profileId: null,
     profile: null,
     schedule: "@daily",
-    // Both required on `TaskVm` since Story 58.4: `onMissed` is the
-    // missed-window policy that story gave a control of its own, and
-    // `updatedMs` is the reading a save is checked against. Neither is rendered
-    // by this pane; the fixture carries them because the type does.
+    // Required on `TaskVm` and not rendered by this pane, which is why they sit
+    // together with one reason rather than four: the fixture carries them
+    // because the type does. `onMissed` and `updatedMs` arrived with Story 58.4
+    // (the missed-window policy, and the reading a save is checked against);
+    // `description` and `missedDelayMs` with Stories 59.5 and 59.6. Both of the
+    // new pair are `null` here on purpose — `null` is *absent*, and 59.5's whole
+    // column argument is that an absent description and a blank one are two
+    // different facts. A test that wants either must say so at its own call
+    // site, so this default can never quietly assert one of them.
     onMissed: "run_now",
     updatedMs: NOW - 60_000,
+    description: null,
+    missedDelayMs: null,
     nextDueMs: NOW + 3_600_000,
     runningHost: null,
     leaseUntilMs: null,

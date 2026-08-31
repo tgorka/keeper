@@ -1707,7 +1707,9 @@ const TASKS: TaskVm[] = [
     profileId: null,
     profile: null,
     schedule: "0 3 * * *",
+    description: "nightly backup of the photos",
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: ahead(957),
     runningHost: null,
     leaseUntilMs: null,
@@ -1723,9 +1725,18 @@ const TASKS: TaskVm[] = [
     profileId: "p1",
     profile: "keeper",
     schedule: "every 6h",
+    // Blank rather than absent, and the only fixture that is: a person cleared
+    // the box once. It must render as nothing, exactly as a null does — the
+    // store keeps the two apart and the view deliberately does not.
+    description: "",
     // skip, because a release sweep deletes: a window nobody
     // served is better dropped than served at an instant nobody chose.
     onMissed: "skip",
+    // Stored even though `skip` never reads it, which is the store's rule: a
+    // policy change must not throw away a number somebody typed. So the ⌘8 form
+    // shows the box on this row too, because a value it holds may never be
+    // hidden behind a policy that ignores it.
+    missedDelayMs: 45 * 60_000,
     nextDueMs: ahead(358),
     // Mid-run and holding the lease: the other host on this machine cannot
     // claim this task until the lease expires or this one hands it back.
@@ -1743,9 +1754,14 @@ const TASKS: TaskVm[] = [
     profileId: null,
     profile: null,
     schedule: "0 4 * * *",
+    description: null,
     // delay, so a 04:00 sweep missed overnight does not fire in the
     // same second the machine comes back.
     onMissed: "delay",
+    // Four hours, and the reason this fixture exists: it is the only row whose
+    // delay is NOT keeper's own thirty minutes, so the form's note has to compose
+    // its sentence rather than recite a constant.
+    missedDelayMs: 4 * 60 * 60_000,
     nextDueMs: ahead(1_017),
     runningHost: null,
     leaseUntilMs: null,
@@ -1767,7 +1783,9 @@ const TASKS: TaskVm[] = [
     profileId: "p2",
     profile: "notes",
     schedule: "@hourly",
+    description: null,
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: ahead(51),
     runningHost: null,
     leaseUntilMs: null,
@@ -1788,7 +1806,9 @@ const TASKS: TaskVm[] = [
     // Remembered, not obeyed: a manual task's schedule is stored and ignored,
     // so the row must not read as though something will fire it.
     schedule: "@weekly",
+    description: "trim the archive by hand, quarterly",
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: null,
     runningHost: null,
     leaseUntilMs: null,
@@ -1807,7 +1827,12 @@ const TASKS: TaskVm[] = [
     profileId: "01JNOSUCHPROFILE",
     profile: null,
     schedule: "30 4 * * *",
+    // Named, and this is the row where a name earns its keep: the id is a ULID
+    // nobody chose and the folder it pointed at is gone, so without this there
+    // is nothing on the row a person could recognise it by.
+    description: "push the old vault — folder was moved, needs repointing",
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: ahead(1_407),
     runningHost: null,
     leaseUntilMs: null,
@@ -1827,7 +1852,9 @@ const TASKS: TaskVm[] = [
     profileId: "p1",
     profile: "keeper",
     schedule: "0 2 * * *",
+    description: null,
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: null,
     runningHost: null,
     leaseUntilMs: null,
@@ -2054,6 +2081,21 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
         };
       }
     }
+    // The delay's floor, mirrored for the reason the lost-update refusal above
+    // is: the sentence a person meets when they type five minutes is worth being
+    // able to look at. Only the floor, and only its own words — the ceiling is
+    // unreachable from a box that speaks minutes without deliberate effort, and a
+    // second copy of a rule is a second copy to drift. `900000` and `1800000` are
+    // `TASK_MISSED_GRACE_MS` and `TASK_MISSED_DELAY_MS`; if either moves, this
+    // string is prose in a dev harness and the real refusal is still Rust's.
+    if (req.missedDelayMs !== null && req.missedDelayMs < 900_000) {
+      throw {
+        code: "internal",
+        message: `invalid sync configuration: task missed-window delay must be at least the grace period (900000 ms), because the grace period is the interval that concludes nobody was home — a shorter delay would elapse before the window it holds back counted as missed, which is run_now wearing delay's name, got ${req.missedDelayMs} ms`,
+        accountId: null,
+        retriable: false,
+      };
+    }
     const prior = existing ?? TASKS[0];
     const saved: TaskVm = {
       ...prior,
@@ -2063,7 +2105,15 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       enabled: req.enabled,
       profileId: req.profileId,
       schedule: req.schedule,
+      // Echoed verbatim, `""` included: the real store keeps a blank a person
+      // typed apart from a description that was never there, so a mock that
+      // collapsed them would hide the one case the view has to render as absence.
+      description: req.description,
       onMissed: req.onMissed,
+      // Echoed verbatim too, `null` included: `null` is *use keeper's own
+      // delay*, and a mock that filled the constant in here would hide the one
+      // fact the form's note is composed around.
+      missedDelayMs: req.missedDelayMs,
       // The store owns the window and clears it on any of these three moving,
       // so echoing the request's value back would show a "next due" the real
       // command would have discarded.
@@ -2603,6 +2653,19 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       write: { writable: true, reason: null, caveat: null, caveatShort: null },
     };
   },
+  /**
+   * The path plugin's directory lookup, which is not one of the app's own
+   * commands and is the only non-`keeper` invoke any screen makes (Story 59.8).
+   *
+   * Without it the Add-folder form's Home control sits permanently disabled in
+   * `bun run dev` and a typed `~` never resolves — the whole of that story is
+   * invisible here, and the disabled button reads as a frontend bug, which is
+   * exactly what this file exists to stop. `21` is `BaseDirectory.Home`; every
+   * other directory is answered `null`, which is what the form treats as "the
+   * shell could not say" rather than a wrong answer dressed as a right one.
+   */
+  "plugin:path|resolve_directory": (payload) =>
+    Number(payload.directory) === 21 ? "/Users/tgorka" : null,
 };
 
 /** True when a real Tauri shell is already answering. */
