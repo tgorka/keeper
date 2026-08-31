@@ -3391,22 +3391,79 @@ pub fn arm_task(conn: &Connection, id: &str, next_due_ms: Option<i64>, now_ms: i
 ///   the caller's care. A skip that moved a window backwards would be catch-up
 ///   wearing the name of its opposite.
 ///
-/// Returns whether the window was still the caller's to abandon, so a caller can
-/// record the fact rather than assume it — which is what Story 58.5 needs, and
-/// the reason this is not a `Result<()>`.
-pub fn skip_task_window(
-    conn: &Connection,
-    id: &str,
-    observed_due_ms: i64,
-    next_due_ms: i64,
-    now_ms: i64,
-) -> Result<bool> {
-    let affected = conn.execute(
+/// # The record is written here, and only when this host is the one declining
+///
+/// A declined window is a **fact**, and before Story 58.5 it left no row
+/// anywhere: `task_runs` rows were minted only by [`claim_task`], which runs
+/// only when a host is present *and takes the lease*. So `on_missed = skip` went
+/// quiet — the Tasks view's *last run* stayed stale and the run list said
+/// nothing, which is the invisible-non-execution shape this feature exists to
+/// close. The row is closed and zero-duration, and it takes **no lease**,
+/// because nothing ran and nothing needed serializing.
+///
+/// It hangs off the `affected == 1` branch on purpose. `false` means the other
+/// host armed, ran or skipped this window between this tick's listing read and
+/// this write; recording anyway would claim this host declined a window it did
+/// not. Both statements share the one transaction the compare-and-set opens, so
+/// a moved window and the record of moving it cannot come apart.
+pub fn skip_task_window(conn: &Connection, skip: TaskWindowSkip<'_>) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let affected = tx.execute(
         "UPDATE tasks SET next_due_ms = ?3, updated_ms = ?4
           WHERE id = ?1 AND next_due_ms = ?2 AND ?3 > ?2",
-        (id, observed_due_ms, next_due_ms, now_ms),
+        (
+            skip.task_id,
+            skip.observed_due_ms,
+            skip.next_due_ms,
+            skip.now_ms,
+        ),
     )?;
-    Ok(affected == 1)
+    if affected != 1 {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT INTO task_runs (task_id, started_ms, finished_ms, outcome, detail, host)
+         VALUES (?1, ?2, ?2, ?3, ?4, ?5)",
+        (
+            skip.task_id,
+            skip.now_ms,
+            TaskOutcome::Declined.as_str(),
+            skip.detail,
+            skip.host,
+        ),
+    )?;
+    trim_task_runs(&tx, skip.task_id)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Everything one declined window records (Story 58.5, FR-357, AD-140).
+///
+/// A struct rather than six positional arguments, for [`TaskRunClose`]'s reason:
+/// two `&str`s and three adjacent `i64`s is a call site nobody can read, and
+/// swapping `observed_due_ms` with `next_due_ms` would turn a forward-only write
+/// into one the statement silently declines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskWindowSkip<'a> {
+    pub task_id: &'a str,
+    /// The host that took the decision.
+    ///
+    /// Recorded on the run row like every other host, and it is **not** a lease:
+    /// `running_host` stays `NULL` throughout, because nothing ran. Naming the
+    /// host anyway is what lets somebody reading a two-machine history see
+    /// *which* keeper declined the window.
+    pub host: &'a str,
+    /// The open window this decision was about — the compare-and-set's baseline.
+    pub observed_due_ms: i64,
+    /// The window armed in its place. Must be later; the statement enforces it.
+    pub next_due_ms: i64,
+    /// When the decision was taken. The row's `started_ms` **and** its
+    /// `finished_ms`: a decline is closed the instant it is made, and zero
+    /// duration is the honest length of something that did not run.
+    pub now_ms: i64,
+    /// What the row says happened, composed by the engine from the two instants
+    /// above and the policy that declined.
+    pub detail: &'a str,
 }
 
 /// Take the lease and open a run, or report that somebody else has it.
@@ -3476,14 +3533,29 @@ pub fn claim_task(
         (id, now_ms, host),
     )?;
     let run_id = tx.last_insert_rowid();
-    // Trim in the same transaction as the insert, for `record_activity`'s
-    // reason: a reader must never see the table above its cap. By `id` because
-    // two runs of one task can share a millisecond.
-    //
-    // `finished_ms IS NOT NULL` because a run still in flight is not history: a
-    // frequent task whose one long run outlives fifty later claims would
-    // otherwise have the row it is about to close deleted underneath it, and
-    // `finish_task_run` would update nothing and say nothing.
+    trim_task_runs(&tx, id)?;
+    tx.commit()?;
+    Ok(Some(run_id))
+}
+
+/// Keep one task's history at [`TASK_RUNS_CAP`], in the caller's transaction.
+///
+/// One function, two consumers — [`claim_task`] and [`skip_task_window`] — for
+/// the reason the rest of this module already states about rules with two
+/// readers: a second copy of a `DELETE` this shaped is a second chance to get
+/// the two conditions below wrong, and getting either wrong is silent.
+///
+/// Trimmed in the same transaction as the insert, for `record_activity`'s
+/// reason: a reader must never see the table above its cap. By `id` because two
+/// runs of one task can share a millisecond.
+///
+/// `finished_ms IS NOT NULL` because a run still in flight is not history: a
+/// frequent task whose one long run outlives fifty later claims would otherwise
+/// have the row it is about to close deleted underneath it, and
+/// [`finish_task_run`] would update nothing and say nothing. A declined row is
+/// closed the instant it is written, so it is trimmable immediately — which is
+/// correct: it is history the moment it exists.
+fn trim_task_runs(tx: &rusqlite::Transaction<'_>, task_id: &str) -> Result<()> {
     tx.execute(
         "DELETE FROM task_runs
          WHERE task_id = ?1
@@ -3492,10 +3564,9 @@ pub fn claim_task(
                  (SELECT id FROM task_runs WHERE task_id = ?1
                   ORDER BY id DESC LIMIT 1 OFFSET ?2),
                  -1)",
-        (id, TASK_RUNS_CAP as i64),
+        (task_id, TASK_RUNS_CAP as i64),
     )?;
-    tx.commit()?;
-    Ok(Some(run_id))
+    Ok(())
 }
 
 /// Hand back the leases this host holds, except the ones it is still running,
@@ -6585,6 +6656,19 @@ mod tests {
         );
     }
 
+    /// A skip fixture, so the calls below differ only in the two instants they
+    /// are about.
+    fn a_skip(observed: i64, next: i64, now: i64) -> TaskWindowSkip<'static> {
+        TaskWindowSkip {
+            task_id: "01SK",
+            host: "hostA",
+            observed_due_ms: observed,
+            next_due_ms: next,
+            now_ms: now,
+            detail: "skip: the window at 50000 was not run, and 90000 is armed in its place",
+        }
+    }
+
     /// The skip write is forward-only and compare-and-set, and both halves are
     /// asserted because both are load-bearing (Story 58.4).
     ///
@@ -6599,7 +6683,7 @@ mod tests {
         arm_task(&c, "01SK", Some(50_000), 0).expect("arm");
 
         assert!(
-            !skip_task_window(&c, "01SK", 40_000, 90_000, 1).expect("write"),
+            !skip_task_window(&c, a_skip(40_000, 90_000, 1)).expect("write"),
             "a decision about a window this row does not carry affects nothing: \
              the other host has moved on since this tick's listing read"
         );
@@ -6610,19 +6694,25 @@ mod tests {
         );
 
         assert!(
-            !skip_task_window(&c, "01SK", 50_000, 50_000, 1).expect("write"),
+            !skip_task_window(&c, a_skip(50_000, 50_000, 1)).expect("write"),
             "and a replacement that is not later is refused by the statement \
              rather than by the caller's care — a skip that moved a window \
              backwards would be catch-up wearing the name of its opposite"
         );
-        assert!(!skip_task_window(&c, "01SK", 50_000, 10_000, 1).expect("write"));
+        assert!(!skip_task_window(&c, a_skip(50_000, 10_000, 1)).expect("write"));
         assert_eq!(
             get_task(&c, "01SK").expect("get").expect("row").next_due_ms,
             Some(50_000)
         );
+        // Story 58.5: a decline this host did not make records nothing either. A
+        // row here would claim this keeper declined a window it did not.
+        assert!(
+            task_runs(&c, "01SK", 10).expect("runs").is_empty(),
+            "three refused writes, three absences of a record"
+        );
 
         assert!(
-            skip_task_window(&c, "01SK", 50_000, 90_000, 60_000).expect("write"),
+            skip_task_window(&c, a_skip(50_000, 90_000, 60_000)).expect("write"),
             "the window it did see, replaced by a later one"
         );
         let row = get_task(&c, "01SK").expect("get").expect("row");
@@ -6636,6 +6726,127 @@ mod tests {
         assert_eq!(
             row.running_host, None,
             "a decline takes no lease: nothing ran"
+        );
+        assert_eq!(
+            row.lease_until_ms, None,
+            "and no lease expiry either, so no other host reclaims it as abandoned"
+        );
+    }
+
+    /// A declined window is a **recorded fact**, and it cannot be read as a run
+    /// that happened (Story 58.5, FR-357, AD-140).
+    ///
+    /// Before this story a declined window left no row anywhere, because
+    /// `task_runs` rows were minted only by [`claim_task`] — which runs only when
+    /// a host takes the lease. So `skip` moved a window and went quiet: the
+    /// *last run* line stayed stale for a reason it could not show, which is the
+    /// invisible-non-execution shape this whole feature exists to close.
+    ///
+    /// The second half of the name is the half worth having. Four properties
+    /// separate this row from every run that did happen, and each of them is one
+    /// way a surface could otherwise lie about it.
+    #[test]
+    fn a_declined_window_is_recorded_and_cannot_be_read_as_a_run_that_happened() {
+        let c = conn();
+        upsert_task(&c, &task("01SK", Some("@daily"), TaskMode::Scheduled), None).expect("save");
+        arm_task(&c, "01SK", Some(50_000), 0).expect("arm");
+        assert!(
+            task_runs(&c, "01SK", 10).expect("runs").is_empty(),
+            "nothing has run, which is what makes the next line the whole story"
+        );
+
+        assert!(skip_task_window(&c, a_skip(50_000, 90_000, 60_000)).expect("write"));
+
+        let runs = task_runs(&c, "01SK", 10).expect("runs");
+        assert_eq!(runs.len(), 1, "one declined window, one row");
+        let declined = &runs[0];
+        assert_eq!(
+            declined.outcome,
+            Some(TaskOutcome::Declined),
+            "its own outcome: none of the other five can carry this, because \
+             every one of them is written by a host that took the lease"
+        );
+        assert_eq!(
+            declined.unknown_outcome, None,
+            "and this build reads its own spelling"
+        );
+
+        // 1. Closed, so nothing reports it as a run still in flight.
+        assert_eq!(declined.finished_ms, Some(60_000));
+        // 2. Zero duration, which is the honest length of something that did
+        //    not run.
+        assert_eq!(declined.started_ms, 60_000);
+        assert_eq!(declined.finished_ms, Some(declined.started_ms));
+        // 3. Not one of the two outcomes that assert the work ran.
+        assert!(
+            !matches!(
+                declined.outcome,
+                Some(TaskOutcome::Ok | TaskOutcome::Failed)
+            ),
+            "a declined window neither succeeded nor failed: it did not happen"
+        );
+        // 4. Named to a host, which is not the same as leased to one: two
+        //    machines share this record, and which keeper declined the window is
+        //    the fact somebody reading the history wants.
+        assert_eq!(declined.host, "hostA");
+        assert_eq!(
+            get_task(&c, "01SK")
+                .expect("get")
+                .expect("row")
+                .running_host,
+            None
+        );
+
+        // The detail says what happened, and it is what moves the last-run line
+        // from "never run" to something a reader can act on.
+        assert_eq!(
+            declined.detail.as_deref(),
+            Some("skip: the window at 50000 was not run, and 90000 is armed in its place")
+        );
+
+        // And it round-trips: a spelling this build wrote is one it reads back,
+        // rather than falling into `unknown_outcome` on the next read.
+        assert_eq!(
+            TaskOutcome::from_stored(TaskOutcome::Declined.as_str()),
+            Some(TaskOutcome::Declined)
+        );
+    }
+
+    /// A `skip` task cannot grow `sync.db` by declining every window forever
+    /// (Story 58.5).
+    ///
+    /// The declined row goes through the same cap the run rows do — one
+    /// [`trim_task_runs`], two consumers — and it is trimmable the instant it is
+    /// written, because it is closed the instant it is written. A declined row
+    /// that escaped the trim would be the one row shape that could accumulate
+    /// without bound, since a declining task never runs and so never claims.
+    #[test]
+    fn declined_windows_are_capped_like_every_other_run_row() {
+        let c = conn();
+        upsert_task(&c, &task("01SK", Some("@daily"), TaskMode::Scheduled), None).expect("save");
+        for n in 0..TASK_RUNS_CAP + 5 {
+            let observed = 50_000 + 1_000 * n as i64;
+            arm_task(&c, "01SK", Some(observed), 0).ok();
+            c.execute(
+                "UPDATE tasks SET next_due_ms = ?2 WHERE id = ?1",
+                ("01SK", observed),
+            )
+            .expect("stage the next open window");
+            assert!(skip_task_window(
+                &c,
+                TaskWindowSkip {
+                    observed_due_ms: observed,
+                    next_due_ms: observed + 500,
+                    now_ms: observed,
+                    ..a_skip(0, 0, 0)
+                }
+            )
+            .expect("write"));
+        }
+        assert_eq!(
+            task_runs(&c, "01SK", 1_000).expect("runs").len(),
+            TASK_RUNS_CAP,
+            "the cap holds for the one row shape a task that never runs can write"
         );
     }
 

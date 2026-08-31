@@ -3019,6 +3019,16 @@ pub fn task_exit_code(outcome: TaskOutcome) -> u8 {
         // A condition the work waits on was not met — an unplugged drive above
         // all, which AD-48 settles by name: absence, never failure.
         TaskOutcome::Deferred => EXIT_DEFERRED,
+        // There was no run at all, and nothing is wrong: the task's
+        // missed-window policy declined this window and armed the next one
+        // (Story 58.5). Beside the two above because all three are the same
+        // answer to the only question this verb asks — *was the work done* — and
+        // giving them three numbers would make every caller learn the taxonomy.
+        //
+        // It cannot arise from this verb's own run: a request never passes
+        // through the due-gate, so no policy declines it. Mapped anyway because
+        // `tasks status` reports history and this map has to be total.
+        TaskOutcome::Declined => EXIT_DEFERRED,
         // It ran and failed. `detail` carries the reason.
         TaskOutcome::Failed => EXIT_FAILURE,
         // Nobody closed it, so nothing can claim it succeeded.
@@ -6038,6 +6048,36 @@ mod tests {
         assert!(joined.contains("in 4h"), "{joined}");
         assert!(joined.contains("deferred"), "{joined}");
         assert!(!joined.contains("[disabled]"), "{joined}");
+
+        // Story 58.5: a declined window has to be READABLE, or it is not a fact.
+        // Both renderings reach it through `TaskOutcome::as_str`, so this asserts
+        // the word and the detail actually land rather than trusting that they
+        // must — and `task_exit_code` puts it beside `Busy` and `Deferred`,
+        // because all three answer "the work did not happen, and nothing is
+        // wrong".
+        let mut declined = a_run("nightly", TaskOutcome::Declined);
+        declined.finished_ms = Some(declined.started_ms);
+        declined.detail =
+            Some("skip: the window at 1700000000000 was not run, and 1700000300000 is armed in its place".to_owned());
+        let history = task_run_lines(now, "nightly", std::slice::from_ref(&declined)).join("\n");
+        assert!(history.contains("declined"), "{history}");
+        assert!(history.contains("was not run"), "{history}");
+        assert_eq!(run_outcome_word(&declined), "declined");
+        assert_eq!(task_exit_code(TaskOutcome::Declined), EXIT_DEFERRED);
+        let row = task_lines(
+            now,
+            &[TaskView {
+                task: &task,
+                profile_name: None,
+                last: Some(&declined),
+            }],
+            &[],
+        )
+        .join("\n");
+        assert!(
+            row.contains("last: declined"),
+            "the last-run line moves, which is the whole point of 58.5: {row}"
+        );
 
         // Bound AND disabled. The binding has to be set for the folder's name
         // to be the target at all: `profile_id: None` is host-wide whatever

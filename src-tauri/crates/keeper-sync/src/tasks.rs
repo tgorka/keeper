@@ -279,10 +279,10 @@ impl TaskMissedPolicy {
     }
 }
 
-/// How one run ended.
+/// How one run ended — or, for one of the six, why there was no run at all.
 ///
-/// Three of the five are deliberately **not** failures, and keeping them apart
-/// is what stops a scheduled task crying wolf once an hour.
+/// Four of the six are deliberately **not** failures, and keeping them apart is
+/// what stops a scheduled task crying wolf once an hour.
 ///
 /// [`Self::Busy`] records that the target was already in use when the task came
 /// due, which is NFR-42's one-operation-per-folder rule working rather than
@@ -293,6 +293,12 @@ impl TaskMissedPolicy {
 /// `Retriability::Deferred` for exactly that reason. [`Self::Abandoned`] is
 /// written *by the next host* when it reclaims an expired lease, so a killed
 /// process leaves a closed run rather than a wedged row.
+///
+/// [`Self::Declined`] is the odd one and the newest (Story 58.5), and the thing
+/// that makes it odd is worth stating: **every other variant is written by a
+/// host that took the lease**. Five of the six therefore assert that a host was
+/// present and reached the task, which is precisely what is *not* true of a
+/// window that fell due while nobody was home.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskOutcome {
     /// The work ran and did what it was asked to.
@@ -305,6 +311,30 @@ pub enum TaskOutcome {
     Failed,
     /// The run was never closed by the host that started it.
     Abandoned,
+    /// There was no run: the task's missed-window policy declined this window
+    /// and armed the next one (Story 58.5, FR-357, AD-140).
+    ///
+    /// The one variant written **without a lease**, because nothing ran and
+    /// nothing needed serializing. It exists because none of the five above can
+    /// carry the fact, and their own doc comments settle it: `Busy` needs a
+    /// target that was in use, `Deferred` needs a condition that was waited on,
+    /// `Abandoned` needs a host that started a run, and `Ok` and `Failed` both
+    /// assert the work ran.
+    ///
+    /// **`Deferred` in particular must not be reused for this.**
+    /// `Engine::next_task_window` consumes `Deferred` to retry within
+    /// `TASK_RETRY_MS`, so it means *"try again very soon"* — the exact opposite
+    /// of *"this window is abandoned"*, and overloading it would silently turn
+    /// `on_missed = skip` into `on_missed = retry in a minute`. For the mirror
+    /// reason this variant stays **out** of that retry group: a decline has
+    /// already moved the window forward, so treating it as a run that did not
+    /// happen would rewind it and re-decide the same window a minute later.
+    ///
+    /// Recorded rather than logged because a policy nobody can see the effect of
+    /// is the invisible-non-execution shape this feature exists to close: before
+    /// this variant a declined window left no row anywhere, and the Tasks view's
+    /// *last run* went stale for a reason it could not show.
+    Declined,
 }
 
 impl TaskOutcome {
@@ -316,6 +346,7 @@ impl TaskOutcome {
             Self::Deferred => "deferred",
             Self::Failed => "failed",
             Self::Abandoned => "abandoned",
+            Self::Declined => "declined",
         }
     }
 
@@ -328,6 +359,7 @@ impl TaskOutcome {
             "deferred" => Some(Self::Deferred),
             "failed" => Some(Self::Failed),
             "abandoned" => Some(Self::Abandoned),
+            "declined" => Some(Self::Declined),
             _ => None,
         }
     }

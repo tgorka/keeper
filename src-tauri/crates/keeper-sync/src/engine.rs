@@ -1971,9 +1971,16 @@ impl Engine {
                 Self::lock(&self.task_faults).remove(&task.id);
                 None
             }
+            // None of these four is a failure, so none of them raises and none
+            // of them clears: only a real `Ok` may say a broken task is working
+            // again. `Declined` is unreachable here rather than merely
+            // non-raising — nothing claimed a lease, so `claim_and_run` was
+            // never entered — and it is spelled out because this match has no
+            // `_` arm on purpose (Story 58.5).
             tasks::TaskOutcome::Busy
             | tasks::TaskOutcome::Deferred
-            | tasks::TaskOutcome::Abandoned => None,
+            | tasks::TaskOutcome::Abandoned
+            | tasks::TaskOutcome::Declined => None,
         };
         if let Some(message) = raised {
             tracing::warn!(
@@ -2186,8 +2193,8 @@ impl Engine {
         }
     }
 
-    /// Abandon a window nobody served and arm the next one (Story 58.4,
-    /// FR-356, AD-139).
+    /// Abandon a window nobody served, arm the next one, and record that it
+    /// happened (Story 58.4 and Story 58.5, FR-356, FR-357, AD-139, AD-140).
     ///
     /// The `on_missed = skip` half of the policy, and it is a **write**, not a
     /// silence. Returning `Action::None` from the gate would leave the past
@@ -2202,6 +2209,19 @@ impl Engine {
     /// times. And it goes through [`db::skip_task_window`] rather than
     /// [`db::arm_task`], whose `WHERE next_due_ms IS NULL` a skip can never
     /// satisfy — see that function for the compare-and-set that replaces it.
+    ///
+    /// **And it leaves a row** (Story 58.5). A declined window is a fact, and
+    /// until this story it left no row anywhere — `task_runs` rows were minted
+    /// only by [`db::claim_task`], which runs only when a host takes the lease —
+    /// so `skip` moved a window and then went quiet, and the *last run* line went
+    /// stale for a reason it could not show. The row is closed, zero-duration and
+    /// leaseless, carrying [`tasks::TaskOutcome::Declined`], and it is written in
+    /// the same transaction as the window: see [`db::skip_task_window`].
+    ///
+    /// Nothing here calls [`Self::note_task_outcome`], and that is deliberate
+    /// rather than an omission: a declined window is not a fault and raises no
+    /// toast. It is also not a run, so there is no lease to release and no
+    /// [`db::finish_task_run`] to reach.
     fn skip_task_window(
         &self,
         task: &db::TaskRow,
@@ -2227,10 +2247,32 @@ impl Engine {
             );
             return;
         };
-        match self.with_db(|conn| db::skip_task_window(conn, &task.id, observed, next, now_ms)) {
+        // Composed here rather than in the store, for the reason
+        // `perform_sync_task`'s summary is: `detail` is the one line a person
+        // reads to find out what happened, and the two instants plus the policy
+        // that declined are exactly the three facts this decision holds. The
+        // relative form is deliberate — `relative_ms` lives in the CLI and the
+        // pane renders its own — so the stored line carries the absolute instant
+        // a reader can compare against anything else in the row.
+        let detail = format!(
+            "{policy}: the window at {observed} was not run, and {next} is armed in its place",
+            policy = task.on_missed.as_str(),
+        );
+        let host = self.task_host();
+        let skip = db::TaskWindowSkip {
+            task_id: &task.id,
+            host: &host,
+            observed_due_ms: observed,
+            next_due_ms: next,
+            now_ms,
+            detail: &detail,
+        };
+        match self.with_db(|conn| db::skip_task_window(conn, skip)) {
             // `false` is not a fault: the other host sharing this `sync.db` armed,
             // ran or skipped the same window between this tick's listing read and
-            // this write, and the compare-and-set is what stops us undoing it.
+            // this write, and the compare-and-set is what stops us undoing it. No
+            // record either — a row here would claim this host declined a window
+            // it did not.
             Ok(false) => tracing::debug!(
                 task = task.id,
                 "another host had already moved the window this tick meant to decline"
@@ -13352,12 +13394,20 @@ mod tests {
         for _ in 0..5 {
             let _ = engine.tick().await;
         }
-        assert!(
-            engine
-                .task_history("01SKIP", 250)
-                .expect("history")
-                .is_empty(),
-            "a declined window runs nothing, whatever the tick count"
+        let declined = engine.task_history("01SKIP", 250).expect("history");
+        assert_eq!(
+            declined.len(),
+            1,
+            "five ticks over two hundred missed windows decline ONE of them — \
+             the policy governs a window, it does not enumerate them"
+        );
+        assert_eq!(
+            declined[0].outcome,
+            Some(tasks::TaskOutcome::Declined),
+            "and the one row says the window was declined rather than run \
+             (Story 58.5): before that outcome existed this assertion could only \
+             have been about an absence, and an absence is what the invisible \
+             non-execution this feature closes looks like"
         );
         let rearmed = engine
             .tasks()
@@ -13377,11 +13427,101 @@ mod tests {
         // And the task is not broken by having skipped: the next window runs.
         platform.advance_ms(rearmed - platform.now_ms());
         let _ = engine.tick().await;
+        let after = engine.task_history("01SKIP", 10).expect("history");
         assert_eq!(
-            engine.task_history("01SKIP", 10).expect("history").len(),
-            1,
+            after.len(),
+            2,
             "`skip` declines a window nobody served, not the schedule"
         );
+        assert_eq!(
+            after[0].outcome,
+            Some(tasks::TaskOutcome::Ok),
+            "and the newest row is the run, so a reader's 'last run' is the run \
+             and not the decline that preceded it"
+        );
+    }
+
+    /// A declined window **moves the last-run line**, which is the whole point
+    /// of Story 58.5.
+    ///
+    /// The state this closes is the one the feature's single load-bearing `warn`
+    /// is about: a row that reports itself enabled and scheduled while nothing
+    /// ever runs. With `skip` and no record, that is exactly what a `skip` task
+    /// looked like from every surface — `tasks status`, the Tasks view, the run
+    /// list — for as long as its host kept missing windows.
+    ///
+    /// Asserted through `task_history`'s newest row, because that is precisely
+    /// what `sync_tasks` projects onto `TaskVm.lastRun` and what the CLI's
+    /// `last:` line reads.
+    #[tokio::test]
+    async fn a_declined_window_moves_the_last_run_line_instead_of_going_quiet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &task_on_missed("01QUIET", "every 5m", tasks::TaskMissedPolicy::Skip),
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let missed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        // The state before: enabled, scheduled, and never run. Both facts, so
+        // the assertion after the skip is about a change rather than a value.
+        let before = engine.tasks().expect("tasks").tasks.first().cloned();
+        assert!(before.is_some_and(|row| row.enabled));
+        assert!(
+            engine
+                .task_history("01QUIET", 1)
+                .expect("history")
+                .is_empty(),
+            "never run"
+        );
+
+        platform.advance_ms(tasks::TASK_MISSED_GRACE_MS + 300_000);
+        let _ = engine.tick().await;
+
+        let last = engine.task_history("01QUIET", 1).expect("history");
+        assert_eq!(last.len(), 1, "the last-run line has something to say now");
+        assert_eq!(last[0].outcome, Some(tasks::TaskOutcome::Declined));
+        assert_eq!(
+            last[0].finished_ms,
+            Some(last[0].started_ms),
+            "closed and zero-duration: nothing ran, and that is the honest length"
+        );
+        assert!(
+            last[0].detail.as_deref().is_some_and(
+                |detail| detail.contains("skip") && detail.contains(&missed.to_string())
+            ),
+            "and the detail names the policy that declined and the instant it \
+             declined, which is what makes the row actionable rather than merely \
+             present: {:?}",
+            last[0].detail
+        );
+        assert!(
+            last[0].host.contains('#'),
+            "named to the keeper that took the decision — two machines share \
+             this record — while the task row keeps no lease at all"
+        );
+        let row = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(row.running_host, None);
+        assert_eq!(row.lease_until_ms, None);
     }
 
     /// `delay` holds the window **even though `db::claim_task`'s own condition
