@@ -2,10 +2,11 @@
 title: 'Story 58.1: a task you can create and edit from the app'
 type: 'feature'
 created: '2026-08-31'
-status: 'in-review'
+status: 'done'
 baseline_revision: 'dbb7874'
+final_revision: 'e7beaa6'
 review_loop_iteration: 0
-followup_review_recommended: false
+followup_review_recommended: true
 context:
   - '{project-root}/docs/project-context.md'
 warnings: ['oversized']
@@ -125,3 +126,31 @@ warnings: ['oversized']
 
 **Manual checks (if no CLI):**
 - Mutate one guard away (send the id trimmed) and confirm the padded-id test fails; restore and verify by reading `git diff`, not from memory.
+
+## Auto Run Result
+
+Status: done
+
+**What was implemented.** The ⌘8 Tasks pane can now create, edit and forget a task. `sync_task_save` and `sync_task_forget` had been registered, typed, wrapped and mocked for a whole wave with zero production callers, so the whole story was reachability: one `TaskForm` in two modes (`editing = task !== undefined`), revealed inline by the header for an add and by a row's disclosure for an edit (AD-C7 — never a dialog), with an `AlertDialog` confirming a Forget in the backend's framing. Not one validation rule was duplicated: the id goes untrimmed, the schedule goes verbatim, a blank id lets `sync_ipc` mint the ULID, and Rust's refusal is rendered corrected in no way. **No Rust file and no file under `src/lib/ipc/gen/` was touched.**
+
+**Files changed**
+- `src/components/sync/task-form.tsx` — NEW. The one component: id, kind, mode, an `enabled` switch kept separate from mode (AD-135), a folder *picker* (the one refusal Rust does not make), and a free-text schedule; native `<select>`s because Radix throws on the empty-string sentinel that spells `profileId: null`.
+- `src/components/sync/task-form.test.tsx` — NEW. 14 tests: `id: ""` on create, the stored id on edit, refusals verbatim with every typed value kept, the padded-id and sub-minute messages uncorrected, and the folder picker's three honest states.
+- `src/components/layout/tasks-pane.tsx` — the three mount points, the confirm dialog, the write-in-flight guards, pane-level orphan refusals, focus return, and the rewritten empty-state copy and doc comments.
+- `src/components/layout/tasks-pane.test.tsx` — 31 tests: the empty-state assertions inverted, the CLI-drift guard kept and its blanket `add` ban narrowed, plus reveal / edit / forget / guard / pruning cases.
+- `src/lib/stores/sync.ts` — `TASK_KINDS` and `TASK_MODES` beside `SYNC_DIRECTIONS`, with no derived unions and the reason why.
+
+**Review findings:** 15 patches applied, 1 deferred, 3 rejected, 0 intent gaps, 0 spec loopbacks. See the Review Triage Log above; the deferred item is recorded in `deferred-work.md`.
+
+**Verification performed**
+- `bun run typecheck` — clean.
+- `bun run lint` — 4 warnings + 1 info, exactly the pre-existing baseline.
+- `bun run test` — **301 files / 5002 tests passed** (baseline 300 / 4978; +1 file, +24 tests).
+- Mutation proof, five guards, each restored and the restore verified by reading `git diff` rather than from memory: `id: form.id` → `.trim()` failed *"shows each refusal in the validator's own words and corrects nothing"* (`expected 'nightly' to be ' nightly'`); naming the unlisted folder from the read instead of the row failed *"calls the stored folder by its name while the folder list is still unread"*; and dropping `disabled={writing}`, the orphan-refusal promotion and the `editingId` pruning failed their three respective tests. All 45 pass restored.
+- No visual verification: the `keeper` shell crate does not link on this Linux host, so the app cannot be launched here. The surface is covered behaviourally instead, and `dev/mock-shell.ts` already answers all three verbs statefully, so the dev shell can drive the form unchanged.
+
+**Residual risks**
+- The seed-once form can revert another host's concurrent change to the same task (deferred above): `upsert_task` has no compare-and-set, and the honest fix is a Rust-side `updated_ms` precondition this story's boundaries forbade.
+- The confirm dialog's closing frame is untestable in jsdom, which runs no animations, so the fix for *"Forget task ?"* is asserted by construction — the title reads from a slot that outlives the ask — rather than by a test.
+
+`followup_review_recommended: true` — fifteen patched findings, six of them medium and several changing behaviour (a new write-in-flight flag threaded through both surfaces, a new pane-level alert path, focus management, and two rewritten tests), is enough breadth to be worth an independent pass.
