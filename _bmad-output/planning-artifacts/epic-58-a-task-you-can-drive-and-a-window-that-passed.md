@@ -159,6 +159,14 @@ either. AD-137 was the AD ceiling
 
 58.9 allocates no FR of its own; it documents FR-353…FR-360 in `docs/sync.md` §14.
 
+One item 58.4 carries allocates no new number either, and deliberately: the `updated_ms`
+compare-and-set that closes Wave 1's lost update (`deferred-work.md:5044-5066`) is the **write half
+of NFR-43**, which already reads *"a task row whose kind this build does not understand is skipped
+rather than fatal"* and is already implemented in `upsert_task` as a refusal to overwrite a row a
+newer keeper wrote (`db.rs:3113-3128`). Refusing a write whose baseline has moved is the same rule
+against a moving row rather than an unreadable one, so it extends an existing requirement instead of
+inventing one.
+
 ## Why the suite cannot see the risk in this epic
 
 The recurring lesson in `sprint-status.yaml` — *a story that asserts its central claim through a
@@ -220,7 +228,10 @@ succeed"* (`add-folder-form.tsx:30-31`). A client-side cron regex is the failure
 
 Wave 1's three stories are **disjoint and parallelisable**: 58.1 owns the form and the empty state,
 58.2 owns one `Field` on the row, 58.3 owns one expandable section. They collide only in
-`tasks-pane.tsx`, so one of them owns the file and the other two coordinate.
+`tasks-pane.tsx`, so one of them owns the file and the other two coordinate. **58.1 shipped first
+and widened `TaskRow`** with editing/deleting/writing props and a per-row edit disclosure
+(`e7beaa6`), so 58.2 and 58.3 inherit a larger row than this epic was written against; neither's
+scope changes, but both extend that row rather than the one described here.
 
 58.4 → 58.5 is a strict chain: the outcome exists to make the policy observable, and a policy shipped
 without it is the invisible-non-execution shape. 58.6 depends on 58.4 only for vocabulary — the
@@ -294,6 +305,21 @@ criterion, not a preference.** A policy writable from neither surface is born un
 the exact defect this epic exists to fix: no UI writes tasks today (`tasks-pane.tsx:70-74`) and the
 only writer is `keeper-syncd tasks set`. Splitting them produces a column nobody can set from the
 app and a story that reports itself done.
+
+**58.4 also closes the lost update Wave 1 found**, because it is the same table, the same write
+path and the same migration. An edit form left open across a listing change writes its seed-time
+values back over whatever another host moved meanwhile: the form seeds once — deliberately, since
+re-syncing from the prop would overwrite what has been typed — and `TaskSaveReq` carries **all six**
+fields, while `db::upsert_task` is an unconditional `INSERT … ON CONFLICT DO UPDATE` with no version
+column and no precondition (`db.rs:3082`). Unlike `SyncProfileReq`, which merges onto a clone of the
+stored profile precisely because a form cannot be trusted to carry every field, a task save has no
+merge to hide behind. The honest fix is store-side and 58.1 could not make it — a frontend-only
+story may not change `src-tauri/`: an `updated_ms` compare-and-set on `upsert_task` that **refuses**
+a write whose baseline has moved, in the manner of the NFR-43 stored-row guard already beside it
+(`db.rs:3113-3128`), with the refusal rendered verbatim by the form that already renders every other
+one. A UI-only mitigation is a smaller version of the same idea and still loses the race, so it is
+not worth shipping ahead of the guard. Recorded at `deferred-work.md:5044-5066`, and closed here
+rather than left floating, because 58.4 is the one story that opens this table's write path.
 
 **58.5** — a fourth thing a `task_runs` row can say, written as a **closed, zero-duration** row at
 the instant a policy declines a window, with `detail` naming the declined instant and the policy
