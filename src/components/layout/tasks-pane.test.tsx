@@ -8,8 +8,8 @@
  * build cannot read is shown rather than dropped; and a Run now the engine
  * refuses shows the refusal without any row claiming the task ran.
  */
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/ipc/client", () => ({
   syncTasks: vi.fn(),
@@ -17,14 +17,20 @@ vi.mock("@/lib/ipc/client", () => ({
   syncTaskHistory: vi.fn(),
   syncTaskSave: vi.fn(),
   syncTaskForget: vi.fn(),
+  // The mounted form's own read (Story 58.1): the folder picker.
+  syncProfiles: vi.fn(),
 }));
 
 import {
   formatTaskAgo,
   formatTaskDue,
   TASK_DUE_NOW_TEXT,
+  TASK_EDIT_TEXT,
+  TASK_FORGET_CANCEL_TEXT,
+  TASK_FORGET_CONFIRM_BODY,
+  TASK_FORGET_TESTID,
+  TASK_FORGET_TEXT,
   TASK_HOST_LABEL,
-  TASK_HOST_WIDE_TEXT,
   TASK_IN_FLIGHT_TEXT,
   TASK_LAST_OUTCOME_LABEL,
   TASK_LAST_RUN_LABEL,
@@ -36,6 +42,7 @@ import {
   TASK_RUN_NOW_TEXT,
   TASK_SCHEDULE_LABEL,
   TASKS_CLOCK_TICK_MS,
+  TASKS_ORPHAN_REFUSAL_TESTID,
   TASKS_PANE_EMPTY_AFTER,
   TASKS_PANE_EMPTY_COMMAND,
   TASKS_PANE_EMPTY_SENTENCE,
@@ -47,10 +54,26 @@ import {
   TASKS_UNKNOWN_NO_ID_TEXT,
   TASKS_UNKNOWN_ROW_TESTID,
   TasksPane,
+  taskForgetConfirmTitle,
   taskOutcomeText,
 } from "@/components/layout/tasks-pane";
+import {
+  TASK_FORM_ADD_SUBMIT_LABEL,
+  TASK_FORM_ADD_TITLE,
+  TASK_FORM_EDIT_SUBMIT_LABEL,
+  TASK_FORM_EDIT_TITLE,
+  TASK_FORM_ID_LABEL,
+  TASK_FORM_SCHEDULE_LABEL,
+  TASK_HOST_WIDE_TEXT,
+} from "@/components/sync/task-form";
 import type { TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
-import { syncTaskRunNow, syncTasks } from "@/lib/ipc/client";
+import {
+  syncProfiles,
+  syncTaskForget,
+  syncTaskRunNow,
+  syncTaskSave,
+  syncTasks,
+} from "@/lib/ipc/client";
 
 const NOW = 1_760_000_000_000;
 
@@ -99,6 +122,12 @@ function listing(over: Partial<TaskListingVm> = {}): TaskListingVm {
 function answer(value: TaskListingVm): void {
   vi.mocked(syncTasks).mockResolvedValue(value);
 }
+
+beforeEach(() => {
+  // Every form this pane reveals reads the folder list as it mounts, so a test
+  // that opens one needs an answer here or the read never resolves.
+  vi.mocked(syncProfiles).mockResolvedValue([]);
+});
 
 afterEach(() => {
   vi.clearAllMocks();
@@ -369,7 +398,13 @@ describe("the Tasks pane's empty state names something that exists", () => {
     // existing install sees when it first opens ⌘8, because nothing in this epic
     // creates a task row on migration or on open.
     expect(COPY).not.toMatch(/keeper-syncd\s+task\s/);
-    expect(COPY).not.toMatch(/\badd\b/);
+    // Narrowed from a blanket `/\badd\b/` by Story 58.1: the pane now
+    // legitimately says "Add a task", because the app can create one. What the
+    // blanket ban was actually protecting is the CLI phrase, so that is what is
+    // banned — and the mechanical phrase loop below checks every
+    // `keeper-syncd <group> <verb>` in the copy against the real clap tree,
+    // which covers `add` and every other verb the binary does not have.
+    expect(COPY).not.toMatch(/keeper-syncd\s+\S+\s+add\b/);
 
     // Mechanical rather than a spot check: every `keeper-syncd <word> <word>`
     // phrase in the copy is measured against the real tree, so a future rename
@@ -386,13 +421,19 @@ describe("the Tasks pane's empty state names something that exists", () => {
     }
   });
 
-  it("offers the real creation command and says plainly that this view cannot", async () => {
+  it("says a task can be made here, and offers the control that makes one", async () => {
     answer(listing({ tasks: [], unknown: [] }));
     render(<TasksPane />);
 
     // On the real strings, so a reworded constant still has to say these things.
     expect(await screen.findByText(TASKS_PANE_EMPTY_SENTENCE)).toBeInTheDocument();
-    expect(TASKS_PANE_EMPTY_SENTENCE).toContain("cannot create one yet");
+    // The inverse of what this asserted until Story 58.1. The old copy said the
+    // view "cannot create one yet" and sent the reader to a terminal; it now can,
+    // and a sentence that still said otherwise would have the app deny a button
+    // sitting in the header above it.
+    expect(TASKS_PANE_EMPTY_SENTENCE).not.toMatch(/cannot create/);
+    expect(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE })).toBeInTheDocument();
+    // The command stays named as the other way in, and stays real.
     expect(screen.getByText(TASKS_PANE_EMPTY_COMMAND)).toBeInTheDocument();
     expect(TASKS_PANE_EMPTY_COMMAND).toContain("keeper-syncd tasks set");
     expect(screen.getByText(TASKS_PANE_EMPTY_AFTER)).toBeInTheDocument();
@@ -609,5 +650,275 @@ describe("the Tasks pane's live state", () => {
     } finally {
       warned.mockRestore();
     }
+  });
+});
+
+/**
+ * Story 58.1: the two commands nothing ever called. `sync_task_save` and
+ * `sync_task_forget` were registered, typed, wrapped and mocked for a whole
+ * wave, and every one of these assertions is a control that now reaches one.
+ */
+describe("the Tasks pane creates, changes and forgets a task", () => {
+  it("reveals the add form inline in the pane rather than in a dialog", async () => {
+    answer(listing({ tasks: [], unknown: [] }));
+    render(<TasksPane />);
+    await screen.findByText(TASKS_PANE_EMPTY_SENTENCE);
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE }));
+
+    expect(await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE })).toBeInTheDocument();
+    // AD-C7's idiom is a disclosure, and the reason is not taste: the same
+    // component is revealed in two places, and a modal over a list of tasks
+    // hides the rows whose settings the person is comparing this one against.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("re-reads the listing after a save, so the window and the host verdict move", async () => {
+    answer(listing({ tasks: [], unknown: [] }));
+    vi.mocked(syncTaskSave).mockResolvedValue(task());
+    render(<TasksPane />);
+    await screen.findByText(TASKS_PANE_EMPTY_SENTENCE);
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE }));
+    await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE });
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "@daily" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(syncTaskSave).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "", schedule: "@daily" }),
+      ),
+    );
+    // `nextDueMs`, both lease columns and the host verdict are the store's and
+    // the engine's, never the request's, so the row can only be right after a
+    // read. And the disclosure closes behind a save that actually happened.
+    await waitFor(() => expect(syncTasks).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByRole("form", { name: TASK_FORM_ADD_TITLE })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("reveals a row's edit form seeded from the row already on screen", async () => {
+    answer(listing());
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+
+    // Named for the task it belongs to, because several rows can have one open.
+    const form = await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+    expect(within(form).getByLabelText(TASK_FORM_ID_LABEL)).toHaveValue("01SCHED");
+    // Seeded from the listing that is already on screen: no second read of the
+    // task record to open a form over a row it was just rendered from.
+    expect(syncTasks).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers neither Edit nor Forget on a row this build cannot read", async () => {
+    // They are not `TaskVm`s — `db::list_tasks` could not decode them — so there
+    // is nothing to seed a form from, and an upsert assembled out of a reason
+    // string is one `sync_task_save` would refuse. A control that can only fail
+    // is worse than no control.
+    answer(
+      listing({
+        tasks: [],
+        unknown: [{ id: "01FUTURE", reason: "unreadable task row: invalid kind 'teleport'" }],
+      }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_UNKNOWN_ROW_TESTID);
+
+    expect(within(row).queryByRole("button", { name: TASK_EDIT_TEXT })).not.toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: TASK_FORGET_TEXT })).not.toBeInTheDocument();
+    expect(within(row).queryAllByRole("button")).toHaveLength(0);
+  });
+
+  it("asks before forgetting, and says the answer deletes a record and not content", async () => {
+    answer(listing());
+    vi.mocked(syncTaskForget).mockResolvedValue(undefined);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_FORGET_TEXT }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    // Which task, by the id the row shows: a list of ten of these all confirm
+    // with the same words otherwise.
+    expect(within(dialog).getByText(taskForgetConfirmTitle("01SCHED"))).toBeInTheDocument();
+    // The one thing a person deciding this needs to know, in the backend's own
+    // framing (`sync_ipc.rs`: "Deletes a record, never content").
+    expect(within(dialog).getByTestId(TASK_FORGET_TESTID)).toHaveTextContent(
+      "deletes a record, never content",
+    );
+    expect(TASK_FORGET_CONFIRM_BODY).toMatch(/never content/);
+    // Asking is the point: nothing has happened yet.
+    expect(syncTaskForget).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: TASK_FORGET_CANCEL_TEXT }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
+    expect(syncTaskForget).not.toHaveBeenCalled();
+  });
+
+  it("forgets the task on the confirm, and the row leaves the pane", async () => {
+    // The one user-visible outcome of the whole path, and the earlier version of
+    // this test answered the SAME listing to both reads — so it passed over an
+    // implementation that deleted the wrong id, or whose re-read never reached
+    // the rendered list.
+    vi.mocked(syncTasks).mockResolvedValueOnce(listing());
+    vi.mocked(syncTasks).mockResolvedValue(listing({ tasks: [], unknown: [] }));
+    vi.mocked(syncTaskForget).mockResolvedValue(undefined);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_FORGET_TEXT }));
+    const dialog = await screen.findByRole("alertdialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: TASK_FORGET_TEXT }));
+
+    await waitFor(() => expect(syncTaskForget).toHaveBeenCalledWith("01SCHED"));
+    await waitFor(() => expect(syncTasks).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.queryByTestId(TASKS_ROW_TESTID)).not.toBeInTheDocument());
+    expect(screen.getByText(TASKS_PANE_EMPTY_SENTENCE)).toBeInTheDocument();
+  });
+
+  it("shows a refused Forget on the row it is about, as a refused Run now is", async () => {
+    // An `internal` store error, which is what this path can actually emit:
+    // `sync_task_forget` runs two unconditional DELETEs and has no
+    // does-this-exist branch, so a "no such task" refusal was an invented
+    // failure. Two rows, so `within` is the assertion and not decoration.
+    answer(listing({ tasks: [task(), task({ id: "01OTHER" })] }));
+    vi.mocked(syncTaskForget).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+    const rows = await screen.findAllByTestId(TASKS_ROW_TESTID);
+    const mine = rows[1];
+
+    fireEvent.click(within(mine).getByRole("button", { name: TASK_FORGET_TEXT }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: TASK_FORGET_TEXT,
+      }),
+    );
+
+    // On its own row and on no other: the refusal names which task did not go.
+    await waitFor(() =>
+      expect(
+        within(screen.getAllByTestId(TASKS_ROW_TESTID)[1]).getByTestId(TASKS_REFUSAL_TESTID),
+      ).toHaveTextContent("database is locked"),
+    );
+    expect(
+      within(screen.getAllByTestId(TASKS_ROW_TESTID)[0]).queryByTestId(TASKS_REFUSAL_TESTID),
+    ).not.toBeInTheDocument();
+    // And the task is still there, because it was not deleted.
+    expect(
+      within(screen.getAllByTestId(TASKS_ROW_TESTID)[1]).getByText("01OTHER"),
+    ).toBeInTheDocument();
+  });
+
+  it("still reports a refused Forget when the row it belonged to has gone", async () => {
+    // `refusals` is keyed by task id and drawn by the row, so a refusal for a
+    // task the re-read no longer lists had nowhere to be drawn — and the
+    // likeliest reason a Forget is refused is that another writer removed the row
+    // first. A failed delete then looked exactly like a successful one, which is
+    // the invisible-failure shape this epic exists to close.
+    vi.mocked(syncTasks).mockResolvedValueOnce(listing());
+    vi.mocked(syncTasks).mockResolvedValue(listing({ tasks: [], unknown: [] }));
+    vi.mocked(syncTaskForget).mockRejectedValue({
+      code: "internal",
+      message: "database is locked",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(within(row).getByRole("button", { name: TASK_FORGET_TEXT }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: TASK_FORGET_TEXT,
+      }),
+    );
+
+    const orphan = await screen.findByTestId(TASKS_ORPHAN_REFUSAL_TESTID);
+    expect(orphan).toHaveTextContent("database is locked");
+    // Named, because the row that would have said which task is gone.
+    expect(orphan).toHaveTextContent("01SCHED");
+  });
+
+  it("refuses to unmount a form, or delete its row, while its save is in flight", async () => {
+    // Two defects with one flag. Pressing the disclosure mid-save unmounted the
+    // form, so Rust's refusal had nowhere to land and a collapsed disclosure with
+    // no message read as a save that happened. And a Forget confirmed mid-save
+    // deletes a row the settling save re-inserts — `upsert_task` inserts when the
+    // id is absent — so a confirmed deletion silently undoes itself.
+    answer(listing());
+    // A held promise, `files-pane.test.tsx`'s shape: the executor form and not
+    // `Promise.withResolvers`, which this project's `lib` target does not have.
+    let land: ((saved: TaskVm) => void) | null = null;
+    vi.mocked(syncTaskSave).mockImplementation(
+      () =>
+        new Promise<TaskVm>((resolve) => {
+          land = resolve;
+        }),
+    );
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+    const form = await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+
+    fireEvent.click(within(form).getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+
+    const live = screen.getByTestId(TASKS_ROW_TESTID);
+    await waitFor(() =>
+      expect(within(live).getByRole("button", { name: TASK_EDIT_TEXT })).toBeDisabled(),
+    );
+    expect(within(live).getByRole("button", { name: TASK_FORGET_TEXT })).toBeDisabled();
+    expect(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE })).toBeDisabled();
+    expect(syncTaskForget).not.toHaveBeenCalled();
+
+    // The save settles and every control comes back.
+    await act(async () => {
+      land?.(task());
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE })).toBeEnabled(),
+    );
+  });
+
+  it("drops an edit disclosure whose row the record no longer has", async () => {
+    // The id is user-supplied on the Add form, so a stale `editingId` is
+    // re-creatable: forget `01SCHED`, add a new task called `01SCHED`, and the
+    // new row rendered with its form already expanded and `aria-expanded` set on
+    // a disclosure nobody had opened.
+    vi.mocked(syncTasks).mockResolvedValueOnce(listing());
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
+    await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
+
+    // The record loses the task, then gains one with the same id again.
+    vi.mocked(syncTasks).mockResolvedValueOnce(listing({ tasks: [], unknown: [] }));
+    fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
+      ).not.toBeInTheDocument(),
+    );
+
+    vi.mocked(syncTasks).mockResolvedValue(listing());
+    fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+    const back = await screen.findByTestId(TASKS_ROW_TESTID);
+    expect(within(back).getByRole("button", { name: TASK_EDIT_TEXT })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(
+      screen.queryByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` }),
+    ).not.toBeInTheDocument();
   });
 });

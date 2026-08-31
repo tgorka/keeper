@@ -45,6 +45,35 @@ export const SYNC_LFS_MODES = ["materialize", "pointerOnly", "disabled"] as cons
 export type SyncLfsMode = (typeof SYNC_LFS_MODES)[number];
 
 /**
+ * The legal task `kind` values (mirror of the Rust `TaskKind::from_stored`
+ * match).
+ *
+ * A frontend constant list because no IPC type enumerates these: `TaskVm.kind`
+ * and `TaskSaveReq.kind` are both `String`, deliberately, so a row written by a
+ * newer keeper survives a read by an older one (NFR-43). Something still has to
+ * offer the spellings *this* build can write, and it lives here beside
+ * {@link SYNC_DIRECTIONS} rather than in whichever component happens to draw
+ * the menu — a second registry in a component file is how the picker and the
+ * store come to disagree about what a task may be.
+ *
+ * No derived union type accompanies it, unlike {@link SYNC_DIRECTIONS}: a task
+ * form holds the widened `string` its wire type has, because `db::decode_task`
+ * partitions on both `kind` and `mode` and sends every spelling this build
+ * cannot read to `TaskListingVm.unknown`. So an *editable* row's spelling is
+ * always one of these by construction, and a union that only ever narrowed a
+ * value already known to be narrow would be a type nothing could use.
+ */
+export const TASK_KINDS = ["sync", "release"] as const;
+
+/**
+ * The legal task `mode` values (mirror of the Rust `TaskMode::from_stored`
+ * match). Here for {@link TASK_KINDS}' reason, and with no union type for the
+ * same one: `mode` crosses IPC as a `String` too, and the list of what can be
+ * *chosen* is the frontend's to hold once.
+ */
+export const TASK_MODES = ["off", "manual", "scheduled"] as const;
+
+/**
  * The lane every profile created from Settings uses. The other lane
  * (`worktree`) is an agent airlock that Rust only accepts together with
  * `direction = pushOnly`, so it stays a syncd-config affordance rather than a

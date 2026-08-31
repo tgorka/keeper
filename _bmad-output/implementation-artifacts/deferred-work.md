@@ -5040,3 +5040,27 @@ status: open
     past — so a requested run landing on an overdue window is reachable in normal
     operation, not only in theory. Pre-existing: the doc and `next_task_window` both
     shipped before story 57.5's diff.
+
+- source_spec: `{project-root}/_bmad-output/implementation-artifacts/spec-58-1-a-task-you-can-create-and-edit.md`
+  summary: A task edit form left open across a listing change writes its seed-time values back over whatever another host changed meanwhile, because `upsert_task` has no compare-and-set.
+  evidence: |
+    `TaskForm` seeds all six values once (`task-form.tsx`, `useState(() => …)`), which is
+    `AddFolderForm`'s deliberate rule — re-syncing from the prop would overwrite what has
+    been typed since the form opened, and the pane hands the row a fresh object on every
+    read. Submit then sends the full tuple (kind, mode, enabled, profileId, schedule) and
+    `db::upsert_task` performs an unconditional `INSERT … ON CONFLICT(id) DO UPDATE` with
+    no version column and no `updated_ms` precondition, so every field another host or
+    `keeper-syncd tasks set` moved while the form sat open is silently reverted. The task
+    record is explicitly shared across hosts (`TASKS_PANE_EMPTY_AFTER`: "Every host that
+    shares this record sees it"), so this is an ordinary two-machine sequence rather than a
+    contrived one, and nothing on screen says a stale value was written back.
+    Deferred rather than patched for two reasons. It is the identical, already-accepted
+    property of the profile form this one is modelled on — `SyncProfileReq` merges onto a
+    clone of the stored profile precisely because a form cannot be trusted to carry every
+    field, and tasks have no such merge because `TaskSaveReq` carries all of them. And the
+    honest fix is a precondition in Rust (an `updated_ms` compare-and-set on `upsert_task`,
+    refusing a write whose baseline has moved, in the manner of the NFR-43 stored-row
+    guard beside it), which story 58.1 could not make: it is a frontend-only story and
+    changing `src-tauri/` was outside its boundaries. A UI-only mitigation — noticing the
+    prop changed and offering to re-seed — is a smaller version of the same idea and would
+    still lose the race, so it is not worth shipping ahead of the store-side guard.

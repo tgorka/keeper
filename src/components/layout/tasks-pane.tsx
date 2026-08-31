@@ -21,6 +21,17 @@
  *   invisible-failure shape this whole epic exists to close: nobody notices the
  *   absence of housekeeping.
  *
+ * **Story 58.1 made it a surface that also creates, changes and deletes one.**
+ * Until then `sync_task_save` and `sync_task_forget` were registered, typed,
+ * wrapped and mocked, and no control anywhere in the app called either — so this
+ * pane could only tell the owner to open a terminal. Now the header reveals
+ * {@link TaskForm} inline, each readable row reveals the same component seeded
+ * from itself, and Forget asks first. One component in two places (AD-C7),
+ * because two forms would be two chances to word or validate the same task
+ * differently. What that form deliberately does not validate is everything Rust
+ * already refuses in its own words; the list and the reasons are in
+ * `task-form.tsx`.
+ *
  * **Not one word of that decision is made here.** The kind, the sentence and
  * the reason all arrive on {@link TaskHostVm}, composed by
  * `keeper_core::tasks::task_host` over facts the shell can establish, and are
@@ -40,11 +51,27 @@
  * keep a task record gets no Tasks entry at all rather than an empty one.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+// `TASK_HOST_WIDE_TEXT` is the form's rather than this file's: the picker's
+// first option and this pane's folder column are one fact, and the dependency
+// has to run this way round because the pane mounts the form. The other
+// arrangement is an import cycle between a pane and the form it reveals.
+import { TASK_FORM_ADD_TITLE, TASK_HOST_WIDE_TEXT, TaskForm } from "@/components/sync/task-form";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
-import { syncTaskRunNow, syncTasks } from "@/lib/ipc/client";
+import { syncTaskForget, syncTaskRunNow, syncTasks } from "@/lib/ipc/client";
 
 /** The heading, and the promise the pane makes in one line. */
 export const TASKS_PANE_TITLE = "Tasks";
@@ -55,30 +82,34 @@ export const TASKS_PANE_SUBTITLE =
 export const TASKS_PANE_LOADING_SENTENCE = "Reading the task record…";
 
 /**
- * The empty state, in two sentences: what this view is, and how a task gets
- * here.
+ * The empty state, in three parts: what this view is, that a task can be made
+ * right here, and how a host with no window gets one instead.
  *
- * **Load-bearing rather than cosmetic**, and it was wrong (Story 57.5's review,
- * finding 5). Nothing in this epic creates a task row on migration, on open or
- * on first tick, so *every existing install opens ⌘8 to this text and nothing
- * else* — it is the first thing the owner reads, and it said
- * "`keeper-syncd task add` creates one". There is no `task` group and no `add`
- * verb: the group is `tasks` and creation is `tasks set` (`keeper-syncd`'s clap
- * tree). Following it verbatim earned an `InvalidSubcommand`.
+ * **Load-bearing rather than cosmetic**, and it has now been wrong twice.
+ * Nothing in either epic creates a task row on migration, on open or on first
+ * tick, so *every existing install opens ⌘8 to this text and nothing else* — it
+ * is the first thing the owner reads. Story 57.5's review found it naming a verb
+ * the CLI does not have (`keeper-syncd task add`: there is no `task` group and
+ * no `add` verb — the group is `tasks` and creation is `tasks set`), and Story
+ * 58.1 found the remainder false: it said this view "cannot create one yet",
+ * which it now can, and it instructed the reader to open a terminal while the
+ * control that does it sits in the header above the sentence.
  *
- * Three things it must not do, each of which the old sentence did:
+ * Three things it must not do:
  *
- * - **Claim this view can create one.** It cannot. `sync_task_save` is a
- *   registered command and the wire type exists, but no control here calls it,
- *   so the honest sentence says so plainly instead of leaving the reader hunting
- *   for a button.
+ * - **Send the reader to a terminal for something the app now does.** Creation
+ *   is {@link TASK_FORM_ADD_TITLE} in this pane's header, so that is the primary
+ *   path and the sentence says so. The command is still named, because it is
+ *   still true: a host with no window of its own — one reached only over a
+ *   terminal — gets its tasks from the daemon's command line, and that is the
+ *   *other* way rather than the only one.
  * - **Name a verb the CLI does not have.**
  *   {@link TASKS_PANE_EMPTY_COMMAND} is the real one, and
  *   `tasks-pane.test.tsx` checks every `keeper-syncd` phrase in this file's copy
  *   against the daemon's actual group and verb list, so a rename cannot quietly
  *   re-break it.
  * - **Promise a background service that is not there.** `keeper-syncd` builds
- *   and ships for both Linux and macOS (`release.yml` publishes
+ *   and ships for both of keeper's desktop targets (`release.yml` publishes
  *   `keeper-syncd-x86_64-unknown-linux-gnu` and
  *   `keeper-syncd-aarch64-apple-darwin`), so the command is true to read on
  *   either — but no launchd plist exists anywhere in this repository, so nothing
@@ -89,21 +120,22 @@ export const TASKS_PANE_LOADING_SENTENCE = "Reading the task record…";
  *   `src/test/no-user-agent-gating.test.ts` forbids one by name.
  */
 export const TASKS_PANE_EMPTY_SENTENCE =
-  "No tasks yet. This view lists, inspects and runs tasks; it cannot create one yet.";
+  "No tasks yet. This view lists, inspects and runs tasks, and you can create one right here. A host with no window of its own gets its tasks from the daemon's command line instead:";
 
 /** The one real creation command, quoted exactly as `keeper-syncd` spells it. */
 export const TASKS_PANE_EMPTY_COMMAND =
   'keeper-syncd tasks set nightly --kind sync --schedule "0 3 * * *"';
 
 /**
- * What happens once a task exists, and the only promise made here.
+ * What happens once a task exists — however it got here — and the only promise
+ * made on this screen.
  *
  * Deliberately says *while keeper is running* and nothing stronger: whether a
  * daemon also runs it is a per-machine fact each row states for itself, and this
  * text has no way to establish it.
  */
 export const TASKS_PANE_EMPTY_AFTER =
-  "Run that in a terminal and the task appears here. Every host that shares this record sees it, and keeper runs a due task while keeper is running — each row says which host will actually run it.";
+  "Either way the task appears here. Every host that shares this record sees it, and keeper runs a due task while keeper is running — each row says which host will actually run it.";
 
 /**
  * The heading over the rows this build cannot read (NFR-43).
@@ -146,6 +178,33 @@ export const TASKS_CLOCK_TICK_MS = 30_000;
 export const TASK_RUN_NOW_TEXT = "Run now";
 export const TASK_REFRESH_TEXT = "Refresh";
 
+/** Reveals this row's own edit form, and hides it again. */
+export const TASK_EDIT_TEXT = "Edit";
+
+/** The destructive one, and the three sentences it is confirmed with. */
+export const TASK_FORGET_TEXT = "Forget";
+/**
+ * Which task is being forgotten, by the id the row shows. A function and
+ * therefore camelCase, `syncInForceNote`'s shape: a list of ten of these would
+ * otherwise all confirm with the same words.
+ */
+export function taskForgetConfirmTitle(id: string): string {
+  return `Forget task ${id}?`;
+}
+/**
+ * What forgetting a task actually does, in the backend's own framing
+ * (`sync_ipc.rs`: *"Deletes a record, never content"*).
+ *
+ * The distinction is the whole reason this confirmation exists. A `release`
+ * task's forgotten schedule simply stops sweeping — nothing it has ever released
+ * comes back, and nothing it would have swept goes away — and a `sync` task's
+ * folder is untouched. Somebody who thinks Forget might delete files will not
+ * press it, and somebody who thinks it will tidy their releases up will.
+ */
+export const TASK_FORGET_CONFIRM_BODY =
+  "This deletes a record, never content. keeper drops the task and the runs it recorded; the folders it synced and everything it ever released are left exactly as they are — a release task's forgotten schedule just stops sweeping.";
+export const TASK_FORGET_CANCEL_TEXT = "Keep it";
+
 /** Column labels, so the row is readable without a table header. */
 export const TASK_SCHEDULE_LABEL = "Schedule";
 export const TASK_HOST_LABEL = "Host";
@@ -160,14 +219,14 @@ export const TASK_NEVER_RAN_TEXT = "never run";
 export const TASK_DUE_NOW_TEXT = "due now";
 export const TASK_IN_FLIGHT_TEXT = "running now";
 
-/** Which folder a task is scoped to, or that it belongs to the machine. */
-export const TASK_HOST_WIDE_TEXT = "the whole machine";
-
 export const TASKS_ROW_TESTID = "task-row";
 export const TASKS_UNKNOWN_ROW_TESTID = "task-unknown-row";
 export const TASKS_HOST_TESTID = "task-host";
 export const TASKS_REFUSAL_TESTID = "task-refusal";
+/** Where a refusal whose row the listing no longer holds is drawn instead. */
+export const TASKS_ORPHAN_REFUSAL_TESTID = "tasks-orphan-refusal";
 export const TASKS_ERROR_TESTID = "tasks-error";
+export const TASK_FORGET_TESTID = "task-forget-confirm";
 
 /**
  * The word for each host verdict.
@@ -314,15 +373,41 @@ function TaskRow({
   now,
   refusal,
   running,
+  deleting,
+  editing,
+  writing,
   onRunNow,
+  onEditToggle,
+  onSaved,
+  onSavingChange,
+  onForget,
 }: {
   task: TaskVm;
   now: number;
   refusal: string | null;
   running: boolean;
+  /** This row's own Forget is in flight, so a second confirm cannot re-issue it. */
+  deleting: boolean;
+  editing: boolean;
+  /** A save is in flight somewhere in the pane — see `formSaving`. */
+  writing: boolean;
   onRunNow: (id: string) => void;
+  onEditToggle: (id: string) => void;
+  onSaved: () => void;
+  onSavingChange: (saving: boolean) => void;
+  onForget: (id: string) => void;
 }) {
   const unhosted = task.host.kind === "unhosted";
+  // The header disclosure's rule, per row: the form is closed from inside
+  // itself, so without this focus lands on `<body>`.
+  const editTriggerRef = useRef<HTMLButtonElement>(null);
+  const wasEditing = useRef(false);
+  useEffect(() => {
+    if (!editing && wasEditing.current) {
+      editTriggerRef.current?.focus();
+    }
+    wasEditing.current = editing;
+  }, [editing]);
   return (
     <li
       data-testid={TASKS_ROW_TESTID}
@@ -341,16 +426,45 @@ function TaskRow({
             {task.profile ?? (task.profileId === null ? TASK_HOST_WIDE_TEXT : task.profileId)}
           </p>
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          disabled={running}
-          onClick={() => onRunNow(task.id)}
-        >
-          {TASK_RUN_NOW_TEXT}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={running}
+            onClick={() => onRunNow(task.id)}
+          >
+            {TASK_RUN_NOW_TEXT}
+          </Button>
+          {/* A disclosure, not a dialog: the same component the header reveals,
+              in the row it is about (AD-C7). Disabled while a save is in flight
+              for the reason the header's twin is — pressing it unmounts the form
+              Rust's answer has to land in. */}
+          <Button
+            ref={editTriggerRef}
+            type="button"
+            variant="outline"
+            size="sm"
+            aria-expanded={editing}
+            disabled={writing}
+            onClick={() => onEditToggle(task.id)}
+          >
+            {TASK_EDIT_TEXT}
+          </Button>
+          {/* Refused twice over while a write is on its way: `upsert_task`
+              inserts when the id is absent, so a deletion confirmed mid-save is
+              undone by the save settling behind it. `deleting` is the second
+              confirm of the same delete. */}
+          <Button
+            type="button"
+            variant="destructive"
+            size="sm"
+            disabled={writing || deleting}
+            onClick={() => onForget(task.id)}
+          >
+            {TASK_FORGET_TEXT}
+          </Button>
+        </div>
       </div>
 
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -380,12 +494,29 @@ function TaskRow({
         </dd>
       </div>
 
-      {/* A refusal from Run now, quoted where it was asked. The row keeps every
-          other value it had: nothing here may read as though the task ran. */}
+      {/* A refusal, quoted where it was asked — from a Run now, or from a
+          Forget the engine would not do. The row keeps every other value it
+          had: nothing here may read as though the task ran or went away. */}
       {refusal !== null && (
         <p role="alert" data-testid={TASKS_REFUSAL_TESTID} className="text-destructive text-sm">
           {refusal}
         </p>
+      )}
+
+      {/* Capped where the row is not, the Sync pane's reason: a form is read
+          line by line, and a label-and-field pair stretched across a wide
+          window is worse than one that sits still. */}
+      {editing && (
+        <Card size="sm" className="w-full max-w-[720px]">
+          <CardContent>
+            <TaskForm
+              task={task}
+              onSaved={onSaved}
+              onCancel={() => onEditToggle(task.id)}
+              onSavingChange={onSavingChange}
+            />
+          </CardContent>
+        </Card>
       )}
     </li>
   );
@@ -394,8 +525,53 @@ function TaskRow({
 export function TasksPane() {
   const [listing, setListing] = useState<TaskListingVm | null>(null);
   const [error, setError] = useState<string | null>(null);
-  /** Per-task refusals from Run now, keyed by task id. */
+  /** Per-task refusals from a Run now or a Forget, keyed by task id. */
   const [refusals, setRefusals] = useState<Record<string, string>>({});
+  /** Whether the header's add form is revealed. */
+  const [adding, setAdding] = useState(false);
+  /**
+   * Which row has its edit form open, or `null`.
+   *
+   * Held here rather than per-row so exactly one can be open: an edit form is
+   * eight controls tall, and three of them open at once turns a list of tasks
+   * into a wall of forms with the rows they belong to scrolled apart. It is
+   * cleared by a save, by Cancel and by pressing Edit again.
+   */
+  const [editingId, setEditingId] = useState<string | null>(null);
+  /**
+   * The task a Forget is asking about, and whether the question is on screen.
+   *
+   * One dialog for the whole pane (`files-pane.tsx`'s shape) rather than one per
+   * row: only one question can be being answered at a time. Two slots for it
+   * rather than one, though, because `AlertDialogContent` stays mounted for its
+   * own hundred-millisecond exit animation: driving the title from the same
+   * state that drives `open` made the last frame the person sees read "Forget
+   * task ?", on the one dialog in this pane whose entire job is naming the
+   * record about to go. `files-pane.tsx` degrades to nothing there; naming the
+   * task all the way through the close is better than naming nothing, so the
+   * subject outlives the ask and is replaced only by the next one.
+   */
+  const [forgetSubject, setForgetSubject] = useState<string | null>(null);
+  const [forgetAsking, setForgetAsking] = useState(false);
+  /**
+   * Ids whose Forget is in flight, so a second confirmation cannot issue a
+   * second delete for a task already going. {@link running}'s shape and
+   * {@link running}'s reason — Story 57.5's finding 7 — applied to the
+   * destructive path, which did not inherit it.
+   */
+  const [deleting, setDeleting] = useState<Record<string, true>>({});
+  /**
+   * Whether a revealed {@link TaskForm} has a save in flight.
+   *
+   * Deliberately pane-wide rather than per-form: what it really says is *a write
+   * to the task record is on its way*, and two things must wait for that. A
+   * disclosure toggle pressed mid-save unmounts the form, so Rust's refusal has
+   * nowhere to land and a collapsed disclosure with no message reads as a save
+   * that happened. And a Forget confirmed mid-save deletes a row the settling
+   * save then re-inserts — `upsert_task` inserts when the id is absent — so a
+   * confirmed deletion silently undoes itself.
+   */
+  const [formSaving, setFormSaving] = useState(false);
   /**
    * Ids whose Run now is in flight — a set of them, not one slot (Story 57.5's
    * review, finding 7).
@@ -453,6 +629,18 @@ export function TasksPane() {
       setListing(next);
       setNow(Date.now());
       setError(null);
+      // A disclosure cannot belong to a row the record no longer has. Left
+      // standing, the id is re-creatable — the Add form takes a typed id — so
+      // forgetting `nightly` and adding a new `nightly` rendered the new row
+      // with its edit form already expanded and `aria-expanded` set on a
+      // disclosure nobody had opened. `forgetSubject` is deliberately NOT
+      // pruned here: this read fires on every Run now settle too, and closing a
+      // question under the person answering it is worse than asking about a row
+      // that has gone — a confirm on a row that is gone is refused, and the
+      // refusal is rendered either way (see `orphanRefusals`).
+      setEditingId((open) =>
+        open !== null && next.tasks.some((t) => t.id === open) ? open : null,
+      );
       // A listing read *after* an attempt is newer evidence than the attempt
       // (finding 9). `refusals` used to be cleared at exactly one point — the
       // top of `runNow`, for the one id being run — so a "the other host is
@@ -485,6 +673,25 @@ export function TasksPane() {
     const clock = setInterval(() => setNow(Date.now()), TASKS_CLOCK_TICK_MS);
     return () => clearInterval(clock);
   }, []);
+
+  /**
+   * Return focus to the button that revealed the add form when it closes.
+   *
+   * The form is closed from a control inside itself — Cancel, or the submit that
+   * unmounts it on success — so without this the focused element is destroyed
+   * and focus falls to `<body>`: a keyboard user is thrown out of the pane and
+   * has to tab from the top of the app to get back. `recording-summary-card.tsx`
+   * is the near-exact analogue (an inline edit disclosure in a card) and this is
+   * its shape; `app-shell.tsx`'s `closeDetail` states the rule.
+   */
+  const addTriggerRef = useRef<HTMLButtonElement>(null);
+  const wasAdding = useRef(false);
+  useEffect(() => {
+    if (!adding && wasAdding.current) {
+      addTriggerRef.current?.focus();
+    }
+    wasAdding.current = adding;
+  }, [adding]);
 
   const runNow = useCallback(
     async (id: string) => {
@@ -520,6 +727,57 @@ export function TasksPane() {
     [refresh],
   );
 
+  /**
+   * Delete the task the confirmation named, and re-read.
+   *
+   * A refusal goes where a refused Run now's goes — the row's own alert, keyed
+   * by id — because it is the same kind of answer: the engine would not do this,
+   * and its sentence is the actionable half. The dialog closes either way: it has
+   * asked its question and been answered, and leaving it open over a refusal
+   * would hide the row the refusal is written on.
+   */
+  const forget = useCallback(
+    async (id: string) => {
+      setForgetAsking(false);
+      setDeleting((prior) => ({ ...prior, [id]: true }));
+      setRefusals((prior) => {
+        const { [id]: _dropped, ...rest } = prior;
+        return rest;
+      });
+      try {
+        await syncTaskForget(id);
+        // Only a row that is gone can have no form open on it.
+        setEditingId((open) => (open === id ? null : open));
+      } catch (cause) {
+        setRefusals((prior) => ({ ...prior, [id]: messageOf(cause) }));
+      } finally {
+        setDeleting((prior) => {
+          const { [id]: _settled, ...rest } = prior;
+          return rest;
+        });
+        await refresh(true);
+      }
+    },
+    [refresh],
+  );
+
+  /**
+   * Refusals whose row the listing no longer holds.
+   *
+   * `refusals` is keyed by task id and drawn by {@link TaskRow}, so a refusal
+   * for a task that is not in the listing had nowhere to be drawn at all — and
+   * the likeliest reason `sync_task_forget` refuses is that another writer on
+   * this shared record removed the row first, at which point the re-read in
+   * `forget`'s own `finally` takes away the row that would have carried the
+   * sentence. A failed delete then looked exactly like a successful one, which
+   * is the invisible-failure shape this whole epic exists to close, so an
+   * orphaned refusal is promoted to the pane's own alert instead of dropped.
+   */
+  const orphanRefusals =
+    listing === null
+      ? []
+      : Object.entries(refusals).filter(([id]) => !listing.tasks.some((task) => task.id === id));
+
   return (
     <section
       aria-label={TASKS_PANE_TITLE}
@@ -530,15 +788,27 @@ export function TasksPane() {
           <h1 className="font-heading text-title">{TASKS_PANE_TITLE}</h1>
           <p className="text-muted-foreground text-sm">{TASKS_PANE_SUBTITLE}</p>
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          onClick={() => void refresh()}
-        >
-          {TASK_REFRESH_TEXT}
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          {/* The action and the thing it reveals are worded identically
+              (`add-folder-form.tsx`'s rule): a button called something else
+              would be a second name for one form. Disabled while a save is in
+              flight, because pressing it then unmounts the form Rust's answer
+              has to land in — see `formSaving`. */}
+          <Button
+            ref={addTriggerRef}
+            type="button"
+            variant="outline"
+            size="sm"
+            aria-expanded={adding}
+            disabled={formSaving}
+            onClick={() => setAdding((open) => !open)}
+          >
+            {TASK_FORM_ADD_TITLE}
+          </Button>
+          <Button type="button" variant="outline" size="sm" onClick={() => void refresh()}>
+            {TASK_REFRESH_TEXT}
+          </Button>
+        </div>
       </header>
 
       <ScrollArea fitWidth className="min-h-0 flex-1">
@@ -552,8 +822,40 @@ export function TasksPane() {
               {error}
             </p>
           )}
+          {/* A refusal whose row the listing no longer has — see
+              `orphanRefusals`. Named by its task, because the row that would
+              have said which one is gone. */}
+          {orphanRefusals.map(([id, refusal]) => (
+            <p
+              key={id}
+              role="alert"
+              data-testid={TASKS_ORPHAN_REFUSAL_TESTID}
+              className="px-6 pt-4 text-destructive text-sm"
+            >
+              {id}: {refusal}
+            </p>
+          ))}
           {listing === null && error === null && (
             <p className="px-6 pt-4 text-muted-foreground text-sm">{TASKS_PANE_LOADING_SENTENCE}</p>
+          )}
+          {/* The add form, revealed by the header and mounted at the top of the
+              body — inline, never a dialog (AD-C7): the two configuration
+              surfaces are the same component, so they cannot word or validate a
+              task differently. Closing unmounts it, so the next open starts from
+              a fresh form rather than an abandoned draft. */}
+          {adding && (
+            <Card size="sm" className="m-6 w-full max-w-[720px]">
+              <CardContent>
+                <TaskForm
+                  onSaved={() => {
+                    setAdding(false);
+                    void refresh();
+                  }}
+                  onCancel={() => setAdding(false)}
+                  onSavingChange={setFormSaving}
+                />
+              </CardContent>
+            </Card>
           )}
           {listing !== null && listing.tasks.length === 0 && listing.unknown.length === 0 && (
             <div className="flex flex-col gap-2 px-6 pt-4">
@@ -573,11 +875,29 @@ export function TasksPane() {
                   now={now}
                   refusal={refusals[task.id] ?? null}
                   running={running[task.id] === true}
+                  deleting={deleting[task.id] === true}
+                  editing={editingId === task.id}
+                  writing={formSaving}
                   onRunNow={(id) => void runNow(id)}
+                  onEditToggle={(id) => setEditingId((open) => (open === id ? null : id))}
+                  onSaved={() => {
+                    setEditingId(null);
+                    void refresh();
+                  }}
+                  onSavingChange={setFormSaving}
+                  onForget={(id) => {
+                    setForgetSubject(id);
+                    setForgetAsking(true);
+                  }}
                 />
               ))}
             </ul>
           )}
+          {/* These rows carry no Edit and no Forget, now that the readable ones
+              do. They are not `TaskVm`s — `db::list_tasks` could not decode
+              them — so there is nothing to seed a form from, and an upsert built
+              out of a reason string is one `sync_task_save` would refuse. A
+              control that can only fail is worse than no control. */}
           {listing !== null && listing.unknown.length > 0 && (
             <>
               <h2 className="border-border border-t px-6 pt-4 font-heading text-muted-foreground text-sm">
@@ -616,6 +936,37 @@ export function TasksPane() {
           )}
         </div>
       </ScrollArea>
+
+      {/* Asked before anything is deleted, and the question says what the answer
+          costs. Every word of it is the backend's own framing: this deletes a
+          record, never content. */}
+      <AlertDialog open={forgetAsking} onOpenChange={(open) => !open && setForgetAsking(false)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            {/* Named from `forgetSubject` and never from the slot that drives
+                `open`, so the question still names its task through the close. */}
+            <AlertDialogTitle>
+              {forgetSubject !== null && taskForgetConfirmTitle(forgetSubject)}
+            </AlertDialogTitle>
+            <AlertDialogDescription data-testid={TASK_FORGET_TESTID}>
+              {TASK_FORGET_CONFIRM_BODY}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{TASK_FORGET_CANCEL_TEXT}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                if (forgetSubject !== null) {
+                  void forget(forgetSubject);
+                }
+              }}
+            >
+              {TASK_FORGET_TEXT}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </section>
   );
 }
