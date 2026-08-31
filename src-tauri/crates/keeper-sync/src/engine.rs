@@ -440,7 +440,12 @@ const UNTRACKED_SWEEP_INTERVAL: Duration = Duration::from_secs(900);
 ///
 /// An hour, matching `SCRATCH_DEBRIS_AGE`: the sweep runs as often as a file can
 /// become eligible for it, and no oftener.
-const SWEEP_EVERY_MS: i64 = 3_600_000;
+///
+/// `pub` for Story 58.7: the projected read-only row for this sweep has to state
+/// the cadence that is actually in force, and the shell crate composing that row
+/// must read the constant rather than re-spell the literal — a second copy is a
+/// second place for it to disagree.
+pub const SWEEP_EVERY_MS: i64 = 3_600_000;
 
 /// Paths one release sweep may attempt (Story 56.5, AD-126).
 ///
@@ -3285,8 +3290,24 @@ impl Engine {
     /// are self-limiting besides: the debouncer collapses a burst into one
     /// event per path per 500 ms, and a deadline is by construction at least
     /// `CLOSE_WRITE_SETTLE_MS` later than the observation that produced it.
+    ///
+    /// # A scheduled sync task takes reason 3, and only reason 3
+    ///
+    /// [`Self::sync_poll_permits`] is the `sync_governance` half of Story 58.8:
+    /// with a `scheduled` [`tasks::TaskKind::Sync`] row governing this folder,
+    /// the paced backstop **stands down** and the task's schedule is the folder's
+    /// clock, because leaving both running is a folder synced twice per window.
+    /// Reasons 1 and 2 are untouched — a schedule cannot own a filesystem event
+    /// (AD-141), and a governed folder must still answer a file somebody just
+    /// saved.
+    ///
+    /// It is asked **after** `scan_is_due`, and the `&&` is what makes that
+    /// affordable: the window is still advanced on every fire, and the tasks
+    /// table is read at most once per poll interval per folder rather than once
+    /// per tick. See [`Self::sync_poll_permits`] for why the declined window is
+    /// left armed rather than removed.
     fn scan_due(&self, profile: &SyncProfile) -> bool {
-        let paced = self.scan_is_due(profile);
+        let paced = self.scan_is_due(profile) && self.sync_poll_permits(profile);
         paced || self.watch_wake_pending(&profile.id) || self.settle_window_elapsed(profile)
     }
 
@@ -8371,6 +8392,47 @@ impl Engine {
     /// stored `off` row forbids, on exactly the machine where two hosts contend
     /// for one database.
     fn release_governance(&self, profile_id: &str) -> Result<Option<tasks::TaskMode>> {
+        self.task_governance(profile_id, tasks::TaskKind::Release)
+    }
+
+    /// Which stored `Sync` row governs this folder's **paced backstop**, if any
+    /// (Story 58.8, FR-360, AD-141).
+    ///
+    /// [`Self::release_governance`]'s twin, over the same fold, and everything
+    /// that doc says about the two tiers, about `enabled == false` reading as
+    /// [`tasks::TaskMode::Off`] rather than as absent, and about a row this build
+    /// cannot read governing nothing applies here word for word.
+    ///
+    /// One thing does **not** transpose, and it is the `Err` arm.
+    /// [`Self::release_permits`] declines on a table it could not read, because
+    /// the question there is *may I delete content*. The question here is *may I
+    /// walk a tree*, and the honest answer when `sync.db` is briefly locked by
+    /// the other host is **yes** — a poll that stopped because a read failed
+    /// would be housekeeping that stopped a folder syncing, which is the bargain
+    /// [`Self::run_due_tasks`] already refuses in the other direction. So
+    /// [`Self::sync_poll_permits`] permits on `Err`; the `Result` survives only
+    /// so that the reason can be logged.
+    fn sync_governance(&self, profile_id: &str) -> Result<Option<tasks::TaskMode>> {
+        self.task_governance(profile_id, tasks::TaskKind::Sync)
+    }
+
+    /// Which stored task row of `kind` governs this folder, if any.
+    ///
+    /// One fold for both kinds, deliberately: the tier rule (*the narrower
+    /// statement wins*), the least-permissive rule and the rank they are measured
+    /// on are the same claim about both records, and a second copy would be a
+    /// second place for them to disagree. What each kind then *does* with the
+    /// answer differs, and that lives in [`Self::release_permits`] and
+    /// [`Self::sync_poll_permits`] where the claim being made is visible.
+    ///
+    /// The `kind` filter is load-bearing in both directions: a sync task says
+    /// nothing about whether content may be deleted, and a release task says
+    /// nothing about how often a folder is walked.
+    fn task_governance(
+        &self,
+        profile_id: &str,
+        kind: tasks::TaskKind,
+    ) -> Result<Option<tasks::TaskMode>> {
         let listing = self.with_db(db::list_tasks)?;
         // Least permissive wins, so the fold is a `min` over an order
         // [`tasks::TaskMode`] deliberately does not derive: its three variants
@@ -8385,11 +8447,11 @@ impl Engine {
         let mut mine: Option<tasks::TaskMode> = None;
         let mut host_wide: Option<tasks::TaskMode> = None;
         for task in &listing.tasks {
-            if task.kind != tasks::TaskKind::Release {
+            if task.kind != kind {
                 continue;
             }
             // A row that is not live is a knob set to off, not a knob that is
-            // absent. See this method's doc.
+            // absent. See [`Self::release_governance`]'s doc.
             let mode = if task.enabled {
                 task.mode
             } else {
@@ -8409,6 +8471,116 @@ impl Engine {
         }
         // The narrower statement first.
         Ok(mine.or(host_wide))
+    }
+
+    /// Which `Sync` task mode governs this folder's paced backstop, if any —
+    /// the read Story 58.7's projection makes (Story 58.8, FR-359, FR-360).
+    ///
+    /// `Some(`[`tasks::TaskMode::Scheduled`]`)` is the one answer that changes
+    /// what a person sees: the folder's paced poll has been **surrendered** to
+    /// that task's schedule, so a projected row printing
+    /// `effective_poll_interval_ms` as this folder's cadence would state a
+    /// cadence nothing is keeping. The other two answers mean a row exists and
+    /// the poll is unchanged — see [`Self::sync_poll_permits`] for why.
+    ///
+    /// **A read error and a real `None` are the same value here, and nothing
+    /// downstream may render them as different facts.** That is not a gap: if
+    /// the table could not be read, the poll genuinely still runs, so a row
+    /// printing the poll interval is *true*. A caller that ever needs to tell
+    /// the two apart needs a second return shape rather than a guess.
+    pub fn sync_governance_mode(&self, profile_id: &str) -> Option<tasks::TaskMode> {
+        self.sync_governance(profile_id).ok().flatten()
+    }
+
+    /// Whether this folder's **paced backstop** may open a walk on this tick
+    /// (Story 58.8, FR-360, NFR-45, AD-141).
+    ///
+    /// `release_permits`' twin, and the answer AD-141 demands of any story that
+    /// puts a task row over pre-existing paced work: *"builds that twin **and
+    /// surrenders the existing gate in the same change**; adding a driver
+    /// without surrendering the gate ships a folder that syncs twice."*
+    ///
+    /// The whole table, exhaustive and with no `_` arm:
+    ///
+    /// * `None` — no sync task governs this folder: **today's behaviour,
+    ///   unchanged**, and the arm an un-migrated `sync.db` takes.
+    /// * `Some(Off)` — the poll is **unchanged**. This is where this table
+    ///   diverges from [`Self::release_permits`]'s, and the divergence is the
+    ///   point: `off` on a release row stops the *only* driver of optional
+    ///   housekeeping, while the sync poll is the folder's basic function,
+    ///   switched on by adding the folder and paused by `profile.enabled`. Read
+    ///   as a pause, one forgotten `off` row would silently stop a folder
+    ///   syncing that nobody asked to stop, and it would duplicate a control
+    ///   that already exists and is visible.
+    /// * `Some(Manual)` — the poll is **unchanged**, for the same reason: a
+    ///   manual sync task adds a button, and a button takes nothing away.
+    /// * `Some(Scheduled)` — the paced backstop **stands down** and the task's
+    ///   schedule becomes this folder's clock. Anything else would leave the
+    ///   15 s pacing running underneath the schedule: the folder synced twice in
+    ///   one window, and a run row claiming *"1 synced"* for work the supervisor
+    ///   would have done anyway.
+    ///
+    /// # What keeps working, and why it is not the whole of `scan_due`
+    ///
+    /// Only the *paced* trigger is surrendered. [`Self::scan_due`] is
+    /// `paced || watch_wake_pending || settle_window_elapsed`, and AD-141 settles
+    /// the other two by name — *"two of its three triggers are filesystem events
+    /// a schedule cannot own"*. Standing them down as well would make a folder
+    /// with an hourly task feel **dead** to somebody who had just saved a file:
+    /// AD-34-11's low-latency path gone, and a settling file waiting out an hour
+    /// instead of its own window. So this is [`Self::release_permits`]' sentence
+    /// transposed rather than contradicted — *the schedule drives it **and** the
+    /// filesystem events keep working*.
+    ///
+    /// The journal drain is untouched too: [`Self::tick_profile`] still calls
+    /// [`Self::drain_journal`] every tick, with `scan_when_idle = false`. What
+    /// stands down is the walk that **discovers** new work, never the draining of
+    /// work already queued — standing that down would strand an in-flight upload
+    /// behind a schedule.
+    ///
+    /// # An unreadable table permits the poll, which is the opposite answer
+    ///
+    /// [`Self::release_permits`] declines on `Err` because the honest answer to
+    /// *may I delete content* under an unreadable instruction is no. Here the
+    /// question is *may I walk a tree*, and the rule this tree already states
+    /// applies unchanged: *housekeeping that could stop a folder syncing would be
+    /// a far worse bargain than housekeeping that occasionally does not happen*
+    /// ([`Self::run_due_tasks`]). A poll suppressed because the other host held a
+    /// write lock for a moment would be exactly that bargain, taken the wrong
+    /// way round.
+    ///
+    /// # Nothing is `remove`d, unlike the release window
+    ///
+    /// [`Self::scan_is_due`] is asked **first** and arms unconditionally, so this
+    /// is consulted only on the tick the paced window actually fired: the
+    /// `list_tasks` read costs one query per poll interval per folder rather than
+    /// one per 1 Hz tick, and a declined folder re-asks its governance at that
+    /// same cadence. When the governance stops applying — the task forgotten, or
+    /// moved to `manual` — the armed window is already at or behind `now`, so the
+    /// very next tick walks. That is [`Self::scan_is_due`]'s own first-sight
+    /// promise, reached without a `remove`, and it is why
+    /// [`Self::forget_release_window`]'s idiom is deliberately not copied here:
+    /// that `remove` exists so re-enabling a sweep cannot delete immediately, and
+    /// a walk deletes nothing.
+    fn sync_poll_permits(&self, profile: &SyncProfile) -> bool {
+        let governance = match self.sync_governance(&profile.id) {
+            Ok(governance) => governance,
+            Err(err) => {
+                tracing::debug!(
+                    profile = profile.name,
+                    error = %err,
+                    "cannot read this host's tasks, so the paced poll keeps running rather \
+                     than stopping a folder because a read failed",
+                );
+                return true;
+            }
+        };
+        match governance {
+            None => true,
+            Some(tasks::TaskMode::Off) => true,
+            Some(tasks::TaskMode::Manual) => true,
+            Some(tasks::TaskMode::Scheduled) => false,
+        }
     }
 
     /// Whether a release pass may proceed on this folder, given who is asking
@@ -14885,6 +15057,377 @@ mod tests {
                 mode.as_str()
             );
         }
+    }
+
+    /// Which sync row governs a folder's paced backstop, over every case that
+    /// can disagree (Story 58.8, FR-360).
+    ///
+    /// [`Engine::release_governance`]'s test, mirrored, because the two now share
+    /// one fold and the mirror is what proves the `kind` filter still separates
+    /// them in **both** directions: a release task must say nothing about how
+    /// often a folder is walked, exactly as a sync task says nothing about
+    /// whether content may be deleted.
+    #[test]
+    fn a_folders_sync_governance_is_the_narrowest_row_and_the_least_permissive_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "no rows at all is the un-migrated database, and it has to read as \
+             `the folder polls exactly as it did` rather than as anything new"
+        );
+
+        // The mirror of the release test's first case, and the half that was
+        // untestable until the fold was shared.
+        let mut release_scheduled = release_task("01RELSCHED", Some(&p.id), "@daily");
+        release_scheduled.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&release_scheduled, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "a release task says nothing about how often a folder is walked"
+        );
+
+        // Another folder's row is a decision about another folder. Read as
+        // host-wide it would stand THIS folder's poll down.
+        let mut elsewhere = task("01ELSEWHERE", Some("01JOTHERFOLDER"), "@daily");
+        elsewhere.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&elsewhere, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "another folder's row governs another folder"
+        );
+
+        // Host-wide, then the folder's own — which wins even though it is the
+        // LESS permissive of the two here, because narrower is more specific and
+        // precedence is not a second safety rule.
+        let mut host_wide = task("01HOSTSCHED", None, "@daily");
+        host_wide.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&host_wide, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Scheduled),
+            "a host-wide row is the default every folder takes"
+        );
+        let mut mine = task("01MINE", Some(&p.id), "@daily");
+        mine.mode = tasks::TaskMode::Manual;
+        engine.save_task(&mine, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Manual),
+            "and a row naming this folder beats the host's default"
+        );
+
+        // Two rows in the SAME tier, and the order they were written in must not
+        // be what decides.
+        let mut also_mine = task("01ALSOMINE", Some(&p.id), "@daily");
+        also_mine.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&also_mine, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Manual),
+            "the least permissive of two rows in one tier is what the fold answers"
+        );
+
+        // `enabled = 0` is a knob set to off, not a knob that is absent.
+        mine.enabled = false;
+        engine.save_task(&mine, None).expect("save");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            Some(tasks::TaskMode::Off),
+            "a row that is not live must not leave a knob that does nothing"
+        );
+
+        // A row a newer keeper wrote governs nothing, and the fallback is
+        // TODAY's pacing rather than a new one (NFR-43). The other reading —
+        // an unreadable row stands the poll down — would let one bad row
+        // silently stop a folder syncing.
+        for id in ["01MINE", "01ALSOMINE", "01HOSTSCHED"] {
+            engine.forget_task(id).expect("forget");
+        }
+        engine
+            .with_db(|conn| {
+                // Past the typed door on purpose: `save_task` takes a `TaskKind`,
+                // so raw SQL is the only way such a row exists — which is what a
+                // newer keeper writing this file looks like.
+                conn.execute(
+                    "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms,
+                                        enabled, updated_ms)
+                     VALUES ('01TEL', ?1, 'sync', 'every 5m', 'teleport', 0, 1, 0)",
+                    [&p.id],
+                )?;
+                Ok(())
+            })
+            .expect("a row written past the typed door");
+        assert_eq!(
+            engine
+                .sync_governance(&p.id)
+                .expect("the tasks table reads"),
+            None,
+            "one row this build cannot read must not be able to stop a folder polling"
+        );
+    }
+
+    /// The poll table, arm by arm, with no arm left to inference (Story 58.8,
+    /// FR-360, AD-141).
+    ///
+    /// The two `true` arms are the ones worth a test rather than a comment:
+    /// `off` and `manual` on a **sync** row leave the folder's pacing alone,
+    /// where the same two modes on a **release** row stop the sweep. A sync
+    /// task is a schedule; a folder's pause is `profile.enabled`, and one
+    /// forgotten `off` row must not be able to stop a folder syncing.
+    #[test]
+    fn sync_poll_permits_answers_every_mode_the_table_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert!(
+            engine.sync_poll_permits(&p),
+            "(None): no row governs, so the folder polls exactly as it did"
+        );
+
+        let mut row = task("01GOV", Some(&p.id), "@daily");
+        for (mode, permitted) in [
+            (tasks::TaskMode::Off, true),
+            (tasks::TaskMode::Manual, true),
+            (tasks::TaskMode::Scheduled, false),
+        ] {
+            row.mode = mode;
+            engine.save_task(&row, None).expect("save");
+            assert_eq!(
+                engine.sync_poll_permits(&p),
+                permitted,
+                "Some({})",
+                mode.as_str()
+            );
+            assert_eq!(
+                engine.sync_governance_mode(&p.id),
+                Some(mode),
+                "and the projection reads the same verdict Story 58.7 renders"
+            );
+        }
+    }
+
+    /// One window, one driver: a folder with a `scheduled` sync task is not also
+    /// polled underneath it (Story 58.8, FR-360, NFR-45, AD-141).
+    ///
+    /// Driven through the real pacing rather than by asking one function. The
+    /// loop is the shape of both hosts: [`Engine::run_due_tasks`]' gate, first
+    /// sight arm, claim and close for the task half, and
+    /// [`Engine::tick_profile`]'s [`Engine::scan_due`] for the supervisor half.
+    /// Only `perform_task` is elided, because the quantity under test is
+    /// **drivers**, not bytes.
+    ///
+    /// The two phases are the before and after of AD-141's rule. With no sync
+    /// row the folder keeps its 240 paced walks an hour and nothing else — the
+    /// arm an un-migrated `sync.db` takes. With a `scheduled` row it gets the
+    /// task's windows and **no** paced walk: before this story that second phase
+    /// counted 240 walks *and* the task's full passes, which is the duplicated
+    /// work and the lying run record AD-141 names.
+    #[test]
+    fn a_scheduled_sync_task_is_the_folders_only_paced_driver() {
+        const TICKS: usize = 3_600;
+        const HOST: &str = "01JTESTDEVICE#1";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = profile(dir.path());
+        p.poll_interval_ms = 15_000;
+        engine.upsert_profile(&p).expect("upsert");
+
+        // One hour of 1 Hz ticks, returning (paced walks, task windows served).
+        let drive_an_hour = |engine: &Engine| {
+            let mut walks = 0usize;
+            let mut served = 0usize;
+            for _ in 0..TICKS {
+                let now = platform.now_ms();
+                let listing = engine
+                    .with_db(db::list_tasks)
+                    .expect("the tasks table reads");
+                for row in &listing.tasks {
+                    let schedule = row.parsed_schedule().expect("a fixture schedule parses");
+                    match tasks::decide(&row.state(), schedule.as_ref(), now) {
+                        tasks::Action::Arm => {
+                            engine.arm_task_window(row, schedule.as_ref(), now, 0);
+                        }
+                        tasks::Action::Run => {
+                            let run_id = engine
+                                .with_db(|conn| {
+                                    db::claim_task(
+                                        conn,
+                                        &row.id,
+                                        HOST,
+                                        now,
+                                        TASK_LEASE_MS,
+                                        Some(now),
+                                    )
+                                })
+                                .expect("the claim statement runs")
+                                .expect("an open window with no live lease is claimable");
+                            served += 1;
+                            let next = engine.next_task_window(
+                                row,
+                                now,
+                                0,
+                                TaskTrigger::Scheduled,
+                                tasks::TaskOutcome::Ok,
+                            );
+                            engine
+                                .with_db(|conn| {
+                                    db::finish_task_run(
+                                        conn,
+                                        db::TaskRunClose {
+                                            run_id,
+                                            task_id: &row.id,
+                                            host: HOST,
+                                            finished_ms: now,
+                                            outcome: tasks::TaskOutcome::Ok,
+                                            detail: Some("counted, not performed"),
+                                            next_due_ms: next,
+                                        },
+                                    )
+                                })
+                                .expect("the run closes");
+                        }
+                        // Neither is reachable from this fixture: the policy is
+                        // `run_now` and no host goes away. Total anyway.
+                        tasks::Action::None | tasks::Action::Skip | tasks::Action::Postpone => {}
+                    }
+                }
+                if engine.scan_due(&p) {
+                    walks += 1;
+                    engine.clear_watch_wake(&p.id);
+                }
+                platform.advance_ms(TICK_MS as i64);
+            }
+            (walks, served)
+        };
+
+        assert_eq!(
+            drive_an_hour(&engine),
+            (240, 0),
+            "with no sync task stored, the folder keeps its own pacing: 3600 s of \
+             ticks at one paced walk every 15 s is 240, and nothing else drives it"
+        );
+
+        // `every 20m`, so the hour holds windows at +20 and +40 minutes — the
+        // +60 one lands on the tick after the last.
+        let mut governing = task("01HOURLY", Some(&p.id), "every 20m");
+        governing.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&governing, None).expect("save");
+
+        assert_eq!(
+            drive_an_hour(&engine),
+            (0, 2),
+            "a scheduled sync task is the folder's clock: its two windows are \
+             served and the 15 s backstop opens NOT ONE walk underneath them. \
+             Before Story 58.8 this counted (240, 2) — the same folder synced by \
+             two paced drivers, with the task's run row claiming work the \
+             supervisor would have done anyway"
+        );
+    }
+
+    /// The half that must survive the stand-down: a governed folder still
+    /// answers a file somebody just saved (Story 58.8, AD-141, AD-34-11).
+    ///
+    /// Asserted as a negative *and* a positive on the same folder in the same
+    /// state, because either half alone is satisfiable by the wrong fix.
+    /// Suppressing the whole of [`Engine::scan_due`] would pass the negative and
+    /// make a folder with an hourly task feel dead: the low-latency path gone,
+    /// and a settling file waiting out the schedule instead of its own window.
+    #[test]
+    fn a_governed_folders_filesystem_triggers_are_not_stood_down_with_its_poll() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.poll_interval_ms = 15_000;
+        engine.upsert_profile(&p).expect("upsert");
+
+        let mut governing = task("01HOURLY", Some(&p.id), "@hourly");
+        governing.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&governing, None).expect("save");
+
+        // Reason 3 is surrendered, including on first sight — the one tick that
+        // would otherwise walk whatever the pacing says.
+        assert!(
+            !engine.scan_due(&p),
+            "the paced backstop is the task schedule's now, so it opens no walk"
+        );
+        platform.advance_ms(p.poll_interval_ms as i64);
+        assert!(
+            !engine.scan_due(&p),
+            "and the window coming round again changes nothing while it is governed"
+        );
+
+        // Reason 1: the watcher saw something. This is what makes keeper feel
+        // live, and no schedule owns it.
+        engine.note_watch_wake(&p.id);
+        assert!(
+            engine.scan_due(&p),
+            "a delivered event still opens the walk at once on a governed folder"
+        );
+        engine.clear_watch_wake(&p.id);
+        assert!(!engine.scan_due(&p), "the walk spent it");
+
+        // Reason 2: a held file's settle window elapsed. A settling path needs a
+        // second observation, and observations happen only inside a walk — so
+        // standing this down would make a governed folder hold a finished
+        // download until the schedule came round.
+        let now = platform.now_ms();
+        let held = p.local_path.join("held.bin");
+        let mut gate = StabilityGate::for_profile(&p).expect("gate");
+        gate.observe(
+            &held,
+            FileSample {
+                size: 128,
+                mtime_ns: i128::from(now) * 1_000_000,
+                ctime_ns: i128::from(now) * 1_000_000,
+                inode: 11,
+            },
+            now,
+            false,
+        );
+        Engine::lock(&engine.gates).insert(p.id.clone(), gate);
+        assert!(
+            !engine.scan_due(&p),
+            "a file still inside its window is not yet a reason to walk"
+        );
+        platform.advance_ms(p.effective_settle_ms() as i64);
+        assert!(
+            engine.scan_due(&p),
+            "and its own deadline still reopens the walk, not the task's schedule"
+        );
     }
 
     /// A refusal does not merely decline to arm a window — it **clears** one
