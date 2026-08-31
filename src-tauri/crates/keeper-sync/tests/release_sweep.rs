@@ -554,6 +554,7 @@ impl Fixture {
                     running_host: None,
                     lease_until_ms: None,
                     on_missed: keeper_sync::tasks::TaskMissedPolicy::RunNow,
+                    description: None,
                 },
                 None,
             )

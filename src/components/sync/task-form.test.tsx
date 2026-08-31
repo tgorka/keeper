@@ -3,7 +3,7 @@
  * Story 58.1, FR-347, AD-C7).
  *
  * Every assertion here is one half of that sentence. The form's whole job is to
- * carry eight values across IPC without improving any of them and to render the
+ * carry nine values across IPC without improving any of them and to render the
  * refusal verbatim when the store will not take them — so the tests check what
  * was *sent* as closely as what was shown, because a form that quietly trimmed
  * an id would pass a shallower version of all of this while storing a task under
@@ -30,11 +30,14 @@ vi.mock("@/lib/ipc/client", () => ({
 import {
   TASK_FORM_ADD_SUBMIT_LABEL,
   TASK_FORM_ADD_TITLE,
+  TASK_FORM_DESCRIPTION_LABEL,
+  TASK_FORM_DESCRIPTION_NOTE,
   TASK_FORM_EDIT_SUBMIT_LABEL,
   TASK_FORM_EDIT_TITLE,
   TASK_FORM_ENABLED_LABEL,
   TASK_FORM_ERROR_TESTID,
   TASK_FORM_ID_ADD_NOTE,
+  TASK_FORM_ID_EDIT_NOTE,
   TASK_FORM_ID_LABEL,
   TASK_FORM_KIND_LABEL,
   TASK_FORM_MODE_LABEL,
@@ -67,6 +70,7 @@ function taskVm(over: Partial<TaskVm> = {}): TaskVm {
     profileId: null,
     profile: null,
     schedule: "@daily",
+    description: null,
     nextDueMs: NOW + 3_600_000,
     runningHost: null,
     leaseUntilMs: null,
@@ -155,7 +159,7 @@ describe("TaskForm, adding a task", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
 
-    // Exactly these eight keys, and `id: ""` above all: an id invented here
+    // Exactly these nine keys, and `id: ""` above all: an id invented here
     // would be a second minter, and `sync_ipc.rs` already has the only one.
     await waitFor(() =>
       expect(mockSave).toHaveBeenCalledWith({
@@ -165,6 +169,9 @@ describe("TaskForm, adding a task", () => {
         enabled: true,
         profileId: null,
         schedule: "@daily",
+        // Untouched, so absent — and `null` rather than `""`, which is the same
+        // rule the schedule two lines up follows.
+        description: null,
         onMissed: "run_now",
         // No reading to be stale: a create has no baseline, and passing one
         // would make the store refuse a row it is about to insert.
@@ -432,6 +439,7 @@ describe("TaskForm, editing a task", () => {
         enabled: false,
         profileId: "01FOLDER",
         schedule: "@weekly",
+        description: null,
         onMissed: "run_now",
         // The reading this form opened on, which is what makes the store's
         // refusal possible at all.
@@ -598,6 +606,108 @@ describe("TaskForm, the missed-window policy", () => {
     // And every typed value survives, because the typed value is what a retry is
     // driven from.
     expect(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL)).toHaveValue("@weekly");
+  });
+});
+
+describe("TaskForm, the task's description", () => {
+  it("round-trips the stored description and sends what was typed, untrimmed", async () => {
+    // THE PROPERTY OF STORY 59.5, and it has the same shape as the policy above:
+    // a name writable only from `keeper-syncd tasks set --description` is born
+    // unreachable. Two claims in one test because they are one claim from the
+    // person's side — a box that does not arrive holding the stored value is a
+    // box that silently un-names the task on the next save, and a box that
+    // tidies what was typed stores something other than what is on screen.
+    const stored = taskVm({ description: "nightly backup of the photos" });
+    mockSave.mockResolvedValue(stored);
+    render(<TaskForm task={stored} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    const box = screen.getByLabelText(TASK_FORM_DESCRIPTION_LABEL);
+    expect(box).toHaveValue("nightly backup of the photos");
+
+    // Padded on purpose. `id` is sent untrimmed so `validate_id`'s refusal can
+    // quote it and `schedule` is sent untrimmed so `TaskSchedule::parse`'s can —
+    // this field has no refusal behind it at all, so the only thing trimming
+    // could do here is quietly edit a person's words. The note beside the box
+    // promises exactly this, which is why it is asserted below.
+    fireEvent.change(box, { target: { value: "  the photos, nightly  " } });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ description: "  the photos, nightly  " }),
+      ),
+    );
+  });
+
+  it("sends null rather than an empty string when the box is empty", async () => {
+    // The wire type's absent value is `null`, and this is the one normalisation
+    // the form performs — `schedule`'s rule, for its reason. It matters at the
+    // far end: the store keeps `null` and `""` apart deliberately, so a form that
+    // sent `""` for an untouched add would write every new task as *named
+    // nothing* rather than as *unnamed*, and the column would then be unable to
+    // tell a fresh task from one somebody had cleared.
+    mockSave.mockResolvedValue(taskVm({ description: null }));
+    render(<TaskForm />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    expect(screen.getByLabelText(TASK_FORM_DESCRIPTION_LABEL)).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ description: null })),
+    );
+  });
+
+  it("shows a refusal verbatim and keeps the description that was typed", async () => {
+    // Nothing refuses a description — there is no vocabulary and no grammar in
+    // it — so the refusal a person actually meets while naming a task comes from
+    // somewhere else entirely: they opened this form, went to write a better
+    // name for it, and another host moved the row meanwhile. The claim is that
+    // the sentence arrives uncorrected AND that the words they had just typed
+    // are still in the box, because retyping a name you already wrote is the
+    // moment a person gives up on naming things.
+    mockSave.mockRejectedValue({
+      code: "internal",
+      message:
+        "invalid sync configuration: task '01SCHED' was changed elsewhere since this was opened (last written at 1760000090000, this edit started from 1759999940000): refusing to write stale values over it — re-read it and try again",
+      accountId: null,
+      retriable: false,
+    });
+    const onSaved = vi.fn();
+    render(<TaskForm task={taskVm()} onSaved={onSaved} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_DESCRIPTION_LABEL), {
+      target: { value: "the one that backs up the photos" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+
+    expect(await screen.findByTestId(TASK_FORM_ERROR_TESTID)).toHaveTextContent(
+      "task '01SCHED' was changed elsewhere since this was opened (last written at 1760000090000, this edit started from 1759999940000): refusing to write stale values over it — re-read it and try again",
+    );
+    expect(onSaved).not.toHaveBeenCalled();
+    expect(screen.getByLabelText(TASK_FORM_DESCRIPTION_LABEL)).toHaveValue(
+      "the one that backs up the photos",
+    );
+  });
+
+  it("tells the reader why this is the only name they can ever change", async () => {
+    // The note carries a fact about the *id*, and it is the reason the field
+    // exists: an add form sends `""` to have Rust mint a ULID, and an edit form
+    // cannot change an id at all because `task_runs.task_id` joins on it. A
+    // reader who does not know that keeps hunting for an editable name. Asserted
+    // against the id notes rather than against a copy of the sentence, so the
+    // two cannot come to disagree about which one is frozen.
+    render(<TaskForm />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    expect(screen.getByText(TASK_FORM_DESCRIPTION_NOTE)).toBeInTheDocument();
+    expect(TASK_FORM_DESCRIPTION_NOTE).toContain("the only name of this task you can ever change");
+    expect(TASK_FORM_DESCRIPTION_NOTE).toContain("sent exactly as typed");
+    // The two rules it is quoting, each stated where it is actually enforced.
+    expect(TASK_FORM_ID_ADD_NOTE).toContain("Leave it blank and keeper mints one");
+    expect(TASK_FORM_ID_EDIT_NOTE).toContain("The id cannot change");
   });
 });
 

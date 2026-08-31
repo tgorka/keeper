@@ -34,6 +34,17 @@ profileId: string | null,
  */
 schedule: string | null, 
 /**
+ * What to call this task, `null` to store no description.
+ *
+ * Sent exactly as typed, and `null` rather than `""` for the absent case on
+ * `schedule`'s rule above: the empty string is a value, and a form that
+ * coerced whitespace to absence would be storing something other than what
+ * was in the box. Nothing refuses a spelling here — there is no vocabulary
+ * and no grammar to be wrong about, which is what makes this the one task
+ * field with no refusal attached to it.
+ */
+description: string | null, 
+/**
  * The requested missed-window policy, as one of the stored spellings.
  *
  * A `String` rather than an enum for [`TaskVm::on_missed`]'s reason, and

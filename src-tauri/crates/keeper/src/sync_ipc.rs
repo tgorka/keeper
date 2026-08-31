@@ -1824,6 +1824,7 @@ fn task_vm(
         profile_id: row.profile_id.clone(),
         profile,
         schedule: row.schedule.clone(),
+        description: row.description.clone(),
         on_missed: row.on_missed.as_str().to_owned(),
         next_due_ms: row.next_due_ms,
         running_host: row.running_host.clone(),
@@ -2290,6 +2291,10 @@ pub async fn sync_task_save(
         profile_id: req.profile_id.clone(),
         kind,
         schedule: req.schedule.clone(),
+        // Verbatim, and nothing above refuses it: unlike `kind`, `mode` and
+        // `on_missed` there is no vocabulary here to fail to read, so the only
+        // thing this could do to a description is change it.
+        description: req.description.clone(),
         mode,
         // The engine's columns, never the view's: `upsert_task` writes all three
         // itself and ignores whatever is passed here.

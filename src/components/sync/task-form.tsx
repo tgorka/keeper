@@ -96,6 +96,31 @@ export const TASK_FORM_ID_ADD_NOTE =
 export const TASK_FORM_ID_EDIT_NOTE =
   "The id cannot change: the run history is joined to it, so a new id here would create a second task and orphan everything this one has recorded.";
 
+export const TASK_FORM_DESCRIPTION_LABEL = "Description";
+/**
+ * What the description is *for*, which is a fact about the id rather than about
+ * this box (Story 59.5).
+ *
+ * Worth stating because neither half is guessable from the control. An add form
+ * sends `""` to have Rust mint a ULID ({@link TASK_FORM_ID_ADD_NOTE}), and an
+ * edit form cannot change the id at all ({@link TASK_FORM_ID_EDIT_NOTE}) because
+ * `task_runs.task_id` joins on it — so between those two rules the id is either
+ * a ULID nobody chose or a word chosen once and frozen. This box is therefore
+ * the only name of a task anybody can ever revise, and a person who does not
+ * know that will keep looking for an editable name where there is not one.
+ *
+ * One note across both modes, unlike the id's pair, because the sentence is true
+ * in both and for the same reason.
+ *
+ * The last clause is the form's standing rule rather than this field's:
+ * everything free-text here goes to Rust exactly as typed. It is repeated on the
+ * one field where a reader might otherwise expect tidying, since a description
+ * is the only box in this form whose leading space could look like a mistake to
+ * correct.
+ */
+export const TASK_FORM_DESCRIPTION_NOTE =
+  "Optional, and the only name of this task you can ever change: an id is minted by keeper when you leave it blank, and it can never be edited afterwards because the run history is joined to it. Leave this empty to store none. Whatever you type is sent exactly as typed.";
+
 export const TASK_FORM_KIND_LABEL = "Kind";
 export const TASK_FORM_MODE_LABEL = "Mode";
 /** The three modes, accurate to `tasks::decide` and no longer than that. */
@@ -202,7 +227,12 @@ export const TASK_FORM_ERROR_TESTID = "task-form-error";
 const SELECT_CLASS =
   "h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
 
-/** What the seven controls hold. `id` and `schedule` are strings all the way. */
+/**
+ * What the eight controls hold. `id`, `description` and `schedule` are strings
+ * all the way: each has an empty-string state the wire type spells `null`, and
+ * keeping them strings here is what lets the box hold exactly what was typed
+ * until the moment {@link TaskForm}'s submit converts it.
+ */
 type TaskFormValues = {
   id: string;
   kind: string;
@@ -211,6 +241,8 @@ type TaskFormValues = {
   /** `""` is the sentinel for `profileId: null` — see {@link TaskForm}. */
   profileId: string;
   schedule: string;
+  /** `""` means "store no description" — converted on the way out, not here. */
+  description: string;
   onMissed: string;
 };
 
@@ -260,6 +292,7 @@ export function TaskForm({
           enabled: true,
           profileId: "",
           schedule: "",
+          description: "",
           // The store's own default, spelled here so a created task means what
           // a task created before this control existed meant.
           onMissed: "run_now",
@@ -271,6 +304,13 @@ export function TaskForm({
           enabled: task.enabled,
           profileId: task.profileId ?? "",
           schedule: task.schedule ?? "",
+          // `null` and `""` both seed an empty box, which is the one place the
+          // two stop being different facts — and they stop being different
+          // precisely because a box cannot show the difference. Sending it back
+          // unchanged then re-stores `null`, so an edit that touches nothing else
+          // quietly normalizes a blank a person once typed into the absence it
+          // already looked like.
+          description: task.description ?? "",
           onMissed: task.onMissed,
         },
   );
@@ -379,8 +419,9 @@ export function TaskForm({
         enabled: form.enabled,
         profileId: form.profileId === "" ? null : form.profileId,
         // The only normalisation this form performs, and it is not tidying: an
-        // empty box means "store no schedule", and the wire type spells the
-        // absent value `null` — the empty string is a different thing.
+        // empty box means "store nothing", and the wire type spells the absent
+        // value `null` — the empty string is a different thing. Both fields below
+        // take it, for the same reason and with the same `=== ""` test.
         //
         // `=== ""` and not `.trim() === ""`, which is finding 8 of this story's
         // review: a box holding only spaces is not empty, and coercing it to
@@ -391,6 +432,11 @@ export function TaskForm({
         // untrimmed for exactly the same reason. Every non-empty spelling goes
         // verbatim, whitespace and all.
         schedule: form.schedule === "" ? null : form.schedule,
+        // Same test, and here nothing downstream will ever refuse it: a
+        // description has no grammar. So this is the one field where sending
+        // spaces verbatim has no refusal to justify it — it is justified by the
+        // note beside the box, which promises exactly that.
+        description: form.description === "" ? null : form.description,
         onMissed: form.onMissed,
         // The reading this form started from, so a save whose row has moved
         // elsewhere is refused rather than reverting it. `null` on an add form:
@@ -428,6 +474,25 @@ export function TaskForm({
       <p className="text-muted-foreground text-xs">
         {editing ? TASK_FORM_ID_EDIT_NOTE : TASK_FORM_ID_ADD_NOTE}
       </p>
+
+      {/* Directly under the id, because it is the same question answered the
+          other way: the box above is a key that is frozen or minted, and this one
+          is the name a person actually reads. An `Input` and not a `Textarea` —
+          this is a name rather than a note, the row that will draw it has one
+          line for it, and a box that invites paragraphs would be promising a
+          surface that does not exist. */}
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={`${fieldId}-description`}>{TASK_FORM_DESCRIPTION_LABEL}</Label>
+        <Input
+          id={`${fieldId}-description`}
+          className="w-56"
+          value={form.description}
+          disabled={saving}
+          placeholder="nightly backup of the photos"
+          onChange={(event) => setForm((live) => ({ ...live, description: event.target.value }))}
+        />
+      </div>
+      <p className="text-muted-foreground text-xs">{TASK_FORM_DESCRIPTION_NOTE}</p>
 
       {/* The option text is the stored spelling itself: the row's badge already
           shows `task.kind` verbatim, and two words for one stored value is

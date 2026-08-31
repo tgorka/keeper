@@ -292,6 +292,22 @@ pub struct TaskVm {
     pub profile: Option<String>,
     /// The stored schedule expression, `null` when none is stored.
     pub schedule: Option<String>,
+    /// What the operator called this task, `null` when they called it nothing
+    /// (Story 59.5).
+    ///
+    /// The only human-editable name a task will ever have. [`Self::id`] is
+    /// minted by Rust when the form leaves it blank, and it can never be changed
+    /// afterwards because `task_runs.task_id` joins on it — so an id is either a
+    /// ULID nobody chose or a word chosen once, and this is where a second
+    /// thought about the wording has to go.
+    ///
+    /// Carried verbatim, so `null` and `""` both reach the view and are
+    /// different facts: `null` is every row written before the column existed,
+    /// `""` is a person who cleared the box. A surface drawing this renders
+    /// **either** as nothing — `taskReportText`'s rule, for its reason: a
+    /// heading over an empty string is the one shape a reader takes for a failed
+    /// read.
+    pub description: Option<String>,
     /// What to do about a window that fell due while nobody was home: as
     /// stored, `"run_now"`, `"delay"`, `"skip"`, or a spelling this build does
     /// not know (Story 58.4).
@@ -373,6 +389,15 @@ pub struct TaskSaveReq {
     pub profile_id: Option<String>,
     /// The schedule expression, `null` to store none.
     pub schedule: Option<String>,
+    /// What to call this task, `null` to store no description.
+    ///
+    /// Sent exactly as typed, and `null` rather than `""` for the absent case on
+    /// `schedule`'s rule above: the empty string is a value, and a form that
+    /// coerced whitespace to absence would be storing something other than what
+    /// was in the box. Nothing refuses a spelling here — there is no vocabulary
+    /// and no grammar to be wrong about, which is what makes this the one task
+    /// field with no refusal attached to it.
+    pub description: Option<String>,
     /// The requested missed-window policy, as one of the stored spellings.
     ///
     /// A `String` rather than an enum for [`TaskVm::on_missed`]'s reason, and

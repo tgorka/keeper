@@ -445,8 +445,8 @@ fn ensure_journal_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add the tasks table's late columns — `on_missed` so far — if they are not
-/// there yet (Story 58.4, FR-356, AD-139).
+/// Add the tasks table's late columns — `on_missed` and `description` so far —
+/// if they are not there yet (Stories 58.4 and 59.5, FR-356, AD-139).
 ///
 /// The helper the DDL above has demanded since Story 57.1 and nobody had needed
 /// yet. Written on [`ensure_journal_columns`]' shape and for its reasons: one
@@ -454,14 +454,24 @@ fn ensure_journal_columns(conn: &Connection) -> Result<()> {
 /// its own idempotence, and `PRAGMA table_info`'s statement dropped before any
 /// `conn.execute` runs on the same connection.
 ///
-/// **The `DEFAULT` is mandatory rather than tidy**, and it is the reason this
-/// column could not go into the batch above. [`upsert_task`]'s `INSERT` names
-/// its columns, so an older binary — the app and the daemon share one `sync.db`
-/// and are upgraded separately — writes a row without mentioning `on_missed`.
-/// Against a `NOT NULL` column with no default that write fails outright, which
-/// is NFR-43's other half. `'run_now'` is also the only defensible value: it is
-/// what an ordinary restart already does, so no stored row changes meaning when
-/// this migration runs.
+/// **`on_missed`'s `DEFAULT` is mandatory rather than tidy**, and it is the
+/// reason that column could not go into the batch above. [`upsert_task`]'s
+/// `INSERT` names its columns, so an older binary — the app and the daemon share
+/// one `sync.db` and are upgraded separately — writes a row without mentioning
+/// `on_missed`. Against a `NOT NULL` column with no default that write fails
+/// outright, which is NFR-43's other half. `'run_now'` is also the only
+/// defensible value: it is what an ordinary restart already does, so no stored
+/// row changes meaning when this migration runs.
+///
+/// **`description` takes the other branch of that same rule, and deliberately.**
+/// It is nullable and carries **no** `DEFAULT`, which is [`ensure_journal_columns`]'
+/// reading of a row written before a column existed: a task stored last year has
+/// *no* description, and that is a different fact from having an empty one. A
+/// `DEFAULT ''` would make every pre-existing row claim a description that is
+/// blank, and every surface would then have to un-tell that story by treating
+/// `""` as absence anyway. Nullable satisfies NFR-43's write half for free —
+/// SQLite fills a nullable column with `NULL` when an `INSERT` omits it — so
+/// there is nothing here for a default to buy.
 fn ensure_task_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(tasks)")?;
     let existing: Vec<String> = stmt
@@ -473,6 +483,9 @@ fn ensure_task_columns(conn: &Connection) -> Result<()> {
             "ALTER TABLE tasks ADD COLUMN on_missed TEXT NOT NULL DEFAULT 'run_now'",
             [],
         )?;
+    }
+    if !existing.iter().any(|c| c == "description") {
+        conn.execute("ALTER TABLE tasks ADD COLUMN description TEXT", [])?;
     }
     Ok(())
 }
@@ -2866,7 +2879,7 @@ pub const TASK_RUNS_CAP: usize = 50;
 /// constant so a reader added later cannot drift out of step with the decoder.
 const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
                             enabled, updated_ms, running_host, lease_until_ms, \
-                            on_missed";
+                            on_missed, description";
 
 /// One stored task.
 ///
@@ -2895,6 +2908,18 @@ pub struct TaskRow {
     /// (Story 58.4). `run_now` on every row written before the column existed,
     /// which is what an ordinary restart already did.
     pub on_missed: crate::tasks::TaskMissedPolicy,
+    /// The operator's own words for what this task is, or `None` when there are
+    /// none (Story 59.5).
+    ///
+    /// Stored **verbatim**, on [`Self::schedule`]'s rule and for a sharper
+    /// version of its reason: this is the one field on the row that nothing but
+    /// a person authored, so normalizing it would be rewriting what somebody
+    /// wrote. `None` and `Some("")` are therefore both reachable and are
+    /// different facts — every row written before this column existed is `None`,
+    /// and only a person who typed nothing into a box that was already there can
+    /// produce the second. Deciding that a blank one renders as nothing is a
+    /// job for whatever draws it, not for the store.
+    pub description: Option<String>,
 }
 
 impl TaskRow {
@@ -2981,6 +3006,7 @@ type StoredTask = (
     Option<String>,
     Option<i64>,
     String,
+    Option<String>,
 );
 
 /// Read one `tasks` row, tolerating every column but the primary key.
@@ -2997,6 +3023,13 @@ type StoredTask = (
 /// an empty string, and no variant answers to that. `id` stays strict because a
 /// row whose primary key cannot be read cannot be named in a report either, and
 /// [`list_tasks`] handles that failure separately.
+///
+/// `description` is the one column where the fallback is not a route to that
+/// path but the answer itself: it defaults to `None`, which is exactly what an
+/// absent description is, so a value stored under a type this build cannot read
+/// costs a name and never a run. That is the right trade for the only column on
+/// the row with no vocabulary to be wrong about — refusing the row over it would
+/// stop a task for a cosmetic reason, which is the outcome NFR-43 is about.
 fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
     Ok((
         row.get(0)?,
@@ -3010,6 +3043,7 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
         row.get(8).unwrap_or_default(),
         row.get(9).unwrap_or_default(),
         row.get(10).unwrap_or_default(),
+        row.get(11).unwrap_or_default(),
     ))
 }
 
@@ -3034,6 +3068,7 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         running_host,
         lease_until_ms,
         on_missed,
+        description,
     ) = stored;
     let unknown = |reason: String| UnknownTask {
         id: id.clone(),
@@ -3062,6 +3097,7 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         running_host,
         lease_until_ms,
         on_missed,
+        description,
     };
     if let Err(err) = row.parsed_schedule() {
         return Err(unknown(format!("unreadable schedule: {err}")));
@@ -3252,8 +3288,9 @@ pub fn upsert_task(
     };
     tx.execute(
         "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
-                            updated_ms, running_host, lease_until_ms, on_missed)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9)
+                            updated_ms, running_host, lease_until_ms, on_missed,
+                            description)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
              profile_id  = excluded.profile_id,
              kind        = excluded.kind,
@@ -3262,7 +3299,8 @@ pub fn upsert_task(
              next_due_ms = CASE WHEN ?8 = 1 THEN NULL ELSE tasks.next_due_ms END,
              enabled     = excluded.enabled,
              updated_ms  = excluded.updated_ms,
-             on_missed   = excluded.on_missed",
+             on_missed   = excluded.on_missed,
+             description = excluded.description",
         (
             &task.id,
             &task.profile_id,
@@ -3273,6 +3311,7 @@ pub fn upsert_task(
             task.updated_ms,
             i64::from(effect == TaskSave::Rearmed),
             task.on_missed.as_str(),
+            &task.description,
         ),
     )?;
     tx.commit()?;
@@ -5820,6 +5859,7 @@ mod tests {
             running_host: None,
             lease_until_ms: None,
             on_missed: crate::tasks::TaskMissedPolicy::RunNow,
+            description: None,
         }
     }
 
@@ -5904,9 +5944,11 @@ mod tests {
                 "running_host",
                 "lease_until_ms",
                 // Added by `ensure_task_columns` rather than by the batch, which
-                // is why it comes last: a store that predates it reaches this
-                // same shape down the additive path (Story 58.4).
+                // is why these come last, in the order it adds them: a store that
+                // predates either reaches this same shape down the additive path
+                // (Stories 58.4 and 59.5).
                 "on_missed",
+                "description",
             ]
         );
         assert_eq!(
@@ -6616,6 +6658,109 @@ mod tests {
         );
 
         // Idempotent, like its three siblings: a second migrate adds nothing.
+        ensure_task_columns(&c).expect("a second pass");
+    }
+
+    /// A task stored before `description` existed has **no** description, and
+    /// that is not the same fact as having a blank one (Story 59.5, NFR-43).
+    ///
+    /// This is the whole argument for the column being nullable with no
+    /// `DEFAULT`, and it is worth a test rather than a comment because the
+    /// tidy-looking alternative — `DEFAULT ''`, which is what `on_missed`
+    /// needed — is one word away and reads as harmless. It is not: with it,
+    /// every task on every install would come back claiming a description that
+    /// happens to be empty, and every surface that draws one would then have to
+    /// un-tell that story by treating `""` as absence. So the assertion is
+    /// `None` **and explicitly not** `Some("")`, because those two are what the
+    /// two schemas differ by and an `is_none()` check would pass under either
+    /// reading of what the column means.
+    ///
+    /// The second claim is NFR-43's write half, and nullability buys it for
+    /// nothing: SQLite fills an omitted nullable column with `NULL`, so an older
+    /// binary's `INSERT` — which names only the columns it knows — still
+    /// succeeds against the migrated schema. `on_missed` needed a `DEFAULT` for
+    /// this only because it is `NOT NULL`.
+    ///
+    /// The pre-migration store is built by dropping the column, its sibling
+    /// above's technique and for that test's stated reason.
+    #[test]
+    fn the_description_column_is_additive_and_a_row_without_one_has_none() {
+        let c = conn();
+        let mut named = task("01NAMED", Some("@daily"), TaskMode::Scheduled);
+        named.description = Some("nightly backup of the photos".to_owned());
+        upsert_task(&c, &named, None).expect("save");
+        c.execute("ALTER TABLE tasks DROP COLUMN description", [])
+            .expect("a store from before the column existed");
+
+        // An older binary's write: the eleven columns it knows about.
+        c.execute(
+            "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
+                                updated_ms, running_host, lease_until_ms, on_missed)
+             VALUES ('01OLDER', NULL, 'sync', 'every 5m', 'scheduled', NULL, 1, 1, NULL, NULL,
+                     'run_now')",
+            [],
+        )
+        .expect("an older binary's INSERT names only the columns it knows");
+
+        ensure_task_columns(&c).expect("the additive migration");
+        for id in ["01NAMED", "01OLDER"] {
+            let row = get_task(&c, id).expect("get").expect("row");
+            assert_eq!(
+                row.description, None,
+                "{id} predates the column, so it has no description"
+            );
+            assert_ne!(
+                row.description,
+                Some(String::new()),
+                "{id} must not read as having a description that is blank — that is \
+                 what a DEFAULT '' would have made it, and it is a different fact"
+            );
+        }
+
+        // And the same write against the migrated schema, which is the mixed-fleet
+        // case: an older binary is still running beside the newer one.
+        c.execute(
+            "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
+                                updated_ms, running_host, lease_until_ms, on_missed)
+             VALUES ('01MIXED', NULL, 'sync', 'every 5m', 'scheduled', NULL, 1, 1, NULL, NULL,
+                     'run_now')",
+            [],
+        )
+        .expect("a nullable column with no default needs nothing to keep that write working");
+        assert_eq!(
+            get_task(&c, "01MIXED")
+                .expect("get")
+                .expect("row")
+                .description,
+            None
+        );
+
+        // A description written *after* the migration round-trips verbatim, which
+        // is what makes the `None` above a fact about the schema rather than about
+        // the column being ignored. `Some("")` too: a person who cleared a box is
+        // not a row that never had one, and the store keeps them apart.
+        let mut renamed = task("01NEW", Some("@daily"), TaskMode::Scheduled);
+        renamed.description = Some("  what they typed, spaces and all  ".to_owned());
+        upsert_task(&c, &renamed, None).expect("save");
+        assert_eq!(
+            get_task(&c, "01NEW").expect("get"),
+            Some(renamed),
+            "stored verbatim: this is the one column a person authored"
+        );
+        let mut cleared = task("01BLANK", Some("@daily"), TaskMode::Scheduled);
+        cleared.description = Some(String::new());
+        upsert_task(&c, &cleared, None).expect("save");
+        assert_eq!(
+            get_task(&c, "01BLANK")
+                .expect("get")
+                .expect("row")
+                .description,
+            Some(String::new()),
+            "a blank a person typed is stored as one; deciding it renders as \
+             nothing is the drawing surface's job, not the store's"
+        );
+
+        // Idempotent, like its siblings: a second pass adds nothing.
         ensure_task_columns(&c).expect("a second pass");
     }
 
