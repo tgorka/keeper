@@ -1002,15 +1002,54 @@ development_status:
   # sweep 24 times a day); `keeper-syncd` DOES build and ship for Darwin, the
   # provable fact being that no launchd plist exists anywhere in the tree; and
   # `enable-linger` was named in the architecture and present in no line of code.
-  epic-57: review
-  57-1-a-task-is-something-keeper-remembers: review
-  57-2-a-schedule-that-refuses-what-it-cannot-parse: review
-  57-3-the-verb-a-cron-can-call: review
-  57-4-release-becomes-a-task: review
-  57-5-the-app-runs-them-too: review
-  57-6-a-view-of-what-runs-and-when-it-last-did: review
-  57-7-packaging-and-the-chapter: review
+  # SYNCED 2026-08-31: #295 merged, so all seven shipped in v0.8.24. 57.2, 57.4
+  # and 57.6 have no spec of their own — they shipped inside 57.1, 57.3 and 57.5's
+  # specs, which is why only four spec files exist for seven stories.
+  epic-57: done
+  57-1-a-task-is-something-keeper-remembers: done
+  57-2-a-schedule-that-refuses-what-it-cannot-parse: done
+  57-3-the-verb-a-cron-can-call: done
+  57-4-release-becomes-a-task: done
+  57-5-the-app-runs-them-too: done
+  57-6-a-view-of-what-runs-and-when-it-last-did: done
+  57-7-packaging-and-the-chapter: done
   epic-57-retrospective: optional
+
+  # -- EPIC 59, 2026-08-31: a task you can FIND --------------------------------
+  #
+  # The owner's second Tasks-view pass, written while running v0.8.24 — the first
+  # release whose ⌘8 actually holds tasks. Epic doc:
+  # epic-59-a-task-you-can-find-and-a-run-you-can-read.md. Six read-only scouts
+  # over main @ 0224d31; every verdict in that doc carries its file:line.
+  #
+  # FIVE OF HIS SEVEN ASKS WERE ONE DEFECT, and none of the five was a missing
+  # capability. Run now already ignores the window on a scheduled task
+  # (workflow_dispatch semantics, engine.rs:2381-2407) and its button is on every
+  # row; the run list already exists, already sorted newest-first in SQL. What
+  # does not exist is a VIEW: one flat unbounded column of ~250px cards, level 1
+  # and level 2 fused, level 3 absent. So Wave 1 is navigation and no Rust.
+  #
+  # Wave 1 is NOT parallelisable — all four stories rewrite tasks-pane.tsx and
+  # 59.1 restructures it. Epic 58's Wave 1 collided in that same file with one
+  # Field each; here the collision IS the story. 59.1 lands alone.
+  #
+  # The script-kind ask hit ARCHITECTURE-SCHEDULED-TASKS.md:364-369, a Deferred
+  # (not a Never) with a stated reopening condition. Resolved with the owner:
+  # BOTH, IN THAT ORDER — 59.9 ships a closed-vocabulary kind that reopens
+  # nothing, and the general exec kind is epic 60 with the threat model, the
+  # egress-disclosure answer and the missing task timeout as its first story.
+  epic-59: backlog
+  59-1-a-list-of-names-and-one-task-at-a-time: backlog
+  59-2-a-run-you-can-open: backlog
+  59-3-the-row-says-its-mode-and-run-now-says-what-it-does: backlog
+  59-4-several-tasks-at-once: backlog
+  59-5-a-task-you-can-name: backlog
+  59-6-how-long-is-the-delay: backlog
+  59-7-help-for-writing-a-schedule: backlog
+  59-8-home-in-one-click: backlog
+  59-9-a-task-that-runs-a-verb-keeper-already-owns: backlog
+  59-10-the-chapter-grows-a-view: backlog
+  epic-59-retrospective: optional
 
   # -- EPIC 58, 2026-08-31: a task you can drive ------------------------------
   #
