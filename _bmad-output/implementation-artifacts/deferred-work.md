@@ -5098,3 +5098,11 @@ status: open
     changing `src-tauri/` was outside its boundaries. A UI-only mitigation — noticing the
     prop changed and offering to re-seed — is a smaller version of the same idea and would
     still lose the race, so it is not worth shipping ahead of the store-side guard.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-58-3-a-list-of-runs-you-can-open.md`
+  summary: `formatTaskAgo` clamps a clock that runs ahead to "just now", so every run recorded by a peer whose clock leads renders as "just now" in a list whose entire point is other hosts.
+  evidence: `tasks-pane.tsx`'s `formatTaskAgo` does `Math.max(0, now - atMs)`, and an existing test pins that behaviour (`formatTaskAgo(NOW + 60_000, NOW) === "just now"`). Story 58.3 multiplies it: the run history renders one relative time per run, each recorded by the host named beside it, so several runs hours apart can all read "just now" in newest-first order with nothing on screen revealing the skew. Pre-dates 58.3 and changing it changes the row's last-run cell too.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-58-3-a-list-of-runs-you-can-open.md`
+  summary: A readable `tasks` row whose `id` is the empty string is unnamed everywhere on the Tasks pane, not only on the new runs disclosure.
+  evidence: `tasks.id` is `TEXT` and `validate_id` only refuses an empty id on the save path, so a row written outside keeper decodes fine and is NOT diverted to the unknown list. `tasks-pane.tsx` renders `{task.id}` raw in the row header, in the Forget confirmation title, and now in the disclosure's `aria-label` — which degrades to "Runs:" naming nothing, and asks `sync_task_history("")`. The fix belongs to the row (one absent-name constant used everywhere the id is shown), not to the new control.
