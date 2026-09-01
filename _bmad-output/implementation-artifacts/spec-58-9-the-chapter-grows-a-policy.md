@@ -171,3 +171,100 @@ is therefore set, and the next review loop should take this chapter first.
 - `bun run vitest run src/components/sync/task-form.test.tsx` -- expected: 20 green.
 - Mutation proof: `TASK_MISSED_DELAY_MS` 30 → 45 minutes; expected: the Rust help
   guard and the TypeScript mirror test both fail; restore and re-verify green.
+
+## Revision 2 — 2026-09-01: what PR #303 and Epic 59 made the chapter owe
+
+### Why the chapter needed another pass
+
+`7fbffff` wrote §14 against the tree as it stood on 2026-08-31. Two things landed
+after it and neither is cosmetic:
+
+1. **PR #303** (`c0fd6fe`, merged `427aea8`) floored the Pending poll's full
+   status walk at one a minute. That is a second, independent gate over walking a
+   folder, and it changes both what a person sees in the Pending list and what
+   the word *governed* can honestly claim. Untouched, §14's *Paced* section
+   promised an explanation of *governed* — *"see below"* — that the chapter did
+   **not** contain.
+2. **Story 59.6** gave each task its **own** missed-window delay. The `delay`
+   table row still read *"serves it 30 minutes after a host noticed it
+   (`TASK_MISSED_DELAY_MS`)"* as though the constant were the only answer, which
+   after 59.6 is false for any task that carries one.
+
+A third item was owed rather than falsified: the exactly-once rule was described
+in the chapter only as `run_now`'s behaviour and as a systemd analogy, never as
+the **safety** property it is, and never with the reason it is one.
+
+### What changed in `docs/sync.md`
+
+| where | change |
+| --- | --- |
+| §12, *The Pending list runs in both directions* | new: the list refreshes every five seconds but the walk behind it is floored at one a minute, measured between walks; what the walk contributes (untracked rows and a fresh verdict for paths the watcher never saw) versus what does not need it; the visible cost, the measured reason, the paused / unfinished-first-copy exclusions, and the closing sentence that **nothing about syncing is paced by that floor** |
+| §14, *Paced* standings table | the **governed** row said *"has taken this folder's paced walk over"* — corrected to *"paced sync poll"*, and its dangling *"see below"* now names a section that exists |
+| §14, new `#### What a scheduled sync task does to a folder's polling` | 58.8's decision in a person's words: the schedule **replaces** the backstop poll; `off` and `manual` take nothing away; the two things deliberately not stood down with it — the watcher/settle window, and the Sync pane's own status walk — and the honest small print that *governed* means the paced **sync** has stood down, not that nothing ever looks at the folder |
+| §14, `on_missed` table | the `delay` row now reads *"a delay after a host noticed it — thirty minutes unless the task carries its own"* |
+| §14, after the `run_now` paragraph | three new paragraphs: the per-task delay and its two flags; the fifteen-minute floor with its reason and the one-year ceiling; and exactly-once as a safety property, with the mechanism and the `release`-deletes-content argument |
+
+**Nothing was renumbered.** The only structural addition is one `####` inside
+§14, so every section number in the file is unchanged. Re-resolved anyway, line
+by line: `docs/sync.md`'s own in-text references are `§4`, `§9`, `§12` and `§13`
+(→ *Only complete files*, *Virtual files*, *Progress and warnings*, *`keeper-syncd`*),
+all correct, and the `§12` this revision adds points at the section that now
+carries the walk-floor paragraph. `docs/decisions.md` carries exactly three
+references into this file — `docs/sync.md §4` (`decisions.md:73`),
+`docs/sync.md §13` (`:98`) and `docs/sync.md §14` (`:109`) — and all three still
+resolve to `## 4.`, `## 13.` and `## 14.` respectively.
+
+### The cross-check: every verb, flag, field, outcome word, constant and exit code
+
+Checked against the code, not against the epic — Story 56.13 shipped a `--help`
+describing replaced behaviour and Epic 58 shipped a *"fifteen minutes"* string
+against a thirty-minute constant, and both survived review because prose sits far
+from code.
+
+| the chapter says | verified at | verdict |
+| --- | --- | --- |
+| kinds `sync`, `release`, `verify` | `keeper-sync/src/tasks.rs:228-230` (`as_str`), `:238-240` (`from_stored`) | correct, and the set is closed — no `update` value exists to write |
+| modes `off`, `manual`, `scheduled` | `tasks.rs:267-269`, `:277-279` | correct |
+| policy spellings `run_now`, `delay`, `skip` stored; `run-now` on the command line | `tasks.rs:344-346`, `:356`; `commands.rs:695-696` (`#[arg(long, value_enum)] pub on_missed`) | correct, and the kebab/underscore divergence is exactly where the chapter says it is |
+| outcome words `ok`, `busy`, `deferred`, `failed`, `abandoned`, `declined`, `postponed` | `tasks.rs:482-488` | all seven correct; `declined` and `postponed` are distinct variants, not shades |
+| `--missed-delay <MINUTES>` and `--no-missed-delay` | `commands.rs:713-714`, `:722-723` (`conflicts_with = "missed_delay"`) | correct, including that the argument is **minutes** |
+| `--description <TEXT>` and `--no-description` | `commands.rs:733-734`, `:740-741` | correct |
+| `--timer` on `tasks run`, and the shipped unit passing it | `commands.rs:578` (`timer: bool`); `packaging/keeper-syncd-tasks@.service:118` — `ExecStart=%h/.local/bin/keeper-syncd tasks run --timer %i` | correct |
+| `[on missed: delay 45m]` in the row bracket, minutes when they divide and raw ms otherwise | `commands.rs:3445-3453` | correct, including that `run_now` renders **nothing** |
+| `name: <text>` printed under the row, `--json` key `description` | `commands.rs:3470-3471`, `:3595` | correct |
+| `--json` key `missedDelayMs` | `commands.rs:3600` | correct |
+| grace **15 minutes**, `TASK_MISSED_GRACE_MS` | `tasks.rs:66` — `15 * 60_000` | correct. This is the number Epic 58 once got wrong in prose; it is right now, and re-checked rather than assumed |
+| default delay **30 minutes**, `TASK_MISSED_DELAY_MS` | `tasks.rs:102` — `30 * 60_000` | correct |
+| delay floor = the grace period, ceiling = one year, both refused rather than clamped | `tasks.rs:1103-1130` (`validate_missed_delay_ms`), ceiling shares `MAX_SCHEDULE_INTERVAL_MS` `tasks.rs:42` — `366 * 24 * 60 * 60 * 1_000` | correct; "one year" is 366 days in the code, which the chapter's wording does not contradict |
+| lease **one hour** | `engine.rs:532` — `TASK_LEASE_MS: i64 = 3_600_000` | correct |
+| history capped at **50 per task**, the view's read asks for **20** | `db.rs:2891` — `TASK_RUNS_CAP: usize = 50`; `keeper/src/sync_ipc.rs:1745` — `TASK_HISTORY_LIMIT_DEFAULT: u32 = 20` (max 200 at `:1748`) | correct |
+| exit **2** for *no such task* / configuration, exit **4** for *did not run, nothing wrong* | `commands.rs:63` — `EXIT_CONFIG: u8 = 2`; `:87` — `EXIT_DEFERRED: u8 = 4` | correct |
+| the timer ships `OnCalendar=daily`, `Persistent=true`, `RandomizedDelaySec=3600`; the service ships `Restart=on-failure` / `RestartSec=60` (the systemd-244 requirement) | `keeper-syncd-tasks@.timer:72`, `:78`, `:84`; `keeper-syncd-tasks@.service:139-140` | all correct |
+| schedule floor 60 s, refused not clamped | `tasks.rs:31` — `MIN_SCHEDULE_INTERVAL_MS: i64 = 60_000` | correct |
+| the Pending walk floor is **one minute**, between walks | `engine.rs:428` — `POLL_WALK_MIN_INTERVAL = Duration::from_secs(60)`; `poll_walk_finished` at `:11676` called at `:11940` **after** the walk returns | correct |
+| the Pending poll's own cadence is **five seconds**, over **every** mirrored folder | `src/lib/stores/sync-detail.ts:102` — `SYNC_DETAIL_POLL_MS = 5_000`; `:273` `startSyncDetailPolling` → `refreshSyncDetailAll` (`:255-260`, every profile in the store); started at `src/components/layout/sync-pane.tsx:770` | correct — and this is the claim the first draft of the sentence got wrong, saying *the folder you are looking at* |
+| the walk is skipped for a paused folder and for one whose first copy never finished | `engine.rs:11660-11663` (`poll_may_walk`) | correct |
+| the measured motivation: 155 625 entries, a walk every ten to thirty seconds | `engine.rs:410-427` (`POLL_WALK_MIN_INTERVAL`'s own doc) | correct |
+
+**Two findings, both already corrected above rather than filed:** the `delay`
+table row (falsified by 59.6) and the *governed* row's promise of an explanation
+that did not exist (owed since `c6f04fa`, and made materially misleading by
+#303).
+
+**Checked and found already true, so left alone:** nothing in the file claims the
+Tasks view cannot create a task (`grep -n "cannot create"` → no matches; the
+⌘8 section at `docs/sync.md:2264-2299` describes create, edit, forget, Run now
+and Runs); nothing claims a missed window has no policy; and nothing claimed a
+poll walks on every tick — §12 simply had no sentence about the walk's cadence at
+all, which is why this revision adds one rather than repairing one.
+
+### Verification, this revision
+
+- The cross-check table above **is** the verification for a documentation change:
+  every row was read out of the named file at the named line during this pass.
+- `docs/decisions.md`'s three `docs/sync.md §N` references re-resolved by hand
+  against `grep -n "^## [0-9]" docs/sync.md`; all three land on the intended
+  headings, and no heading moved.
+- The code half of this revision lives in
+  `spec-58-8-a-sync-task-that-governs-instead-of-duplicating.md`, *Revision 2*,
+  with its own mutation proof in both directions.

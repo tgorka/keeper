@@ -1440,6 +1440,26 @@ Uploads are deliberately not listed: the path an upload carries is already
 reported by `git status` as a local change, and one fact wearing two hats reads
 as two.
 
+**The list refreshes every five seconds; the full walk behind it does not.** A
+poll re-reads every mirrored folder, but a folder's whole-tree status walk is
+floored at **one a minute**, measured from when the last walk *finished* rather
+than from when a poll started it — so a folder whose walk takes eight seconds is
+not walked again until a minute after that. The walk is what finds **untracked**
+files and what re-checks paths the watcher never saw; everything else on the
+list — the settling rows, the incoming queue, the repair backlog — is assembled
+without it and moves at the poll's own five seconds. The visible cost is that a
+file created while keeper was not watching can take up to a minute to appear,
+and nothing else changes. The floor exists because the walk is not free: on a
+155 625-entry folder on a USB volume the unfloored poll walked the whole tree
+every ten to thirty seconds all day, and an `lstat` of every tracked path is the
+single most expensive thing keeper does. A folder that is **paused**, or whose
+first copy never finished, is not walked for this list at all — the first
+because nothing about it is going to be committed, the second because the walk
+would report every tracked path as deleted, which two integers already say.
+
+Nothing about syncing is paced by that floor: the commit leg has its own cadence
+and never consults this one.
+
 Each row leads with one glyph answering two questions, because a row has space
 for one: the arrow's **direction** says which way the file is travelling, and
 whether it is **circled** says whether the far end already holds something. A
@@ -2342,7 +2362,7 @@ Four standings, and they are four different answers:
 | --- | --- |
 | **paced** | the clock really is pacing this, and the cadence beside it is the one in force — `pollIntervalMs` after its floor is applied, never the number stored on the row |
 | **paused** | the folder is paused, so nothing paces it and **no cadence is shown**. A cadence beside *paused* would be a promise nothing is keeping |
-| **governed** | a `scheduled` **sync task** has taken this folder's paced walk over, so the task's schedule is the cadence — see below. No interval is shown, because none is in force |
+| **governed** | a `scheduled` **sync task** has taken this folder's paced sync poll over, so the task's schedule is the cadence — see *What a scheduled sync task does to a folder's polling* below. No interval is shown, because none is in force |
 | **unregistered** | a notes row only: the folder holds a vault, but keeper has no vault *registered* for it, because the vault folder could not be found when the registry was last built. Nothing paces it, and it is not waiting on a clock |
 
 **A configured vault and a paced vault are two different facts**, which is why
@@ -2374,6 +2394,36 @@ folder's own **Sync now** is on the Sync pane, and a vault is flushed every time
 the window hides. A sentence written to stop somebody hunting for a control must
 not hide the control they were looking for.
 
+#### What a scheduled sync task does to a folder's polling
+
+Give a folder a `sync` task in `scheduled` mode and that schedule **replaces**
+the folder's own backstop poll: the folder is no longer looked at every fifteen
+seconds as well. One driver, not two. Before it worked this way, a folder with
+an hourly sync task was synced hourly *and* every fifteen seconds, and the
+task's run line took the credit for work the ordinary poll would have done
+anyway. `off` and `manual` take nothing away — a `manual` task adds a button,
+and a folder is paused by pausing the folder, never by a task row somebody
+forgot to delete.
+
+Two things are deliberately **not** stood down with it, and both are things you
+would miss:
+
+- **The watcher and the settle window.** A file you just saved is still picked
+  up at once. A schedule owns the folder's *idle* cadence and nothing else. If
+  it owned the event triggers too, a folder on an hourly task would look dead
+  for an hour after you saved something, and a file that finished downloading
+  would wait out the schedule instead of its own settle window.
+- **The Sync pane's own status walk.** The Pending list keeps refreshing for a
+  governed folder exactly as it does for any other — every mirrored folder, at
+  most one full walk a minute each, for as long as the Sync pane is open (§12).
+  That list is the one place the work accruing between two scheduled windows is
+  visible, so a governed folder is the last one whose list should go quiet. It
+  costs a walk a minute while somebody is watching, and it is worth it.
+
+The second of those is the honest small print on *governed*. The standing means
+**this folder's paced sync has stood down**, not that nothing ever looks at the
+folder. That walk syncs nothing and queues nothing; it fills a list.
+
 ### A window that passed while nobody was home
 
 Every task carries one answer to *what should happen to a window that fell due
@@ -2394,7 +2444,7 @@ missed-window policy — it would be a re-timing of the schedule you wrote.
 | setting | what it does to a window nobody served |
 | --- | --- |
 | **`run_now`** | serves it on the first tick that sees it, **once**, however many windows went by |
-| **`delay`** | serves it **30 minutes after a host noticed it** (`TASK_MISSED_DELAY_MS`) — the anchor is the noticing, not the window |
+| **`delay`** | serves it **a delay after a host noticed it** — thirty minutes (`TASK_MISSED_DELAY_MS`) unless the task carries its own. The anchor is the noticing, not the window |
 | **`skip`** | abandons it and arms the next natural window instead |
 
 `run_now` is the default, and it is the default because it is textually what
@@ -2403,6 +2453,39 @@ install's meaning.** It is also precisely `Persistent=true` semantics
 in-process, which is the same rule the shipped systemd timer already words for
 itself — a trigger missed while the machine was off fires once when it comes
 back, once and not once per missed day.
+
+**The delay is the task's own, and thirty minutes is only what it falls back
+to.** `keeper-syncd tasks set --missed-delay <MINUTES>` stores one on the row
+and `--no-missed-delay` takes it off again, and those are two genuinely
+different answers rather than an awkward spelling: storing nothing means *follow
+keeper's own number, whatever it becomes*, while `--missed-delay 30` means
+*thirty minutes even if that number moves*. It is kept whatever `--on-missed`
+says, so switching to `skip` and back does not throw it away, and the ⌘8 form
+writes the same field. `tasks list` shows a stored one in the row's bracket as
+`[on missed: delay 45m]` — minutes when the value divides into them, raw
+milliseconds when it does not, and nothing at all when the task simply uses
+keeper's; `--json` carries it as `missedDelayMs` unconditionally.
+
+**A delay below the grace period is refused, with the reason, and that floor is
+not a taste.** Fifteen minutes is how long a window must sit open before keeper
+concludes nobody was home, so a delay shorter than it would be spent before the
+window it holds back counted as missed: the next tick would serve the window and
+`delay` would be spelling `run_now`, at the price of one extra write and one
+`postponed` row per absence. The ceiling is one year — the same one a schedule
+has, and for the same reason. Both refusals come from the store and are shown
+in the form's own words, wherever the write came from.
+
+**One missed window yields one run under every setting, and that is a safety
+property rather than a convenience.** No policy implements it; it is a property
+of the record. A task's next window is **one stored instant and not a queue**,
+so overdue-by-one and overdue-by-two-hundred are the same state, and the
+replacement instant is computed from the moment a run **finishes** rather than
+from the window it served — otherwise a run that overran its own window would
+come due again the instant it ended. Nothing enumerates the windows that went
+by, so nothing can serve them. It matters more than tidiness because of what one
+of the kinds does: a `release` task deletes local content, so N catch-up sweeps
+would be N deletion passes nobody chose. A laptop shut for a week releases once
+when it comes back, not seven times.
 
 The other two act by **writing** rather than by waiting, and the instant they
 write is the row's own `next_due_ms`. Three things follow, and they are the
