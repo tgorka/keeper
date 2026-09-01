@@ -4,7 +4,7 @@ type: 'docs'
 created: '2026-08-31'
 status: 'done'
 baseline_revision: 'c6f04fa'
-final_revision: '69c7368'
+final_revision: '4c6be3f'
 review_loop_iteration: 2
 followup_review_recommended: false
 context:
