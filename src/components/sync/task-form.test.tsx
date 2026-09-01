@@ -53,6 +53,7 @@ import {
   TASK_FORM_ID_EDIT_NOTE,
   TASK_FORM_ID_LABEL,
   TASK_FORM_KIND_LABEL,
+  TASK_FORM_KIND_NOTE,
   TASK_FORM_MISSED_DELAY_LABEL,
   TASK_FORM_MISSED_DELAY_NOT_A_NUMBER,
   TASK_FORM_MISSED_DELAY_NOTE,
@@ -81,6 +82,7 @@ import {
 } from "@/components/sync/task-form";
 import type { SyncProfileVm, TaskSchedulePreviewVm, TaskVm } from "@/lib/ipc/client";
 import { syncProfiles, syncTaskSave, syncTaskSchedulePreview } from "@/lib/ipc/client";
+import { TASK_KINDS } from "@/lib/stores/sync";
 
 const mockSave = vi.mocked(syncTaskSave);
 const mockProfiles = vi.mocked(syncProfiles);
@@ -569,6 +571,164 @@ describe("TaskForm, editing a task", () => {
     fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
     await waitFor(() =>
       expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ profileId: "01NOSUCH" })),
+    );
+  });
+});
+
+/**
+ * Which kind of task this is (Story 59.11).
+ *
+ * The reachability property the missed-window policy below already asserts,
+ * arrived at from the other end: `TaskKind::from_stored` has accepted
+ * `"verify"` since Story 59.9 while `TASK_KINDS` offered two kinds, so the one
+ * kind that checks rather than moves bytes was creatable from a terminal and
+ * from nowhere else. The mechanical half of the fix is Rust reading this
+ * repository's TypeScript — `tasks.rs`'
+ * `every_kind_the_form_offers_is_one_this_build_runs_and_every_kind_it_runs_is_offered`,
+ * which compares `TASK_KINDS` against the real match arms in both directions.
+ * These are the half that guard cannot make: that the picker really renders the
+ * list, that the chosen spelling really reaches the wire, and that a person is
+ * told what the three words mean.
+ */
+describe("TaskForm, which kind of task this is", () => {
+  it("offers every kind this build can write, in order, spelled as it stores them", async () => {
+    // Asserted against `TASK_KINDS` rather than against a literal triple, so
+    // this stays true of Epic 60's kind without an edit here — the Rust guard
+    // is what makes `TASK_KINDS` itself trustworthy. But `TASK_KINDS` is also
+    // the thing that lost a kind once, and a test that only compared the menu
+    // to it would have passed happily through the whole of that epic. So the
+    // spelling that went missing is named outright.
+    expect(TASK_KINDS).toContain("verify");
+
+    render(<TaskForm />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    const picker = screen.getByLabelText(TASK_FORM_KIND_LABEL);
+    const options = Array.from(picker.querySelectorAll("option"));
+    // Value AND text, because by AD-C7 they are one string: the row's badge
+    // renders `task.kind` verbatim and `tasks list --json` prints this
+    // vocabulary, so a friendly label in the menu would be a second word for
+    // one stored value and a person could not match their own task list to the
+    // thing they chose.
+    expect(options.map((option) => option.getAttribute("value"))).toEqual([...TASK_KINDS]);
+    expect(options.map((option) => option.textContent)).toEqual([...TASK_KINDS]);
+    // The first option is what an untouched add form sends, so the order the
+    // guard pins is also a default somebody chose.
+    expect(picker).toHaveValue("sync");
+  });
+
+  it("sends verify as the kind when verify is chosen", async () => {
+    // THE PROPERTY OF STORY 59.11, end to end and asserted on the REQUEST
+    // rather than on the DOM: a picker that showed the option and sent
+    // something else would satisfy the test above and store the wrong kind,
+    // which is a worse failure than the one this story is repairing.
+    mockSave.mockResolvedValue(taskVm({ kind: "verify" }));
+    render(<TaskForm />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_KIND_LABEL), { target: { value: "verify" } });
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "@daily" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+
+    // The same ten keys the add form has always sent, with the kind the only
+    // thing that differs: nothing else about a task changes because it checks
+    // rather than moves bytes. `verify` takes no reservation and asks no
+    // network, but that is `run_task`'s business and not this form's.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith({
+        id: "",
+        kind: "verify",
+        mode: "scheduled",
+        enabled: true,
+        profileId: null,
+        schedule: "@daily",
+        description: null,
+        onMissed: "run_now",
+        missedDelayMs: null,
+        baselineUpdatedMs: null,
+      }),
+    );
+  });
+
+  it("still sends release as the kind when release is chosen", async () => {
+    // This story is additive, and that is a claim about the two kinds it did
+    // not add. A third option wired by widening the `<select>`'s `onChange`,
+    // or by reordering the list, could change what the other two send while
+    // the new one worked perfectly.
+    mockSave.mockResolvedValue(taskVm({ kind: "release" }));
+    render(<TaskForm />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_KIND_LABEL), { target: { value: "release" } });
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "@daily" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith({
+        id: "",
+        kind: "release",
+        mode: "scheduled",
+        enabled: true,
+        profileId: null,
+        schedule: "@daily",
+        description: null,
+        onMissed: "run_now",
+        missedDelayMs: null,
+        baselineUpdatedMs: null,
+      }),
+    );
+  });
+
+  it("says what each offered kind does, on screen, in the stored vocabulary", async () => {
+    // The copy guard, and it is the other half of AD-C7's cost: since the
+    // option text must be the bare stored spelling, a kind offered with nothing
+    // said about it is an option nobody can act on — which is what the
+    // invocation behind this story actually asked for. Driven from
+    // `TASK_KINDS`, so adding a kind without a sentence for it is red rather
+    // than merely unhelpful.
+    //
+    // A bare substring check would not do it. The note is prose about running
+    // and releasing and checking, so a kind spelled `run` would be "mentioned"
+    // by the word `runs` in the sentence about `sync` — a false green on the
+    // exact claim this test exists to make. What is asserted instead is the
+    // note's actual shape, the one {@link TASK_FORM_MODE_NOTE} set: one
+    // sentence per value, each LEADING with the spelling it is about.
+    const sentences = TASK_FORM_KIND_NOTE.split(". ");
+    for (const kind of TASK_KINDS) {
+      expect(sentences.some((sentence) => sentence.startsWith(`${kind} `))).toBe(true);
+    }
+    // Not a sentence COUNT: the note is prose, and a future edit that wrote
+    // "e.g." or "vs." into it would over-split and go red while saying exactly
+    // what it should. The claim is that every offered kind has a sentence of
+    // its own, and the loop above is the whole of that claim.
+
+    // And rendered: the constant could name all three while no control showed
+    // it, which is the same trap the schedule bounds note's own guard closes.
+    render(<TaskForm />);
+    expect(await screen.findByText(TASK_FORM_KIND_NOTE)).toBeInTheDocument();
+  });
+
+  it("arrives holding a stored verify rather than the add form's default", async () => {
+    // The state this story newly makes reachable, seen from the other end. An
+    // edit form that opened on the add default would silently rewrite a check
+    // into a sync pass — a task that took no reservation and asked no network
+    // becoming one that moves bytes, on somebody else's schedule.
+    mockSave.mockResolvedValue(taskVm({ kind: "verify" }));
+    render(<TaskForm task={taskVm({ kind: "verify" })} />);
+    await waitFor(() => expect(mockProfiles).toHaveBeenCalled());
+
+    expect(screen.getByLabelText(TASK_FORM_KIND_LABEL)).toHaveValue("verify");
+
+    // And it survives the round trip untouched, which the value above does not
+    // prove on its own: the seed could be right and the submit could send the
+    // form's initial state instead of the row's.
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ kind: "verify" })),
     );
   });
 });

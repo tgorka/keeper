@@ -1924,6 +1924,260 @@ mod tests {
         }
     }
 
+    /// Every kind the form **offers** is one this build runs, and every kind it
+    /// runs is one the form offers (Story 59.11).
+    ///
+    /// The guard above's method pointed at a second pair of files, and for a
+    /// defect that had already happened rather than one that might: Story 59.9
+    /// taught [`TaskKind::from_stored`] `"verify"` and left `TASK_KINDS` in
+    /// `src/lib/stores/sync.ts` reading `["sync", "release"]`, so for one epic
+    /// the only kind that *checks* rather than moves bytes was creatable from a
+    /// terminal and from nowhere else. Nothing went red, because the coupling
+    /// between those two lists was a sentence in a doc comment. Direction 2
+    /// below is that sentence made mechanical, and it is the direction that was
+    /// actually violated.
+    ///
+    /// **Why this reads two files instead of enumerating the variants.**
+    /// Direction 1 needs no source reading at all — `from_stored(literal)`
+    /// answers it, which is why it is written that way. Direction 2 cannot be:
+    /// `from_stored` is a function from `&str`, its domain is not enumerable,
+    /// and there is no dependency-free way to list an enum's variants here (no
+    /// `strum` in this workspace, `variant_count` unstable). A hand-written
+    /// `TaskKind::ALL` would make this guard a mirror of a mirror — the same
+    /// hand-maintained coupling one layer deeper, and that layer is precisely
+    /// the one that failed. Reading the match arms is the only version of
+    /// direction 2 that checks rather than restates.
+    ///
+    /// **What text-reading costs, and what is done about it.** Reading source
+    /// is a *syntactic shadow* of `from_stored`, so the shadow has to be
+    /// policed or direction 2 is only as good as an arm's spelling. Three
+    /// checks do that, and each exists because this review found the evasion
+    /// it closes: every acceptance arm must contribute at least one literal
+    /// (so a match-guard or a `strip_prefix` arm the line scan cannot read is
+    /// red, not invisible); the offered slice must be *nothing but* string
+    /// literals (so a spread or a computed entry is red, not skipped); and the
+    /// enum may have exactly one inherent `impl` block (so a second parser
+    /// added elsewhere is red rather than a door direction 2 does not know
+    /// about). What remains uncovered is a kind made runnable by a trait impl
+    /// on `TaskKind` — there is none today, and `perform_task`'s exhaustive
+    /// match is what would make one visible.
+    ///
+    /// **This is one link of a two-link chain, and it owns the first link.**
+    /// Here: `from_stored` ↔ `TASK_KINDS`. There: `TASK_KINDS` ↔ the rendered
+    /// menu, which only a browser-shaped test can see and which
+    /// `task-form.test.tsx`'s *"offers every kind this build can write, in
+    /// order, spelled as it stores them"* asserts. Neither link is worth
+    /// anything alone, so a later reader weakening one should know the other
+    /// exists.
+    #[test]
+    fn every_kind_the_form_offers_is_one_this_build_runs_and_every_kind_it_runs_is_offered() {
+        let store = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../src/lib/stores/sync.ts")
+            .canonicalize()
+            .expect("src/lib/stores/sync.ts is in this repository");
+        let store_source = std::fs::read_to_string(&store).expect("read the offered kinds");
+        let tasks_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/tasks.rs")
+            .canonicalize()
+            .expect("this file is in this repository");
+        let tasks_source = std::fs::read_to_string(&tasks_rs).expect("read this file");
+
+        // The spellings the picker offers: every quoted literal between the
+        // declaration of `TASK_KINDS` and the bracket that closes it. Bounded
+        // by the `]` so the neighbouring `TASK_MODES` list cannot leak in.
+        //
+        // Anchored on `export const` rather than on the bare name, and the
+        // floor below is how that was found out: the store's doc comment names
+        // this guard and quotes the marker it slices on, so a slice from the
+        // first bare mention lands inside the prose and finds no literals at
+        // all. The declaration is the only thing that has to be matched, and
+        // matching it is also the narrower claim.
+        let mut offered = Vec::new();
+        let mut offered_residue = String::new();
+        if let Some(rest) = store_source
+            .split_once("export const TASK_KINDS = [")
+            .map(|(_, tail)| tail)
+        {
+            let list = rest.split(']').next().unwrap_or_default();
+            for (index, chunk) in list.split('"').enumerate() {
+                // Odd chunks are inside quotes, even ones are the punctuation
+                // between them.
+                if index % 2 == 1 {
+                    offered.push(chunk.to_owned());
+                } else {
+                    offered_residue.push_str(chunk);
+                }
+            }
+        }
+
+        // The list must be **nothing but** string literals. Without this the
+        // extraction silently skips whatever it does not understand, and a
+        // spread, a computed entry or an identifier — `[...BASE, VERIFY]` —
+        // would be an offered kind direction 1 never passes through
+        // `from_stored`. Comments are refused for the same reason and not as
+        // fussiness: a quoted word inside one is indistinguishable from an
+        // entry, and this array is the last place to be clever.
+        assert!(
+            offered_residue
+                .chars()
+                .all(|ch| ch.is_whitespace() || ch == ','),
+            "TASK_KINDS in {} holds something this guard cannot read as a plain \
+             string literal ({:?} is left over once the literals are removed). \
+             Keep the array a bare comma-separated list of quoted spellings, or \
+             re-point this extraction in the same change.",
+            store.display(),
+            offered_residue.trim()
+        );
+
+        // The spellings this build runs: `from_stored`'s match keys, taken from
+        // this file's own `impl TaskKind` window — the block holding `as_str`
+        // and `from_stored` and nothing else, since the next unindented `}`
+        // closes it. `as_str`'s arms read `Self::Sync => "sync"` and so do not
+        // start with a quote; `_ => None,` carries no literal at all.
+        //
+        // Every literal *before* the `=>` is taken, not just the first, so an
+        // alternation arm (`"verify" | "check" => …`) contributes both of its
+        // spellings rather than hiding the alias. And the arm is recognised by
+        // `=>` alone rather than by `=> Some(Self::`: `Some(TaskKind::Verify)`
+        // compiles identically, rustfmt does not rewrite one into the other,
+        // and a filter that insisted on one spelling would drop a real
+        // acceptance arm — the exact blindness this test exists to prevent,
+        // wearing the test's own clothes.
+        let mut accepted = Vec::new();
+        let mut window = "";
+        assert_eq!(
+            tasks_source.matches("\nimpl TaskKind {\n").count(),
+            1,
+            "`TaskKind` has more than one inherent impl block in {}, so this \
+             extraction's window no longer holds every place a stored spelling \
+             becomes runnable",
+            tasks_rs.display()
+        );
+        if let Some(rest) = tasks_source
+            .split_once("\nimpl TaskKind {\n")
+            .map(|(_, tail)| tail)
+        {
+            window = rest.split("\n}\n").next().unwrap_or_default();
+            for line in window.lines() {
+                let line = line.trim();
+                let Some((keys, _)) = line.split_once("=>") else {
+                    continue;
+                };
+                if !keys.starts_with('"') {
+                    continue;
+                }
+                for literal in keys.split('"').skip(1).step_by(2) {
+                    accepted.push(literal.to_owned());
+                }
+            }
+        }
+
+        // Floors, before anything is compared, and they are not redundant with
+        // the set equality below — they are what makes it mean anything. If a
+        // rename or a reshape broke BOTH extractions to empty, two empty sets
+        // are equal and this test would pass having checked nothing at all.
+        assert!(
+            offered.len() >= 2,
+            "the extraction found {} kind literals in {}, which is too few to be \
+             the offered list — has the constant been renamed?",
+            offered.len(),
+            store.display()
+        );
+        assert!(
+            accepted.len() >= 2,
+            "the extraction found {} accepted kind literals in {}, which is too \
+             few to be `from_stored`'s arms — has the match been reshaped?",
+            accepted.len(),
+            tasks_rs.display()
+        );
+
+        // Every arm that *accepts* something must have contributed at least one
+        // spelling. This is what keeps direction 2 honest about the arms it
+        // cannot read: a match guard (`v if v.eq_ignore_ascii_case("verify")`),
+        // a `strip_prefix`, or a key written on its own line accepts a string
+        // that leads no arm, so the count of acceptances exceeds the count of
+        // extracted spellings and this fails — loudly and here — rather than
+        // leaving a runnable kind invisible to the comparison below.
+        let acceptances = window.matches("=> Some(").count();
+        assert!(
+            accepted.len() >= acceptances,
+            "`from_stored` in {} has {acceptances} arms that accept something but \
+             only {} spellings could be read off them: an arm this guard cannot \
+             read is a kind direction 2 would not know to demand",
+            tasks_rs.display(),
+            accepted.len()
+        );
+
+        /// Kinds deliberately withheld from the app, each of which must be
+        /// named here rather than merely absent from `TASK_KINDS`.
+        ///
+        /// A silent omission is exactly the state this test exists to catch, so
+        /// a guard that could be satisfied by editing a list would be a guard
+        /// with a back door. Empty today: every kind `from_stored` accepts is
+        /// one a person may reasonably schedule. `update` is not a
+        /// counter-example — `from_stored` refuses it, so it never enters this
+        /// comparison in the first place.
+        const NEVER_OFFERED: [&str; 0] = [];
+
+        // An exemption for a spelling nothing accepts is an exemption that
+        // exempts nothing, and the day somebody misspells one here the kind it
+        // was meant to cover goes on failing direction 2 with a message about
+        // adding it to `TASK_KINDS` — advice that contradicts the decision the
+        // entry records.
+        for exempt in NEVER_OFFERED {
+            assert!(
+                accepted.iter().any(|literal| literal == exempt),
+                "NEVER_OFFERED names {exempt:?}, which `from_stored` does not \
+                 accept, so it withholds nothing"
+            );
+        }
+
+        // Direction 1: nothing offered is unrunnable. Answered by the real
+        // parser rather than by the text it was extracted from.
+        for literal in &offered {
+            assert!(
+                TaskKind::from_stored(literal).is_some(),
+                "the form offers {literal:?}, which this build cannot run"
+            );
+        }
+
+        // Direction 2: nothing runnable is unoffered. The one that was violated.
+        for literal in &accepted {
+            if NEVER_OFFERED.contains(&literal.as_str()) {
+                continue;
+            }
+            assert!(
+                offered.iter().any(|kind| kind == literal),
+                "this build runs {literal:?}, which the form does not offer: a kind \
+                 creatable only from a terminal is born unreachable — add it to \
+                 TASK_KINDS in src/lib/stores/sync.ts, or name it in NEVER_OFFERED \
+                 with a reason"
+            );
+        }
+
+        // And the same list — as a set, sorted, so a duplicate entry is caught
+        // by the length while the *order* of the menu stays the frontend's to
+        // choose. It is deliberately not order-equality: the picker's first
+        // option is the default kind of every task created afterwards and is
+        // worth pinning, but pinning it to the order `from_stored`'s arms
+        // happen to sit in would make a no-op Rust refactor demand a TypeScript
+        // edit. That default is asserted where it is visible, in
+        // `task-form.test.tsx`'s `expect(picker).toHaveValue("sync")`.
+        let mut offered_set = offered.clone();
+        offered_set.sort();
+        let mut expected: Vec<String> = accepted
+            .iter()
+            .filter(|literal| !NEVER_OFFERED.contains(&literal.as_str()))
+            .cloned()
+            .collect();
+        expected.sort();
+        assert_eq!(
+            offered_set, expected,
+            "the two lists hold different spellings, or one of them holds a \
+             spelling twice"
+        );
+    }
+
     /// The preview is the dialect's own cadence, not one answer repeated
     /// (Story 59.7).
     ///

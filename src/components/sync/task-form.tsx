@@ -132,6 +132,28 @@ export const TASK_FORM_DESCRIPTION_NOTE =
   "Optional, and the only name of this task you can ever change: an id is minted by keeper when you leave it blank, and it can never be edited afterwards because the run history is joined to it. Leave this empty to store none. Whatever you type is sent exactly as typed.";
 
 export const TASK_FORM_KIND_LABEL = "Kind";
+/**
+ * The three kinds, in the CLI's own words (Story 59.11).
+ *
+ * The option text is the stored spelling itself, by the AD-C7 rule stated at
+ * the control below: the row's badge renders `task.kind` verbatim and
+ * `tasks list --json` prints this vocabulary, so a prettified label would be a
+ * second word for one stored value. That leaves nowhere in the menu to say what
+ * the three words mean, so the sentence a person actually needs goes here —
+ * the {@link TASK_FORM_MODE_NOTE} idiom one control down, one sentence per
+ * value, each leading with the spelling it is about.
+ *
+ * The three sentences are `TaskKindArg`'s own per-value `--help` lines
+ * (`keeper-syncd/src/commands.rs:876-884`), which exist for this exact problem
+ * and say so: *"a bare `[possible values: …]` list cannot say which of the
+ * three a nightly schedule should be pointed at"*. `docs/sync.md`'s §14 kind
+ * table corroborates them. Taken rather than invented, so the CLI's help and
+ * this menu agree by provenance instead of by coincidence — the drift a second
+ * author would introduce here is the same drift AD-C7 forbids in the spellings.
+ */
+export const TASK_FORM_KIND_NOTE =
+  "sync runs one sync pass over the folder, or over every enabled folder. release runs one release sweep, with every refusal dehydrate has. verify re-checks stored content against its recorded digests: it reads only, asks no network, and takes no per-folder reservation.";
+
 export const TASK_FORM_MODE_LABEL = "Mode";
 /** The three modes, accurate to `tasks::decide` and no longer than that. */
 export const TASK_FORM_MODE_NOTE =
@@ -831,6 +853,7 @@ export function TaskForm({
           ))}
         </select>
       </div>
+      <p className="text-muted-foreground text-xs">{TASK_FORM_KIND_NOTE}</p>
 
       <div className="flex items-center justify-between gap-2">
         <Label htmlFor={`${fieldId}-mode`}>{TASK_FORM_MODE_LABEL}</Label>

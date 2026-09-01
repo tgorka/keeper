@@ -5177,3 +5177,20 @@ status: open
     `resetColumnFoldForTest()` in the top-level `beforeEach`; `files-pane.test.tsx` and any other
     pane suite that exercises the fold carry the same latent ordering trap, and the next person to
     append a test to one of them pays for it the same way.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-59-11-every-kind-this-build-can-write.md`
+  summary: |
+    `TASK_FORM_KIND_NOTE` is sourced from `TaskKindArg`'s per-value `--help` lines but nothing pins
+    it there, so the CLI and the app can drift into describing the same task kind differently.
+  evidence: |
+    Raised 2026-09-01 by story 59.11's adversarial review. That story made the *vocabulary* of task
+    kinds drift-proof — `TASK_KINDS` and `TaskKind::from_stored` are now compared in both directions
+    by a Rust test — but the *description* of each kind is copied prose. The three sentences in
+    `src/components/sync/task-form.tsx` were transcribed from the doc comments on `TaskKindArg`
+    (`keeper-syncd/src/commands.rs:876-884`) and corroborated against `docs/sync.md` §14's kind
+    table, which is three statements of the same fact with two of them unguarded. The precedent for
+    closing it exists in the same file: `every_kind_the_cli_offers_is_a_documented_row_and_the_
+    heading_counts_nothing` already drives a `docs/sync.md` assertion off `TaskKindArg::value_
+    variants`, so extending that test to also demand the frontend note is the shape. Not done in
+    59.11 because the note lives in a file that crate's tests do not otherwise read, and because the
+    story's own guard had five evasions to close first.

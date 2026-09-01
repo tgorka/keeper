@@ -62,8 +62,31 @@ export type SyncLfsMode = (typeof SYNC_LFS_MODES)[number];
  * cannot read to `TaskListingVm.unknown`. So an *editable* row's spelling is
  * always one of these by construction, and a union that only ever narrowed a
  * value already known to be narrow would be a type nothing could use.
+ *
+ * Tied to Rust mechanically since Story 59.11, and no longer only by this
+ * comment: the test
+ * `every_kind_the_form_offers_is_one_this_build_runs_and_every_kind_it_runs_is_offered`
+ * in `keeper-sync/src/tasks.rs` reads *this file*, extracts the literals
+ * below, and compares them as a **set** against `TaskKind::from_stored`'s own
+ * match arms — in both directions, so this list and that match are one list
+ * and adding to either alone is red. The two drifted once already, within one
+ * epic of the coupling being written down: Story 59.9 taught `from_stored`
+ * `"verify"` and left the picker offering two kinds, so the one kind that
+ * checks rather than moves bytes was creatable from a terminal and from
+ * nowhere else.
+ *
+ * That guard slices this file on the text of the declaration below — the
+ * `export const`, the name, and the opening bracket — and reads to the first
+ * `]`, which makes all three load-bearing beyond TypeScript: renaming the
+ * constant, or spelling the list some other way, needs the test's extraction
+ * re-pointed in the same change. It is anchored on the declaration rather than
+ * on the bare name because this paragraph mentions the name too, and a slice
+ * that began at the first mention would begin inside this comment. The guard
+ * asserts a floor on how many literals it found precisely so that such a
+ * mis-anchoring cannot leave it passing over nothing — which is how that one
+ * was caught.
  */
-export const TASK_KINDS = ["sync", "release"] as const;
+export const TASK_KINDS = ["sync", "release", "verify"] as const;
 
 /**
  * The legal task `mode` values (mirror of the Rust `TaskMode::from_stored`
