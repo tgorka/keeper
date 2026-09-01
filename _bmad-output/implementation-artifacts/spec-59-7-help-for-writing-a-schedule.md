@@ -325,10 +325,14 @@ place for it is the caller and the guard for it already exists.
   `proc-macro-error2` future-incompat note is a pre-existing dependency warning, not a lint failure.
 - `bun run vitest run src/components/sync/task-form.test.tsx` -- 45 passed / 0 failed (32 before).
 - `bun run typecheck` -- clean, once the sibling-owned `client.ts` wrapper landed.
-- `bun run lint` -- this story's three files clean. The tree's remaining findings are a sibling's
-  in-flight files plus one pre-existing committed `lint/style/useTemplate` error in
-  `src/components/viewers/markdown-preview.ts:424`, which this story has not modified and which was
-  reported to the coordinator rather than fixed blind.
+- `bun run lint` -- **at baseline: 4 warnings, 1 info, zero errors**, this story's three files clean.
+  Corrected claim, and the correction is worth keeping because it is the same error class this story
+  is about: an earlier reading of this line said there were three errors including a
+  `lint/style/useTemplate` **error** in `src/components/viewers/markdown-preview.ts:424`, and that was
+  wrong twice over. The three errors were biome *format* diffs on files two siblings had in flight
+  (and one of my own, before I formatted), all transient; and the `useTemplate` finding is one of the
+  four standing warnings, not an error. It was read off a collapsed grep over a dirty tree and
+  attributed by position rather than by severity. A sibling checked it independently and was right.
 - `bun run test` in full, once, mid-story: 301 files / 5109 tests, 4 failed — all four in
   `src/components/layout/tasks-pane.test.tsx`, a sibling's in-flight 59.1 restructure. Nothing this
   story owns was red.
@@ -385,10 +389,11 @@ does that.
   note above; the reviewer's own recommendation was to leave it, because the pane already owns the
   other question and re-labelling would dilute the add-form case.
 
-**Out of scope, reported not fixed:** the pre-existing `lint/style/useTemplate` error in
-`src/components/viewers/markdown-preview.ts:424`, and the sibling-owned files this story's contract
-depends on. One of those did break during the wave and is worth recording because it is a lesson about
-guards that read source text: the shipped
+**Out of scope, reported not fixed:** the sibling-owned files this story's contract depends on. (An
+earlier version of this line also flagged a lint error in `src/components/viewers/markdown-preview.ts`
+that does not exist — see the corrected `bun run lint` note above.) One of those sibling files did
+break during the wave, and it is worth recording because it is a lesson about guards that read source
+text: the shipped
 `every_schedule_the_dev_harness_shows_is_one_this_dialect_accepts` went red on `"…"` — the ellipsis —
 because a newly written comment in `dev/mock-shell.ts` contained the literal token `schedule: "…"`
 while explaining the guard, and the blunt extractor read the prose as a fixture. Its owner reworded
