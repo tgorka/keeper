@@ -252,6 +252,22 @@ describe("AppShell", () => {
     expect(screen.queryByRole("region", { name: "Files" })).not.toBeInTheDocument();
   });
 
+  // ── Tasks view (Story 59.12) ───────────────────────────────────────────────
+  it("puts the panel strip beside the Tasks pane, so a task can be opened in a tab", () => {
+    // The reachability half of the story, and it belongs here because nothing
+    // else can assert it: the pane writes a `task` target into `panelsStore`
+    // and the strip renders it, but the two are only ever siblings HERE. Tested
+    // for a whole epic, a pane that composed no strip would have shipped a
+    // gesture with nothing on the other end of it — which is the shape of the
+    // owner's report that started this story.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sessions: true });
+    primaryViewStore.getState().setView("tasks");
+    render(<AppShell />);
+
+    expect(screen.getByRole("region", { name: "Tasks" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Open panels")).toBeInTheDocument();
+  });
+
   // ── Overlay-titlebar drag band (Story 34.2) ────────────────────────────────
   it("renders no drag band where the platform draws its own title bar", () => {
     // Off macOS the window controls live in a real title bar above the webview, so

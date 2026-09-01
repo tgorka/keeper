@@ -2,7 +2,13 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { FOLD_STRIP_HEAD_SLOT, FOLD_STRIP_NAME_SLOT } from "@/components/layout/fold-strip";
-import type { FilesEntryVm, FilesListingVm, NoteVaultVm } from "@/lib/ipc/client";
+import type {
+  FilesEntryVm,
+  FilesListingVm,
+  NoteVaultVm,
+  TaskListingVm,
+  TaskVm,
+} from "@/lib/ipc/client";
 
 /** Test id for the stand-in the note panel's own suite explains. */
 const EDITOR_STUB_TESTID = "note-editor-stub";
@@ -28,6 +34,8 @@ const syncBrowse = vi.fn();
 const syncOpenEntry = vi.fn();
 const revealPath = vi.fn();
 const syncReadText = vi.fn();
+const syncTasks = vi.fn();
+const syncTaskHistory = vi.fn();
 vi.mock("@/lib/ipc/client", () => ({
   syncBrowse: (id: unknown, subpath: unknown) => syncBrowse(id, subpath),
   syncOpenEntry: (id: unknown, subpath: unknown) => syncOpenEntry(id, subpath),
@@ -52,6 +60,22 @@ vi.mock("@/lib/ipc/client", () => ({
   syncReadFrontmatter: vi.fn(async () => ""),
   syncWriteFrontmatter: vi.fn(async () => ""),
   tagsVocabulary: vi.fn(async () => ({ entries: [] })),
+  // Story 59.12 gave `PanelTargetVm` a `task` variant, so the strip now mounts
+  // the Tasks pane's own `TaskDetail` — and with it that pane's module, its
+  // form, and everything either of them imports from this edge. The two the
+  // strip actually reaches are answered per test; the rest are here because a
+  // named import of an export this factory does not define is a module that
+  // will not load, and enumerating them is what keeps the reach visible.
+  syncTasks: () => syncTasks(),
+  syncTaskHistory: (id: unknown) => syncTaskHistory(id),
+  syncTaskRunNow: vi.fn(),
+  syncTaskSave: vi.fn(),
+  syncTaskForget: vi.fn(),
+  syncTasksSetEnabled: vi.fn(),
+  syncTasksForget: vi.fn(),
+  syncTaskSchedulePreview: vi.fn(),
+  syncPacedWork: vi.fn(),
+  syncProfiles: vi.fn(async () => []),
 }));
 
 import { EXPORT_FILE_LABEL } from "@/components/export/export-file-button";
@@ -63,12 +87,24 @@ import {
   PANEL_REASON_TESTID,
   PANEL_RESOLVING_SENTENCE,
   PANEL_STRIP_LABEL,
+  PANEL_TASK_UNREADABLE_SENTENCE,
   PANEL_TESTID,
   PANEL_UNFOLD_LABEL,
   PANEL_UNSUPPORTED_SENTENCE,
   PanelStrip,
   panelFileGoneSentence,
+  taskPanelGoneSentence,
+  taskPanelUnknownSentence,
 } from "@/components/layout/panel-strip";
+import {
+  TASK_EDIT_TEXT,
+  TASK_FORGET_TEXT,
+  TASK_HISTORY_TITLE,
+  TASK_HOST_LABEL,
+  TASK_RUN_NOW_TEXT,
+  TASK_SCHEDULE_LABEL,
+  TASKS_DETAIL_TESTID,
+} from "@/components/layout/tasks-pane";
 import { DOCUMENT_VIEWER_TESTID } from "@/components/viewers/document-viewer";
 import {
   MEDIA_VIEWER_ELEMENT_TESTID,
@@ -147,6 +183,8 @@ beforeEach(() => {
   syncOpenEntry.mockReset();
   revealPath.mockReset();
   syncReadText.mockReset();
+  syncTasks.mockReset();
+  syncTaskHistory.mockReset();
 });
 
 describe("the panel strip", () => {
@@ -928,5 +966,194 @@ describe("a file in a panel", () => {
     expect(
       screen.getByRole("button", { name: `${PANEL_UNFOLD_LABEL}: notes.md` }),
     ).toBeInTheDocument();
+  });
+});
+
+/**
+ * A task in a panel (Story 59.12).
+ *
+ * Three claims, and they are the three states a task target can be in. The
+ * first is the one the owner asked for; the other two are the ones a restart
+ * produces, because a panel list is persisted as identities and the record it
+ * names moves underneath it.
+ *
+ * The sentences are IMPORTED rather than spelled out here, unlike the Rust ones
+ * above: these two are composed in this module, so a test that re-derived them
+ * would agree with a typo. What is spelled out verbatim is `reason`, which is
+ * Rust's and must reach the screen unaltered.
+ */
+describe("a task in a panel", () => {
+  /** The sentence `keeper_core::tasks::task_host` composes for the app host. */
+  const SENTENCE_APP = "keeper runs this — only while keeper is running";
+
+  function task(over: Partial<TaskVm> = {}): TaskVm {
+    return {
+      id: "nightly",
+      kind: "sync",
+      mode: "scheduled",
+      enabled: true,
+      profileId: null,
+      profile: null,
+      schedule: "@daily",
+      onMissed: "run_now",
+      updatedMs: 1_000,
+      description: null,
+      missedDelayMs: null,
+      nextDueMs: 2_000,
+      runningHost: null,
+      leaseUntilMs: null,
+      lastRun: null,
+      host: { kind: "app", sentence: SENTENCE_APP, reason: null },
+      ...over,
+    } as TaskVm;
+  }
+
+  function taskListing(over: Partial<TaskListingVm> = {}): TaskListingVm {
+    return { tasks: [task()], unknown: [], ...over };
+  }
+
+  it("draws the task's facts and offers no control that would write", async () => {
+    syncTasks.mockResolvedValue(taskListing());
+    panelsStore.getState().setActiveTarget({ kind: "task", taskId: "nightly" });
+
+    await mount();
+
+    const detail = await screen.findByTestId(TASKS_DETAIL_TESTID);
+    expect(detail.dataset.taskId).toBe("nightly");
+    // The pane's own rendering, fact for fact — this panel draws `TaskDetail`
+    // and not a second, thinner idea of what a task is.
+    expect(within(detail).getByText("@daily")).toBeInTheDocument();
+    expect(within(detail).getByText(TASK_SCHEDULE_LABEL)).toBeInTheDocument();
+    expect(within(detail).getByText(TASK_HOST_LABEL)).toBeInTheDocument();
+    expect(within(detail).getByText(SENTENCE_APP)).toBeInTheDocument();
+
+    // And none of the three verbs. Absent, not disabled: the pane is the only
+    // writer, because `formSaving`/`deleting`/`running` are pane-wide precisely
+    // so two write surfaces over one task cannot undo each other, and a second
+    // host cannot see the first's in-flight flags.
+    for (const name of [TASK_RUN_NOW_TEXT, TASK_EDIT_TEXT, TASK_FORGET_TEXT]) {
+      expect(within(detail).queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+
+    // The panel names itself with the id, and keeps its own header: nothing
+    // below it has promised to draw the fold and the close.
+    const only = panelsStore.getState().panels[0];
+    if (only === undefined) {
+      throw new Error("expected one panel");
+    }
+    expect(screen.getByTestId(`${PANEL_TESTID}-${only.id}`)).toHaveAttribute(
+      "aria-label",
+      "nightly",
+    );
+    expect(screen.getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
+  });
+
+  it("keeps its place and names the task when the record no longer holds it", async () => {
+    // The restart case. The panel list is persisted as identities, so the task
+    // it names may have been forgotten — here or on another host sharing the
+    // record — between the write and the read. Dropping the panel would be the
+    // same mistake as an app that forgets your tabs because a file moved.
+    syncTasks.mockResolvedValue(taskListing({ tasks: [task({ id: "weekly" })] }));
+    panelsStore.getState().setActiveTarget({ kind: "task", taskId: "nightly" });
+
+    await mount();
+
+    await waitFor(() =>
+      expect(screen.getByTestId(PANEL_REASON_TESTID)).toHaveTextContent(
+        taskPanelGoneSentence("nightly"),
+      ),
+    );
+    expect(screen.queryByTestId(TASKS_DETAIL_TESTID)).not.toBeInTheDocument();
+    // Its place, and its way out: a sentence carries no fold and no close, so
+    // this panel keeps the header that does.
+    expect(panelsStore.getState().panels).toHaveLength(1);
+    expect(screen.getByRole("button", { name: PANEL_FOLD_LABEL })).toBeInTheDocument();
+  });
+
+  it("says a newer keeper wrote the row, in Rust's own words, for a task it cannot read", async () => {
+    // A different fact from having gone, and the one the reader can act on. The
+    // reason is composed where `db::list_tasks` failed to decode the row and is
+    // rendered verbatim — the pane's own *Written by a newer keeper* list shows
+    // the same string, and two surfaces wording one unreadable row differently
+    // is how a reader concludes they are two faults.
+    const REASON = "unknown task kind `transcribe`, written by a newer keeper";
+    syncTasks.mockResolvedValue(
+      taskListing({ tasks: [], unknown: [{ id: "nightly", reason: REASON }] }),
+    );
+    panelsStore.getState().setActiveTarget({ kind: "task", taskId: "nightly" });
+
+    await mount();
+
+    await waitFor(() =>
+      expect(screen.getByTestId(PANEL_REASON_TESTID)).toHaveTextContent(
+        taskPanelUnknownSentence(REASON),
+      ),
+    );
+    // And not the other sentence: a row that is present and undecodable must
+    // never be reported as absent.
+    expect(screen.queryByText(taskPanelGoneSentence("nightly"))).not.toBeInTheDocument();
+  });
+
+  it("says the record would not read, and never that the task is gone, when the read throws", async () => {
+    // The third unresolved state, and the one whose wrong answer is actionable
+    // in the worst way: told a task is gone, a person re-creates it. A rejection
+    // says nothing whatsoever about whether the task is still there.
+    syncTasks.mockRejectedValue(new TypeError("network down"));
+    panelsStore.getState().setActiveTarget({ kind: "task", taskId: "nightly" });
+
+    await mount();
+
+    await waitFor(() =>
+      expect(screen.getByTestId(PANEL_REASON_TESTID)).toHaveTextContent(
+        PANEL_TASK_UNREADABLE_SENTENCE,
+      ),
+    );
+    expect(screen.queryByText(taskPanelGoneSentence("nightly"))).not.toBeInTheDocument();
+
+    // And Rust's own sentence wins whenever there is one, because a refusal the
+    // engine worded is the only actionable half of a failed read.
+    syncTasks.mockRejectedValue({ code: "unsupported", message: "no task database here" });
+    panelsStore.getState().setActiveTarget({ kind: "task", taskId: "weekly" });
+    await waitFor(() =>
+      expect(screen.getByTestId(PANEL_REASON_TESTID)).toHaveTextContent("no task database here"),
+    );
+  });
+
+  it("re-reads a task's runs rather than re-showing the list it read before another task", async () => {
+    // The section is opened for A, the panel is previewed at B and then back at
+    // A. Nothing was toggled, so no token moved: without a body per task the
+    // retained state re-renders A's ORIGINAL runs as an open section — a run
+    // list `task_runs` may have trimmed since, presented as current.
+    syncTasks.mockResolvedValue(taskListing({ tasks: [task(), task({ id: "weekly" })] }));
+    syncTaskHistory.mockResolvedValue([]);
+    panelsStore.getState().setActiveTarget({ kind: "task", taskId: "nightly" });
+
+    await mount();
+    await screen.findByTestId(TASKS_DETAIL_TESTID);
+
+    const runs = screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: nightly` });
+    await act(async () => {
+      fireEvent.click(runs);
+      await Promise.resolve();
+    });
+    expect(syncTaskHistory).toHaveBeenCalledTimes(1);
+
+    // Away, and back. Each preview is a fresh body, so the section comes back
+    // closed and the runs come back unread.
+    await act(async () => {
+      panelsStore.getState().setActiveTarget({ kind: "task", taskId: "weekly" });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      panelsStore.getState().setActiveTarget({ kind: "task", taskId: "nightly" });
+      await Promise.resolve();
+    });
+
+    await screen.findByTestId(TASKS_DETAIL_TESTID);
+    expect(screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: nightly` })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(syncTaskHistory).toHaveBeenCalledTimes(1);
   });
 });

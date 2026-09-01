@@ -38,4 +38,10 @@ relativePath: string, } | { "kind": "recording",
  * already keys its rows by, and the only handle that outlives a retitle
  * of the session folder.
  */
-sessionId: string, };
+sessionId: string, } | { "kind": "task", 
+/**
+ * The task's id: its primary key in the task record, unchangeable once
+ * the task exists because every run joins on it, and the single
+ * argument every task verb takes.
+ */
+taskId: string, };

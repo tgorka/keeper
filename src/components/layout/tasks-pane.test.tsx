@@ -124,6 +124,7 @@ import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { countLabel } from "@/lib/count-label";
 import type {
   PacedWorkVm,
+  PanelTargetVm,
   TaskBatchReceiptVm,
   TaskListingVm,
   TaskRunVm,
@@ -141,6 +142,7 @@ import {
   syncTasksSetEnabled,
 } from "@/lib/ipc/client";
 import { resetColumnFoldForTest } from "@/lib/stores/column-fold";
+import { activePanel, panelsStore, resetPanelsStoreForTest, sameTarget } from "@/lib/stores/panels";
 import {
   SYNC_LIST_FOLDED_FALLBACK,
   SYNC_LIST_UNFOLDED_FALLBACK,
@@ -328,6 +330,9 @@ beforeEach(() => {
   // no rows at all. It leaked harmlessly only while that test happened to be
   // last in the file.
   resetColumnFoldForTest();
+  // The panel list is a module singleton and this pane now writes to it, so one
+  // test's preview would otherwise be the next test's starting arrangement.
+  resetPanelsStoreForTest();
 });
 
 afterEach(() => {
@@ -2667,6 +2672,10 @@ describe("a list of names, and one task at a time", () => {
     // And no WRITE either: a selection is not an action.
     expect(syncTasksSetEnabled).not.toHaveBeenCalled();
     expect(syncTasksForget).not.toHaveBeenCalled();
+    // Story 59.12 put a panel target behind the plain clicks above, and it does
+    // not weaken this claim: `setActiveTarget` is a store write, so the panel
+    // moved three times and the pane still issued exactly one read.
+    expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: "A" });
   });
 
   it("moves the selection with the arrow keys, and stops at both ends", async () => {
@@ -3246,5 +3255,166 @@ describe("several tasks at once", () => {
 
     expect(selectedRows()).toEqual(["A", "B"]);
     expect(tabStops()).toEqual(["A"]);
+  });
+});
+
+/**
+ * A task you can open in a tab (Story 59.12).
+ *
+ * The owner's report was that he *"could not click an element in the task list
+ * and see the details in a new tab"*. Clicking a row already worked and was
+ * already tested — it selects, and the pane's own sibling region draws the task
+ * — so what these assertions are about is the OTHER half: the panel list beside
+ * the pane, and the two gestures every browsing surface in this app already
+ * answers to.
+ *
+ * Asserted against `panelsStore` and nothing invented for the occasion. That is
+ * the point of the story: a task is an ordinary `PanelTargetVm`, so the preview
+ * and the open-beside are the same two store verbs a file row calls, and a test
+ * that measured them any other way would be testing a second idiom rather than
+ * proving there is not one.
+ */
+describe("a task you can open beside the list", () => {
+  /** What every panel is showing, left to right. */
+  function panelTargets(): (PanelTargetVm | null)[] {
+    return panelsStore.getState().panels.map((panel) => panel.target);
+  }
+
+  async function twoTasks(): Promise<void> {
+    answer(listing({ tasks: [task({ id: "A" }), task({ id: "B" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+  }
+
+  it("previews a task into the active panel on a plain click, without growing the list", async () => {
+    await twoTasks();
+
+    selectRow("A");
+
+    expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: "A" });
+    expect(panelsStore.getState().panels).toHaveLength(1);
+
+    // And a second plain click REPLACES rather than appends, which is what
+    // makes stepping down a list of twenty leave one panel and not twenty.
+    selectRow("B");
+
+    expect(panelTargets()).toEqual([{ kind: "task", taskId: "B" }]);
+  });
+
+  it("opens a task beside what was already open on a double click, and puts back what the click displaced", async () => {
+    await twoTasks();
+
+    // Pinned, so there is something under the next preview for the pin to put
+    // back. This is the arrangement a person is in after opening one task.
+    await act(async () => {
+      fireEvent.doubleClick(rowOption("A"));
+      await Promise.resolve();
+    });
+    expect(panelTargets()).toEqual([{ kind: "task", taskId: "A" }]);
+
+    // The gesture as the DOM delivers it: a real double click fires `click`
+    // first, so without `Panel.replaced` this would replace A with B and then
+    // open B beside itself — two panels of B, and A gone.
+    const rowB = rowOption("B");
+    await act(async () => {
+      fireEvent.click(rowB);
+      fireEvent.doubleClick(rowB);
+      await Promise.resolve();
+    });
+
+    expect(panelTargets()).toEqual([
+      { kind: "task", taskId: "A" },
+      { kind: "task", taskId: "B" },
+    ]);
+    expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: "B" });
+  });
+
+  it("leaves every panel alone for a modified click, which is a selection gesture only", async () => {
+    await twoTasks();
+
+    // A selected and its panel pinned, so a modifier click that leaked into the
+    // panel would be visible as a changed target rather than only as a count —
+    // and so the Cmd-click below grows a set rather than starting one.
+    selectRow("A");
+    await act(async () => {
+      fireEvent.doubleClick(rowOption("A"));
+      await Promise.resolve();
+    });
+    const before = panelTargets();
+
+    await clickRowWith("B", { metaKey: true });
+    expect(selectedRows()).toEqual(["A", "B"]);
+    expect(panelTargets()).toEqual(before);
+
+    // Back to A, so the Shift below measures a run that ENDS on B — the case
+    // where a leak into the panel would be visible, because the range's last
+    // row is not the row the panel is holding.
+    selectRow("A");
+    await clickRowWith("B", { shiftKey: true });
+    expect(selectedRows()).toEqual(["A", "B"]);
+    expect(panelTargets()).toEqual(before);
+
+    // Somebody assembling a selection to Forget did not ask for a panel, and
+    // the last Shift-click of a range is not the task they were looking at.
+    expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: "A" });
+    expect(sameTarget(panelTargets()[0] ?? null, { kind: "task", taskId: "A" })).toBe(true);
+  });
+
+  /**
+   * The invariant that makes two hosts over one task record safe.
+   *
+   * The pane's own detail region and a task panel are two hosts of one
+   * component, so they cannot word a fact differently — but they CAN be aimed
+   * at different tasks, and the story's claim is that only a gesture which
+   * asked for exactly that will do it. A single click keeps them in lockstep;
+   * the double click is the one that says *keep this one while I look at
+   * another*, which is the whole reason it exists.
+   *
+   * The panel side is read off the store rather than rendered, because
+   * `PanelStrip` is mounted beside this pane by `AppShell` and not by it: what
+   * this file owns is which target the pane PUTS there.
+   */
+  it("keeps the pane's detail region and the panel on one task until a gesture asks otherwise", async () => {
+    await twoTasks();
+
+    // A pinned panel to start from, and it is load-bearing rather than
+    // scene-setting: previewing into the panel a fresh keeper starts with
+    // records `was: null`, and the store deliberately PINS in place rather than
+    // appending when the thing a preview displaced was nothing. So a run that
+    // only ever previewed could never grow a second panel, and a test that
+    // started there would prove the opposite of what it claimed.
+    await act(async () => {
+      fireEvent.doubleClick(rowOption("A"));
+      await Promise.resolve();
+    });
+
+    // Lockstep. A plain click moves both, and does so for every row it lands
+    // on, so a reader stepping down the list never sees two different tasks.
+    for (const id of ["B", "A", "B"]) {
+      selectRow(id);
+      expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", id);
+      expect(activePanel(panelsStore.getState()).target).toEqual({ kind: "task", taskId: id });
+    }
+    expect(panelTargets()).toHaveLength(1);
+
+    // The one gesture that asks for a difference, delivered as the DOM delivers
+    // it: B is previewing over A, so pinning it puts A back and opens B beside.
+    const rowB = rowOption("B");
+    await act(async () => {
+      fireEvent.click(rowB);
+      fireEvent.doubleClick(rowB);
+      await Promise.resolve();
+    });
+
+    // The region followed the selection to B and still draws everything Story
+    // 59.1 put in it; the panel that was holding A is still holding A. Two
+    // subjects, and the reader asked for both of them.
+    const region = screen.getByTestId(TASKS_DETAIL_TESTID);
+    expect(region).toHaveAttribute("data-task-id", "B");
+    expect(within(region).getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeInTheDocument();
+    expect(panelTargets()).toEqual([
+      { kind: "task", taskId: "A" },
+      { kind: "task", taskId: "B" },
+    ]);
   });
 });

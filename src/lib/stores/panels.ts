@@ -264,6 +264,8 @@ export function sameTarget(a: PanelTargetVm | null, b: PanelTargetVm | null): bo
       return b.kind === "file" && a.profileId === b.profileId && a.relativePath === b.relativePath;
     case "recording":
       return b.kind === "recording" && a.sessionId === b.sessionId;
+    case "task":
+      return b.kind === "task" && a.taskId === b.taskId;
   }
 }
 
@@ -297,6 +299,11 @@ export function isRestorableTarget(target: PanelTargetVm): boolean {
       );
     case "recording":
       return target.sessionId !== "";
+    case "task":
+      // The id is the whole target, and Rust cannot mint an empty one — a task
+      // row is keyed by it. So an empty string here only ever arrived from a
+      // hand-edited cookie, and a panel restored on it could name nothing.
+      return target.taskId !== "";
   }
 }
 
@@ -394,6 +401,8 @@ function isTarget(value: unknown): value is PanelTargetVm {
       );
     case "recording":
       return "sessionId" in value && typeof value.sessionId === "string";
+    case "task":
+      return "taskId" in value && typeof value.taskId === "string";
     default:
       return false;
   }

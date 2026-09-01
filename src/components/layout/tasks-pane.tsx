@@ -94,6 +94,16 @@
  * name. Anything that genuinely could not be reused says so where it is: see
  * {@link TaskRow} for the `aria-current` → `aria-selected` flip and `select`
  * below for the one Files branch that has no Tasks analogue.
+ *
+ * **Story 59.12 let a task be opened in a tab.** The owner could click a row
+ * and read its detail beside the list, and could not keep one: *"nie mogle
+ * kliknac na element z task list i zobaczyc szczegolow w nowym tabie."* So
+ * `PanelTargetVm` grew a `task` variant and this pane answers the gesture pair
+ * every other browsing surface already answers to — a plain click previews into
+ * the active panel, a double click opens beside it — copied from
+ * `files-pane.tsx` for the reason 59.4's selection model was. The panel draws
+ * {@link TaskDetail}, this file's own component, with its write half switched
+ * off; see that component's header for why the pane stays the only writer.
  */
 import { ChevronRight, ListChecks } from "lucide-react";
 import type { MouseEvent as ReactMouseEvent } from "react";
@@ -122,6 +132,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { type CountNoun, countLabel, RUNS } from "@/lib/count-label";
 import type {
   PacedWorkVm,
+  PanelTargetVm,
   TaskBatchReceiptVm,
   TaskListingVm,
   TaskRunVm,
@@ -137,6 +148,7 @@ import {
   syncTasksSetEnabled,
 } from "@/lib/ipc/client";
 import { columnFoldStore } from "@/lib/stores/column-fold";
+import { panelsStore } from "@/lib/stores/panels";
 import { hydrateSyncListSizes } from "@/lib/stores/sync-detail";
 import { cn } from "@/lib/utils";
 
@@ -365,6 +377,18 @@ export const TASK_FORGET_TESTID = "task-forget-confirm";
  * named by its own entry in `SURFACE_COLUMNS`) and this apart.
  */
 export const TASKS_DETAIL_LABEL = "Task detail";
+
+/**
+ * What a task panel with nothing in it says (Story 59.12).
+ *
+ * `PanelStrip`'s own default names the gesture that fills a panel in the Files
+ * surface, and "click a file to open it" is the wrong instruction beside a list
+ * of task names. Sited here rather than in the strip for `notes-pane.tsx`'s
+ * reason: the sentence belongs to the surface that knows what its rows are, and
+ * the strip's prop exists exactly so that each host may say its own.
+ */
+export const TASKS_PANEL_EMPTY_SENTENCE =
+  "Nothing is open here yet. Double-click a task to open it beside the list.";
 
 /**
  * What the master list is called to a screen reader.
@@ -1216,6 +1240,7 @@ function TaskRow({
   tabIndex,
   optionRef,
   onRowClick,
+  onRowDoubleClick,
   onActivate,
 }: {
   task: TaskVm;
@@ -1232,6 +1257,9 @@ function TaskRow({
   optionRef: (element: HTMLDivElement | null) => void;
   /** The whole event, because the modifier is what decides the gesture. */
   onRowClick: (event: ReactMouseEvent<HTMLDivElement>, id: string) => void;
+  /** The whole event too, for the same reason: the guards a double click has to
+   *  pass are the ones a single click passes, and they are decoded in one place. */
+  onRowDoubleClick: (event: ReactMouseEvent<HTMLDivElement>, id: string) => void;
   /** Enter, which a `<button>` used to answer for nothing. */
   onActivate: (id: string) => void;
 }) {
@@ -1245,6 +1273,7 @@ function TaskRow({
       tabIndex={tabIndex}
       aria-selected={selected}
       onClick={(event) => onRowClick(event, task.id)}
+      onDoubleClick={(event) => onRowDoubleClick(event, task.id)}
       onKeyDown={(event) => {
         // Space belongs to the list's own handler, where the modifier that
         // makes it a toggle is decoded beside the arrows — one place for the
@@ -1299,37 +1328,64 @@ function TaskRow({
  * width"* — a sentence written against a region that did not exist yet. This is
  * that region; the sentence is honoured rather than amended.
  *
- * A region and not a panel: `PanelStrip`'s targets are documents opened in an
- * editor, and a task is not one. Nothing here enters `panelsStore`.
+ * # Two hosts, one rendering (Story 59.12)
+ *
+ * The paragraph that stood here said *"a region and not a panel: `PanelStrip`'s
+ * targets are documents opened in an editor, and a task is not one"*. The owner
+ * then asked for a task he could open in a tab, and 59.12 gave `PanelTargetVm`
+ * a `task` variant — so this component now has **two hosts**: the pane's own
+ * detail region, and a task panel in the strip beside it. Two hosts and ONE
+ * rendering, deliberately: two components over one task could word the same
+ * fact differently, which is the defect shape this codebase keeps closing.
+ *
+ * All of the difference between the two hosts is {@link TaskDetailVerbs}, and a
+ * host that does not write passes `null` rather than nine inert props. A `null`
+ * cannot drift; nine no-ops can, and the first one somebody wires up by mistake
+ * is a write from the host that must not write.
+ *
+ * **Why the panel does not write, in the words of the flag that decides it.**
+ * `writing` is `formSaving`, and `formSaving` is pane-wide *because* two write
+ * surfaces over one task undo each other: `upsert_task` inserts when the id is
+ * absent, so a Forget confirmed mid-save deletes a row the settling save then
+ * re-inserts. That rule is enforceable only by a host that can see its own
+ * in-flight writes, and a second host by definition cannot see the first's. So
+ * the pane writes and the panel reads, and the read-only host is expressed as
+ * the absence of the verbs rather than as a disabled copy of them.
+ *
+ * The `Runs` disclosure stays in both, which is that same rule rather than an
+ * exception to it: `sync_task_history` is a **read**, it takes the id and
+ * nothing else, and a detail that could not show a task's runs would be a
+ * strictly poorer copy of the region it is a copy of.
  */
-function TaskDetail({
-  task,
-  now,
-  refusal,
-  running,
-  deleting,
-  editing,
-  writing,
-  historyOpen,
-  historyRuns,
-  historyError,
-  onRunNow,
-  onEditToggle,
-  onSaved,
-  onSavingChange,
-  onForget,
-  onHistoryToggle,
-}: {
-  task: TaskVm;
-  now: number;
-  refusal: string | null;
+export interface TaskDetailVerbs {
   running: boolean;
   /** This task's own Forget is in flight, so a second confirm cannot re-issue it. */
   deleting: boolean;
   editing: boolean;
   /** A save is in flight somewhere in the pane — see `formSaving`. */
   writing: boolean;
-  /** Whether this task's runs are the pane's one open section. */
+  onRunNow: (id: string) => void;
+  onEditToggle: (id: string) => void;
+  onSaved: () => void;
+  onSavingChange: (saving: boolean) => void;
+  onForget: (id: string) => void;
+}
+
+export function TaskDetail({
+  task,
+  now,
+  refusal,
+  historyOpen,
+  historyRuns,
+  historyError,
+  onHistoryToggle,
+  heading = true,
+  verbs,
+}: {
+  task: TaskVm;
+  now: number;
+  refusal: string | null;
+  /** Whether this task's runs are the host's one open section. */
   historyOpen: boolean;
   /**
    * The runs read for this task: `null` while unread, `[]` for a task with none.
@@ -1339,13 +1395,32 @@ function TaskDetail({
    */
   historyRuns: TaskRunVm[] | null;
   historyError: string | null;
-  onRunNow: (id: string) => void;
-  onEditToggle: (id: string) => void;
-  onSaved: () => void;
-  onSavingChange: (saving: boolean) => void;
-  onForget: (id: string) => void;
   onHistoryToggle: (id: string) => void;
+  /**
+   * Whether the task's id is drawn as this region's heading.
+   *
+   * True in the pane, whose region is a section about exactly one task — the id
+   * is its title rather than one cell among five. False in a panel, which is
+   * already named twice over by the frame around it: the `aria-label` on its
+   * `<section>` and the header row under it. `PanelFrame` refuses a heading for
+   * a file for the reason that applies here word for word — *a second `h2`
+   * naming the same document would put two entries in a screen reader's heading
+   * list for one document* — and under the lockstep a plain click leaves, the
+   * pane's region beside the panel is holding the very same task, so the two
+   * entries would be the same word twice.
+   *
+   * Defaulted rather than required, because the heading is what this region has
+   * always drawn: a host that says nothing gets what Story 59.1 shipped.
+   */
+  heading?: boolean;
+  /** Everything that changes the task record, or `null` in a host that reads. */
+  verbs: TaskDetailVerbs | null;
 }) {
+  const editing = verbs?.editing ?? false;
+  // Both flags refuse the disclosure while a write to this task is on its way,
+  // and both are false in a host with no verbs — nothing it can do could be the
+  // write they are guarding against.
+  const busy = verbs !== null && (verbs.writing || verbs.deleting);
   const unhosted = task.host.kind === "unhosted";
   const report = taskReportText(task.lastRun);
   // Names the region the disclosure genuinely opens, which this project treats
@@ -1377,8 +1452,15 @@ function TaskDetail({
             <Badge variant="outline">{task.mode}</Badge>
             {/* The name, and the reason it is a heading here and a span in the
                 list: this region is about exactly one task, so the id is its
-                title rather than one cell among five. */}
-            <h2 className="truncate font-medium text-foreground text-sm">{task.id}</h2>
+                title rather than one cell among five. A panel draws the same
+                string with the same weight and no heading semantics — see
+                {@link heading}; the styling is one class list either way, so
+                the two hosts cannot come to look different. */}
+            {heading ? (
+              <h2 className="truncate font-medium text-foreground text-sm">{task.id}</h2>
+            ) : (
+              <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
+            )}
           </div>
           {/* The task's own words, when it has any (Story 59.5). Under the name
               because the name is what it describes, and absent when blank —
@@ -1393,45 +1475,50 @@ function TaskDetail({
             {task.profile ?? (task.profileId === null ? TASK_HOST_WIDE_TEXT : task.profileId)}
           </p>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={running}
-            onClick={() => onRunNow(task.id)}
-          >
-            {TASK_RUN_NOW_TEXT}
-          </Button>
-          {/* A disclosure, not a dialog: the same component the header reveals,
-              in the region it is about (AD-C7). Disabled while a save is in
-              flight for the reason the header's twin is — pressing it unmounts
-              the form Rust's answer has to land in. */}
-          <Button
-            ref={editTriggerRef}
-            type="button"
-            variant="outline"
-            size="sm"
-            aria-expanded={editing}
-            disabled={writing}
-            onClick={() => onEditToggle(task.id)}
-          >
-            {TASK_EDIT_TEXT}
-          </Button>
-          {/* Refused twice over while a write is on its way: `upsert_task`
-              inserts when the id is absent, so a deletion confirmed mid-save is
-              undone by the save settling behind it. `deleting` is the second
-              confirm of the same delete. */}
-          <Button
-            type="button"
-            variant="destructive"
-            size="sm"
-            disabled={writing || deleting}
-            onClick={() => onForget(task.id)}
-          >
-            {TASK_FORGET_TEXT}
-          </Button>
-        </div>
+        {/* Absent, not disabled, in a read-only host: a disabled control says
+            *not now*, and in a task panel the truth is *not here* — see this
+            component's header for why the pane is the only writer. */}
+        {verbs !== null && (
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={verbs.running}
+              onClick={() => verbs.onRunNow(task.id)}
+            >
+              {TASK_RUN_NOW_TEXT}
+            </Button>
+            {/* A disclosure, not a dialog: the same component the header reveals,
+                in the region it is about (AD-C7). Disabled while a save is in
+                flight for the reason the header's twin is — pressing it unmounts
+                the form Rust's answer has to land in. */}
+            <Button
+              ref={editTriggerRef}
+              type="button"
+              variant="outline"
+              size="sm"
+              aria-expanded={verbs.editing}
+              disabled={verbs.writing}
+              onClick={() => verbs.onEditToggle(task.id)}
+            >
+              {TASK_EDIT_TEXT}
+            </Button>
+            {/* Refused twice over while a write is on its way: `upsert_task`
+                inserts when the id is absent, so a deletion confirmed mid-save is
+                undone by the save settling behind it. `deleting` is the second
+                confirm of the same delete. */}
+            <Button
+              type="button"
+              variant="destructive"
+              size="sm"
+              disabled={verbs.writing || verbs.deleting}
+              onClick={() => verbs.onForget(task.id)}
+            >
+              {TASK_FORGET_TEXT}
+            </Button>
+          </div>
+        )}
       </div>
 
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
@@ -1532,7 +1619,7 @@ function TaskDetail({
         // one of these is on screen now, because the name a reader hears should
         // not depend on how many happen to be mounted.
         aria-label={`${TASK_HISTORY_TITLE}: ${task.id}`}
-        disabled={writing || deleting}
+        disabled={busy}
         onClick={() => onHistoryToggle(task.id)}
         className="self-start"
       >
@@ -1555,14 +1642,18 @@ function TaskDetail({
       {/* Capped where the region is not, the Sync pane's reason: a form is read
           line by line, and a label-and-field pair stretched across a wide
           window is worse than one that sits still. */}
-      {editing && (
+      {/* `editing` rather than `verbs.editing`: it is the same value — see its
+          declaration — and it keeps the guard a null check rather than a member
+          access the linter would rewrite into an optional chain that no longer
+          narrows `verbs` for the form below. */}
+      {verbs !== null && editing && (
         <Card size="sm" className="w-full max-w-[720px]">
           <CardContent>
             <TaskForm
               task={task}
-              onSaved={onSaved}
-              onCancel={() => onEditToggle(task.id)}
-              onSavingChange={onSavingChange}
+              onSaved={verbs.onSaved}
+              onCancel={() => verbs.onEditToggle(task.id)}
+              onSavingChange={verbs.onSavingChange}
             />
           </CardContent>
         </Card>
@@ -2434,33 +2525,77 @@ export function TasksPane() {
   };
 
   /**
+   * What a row's click is allowed to do to the panel beside the list (Story
+   * 59.12), `files-pane.tsx:2102-2131`'s rule, branch for branch.
+   *
+   * A modified click belongs to the selection model and never to the panel:
+   * somebody assembling a five-task selection to Forget does not want five
+   * panels, and the last Shift-click of a range is not the task they were
+   * looking at. A click that landed on a control is that control's — no row
+   * carries one today, and Story 59.1's invariant says none ever will, but this
+   * is the line that keeps the invariant's next reader honest.
+   *
+   * The target is composed here and nowhere else, so the preview and the
+   * open-beside below cannot come to disagree about which task a gesture named.
+   */
+  const clickTarget = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>, id: string): PanelTargetVm | null => {
+      if (event.metaKey || event.ctrlKey || event.shiftKey) {
+        return null;
+      }
+      if (event.target instanceof Element && event.target.closest("button") !== null) {
+        return null;
+      }
+      return { kind: "task", taskId: id };
+    },
+    [],
+  );
+
+  /**
    * What a row's own click means (Story 59.4), `files-pane.tsx:2146-2163`'s
-   * decoding.
+   * decoding, with 59.12's panel half beside it.
    *
    * `metaKey || ctrlKey` is checked **before** `shiftKey`, and the two are one
    * branch rather than two: on any given machine one of them is the wrong
    * platform, and a browser that honoured only Cmd would leave every Linux user
    * without a toggle.
    *
-   * The button guard is copied even though no row carries a control today —
-   * Story 59.1's invariant says none ever will, and this is the line that would
-   * keep the invariant's *next* reader honest if one appeared: a control's click
-   * is that control's, never a selection gesture.
+   * Two things at once because they are one gesture, and the split between them
+   * is {@link clickTarget}: the selection branch runs for every click including
+   * the modified ones, and the panel branch runs only for a plain click that
+   * did not land on a control. Previewing rather than opening, so a person
+   * stepping down a list of twenty is left with one panel and not twenty.
    */
   const handleRowClick = useCallback(
     (event: ReactMouseEvent<HTMLDivElement>, id: string) => {
-      if (event.target instanceof Element && event.target.closest("button") !== null) {
-        return;
+      if (!(event.target instanceof Element && event.target.closest("button") !== null)) {
+        let mode: "replace" | "toggle" | "extend" = "replace";
+        if (event.metaKey || event.ctrlKey) {
+          mode = "toggle";
+        } else if (event.shiftKey) {
+          mode = "extend";
+        }
+        select(id, mode);
       }
-      let mode: "replace" | "toggle" | "extend" = "replace";
-      if (event.metaKey || event.ctrlKey) {
-        mode = "toggle";
-      } else if (event.shiftKey) {
-        mode = "extend";
+      const target = clickTarget(event, id);
+      if (target !== null) {
+        panelsStore.getState().setActiveTarget(target);
       }
-      select(id, mode);
     },
-    [select],
+    [clickTarget, select],
+  );
+
+  /** Double click: open this task BESIDE what is already open. The single click
+   *  that necessarily preceded it is undone by the store, so the task that was
+   *  showing comes back rather than being replaced by a second copy of this one. */
+  const handleRowDoubleClick = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>, id: string) => {
+      const target = clickTarget(event, id);
+      if (target !== null) {
+        panelsStore.getState().openPanel(target);
+      }
+    },
+    [clickTarget],
   );
 
   /**
@@ -2818,6 +2953,7 @@ export function TasksPane() {
                           rowRefs.current[index] = element;
                         }}
                         onRowClick={handleRowClick}
+                        onRowDoubleClick={handleRowDoubleClick}
                         // Enter, and a plain replace: re-choosing the task
                         // already open costs nothing now, because the effect
                         // that closes a form keys off the resolved id rather
@@ -2889,9 +3025,13 @@ export function TasksPane() {
         </section>
         {list.seam}
 
-        {/* Level 2 — one task at a time. A plain sibling region and NOT a
-            `PanelStrip`: that strip's targets are documents opened in an editor
-            and a task is not one, so nothing here enters `panelsStore`. */}
+        {/* Level 2 — one task at a time, and still the pane's own region rather
+            than the strip beside it (Story 59.12). The two are not rivals: this
+            region follows the selection, a panel holds the task somebody asked
+            to keep, and the only gesture that makes them differ is the double
+            click that asked for exactly that. Deleting this region in favour of
+            the strip would take Story 59.1's level 2 away from every reader who
+            never double-clicks anything. */}
         <section
           aria-label={TASKS_DETAIL_LABEL}
           className="flex min-w-0 flex-1 flex-col bg-background"
@@ -2967,35 +3107,40 @@ export function TasksPane() {
                   task={selectedTask}
                   now={now}
                   refusal={refusals[selectedTask.id] ?? null}
-                  running={running[selectedTask.id] === true}
-                  deleting={deleting[selectedTask.id] === true}
-                  editing={editingId === selectedTask.id}
-                  writing={formSaving}
+                  // The pane is the writing host, so it passes all nine — see
+                  // {@link TaskDetailVerbs} for why the panel beside it passes
+                  // `null` instead of nine inert copies of them.
+                  verbs={{
+                    running: running[selectedTask.id] === true,
+                    deleting: deleting[selectedTask.id] === true,
+                    editing: editingId === selectedTask.id,
+                    writing: formSaving,
+                    onRunNow: (id) => void runNow(id),
+                    // Opening an edit form closes this task's runs, the mirror of
+                    // `toggleHistory` closing the form: one of the two, never both.
+                    onEditToggle: (id) => {
+                      setEditingId((open) => (open === id ? null : id));
+                      if (historyRef.current?.id === id) {
+                        historyToken.current += 1;
+                        openHistory(null);
+                      }
+                    },
+                    onSaved: () => {
+                      setEditingId(null);
+                      void refresh();
+                    },
+                    onSavingChange: setFormSaving,
+                    onForget: (id) => {
+                      setForgetSubject({ kind: "one", id });
+                      setForgetAsking(true);
+                    },
+                  }}
                   // All three read the ONE slot, so the region can never be
                   // handed another task's runs: the id and the runs it belongs
                   // to move together or not at all.
                   historyOpen={history?.id === selectedTask.id}
                   historyRuns={history?.id === selectedTask.id ? history.runs : null}
                   historyError={history?.id === selectedTask.id ? history.error : null}
-                  onRunNow={(id) => void runNow(id)}
-                  // Opening an edit form closes this task's runs, the mirror of
-                  // `toggleHistory` closing the form: one of the two, never both.
-                  onEditToggle={(id) => {
-                    setEditingId((open) => (open === id ? null : id));
-                    if (historyRef.current?.id === id) {
-                      historyToken.current += 1;
-                      openHistory(null);
-                    }
-                  }}
-                  onSaved={() => {
-                    setEditingId(null);
-                    void refresh();
-                  }}
-                  onSavingChange={setFormSaving}
-                  onForget={(id) => {
-                    setForgetSubject({ kind: "one", id });
-                    setForgetAsking(true);
-                  }}
                   onHistoryToggle={toggleHistory}
                 />
               )
