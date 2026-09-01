@@ -1146,6 +1146,26 @@ pub struct Engine {
     /// [`REPAIR_MEMO_TTL`], and the sweep that drains it publishes its own
     /// progress, so a slightly old answer here is honest.
     repair_memo: Mutex<HashMap<String, (Instant, Vec<PathBuf>)>>,
+    /// Per profile, the paths a repair pass has already failed to convert.
+    ///
+    /// The sweep's termination argument is "one commit converts each such file
+    /// once, after which blob and attributes agree". A path for which that is
+    /// false — an empty blob, a symlink, or any shape not yet enumerated — is
+    /// re-found by every later pass, re-staged, re-committed into a commit that
+    /// lands nothing, and re-found again. Measured on the owner's `tgdrive`:
+    /// 35 such paths held the sweep and a 155 625-entry status walk at a steady
+    /// core of CPU from 2026-08-28 to 2026-09-01, with the last commit in the
+    /// folder dated the moment the backlog stopped shrinking.
+    ///
+    /// [`lfs::stage::repairable_entry`] rejects the two known shapes before
+    /// they ever reach a commit; this is the general backstop, and it is
+    /// populated only by evidence — a path goes in when a commit has demonstrably
+    /// left it as it was ([`lfs::stage::unconverted_after_repair`]).
+    ///
+    /// In memory rather than in the database on purpose: it costs one wasted
+    /// pass per boot to re-establish, and a shape that becomes repairable after
+    /// a fix must not stay excluded by a record nobody knows to clear.
+    repair_quarantine: Mutex<HashMap<String, HashSet<PathBuf>>>,
 
     /// Profiles with a full-tree status walk in flight.
     ///
@@ -1338,6 +1358,7 @@ impl Engine {
             walk_report_interval: WALK_REPORT_INTERVAL,
             repair_cursor: Mutex::new(HashMap::new()),
             repair_memo: Mutex::new(HashMap::new()),
+            repair_quarantine: Mutex::new(HashMap::new()),
             walking: Mutex::new(std::collections::HashSet::new()),
             untracked_sweep: Mutex::new(HashMap::new()),
             untracked_appeared: Mutex::new(HashSet::new()),
@@ -5953,6 +5974,46 @@ impl Engine {
             .insert(profile_id.to_owned(), (Instant::now(), found.to_vec()));
     }
 
+    /// The paths this profile's repair passes must not offer again.
+    ///
+    /// Cloned rather than borrowed because the Pending leg consults it from a
+    /// `spawn_blocking` closure that outlives any lock this could hand out, and
+    /// the set is the handful of paths a commit has refused — not the backlog.
+    fn repair_skip(&self, profile_id: &str) -> HashSet<PathBuf> {
+        Self::lock(&self.repair_quarantine)
+            .get(profile_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Record paths a repair commit demonstrably did not change.
+    ///
+    /// Said at `warn` once per batch that produces any: a folder holding these
+    /// is a folder whose Pending count will never reach zero on its own, and
+    /// the paths name what a human would have to fix. Silence here is what let
+    /// three days of a spinning core look like ordinary sync activity.
+    fn quarantine_repair(&self, profile: &SyncProfile, unconverted: &[PathBuf]) {
+        // One example is named because the count alone does not tell a human
+        // which folder to look in; the rest are recoverable from the same rule.
+        let Some(example) = unconverted.first() else {
+            return;
+        };
+        let total = {
+            let mut held = Self::lock(&self.repair_quarantine);
+            let set = held.entry(profile.id.clone()).or_default();
+            set.extend(unconverted.iter().cloned());
+            set.len()
+        };
+        tracing::warn!(
+            profile = profile.name,
+            batch = unconverted.len(),
+            quarantined = total,
+            path = %example.display(),
+            "a commit left these files exactly as they were although this folder's rules filter \
+             them; they cannot be rewritten as pointers and will not be attempted again"
+        );
+    }
+
     /// A bounded batch of paths whose committed blob contradicts their
     /// attributes, or `None` when there are none.
     ///
@@ -5985,6 +6046,7 @@ impl Engine {
             from,
             REPAIR_WINDOW,
             REPAIR_BATCH,
+            &self.repair_skip(&profile.id),
         );
         Self::lock(&self.repair_cursor).insert(profile.id.clone(), next);
         if found.is_empty() {
@@ -6029,9 +6091,12 @@ impl Engine {
         // read and a filter round trip *per walk* until it is committed, which
         // is what turned this folder's 84-second stat floor into 25 to 74
         // minutes. The index knows the answer for nothing.
-        let staged = match self.repair_recorded_pointers(profile)? {
-            Some(repair) => repair,
-            None => self.collect_stable_changes(profile)?,
+        // Which leg produced the change matters after the commit, not before:
+        // only a repair can land a commit that changes nothing, and only then
+        // is there anything to quarantine.
+        let (staged, is_repair) = match self.repair_recorded_pointers(profile)? {
+            Some(repair) => (repair, true),
+            None => (self.collect_stable_changes(profile)?, false),
         };
         if staged.is_empty() {
             return Ok(0);
@@ -6046,6 +6111,19 @@ impl Engine {
         self.publish(event);
         self.commit(profile, &staged, source, push_unit)?;
         self.bump_counters(&profile.id, |counters| counters.commits += 1);
+        // The sweep's whole termination argument is that one commit converts
+        // each path once. Checking rather than assuming it is what turns a
+        // permanent loop into a bounded one: whatever the commit did not
+        // change, no identical later attempt will. A repository that will not
+        // reopen here simply leaves the paths unquarantined — the next pass
+        // pays for them again, which is the pre-existing behaviour and not
+        // worth failing a durable commit over.
+        if is_repair {
+            if let Ok(repo) = self.open_repo(profile) {
+                let unconverted = lfs::stage::unconverted_after_repair(&repo, &staged.modified);
+                self.quarantine_repair(profile, &unconverted);
+            }
+        }
         // The commit is durable, so every staged path landed. Reporting it
         // leaves the bar full rather than stranded mid-way when the phase
         // changes underneath it.
@@ -11291,6 +11369,40 @@ impl Engine {
     /// because it is the reason the file is not moving. Saying "modified"
     /// about a file the engine is deliberately holding would make the user
     /// think sync was broken.
+    /// Is a full status walk worth starting for a Pending poll of this folder?
+    ///
+    /// The claim below stops two walks of one folder running at once; this
+    /// stops the poll starting a walk that cannot tell it anything. Two shapes
+    /// answer no, and both were measured on the owner's machine:
+    ///
+    /// * **A paused folder.** `profile.enabled` is the folder's pause switch,
+    ///   and nothing about a paused folder is going to be committed. Paying a
+    ///   full-tree walk for it every five seconds is the poll spending the
+    ///   folder's whole cost for a list nobody is going to act on.
+    /// * **A folder whose first copy never finished.** `HEAD` holds a tree and
+    ///   the index holds nothing, so the walk diffs that whole tree against
+    ///   nothing and emits one deletion per tracked path — a conclusion two
+    ///   integers already state. [`Self::collect_stable_changes`] has refused
+    ///   this since Story 56.15 and gives the arithmetic; the poll was the leg
+    ///   that leg's fix did not reach.
+    ///
+    /// Both were true of `tgdrive-light` at once, and the result is what a
+    /// five-second poll does with a walk that can never converge: passes of
+    /// **310 898 emitted items** — 155 625 tree paths read as deleted plus
+    /// every worktree file read as untracked — one every ten to seventeen
+    /// seconds, for as long as the folder stayed in that state. It outlived the
+    /// pause by hours, because this is the one leg that never asked.
+    ///
+    /// Losing the walk costs the poll only its untracked rows, exactly as
+    /// losing the claim does — the settling rows and the repair backlog are
+    /// assembled before this is asked.
+    ///
+    /// Free in the healthy case: a bool, then one `exists()` and a 12-byte
+    /// read of the index header (see [`Self::first_checkout_is_unfinished`]).
+    fn poll_may_walk(&self, profile: &SyncProfile) -> bool {
+        profile.enabled && !self.first_checkout_is_unfinished(profile)
+    }
+
     pub async fn pending(&self, profile_id: &str) -> Result<Vec<PendingFile>> {
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
             return Err(SyncError::Config(format!(
@@ -11398,6 +11510,11 @@ impl Engine {
                         .get(&profile.id)
                         .copied()
                         .unwrap_or(0);
+                    // The same exclusions the sweep uses, for the same reason
+                    // and one more: a path no commit can convert is not work
+                    // anybody is waiting on, and listing it leaves Pending
+                    // showing a count that never reaches zero.
+                    let skip = self.repair_skip(&profile.id);
                     let found = tokio::task::spawn_blocking(move || -> Vec<PathBuf> {
                         if !filtered {
                             return Vec::new();
@@ -11414,6 +11531,7 @@ impl Engine {
                             from,
                             REPAIR_WINDOW,
                             PENDING_LIST_CAP,
+                            &skip,
                         )
                         .0
                     })
@@ -11453,7 +11571,7 @@ impl Engine {
         // the untracked rows; the settling rows and the repair backlog above
         // are already assembled, and the walk that does hold the claim is
         // computing the same verdicts for the commit path anyway.
-        let walk_claim = (is_repository && repair.is_empty())
+        let walk_claim = (is_repository && repair.is_empty() && self.poll_may_walk(&profile))
             .then(|| self.claim_walk(profile_id))
             .flatten();
         if walk_claim.is_some() {
@@ -16916,10 +17034,113 @@ mod tests {
         // not come back on the repair list.
         let repo = engine.open_repo(&p).expect("open");
         assert!(
-            lfs::stage::mismatched_filtered_paths(&repo, &[PathBuf::from("small.gif")], 0, 10, 10,)
-                .0
-                .is_empty(),
+            lfs::stage::mismatched_filtered_paths(
+                &repo,
+                &[PathBuf::from("small.gif")],
+                0,
+                10,
+                10,
+                &HashSet::new(),
+            )
+            .0
+            .is_empty(),
             "a repaired path must not be repaired again"
+        );
+    }
+
+    /// A repair the repository refuses is offered exactly once.
+    ///
+    /// The sweep terminates only because "one commit converts each such file
+    /// once, after which blob and attributes agree". When that is false for a
+    /// path the whole thing inverts: the pass re-finds it, re-stages it,
+    /// commits nothing, and re-finds it on the next tick — forever, at the
+    /// price of a full attribute pass over the folder each time. Measured on
+    /// the owner's `tgdrive`, 35 such paths held a core and a 155 625-entry
+    /// walk busy for three days with the folder's last commit dated the day
+    /// the backlog stopped shrinking.
+    ///
+    /// So the commit's *effect* is checked rather than its return value —
+    /// [`lfs::stage::unconverted_after_repair`] — and what it did not move is
+    /// never offered again.
+    #[test]
+    fn a_repair_that_changes_nothing_is_never_offered_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_threshold_bytes = 1_000_000;
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+
+        // The same recorded inconsistency the sweep exists for, seeded the way
+        // the field produced it: the rule filters every `.gif`, and the blob is
+        // the file's own bytes.
+        std::fs::write(
+            p.local_path.join(".gitattributes"),
+            "*.gif filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .expect("rule");
+        std::fs::write(p.local_path.join("small.gif"), vec![3u8; 512]).expect("write");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p.local_path)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&[
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=cat",
+            "-c",
+            "filter.lfs.required=false",
+            "add",
+            ".gitattributes",
+            "small.gif",
+        ]);
+        git(&[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "raw",
+        ]);
+
+        assert_eq!(
+            engine
+                .repair_recorded_pointers(&p)
+                .expect("sweep")
+                .map(|staged| staged.modified),
+            Some(vec![PathBuf::from("small.gif")]),
+            "the first pass has to find it — that part was never wrong"
+        );
+
+        // What `commit_local` does after a repair commit, standing in for a
+        // commit that landed nothing for this path: ask the index, not the
+        // commit, whether anything actually moved.
+        let repo = engine.open_repo(&p).expect("open");
+        let unconverted =
+            lfs::stage::unconverted_after_repair(&repo, &[PathBuf::from("small.gif")]);
+        assert_eq!(
+            unconverted,
+            vec![PathBuf::from("small.gif")],
+            "nothing has committed it, so it is still exactly as the sweep found it"
+        );
+        engine.quarantine_repair(&p, &unconverted);
+
+        assert!(
+            engine
+                .repair_recorded_pointers(&p)
+                .expect("sweep")
+                .is_none(),
+            "a path a commit did not move must not be staged a second time"
         );
     }
 
@@ -17039,6 +17260,94 @@ mod tests {
                 .iter()
                 .any(|row| row.path == "fresh.txt" && row.reason == PendingReason::Untracked),
             "an untracked path is only discoverable by walking: {pending:?}"
+        );
+    }
+
+    /// A paused folder is not walked by the poll either.
+    ///
+    /// `enabled` is the folder's pause switch, and nothing about a paused
+    /// folder is going to be committed — so a full-tree walk every five
+    /// seconds buys a list nobody can act on. The fixture is deliberately the
+    /// one from `a_pending_poll_with_no_backlog_still_walks`, which walks:
+    /// the pause is the only difference between them.
+    #[tokio::test]
+    async fn a_pending_poll_does_not_walk_a_paused_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let mut p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        std::fs::write(p.local_path.join("fresh.txt"), b"new").expect("write");
+
+        p.enabled = false;
+        engine.upsert_profile(&p).expect("pause");
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+        engine.pending(&p.id).await.expect("pending");
+
+        let phases: Vec<SyncPhase> = Engine::lock(&published)
+            .iter()
+            .map(|event| event.phase)
+            .collect();
+        assert!(
+            !phases.contains(&SyncPhase::Scanning),
+            "a paused folder must not be walked by a five-second poll: {phases:?}"
+        );
+    }
+
+    /// Nor is a folder whose first copy never finished.
+    ///
+    /// `HEAD` holds a tree and the index holds nothing, so the walk diffs that
+    /// whole tree against nothing and calls every tracked path deleted — which
+    /// two integers already said. `collect_stable_changes` has refused this
+    /// since Story 56.15; the poll is the leg that fix did not reach, and on
+    /// the owner's `tgdrive-light` it kept 310 898-item passes running every
+    /// ten to seventeen seconds — hours after the folder had been paused, and
+    /// with the repair blocked so the state could not clear itself.
+    #[tokio::test]
+    async fn a_pending_poll_does_not_walk_a_folder_whose_first_copy_never_finished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        std::fs::write(p.local_path.join("fresh.txt"), b"new").expect("write");
+
+        // The state itself: commits, a worktree, and no index.
+        std::fs::remove_file(p.local_path.join(".git/index")).expect("drop the index");
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+        // It still answers — the poll is not an error path — it just answers
+        // from what it already holds.
+        engine.pending(&p.id).await.expect("pending");
+
+        let phases: Vec<SyncPhase> = Engine::lock(&published)
+            .iter()
+            .map(|event| event.phase)
+            .collect();
+        assert!(
+            !phases.contains(&SyncPhase::Scanning),
+            "a walk here can only report every tracked path as deleted: {phases:?}"
         );
     }
 

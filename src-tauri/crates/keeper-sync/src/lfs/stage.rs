@@ -33,7 +33,7 @@
 //! without hashing gigabytes twice.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -1314,33 +1314,106 @@ pub fn is_false_modification(repo: &gix::Repository, rela: &Path, absolute: &Pat
 /// Every failure — unreadable `core.attributesFile`, an attribute stack that
 /// cannot descend to the path — answers `false`, i.e. "do not dismiss". See
 /// [`is_false_modification`] for why that is the only safe direction.
+///
+/// The one-path form of [`LfsRouting`], for the two callers that ask about a
+/// single path and then stop. Anything asking in a loop must hold the stack
+/// itself; that type's doc says what building one costs.
 fn routed_through_lfs(
     repo: &gix::Repository,
     index: &gix::index::State,
     key: &str,
     mode: gix::index::entry::Mode,
 ) -> bool {
-    let source = gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping;
-    let Ok(mut stack) = repo.attributes_only(index, source) else {
+    LfsRouting::new(repo, index).is_some_and(|mut routing| routing.routes(key, mode))
+}
+
+/// One repository's attribute stack, held across many `filter=lfs` questions.
+///
+/// [`gix::Repository::attributes_only`] is not a lookup, it is a build: it
+/// assembles the attribute sources and then runs `id_mappings_from_index`,
+/// which walks **every entry in the index**. Asking it per path therefore made
+/// each path cost O(index), and on the owner's 155 625-entry `tgdrive` that is
+/// what the repair sweep spent its time on — 1321 of the 1606 samples inside
+/// [`mismatched_filtered_paths`] in a 2.9 s profile were building stacks, not
+/// using them, at a steady core of CPU for as long as the folder was mounted.
+///
+/// Held for the whole pass instead. That is also what finally makes the
+/// ordering note in [`mismatched_filtered_paths`] true: "free for every path
+/// whose directory was already resolved" describes a stack that survives
+/// between paths, and there was not one.
+///
+/// The [`gix::attrs::search::Outcome`] rides along and is safe to reuse —
+/// `matching_attributes` re-initializes it against the current collection on
+/// every call, which both clears the previous path's matches and picks up
+/// attribute names introduced by a `.gitattributes` loaded deeper in the walk.
+struct LfsRouting<'repo> {
+    stack: gix::AttributeStack<'repo>,
+    outcome: gix::attrs::search::Outcome,
+}
+
+impl<'repo> LfsRouting<'repo> {
+    /// Build the stack once, or `None` when the repository's attribute
+    /// configuration cannot be read — the failure the per-path version
+    /// answered `false` for, hoisted to the one place it can now happen.
+    fn new(repo: &'repo gix::Repository, index: &gix::index::State) -> Option<Self> {
+        let source = gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping;
+        let stack = repo.attributes_only(index, source).ok()?;
+        // Only `filter` is collected, so the outcome holds one slot rather than
+        // one per attribute the repository happens to define.
+        let outcome = stack.selected_attribute_matches(["filter"]);
+        Some(Self { stack, outcome })
+    }
+
+    /// Does `.gitattributes` route `key` through the LFS filter?
+    ///
+    /// `key` is the slash-separated index key, which is also the spelling the
+    /// attribute stack matches patterns against. A path the stack cannot
+    /// descend to answers `false`, for [`routed_through_lfs`]'s reason.
+    fn routes(&mut self, key: &str, mode: gix::index::entry::Mode) -> bool {
+        let Ok(platform) = self
+            .stack
+            .at_entry(gix::bstr::BStr::new(key.as_bytes()), Some(mode))
+        else {
+            return false;
+        };
+        // The returned bool only says whether some pattern matched at all, which
+        // is not the question: an explicitly unset or unspecified `filter` is a
+        // perfectly good "not routed". The resolved state is what decides.
+        platform.matching_attributes(&mut self.outcome);
+        self.outcome.iter_selected().any(|attribute| {
+            attribute.assignment.state.as_bstr() == Some(gix::bstr::BStr::new(LFS_FILTER_DRIVER))
+        })
+    }
+}
+
+/// Could a repair pass ever turn this index entry into a pointer?
+///
+/// Two shapes read as "filtered, and its blob is not a pointer" forever, and
+/// neither is a defect any commit can fix:
+///
+/// * **Anything that is not a regular file.** git runs no filter on a symlink,
+///   a gitlink or a sparse directory: the blob is the link target or the
+///   submodule's commit id and it is already what it should be. Attributes
+///   match on the path alone, so a single `*.so` rule is enough to sweep a
+///   symlink into the list.
+/// * **The empty blob.** [`blob_could_be_a_pointer`] refuses zero bytes on
+///   purpose — see its note — so every empty tracked file reads as "not a
+///   pointer", and none of them can become one: an empty file has no content
+///   to route through LFS, and staging it produces the same empty blob again.
+///
+/// Measured on the owner's `tgdrive`: 34 empty blobs and one symlink under
+/// LFS-routed patterns were the *entire* repair backlog from 2026-08-28
+/// onward. They kept the sweep — and with it a full status walk of 155 625
+/// entries — running every ten to seventeen seconds for three days while not
+/// one commit landed.
+///
+/// Cheap enough to ask first: a mode comparison and a hash comparison against
+/// a constant, with no attribute stack and no object database behind either.
+fn repairable_entry(mode: gix::index::entry::Mode, blob: gix::hash::ObjectId) -> bool {
+    if mode != gix::index::entry::Mode::FILE && mode != gix::index::entry::Mode::FILE_EXECUTABLE {
         return false;
-    };
-    // Only `filter` is collected, so the outcome holds one slot rather than
-    // one per attribute the repository happens to define.
-    let mut outcome = stack.selected_attribute_matches(["filter"]);
-    let Ok(platform) = stack.at_entry(gix::bstr::BStr::new(key.as_bytes()), Some(mode)) else {
-        return false;
-    };
-    // The returned bool only says whether some pattern matched at all, which
-    // is not the question: an explicitly unset or unspecified `filter` is a
-    // perfectly good "not routed". The resolved state is what decides.
-    platform.matching_attributes(&mut outcome);
-    // Bound to a local rather than returned as the block's tail expression:
-    // `iter_selected` borrows `outcome`, and a tail temporary is dropped AFTER
-    // the block's locals, so returning it directly outlives what it reads.
-    let routed = outcome.iter_selected().any(|attribute| {
-        attribute.assignment.state.as_bstr() == Some(gix::bstr::BStr::new(LFS_FILTER_DRIVER))
-    });
-    routed
+    }
+    !blob.is_empty_blob()
 }
 
 /// Does `HEAD` already record `blob` for `rela`?
@@ -1411,18 +1484,30 @@ fn already_routed(repo: &gix::Repository, rela: &Path) -> bool {
 /// thousands of them, and one commit of 54 872 files is not a commit anybody
 /// can read or a pass anybody can interrupt. The caller drains the backlog over
 /// several passes.
+///
+/// `skip` names paths a previous pass already staged, committed, and found
+/// unchanged afterwards — see [`unconverted_after_repair`]. They are examined
+/// (they count against `window`) and never returned: a repair the repository
+/// has already refused once will be refused identically forever, and offering
+/// it again is exactly how a backlog stops draining and becomes a load.
 pub fn mismatched_filtered_paths(
     repo: &gix::Repository,
     tracked: &[PathBuf],
     from: usize,
     window: usize,
     cap: usize,
+    skip: &HashSet<PathBuf>,
 ) -> (Vec<PathBuf>, usize) {
     let start = if from >= tracked.len() { 0 } else { from };
     if cap == 0 || window == 0 || tracked.is_empty() {
         return (Vec::new(), start);
     }
     let Ok(index) = repo.index_or_empty() else {
+        return (Vec::new(), start);
+    };
+    // One stack for the whole pass. Building it per path is what made this
+    // function O(index) per entry; [`LfsRouting`] carries the measurement.
+    let Some(mut routing) = LfsRouting::new(repo, &index) else {
         return (Vec::new(), start);
     };
     let mut out = Vec::new();
@@ -1436,10 +1521,19 @@ pub fn mismatched_filtered_paths(
             break;
         }
         at = start + examined + 1;
+        if skip.contains(rela) {
+            continue;
+        }
         let key = index_key(rela);
         let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes())) else {
             continue;
         };
+        // Free next to either question below — a mode and a hash compared
+        // against constants — and it removes the two shapes no commit can
+        // convert before anything is read at all.
+        if !repairable_entry(entry.mode, entry.id) {
+            continue;
+        }
         // The attribute question FIRST, and the ordering is the whole cost of
         // this function. Resolving attributes walks a directory stack gitoxide
         // keeps in memory — microseconds, and free for every path whose
@@ -1447,7 +1541,7 @@ pub fn mismatched_filtered_paths(
         // measured on the owner's volume, that ordering left keeper holding the
         // index lock at 0% CPU for eight minutes, because it probed a pack for
         // every one of 155 662 entries before asking the cheap question.
-        if !routed_through_lfs(repo, &index, &key, entry.mode) {
+        if !routing.routes(&key, entry.mode) {
             continue;
         }
         // Filtered, so its blob MUST be a pointer. `pointer_blob` answers from
@@ -1467,6 +1561,47 @@ pub fn mismatched_filtered_paths(
         at = 0;
     }
     (out, at)
+}
+
+/// Which of `paths` a repair commit left exactly as it found them.
+///
+/// Asked immediately after the commit that was supposed to convert them. A
+/// path still answering "filtered, and its blob is not a pointer" was not
+/// converted; nothing about the repository has changed, so an identical later
+/// attempt will not convert it either. The caller quarantines what comes back
+/// and stops offering it — see `Engine::repair_recorded_pointers`.
+///
+/// Deliberately re-derived from the index rather than read off the commit's
+/// own report: a commit can succeed, land nothing for a given path, and still
+/// return `Ok`. That gap is the livelock this closes, and only the index can
+/// tell the two apart.
+///
+/// [`repairable_entry`] names the two shapes we already know about, and this
+/// is the backstop for the ones we do not: whatever the reason a path cannot
+/// be rewritten, it costs one pass to discover and nothing thereafter.
+pub fn unconverted_after_repair(repo: &gix::Repository, paths: &[PathBuf]) -> Vec<PathBuf> {
+    let Ok(index) = repo.index_or_empty() else {
+        return Vec::new();
+    };
+    let Some(mut routing) = LfsRouting::new(repo, &index) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for rela in paths {
+        let key = index_key(rela);
+        let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes())) else {
+            // The commit removed it from the index entirely, which is a change
+            // by any reading. Nothing to quarantine.
+            continue;
+        };
+        if repairable_entry(entry.mode, entry.id)
+            && routing.routes(&key, entry.mode)
+            && pointer_blob(repo, entry.id).is_none()
+        {
+            out.push(rela.clone());
+        }
+    }
+    out
 }
 
 /// Prepare LFS staging for a set of candidate paths.
@@ -3731,20 +3866,28 @@ mod tests {
 
         let repo = crate::git::repo::open(root, false).expect("open");
         let mut index = State::new(repo.object_hash());
-        // Three shapes, one index: filtered-but-raw (the inconsistency),
-        // filtered-and-already-a-pointer, and a path nothing filters.
+        // Five shapes, one index: filtered-but-raw (the inconsistency),
+        // filtered-and-already-a-pointer, a path nothing filters, and the two
+        // no commit can ever convert — an empty file and a symlink, both under
+        // the same `*.gif` rule.
         let pointer = Pointer::new("a".repeat(64), 4_000_000);
-        for (rela, bytes) in [
-            ("wrong.gif", vec![9u8; 4096]),
-            ("right.gif", pointer.render().into_bytes()),
-            ("ordinary.txt", vec![7u8; 4096]),
+        for (rela, bytes, mode) in [
+            ("wrong.gif", vec![9u8; 4096], Mode::FILE),
+            ("right.gif", pointer.render().into_bytes(), Mode::FILE),
+            ("ordinary.txt", vec![7u8; 4096], Mode::FILE),
+            ("empty.gif", Vec::new(), Mode::FILE),
+            ("link.gif", b"wrong.gif".to_vec(), Mode::SYMLINK),
         ] {
             let absolute = root.join(rela);
-            std::fs::write(&absolute, &bytes).expect("write");
+            if mode == Mode::SYMLINK {
+                std::os::unix::fs::symlink("wrong.gif", &absolute).expect("symlink");
+            } else {
+                std::fs::write(&absolute, &bytes).expect("write");
+            }
             let blob = repo.write_blob(&bytes).expect("write blob").detach();
             let metadata = gix::index::fs::Metadata::from_path_no_follow(&absolute).expect("stat");
             let stat = Stat::from_fs(&metadata).expect("stat convert");
-            index.dangerously_push_entry(stat, blob, Flags::empty(), Mode::FILE, rela.into());
+            index.dangerously_push_entry(stat, blob, Flags::empty(), mode, rela.into());
         }
         index.sort_entries();
         let mut file = gix::index::File::from_state(index, repo.index_path());
@@ -3755,27 +3898,43 @@ mod tests {
         let tracked = crate::git::repo::tracked_paths(&repo).expect("tracked");
         assert_eq!(
             tracked.len(),
-            3,
-            "the fixture must hold all three: {tracked:?}"
+            5,
+            "the fixture must hold all five: {tracked:?}"
         );
+        let none = HashSet::new();
         assert_eq!(
-            mismatched_filtered_paths(&repo, &tracked, 0, 100, 100).0,
+            mismatched_filtered_paths(&repo, &tracked, 0, 100, 100, &none).0,
             vec![PathBuf::from("wrong.gif")],
-            "only the filtered path whose blob is its own bytes"
+            "only the filtered path whose blob is its own bytes — the empty \
+             file and the symlink match the same rule and no commit can \
+             convert either, so offering them is a pass that never ends"
         );
 
         // Bounded three ways, because a folder in this state has tens of
         // thousands of these and a pass must stay short.
-        assert!(mismatched_filtered_paths(&repo, &tracked, 0, 100, 0)
+        assert!(mismatched_filtered_paths(&repo, &tracked, 0, 100, 0, &none)
             .0
             .is_empty());
-        assert!(mismatched_filtered_paths(&repo, &tracked, 0, 0, 100)
+        assert!(mismatched_filtered_paths(&repo, &tracked, 0, 0, 100, &none)
             .0
             .is_empty());
+        // A quarantined path is examined and never returned: the sweep has
+        // already proved a commit does not move it.
+        let quarantined = HashSet::from([PathBuf::from("wrong.gif")]);
+        let (skipped, after) =
+            mismatched_filtered_paths(&repo, &tracked, 0, 100, 100, &quarantined);
+        assert!(
+            skipped.is_empty(),
+            "a quarantined path must not be offered again: {skipped:?}"
+        );
+        assert_eq!(
+            after, 0,
+            "and the pass still examined the whole tracked list"
+        );
         // The window stops the pass, and the cursor says where to resume; the
-        // wrong.gif entry sorts last of the three, so a one-entry window cannot
+        // wrong.gif entry sorts last of the five, so a one-entry window cannot
         // have reached it yet.
-        let (found, next) = mismatched_filtered_paths(&repo, &tracked, 0, 1, 100);
+        let (found, next) = mismatched_filtered_paths(&repo, &tracked, 0, 1, 100, &none);
         assert!(
             found.is_empty(),
             "a one-entry window cannot reach it: {found:?}"
@@ -3783,8 +3942,21 @@ mod tests {
         assert_eq!(next, 1, "and the next pass resumes after what it examined");
         // Resuming from the end wraps rather than stalling.
         assert_eq!(
-            mismatched_filtered_paths(&repo, &tracked, 999, 100, 100).1,
+            mismatched_filtered_paths(&repo, &tracked, 999, 100, 100, &none).1,
             0
+        );
+
+        // The backstop, asked of the very paths a repair would have staged:
+        // the inconsistency is still unconverted (nothing has committed it
+        // here), and neither the pointer nor the unfiltered path is claimed.
+        assert_eq!(
+            unconverted_after_repair(&repo, &tracked),
+            vec![PathBuf::from("wrong.gif")],
+            "only what a commit would have had to change and did not"
+        );
+        assert!(
+            unconverted_after_repair(&repo, &[PathBuf::from("nowhere.gif")]).is_empty(),
+            "a path the index does not carry is not a failed repair"
         );
     }
 
