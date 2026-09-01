@@ -4,8 +4,8 @@ type: 'feature'
 created: '2026-08-31'
 status: 'done'
 baseline_revision: 'ce9fc87'
-final_revision: '1fb6db7'
-review_loop_iteration: 1
+final_revision: '065d82b'
+review_loop_iteration: 2
 followup_review_recommended: false
 context:
   - '{project-root}/docs/project-context.md'

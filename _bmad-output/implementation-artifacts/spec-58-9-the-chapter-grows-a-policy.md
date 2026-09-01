@@ -4,9 +4,9 @@ type: 'docs'
 created: '2026-08-31'
 status: 'done'
 baseline_revision: 'c6f04fa'
-final_revision: '7fbffff'
-review_loop_iteration: 1
-followup_review_recommended: true
+final_revision: '69c7368'
+review_loop_iteration: 2
+followup_review_recommended: false
 context:
   - '{project-root}/docs/project-context.md'
 warnings: ['written-from-implementation']
