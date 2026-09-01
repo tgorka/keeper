@@ -2242,25 +2242,39 @@ that gate sits above every mode gate. A reason is attached to the unhosted
 verdict and to nothing else, so a reason present at all **is** the alarm.
 
 In the app, ⌘8 opens **Tasks**, and it is now a place you can work rather than
-only look. Every row states its kind, its schedule, the host that will actually
-run it, its next due time, its missed-window policy, and its last run — the
-**outcome word and the line that run reported**, not merely that it ended; a run
-with no detail renders as absence rather than as an empty string, because those
-are different facts. Each row offers **Run now**, **Edit**, **Forget** and
-**Runs**:
+only look. Every row states its kind, **its mode**, its schedule, the host that
+will actually run it, its next due time, its missed-window policy, and its last
+run — the **outcome word and the line that run reported**, not merely that it
+ended; a run with no detail renders as absence rather than as an empty string,
+because those are different facts. A task that carries a **description** shows
+it under its name; a blank one shows nothing, because a heading over an empty
+string reads as a failed read. Each row offers **Run now**, **Edit**, **Forget**
+and **Runs**:
 
 - **Add a task** is a form in the pane's header, and **Edit** is the same form
   seeded from the row you pressed it on. Every refusal keeper makes at the write
   door — a malformed id, a schedule it cannot parse, `scheduled` with no
-  schedule, a kind that differs from the stored one — is shown **verbatim**, in
-  the form that asked for it. The form re-implements none of those rules: it
-  carries no cron regex and does not trim what you typed, so a task is never
-  stored under a name nobody wrote.
+  schedule, a kind that differs from the stored one, a missed-window delay
+  shorter than the grace period — is shown **verbatim**, in the form that asked
+  for it. The form re-implements none of those rules: it carries no cron regex
+  and does not trim what you typed, so a task is never stored under a name
+  nobody wrote.
+- **Run now** performs the work **whether or not a window is open, and does not
+  move the schedule** — the same contract `keeper-syncd tasks run` has always
+  had, said in the pane beside the button rather than only here. A scheduled
+  task can therefore be run by hand at any time; the only three things that
+  refuse a person are a task that does not exist, one that is `off` or disabled,
+  and a live lease held by the other host.
 - **Forget** asks first, and says what it deletes: a record, never content.
   Nothing a task ever did is undone by forgetting the task.
 - **Runs** opens that task's history — the same bounded, newest-first list
   `tasks status` prints, with the outcome, the time, the host and the detail for
-  each run.
+  each run. The control says how many runs the open section holds and nothing at
+  all while it is shut, because the history is read when you open it and a count
+  keeper has not read is one it must not print. A full section says once that
+  older runs are trimmed: the read asks for twenty and the store keeps the fifty
+  most recent for each task, so the end of that list is not the end of the
+  record.
 - **Edit is not offered** on a row whose kind or mode this build cannot read.
   The store would refuse the write, so the control could only fail.
 

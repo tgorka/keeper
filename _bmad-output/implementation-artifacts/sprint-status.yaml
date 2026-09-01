@@ -1038,17 +1038,17 @@ development_status:
   # BOTH, IN THAT ORDER — 59.9 ships a closed-vocabulary kind that reopens
   # nothing, and the general exec kind is epic 60 with the threat model, the
   # egress-disclosure answer and the missing task timeout as its first story.
-  epic-59: backlog
+  epic-59: in-progress
   59-1-a-list-of-names-and-one-task-at-a-time: backlog
-  59-2-a-run-you-can-open: backlog
-  59-3-the-row-says-its-mode-and-run-now-says-what-it-does: backlog
+  59-2-a-run-you-can-open: done
+  59-3-the-row-says-its-mode-and-run-now-says-what-it-does: done
   59-4-several-tasks-at-once: backlog
-  59-5-a-task-you-can-name: backlog
-  59-6-how-long-is-the-delay: backlog
+  59-5-a-task-you-can-name: done
+  59-6-how-long-is-the-delay: done
   59-7-help-for-writing-a-schedule: backlog
-  59-8-home-in-one-click: backlog
-  59-9-a-task-that-runs-a-verb-keeper-already-owns: backlog
-  59-10-the-chapter-grows-a-view: backlog
+  59-8-home-in-one-click: done
+  59-9-a-task-that-runs-a-verb-keeper-already-owns: done
+  59-10-the-chapter-grows-a-view: done
   epic-59-retrospective: optional
 
   # -- EPIC 58, 2026-08-31: a task you can drive ------------------------------
