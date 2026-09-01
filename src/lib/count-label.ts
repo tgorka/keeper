@@ -60,6 +60,17 @@ export const SESSIONS: CountNoun = { one: "session", many: "sessions" };
  */
 export const ITEMS: CountNoun = { one: "item", many: "items" };
 
+/**
+ * A task's run history noun (Story 59.2).
+ *
+ * The Tasks pane's trigger says how many runs a task's open section holds, and
+ * it says nothing at all while the section is shut — `task_runs` is read on
+ * open and never on render, so a closed section has no count to print and a
+ * guessed one would be exactly the "loaded so far dressed as a total" this
+ * module exists to prevent.
+ */
+export const RUNS: CountNoun = { one: "run", many: "runs" };
+
 export interface CountOptions {
   /**
    * How many the query MATCHED, when a cap declined some of them. Rendered as

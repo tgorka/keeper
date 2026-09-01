@@ -47,6 +47,8 @@ import {
   TASK_FORGET_CONFIRM_BODY,
   TASK_FORGET_TESTID,
   TASK_FORGET_TEXT,
+  TASK_HISTORY_BOUND_NOTICE_AT,
+  TASK_HISTORY_BOUND_TEXT,
   TASK_HISTORY_EMPTY_TEXT,
   TASK_HISTORY_LOADING_TEXT,
   TASK_HISTORY_NO_HOST_TEXT,
@@ -66,6 +68,7 @@ import {
   TASK_SCHEDULE_LABEL,
   TASK_UNREADABLE_OUTCOME_TEXT,
   TASKS_CLOCK_TICK_MS,
+  TASKS_DESCRIPTION_TESTID,
   TASKS_ERROR_TESTID,
   TASKS_HISTORY_REFUSAL_TESTID,
   TASKS_HISTORY_ROW_TESTID,
@@ -77,6 +80,7 @@ import {
   TASKS_PANE_TITLE,
   TASKS_REFUSAL_TESTID,
   TASKS_ROW_TESTID,
+  TASKS_RUN_NOW_SENTENCE,
   TASKS_UNKNOWN_BADGE,
   TASKS_UNKNOWN_HEADING,
   TASKS_UNKNOWN_NO_ID_TEXT,
@@ -2126,5 +2130,144 @@ describe("the pane also lists what this host paces, and says it is not a task", 
     expect(within(sweep as HTMLElement).getByText(PACED_KIND_LABELS.scratchSweep)).toBeVisible();
     expect(within(sweep as HTMLElement).getByText("every 1 hour")).toBeVisible();
     expect(within(sweep as HTMLElement).getByText(PACED_SENTENCE_SWEEP)).toBeVisible();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Epic 59 — the facts the pane was silent about
+// ---------------------------------------------------------------------------
+
+/**
+ * A run list of a given length, newest first.
+ *
+ * A second, top-level copy of the one nested inside the history describe above,
+ * because these tests live outside that block and a helper reached across a
+ * describe boundary is a helper two suites can silently disagree about. Ids
+ * descend so the order matches what `task_runs … ORDER BY id DESC` hands over.
+ */
+function runList(count: number): TaskRunVm[] {
+  return Array.from({ length: count }, (_unused, index) =>
+    run({ id: count - index, startedMs: NOW - (index + 1) * 60_000 }),
+  );
+}
+
+describe("the row says enough to act on", () => {
+  it("states the mode, so a scheduled row says it is scheduled", async () => {
+    // The owner asked for a Run now on scheduled tasks that has always been
+    // there. Half of why he could not tell: the row never rendered `mode` at
+    // all, so a scheduled row's only visible schedule facts were a cron string
+    // and a next-due time.
+    answer(listing({ tasks: [task({ id: "01SCHED", mode: "scheduled" })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).getByText("scheduled")).toBeInTheDocument();
+    // The stored spelling, not a prettified one: `tasks list --json` prints
+    // this vocabulary and two words for one stored value is the drift AD-C7
+    // forbids.
+    expect(within(row).queryByText("Scheduled")).toBeNull();
+  });
+
+  it("says what Run now does, once, and only when there is a row to do it to", async () => {
+    answer(listing({ tasks: [] }));
+    render(<TasksPane />);
+    await screen.findByText(TASKS_PANE_EMPTY_SENTENCE);
+    // A sentence about a button nobody can see yet is noise.
+    expect(screen.queryByText(TASKS_RUN_NOW_SENTENCE)).toBeNull();
+
+    answer(listing());
+    fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+
+    expect(await screen.findByText(TASKS_RUN_NOW_SENTENCE)).toBeVisible();
+    // The two halves that are worth stating, and both are in it: the window is
+    // not consulted, and the schedule does not move.
+    expect(TASKS_RUN_NOW_SENTENCE).toMatch(/whether or not a window is open/);
+    expect(TASKS_RUN_NOW_SENTENCE).toMatch(/does not move the schedule/);
+  });
+
+  it("shows a task's own words when it has any, and nothing at all when it does not", async () => {
+    // `taskDescriptionText`'s rule, which is `taskReportText`'s: blank and
+    // absent are one rendered state — nothing — while the store keeps them
+    // apart. A heading over an empty string reads as a failed read.
+    answer(
+      listing({
+        tasks: [
+          task({ id: "01NAMED", description: "the photos, nightly" }),
+          task({ id: "01BLANK", description: "   " }),
+          task({ id: "01NONE", description: null }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    await screen.findAllByTestId(TASKS_ROW_TESTID);
+
+    const rows = screen.getAllByTestId(TASKS_ROW_TESTID);
+    expect(within(rows[0]).getByTestId(TASKS_DESCRIPTION_TESTID)).toHaveTextContent(
+      "the photos, nightly",
+    );
+    // Asserted on the ELEMENT, not on its text. A text query cannot tell a
+    // paragraph that was never rendered from one rendered around three spaces,
+    // and that is the whole distinction here: mutating `taskDescriptionText` to
+    // return its argument unchanged left a text-based version of this test
+    // green, which made it a test that could not fail.
+    expect(within(rows[1]).queryByTestId(TASKS_DESCRIPTION_TESTID)).toBeNull();
+    expect(within(rows[2]).queryByTestId(TASKS_DESCRIPTION_TESTID)).toBeNull();
+  });
+});
+
+describe("the runs control reads as a control", () => {
+  it("says a task has never run before anything is opened, and counts only what it holds", async () => {
+    // The count is the affordance that costs nothing — but ONLY once the
+    // section is open. A closed section has read nothing, so a number on it
+    // could only be guessed, and a guessed total that looks real is what
+    // `count-label.ts` exists to prevent.
+    // Stated rather than inherited: the fold is a module-level preference, so a
+    // sibling test that lowered it to two leaks into this one and the section
+    // renders two of the three runs it holds. A test whose subject is a COUNT
+    // must own every number that can change it.
+    setSyncListSizes({ folded: 10, unfolded: 100 });
+    answer(listing({ tasks: [task({ id: "01SCHED", lastRun: null })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runList(3));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    const trigger = screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: 01SCHED` });
+    expect(trigger).toHaveTextContent(`${TASK_HISTORY_TITLE} — none yet`);
+    expect(trigger).not.toHaveTextContent(/\d/);
+
+    fireEvent.click(trigger);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_HISTORY_ROW_TESTID)).toHaveLength(3));
+
+    // Now it may count, because now it has something to count.
+    expect(
+      screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: 01SCHED` }),
+    ).toHaveTextContent("3 runs");
+  });
+
+  it("says the history is a page of a longer record, and only when it is full", async () => {
+    // Three numbers were invisible at once: the read asks for twenty, the store
+    // keeps fifty, and the fold shows ten first. A reader who pressed Show all
+    // had reached the end of neither.
+    setSyncListSizes({ folded: 5, unfolded: 25 });
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runList(TASK_HISTORY_BOUND_NOTICE_AT));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: 01SCHED` }));
+
+    expect(await screen.findByText(TASK_HISTORY_BOUND_TEXT)).toBeVisible();
+  });
+
+  it("does not warn about trimming a history that has not been trimmed", async () => {
+    answer(listing({ tasks: [task({ id: "01SCHED" })] }));
+    vi.mocked(syncTaskHistory).mockResolvedValue(runList(TASK_HISTORY_BOUND_NOTICE_AT - 1));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_ROW_TESTID);
+
+    fireEvent.click(screen.getByRole("button", { name: `${TASK_HISTORY_TITLE}: 01SCHED` }));
+    await screen.findByTestId(TASKS_HISTORY_TESTID);
+
+    expect(screen.queryByText(TASK_HISTORY_BOUND_TEXT)).toBeNull();
   });
 });

@@ -80,6 +80,7 @@
  * forgets the runs it held, so re-opening re-reads rather than showing a list
  * `task_runs` may have trimmed underneath it (cap `TASK_RUNS_CAP`).
  */
+import { ChevronRight } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { FoldToggle, useFold } from "@/components/layout/list-fold";
 // `TASK_HOST_WIDE_TEXT` is the form's rather than this file's: the picker's
@@ -101,6 +102,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { countLabel, RUNS } from "@/lib/count-label";
 import type { PacedWorkVm, TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
 import {
   syncPacedWork,
@@ -115,6 +117,32 @@ import { hydrateSyncListSizes } from "@/lib/stores/sync-detail";
 export const TASKS_PANE_TITLE = "Tasks";
 export const TASKS_PANE_SUBTITLE =
   "Work keeper does on a schedule, and which host on this machine will actually run each one.";
+
+/**
+ * What **Run now** means, said where the button is (Story 59.3).
+ *
+ * The sentence already existed — twice — in `docs/sync.md` (§14's exit-code
+ * section and its `--timer` paragraph), and nowhere in the app. The owner asked
+ * for a control that has always been there, is rendered on every readable row,
+ * and is gated on nothing but *this row's run is in flight*; what he could not
+ * tell is what pressing it would do to a `scheduled` task. Both halves of that
+ * are worth stating and neither is obvious:
+ *
+ * - It performs the work **whether or not a window is open**. `run_task_now`
+ *   passes `TaskTrigger::Requested`, which sets `due_at_most: None` and drops
+ *   `claim_task`'s window predicate entirely. Story 58.6 asserts this against
+ *   its opposite in one pair of tests, precisely so a later change cannot
+ *   quietly narrow *run it now* into *run it if due*.
+ * - It does **not move the schedule**. Somebody asking for a run now is not
+ *   asking to skip tonight's.
+ *
+ * Sited on the pane rather than as a per-row tooltip: this is one fact about the
+ * verb, not per-row state, and `PACED_SUBTITLE` set the precedent that a fact
+ * worth knowing is said in words rather than left to be inferred from an
+ * absence.
+ */
+export const TASKS_RUN_NOW_SENTENCE =
+  "Run now performs the work immediately, whether or not a window is open — and it does not move the schedule.";
 
 /** Before the first read has landed the list is unknown, not empty. */
 export const TASKS_PANE_LOADING_SENTENCE = "Reading the task record…";
@@ -279,6 +307,16 @@ export const TASK_DUE_NOW_TEXT = "due now";
 export const TASK_IN_FLIGHT_TEXT = "running now";
 
 export const TASKS_ROW_TESTID = "task-row";
+/**
+ * The row's description line (Story 59.5).
+ *
+ * A testid rather than a text query, because the fact under test is ABSENCE and
+ * a text query cannot see the difference between a paragraph that was not
+ * rendered and one rendered around whitespace — which is precisely the bug
+ * `taskDescriptionText` exists to prevent. Proved: mutating that helper to
+ * return its argument unchanged left a text-based assertion green.
+ */
+export const TASKS_DESCRIPTION_TESTID = "task-description";
 export const TASKS_UNKNOWN_ROW_TESTID = "task-unknown-row";
 export const TASKS_HOST_TESTID = "task-host";
 export const TASKS_REFUSAL_TESTID = "task-refusal";
@@ -299,6 +337,63 @@ export const TASK_FORGET_TESTID = "task-forget-confirm";
  * called something else would be a second name for one list.
  */
 export const TASK_HISTORY_TITLE = "Runs";
+
+/**
+ * What the Runs control says (Story 59.2).
+ *
+ * Three shapes, and the distinction between them is the whole point:
+ *
+ * | state | reads |
+ * | --- | --- |
+ * | shut, and the listing says the task has never run | `Runs — none yet` |
+ * | shut, otherwise | `Runs` |
+ * | open | `Runs · 12 runs`, from what the section actually holds |
+ *
+ * **A closed section prints no number**, and that is a rule rather than an
+ * omission. `task_runs` is read when the section opens and never on render, so
+ * a count on a shut row could only be guessed — and a guessed total that looks
+ * like a real one is exactly what `count-label.ts` was written to make
+ * impossible. `lastRun === null` is the single fact the pane may state before
+ * opening anything, because the listing carries it already.
+ *
+ * An OPEN section counts what it holds, not what exists: `task_runs` is capped
+ * at fifty per task in the store and the read asks for twenty, so this is the
+ * length of the answer in hand. {@link TASK_HISTORY_BOUND_TEXT} is where that
+ * is said in words; a bare number here would quietly claim to be a total.
+ */
+export function taskHistoryTriggerText(
+  runs: TaskRunVm[] | null,
+  lastRun: TaskRunVm | null,
+): string {
+  if (runs !== null) {
+    return `${TASK_HISTORY_TITLE} · ${countLabel(runs.length, RUNS)}`;
+  }
+  return lastRun === null ? `${TASK_HISTORY_TITLE} — none yet` : TASK_HISTORY_TITLE;
+}
+
+/**
+ * That an open section is a page and not the whole history.
+ *
+ * The numbers were invisible before Story 59.2: the read asks for twenty
+ * (`TASK_HISTORY_LIMIT_DEFAULT`), the store keeps fifty per task
+ * (`TASK_RUNS_CAP`), and the fold showed ten of the twenty first. A reader who
+ * pressed *Show all* therefore reached the end of a list that was not the end
+ * of the history, with nothing on screen saying so. This says it once, under
+ * the list, and only when the list is long enough for the question to arise.
+ */
+export const TASK_HISTORY_BOUND_TEXT =
+  "Older runs are trimmed: keeper keeps the fifty most recent for each task.";
+
+/**
+ * How many runs a section must hold before {@link TASK_HISTORY_BOUND_TEXT} is
+ * worth saying.
+ *
+ * The read's own limit (`TASK_HISTORY_LIMIT_DEFAULT`, twenty), because a section
+ * holding fewer than that has not been trimmed by anything: the reader is
+ * looking at every run the store has for this task, and warning them that older
+ * ones are trimmed would describe something that has not happened.
+ */
+export const TASK_HISTORY_BOUND_NOTICE_AT = 20;
 
 /**
  * An unread list is UNKNOWN, and not empty.
@@ -659,6 +754,29 @@ export function taskReportText(run: TaskRunVm | null): string | null {
   return run.detail;
 }
 
+/**
+ * A task's own words, or `null` when it has none (Story 59.5).
+ *
+ * {@link taskReportText}'s rule, applied to the other free-text column and for
+ * the same reason: `description` is `TEXT NULL` with no non-empty constraint,
+ * the form deliberately sends what was typed **untrimmed**, and `tasks set
+ * --description "   "` is a write nothing refuses. So blank and absent must
+ * collapse to one rendered state — nothing — while what is stored stays exactly
+ * what the person typed. Trimmed to decide, untrimmed to draw.
+ *
+ * The two states stay distinct everywhere they matter: the store keeps `NULL`
+ * and `""` apart (that is 59.5's whole column argument, and the dev shell keeps
+ * a `""` fixture to prove it), and `--no-description` restores the absent case
+ * rather than the blank one. This function is about the SCREEN, where a heading
+ * over an empty string reads as a failed read.
+ */
+export function taskDescriptionText(description: string | null): string | null {
+  if (description === null || description.trim() === "") {
+    return null;
+  }
+  return description;
+}
+
 /** One `label: value` cell, so a row reads without a table header above it. */
 function Field({
   label,
@@ -854,6 +972,16 @@ function TaskRunList({
       {runs !== null && fold.expanded && fold.hidden > 0 && (
         <p className="text-muted-foreground text-xs">{taskHistoryUnshownText(fold.hidden)}</p>
       )}
+      {/* And that the whole list is a page of a longer record, which nothing on
+          screen said before Story 59.2. Three numbers were invisible at once:
+          the read asks for twenty, the store keeps fifty per task, and the fold
+          shows ten of the twenty first — so a reader who pressed *Show all* and
+          then read the last row had reached the end of neither. Said only when
+          the section is full enough for the question to arise, because on a
+          three-run task it is a sentence about nothing. */}
+      {runs !== null && runs.length >= TASK_HISTORY_BOUND_NOTICE_AT && (
+        <p className="text-muted-foreground text-xs">{TASK_HISTORY_BOUND_TEXT}</p>
+      )}
     </div>
   );
 }
@@ -932,8 +1060,30 @@ function TaskRow({
             {/* The kind as stored, so a kind a newer keeper wrote is shown
                 rather than hidden (NFR-43). */}
             <Badge variant="secondary">{task.kind}</Badge>
+            {/* The MODE, added by Story 59.3, and the row was silent about it
+                until now. Mode reached the screen only obliquely — through the
+                host badge's `onRequest` / `off` wording — so a `scheduled` row's
+                only visible schedule facts were a cron string and a next-due
+                time, sitting beside a Run now button whose relationship to them
+                was unstated. The owner asked for a button that already existed
+                and worked; this is half of why he could not tell.
+
+                Stored spelling, `PACED_KIND_LABELS`' rule and the kind badge's
+                immediately above: `db::decode_task` diverts a mode this build
+                cannot read into the unknown list, so this can only ever render
+                one of `TASK_MODES`. */}
+            <Badge variant="outline">{task.mode}</Badge>
             <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
           </div>
+          {/* The task's own words, when it has any (Story 59.5). Under the id
+              because the id is the name and this is the sentence about it, and
+              absent when blank — `TASK_LAST_REPORT_LABEL`'s rule: a heading over
+              an empty string reads as a failed read. */}
+          {taskDescriptionText(task.description) !== null && (
+            <p data-testid={TASKS_DESCRIPTION_TESTID} className="truncate text-foreground text-xs">
+              {taskDescriptionText(task.description)}
+            </p>
+          )}
           <p className="truncate text-muted-foreground text-xs">
             {task.profile ?? (task.profileId === null ? TASK_HOST_WIDE_TEXT : task.profileId)}
           </p>
@@ -1032,22 +1182,29 @@ function TaskRow({
         </p>
       )}
 
-      {/* A link-weight control on its own line, and NOT a fourth `Button` in
-          the header cluster. `FoldToggle` states the rule that settles it: a
-          control that changes "how much of a list is on screen … is not an
-          action on the folder and must not carry the same visual weight as
-          Retry or Sync now" (`list-fold.tsx`). The second reason is the cluster
-          itself, which already holds Run now, Edit and Forget in a `shrink-0`
-          block — so at a narrow window this row's id is what truncates to pay
-          for each one, and jsdom performs no layout, so no component test in
-          this file could ever catch a control that had left the screen.
+      {/* A control that reads as one, since Story 59.1's review. It was a bare
+          dotted-underline link at the very bottom of the row, and the owner —
+          running the build with tasks in it for the first time — reported that
+          he could not see a task's runs at all. The link was there; it was last,
+          after the field grid, the host block and any refusal, and it carried no
+          affordance, no count and no chevron.
 
-          It wears `FoldToggle`'s own treatment for the same reason it borrows
-          its rule, and deliberately NOT `text-faint`: that tone is "reserved for
-          `aria-hidden` glyphs and section labels … and never carries a fact"
-          (`DESIGN.md`), and this control is the only route to a task's history,
-          which makes it the most load-bearing thing on the row. The section
-          below still prints no heading of its own, because the trigger names it.
+          What that overturns, and what it does not. `FoldToggle`'s rule stands
+          for a FOLD — "how much of a list is on screen … is not an action on the
+          folder" — but this is not a fold: it is the only route to a task's
+          history, which the original comment itself conceded made it "the most
+          load-bearing thing on the row". A route is not a fold, and the two
+          deserve different weight. Story 58.3's other reason was the `shrink-0`
+          cluster at the top; that reason is answered by 59.1 rather than argued
+          with, because the detail region this now sits in is not competing with
+          three buttons for a narrow row's width.
+
+          The count is the affordance that costs nothing: `historyRuns` is
+          already in hand once opened, so an opened section can say how many it
+          holds without a second read, and a closed one says nothing rather than
+          guessing — a number the pane has not read is a number it must not
+          print. `lastRun === null` is the one thing it may say before opening,
+          because that fact is on the listing already.
 
           Refused while a write is on its way, the rule Edit and Forget already
           follow: opening this closes an edit form, so pressing it mid-save would
@@ -1057,12 +1214,11 @@ function TaskRow({
 
           No focus-return effect, unlike Edit: on the self-close path focus never
           leaves the trigger, which is also why the section needs no close
-          control of its own. The section can also be destroyed without a press —
-          `refresh` prunes it when the row leaves the listing — but that takes
-          the whole row with it, which is the case the pane already accepts for
-          Edit and Forget. */}
-      <button
+          control of its own. */}
+      <Button
         type="button"
+        variant="ghost"
+        size="sm"
         aria-expanded={historyOpen}
         aria-controls={historyOpen ? historyRegionId : undefined}
         // Named for its task, `FoldToggle`'s reason: ten rows would otherwise
@@ -1070,10 +1226,14 @@ function TaskRow({
         aria-label={`${TASK_HISTORY_TITLE}: ${task.id}`}
         disabled={writing || deleting}
         onClick={() => onHistoryToggle(task.id)}
-        className="self-start text-muted-foreground text-xs underline decoration-dotted hover:text-foreground"
+        className="self-start"
       >
-        {TASK_HISTORY_TITLE}
-      </button>
+        <ChevronRight
+          aria-hidden="true"
+          className={`size-3.5 transition-transform ${historyOpen ? "rotate-90" : ""}`}
+        />
+        {taskHistoryTriggerText(historyOpen ? historyRuns : null, task.lastRun)}
+      </Button>
       {historyOpen && (
         <TaskRunList
           taskId={task.id}
@@ -1676,6 +1836,12 @@ export function TasksPane() {
         <div className="min-w-0">
           <h1 className="font-heading text-title">{TASKS_PANE_TITLE}</h1>
           <p className="text-muted-foreground text-sm">{TASKS_PANE_SUBTITLE}</p>
+          {/* Rendered only when there is a row it could apply to: a sentence
+              about a button nobody can see yet is noise, and the empty state
+              already carries its own three-part explanation. */}
+          {listing !== null && listing.tasks.length > 0 && (
+            <p className="text-muted-foreground text-xs">{TASKS_RUN_NOW_SENTENCE}</p>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {/* The action and the thing it reveals are worded identically
