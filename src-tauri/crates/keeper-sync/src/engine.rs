@@ -407,6 +407,26 @@ const TICK_MS: u64 = 1_000;
 /// backlog of tens of thousands takes to drain. See [`Engine::repair_memo`].
 const REPAIR_MEMO_TTL: Duration = Duration::from_secs(30);
 
+/// The shortest gap between two full status walks started by a Pending poll.
+///
+/// The pane polls every five seconds and each poll may walk; the walk itself
+/// is the only thing that bounds the rate, so a folder gets walked as often as
+/// a walk can finish. On the owner's `tgdrive` — 155 625 entries on a USB
+/// volume — that measured as a walk every ten to thirty seconds, all day, each
+/// one an `lstat` of every tracked path.
+///
+/// A minute floor costs almost nothing, because the poll's walk is not how
+/// work is discovered: a new or changed file reaches the Pending list through
+/// the watcher and the stability gate long before a walk would find it (see
+/// the note on `poll_walk_policy`). What the walk adds is the untracked sweep
+/// and a fresh verdict for paths the watcher never saw — neither of which is
+/// worth a full-tree pass four times a minute.
+///
+/// The floor is on the gap between walks rather than between polls, so a
+/// folder whose walk takes eight seconds is not walked again for another
+/// minute after it finishes.
+const POLL_WALK_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How often a Pending poll pays for a directory walk to look for untracked
 /// files.
 ///
@@ -1166,6 +1186,13 @@ pub struct Engine {
     /// pass per boot to re-establish, and a shape that becomes repairable after
     /// a fix must not stay excluded by a record nobody knows to clear.
     repair_quarantine: Mutex<HashMap<String, HashSet<PathBuf>>>,
+    /// When each profile's last Pending-poll walk finished.
+    ///
+    /// The clock behind [`POLL_WALK_MIN_INTERVAL`]. Absent means "never walked
+    /// by a poll in this process", which walks immediately — a folder the user
+    /// has just opened the pane on should not wait out a minute to be told
+    /// what it is holding.
+    poll_walked: Mutex<HashMap<String, Instant>>,
 
     /// Profiles with a full-tree status walk in flight.
     ///
@@ -1359,6 +1386,7 @@ impl Engine {
             repair_cursor: Mutex::new(HashMap::new()),
             repair_memo: Mutex::new(HashMap::new()),
             repair_quarantine: Mutex::new(HashMap::new()),
+            poll_walked: Mutex::new(HashMap::new()),
             walking: Mutex::new(std::collections::HashSet::new()),
             untracked_sweep: Mutex::new(HashMap::new()),
             untracked_appeared: Mutex::new(HashSet::new()),
@@ -11400,7 +11428,23 @@ impl Engine {
     /// Free in the healthy case: a bool, then one `exists()` and a 12-byte
     /// read of the index header (see [`Self::first_checkout_is_unfinished`]).
     fn poll_may_walk(&self, profile: &SyncProfile) -> bool {
-        profile.enabled && !self.first_checkout_is_unfinished(profile)
+        if !profile.enabled || self.first_checkout_is_unfinished(profile) {
+            return false;
+        }
+        // And not again inside a minute of the last one; see
+        // [`POLL_WALK_MIN_INTERVAL`] for why a poll's walk is the one that can
+        // afford to be lazy.
+        Self::lock(&self.poll_walked)
+            .get(&profile.id)
+            .is_none_or(|last| last.elapsed() >= POLL_WALK_MIN_INTERVAL)
+    }
+
+    /// Start the clock [`Self::poll_may_walk`] reads.
+    ///
+    /// Called when a poll's walk *finishes*, so the floor is a gap between
+    /// walks rather than between the polls that start them.
+    fn poll_walk_finished(&self, profile_id: &str) {
+        Self::lock(&self.poll_walked).insert(profile_id.to_owned(), Instant::now());
     }
 
     pub async fn pending(&self, profile_id: &str) -> Result<Vec<PendingFile>> {
@@ -11657,9 +11701,14 @@ impl Engine {
                 event.files_total = (entries > 0).then_some(entries);
                 self.publish(event);
             }
-            let (status, untracked, deleted_sizes) = task
+            let walked = task
                 .await
-                .map_err(|err| SyncError::Journal(format!("pending scan task failed: {err}")))??;
+                .map_err(|err| SyncError::Journal(format!("pending scan task failed: {err}")));
+            // Before the `?`s, and on both outcomes. A walk that failed still
+            // spent the folder's cost, and a poll that retried it every five
+            // seconds because of that is the shape this floor exists to stop.
+            self.poll_walk_finished(profile_id);
+            let (status, untracked, deleted_sizes) = walked??;
 
             let buckets: [(&Vec<PathBuf>, PendingReason); 4] = [
                 (&status.added, PendingReason::Added),
@@ -17260,6 +17309,55 @@ mod tests {
                 .iter()
                 .any(|row| row.path == "fresh.txt" && row.reason == PendingReason::Untracked),
             "an untracked path is only discoverable by walking: {pending:?}"
+        );
+    }
+
+    /// And the second poll inside a minute does not walk again.
+    ///
+    /// The pane polls every five seconds and the walk is the only thing that
+    /// paced it, so a folder was walked as often as a walk could finish — on
+    /// the owner's `tgdrive`, an `lstat` of 155 625 paths every ten to thirty
+    /// seconds, all day. Nothing is discovered by that: the watcher and the
+    /// stability gate carry a change to this list long before a walk would.
+    #[tokio::test]
+    async fn a_second_pending_poll_inside_the_minute_does_not_walk_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        std::fs::write(p.local_path.join("fresh.txt"), b"new").expect("write");
+
+        // The first poll walks — that is `a_pending_poll_with_no_backlog_still_walks`.
+        let first = engine.pending(&p.id).await.expect("pending");
+        assert!(
+            first
+                .iter()
+                .any(|row| row.path == "fresh.txt" && row.reason == PendingReason::Untracked),
+            "the first poll still finds the untracked path: {first:?}"
+        );
+
+        // Subscribed only now, so the stream below holds the second poll alone.
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+        engine.pending(&p.id).await.expect("pending");
+
+        let phases: Vec<SyncPhase> = Engine::lock(&published)
+            .iter()
+            .map(|event| event.phase)
+            .collect();
+        assert!(
+            !phases.contains(&SyncPhase::Scanning),
+            "a second walk five seconds after the first buys nothing: {phases:?}"
         );
     }
 
