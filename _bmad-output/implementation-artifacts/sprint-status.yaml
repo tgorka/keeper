@@ -1038,22 +1038,25 @@ development_status:
   # BOTH, IN THAT ORDER — 59.9 ships a closed-vocabulary kind that reopens
   # nothing, and the general exec kind is epic 60 with the threat model, the
   # egress-disclosure answer and the missing task timeout as its first story.
-  # SHIPPED 2026-09-01 as PR #301 on main - seven of ten. `review`, not `done`:
-  # in this file `done` means merged (epics 57 and 58 read `done` only after
-  # their PRs landed), and #301 is open. 59.4 stays `backlog` on purpose - the
-  # story's deliverable was a REFUSAL with a checkable reason (every task write
-  # in the stack is single-id, so a checkbox column would be state whose only
-  # action is a loop of N writes, and a second selection idiom the notes
-  # decision forbids by name). Its row stays open so the bulk-verb story that
-  # would earn it can be planned rather than assumed.
-  epic-59: in-progress
+  # SHIPPED 2026-09-01. Seven stories went out as PR #301 on main; the last
+  # three followed as #306 (59.7), #307 (59.1) and #308 (59.4), stacked over
+  # #305, which reconciles epic 58's governance with PR #303.
+  # COMPLETE 2026-09-01. All ten stories shipped; `review` because in this file
+  # `done` means merged, and the stack #301 -> #305 -> #306 -> #307 -> #308 is
+  # open. 59.4 shipped by OVERTURNING this epic's own refusal of it, on the
+  # epic's own test: the refusal held only while every task write was single-id,
+  # so 59.4 built the batched consumer first (in its own commit, with no
+  # frontend file in it) and only then copied the Files pane's selection model.
+  # The `aria-current` 59.1 chose was flipped to `aria-selected` by agreement
+  # between the two stories once a set could genuinely be chosen.
+  epic-59: review
   59-1-a-list-of-names-and-one-task-at-a-time: review
   59-2-a-run-you-can-open: review
   59-3-the-row-says-its-mode-and-run-now-says-what-it-does: review
-  59-4-several-tasks-at-once: backlog
+  59-4-several-tasks-at-once: review
   59-5-a-task-you-can-name: review
   59-6-how-long-is-the-delay: review
-  59-7-help-for-writing-a-schedule: backlog
+  59-7-help-for-writing-a-schedule: review
   59-8-home-in-one-click: review
   59-9-a-task-that-runs-a-verb-keeper-already-owns: review
   59-10-the-chapter-grows-a-view: review
