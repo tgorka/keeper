@@ -24,6 +24,11 @@
  *   `every <n><unit>` are `TaskSchedule::parse`'s to read, with its own floor of
  *   one minute and its own ceiling. There is no regex here, and no coercion:
  *   FR-347 says a schedule that does not parse is refused, never rounded.
+ *   Story 59.7 makes the dialect *offerable* without making it checkable here —
+ *   a menu of starting points that get typed into the box, and a preview of the
+ *   next instants that **Rust** computed. Neither is a validator: nothing is
+ *   trimmed, no save is prevented, and a refusal shown before a save is the same
+ *   sentence the save itself would show, off the same `Display`.
  * - **The scheduled-with-no-schedule refusal.** `upsert_task` catches the task
  *   that would report itself enabled and never run; this form lets the
  *   combination be expressed and shows the answer.
@@ -53,12 +58,17 @@
  * and never typed — that picker is the only defence there is.
  */
 import { type FormEvent, useEffect, useId, useState } from "react";
+import {
+  TASK_SCHEDULE_BOUNDS_NOTE,
+  TASK_SCHEDULE_OFFERS,
+  type TaskScheduleOffer,
+} from "@/components/sync/schedule-offers";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import type { SyncProfileVm, TaskVm } from "@/lib/ipc/client";
-import { syncProfiles, syncTaskSave } from "@/lib/ipc/client";
+import type { SyncProfileVm, TaskSchedulePreviewVm, TaskVm } from "@/lib/ipc/client";
+import { syncProfiles, syncTaskSave, syncTaskSchedulePreview } from "@/lib/ipc/client";
 import { syncErrorMessage, TASK_KINDS, TASK_MISSED_POLICIES, TASK_MODES } from "@/lib/stores/sync";
 import { cn } from "@/lib/utils";
 
@@ -181,6 +191,88 @@ export const TASK_FORM_SCHEDULE_LABEL = "Schedule";
  */
 export const TASK_FORM_SCHEDULE_NOTE =
   "Five-field cron, or @hourly / @daily / @weekly, or every <n><unit> such as every 90m. Leave it empty to store no schedule. keeper refuses an expression it cannot read, and quotes what you typed.";
+/**
+ * What the box refuses at either end, mirrored from Rust's two constants
+ * (Story 59.7).
+ *
+ * Re-exported through this module so every sentence this form renders is
+ * reachable from one place, which is how the mirror guard finds them.
+ */
+export { TASK_SCHEDULE_BOUNDS_NOTE };
+
+export const TASK_FORM_SCHEDULE_OFFER_LABEL = "Or choose a form";
+/**
+ * The menu's resting option, and the only one it ever shows as selected.
+ *
+ * Phrased as an instruction rather than as a value (*"Choose one…"*, never
+ * *"custom"* or the current expression) because the control's own state is
+ * meaningless: see {@link TASK_FORM_SCHEDULE_OFFER_NOTE}.
+ */
+export const TASK_FORM_SCHEDULE_OFFER_PLACEHOLDER = "Choose one to fill the box…";
+/**
+ * What the menu of offered forms does, and what it deliberately does not do.
+ *
+ * The menu **fills the box** and then forgets it happened — it is an action, not
+ * a second view of the value. That is why it always shows its own placeholder
+ * rather than the current expression: a `<select>` that appeared to mirror the
+ * box would be claiming to know which of its options the typed text is, and for
+ * anything hand-written the honest answer is *none of them*. The box remains the
+ * single place the schedule lives, and anything may be typed there — the menu is
+ * a starting point, not a vocabulary.
+ */
+export const TASK_FORM_SCHEDULE_OFFER_NOTE =
+  "Choosing one types it into the box above, replacing what is there; edit it afterwards or ignore the menu entirely and write your own. Nothing is checked here — the box's contents go to keeper exactly as typed.";
+
+/**
+ * One option's text: the expression first, then what it means.
+ *
+ * The expression leads deliberately. The point of the menu is that somebody
+ * stops needing it — a person who picks *every day at 03:00* three times has
+ * read `0 3 * * *` three times, and the dialect is small enough that this is how
+ * it gets learned.
+ */
+export function taskFormScheduleOfferText(offer: TaskScheduleOffer): string {
+  return `${offer.expression} — ${offer.says}`;
+}
+
+/** Where the preview is rendered, refusal or instants alike. */
+export const TASK_FORM_SCHEDULE_PREVIEW_TESTID = "task-form-schedule-preview";
+
+/**
+ * What precedes keeper's own refusal while somebody is still typing.
+ *
+ * The refusal itself is Rust's, unaltered — the same sentence the save shows,
+ * because it comes off the same `Display`. This prefix exists because the two
+ * arrive at different moments and mean different things about the world: after a
+ * save it is a report that nothing was stored, and here it is a warning that
+ * nothing *would* be. Nothing is prevented in the meantime: the save button is
+ * live, the box is untouched, and pressing Save sends what is there and shows
+ * what keeper says about it.
+ */
+export const TASK_FORM_SCHEDULE_REFUSAL_PREFIX = "keeper would refuse this: ";
+
+/**
+ * The next instants this schedule fires at, as a person reads them
+ * (Story 59.7, FR-368).
+ *
+ * Every number in here was computed by `TaskSchedule::next_due_after` — the same
+ * function the engine's tick walks — and this composes them into a sentence
+ * without doing any arithmetic of its own. There is no cron parsing in
+ * TypeScript anywhere in this codebase, and this is the function that would have
+ * been the excuse for some: a preview computed here would have needed the
+ * dialect, the calendar, vixie's day rule and the zone, and the first time any
+ * of the four drifted the form would have promised a time the engine had no
+ * intention of keeping.
+ *
+ * The count is never named. However many instants arrived are the ones shown —
+ * Rust's search window is finite, so a short list is possible, and a sentence
+ * saying *the next three* over a list of two would be the sort of small lie this
+ * whole story is about. `toLocaleString` for each instant, which is this repo's
+ * existing way to stamp an absolute one (`recording-row.tsx`).
+ */
+export function taskFormScheduleFiresNote(instants: readonly number[]): string {
+  return `Next: ${instants.map((instant) => new Date(instant).toLocaleString()).join(", ")}`;
+}
 
 export const TASK_FORM_ON_MISSED_LABEL = "If a window is missed";
 /**
@@ -435,6 +527,17 @@ export function TaskForm({
   /** `null` until the folder read lands — an unknown list, not an empty one. */
   const [profiles, setProfiles] = useState<SyncProfileVm[] | null>(null);
   const [profilesError, setProfilesError] = useState<string | null>(null);
+  /**
+   * Rust's answer about the expression currently in the schedule box, or `null`
+   * when there is nothing to ask about (Story 59.7).
+   *
+   * `null` covers an empty box and a read that failed, and both mean the same
+   * thing on screen: no preview. A failed read is deliberately silent — the
+   * preview is help, and a form that grew a second error paragraph because a
+   * read for a *hint* did not land would be worse than one that quietly does not
+   * hint.
+   */
+  const [schedulePreview, setSchedulePreview] = useState<TaskSchedulePreviewVm | null>(null);
   const fieldId = useId();
   const title = editing ? `${TASK_FORM_EDIT_TITLE}: ${task.id}` : TASK_FORM_ADD_TITLE;
 
@@ -468,6 +571,57 @@ export function TaskForm({
       abandoned = true;
     };
   }, []);
+
+  /**
+   * Ask Rust when the typed expression would actually fire (Story 59.7,
+   * FR-368).
+   *
+   * One read per change of the box, and the *only* implementation of the dialect
+   * answers it. Writing this in TypeScript would have meant a second parser, a
+   * second calendar, a second copy of vixie's day rule and a second opinion
+   * about the zone; the first time any of the four drifted, this form would have
+   * promised an instant the engine had no intention of keeping — and a preview
+   * that can disagree with the engine is worse than no preview.
+   *
+   * An empty box asks nothing, because an empty box is not a bad expression: it
+   * means *store no schedule*, which is what the note beside it promises and
+   * what `submit` sends as `null`. The verb itself does not special-case `""` —
+   * it refuses it, exactly as the write door does — so the decision not to ask
+   * lives here, at the one place that knows an empty box is a choice rather than
+   * a mistake. Whitespace is **not** empty and is asked about, which keeps this
+   * consistent with the `=== ""` rule `submit` uses for the same field.
+   *
+   * `abandoned` and the echo check are two guards against one hazard, and both
+   * are wanted. Replies can land out of order, so a slow answer about `0 3 * * `
+   * can arrive after the answer about `0 3 * * *`: the cleanup stops a superseded
+   * read from ever calling `setSchedulePreview`, and the echo check below stops a
+   * preview being *rendered* against text the box no longer holds even if some
+   * later refactor loses the cleanup. A stale preview is precisely the class of
+   * defect this story exists to avoid, so it is guarded twice on purpose.
+   */
+  useEffect(() => {
+    if (form.schedule === "") {
+      setSchedulePreview(null);
+      return;
+    }
+    let abandoned = false;
+    void (async () => {
+      try {
+        const previewed = await syncTaskSchedulePreview(form.schedule);
+        if (!abandoned) {
+          setSchedulePreview(previewed);
+        }
+      } catch {
+        // Silent, and the reason is above: this is a hint, not a value.
+        if (!abandoned) {
+          setSchedulePreview(null);
+        }
+      }
+    })();
+    return () => {
+      abandoned = true;
+    };
+  }, [form.schedule]);
 
   // Reported on every change and on unmount, so the surface that revealed this
   // form always knows whether a write is in flight — see `onSavingChange`.
@@ -511,6 +665,19 @@ export function TaskForm({
     storedProfileId !== "" && !listedProfiles.some((listed) => listed.id === storedProfileId);
   const unlistedProfileText = task?.profile ?? taskFormUnlistedProfileText(storedProfileId);
 
+  /**
+   * The preview, but only while it is still about what the box holds.
+   *
+   * The echo half of the staleness guard described on the effect above. A
+   * preview whose `expression` is not the current text is dropped rather than
+   * shown, so the worst this control can do while somebody types quickly is show
+   * nothing for a moment — never a time or a refusal belonging to a string that
+   * is no longer on screen.
+   */
+  const shownPreview =
+    schedulePreview !== null && schedulePreview.expression === form.schedule
+      ? schedulePreview
+      : null;
   /**
    * Whether the delay box is on screen.
    *
@@ -743,6 +910,68 @@ export function TaskForm({
         />
       </div>
       <p className="text-muted-foreground text-xs">{TASK_FORM_SCHEDULE_NOTE}</p>
+
+      {/* Directly under the box, because it is the answer to the question the
+          box asks. Both spellings are `text-muted-foreground` and neither is a
+          `role="alert"`: this is help about text somebody is still writing, and
+          the one paragraph in this form that reports a *failure* is the refusal
+          at the bottom, which arrives from a save that actually happened. A
+          refusal here is louder than nothing and quieter than an error, which is
+          exactly its standing.
+
+          Rendered only when there is something to say. A parsed expression with
+          no instants is possible in principle — Rust's search window is finite —
+          and it renders nothing rather than a sentence about the search window,
+          because copy for a state nobody can reach is copy nobody can check. */}
+      {shownPreview !== null &&
+        (shownPreview.refusal !== null ? (
+          <p
+            className="text-muted-foreground text-xs"
+            data-testid={TASK_FORM_SCHEDULE_PREVIEW_TESTID}
+          >
+            {TASK_FORM_SCHEDULE_REFUSAL_PREFIX}
+            {shownPreview.refusal}
+          </p>
+        ) : (
+          shownPreview.instants.length > 0 && (
+            <p
+              className="text-muted-foreground text-xs"
+              data-testid={TASK_FORM_SCHEDULE_PREVIEW_TESTID}
+            >
+              {taskFormScheduleFiresNote(shownPreview.instants)}
+            </p>
+          )
+        ))}
+      <p className="text-muted-foreground text-xs">{TASK_SCHEDULE_BOUNDS_NOTE}</p>
+
+      {/* An action, not a value — see {@link TASK_FORM_SCHEDULE_OFFER_NOTE}. The
+          `value` is pinned to `""` so the control always reads as its own
+          placeholder rather than pretending to mirror the box, and native for the
+          reason the other four menus are. */}
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={`${fieldId}-schedule-offer`}>{TASK_FORM_SCHEDULE_OFFER_LABEL}</Label>
+        <select
+          id={`${fieldId}-schedule-offer`}
+          className={cn(SELECT_CLASS, "w-56")}
+          value=""
+          disabled={saving}
+          onChange={(event) => {
+            const chosen = event.target.value;
+            if (chosen === "") {
+              return;
+            }
+            setForm((live) => ({ ...live, schedule: chosen }));
+          }}
+        >
+          <option value="">{TASK_FORM_SCHEDULE_OFFER_PLACEHOLDER}</option>
+          {TASK_SCHEDULE_OFFERS.map((offer) => (
+            <option key={offer.expression} value={offer.expression}>
+              {taskFormScheduleOfferText(offer)}
+            </option>
+          ))}
+        </select>
+      </div>
+      <p className="text-muted-foreground text-xs">{TASK_FORM_SCHEDULE_OFFER_NOTE}</p>
 
       {/* Beside the schedule because it is a question about the schedule, and
           native for the reason the other three menus are. The option text is

@@ -25,8 +25,21 @@ vi.mock("@/lib/ipc/client", () => ({
   // The picker's read. It is the one defence against a `profileId` naming
   // nothing, which is the single refusal the backend does not make.
   syncProfiles: vi.fn(),
+  // The schedule preview (Story 59.7). Mocked here rather than stubbed per test
+  // because the form asks it on every change of the schedule box, so an edit
+  // form seeded with a stored schedule asks it on mount — and a suite that left
+  // it undefined would be exercising the effect's `catch` in every test that
+  // touches the field.
+  syncTaskSchedulePreview: vi.fn(),
 }));
 
+import {
+  TASK_SCHEDULE_CEILING_DAYS,
+  TASK_SCHEDULE_FLOOR_MINUTES,
+  TASK_SCHEDULE_OFFERS,
+  taskScheduleBoundsNote,
+  taskSchedulePeriodPhrase,
+} from "@/components/sync/schedule-offers";
 import {
   TASK_FORM_ADD_SUBMIT_LABEL,
   TASK_FORM_ADD_TITLE,
@@ -50,19 +63,33 @@ import {
   TASK_FORM_PROFILE_READ_FAILED_PREFIX,
   TASK_FORM_PROFILE_READING_NOTE,
   TASK_FORM_SCHEDULE_LABEL,
+  TASK_FORM_SCHEDULE_OFFER_LABEL,
+  TASK_FORM_SCHEDULE_OFFER_NOTE,
+  TASK_FORM_SCHEDULE_OFFER_PLACEHOLDER,
+  TASK_FORM_SCHEDULE_PREVIEW_TESTID,
+  TASK_FORM_SCHEDULE_REFUSAL_PREFIX,
   TASK_HOST_WIDE_TEXT,
   TASK_MISSED_DELAY_MINUTES,
   TASK_MISSED_GRACE_MINUTES,
+  TASK_SCHEDULE_BOUNDS_NOTE,
   TaskForm,
   taskFormMissedDelayMs,
   taskFormOnMissedNote,
+  taskFormScheduleFiresNote,
+  taskFormScheduleOfferText,
   taskFormUnlistedProfileText,
 } from "@/components/sync/task-form";
-import type { SyncProfileVm, TaskVm } from "@/lib/ipc/client";
-import { syncProfiles, syncTaskSave } from "@/lib/ipc/client";
+import type { SyncProfileVm, TaskSchedulePreviewVm, TaskVm } from "@/lib/ipc/client";
+import { syncProfiles, syncTaskSave, syncTaskSchedulePreview } from "@/lib/ipc/client";
 
 const mockSave = vi.mocked(syncTaskSave);
 const mockProfiles = vi.mocked(syncProfiles);
+const mockPreview = vi.mocked(syncTaskSchedulePreview);
+
+/** Rust's answer, as the verb shapes it: the echo, the refusal, the instants. */
+function previewVm(over: Partial<TaskSchedulePreviewVm> = {}): TaskSchedulePreviewVm {
+  return { expression: "", refusal: null, instants: [], ...over };
+}
 
 const NOW = 1_760_000_000_000;
 
@@ -134,6 +161,11 @@ function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
 
 beforeEach(() => {
   mockProfiles.mockResolvedValue([]);
+  // Echoing and empty by default: the echo keeps the staleness guard satisfied
+  // for every test that is not about staleness, and no instants means no preview
+  // paragraph — so a test that wants one asks for it explicitly and every other
+  // test is unaffected by a control it does not care about.
+  mockPreview.mockImplementation(async (expression: string) => previewVm({ expression }));
 });
 
 afterEach(() => {
@@ -861,6 +893,286 @@ describe("TaskForm, the task's description", () => {
 });
 
 /**
+ * Help for writing a schedule (Story 59.7, FR-368).
+ *
+ * Two claims, and the second one is the dangerous half. The first is that the
+ * dialect is *offered*: a menu of expressions that get typed into the box, so
+ * nobody has to hold five-field cron in their head. The second is that the form
+ * shows when the typed expression will actually fire — and the only acceptable
+ * source for that is Rust, because a preview computed in the browser would need
+ * the dialect, the calendar, vixie's day rule and the zone, and the first of
+ * those to drift would make this form promise an instant the engine had no
+ * intention of keeping.
+ *
+ * So the assertions below are mostly about *provenance*: the rendered instants
+ * are the ones the view model carried, the rendered refusal is the sentence Rust
+ * sent, and neither is recomputed, reworded or second-guessed here. The
+ * corresponding claim on the Rust side — that the offered expressions are ones
+ * `TaskSchedule::parse` accepts, and that the instants are its own chained
+ * cadence — is asserted in `keeper-sync/src/tasks.rs`, because only Rust can run
+ * the parser.
+ */
+describe("TaskForm, help for writing a schedule", () => {
+  it("offers every form the dialect accepts, expression first", async () => {
+    render(<TaskForm />);
+    const menu = await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
+
+    // The option list is the offered list, in order, and each option leads with
+    // the expression — which is the whole mechanism by which somebody stops
+    // needing the menu.
+    expect([...menu.querySelectorAll("option")].map((option) => option.textContent)).toStrictEqual([
+      TASK_FORM_SCHEDULE_OFFER_PLACEHOLDER,
+      ...TASK_SCHEDULE_OFFERS.map((offer) => taskFormScheduleOfferText(offer)),
+    ]);
+    // Sized rather than merely non-empty: a list that shrank to one entry would
+    // still pass a per-option assertion while having stopped being help.
+    expect(TASK_SCHEDULE_OFFERS.length).toBeGreaterThanOrEqual(5);
+    // Every one of the three shapes of the dialect is reachable from the menu,
+    // because the point is to teach the grammar and not one corner of it. The
+    // `@` aliases and `every <n><unit>` are the two nobody can guess.
+    const offered = TASK_SCHEDULE_OFFERS.map((offer) => offer.expression);
+    expect(offered.some((expression) => expression.startsWith("@"))).toBe(true);
+    expect(offered.some((expression) => expression.startsWith("every "))).toBe(true);
+    expect(offered.some((expression) => expression.split(" ").length === 5)).toBe(true);
+    expect(screen.getByText(TASK_FORM_SCHEDULE_OFFER_NOTE)).toBeInTheDocument();
+  });
+
+  it("types the chosen form into the box and keeps claiming nothing itself", async () => {
+    render(<TaskForm />);
+    const menu = await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
+    const box = screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL);
+    const chosen = TASK_SCHEDULE_OFFERS[2];
+
+    fireEvent.change(menu, { target: { value: chosen.expression } });
+
+    expect(box).toHaveValue(chosen.expression);
+    // And the menu is back at its placeholder rather than showing what was
+    // picked. It is an action, not a second view of the value: a `<select>` that
+    // appeared to mirror the box would be claiming to know which option some
+    // hand-written expression is, and for anything typed the answer is none of
+    // them.
+    expect(menu).toHaveValue("");
+  });
+
+  it("sends what the box holds after a choice, edits included", async () => {
+    const onSaved = vi.fn();
+    mockSave.mockResolvedValue(taskVm());
+    render(<TaskForm onSaved={onSaved} />);
+    const menu = await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
+
+    fireEvent.change(menu, { target: { value: "@daily" } });
+    // Edited afterwards, which is the promise the note makes: the menu is a
+    // starting point and the box is still the only place the schedule lives.
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "0 3 * * 1 " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+
+    // Verbatim, trailing space and all — nothing about offering the dialect
+    // turned this form into something that tidies input.
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ schedule: "0 3 * * 1 " })),
+    );
+  });
+
+  it("shows the instants Rust computed, and computes none of its own", async () => {
+    // Deliberately NOT the instants `0 3 * * *` really fires at: they are three
+    // arbitrary numbers, and they still appear on screen. That is the assertion —
+    // this form renders what the engine sent rather than what it would itself
+    // have worked out, so a form that quietly recomputed the answer would fail
+    // here even though its arithmetic was "right".
+    const instants = [NOW + 61_000, NOW + 987_654, NOW + 3_600_000];
+    mockPreview.mockResolvedValue(previewVm({ expression: "0 3 * * *", instants }));
+    render(<TaskForm />);
+
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "0 3 * * *" },
+    });
+
+    expect(await screen.findByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toHaveTextContent(
+      taskFormScheduleFiresNote(instants),
+    );
+    expect(mockPreview).toHaveBeenCalledWith("0 3 * * *");
+    // Each instant stamped as itself, so a sentence that dropped or reordered one
+    // is caught. Composed with the same `Date` the component uses rather than
+    // hard-coded, for the reason `recording-row.test.tsx` composes its own: a
+    // literal here would assert the test machine's time zone.
+    for (const instant of instants) {
+      expect(screen.getByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toHaveTextContent(
+        new Date(instant).toLocaleString(),
+      );
+    }
+    // The count is never named, so a shorter list is stated as itself rather than
+    // as two thirds of a promise.
+    expect(taskFormScheduleFiresNote([instants[0]])).toBe(
+      `Next: ${new Date(instants[0]).toLocaleString()}`,
+    );
+  });
+
+  it("shows a refusal in Rust's own words, and refuses nothing itself", async () => {
+    // The epic's own example, and the sentence is `TaskSchedule::parse`'s
+    // verbatim — the same one `sync_ipc_error` puts in `message` when a save is
+    // refused, because both come off the same `Display`.
+    const refusal =
+      'invalid sync configuration: task schedule matches no instant, got "0 0 30 2 *"';
+    mockPreview.mockResolvedValue(previewVm({ expression: "0 0 30 2 *", refusal }));
+    mockSave.mockResolvedValue(taskVm());
+    render(<TaskForm />);
+    const box = screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL);
+
+    fireEvent.change(box, { target: { value: "0 0 30 2 *" } });
+
+    const preview = await screen.findByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID);
+    expect(preview).toHaveTextContent(`${TASK_FORM_SCHEDULE_REFUSAL_PREFIX}${refusal}`);
+    // Not an alert, and not the form's error paragraph: this is help about text
+    // somebody is still writing, and the error paragraph is for a save that
+    // actually happened.
+    expect(preview).not.toHaveAttribute("role", "alert");
+    expect(screen.queryByTestId(TASK_FORM_ERROR_TESTID)).toBeNull();
+
+    // What was typed is still on screen and unchanged: the refusal is beside the
+    // box, not instead of it.
+    expect(box).toHaveValue("0 0 30 2 *");
+    // And nothing is prevented. Save is live and sends exactly what is there —
+    // this form does not pre-empt a refusal, which is the rule its own header
+    // states and the reason there is no client-side validator here.
+    const submit = screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ schedule: "0 0 30 2 *" })),
+    );
+  });
+
+  it("asks nothing about an empty box, because empty is a choice", async () => {
+    render(<TaskForm />);
+    await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
+
+    expect(mockPreview).not.toHaveBeenCalled();
+    expect(screen.queryByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toBeNull();
+
+    // Typed, then cleared: the preview goes with it rather than lingering over a
+    // box that now means *store no schedule*.
+    const box = screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL);
+    mockPreview.mockResolvedValue(previewVm({ expression: "@daily", instants: [NOW + 1] }));
+    fireEvent.change(box, { target: { value: "@daily" } });
+    await screen.findByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID);
+    fireEvent.change(box, { target: { value: "" } });
+    await waitFor(() => expect(screen.queryByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toBeNull());
+
+    // Whitespace is NOT empty, and is asked about — the same `=== ""` rule the
+    // save uses for this field, so the preview and the save agree about which
+    // strings are a schedule at all.
+    fireEvent.change(box, { target: { value: " " } });
+    await waitFor(() => expect(mockPreview).toHaveBeenCalledWith(" "));
+  });
+
+  it("never shows an answer about text the box no longer holds", async () => {
+    // Two independent ways a preview can end up describing a string that is no
+    // longer on screen, and each has its own guard. Both are asserted here,
+    // because each guard is invisible while the other one holds.
+    const settle: Array<() => void> = [];
+    mockPreview.mockImplementation(
+      (expression: string) =>
+        new Promise<TaskSchedulePreviewVm>((resolve) => {
+          settle.push(() => resolve(previewVm({ expression, instants: [NOW + 60_000] })));
+        }),
+    );
+    render(<TaskForm />);
+    const box = screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL);
+
+    // (1) THE ALREADY-ANSWERED PREVIOUS EXPRESSION. `@daily`'s answer has landed
+    // and is on screen. The moment the box changes, that answer is about text
+    // nobody is looking at — and it is still sitting in state, because a
+    // keystroke cannot un-answer a read that already completed. So the preview
+    // must go blank until the new answer arrives, and the guard that blanks it is
+    // the echo comparison rather than any cancellation: there is nothing left to
+    // cancel.
+    fireEvent.change(box, { target: { value: "@daily" } });
+    settle[0]();
+    expect(await screen.findByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toHaveTextContent(
+      taskFormScheduleFiresNote([NOW + 60_000]),
+    );
+
+    fireEvent.change(box, { target: { value: "0 0 30 2 *" } });
+    // Nothing, immediately — not `@daily`'s instants under an expression that
+    // fires at no instant at all.
+    expect(screen.queryByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toBeNull();
+    settle[1]();
+    await waitFor(() =>
+      expect(screen.getByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toBeInTheDocument(),
+    );
+
+    // (2) THE OUT-OF-ORDER REPLY, which a happy-path mock can never show: the
+    // answer about the half-typed `0 3 * * ` is slower than the answer about the
+    // finished `0 3 * * *`, so it lands last. Rendering it would paint a refusal
+    // over an expression that is perfectly good. The superseded read is abandoned
+    // by the effect's cleanup, so it never reaches state at all.
+    settle.length = 0;
+    mockPreview.mockImplementation(
+      (expression: string) =>
+        new Promise<TaskSchedulePreviewVm>((resolve) => {
+          settle.push(() =>
+            resolve(
+              expression === "0 3 * * *"
+                ? previewVm({ expression, instants: [NOW + 120_000] })
+                : previewVm({
+                    expression,
+                    refusal:
+                      'invalid sync configuration: task schedule must be a 5-field cron expression, got "0 3 * * "',
+                  }),
+            ),
+          );
+        }),
+    );
+    fireEvent.change(box, { target: { value: "0 3 * * " } });
+    fireEvent.change(box, { target: { value: "0 3 * * *" } });
+    // Newest first, then the stale one.
+    settle[1]();
+    settle[0]();
+
+    await waitFor(() =>
+      expect(screen.getByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toHaveTextContent(
+        taskFormScheduleFiresNote([NOW + 120_000]),
+      ),
+    );
+    expect(screen.getByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).not.toHaveTextContent(
+      "must be a 5-field cron",
+    );
+  });
+
+  it("says nothing rather than something wrong when there is nothing to say", async () => {
+    // A read that failed is silent. The preview is a hint; a second error
+    // paragraph because a hint did not arrive would be worse than no hint.
+    mockPreview.mockRejectedValue({
+      code: "internal",
+      message: "the engine is not running",
+      accountId: null,
+      retriable: false,
+    });
+    render(<TaskForm />);
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "@daily" },
+    });
+
+    await waitFor(() => expect(mockPreview).toHaveBeenCalled());
+    expect(screen.queryByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toBeNull();
+    expect(screen.queryByTestId(TASK_FORM_ERROR_TESTID)).toBeNull();
+
+    // And an expression that parsed but yielded no instant — possible in
+    // principle, because Rust's search window is finite — renders nothing rather
+    // than an empty "Next:" or a sentence about a search window that nobody can
+    // ever check.
+    mockPreview.mockResolvedValue(previewVm({ expression: "@weekly", instants: [] }));
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "@weekly" },
+    });
+    await waitFor(() => expect(mockPreview).toHaveBeenCalledWith("@weekly"));
+    expect(screen.queryByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toBeNull();
+  });
+});
+
+/**
  * The note under *If a window is missed* states the numbers Rust actually uses
  * (Story 58.9).
  *
@@ -991,5 +1303,104 @@ wording needs rewriting rather than this regex widening`,
     for (const nonsense of ["soon", "12abc", "1.5", "1e999", "-"]) {
       expect(taskFormMissedDelayMs(nonsense)).toBeUndefined();
     }
+  });
+});
+
+/**
+ * The schedule bounds note states the numbers Rust actually refuses at
+ * (Story 59.7).
+ *
+ * The third member of a family, and the family exists because of one shipped
+ * defect: Story 58.4 wrote a note claiming fifteen minutes against a
+ * thirty-minute constant, and it survived a review and a full gate because
+ * nothing compared the two (see the guard above). Story 59.7 adds a sentence
+ * naming a floor and a ceiling, which is exactly the same exposure — so it
+ * arrives with the same mechanical comparison, in the same direction and for the
+ * same reason: Rust cannot import a TypeScript literal, and no ts-rs binding
+ * carries either constant.
+ *
+ * The two halves are separate claims. That the mirrored numbers equal Rust's is
+ * the first; that the *sentence* is composed from them rather than typed beside
+ * them is the second, and only the second catches a note that goes on saying
+ * "once a minute" after the floor has moved.
+ *
+ * **What this does NOT prove:** that the parser refuses at those bounds.
+ * `keeper-sync`'s own tests own that, boundary by boundary. This proves the
+ * sentence a person reads carries the numbers that code is compiled with.
+ */
+describe("the schedule bounds note states the numbers Rust refuses at", () => {
+  const TASKS_RS = resolve(
+    import.meta.dirname,
+    "../../../src-tauri/crates/keeper-sync/src/tasks.rs",
+  );
+
+  /** `MIN_SCHEDULE_INTERVAL_MS: i64 = 60_000;` → `60000`. */
+  const rustIntervalMs = (name: string): number => {
+    const source = readFileSync(TASKS_RS, "utf8");
+    // The floor is `pub`, the ceiling is not, and the ceiling is written as a
+    // product of days. Both spellings are matched here rather than normalised in
+    // Rust, because the Rust side is written for the reader who has to believe
+    // the number and this side is written for a regex.
+    const literal = new RegExp(`${name}: i64 = ([0-9_ *]+);`).exec(source);
+    if (literal === null) {
+      throw new Error(
+        `${name} is not an integer expression in tasks.rs any more, so this note's \
+wording needs rewriting rather than this regex widening`,
+      );
+    }
+    return literal[1]
+      .split("*")
+      .map((factor) => Number(factor.trim().split("_").join("")))
+      .reduce((product, factor) => product * factor, 1);
+  };
+
+  it("mirrors MIN_SCHEDULE_INTERVAL_MS and MAX_SCHEDULE_INTERVAL_MS", () => {
+    expect(TASK_SCHEDULE_FLOOR_MINUTES).toBe(rustIntervalMs("MIN_SCHEDULE_INTERVAL_MS") / 60_000);
+    expect(TASK_SCHEDULE_CEILING_DAYS).toBe(
+      rustIntervalMs("MAX_SCHEDULE_INTERVAL_MS") / 86_400_000,
+    );
+    // Whole units, because the sentence says "minute" and "day" rather than
+    // milliseconds. If either constant ever stops dividing exactly, the wording
+    // needs rewriting and this is where that is noticed.
+    expect(Number.isInteger(TASK_SCHEDULE_FLOOR_MINUTES)).toBe(true);
+    expect(Number.isInteger(TASK_SCHEDULE_CEILING_DAYS)).toBe(true);
+  });
+
+  it("composes both bounds from the constants rather than naming them", () => {
+    // Each in its role, which is the lesson the missed-window guard's own comment
+    // records: a bare `toContain("366")` would pass on a sentence that had the
+    // floor and the ceiling the wrong way round.
+    expect(TASK_SCHEDULE_BOUNDS_NOTE).toContain(
+      `more often than ${taskSchedulePeriodPhrase(TASK_SCHEDULE_FLOOR_MINUTES, "minute")}`,
+    );
+    expect(TASK_SCHEDULE_BOUNDS_NOTE).toContain(
+      `less often than ${taskSchedulePeriodPhrase(TASK_SCHEDULE_CEILING_DAYS, "day")}`,
+    );
+
+    // The half that catches a literal: at other numbers the sentence is a
+    // different sentence. A note typed with today's values would pass every
+    // assertion above and fail these two.
+    const retuned = taskScheduleBoundsNote(5, 30);
+    expect(retuned).toContain("more often than once every 5 minutes");
+    expect(retuned).toContain("less often than once every 30 days");
+    expect(retuned).not.toContain(taskSchedulePeriodPhrase(TASK_SCHEDULE_FLOOR_MINUTES, "minute"));
+    expect(retuned).not.toContain(taskSchedulePeriodPhrase(TASK_SCHEDULE_CEILING_DAYS, "day"));
+    // And the rendered note is exactly this function at Rust's numbers, so the
+    // mirror above is a claim about the sentence a real form shows.
+    expect(TASK_SCHEDULE_BOUNDS_NOTE).toBe(
+      taskScheduleBoundsNote(TASK_SCHEDULE_FLOOR_MINUTES, TASK_SCHEDULE_CEILING_DAYS),
+    );
+  });
+
+  it("is the sentence the form actually renders", async () => {
+    render(<TaskForm />);
+    expect(await screen.findByText(TASK_SCHEDULE_BOUNDS_NOTE)).toBeInTheDocument();
+  });
+
+  it("names a singular period without a bare 1 in front of it", () => {
+    // The pluraliser is the seam this guard leans on, so it is asserted rather
+    // than assumed: "once a minute" at one, "once every N minutes" above one.
+    expect(taskSchedulePeriodPhrase(1, "minute")).toBe("once a minute");
+    expect(taskSchedulePeriodPhrase(366, "day")).toBe("once every 366 days");
   });
 });

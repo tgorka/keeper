@@ -64,6 +64,7 @@ import type {
   TaskListingVm,
   TaskRunVm,
   TaskSaveReq,
+  TaskSchedulePreviewVm,
   TaskVm,
 } from "@/lib/ipc/client";
 
@@ -1994,6 +1995,103 @@ const PACED_WORK = [
   },
 ] satisfies PacedWorkVm[];
 
+/**
+ * What a written schedule would do (Story 59.7). Answered from the REAL
+ * dialect rather than with a fixed happy preview, because Story 58.4 already
+ * shipped three mock fixtures describing schedules the parser refuses and the
+ * trap is the same one: a mock that accepts everything makes the dev shell
+ * the only place a bad expression looks fine. `keeper-sync/src/tasks.rs`'s
+ * `every_schedule_the_dev_harness_shows_is_one_this_dialect_accepts` reads
+ * every schedule literal in this file through `TaskSchedule::parse` — and it
+ * extracts them by splitting on the field name, so this comment deliberately
+ * does not spell that token out: it tripped the guard once by describing it.
+ *
+ * The refusal sentences are `TaskSchedule::parse`'s own, copied verbatim —
+ * including the `{original:?}` quoting, which is Rust's `Debug` for a string
+ * and therefore double quotes. A paraphrase here would let the app's real
+ * wording change while the dev shell went on showing the old one.
+ */
+export function mockSchedulePreview(expression: string): TaskSchedulePreviewVm {
+  const original = expression.trim();
+  const lowered = original.toLowerCase();
+  const quoted = JSON.stringify(original);
+  const refuse = (sentence: string) => ({ expression, refusal: sentence, instants: [] });
+  const malformed = () =>
+    refuse(
+      "task schedule must be a 5-field cron expression (minute hour day-of-month month day-of-week), one of @hourly, @daily or @weekly, or every <n><unit> with unit s/m/h/d, got " +
+        quoted,
+    );
+  // Each branch settles two things: the gap between fires, and HOW MANY the
+  // real command will answer with. That second one is not cosmetic. An
+  // interval schedule fires `interval_ms` after the END of the previous run
+  // (`tasks.rs:534-541`, re-derived by `Engine::next_task_window` from
+  // `finished_ms`), so instants two and three would depend on how long the
+  // first run takes — arithmetic dressed as knowledge. `preview_schedule`
+  // therefore answers exactly ONE instant for an interval and up to the full
+  // count for a cron pattern, which names wall-clock instants and has no such
+  // dependency. A dev shell that showed three for `every 6h` would be more
+  // generous than the app.
+  //
+  // The gap for a cron form here is a plain day: the real command walks a
+  // calendar and this does not, and it says so rather than pretending. What
+  // the dev shell exercises is the SHAPE of the answer and the refusals,
+  // which is what the form renders.
+  let everyMs: number;
+  let chained: boolean;
+  if (lowered.startsWith("@")) {
+    const alias = { "@hourly": 3_600_000, "@daily": 86_400_000, "@weekly": 604_800_000 }[lowered];
+    if (alias === undefined) {
+      return malformed();
+    }
+    everyMs = alias;
+    // Aliases desugar to cron, never to an interval — `@daily` keeps meaning
+    // night rather than drifting to the last restart.
+    chained = true;
+  } else if (lowered.startsWith("every")) {
+    const match =
+      /^every\s+(\d+)\s*(s|m|h|d|sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days)$/.exec(
+        lowered,
+      );
+    if (match === null) {
+      return malformed();
+    }
+    const unit = match[2].charAt(0) as "s" | "m" | "h" | "d";
+    everyMs = Number(match[1]) * { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[unit];
+    // The floor and the ceiling, with the parser's own two sentences. `every
+    // 30s` is in the grammar precisely so it is told about the floor rather
+    // than about an unknown unit.
+    if (everyMs < 60_000) {
+      return refuse(
+        `task schedule must not fire more often than once a minute (60000 ms), got ${quoted}`,
+      );
+    }
+    if (everyMs > 366 * 86_400_000) {
+      return refuse(
+        `task schedule must not fire less often than once a year (${366 * 86_400_000} ms) — write a calendar pattern instead, got ${quoted}`,
+      );
+    }
+    chained = false;
+  } else {
+    const fields = original.split(/\s+/);
+    if (original === "" || fields.length !== 5) {
+      return malformed();
+    }
+    // The one cron refusal a person actually meets: a date that parses and
+    // names no instant. 30 February is the parser's own example.
+    if (fields[2] === "30" && fields[3] === "2") {
+      return refuse(`task schedule matches no instant, got ${quoted}`);
+    }
+    everyMs = 86_400_000;
+    chained = true;
+  }
+  const from = Date.now();
+  return {
+    expression,
+    refusal: null,
+    instants: (chained ? [1, 2, 3] : [1]).map((n) => from + everyMs * n),
+  };
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   // --- Tasks (Epic 57, Story 57.6) ---------------------------------------
   //
@@ -2005,6 +2103,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // pass. A static answer: nothing about it depends on the payload, and nothing
   // in the app can change it — the class is read-only by construction.
   sync_paced_work: () => PACED_WORK,
+  sync_task_schedule_preview: (payload) => mockSchedulePreview(String(payload.expression ?? "")),
   sync_task_history: (payload) => {
     const runs = TASK_RUNS[String(payload.id)] ?? [];
     // The clamp the command applies, mirrored so a caller asking for two rows

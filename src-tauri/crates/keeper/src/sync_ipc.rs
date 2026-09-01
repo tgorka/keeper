@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use keeper_core::tasks::{
     paced_work, task_host, DaemonPresence, PacedFolderFacts, PacedNotesFacts, PacedWorkVm,
-    TaskHostFacts, TaskListingVm, TaskRunVm, TaskSaveReq, TaskVm, UnknownTaskVm,
+    TaskHostFacts, TaskListingVm, TaskRunVm, TaskSaveReq, TaskSchedulePreviewVm, TaskVm,
+    UnknownTaskVm,
 };
 use keeper_core::vm::{
     ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
@@ -2182,6 +2183,72 @@ pub async fn sync_paced_work(
         })
         .collect();
     Ok(paced_work(&facts))
+}
+
+/// How many upcoming instants a schedule preview answers with.
+///
+/// Three, because the question the preview answers is *"is this the cadence I
+/// meant"* and one instant cannot answer it — `@daily` and `every 24h` both say
+/// "tomorrow" and differ only from the second one onward. More than three turns
+/// a hint under a text field into a list a person has to read.
+const TASK_SCHEDULE_PREVIEW_COUNT: usize = 3;
+
+/// What one written schedule would actually do, computed in Rust (Story 59.7).
+///
+/// **The browser gains no second parser.** The dialect is exact, small and
+/// already implemented once — five-field cron, three aliases, `every <n><unit>`,
+/// a sixty-second floor and a one-year ceiling, plus the refusal for a cron that
+/// parses and names no real date (`0 0 30 2 *`). A JavaScript cron library
+/// beside it would be a second opinion about the same string, and the one that
+/// disagrees is always the one the user is looking at. This is
+/// `recording_path_preview`'s precedent, on its stated rule: both the clock and
+/// the renderer belong to Rust.
+///
+/// **A refusal is data, not an error.** This is called as a person types, so a
+/// half-written expression is the ordinary case rather than a fault — and
+/// [`keeper_sync::tasks::SchedulePreview`] has no third variant, so the mapping
+/// below is total and this command has no judgement in it about which failures
+/// are the user's. The refusal is `TaskSchedule::parse`'s own `Display` string,
+/// which is exactly what [`sync_ipc_error`] would have put in `message` — so the
+/// preview and the save quote one wording rather than two.
+///
+/// **It takes state for the clock, and that is load-bearing.** `preview_schedule`
+/// needs a zone, and the port's default answer reads it through `gix`, which
+/// falls back to UTC when it cannot determine one. [`crate::sync::sync_platform`]
+/// overrides both `now_ms` and `utc_offset_minutes` for precisely that reason
+/// (`sync.rs:114-131`), and it is the platform the engine's own tick reasons
+/// with. A preview computed on a different clock than the save path would show a
+/// person one set of instants and then schedule another.
+///
+/// Rejects with: nothing. The only failure this verb can have is a refusal, and
+/// a refusal comes back inside the answer.
+#[tauri::command]
+pub async fn sync_task_schedule_preview(
+    state: tauri::State<'_, AppState>,
+    expression: String,
+) -> Result<TaskSchedulePreviewVm, IpcError> {
+    let platform = crate::sync::sync_platform(Arc::clone(&state.platform));
+    // Whitespace and all, exactly as the save door receives it: `validate_id`'s
+    // sibling rule is that a refusal quotes the original text and not a tidied
+    // copy, and a preview that silently trimmed would approve a string the save
+    // then refuses.
+    let (refusal, instants) = match keeper_sync::tasks::preview_schedule(
+        &expression,
+        platform.now_ms(),
+        platform.utc_offset_minutes(),
+        TASK_SCHEDULE_PREVIEW_COUNT,
+    ) {
+        keeper_sync::tasks::SchedulePreview::Refused(sentence) => (Some(sentence), Vec::new()),
+        keeper_sync::tasks::SchedulePreview::Fires(instants) => (None, instants),
+    };
+    Ok(TaskSchedulePreviewVm {
+        // Echoed back so the caller can drop a reply that a newer keystroke has
+        // already made stale: these land out of order under load, and a refusal
+        // rendered for text the box no longer holds is worse than no preview.
+        expression,
+        refusal,
+        instants,
+    })
 }
 
 /// One task's run history, newest first.

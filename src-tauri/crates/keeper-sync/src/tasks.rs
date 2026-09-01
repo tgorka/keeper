@@ -747,6 +747,79 @@ impl TaskSchedule {
     }
 }
 
+/// What one written schedule previews to (Story 59.7, FR-368).
+///
+/// No `Result`, deliberately. Every way [`preview_schedule`] can fail is a
+/// sentence for the person who typed the expression, and a `Result` would push
+/// that fact out of the type and into each caller's judgement — the shell's IPC
+/// arm would have to decide which `Err` means *you typed it wrong* and which
+/// means *keeper is broken*, guessing at variants it does not own. There is no
+/// second class of failure here, so there is no second arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulePreview {
+    /// [`TaskSchedule::parse`]'s own refusal, rendered exactly as the save door
+    /// renders it, quoting what was typed.
+    Refused(String),
+    /// The next instants in epoch milliseconds, soonest first.
+    ///
+    /// At most `count` of them and never more; possibly fewer, because the
+    /// search window is finite. Never empty for an expression that parsed and a
+    /// `count` above nought.
+    Fires(Vec<i64>),
+}
+
+/// The next few instants one written schedule fires at, or the refusal it
+/// earns (Story 59.7, FR-368).
+///
+/// This exists so that there is exactly **one** implementation of the dialect.
+/// The form that asks the question could have grown a cron parser of its own in
+/// the browser, and the first symptom would not have been a crash: it would
+/// have been a preview that quietly disagreed with the engine about when a task
+/// runs, which is a lie about the future told with a straight face. So this
+/// walks the same [`TaskSchedule::parse`] the write door walks, the same
+/// [`TaskSchedule::next_due_after`] the tick walks, and reports the refusal
+/// through the same `Display` the save's own error goes out on — so the
+/// sentence a person reads before saving and the sentence they read after
+/// saving are the same sentence, not two spellings of one rule.
+///
+/// Each instant is computed from the previous one rather than from `now_ms`,
+/// which is what makes the list the schedule's own cadence instead of `count`
+/// copies of the first answer.
+///
+/// Nothing here special-cases an empty expression: `""` earns the malformed
+/// refusal, exactly as it does at the write door. A caller that means *store no
+/// schedule* must not ask this question at all, because the answer to *what
+/// does the empty string fire at* is honestly a refusal.
+pub fn preview_schedule(
+    expression: &str,
+    now_ms: i64,
+    utc_offset_minutes: i32,
+    count: usize,
+) -> SchedulePreview {
+    let schedule = match TaskSchedule::parse(expression) {
+        Ok(schedule) => schedule,
+        Err(refusal) => return SchedulePreview::Refused(refusal.to_string()),
+    };
+    let mut fires = Vec::with_capacity(count);
+    let mut from = now_ms;
+    for _ in 0..count {
+        let Some(next) = schedule.next_due_after(from, utc_offset_minutes) else {
+            break;
+        };
+        // Strictly increasing or the walk stops. `next_due_after` promises
+        // *strictly after*, and the one thing that can break the promise is
+        // `Every`'s `saturating_add` pinned at `i64::MAX` — at which point every
+        // further answer is the same instant, and a list that repeated it would
+        // read as a schedule that fires three times at once.
+        if next <= from {
+            break;
+        }
+        fires.push(next);
+        from = next;
+    }
+    SchedulePreview::Fires(fires)
+}
+
 impl CronSpec {
     /// Parse the five whitespace-separated fields, or `None`.
     ///
@@ -1741,6 +1814,160 @@ mod tests {
                 parsed.is_ok(),
                 "the dev harness shows {literal:?}, which this dialect refuses: {}",
                 parsed.expect_err("refused")
+            );
+        }
+    }
+
+    /// Every form the task form **offers** is one this dialect accepts
+    /// (Story 59.7).
+    ///
+    /// The sibling of the harness guard above, aimed at the person rather than
+    /// at the developer. Story 59.7 puts a menu of starting points beside the
+    /// schedule box so nobody has to know cron by heart; a menu entry the parser
+    /// refuses would be help that produces a refusal, which is worse than no
+    /// help at all — and it is the identical defect the harness guard exists to
+    /// stop, so it gets the identical shape.
+    ///
+    /// Rust reading TypeScript, where this repo's other cross-language guards
+    /// read the other way round. That is not an oversight: only Rust can run
+    /// `TaskSchedule::parse`, so this is the only direction in which the claim
+    /// can actually be checked rather than restated.
+    #[test]
+    fn every_schedule_the_form_offers_is_one_this_dialect_accepts() {
+        let offers = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../src/components/sync/schedule-offers.ts")
+            .canonicalize()
+            .expect("src/components/sync/schedule-offers.ts is in this repository");
+        let source = std::fs::read_to_string(&offers).expect("read the offered forms");
+
+        // `expression: "…"`, which is how the offer objects spell it. The type
+        // declaration's own `expression: string;` carries no quote and is not
+        // matched.
+        let mut found = Vec::new();
+        for rest in source.split("expression: \"").skip(1) {
+            let Some(literal) = rest.split('"').next() else {
+                continue;
+            };
+            found.push(literal.to_owned());
+        }
+
+        // Before anything is asserted about the contents: a renamed field or a
+        // reshaped list would otherwise make this test pass over nothing.
+        assert!(
+            found.len() >= 5,
+            "the extraction found {} offered expressions in {}, which is too few \
+             to be the offered list — has the field been renamed?",
+            found.len(),
+            offers.display()
+        );
+
+        for literal in &found {
+            let parsed = TaskSchedule::parse(literal);
+            assert!(
+                parsed.is_ok(),
+                "the form offers {literal:?}, which this dialect refuses: {}",
+                parsed.expect_err("refused")
+            );
+        }
+    }
+
+    /// The preview is the dialect's own cadence, not one answer repeated
+    /// (Story 59.7).
+    ///
+    /// Each instant is asserted against `next_due_after` chained from the one
+    /// before it, because that is the whole claim: a preview that fed `now_ms`
+    /// to every call would return the same instant three times and look
+    /// perfectly plausible on screen.
+    #[test]
+    fn preview_schedule_walks_the_dialects_own_cadence() {
+        let now = JAN_1_2024_UTC;
+
+        let SchedulePreview::Fires(daily) = preview_schedule("0 3 * * *", now, 0, 3) else {
+            panic!("`0 3 * * *` is in the accepted dialect");
+        };
+        assert_eq!(
+            daily,
+            vec![
+                now + 3 * HOUR_MS,
+                now + DAY_MS + 3 * HOUR_MS,
+                now + 2 * DAY_MS + 3 * HOUR_MS,
+            ],
+            "three successive 03:00s, not one of them three times"
+        );
+
+        // The interval half, whose `next_due_after` is a bare addition — so
+        // chaining is the only thing that separates a real cadence from a
+        // repeated first answer.
+        let SchedulePreview::Fires(interval) = preview_schedule("every 90m", now, 0, 3) else {
+            panic!("`every 90m` is in the accepted dialect");
+        };
+        assert_eq!(
+            interval,
+            vec![now + 90 * 60_000, now + 180 * 60_000, now + 270 * 60_000]
+        );
+
+        // The offset is honoured, and it is the same argument the tick passes.
+        // Three hours east the local clock already reads 03:00 at `now`, and
+        // `next_due_after` is strictly after — so the answer is *tomorrow's*
+        // 03:00 local, a full day on, and deliberately not the instant the
+        // zero-offset case above picked. A preview that ignored the offset would
+        // return `now + 3 h` here and be wrong by twenty-one hours.
+        let SchedulePreview::Fires(east) = preview_schedule("0 3 * * *", now, 180, 1) else {
+            panic!("`0 3 * * *` is in the accepted dialect");
+        };
+        assert_eq!(east, vec![now + DAY_MS]);
+        assert_ne!(east, vec![now + 3 * HOUR_MS]);
+
+        // Never longer than asked, and a `count` of nought parses first and then
+        // asks for nothing — an empty list from a *valid* expression, which is
+        // not the same fact as a refusal.
+        let SchedulePreview::Fires(one) = preview_schedule("@hourly", now, 0, 1) else {
+            panic!("`@hourly` is in the accepted dialect");
+        };
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            preview_schedule("@hourly", now, 0, 0),
+            SchedulePreview::Fires(Vec::new())
+        );
+    }
+
+    /// A refusal previews as a refusal, in the save door's own words
+    /// (Story 59.7).
+    ///
+    /// Asserted against `TaskSchedule::parse`'s own error rather than against a
+    /// copied sentence, and through the same `Display` `sync_ipc_error` puts on
+    /// the wire — so the sentence a person reads *before* saving and the one
+    /// they read *after* a save is refused are the same sentence, and this test
+    /// goes red if either side ever starts rewording the other.
+    ///
+    /// All four refusals, plus the empty string. The empty string is here to pin
+    /// that nothing in the preview special-cases it: *store no schedule* is a
+    /// decision the caller makes by not asking, not a meaning this function
+    /// invents, and the write door treats `""` exactly the same way.
+    #[test]
+    fn preview_schedule_answers_a_refusal_in_the_save_doors_own_words() {
+        for expression in [
+            "eee",          // malformed
+            "every 30s",    // below the floor
+            "every 400d",   // above the ceiling
+            "0 0 30 2 *",   // parses, matches no instant
+            "",             // no schedule at all
+            "   ",          // not an empty box; whitespace goes verbatim
+            "@daily 03:00", // the syntax the 58.4 fixtures wrongly taught
+        ] {
+            let refusal = TaskSchedule::parse(expression)
+                .expect_err("this expression is outside the dialect")
+                .to_string();
+            assert_eq!(
+                preview_schedule(expression, JAN_1_2024_UTC, 0, 3),
+                SchedulePreview::Refused(refusal.clone()),
+                "{expression:?} must preview as the refusal it earns"
+            );
+            // The refusal quotes what was typed, which is what makes it usable
+            // beside the box that still holds it.
+            assert!(
+                refusal.contains(&format!("{:?}", expression.trim())),
+                "the refusal for {expression:?} must quote it: {refusal}"
             );
         }
     }

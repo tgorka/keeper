@@ -1146,6 +1146,58 @@ fn plural_words(count: u64, unit: &str) -> String {
     }
 }
 
+/// What one written schedule fires at, or the refusal it earns (Story 59.7,
+/// FR-368).
+///
+/// The answer to *when does this actually run*, asked by the task form while
+/// somebody is still typing, and answered by the only implementation of the
+/// dialect there is: `keeper_sync::tasks::preview_schedule` runs the same
+/// `TaskSchedule::parse` the write door runs and the same `next_due_after` the
+/// tick runs. The browser gains no cron parser, and the reason is not tidiness
+/// — a second implementation would drift, and its first symptom would be a
+/// preview that disagreed with the engine about when a task runs, which is a
+/// lie about the future told with a straight face. `recording_path_preview` is
+/// the precedent and states the same rule: both the clock and the renderer
+/// belong to Rust.
+///
+/// This type is the wire shape only; it holds no dialect knowledge, because
+/// this crate is deliberately `keeper-sync`-free (AD-40) and could not call the
+/// parser even if it wanted to. The shell composes it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskSchedulePreviewVm {
+    /// The expression this answer is **about**, echoed exactly as it was asked.
+    ///
+    /// On the wire for one reason, and it is a correctness one: a caller that
+    /// asks on every keystroke has replies that can land out of order, so a slow
+    /// answer about `0 3 * * ` can arrive after the answer about `0 3 * * *` and
+    /// paint a refusal over text the box no longer holds. The caller compares
+    /// this against what it currently holds and renders nothing when they
+    /// differ. Without the echo that guard cannot be written at all.
+    pub expression: String,
+    /// keeper's own refusal, verbatim, `null` when the expression parsed.
+    ///
+    /// The same sentence the save would show, from the same `Display` the save's
+    /// error travels on — so a person meets one wording rather than a preview's
+    /// paraphrase and then the real thing. It is a **refusal**, not a fault:
+    /// asking about half-typed text is normal, so this arrives as data on a
+    /// successful read rather than as a failed command, and nothing about it
+    /// blocks a save. The write door still decides, still refuses, and still
+    /// quotes what was typed.
+    pub refusal: Option<String>,
+    /// The next instants this schedule fires at: ms since the Unix epoch,
+    /// soonest first.
+    ///
+    /// Empty when [`Self::refusal`] is set. Each instant is computed from the one
+    /// before it, so this is the schedule's own cadence rather than one answer
+    /// repeated — and it may be **shorter** than the number asked for, because
+    /// the search window is finite. A surface renders however many arrived and
+    /// claims no count of its own.
+    #[ts(type = "Array<number>")]
+    pub instants: Vec<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
