@@ -17,6 +17,11 @@ vi.mock("@/lib/ipc/client", () => ({
   syncTaskHistory: vi.fn(),
   syncTaskSave: vi.fn(),
   syncTaskForget: vi.fn(),
+  // The batched pair Story 59.4's multi-selection drives. Answered in
+  // `beforeEach` with an empty receipt, so a test that presses a bulk control
+  // without saying what came back gets a receipt rather than `undefined`.
+  syncTasksSetEnabled: vi.fn(),
+  syncTasksForget: vi.fn(),
   // Story 58.7's read. Mocked here and answered in `beforeEach`, because the
   // pane now reads it in the SAME settled pass as `syncTasks` — an unanswered
   // mock resolves `undefined` and the section would render rows out of it.
@@ -69,6 +74,10 @@ import {
   TASK_SCHEDULE_LABEL,
   TASK_UNREADABLE_OUTCOME_TEXT,
   TASKS,
+  TASKS_BULK_DISABLE_TEXT,
+  TASKS_BULK_ENABLE_TEXT,
+  TASKS_BULK_FORGET_TEXT,
+  TASKS_BULK_MISSING_TEXT,
   TASKS_CLOCK_TICK_MS,
   TASKS_DESCRIPTION_TESTID,
   TASKS_DETAIL_LABEL,
@@ -87,6 +96,8 @@ import {
   TASKS_REFUSAL_TESTID,
   TASKS_ROW_TESTID,
   TASKS_RUN_NOW_SENTENCE,
+  TASKS_SELECTED_TESTID,
+  TASKS_SELECTION_TESTID,
   TASKS_UNKNOWN_BADGE,
   TASKS_UNKNOWN_HEADING,
   TASKS_UNKNOWN_NO_ID_TEXT,
@@ -95,6 +106,8 @@ import {
   taskForgetConfirmTitle,
   taskHistoryUnshownText,
   taskOutcomeText,
+  tasksForgetConfirmTitle,
+  tasksSelectionSentence,
 } from "@/components/layout/tasks-pane";
 import {
   TASK_FORM_ADD_SUBMIT_LABEL,
@@ -116,7 +129,10 @@ import {
   syncTaskRunNow,
   syncTaskSave,
   syncTasks,
+  syncTasksForget,
+  syncTasksSetEnabled,
 } from "@/lib/ipc/client";
+import { resetColumnFoldForTest } from "@/lib/stores/column-fold";
 import {
   SYNC_LIST_FOLDED_FALLBACK,
   SYNC_LIST_UNFOLDED_FALLBACK,
@@ -222,18 +238,49 @@ function answerPaced(rows: PacedWorkVm[]): void {
 }
 
 /**
- * Choose a task in the master list (Story 59.1).
+ * The row, which IS the listbox's own `option` (Story 59.1, re-roled by 59.4).
  *
- * The `<li>` holds exactly one button — the row itself — because a projected
- * control on a 320px line is what Story 58.3 already had to undo once. Selecting
- * costs no IPC, which several tests below assert directly.
+ * `role="option"` and no longer a `<button>` inside an `<li>`: `aria-selected`
+ * is not a supported state on `role="button"`, and a listbox has to own its
+ * options directly — so once a selection could hold several rows, one row became
+ * one element carrying the role, the state and the testid together. What has not
+ * changed is that the row holds no controls of its own, which the block below
+ * asserts as an absence.
  */
-function selectRow(id: string): void {
+function rowOption(id: string): HTMLElement {
   const row = screen
     .getAllByTestId(TASKS_ROW_TESTID)
     .find((candidate) => candidate.dataset.taskId === id);
   expect(row, `row ${id}`).toBeDefined();
-  fireEvent.click(within(row as HTMLElement).getByRole("button"));
+  return row as HTMLElement;
+}
+
+/** Choose a task with a plain click, which REPLACES the selection. */
+function selectRow(id: string): void {
+  fireEvent.click(rowOption(id));
+}
+
+/**
+ * A modifier click, in `files-pane.test.tsx:2630`'s idiom.
+ *
+ * Inside one `act` with a flush, because the gesture settles a state update the
+ * assertion after it reads — and one modifier per call, because three modifier
+ * clicks in one `act` cannot tell you which modifier the handler honoured.
+ */
+async function clickRowWith(id: string, modifiers: MouseEventInit): Promise<void> {
+  const option = rowOption(id);
+  await act(async () => {
+    fireEvent.click(option, modifiers);
+    await Promise.resolve();
+  });
+}
+
+/** Which rows read as selected, by id and in the list's own order. */
+function selectedRows(): string[] {
+  return screen
+    .getAllByTestId(TASKS_ROW_TESTID)
+    .filter((row) => row.getAttribute("aria-selected") === "true")
+    .map((row) => row.dataset.taskId ?? "");
 }
 
 /** A control in the detail region, which draws exactly one task. */
@@ -250,6 +297,16 @@ beforeEach(() => {
   // are about the task list, and a projected row in each of them would put a
   // second `Cadence` cell inside reach of their queries.
   answerPaced([]);
+  // An empty receipt rather than `undefined`: a bulk press in a test that does
+  // not care what came back must not fall over inside the pane's own receipt
+  // handling and report itself as a rendering failure.
+  vi.mocked(syncTasksSetEnabled).mockResolvedValue({ entries: [] });
+  vi.mocked(syncTasksForget).mockResolvedValue({ entries: [] });
+  // The fold is module state and one test below folds the names away, so
+  // without this every test declared after it renders a 48px strip and can find
+  // no rows at all. It leaked harmlessly only while that test happened to be
+  // last in the file.
+  resetColumnFoldForTest();
 });
 
 afterEach(() => {
@@ -2442,10 +2499,18 @@ describe("a list of names, and one task at a time", () => {
     render(<TasksPane />);
     await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(3));
 
+    // One option per row and not one more: the row itself. Asserted over the
+    // whole list because the row IS the option now, so a nested one would be a
+    // second option this count would catch.
+    expect(screen.getAllByRole("option")).toHaveLength(3);
     for (const row of screen.getAllByTestId(TASKS_ROW_TESTID)) {
-      // Exactly one button: the row itself. Not Run now, not Edit, not Forget,
-      // not Runs.
-      expect(within(row).getAllByRole("button")).toHaveLength(1);
+      // ZERO buttons, which Story 59.4 made the stronger claim rather than a
+      // weaker one: the row lost its `<button>` because `aria-selected` is not a
+      // state `role="button"` supports, so the old "exactly one button" would
+      // now be satisfied by a row that had grown a control and lost its option.
+      // Not Run now, not Edit, not Forget, not Runs.
+      expect(row).toHaveAttribute("role", "option");
+      expect(within(row).queryAllByRole("button")).toHaveLength(0);
       for (const name of [
         TASK_RUN_NOW_TEXT,
         TASK_EDIT_TEXT,
@@ -2503,22 +2568,36 @@ describe("a list of names, and one task at a time", () => {
     expect(screen.getByRole("region", { name: TASKS_PANE_TITLE })).toBeInTheDocument();
   });
 
-  it("marks exactly one name as current, and moves the mark rather than adding one", async () => {
+  it("marks exactly one name as selected, and moves the mark rather than adding one", async () => {
+    // Story 59.1's test, rewritten rather than worked around. It asserted one
+    // `aria-current` row on the ground that `aria-selected` announces a SET to a
+    // reader when only one thing can be chosen — and Story 59.4 removed that
+    // ground by building the bulk consumer, so the attribute and the refusal
+    // flip together.
+    //
+    // What has NOT changed is the claim: the selection's **contents**, not its
+    // size. "Exactly one" and "the right one" are different claims, and a test
+    // that counted would pass while the mark sat on the wrong row.
     answer(listing({ tasks: [task({ id: "01FIRST" }), task({ id: "01SECOND" })] }));
     render(<TasksPane />);
     await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
 
-    const current = (): string[] =>
-      screen
-        .getAllByTestId(TASKS_ROW_TESTID)
-        .filter((row) => within(row).getByRole("button").getAttribute("aria-current") === "true")
-        .map((row) => row.dataset.taskId ?? "");
+    expect(selectedRows()).toEqual(["01FIRST"]);
+    // On EVERY row, `"false"` included: a list that marked only the selected
+    // rows would leave a screen reader unable to say "not selected" about the
+    // others (`files-pane.tsx:2528-2532`).
+    expect(rowOption("01SECOND")).toHaveAttribute("aria-selected", "false");
+    // And the container says a set is possible at all, which is the half a
+    // reader learns before touching anything.
+    expect(screen.getByRole("listbox", { name: TASKS_LIST_LABEL })).toHaveAttribute(
+      "aria-multiselectable",
+      "true",
+    );
 
-    expect(current()).toEqual(["01FIRST"]);
     selectRow("01SECOND");
-    // One, and the other one — not two. Story 59.4 refuses a selection SET, and
-    // the refusal is only true while this stays a single mark.
-    expect(current()).toEqual(["01SECOND"]);
+    // One, and the other one — not two: a plain click REPLACES.
+    expect(selectedRows()).toEqual(["01SECOND"]);
+    expect(rowOption("01FIRST")).toHaveAttribute("aria-selected", "false");
   });
 
   it("reads nothing at all when a task is chosen", async () => {
@@ -2536,17 +2615,25 @@ describe("a list of names, and one task at a time", () => {
     selectRow("B");
     selectRow("C");
     selectRow("A");
+    // The modifier gestures too (Story 59.4). Assembling a five-row selection
+    // is the shape most able to break this: it is five gestures, and a read on
+    // any of them would be five reads for one deliberate bulk action.
+    await clickRowWith("C", { metaKey: true });
+    await clickRowWith("B", { shiftKey: true });
 
     expect(syncTasks).toHaveBeenCalledTimes(1);
     expect(syncPacedWork).toHaveBeenCalledTimes(1);
     expect(syncTaskHistory).not.toHaveBeenCalled();
+    // And no WRITE either: a selection is not an action.
+    expect(syncTasksSetEnabled).not.toHaveBeenCalled();
+    expect(syncTasksForget).not.toHaveBeenCalled();
   });
 
   it("moves the selection with the arrow keys, and stops at both ends", async () => {
     answer(listing({ tasks: [task({ id: "A" }), task({ id: "B" })] }));
     render(<TasksPane />);
     await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
-    const list = screen.getByRole("list", { name: TASKS_LIST_LABEL });
+    const list = screen.getByRole("listbox", { name: TASKS_LIST_LABEL });
     const shown = (): string | undefined => screen.getByTestId(TASKS_DETAIL_TESTID).dataset.taskId;
 
     fireEvent.keyDown(list, { key: "ArrowDown" });
@@ -2571,7 +2658,7 @@ describe("a list of names, and one task at a time", () => {
     render(<TasksPane />);
     await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
 
-    fireEvent.keyDown(screen.getByRole("list", { name: TASKS_LIST_LABEL }), {
+    fireEvent.keyDown(screen.getByRole("listbox", { name: TASKS_LIST_LABEL }), {
       key: "ArrowDown",
       metaKey: true,
     });
@@ -2623,8 +2710,13 @@ describe("a list of names, and one task at a time", () => {
     const unknown = await screen.findByTestId(TASKS_UNKNOWN_ROW_TESTID);
 
     expect(within(unknown).queryAllByRole("button")).toHaveLength(0);
-    expect(within(unknown).queryByRole("button")).toBeNull();
+    expect(within(unknown).queryByRole("option")).toBeNull();
+    // No selection state of any kind, in either spelling: Story 59.1 marked the
+    // chosen row with `aria-current` and Story 59.4 moved to `aria-selected`, and
+    // an unreadable row has never carried either. It is not a `TaskVm`, so there
+    // is nothing to draw a detail from and nothing a batch could act on.
     expect(unknown.querySelector("[aria-current]")).toBeNull();
+    expect(unknown.querySelector("[aria-selected]")).toBeNull();
   });
 
   it("says how many names it is hiding, and offers no second Refresh", async () => {
@@ -2661,5 +2753,321 @@ describe("a list of names, and one task at a time", () => {
     // The detail region does NOT fold with the list: a person who put the names
     // away to read one task must still be reading that task.
     expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "A");
+  });
+});
+
+/**
+ * Several tasks at once (Story 59.4).
+ *
+ * The semantics asserted here are **not this pane's own**: every one of them is
+ * the semantics `files-pane.test.tsx:2609/2630/2657/2912` already asserts about
+ * the one selection idiom this app has, read against
+ * `files-pane.tsx:1656-1668`'s doc for what each modifier is *supposed* to mean.
+ * A gesture that behaved differently here would be the second selection model
+ * `spec-45-17…:200` forbids by name, and these tests are what would catch it.
+ *
+ * Three idioms are copied verbatim from that file: a modifier click is a
+ * `fireEvent.click(el, { metaKey: true })` inside one `act`; selection is read
+ * through `aria-selected` in both spellings; and the count is asserted by ROLE
+ * and NAME plus its text content, because the badge draws the figure and
+ * announces the sentence.
+ */
+describe("several tasks at once", () => {
+  /** Three rows, each with its own `updatedMs`, ready to select in. */
+  async function threeTasks(): Promise<void> {
+    answer(
+      listing({
+        tasks: [
+          task({ id: "A", updatedMs: NOW - 3_000 }),
+          task({ id: "B", updatedMs: NOW - 2_000 }),
+          task({ id: "C", updatedMs: NOW - 1_000 }),
+        ],
+      }),
+    );
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(3));
+  }
+
+  async function pressBulk(name: string): Promise<void> {
+    const control = screen.getByRole("button", { name });
+    await act(async () => {
+      fireEvent.click(control);
+      await Promise.resolve();
+    });
+  }
+
+  it("selects one row on a plain click and replaces the selection on the next", async () => {
+    await threeTasks();
+
+    selectRow("A");
+    expect(selectedRows()).toEqual(["A"]);
+
+    selectRow("B");
+    // Replaced, not accumulated: a plain click is not a multiselect gesture,
+    // and a list that accumulated them would disable the task you looked at
+    // five minutes ago.
+    expect(selectedRows()).toEqual(["B"]);
+  });
+
+  it("extends the selection with Cmd-click and takes the run with Shift-click", async () => {
+    await threeTasks();
+
+    selectRow("A");
+    // Singular at exactly one, and through `countLabel` rather than a
+    // hand-rolled plural (`count-label.ts:29-31`).
+    expect(tasksSelectionSentence(1)).toBe("1 task selected");
+    expect(screen.getByRole("status", { name: "1 task selected" })).toHaveTextContent("1");
+
+    await clickRowWith("C", { metaKey: true });
+    expect(selectedRows()).toEqual(["A", "C"]);
+    // The middle row was NOT taken: Cmd adds one, it does not fill the gap.
+    expect(rowOption("B")).toHaveAttribute("aria-selected", "false");
+    expect(screen.getByRole("status", { name: "2 tasks selected" })).toHaveTextContent("2");
+
+    selectRow("A");
+    await clickRowWith("C", { shiftKey: true });
+    // Shift fills it, because a run is what a person sees between two rows —
+    // and it is inclusive at both ends.
+    expect(selectedRows()).toEqual(["A", "B", "C"]);
+    expect(screen.getByRole("status", { name: "3 tasks selected" })).toHaveTextContent("3");
+  });
+
+  it("treats Ctrl-click as Cmd-click, because one of them is the wrong platform", async () => {
+    // Asserted on its own rather than folded into the test above, for
+    // `files-pane.test.tsx:2657`'s reason: three modifier clicks inside one
+    // `act` cannot tell you which modifier the handler honoured, and jsdom
+    // reports a non-Mac platform.
+    await threeTasks();
+
+    selectRow("A");
+    await clickRowWith("B", { ctrlKey: true });
+
+    expect(selectedRows()).toEqual(["A", "B"]);
+    expect(screen.getByRole("status", { name: "2 tasks selected" })).toHaveTextContent("2");
+  });
+
+  it("clears the selection on Escape", async () => {
+    await threeTasks();
+
+    selectRow("A");
+    await clickRowWith("B", { metaKey: true });
+    expect(screen.getByTestId(TASKS_SELECTED_TESTID)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.keyDown(rowOption("B"), { key: "Escape" });
+      await Promise.resolve();
+    });
+
+    // Nothing is held, so the count and the three verbs are gone. The detail
+    // region falls back to the first row, which is Story 59.1's rule and not a
+    // selection anybody made.
+    expect(screen.queryByTestId(TASKS_SELECTED_TESTID)).toBeNull();
+    expect(screen.queryByRole("button", { name: TASKS_BULK_ENABLE_TEXT })).toBeNull();
+    expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "A");
+  });
+
+  it("offers no bulk action until something is selected", async () => {
+    // Absent, not disabled: a disabled control says *not now*, and with nothing
+    // selected the truth is *there is nothing to do this to*. Asserted before
+    // any click, which is also the state every install opens ⌘8 in.
+    await threeTasks();
+
+    expect(screen.queryByTestId(TASKS_SELECTED_TESTID)).toBeNull();
+    for (const name of [TASKS_BULK_ENABLE_TEXT, TASKS_BULK_DISABLE_TEXT, TASKS_BULK_FORGET_TEXT]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+  });
+
+  it("sends each row's own reading as the baseline the write is checked against", async () => {
+    // The decision this argues for is in `TaskBatchIdReq`'s doc: the app's edit
+    // form is the one caller that passes a baseline, because it seeded its
+    // values once — and a bulk action from a rendered list is that case, not the
+    // read-and-write-in-one-call case the CLI is. Ids alone would make the bulk
+    // path silently weaker than the single-id path it stands in for.
+    await threeTasks();
+
+    selectRow("A");
+    await clickRowWith("C", { shiftKey: true });
+    await pressBulk(TASKS_BULK_ENABLE_TEXT);
+
+    expect(syncTasksSetEnabled).toHaveBeenCalledWith(
+      [
+        { id: "A", baselineUpdatedMs: NOW - 3_000 },
+        { id: "B", baselineUpdatedMs: NOW - 2_000 },
+        { id: "C", baselineUpdatedMs: NOW - 1_000 },
+      ],
+      true,
+    );
+  });
+
+  it("names what it could not enable rather than shrinking the selection in silence", async () => {
+    // The receipt is the reason this story exists. Three of five refuse for
+    // three DIFFERENT reasons — a moved baseline, a row this build cannot read,
+    // a spelling keeper could never have stored — and each sentence has to reach
+    // the screen attributed to its own id. A surface that rendered the first
+    // refusal, or a count of refusals, would leave two ids looking enabled.
+    const moved =
+      "task 'B' was changed elsewhere since this was opened: refusing to write stale values over it — re-read it and try again";
+    const unreadable =
+      "task 'C' is stored, but this keeper cannot read it: invalid kind 'teleport'";
+    const spelling = "task id 'D' is not a spelling this keeper could ever have stored";
+    answer(
+      listing({
+        tasks: [
+          task({ id: "A" }),
+          task({ id: "B" }),
+          task({ id: "C" }),
+          task({ id: "D" }),
+          task({ id: "E" }),
+        ],
+      }),
+    );
+    vi.mocked(syncTasksSetEnabled).mockResolvedValue({
+      entries: [
+        { id: "A", outcome: "saved", effect: "updated", reason: null },
+        { id: "B", outcome: "refused", effect: null, reason: moved },
+        { id: "C", outcome: "refused", effect: null, reason: unreadable },
+        { id: "D", outcome: "refused", effect: null, reason: spelling },
+        { id: "E", outcome: "saved", effect: "rearmed", reason: null },
+      ],
+    });
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(5));
+
+    selectRow("A");
+    await clickRowWith("E", { shiftKey: true });
+    await pressBulk(TASKS_BULK_DISABLE_TEXT);
+
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ORPHAN_REFUSAL_TESTID)).toHaveLength(3));
+    // Verbatim, and attributed: keeper's own sentence under the id it is about.
+    // Nothing here is a sentence this pane composed.
+    const drawn = screen
+      .getAllByTestId(TASKS_ORPHAN_REFUSAL_TESTID)
+      .map((node) => node.textContent ?? "");
+    expect(drawn).toEqual([`B: ${moved}`, `C: ${unreadable}`, `D: ${spelling}`]);
+    // And the selection is NOT quietly shrunk to the two that went: the person
+    // still has the five rows they chose, and can act on them again.
+    expect(screen.getByRole("status", { name: "5 tasks selected" })).toHaveTextContent("5");
+    expect(selectedRows()).toEqual(["A", "B", "C", "D", "E"]);
+  });
+
+  it("says so when an id it was asked about is not there at all", async () => {
+    // `missing` is a fourth outcome and not a refusal — a well-formed id whose
+    // row another host forgot is usually benign — so the wire carries no
+    // sentence for it and the pane owns one. Something must still be said: a
+    // bulk action that silently skipped an id looks exactly like one that
+    // worked.
+    await threeTasks();
+    vi.mocked(syncTasksSetEnabled).mockResolvedValue({
+      entries: [
+        { id: "A", outcome: "saved", effect: "updated", reason: null },
+        { id: "B", outcome: "missing", effect: null, reason: null },
+      ],
+    });
+
+    selectRow("A");
+    await clickRowWith("B", { metaKey: true });
+    await pressBulk(TASKS_BULK_ENABLE_TEXT);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(TASKS_ORPHAN_REFUSAL_TESTID)).toHaveTextContent(
+        `B: ${TASKS_BULK_MISSING_TEXT}`,
+      ),
+    );
+  });
+
+  it("asks before forgetting several, and empties the selection once they are gone", async () => {
+    // A destructive verb over a set with no confirmation would be worse than the
+    // single-id Forget it stands in for, not better — and the question names the
+    // COUNT, because a set has no one name and the number is what is being
+    // decided about.
+    await threeTasks();
+
+    selectRow("A");
+    await clickRowWith("C", { shiftKey: true });
+    await pressBulk(TASKS_BULK_FORGET_TEXT);
+
+    const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByText(tasksForgetConfirmTitle(3))).toBeInTheDocument();
+    expect(within(dialog).getByText("Forget 3 tasks?")).toBeInTheDocument();
+    // Nothing has gone yet: there is no gesture in this pane that forgets a task
+    // without keeper's framing being read first.
+    expect(syncTasksForget).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: TASK_FORGET_TEXT }));
+      await Promise.resolve();
+    });
+
+    // Exactly the ids that were held, in the list's own order.
+    expect(syncTasksForget).toHaveBeenCalledWith(["A", "B", "C"]);
+    // And nothing stays selected: the rows are gone, unlike an Enable where they
+    // are still there and still the same set.
+    await waitFor(() => expect(screen.queryByTestId(TASKS_SELECTED_TESTID)).toBeNull());
+  });
+
+  it("keeps one task at a time working exactly as it did", async () => {
+    // Story 59.1's whole surface, re-asserted under a set: single-select has to
+    // be byte-for-byte what it was, which is what the resolved-not-stored rule
+    // buys. The empty-selection fallback, a plain click and the arrows all
+    // resolve to exactly one task and the region draws it.
+    await threeTasks();
+
+    expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "A");
+
+    selectRow("B");
+    expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "B");
+
+    const list = screen.getByRole("listbox", { name: TASKS_LIST_LABEL });
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "C");
+    fireEvent.keyDown(list, { key: "ArrowUp" });
+    expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "B");
+
+    // Two selected: no task's detail is drawn, and what stands in its place says
+    // what there is rather than pretending to be one task.
+    await clickRowWith("C", { metaKey: true });
+    expect(screen.queryByTestId(TASKS_DETAIL_TESTID)).toBeNull();
+    expect(screen.getByTestId(TASKS_SELECTION_TESTID)).toHaveTextContent("2 tasks selected");
+    expect(screen.getByRole("region", { name: TASKS_DETAIL_LABEL })).toBeInTheDocument();
+
+    // Collapsed back to one, and the region is a task's again.
+    await clickRowWith("C", { metaKey: true });
+    expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "B");
+  });
+
+  it("offers no selection and no bulk action on a row it cannot read", async () => {
+    // Neither an `unknown` row nor a projected paced row is a `TaskVm`, so
+    // neither can be in a selection: a control that can only fail is worse than
+    // no control, and half a selection no command can act on is worse than one
+    // that visibly reset.
+    answer(
+      listing({
+        tasks: [task({ id: "A" })],
+        unknown: [{ id: "01TELEPORT", reason: "invalid kind 'teleport'" }],
+      }),
+    );
+    answerPaced([pacedRow()]);
+    render(<TasksPane />);
+    const unknown = await screen.findByTestId(TASKS_UNKNOWN_ROW_TESTID);
+    const paced = screen.getByTestId(PACED_ROW_TESTID);
+
+    // Exactly one listbox on this surface: the readable names. Neither of the
+    // other two lists was widened into one.
+    expect(screen.getAllByRole("listbox")).toHaveLength(1);
+    expect(screen.getByRole("list", { name: PACED_HEADING })).toBeInTheDocument();
+    for (const row of [unknown, paced]) {
+      expect(within(row).queryByRole("option")).toBeNull();
+      expect(row.querySelector("[aria-selected]")).toBeNull();
+    }
+
+    // Clicking either one selects nothing, so no bulk control appears.
+    await act(async () => {
+      fireEvent.click(unknown);
+      fireEvent.click(paced);
+      await Promise.resolve();
+    });
+    expect(screen.queryByTestId(TASKS_SELECTED_TESTID)).toBeNull();
+    expect(screen.queryByRole("button", { name: TASKS_BULK_FORGET_TEXT })).toBeNull();
   });
 });

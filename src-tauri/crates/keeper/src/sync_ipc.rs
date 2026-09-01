@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 
 use keeper_core::tasks::{
     paced_work, task_host, DaemonPresence, PacedFolderFacts, PacedNotesFacts, PacedWorkVm,
-    TaskHostFacts, TaskListingVm, TaskRunVm, TaskSaveReq, TaskSchedulePreviewVm, TaskVm,
-    UnknownTaskVm,
+    TaskBatchEntryVm, TaskBatchIdReq, TaskBatchOutcomeKind, TaskBatchReceiptVm, TaskHostFacts,
+    TaskListingVm, TaskRunVm, TaskSaveReq, TaskSchedulePreviewVm, TaskVm, UnknownTaskVm,
 };
 use keeper_core::vm::{
     ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
@@ -2434,6 +2434,116 @@ pub async fn sync_task_forget(
 ) -> Result<(), IpcError> {
     let engine = engine_of(&state)?;
     engine.forget_task(&id).map_err(|err| sync_ipc_error(&err))
+}
+
+/// Word one batch's receipt for the wire, one entry per id and in request order.
+///
+/// The match over [`keeper_sync::db::TaskBatchOutcome`] is **total** — no `_`
+/// arm, this file's convention — so a fifth outcome breaks the compile here
+/// rather than reaching a surface as a silent nothing. That totality is exactly
+/// what `TaskBatchEntryVm`'s doc leans on when it promises `effect` is `Some`
+/// only for `saved` and `reason` only for `refused`: a flat struct with two
+/// `Option`s can represent the forbidden combinations, and this is the one place
+/// that can emit them.
+fn task_batch_receipt_vm(entries: Vec<keeper_sync::db::TaskBatchEntry>) -> TaskBatchReceiptVm {
+    TaskBatchReceiptVm {
+        entries: entries
+            .into_iter()
+            .map(|entry| {
+                let (outcome, effect, reason) = match entry.outcome {
+                    keeper_sync::db::TaskBatchOutcome::Saved(effect) => (
+                        TaskBatchOutcomeKind::Saved,
+                        // The same three words `cmd_task_set_enabled` prints
+                        // (`commands.rs`, the `TaskSave` match), so the CLI and
+                        // the IPC cannot drift into two vocabularies for one
+                        // write — and only `created` and `rearmed` mean the task
+                        // came back into service.
+                        Some(
+                            match effect {
+                                keeper_sync::db::TaskSave::Created => "created",
+                                keeper_sync::db::TaskSave::Updated => "updated",
+                                keeper_sync::db::TaskSave::Rearmed => "rearmed",
+                            }
+                            .to_owned(),
+                        ),
+                        None,
+                    ),
+                    keeper_sync::db::TaskBatchOutcome::Forgotten => {
+                        (TaskBatchOutcomeKind::Forgotten, None, None)
+                    }
+                    keeper_sync::db::TaskBatchOutcome::Missing => {
+                        (TaskBatchOutcomeKind::Missing, None, None)
+                    }
+                    // keeper's own sentence, moved rather than copied: the
+                    // surface renders it verbatim, so a person meets one wording
+                    // here and at the single-id write door.
+                    keeper_sync::db::TaskBatchOutcome::Refused(reason) => {
+                        (TaskBatchOutcomeKind::Refused, None, Some(reason))
+                    }
+                };
+                TaskBatchEntryVm {
+                    id: entry.id,
+                    outcome,
+                    effect,
+                    reason,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Take several tasks in or out of service at once, answering for every id.
+///
+/// **`Err` is reserved for the store failing outright** — the listing would not
+/// read — and is never one id's refusal: `FilesDeleteReceiptVm`'s rule, *partial
+/// success is a real outcome and is reported rather than thrown*. N ids in, N
+/// entries out, in request order, with no dedup and no first-error-wins.
+///
+/// Each id carries **its own baseline**, unlike the CLI's batch which passes
+/// `None`. A bulk action from a rendered list is the case that has one: the
+/// person decided against the rows they were looking at, so the pane passes each
+/// row's `updatedMs` and this door is no weaker than [`sync_task_save`]'s.
+///
+/// Rejects with: `unsupported`, `internal` (the task record could not be read).
+#[tauri::command]
+pub async fn sync_tasks_set_enabled(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<TaskBatchIdReq>,
+    enabled: bool,
+) -> Result<TaskBatchReceiptVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let wanted: Vec<keeper_sync::db::TaskBatchId> = ids
+        .iter()
+        .map(|req| keeper_sync::db::TaskBatchId {
+            id: req.id.clone(),
+            baseline_updated_ms: req.baseline_updated_ms,
+        })
+        .collect();
+    let entries = engine
+        .set_tasks_enabled(&wanted, enabled)
+        .map_err(|err| sync_ipc_error(&err))?;
+    Ok(task_batch_receipt_vm(entries))
+}
+
+/// Forget several tasks and everything they recorded, answering for every id.
+///
+/// Deletes records, never content — [`sync_task_forget`]'s promise, per id.
+///
+/// **Plain ids and no baseline**, deliberately: `db::delete_task` makes no
+/// baseline promise today, and inventing one here would be a new promise rather
+/// than a preserved one.
+///
+/// Rejects with: `unsupported`, `internal` (the task record could not be read).
+#[tauri::command]
+pub async fn sync_tasks_forget(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<TaskBatchReceiptVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let entries = engine
+        .forget_tasks(&ids)
+        .map_err(|err| sync_ipc_error(&err))?;
+    Ok(task_batch_receipt_vm(entries))
 }
 
 /// Find `id` among the stored profiles, or report it as a config error naming

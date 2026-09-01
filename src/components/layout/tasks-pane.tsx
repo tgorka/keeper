@@ -79,9 +79,25 @@
  * changed that task's history and was pressed by the same person. Closing
  * forgets the runs it held, so re-opening re-reads rather than showing a list
  * `task_runs` may have trimmed underneath it (cap `TASK_RUNS_CAP`).
+ *
+ * **Story 59.4 let a person hold several names at once.** Epic 59 refused a
+ * Tasks multi-select on a checkable ground — every task write in the whole stack
+ * was single-id, so a selection would have been state whose only action was a
+ * loop of N writes with N partial-failure stories. `Engine::set_tasks_enabled`
+ * and `Engine::forget_tasks` are that missing consumer, so the refusal is
+ * overturned exactly the way `spec-43-8…:347-348`'s Files refusal was at 45.3:
+ * *once a bulk consumer existed*. The selection model is therefore **copied**
+ * from `files-pane.tsx` rather than designed — the same three modes, the same
+ * precedence gate, the same one-pass toggle, the same inclusive Shift run over
+ * the flat visible order, `aria-selected` on every row and the count through
+ * `countLabel` — because `spec-45-17…:200` forbids a second selection idiom by
+ * name. Anything that genuinely could not be reused says so where it is: see
+ * {@link TaskRow} for the `aria-current` → `aria-selected` flip and `select`
+ * below for the one Files branch that has no Tasks analogue.
  */
 import { ChevronRight, ListChecks } from "lucide-react";
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { FoldToggle, useFold } from "@/components/layout/list-fold";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
 // `TASK_HOST_WIDE_TEXT` is the form's rather than this file's: the picker's
@@ -104,13 +120,21 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { type CountNoun, countLabel, RUNS } from "@/lib/count-label";
-import type { PacedWorkVm, TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
+import type {
+  PacedWorkVm,
+  TaskBatchReceiptVm,
+  TaskListingVm,
+  TaskRunVm,
+  TaskVm,
+} from "@/lib/ipc/client";
 import {
   syncPacedWork,
   syncTaskForget,
   syncTaskHistory,
   syncTaskRunNow,
   syncTasks,
+  syncTasksForget,
+  syncTasksSetEnabled,
 } from "@/lib/ipc/client";
 import { columnFoldStore } from "@/lib/stores/column-fold";
 import { hydrateSyncListSizes } from "@/lib/stores/sync-detail";
@@ -372,6 +396,91 @@ export const TASKS_DETAIL_TESTID = "task-detail";
  */
 export const TASKS_RAIL_LIST_LABEL = "Task list";
 export const TASKS: CountNoun = { one: "task", many: "tasks" };
+
+// ---------------------------------------------------------------------------
+// Several tasks at once (Story 59.4): the selection model, copied from
+// `files-pane.tsx` rather than invented
+// ---------------------------------------------------------------------------
+
+/**
+ * How many names are held, said the same way wherever it is said.
+ *
+ * `filesSelectionSentence`'s shape and its reasoning (`files-pane.tsx:232-247`):
+ * the sentence and not a numeral, because this is the **accessible name** of the
+ * count badge and of the region the detail column draws in its place. The badge
+ * draws the figure; a reader who cannot see it is told what the figure counts.
+ *
+ * Through {@link countLabel} and never a hand-rolled plural — one task is `1
+ * task selected` and none is `0 tasks selected`, because zero is a number rather
+ * than a silence (`count-label.ts:29-31`).
+ */
+export function tasksSelectionSentence(count: number): string {
+  return `${countLabel(count, TASKS)} selected`;
+}
+
+/**
+ * The three bulk verbs, in the header beside the count (Story 59.4).
+ *
+ * 45.3's rule for where they live: *a per-row Delete button cannot answer "and
+ * the other four"*, so they sit beside the number that makes them safe to press
+ * and never on a row — which is also what keeps Story 59.1's no-control-on-the-
+ * row invariant true.
+ *
+ * **Suffixed `selected`, and that is not decoration.** {@link TASK_FORGET_TEXT}
+ * is already the accessible name of the detail region's Forget and of the
+ * confirmation's own action, and a third button called `Forget` would be
+ * indistinguishable to anybody navigating by name — the failure a folded rail
+ * with a second `Refresh` on it caused once already. Naming the subject also
+ * answers *forget what?* for a control whose subject is a set.
+ */
+export const TASKS_BULK_ENABLE_TEXT = "Enable selected";
+export const TASKS_BULK_DISABLE_TEXT = "Disable selected";
+export const TASKS_BULK_FORGET_TEXT = "Forget selected";
+
+/** The count badge beside them, and the region drawn where one task's detail would be. */
+export const TASKS_SELECTED_TESTID = "tasks-selected";
+export const TASKS_SELECTION_TESTID = "tasks-selection";
+/** A whole batch that would not run at all — the store, not one id. */
+export const TASKS_BULK_ERROR_TESTID = "tasks-bulk-error";
+
+/**
+ * How many tasks are about to be forgotten, asked before any of them are.
+ *
+ * {@link taskForgetConfirmTitle}'s sibling and its rule — a function, so ten of
+ * these do not all confirm with the same words. The **count** and not the ids:
+ * the number is what a person is deciding about, and forty ids in a dialog title
+ * is a title nobody reads. Through {@link countLabel} for
+ * {@link tasksSelectionSentence}'s reason.
+ */
+export function tasksForgetConfirmTitle(count: number): string {
+  return `Forget ${countLabel(count, TASKS)}?`;
+}
+
+/**
+ * What a `missing` entry says, in the pane's own words.
+ *
+ * The one sentence on this surface that is **not** Rust's, and it is that way by
+ * a documented invariant rather than by oversight: `TaskBatchEntryVm.reason` is
+ * non-null exactly for `refused`, so a `missing` id arrives with no sentence at
+ * all. Something still has to be said — a bulk action that silently skipped two
+ * of five ids is the invisible-failure shape this whole epic exists to close —
+ * and it is said here, once, exported so a test can assert it by name
+ * ({@link TASKS_UNKNOWN_NO_ID_TEXT}'s precedent).
+ *
+ * Worded as the benign thing it usually is rather than as a fault: `Missing` is
+ * a fourth outcome precisely *because* it is not a refusal.
+ */
+export const TASKS_BULK_MISSING_TEXT =
+  "keeper has no such task on this host — another writer on this shared record may have forgotten it already.";
+
+/**
+ * What a refusal that arrived without its sentence says.
+ *
+ * Unreachable while the wire keeps its invariant, and written anyway: the
+ * alternative to a fallback is a refused id rendering as nothing, which reads
+ * exactly like a success. A refusal must be seen even when it will not say why.
+ */
+export const TASKS_BULK_NO_REASON_TEXT = "keeper refused this one and did not say why.";
 
 /**
  * The master column's own box.
@@ -1065,74 +1174,112 @@ function TaskRunList({
  * cluster Story 58.3 already had to move the `Runs` link out of, on a row that
  * is now a third of its old width.
  *
- * `aria-current` and not `aria-selected`, which is this app's own idiom for a
- * master list whose selection is single (`chat-row.tsx:266`, asserted at
- * `chat-row.test.tsx:198-207`). `aria-selected` belongs to the multi-select
- * model Story 59.4 deliberately refuses, and borrowing its attribute now would
- * announce a set to a reader when there can only ever be one.
+ * `aria-selected` on **every** row, `"true"` and `"false"` alike, and the
+ * attribute is the story that changed. Story 59.1 chose `aria-current` on the
+ * deliberate ground that `aria-selected` announces a *set* to a reader when only
+ * one thing can be chosen (`chat-row.tsx:266` is the app's single-selection
+ * idiom) — and that ground is exactly what Story 59.4 removes. The attribute and
+ * the refusal flip **together**: while a bulk consumer did not exist a selection
+ * would have been state no command could act on, so `aria-current` was right;
+ * now that `sync_tasks_set_enabled` and `sync_tasks_forget` exist,
+ * `aria-selected` is. Never omitted on the unselected rows, `files-pane.tsx:2528-2532`'s
+ * stated reason: a list that marked only the selected rows would leave a screen
+ * reader unable to say *not selected* about the others.
+ *
+ * **A `role="option"` box and not a `<button>`, which is a consequence rather
+ * than a preference.** `aria-selected` is not a supported state on
+ * `role="button"`, so the element carrying the selection has to be the option
+ * itself. That is what `files-pane.tsx:2523` does for the same reason — a `<div
+ * role="treeitem">` with its own `tabIndex`, `onClick` and `onKeyDown` rather
+ * than a button — and the keyboard activation the `<button>` gave for free is
+ * added back by hand.
+ *
+ * The `<li>` is gone with it, and that is the same consequence one level up: a
+ * listbox has to own its options directly, `<li>` is only valid inside a
+ * `<ul>`/`<ol>`, and `role="listbox"` on a `<ul>` is a non-interactive element
+ * given an interactive role — which the project's own lint refuses by name
+ * (`a11y/noNoninteractiveElementToInteractiveRole`, *"replace ul with a div"*).
+ * So the container is a `<div role="listbox">` and each row is one
+ * `<div role="option">` inside it, which is exactly the shape
+ * `files-pane.tsx:3096-3113` already uses for its tree. The row's
+ * `data-testid`/`data-task-id` move onto that element: one row is now one
+ * element, so there is no wrapper for them to sit on and nothing that could
+ * disagree about which row is which.
+ *
+ * Still no control on the row, which this story strengthens rather than relaxes:
+ * each line now exposes exactly one `option` and **zero** buttons.
  */
 function TaskRow({
   task,
   now,
   selected,
   tabIndex,
-  buttonRef,
-  onSelect,
+  optionRef,
+  onRowClick,
+  onActivate,
 }: {
   task: TaskVm;
   now: number;
   selected: boolean;
   /**
-   * The roving tab stop: `0` on the selected row and `-1` on every other, so the
-   * list is one stop rather than twenty (`chat-list-pane.tsx:756-760`). Selection
-   * IS the cursor here — there is no second highlight to keep in step with it.
+   * The roving tab stop: `0` on the row the cursor is at and `-1` on every
+   * other, so the list is one stop rather than twenty
+   * (`chat-list-pane.tsx:756-760`). Under a single selection the cursor IS the
+   * selection — there is no second highlight to keep in step with it; under a
+   * set it is the anchor, which is the row a Shift-range would measure from.
    */
   tabIndex: number;
-  buttonRef: (element: HTMLButtonElement | null) => void;
-  onSelect: (id: string) => void;
+  optionRef: (element: HTMLDivElement | null) => void;
+  /** The whole event, because the modifier is what decides the gesture. */
+  onRowClick: (event: ReactMouseEvent<HTMLDivElement>, id: string) => void;
+  /** Enter, which a `<button>` used to answer for nothing. */
+  onActivate: (id: string) => void;
 }) {
   const unhosted = task.host.kind === "unhosted";
   return (
-    <li data-testid={TASKS_ROW_TESTID} data-task-id={task.id}>
-      <button
-        ref={buttonRef}
-        type="button"
-        tabIndex={tabIndex}
-        // Only on the selected row: `aria-current="false"` is announced by some
-        // readers as a state worth mentioning, and nineteen rows saying "not
-        // current" is the noise `chat-row.tsx` already refused.
-        aria-current={selected ? "true" : undefined}
-        onClick={() => onSelect(task.id)}
-        className={cn(
-          "flex w-full flex-col gap-1 border-border border-b px-3 py-2 text-left",
-          "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-          selected ? "bg-accent" : "hover:bg-accent",
-        )}
-      >
-        <span className="flex min-w-0 items-center gap-2">
-          {/* Both stored spellings, the kind badge's rule: a kind or a mode a
-              newer keeper wrote is shown rather than hidden (NFR-43). */}
-          <Badge variant="secondary">{task.kind}</Badge>
-          <Badge variant="outline">{task.mode}</Badge>
-          <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
+    <div
+      ref={optionRef}
+      role="option"
+      data-testid={TASKS_ROW_TESTID}
+      data-task-id={task.id}
+      tabIndex={tabIndex}
+      aria-selected={selected}
+      onClick={(event) => onRowClick(event, task.id)}
+      onKeyDown={(event) => {
+        // Space belongs to the list's own handler, where the modifier that
+        // makes it a toggle is decoded beside the arrows — one place for the
+        // keys this list owns. Enter is the plain activation the element lost
+        // when it stopped being a button.
+        if (event.key === "Enter") {
+          event.preventDefault();
+          onActivate(task.id);
+        }
+      }}
+      className={cn(
+        "flex w-full flex-col gap-1 border-border border-b px-3 py-2 text-left",
+        "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+        selected ? "bg-accent" : "hover:bg-accent",
+      )}
+    >
+      <span className="flex min-w-0 items-center gap-2">
+        {/* Both stored spellings, the kind badge's rule: a kind or a mode a
+            newer keeper wrote is shown rather than hidden (NFR-43). */}
+        <Badge variant="secondary">{task.kind}</Badge>
+        <Badge variant="outline">{task.mode}</Badge>
+        <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
+      </span>
+      <span className="flex min-w-0 items-center justify-between gap-2 text-xs">
+        {/* The host WORD only. Its sentence and its reason are Rust's and are
+            rendered whole in the detail — a line this narrow would clip them,
+            and a clipped host claim is the one thing AD-137 cannot tolerate.
+            What the word has to carry alone is the alarm, which is why an
+            unhosted row is coloured here as well as named. */}
+        <span className={unhosted ? "truncate text-destructive" : "truncate text-muted-foreground"}>
+          {HOST_KIND_LABELS[task.host.kind] ?? task.host.kind}
         </span>
-        <span className="flex min-w-0 items-center justify-between gap-2 text-xs">
-          {/* The host WORD only. Its sentence and its reason are Rust's and are
-              rendered whole in the detail — a line this narrow would clip them,
-              and a clipped host claim is the one thing AD-137 cannot tolerate.
-              What the word has to carry alone is the alarm, which is why an
-              unhosted row is coloured here as well as named. */}
-          <span
-            className={unhosted ? "truncate text-destructive" : "truncate text-muted-foreground"}
-          >
-            {HOST_KIND_LABELS[task.host.kind] ?? task.host.kind}
-          </span>
-          <span className="shrink-0 text-muted-foreground">
-            {formatTaskDue(task.nextDueMs, now)}
-          </span>
-        </span>
-      </button>
-    </li>
+        <span className="shrink-0 text-muted-foreground">{formatTaskDue(task.nextDueMs, now)}</span>
+      </span>
+    </div>
   );
 }
 
@@ -1582,32 +1729,48 @@ export function TasksPane() {
    */
   const [editingId, setEditingId] = useState<string | null>(null);
   /**
-   * Which task the detail region is showing, or `null` before anything has been
-   * chosen (Story 59.1).
+   * The selection the rest of the pane reads (Story 59.1, widened by 59.4).
    *
-   * An **id and not a `TaskVm`**, and never the row object itself: `refresh()`
-   * replaces the whole listing on every mount, Refresh press and Run now settle,
-   * so a stored view model would go stale the moment a run moved its
-   * `lastRun` — the detail would then describe a task as it was one read ago
-   * while the list beside it showed the new state. The id is the only part of a
-   * task that does not move (`task_runs.task_id` joins on it, which is also why
-   * Story 59.1 may not make it editable).
+   * **One slot, widened — never a second one beside 59.1's.** It was
+   * `selectedId: string | null`, on the epic's stated ground that every task
+   * write in the whole stack was single-id, so a set would have been state whose
+   * only possible action was a loop of N writes. `Engine::set_tasks_enabled` and
+   * `Engine::forget_tasks` are that missing consumer, so the refusal is
+   * overturned the way `spec-43-8…:347-348`'s was at 45.3 — and
+   * `spec-45-17…:200` forbids *inventing* a second idiom, which is why every
+   * gesture below is `files-pane.tsx`'s.
    *
-   * Nothing prunes it, deliberately: {@link selectedTask} resolves it against
-   * the newest listing and falls back to the first row, so an id the record no
-   * longer holds costs a fallback rather than a stale region. That is one rule
-   * in one place instead of a slot and an effect that can disagree.
+   * **Ids and not `TaskVm`s**, 59.1's rule verbatim: `refresh()` replaces the
+   * whole listing on every mount, Refresh press and Run now settle, so a stored
+   * view model would go stale the moment a run moved its `lastRun`. The id is
+   * the only part of a task that does not move.
+   *
+   * Nothing prunes it, deliberately: {@link selection} resolves it against the
+   * **newest** listing, so an id the record no longer holds contributes nothing
+   * rather than leaving a stale row selected. One rule in one place instead of a
+   * slot and an effect that can disagree.
    */
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
+  /** Where a Shift-range starts. `null` once the anchor row is gone. */
+  const [anchorKey, setAnchorKey] = useState<string | null>(null);
   /**
-   * Live refs to each rendered row button, so the keyboard handler can move
-   * focus as the selection moves (`chat-list-pane.tsx:142-145`'s idiom).
-   * Rebuilt each render from the current row order, which is `list_tasks`' and
-   * is never re-sorted here.
+   * A whole batch that would not run at all, as distinct from one id's refusal.
+   *
+   * The batched verbs reserve rejection for the store failing outright — the
+   * task record would not read — and answer every per-id outcome inside the
+   * receipt. So this slot holds the first kind and {@link refusals} holds the
+   * second, and they are never the same sentence in two places.
    */
-  const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const [bulkError, setBulkError] = useState<string | null>(null);
   /**
-   * The task a Forget is asking about, and whether the question is on screen.
+   * Live refs to each rendered row, so the keyboard handler can move focus as
+   * the selection moves (`chat-list-pane.tsx:142-145`'s idiom). Rebuilt each
+   * render from the current row order, which is `list_tasks`' and is never
+   * re-sorted here.
+   */
+  const rowRefs = useRef<(HTMLDivElement | null)[]>([]);
+  /**
+   * What a Forget is asking about, and whether the question is on screen.
    *
    * One dialog for the whole pane (`files-pane.tsx`'s shape) rather than one per
    * row: only one question can be being answered at a time. Two slots for it
@@ -1618,8 +1781,18 @@ export function TasksPane() {
    * record about to go. `files-pane.tsx` degrades to nothing there; naming the
    * task all the way through the close is better than naming nothing, so the
    * subject outlives the ask and is replaced only by the next one.
+   *
+   * **Tagged rather than a bare list** (Story 59.4). One dialog now asks two
+   * questions — *forget this task?* and *forget these three?* — and they take
+   * different verbs: the row's own Forget still goes through the single-id
+   * `sync_task_forget` that Story 58.1 shipped, and only the header's bulk
+   * control goes through the batch. A `readonly string[]` of length one could
+   * not tell the two apart, and routing a deliberate single Forget through a
+   * batched write on a count would be a difference nobody asked for.
    */
-  const [forgetSubject, setForgetSubject] = useState<string | null>(null);
+  const [forgetSubject, setForgetSubject] = useState<
+    { kind: "one"; id: string } | { kind: "several"; ids: readonly string[] } | null
+  >(null);
   const [forgetAsking, setForgetAsking] = useState(false);
   /**
    * Ids whose Forget is in flight, so a second confirmation cannot issue a
@@ -2012,63 +2185,153 @@ export function TasksPane() {
     [refresh],
   );
 
-  /**
-   * The readable rows, and which one the detail region is drawing (Story 59.1).
-   *
-   * Resolved rather than stored. {@link selectedId} is an id the person chose;
-   * this is that id looked up in the **newest** listing, falling back to the
-   * first row. The fallback is what makes three separate rules unnecessary:
-   *
-   * - Nothing is chosen yet, so the first task is shown. A detail region that
-   *   started empty over a list with rows would be a second empty state
-   *   competing with the real one, and defaulting costs **no read** — every
-   *   field the region draws is already on the `TaskVm` the listing carries.
-   * - The chosen task was forgotten here, or by the other host on this shared
-   *   record. The region moves to a task that exists instead of describing one
-   *   that does not.
-   * - The listing emptied. `selectedTask` is `null`, no region renders, and the
-   *   empty state is the only thing on screen.
-   */
   const tasks = listing?.tasks ?? [];
-  const selectedTask = tasks.find((row) => row.id === selectedId) ?? tasks[0] ?? null;
 
   /**
-   * Choose a task, and close what belonged to the last one.
+   * The selected ids the **newest** listing still holds, in listing order.
    *
-   * **Selection issues no read**, which is the invariant this story is most
-   * able to break. `spec-58-3:40`'s Never clause — *"poll history; hold one
-   * fetch per row in flight at once; register a timer"* — is AD-62's anti-poll
-   * rule, and a master/detail satisfies it *better* than the old per-row
-   * disclosure did, because exactly one task is on screen by construction. It
-   * only stays satisfied while choosing stays inert: the runs are still read on
-   * the deliberate `Runs` press and nowhere else.
-   *
-   * The two closes are the same one-at-a-time rules the disclosures already
-   * had, now enforced by the structure: an edit form seeded from task A must not
-   * survive into task B's region, and a run list read for A must not sit under
-   * B's name. The history token is bumped so A's read, if still in flight,
-   * cannot land in B's section.
+   * `files-pane.tsx:1708-1714`'s memo and its rule: a row that vanished on a
+   * refresh is not silently still selected, and the order is the list's own
+   * rather than the order the person clicked in — a bulk write should act in the
+   * order the receipt will be read back in.
    */
-  const selectTask = useCallback(
-    (id: string) => {
-      setSelectedId(id);
-      setEditingId(null);
-      if (historyRef.current !== null) {
-        historyToken.current += 1;
-        openHistory(null);
+  const selection = useMemo(() => tasks.filter((row) => selected.has(row.id)), [tasks, selected]);
+
+  /**
+   * Which task the detail region draws, resolved rather than stored (Story
+   * 59.1, kept exactly by 59.4).
+   *
+   * Three states, one expression, and it is what keeps single-select
+   * byte-for-byte what Story 59.1 shipped:
+   *
+   * - **Exactly one selected** — that task. Every plain click, every ↑/↓/Home/End
+   *   and every Enter resolves here, because each of them is a `replace`.
+   * - **Nothing selected** — the first row. A detail region that started empty
+   *   over a list with rows would be a second empty state competing with the
+   *   real one, and defaulting costs **no read**: every field it draws is
+   *   already on the `TaskVm` the listing carries. The same fallback absorbs a
+   *   chosen task the other host on this shared record forgot, and leaves
+   *   `null` — no region at all — when the listing empties.
+   * - **Two or more selected** — `null`. The region does not draw a task,
+   *   because there is no one task to draw; it draws the selection's own count
+   *   instead (see the render below). That is also what makes the bulk refusals
+   *   render at pane level rather than one of five landing inside a region about
+   *   somebody else.
+   */
+  const selectedTask =
+    selection.length === 1 ? selection[0] : selection.length === 0 ? (tasks[0] ?? null) : null;
+  const resolvedId = selectedTask?.id ?? null;
+
+  /**
+   * Which row holds the roving tab stop.
+   *
+   * The anchor while it is a row this listing has, because that is the row a
+   * Shift-range measures from and the row the arrows step off. Under a single
+   * selection the anchor and the resolved task are the same row — a plain click
+   * and an arrow both set it — so this is a no-op for everything Story 59.1
+   * shipped; under a set it is the one row that a keyboard user is meaningfully
+   * "at". Falls back to the resolved task, which covers the mount, when nothing
+   * has been clicked yet.
+   */
+  const cursorId =
+    anchorKey !== null && tasks.some((row) => row.id === anchorKey) ? anchorKey : resolvedId;
+
+  /**
+   * Replace, extend or toggle the selection from one row (Story 59.4).
+   *
+   * **Ported from `files-pane.tsx:1656-1706`**, branch for branch, because
+   * `spec-45-17…:200` forbids a second selection idiom by name. The three
+   * gestures a list has, and the modifier decides which: plain replaces,
+   * Cmd/Ctrl toggles one, Shift takes the run from the anchor. The run is over
+   * {@link tasks} — the flat visible order — so what a Shift takes is exactly
+   * what a person sees between the two rows.
+   *
+   * Files' third precedence condition, `crossesProfile`, has **no Tasks
+   * analogue**: a task is not scoped to a folder for these two verbs — one batch
+   * may hold ids from any number of folders and from none — so there is no
+   * cross-scope reset to copy. The rule that condition existed to keep, *half a
+   * selection no command can act on is worse than one that visibly reset*, is
+   * kept a stricter way here: `TaskListing.unknown` rows and 58.7's projected
+   * paced rows are not selectable at all, so a selection cannot contain
+   * something the batch could only refuse.
+   */
+  const select = useCallback(
+    (id: string, mode: "replace" | "toggle" | "extend") => {
+      setSelected((previous) => {
+        if (mode === "replace" || previous.size === 0) {
+          return new Set([id]);
+        }
+        if (mode === "toggle") {
+          // One pass, and it adds exactly one: it never fills the gap between
+          // this row and the anchor, which is Shift's job and only Shift's.
+          const next = new Set(previous);
+          if (!next.delete(id)) {
+            next.add(id);
+          }
+          return next;
+        }
+        const from = tasks.findIndex((row) => row.id === anchorKey);
+        const to = tasks.findIndex((row) => row.id === id);
+        if (from < 0 || to < 0) {
+          return new Set([id]);
+        }
+        // Inclusive at both ends, and it REPLACES rather than unions: a run is
+        // what a person sees between two rows, and re-measuring from an unmoved
+        // anchor is what makes consecutive Shift-clicks grow and shrink one run.
+        const [low, high] = from <= to ? [from, to] : [to, from];
+        return new Set(tasks.slice(low, high + 1).map((row) => row.id));
+      });
+      // Shift keeps the anchor it is measuring from; the other two move it.
+      if (mode !== "extend") {
+        setAnchorKey(id);
       }
+      // A stale refusal from a previous attempt is not about this selection.
+      setBulkError(null);
     },
-    [openHistory],
+    [anchorKey, tasks],
   );
+
+  /**
+   * Close what belonged to the last task, the moment the selection resolves to
+   * one (Story 59.1's side effects, under 59.4's set).
+   *
+   * Story 59.1's `selectTask` closed the previous task's edit form and bumped
+   * `historyToken` to drop its runs, on the rule that a form seeded from task A
+   * must not survive into task B's region and a run list read for A must not sit
+   * under B's name. Under a set that becomes a question with one honest answer:
+   * those effects belong to **the region**, so they fire exactly when the region
+   * changes which task it is drawing — every plain click, every arrow key, and
+   * the moment a multi-selection collapses back to one.
+   *
+   * An additive Cmd-click that grows the set past one deliberately does NOT fire
+   * them: `resolvedId` goes `null`, the region unmounts, and nothing is left
+   * seeded from a task that is no longer on screen. Closing a form at that
+   * moment would be work nobody can see; re-opening on the collapse is what the
+   * person actually experiences, and that is the branch below.
+   *
+   * Keyed on the resolved **id** and not the `TaskVm`, so a refresh that hands
+   * the region a fresher object for the same task is not a change of subject —
+   * which is the whole reason Story 59.1 stored an id in the first place.
+   */
+  useEffect(() => {
+    if (resolvedId === null) {
+      return;
+    }
+    setEditingId(null);
+    if (historyRef.current !== null) {
+      historyToken.current += 1;
+      openHistory(null);
+    }
+  }, [resolvedId, openHistory]);
 
   /**
    * Move the selection with the keyboard, and take focus with it.
    *
-   * The selection **is** the roving cursor. `chat-list-pane.tsx` keeps a second
-   * `focusedKey` beside its selection because opening a conversation is
-   * expensive and arrowing past one must not open it; choosing a task costs
-   * nothing at all — no read, no write — so a second cursor would be state with
-   * no consumer, and two highlights a person has to tell apart.
+   * A **replace**, so an arrow always resolves the region to exactly one task —
+   * `chat-list-pane.tsx` keeps a second `focusedKey` beside its selection
+   * because opening a conversation is expensive and arrowing past one must not
+   * open it; choosing a task costs nothing at all, so a second cursor would be
+   * state with no consumer and two highlights a person has to tell apart.
    *
    * Clamped at both ends rather than wrapping: a list of twenty whose Down at
    * the bottom silently returns to the top is a list that has lost the reader's
@@ -2080,18 +2343,52 @@ export function TasksPane() {
       if (next === undefined) {
         return;
       }
-      selectTask(next.id);
+      select(next.id, "replace");
       rowRefs.current[to]?.focus();
     },
-    [tasks, selectTask],
+    [tasks, select],
   );
-  const onListKeyDown = (event: React.KeyboardEvent<HTMLUListElement>) => {
-    // Chords belong to the global shortcut hooks, `chat-list-pane.tsx`'s rule:
-    // a pane that swallows ⌘↓ breaks a shortcut it knows nothing about.
-    if (event.metaKey || event.altKey || event.ctrlKey || tasks.length === 0) {
+
+  const onListKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (tasks.length === 0) {
       return;
     }
-    const at = selectedTask === null ? -1 : tasks.findIndex((row) => row.id === selectedTask.id);
+    // Space is the selection key on a multi-select list
+    // (`files-pane.tsx:2061-2074`), and it is decoded BEFORE the chord guard
+    // below because Cmd/Ctrl-Space is one of the two spellings of *toggle this
+    // one* — a key this list owns with its modifier attached, unlike ⌘↓.
+    if (event.key === " ") {
+      // Which row, read off the event rather than taken from `cursorId`: after
+      // a Shift-click the browser has focus on the clicked row while the anchor
+      // — and so the cursor — is deliberately elsewhere. `data-task-id` is on
+      // the `<li>` every option sits inside, the same closest-ancestor trick
+      // `files-pane.tsx:2148` uses to tell a row's own click from a control's.
+      const row = event.target instanceof Element ? event.target.closest("[data-task-id]") : null;
+      const id = (row instanceof HTMLElement ? row.dataset.taskId : null) ?? cursorId;
+      if (id === undefined || id === null) {
+        return;
+      }
+      event.preventDefault();
+      select(id, event.metaKey || event.ctrlKey ? "toggle" : "replace");
+      return;
+    }
+    // Chords belong to the global shortcut hooks, `chat-list-pane.tsx`'s rule:
+    // a pane that swallows ⌘↓ breaks a shortcut it knows nothing about.
+    if (event.metaKey || event.altKey || event.ctrlKey) {
+      return;
+    }
+    // Guarded on a non-empty selection, `files-pane.tsx:2088-2094`'s rule: an
+    // Escape with nothing selected is not this list's to swallow — a dialog or
+    // a global handler above it may well want it.
+    if (event.key === "Escape") {
+      if (selected.size > 0) {
+        event.preventDefault();
+        setSelected(new Set());
+        setAnchorKey(null);
+      }
+      return;
+    }
+    const at = cursorId === null ? -1 : tasks.findIndex((row) => row.id === cursorId);
     const to =
       event.key === "ArrowDown"
         ? Math.min(at + 1, tasks.length - 1)
@@ -2110,6 +2407,132 @@ export function TasksPane() {
     event.preventDefault();
     moveSelection(to);
   };
+
+  /**
+   * What a row's own click means (Story 59.4), `files-pane.tsx:2146-2163`'s
+   * decoding.
+   *
+   * `metaKey || ctrlKey` is checked **before** `shiftKey`, and the two are one
+   * branch rather than two: on any given machine one of them is the wrong
+   * platform, and a browser that honoured only Cmd would leave every Linux user
+   * without a toggle.
+   *
+   * The button guard is copied even though no row carries a control today —
+   * Story 59.1's invariant says none ever will, and this is the line that would
+   * keep the invariant's *next* reader honest if one appeared: a control's click
+   * is that control's, never a selection gesture.
+   */
+  const handleRowClick = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>, id: string) => {
+      if (event.target instanceof Element && event.target.closest("button") !== null) {
+        return;
+      }
+      let mode: "replace" | "toggle" | "extend" = "replace";
+      if (event.metaKey || event.ctrlKey) {
+        mode = "toggle";
+      } else if (event.shiftKey) {
+        mode = "extend";
+      }
+      select(id, mode);
+    },
+    [select],
+  );
+
+  /**
+   * Land a batch's receipt on the rows it is about (Story 59.4).
+   *
+   * **Per id, and the selection is never silently shrunk.** Every `refused`
+   * entry goes into the existing {@link refusals} map under its own id, carrying
+   * keeper's sentence verbatim, and every `missing` entry goes in too with the
+   * pane's own {@link TASKS_BULK_MISSING_TEXT} — the wire's `reason` is non-null
+   * only for `refused`, by `TaskBatchEntryVm`'s documented invariant, so a
+   * `missing` id has no Rust sentence to render and something still has to be
+   * said. A success clears whatever that id said last: a listing read after an
+   * attempt is newer evidence than the attempt, which is `refresh`'s own rule.
+   *
+   * One map and not a second surface: because the region draws no task while
+   * more than one row is selected, `orphanRefusals` below already renders every
+   * one of these as `{id}: {reason}` at pane level.
+   */
+  const applyReceipt = useCallback((receipt: TaskBatchReceiptVm) => {
+    setRefusals((prior) => {
+      const next = { ...prior };
+      for (const entry of receipt.entries) {
+        switch (entry.outcome) {
+          case "refused":
+            next[entry.id] = entry.reason ?? TASKS_BULK_NO_REASON_TEXT;
+            break;
+          case "missing":
+            next[entry.id] = TASKS_BULK_MISSING_TEXT;
+            break;
+          default:
+            // `saved` and `forgotten`: the write happened, so anything this id
+            // said about a previous attempt is stale.
+            delete next[entry.id];
+            break;
+        }
+      }
+      return next;
+    });
+  }, []);
+
+  /**
+   * Take the whole selection in or out of service in one call.
+   *
+   * Each id carries **its own** `updatedMs` as the baseline, which is the
+   * decision worth stating: `sync_task_save`'s baseline exists because the edit
+   * form seeded its values once and every field it writes is as old as that
+   * seeding — and a bulk action from a rendered list is that case, not the
+   * read-and-write-in-one-call case the CLI is. Sending ids alone would make the
+   * bulk path silently weaker than the single-id path it stands in for.
+   *
+   * The selection is **kept**: the rows are still there and still the same set,
+   * so clearing it would be state loss with no reason. Contrast the Forget below.
+   */
+  const setSelectionEnabled = useCallback(
+    async (enabled: boolean) => {
+      const ids = selection.map((row) => ({ id: row.id, baselineUpdatedMs: row.updatedMs }));
+      setBulkError(null);
+      try {
+        applyReceipt(await syncTasksSetEnabled(ids, enabled));
+      } catch (cause) {
+        // The one whole-batch failure: the task record would not read at all.
+        setBulkError(messageOf(cause));
+      } finally {
+        // `true`, for `runNow`'s reason: this read is contemporaneous with the
+        // attempt rather than newer than it, so clearing the receipt's refusals
+        // here would erase them in the tick they appeared.
+        await refresh(true);
+      }
+    },
+    [applyReceipt, refresh, selection],
+  );
+
+  /**
+   * Forget every id the confirmation named, and empty the selection.
+   *
+   * **Cleared, unlike Enable/Disable, and the difference is deliberate**
+   * (`files-pane.tsx:1876-1877`'s rule): those rows are gone, so a set still
+   * holding them would be a selection of nothing that the header still counted.
+   * The anchor goes with them — a Shift-range cannot measure from a row the
+   * record no longer has.
+   */
+  const forgetSelection = useCallback(
+    async (ids: readonly string[]) => {
+      setForgetAsking(false);
+      setBulkError(null);
+      try {
+        applyReceipt(await syncTasksForget([...ids]));
+        setSelected(new Set());
+        setAnchorKey(null);
+      } catch (cause) {
+        setBulkError(messageOf(cause));
+      } finally {
+        await refresh(true);
+      }
+    },
+    [applyReceipt, refresh],
+  );
 
   /**
    * Refusals with nowhere on screen to be drawn.
@@ -2176,6 +2599,68 @@ export function TasksPane() {
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {/* The bulk verbs, and they exist only when there is a selection to
+              act on (Story 59.4). Absent rather than disabled, which is
+              `files-pane.tsx:2989`'s gate: a disabled control says *not now*,
+              and with nothing selected the truth is *there is nothing to do
+              this to*.
+
+              Sited in the header because the header sits above BOTH columns and
+              does not fold — and because 45.3's rule is that *a per-row Delete
+              button cannot answer "and the other four"*. That is also what keeps
+              Story 59.1's no-control-on-the-row invariant intact. */}
+          {selection.length > 0 && (
+            <>
+              {/* A COUNT, not a sentence beside buttons — the app's own chip,
+                  `files-pane.tsx:3003`'s treatment: the figure is what is drawn
+                  and the words are what is announced. `role="status"` earns its
+                  live region here, because the number changes under the
+                  reader's own clicks; it is also what makes the name reachable
+                  at all, since an `aria-label` on a role-less `span` reaches a
+                  screen reader not at all. */}
+              <Badge
+                variant="secondary"
+                role="status"
+                data-testid={TASKS_SELECTED_TESTID}
+                aria-label={tasksSelectionSentence(selection.length)}
+                title={tasksSelectionSentence(selection.length)}
+                className="figures"
+              >
+                {selection.length}
+              </Badge>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void setSelectionEnabled(true)}
+              >
+                {TASKS_BULK_ENABLE_TEXT}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void setSelectionEnabled(false)}
+              >
+                {TASKS_BULK_DISABLE_TEXT}
+              </Button>
+              {/* Asked before anything goes, exactly as the row's own Forget is:
+                  a destructive verb over a set with no confirmation is worse
+                  than the single-id one it stands in for, not better. The
+                  question names the COUNT — see `tasksForgetConfirmTitle`. */}
+              <Button
+                type="button"
+                variant="destructive"
+                size="sm"
+                onClick={() => {
+                  setForgetSubject({ kind: "several", ids: selection.map((row) => row.id) });
+                  setForgetAsking(true);
+                }}
+              >
+                {TASKS_BULK_FORGET_TEXT}
+              </Button>
+            </>
+          )}
           {/* The action and the thing it reveals are worded identically
               (`add-folder-form.tsx`'s rule): a button called something else
               would be a second name for one form. Disabled while a save is in
@@ -2211,6 +2696,19 @@ export function TasksPane() {
           {error}
         </p>
       )}
+      {/* A whole batch the store would not run, which is a different fact from
+          any one id's refusal and so has its own slot — see `bulkError`. Sited
+          here rather than in the header, because a header that grows a sentence
+          is a header that reflows the two columns under it. */}
+      {bulkError !== null && (
+        <p
+          role="alert"
+          data-testid={TASKS_BULK_ERROR_TESTID}
+          className="shrink-0 px-6 pt-4 text-destructive text-sm"
+        >
+          {bulkError}
+        </p>
+      )}
       {/* A refusal the detail region is not showing — see `orphanRefusals`.
           Named by its task, because the region that would have said which one
           is either gone or showing somebody else. */}
@@ -2238,11 +2736,25 @@ export function TasksPane() {
                   </p>
                 )}
                 {tasks.length > 0 && (
-                  // Keyboard navigation over the whole list rather than a
-                  // handler per row: the arrows move the selection, and each row
-                  // is already a button so Enter and Space need nothing here.
-                  <ul
+                  // A listbox, and `aria-multiselectable` on it, because since
+                  // Story 59.4 several rows really can be held at once — the
+                  // container attribute and the row's `aria-selected` flip
+                  // together, for the reason `TaskRow`'s doc gives.
+                  //
+                  // A `<div>` and not a `<ul>`: a listbox owns its options
+                  // directly, and `role="listbox"` on a list element is a
+                  // non-interactive element handed an interactive role, which
+                  // this project's lint refuses by name. `files-pane.tsx:3096`
+                  // is the same shape for the same reason.
+                  //
+                  // Keyboard navigation is over the whole list rather than a
+                  // handler per row: the arrows, Space and Escape are facts
+                  // about the list, and only Enter belongs to the row it
+                  // activates.
+                  <div
                     aria-label={TASKS_LIST_LABEL}
+                    role="listbox"
+                    aria-multiselectable="true"
                     className="flex flex-col"
                     onKeyDown={onListKeyDown}
                   >
@@ -2251,22 +2763,26 @@ export function TasksPane() {
                         key={task.id}
                         task={task}
                         now={now}
-                        selected={selectedTask?.id === task.id}
-                        tabIndex={selectedTask?.id === task.id ? 0 : -1}
-                        buttonRef={(element) => {
+                        // The set, OR the row the region resolved to with nothing
+                        // selected. That second half is Story 59.1's
+                        // empty-selection fallback: the region is drawing this
+                        // task, so the row it is drawing has to say so. With a
+                        // selection of one the two agree by construction, and
+                        // with a set only membership can be true.
+                        selected={selected.has(task.id) || resolvedId === task.id}
+                        tabIndex={cursorId === task.id ? 0 : -1}
+                        optionRef={(element) => {
                           rowRefs.current[index] = element;
                         }}
-                        onSelect={(id) => {
-                          // Re-choosing the task already open would otherwise
-                          // close its own edit form and its own runs under the
-                          // person who just clicked its name.
-                          if (id !== selectedTask?.id) {
-                            selectTask(id);
-                          }
-                        }}
+                        onRowClick={handleRowClick}
+                        // Enter, and a plain replace: re-choosing the task
+                        // already open costs nothing now, because the effect
+                        // that closes a form keys off the resolved id rather
+                        // than off the gesture.
+                        onActivate={(id) => select(id, "replace")}
                       />
                     ))}
-                  </ul>
+                  </div>
                 )}
                 {/* These rows carry no controls and are NOT selectable, now that
                     the readable ones open a detail region. They are not
@@ -2357,7 +2873,11 @@ export function TasksPane() {
                       // on whatever was selected before it existed. The id is
                       // Rust's — a create sends `id: ""` and gets a minted ULID
                       // back — so this is the only moment the pane learns it.
-                      setSelectedId(saved.id);
+                      // A replace and not an addition: a new task is what the
+                      // person is now looking at, not a fifth member of a set
+                      // they assembled before it existed.
+                      setSelected(new Set([saved.id]));
+                      setAnchorKey(saved.id);
                       void refresh();
                     }}
                     onCancel={() => setAdding(false)}
@@ -2376,6 +2896,23 @@ export function TasksPane() {
                 </code>
                 <p className="text-muted-foreground text-sm">{TASKS_PANE_EMPTY_AFTER}</p>
               </div>
+            ) : selection.length > 1 ? (
+              // More than one row is held, so there is no one task to draw and
+              // this region says what there is instead — the count, and nothing
+              // that pretends to be a task's detail. The verbs that act on it
+              // are in the header beside the same number (45.3's rule), so this
+              // is a statement rather than a second control surface.
+              //
+              // A plain paragraph and NOT a `role="status"`: the header's badge
+              // already announces this exact sentence as its accessible name,
+              // and a second live region with the same name is one a reader
+              // cannot tell from the first.
+              <p
+                data-testid={TASKS_SELECTION_TESTID}
+                className="px-6 pt-4 text-muted-foreground text-sm"
+              >
+                {tasksSelectionSentence(selection.length)}
+              </p>
             ) : (
               selectedTask !== null && (
                 <TaskDetail
@@ -2413,7 +2950,7 @@ export function TasksPane() {
                   }}
                   onSavingChange={setFormSaving}
                   onForget={(id) => {
-                    setForgetSubject(id);
+                    setForgetSubject({ kind: "one", id });
                     setForgetAsking(true);
                   }}
                   onHistoryToggle={toggleHistory}
@@ -2431,10 +2968,18 @@ export function TasksPane() {
         <AlertDialogContent>
           <AlertDialogHeader>
             {/* Named from `forgetSubject` and never from the slot that drives
-                `open`, so the question still names its task through the close. */}
+                `open`, so the question still names its subject through the
+                close. One task by its id, several by their COUNT — a set has no
+                one name, and the number is what the person is deciding about. */}
             <AlertDialogTitle>
-              {forgetSubject !== null && taskForgetConfirmTitle(forgetSubject)}
+              {forgetSubject !== null &&
+                (forgetSubject.kind === "one"
+                  ? taskForgetConfirmTitle(forgetSubject.id)
+                  : tasksForgetConfirmTitle(forgetSubject.ids.length))}
             </AlertDialogTitle>
+            {/* One body for both, because the fact it states — this deletes a
+                record, never content — is the same fact for one task and for
+                five, and it is the whole reason the question is asked. */}
             <AlertDialogDescription data-testid={TASK_FORGET_TESTID}>
               {TASK_FORGET_CONFIRM_BODY}
             </AlertDialogDescription>
@@ -2444,8 +2989,17 @@ export function TasksPane() {
             <AlertDialogAction
               variant="destructive"
               onClick={() => {
-                if (forgetSubject !== null) {
-                  void forget(forgetSubject);
+                if (forgetSubject === null) {
+                  return;
+                }
+                // The row's own Forget keeps going through the single-id verb it
+                // has used since Story 58.1; only the header's bulk control
+                // takes the batch. Same question, two doors, and the tag on the
+                // subject is what keeps them apart.
+                if (forgetSubject.kind === "one") {
+                  void forget(forgetSubject.id);
+                } else {
+                  void forgetSelection(forgetSubject.ids);
                 }
               }}
             >

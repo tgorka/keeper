@@ -264,6 +264,10 @@ export type { SyncUnspellableVm } from "./gen/SyncUnspellableVm";
 export type { SyncVerifyVm } from "./gen/SyncVerifyVm";
 export type { TagVocabularyEntryVm } from "./gen/TagVocabularyEntryVm";
 export type { TagVocabularyVm } from "./gen/TagVocabularyVm";
+export type { TaskBatchEntryVm } from "./gen/TaskBatchEntryVm";
+export type { TaskBatchIdReq } from "./gen/TaskBatchIdReq";
+export type { TaskBatchOutcomeKind } from "./gen/TaskBatchOutcomeKind";
+export type { TaskBatchReceiptVm } from "./gen/TaskBatchReceiptVm";
 export type { TaskHostKind } from "./gen/TaskHostKind";
 export type { TaskHostVm } from "./gen/TaskHostVm";
 export type { TaskListingVm } from "./gen/TaskListingVm";
@@ -416,6 +420,8 @@ import type { SyncProgressVm } from "./gen/SyncProgressVm";
 import type { SyncStatusVm } from "./gen/SyncStatusVm";
 import type { SyncVerifyVm } from "./gen/SyncVerifyVm";
 import type { TagVocabularyVm } from "./gen/TagVocabularyVm";
+import type { TaskBatchIdReq } from "./gen/TaskBatchIdReq";
+import type { TaskBatchReceiptVm } from "./gen/TaskBatchReceiptVm";
 import type { TaskListingVm } from "./gen/TaskListingVm";
 import type { TaskRunVm } from "./gen/TaskRunVm";
 import type { TaskSaveReq } from "./gen/TaskSaveReq";
@@ -6396,6 +6402,42 @@ export async function syncTaskSave(req: TaskSaveReq): Promise<TaskVm> {
  */
 export async function syncTaskForget(id: string): Promise<void> {
   await invoke<void>("sync_task_forget", { id });
+}
+
+/**
+ * Take several tasks in or out of service in one call, resolving the per-id
+ * receipt (Story 59.4).
+ *
+ * **The receipt is the half worth handling.** A rejection means the task record
+ * would not read at all; one id refusing — its baseline moved, its row is one
+ * this build cannot decode, its spelling is one keeper could never have stored —
+ * arrives as a `refused` entry with keeper's own sentence, beside the entries
+ * that were written. N ids in, N entries out, in request order.
+ *
+ * Each id carries the `updatedMs` the caller was looking at, so a row another
+ * writer moved since the render is refused rather than overwritten. Pass `null`
+ * per id to skip that check.
+ *
+ * Rejects with: `unsupported`, `internal` (the task record could not be read).
+ */
+export async function syncTasksSetEnabled(
+  ids: TaskBatchIdReq[],
+  enabled: boolean,
+): Promise<TaskBatchReceiptVm> {
+  return await invoke<TaskBatchReceiptVm>("sync_tasks_set_enabled", { ids, enabled });
+}
+
+/**
+ * Forget several tasks in one call, resolving the per-id receipt (Story 59.4).
+ *
+ * Deletes records, never content. An id no longer stored answers `missing`
+ * rather than refusing — a row another host forgot first is usually benign — and
+ * a row this build cannot read is `refused` rather than deleted (AD-48).
+ *
+ * Rejects with: `unsupported`, `internal` (the task record could not be read).
+ */
+export async function syncTasksForget(ids: string[]): Promise<TaskBatchReceiptVm> {
+  return await invoke<TaskBatchReceiptVm>("sync_tasks_forget", { ids });
 }
 
 /**

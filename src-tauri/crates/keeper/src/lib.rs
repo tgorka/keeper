@@ -982,6 +982,12 @@ pub fn run() {
         sync_ipc::sync_task_forget,
         sync_ipc::sync_paced_work,
         sync_ipc::sync_task_schedule_preview,
+        // The batched pair (Story 59.4): the Tasks pane's multi-selection acts
+        // on several ids in one call and renders the per-id receipt. The
+        // single-id `sync_task_save` / `sync_task_forget` above stay — the edit
+        // form and the one-row Forget are still their callers.
+        sync_ipc::sync_tasks_set_enabled,
+        sync_ipc::sync_tasks_forget,
         copy_ipc::copy_start,
         copy_ipc::copy_status,
         copy_ipc::copy_cancel,

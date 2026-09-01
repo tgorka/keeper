@@ -61,6 +61,9 @@ import type {
   SyncProfileReq,
   SyncProfileVm,
   SyncVerifyVm,
+  TaskBatchEntryVm,
+  TaskBatchIdReq,
+  TaskBatchReceiptVm,
   TaskListingVm,
   TaskRunVm,
   TaskSaveReq,
@@ -2236,6 +2239,56 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       TASKS.splice(at, 1);
     }
     return null;
+  },
+  // The batched pair the Tasks pane's multi-selection drives (Story 59.4).
+  // Stateful and per-id, for the reason `sync_task_save` above is: the flow
+  // worth looking at is selecting five rows, pressing Disable, and reading a
+  // receipt in which the ids that went and the ids that did not are told apart.
+  // Each entry keeps the wire's invariant — `effect` only on `saved`, `reason`
+  // only on `refused` — because the pane branches on exactly that.
+  sync_tasks_set_enabled: (payload) => {
+    const ids = (payload.ids ?? []) as TaskBatchIdReq[];
+    const enabled = payload.enabled === true;
+    const entries: TaskBatchEntryVm[] = ids.map((wanted) => {
+      const existing = TASKS.find((candidate) => candidate.id === wanted.id);
+      if (existing === undefined) {
+        // `missing` and not `refused`: a well-formed id whose row another host
+        // forgot is usually benign, and the two want different words on screen.
+        return { id: wanted.id, outcome: "missing", effect: null, reason: null };
+      }
+      // The lost-update refusal, per id — the same rule and the same sentence
+      // `sync_task_save` above mirrors. Unreachable in a shell with one writer
+      // unless two batches race, which is the honest state of affairs: the
+      // wording is Rust's and this is where it lands.
+      if (wanted.baselineUpdatedMs !== null && existing.updatedMs !== wanted.baselineUpdatedMs) {
+        return {
+          id: wanted.id,
+          outcome: "refused",
+          effect: null,
+          reason: `task '${wanted.id}' was changed elsewhere since this was opened (last written at ${existing.updatedMs}, this edit started from ${wanted.baselineUpdatedMs}): refusing to write stale values over it — re-read it and try again`,
+        };
+      }
+      // `rearmed` only when the row was out of service and is coming back,
+      // because that is the distinction the effect exists to carry.
+      const effect = !existing.enabled && enabled ? "rearmed" : "updated";
+      existing.enabled = enabled;
+      existing.nextDueMs = enabled ? existing.nextDueMs : null;
+      existing.updatedMs = Date.now();
+      return { id: wanted.id, outcome: "saved", effect, reason: null };
+    });
+    return { entries } satisfies TaskBatchReceiptVm;
+  },
+  sync_tasks_forget: (payload) => {
+    const ids = (payload.ids ?? []) as string[];
+    const entries: TaskBatchEntryVm[] = ids.map((id) => {
+      const at = TASKS.findIndex((candidate) => candidate.id === id);
+      if (at < 0) {
+        return { id, outcome: "missing", effect: null, reason: null };
+      }
+      TASKS.splice(at, 1);
+      return { id, outcome: "forgotten", effect: null, reason: null };
+    });
+    return { entries } satisfies TaskBatchReceiptVm;
   },
   // Two sessions, two shapes: a table would answer the flat one for both and
   // the folder-shaped row would render as something it is not.
