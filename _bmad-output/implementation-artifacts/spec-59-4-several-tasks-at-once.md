@@ -6,7 +6,7 @@ status: 'done' # draft | ready-for-dev | in-progress | in-review | done | blocke
 baseline_revision: '6606fcb'
 review_loop_iteration: 0
 followup_review_recommended: true
-final_revision: '6bcb830' # the commit holding this spec at its final revision; the stamp itself follows it
+final_revision: 'a570dec' # the commit holding this spec at its final revision; the stamp itself follows it
 context: []
 warnings: ['oversized']
 ---
