@@ -1,9 +1,9 @@
 ---
 title: 'Story 59.1: a list of names, and one task at a time'
 type: 'feature'
-status: 'in-review'
-final_revision: ''
-review_loop_iteration: 0
+status: 'done'
+final_revision: '5684b02'
+review_loop_iteration: 1
 followup_review_recommended: false
 context:
   - '{project-root}/docs/project-context.md'

@@ -1047,7 +1047,7 @@ development_status:
   # decision forbids by name). Its row stays open so the bulk-verb story that
   # would earn it can be planned rather than assumed.
   epic-59: in-progress
-  59-1-a-list-of-names-and-one-task-at-a-time: backlog
+  59-1-a-list-of-names-and-one-task-at-a-time: review
   59-2-a-run-you-can-open: review
   59-3-the-row-says-its-mode-and-run-now-says-what-it-does: review
   59-4-several-tasks-at-once: backlog
