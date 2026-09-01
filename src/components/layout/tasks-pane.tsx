@@ -80,9 +80,10 @@
  * forgets the runs it held, so re-opening re-reads rather than showing a list
  * `task_runs` may have trimmed underneath it (cap `TASK_RUNS_CAP`).
  */
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, ListChecks } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { FoldToggle, useFold } from "@/components/layout/list-fold";
+import { useSurfaceColumn } from "@/components/layout/surface-column";
 // `TASK_HOST_WIDE_TEXT` is the form's rather than this file's: the picker's
 // first option and this pane's folder column are one fact, and the dependency
 // has to run this way round because the pane mounts the form. The other
@@ -102,7 +103,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { countLabel, RUNS } from "@/lib/count-label";
+import { type CountNoun, countLabel, RUNS } from "@/lib/count-label";
 import type { PacedWorkVm, TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
 import {
   syncPacedWork,
@@ -111,7 +112,9 @@ import {
   syncTaskRunNow,
   syncTasks,
 } from "@/lib/ipc/client";
+import { columnFoldStore } from "@/lib/stores/column-fold";
 import { hydrateSyncListSizes } from "@/lib/stores/sync-detail";
+import { cn } from "@/lib/utils";
 
 /** The heading, and the promise the pane makes in one line. */
 export const TASKS_PANE_TITLE = "Tasks";
@@ -324,6 +327,62 @@ export const TASKS_REFUSAL_TESTID = "task-refusal";
 export const TASKS_ORPHAN_REFUSAL_TESTID = "tasks-orphan-refusal";
 export const TASKS_ERROR_TESTID = "tasks-error";
 export const TASK_FORGET_TESTID = "task-forget-confirm";
+
+// ---------------------------------------------------------------------------
+// The two levels (Story 59.1): a list of names, and one task at a time
+// ---------------------------------------------------------------------------
+
+/**
+ * The accessible name of the region one selected task is drawn in.
+ *
+ * Distinct from the pane's own name and from the master column's — three
+ * regions sit inside this surface and a reader jumping between landmarks has to
+ * be able to tell "Tasks" (the surface), "Task list" (the column of names,
+ * named by its own entry in `SURFACE_COLUMNS`) and this apart.
+ */
+export const TASKS_DETAIL_LABEL = "Task detail";
+
+/**
+ * What the master list is called to a screen reader.
+ *
+ * The column region around it is already named *Task list* by its own fold-row
+ * heading, so this names the `<ul>` for what its rows are rather than repeating
+ * the column: "Tasks" is the set, "Task list" is the column that holds it.
+ */
+export const TASKS_LIST_LABEL = "Tasks";
+
+export const TASKS_DETAIL_TESTID = "task-detail";
+
+/**
+ * The rail the master column still offers once its body is unmounted.
+ *
+ * `useSurfaceColumn` refuses an empty rail by construction, and getting this
+ * right needed one correction worth recording. The first version put Refresh
+ * and Add on the strip, `files-pane.tsx`'s two — but this pane's header sits
+ * ABOVE both columns rather than inside the folding one, so the fold takes
+ * neither of them away and the strip would have offered a second Refresh a
+ * screen-reader user could not tell from the first. A test caught it as *Found
+ * multiple elements with the role "button" and name "Refresh"*, which is
+ * exactly what a person navigating by name would have hit.
+ *
+ * What the fold genuinely takes is the **names** — and the projected paced rows
+ * under them. So the strip does what the Files tree's selection entry does with
+ * a selection it cannot show: it says how many there are, and gives them back.
+ * Without it a folded Tasks column is a 48px strip that answers nothing.
+ */
+export const TASKS_RAIL_LIST_LABEL = "Task list";
+export const TASKS: CountNoun = { one: "task", many: "tasks" };
+
+/**
+ * The master column's own box.
+ *
+ * `shrink-0` and `min-w-0` together, `FILES_COLUMN_CLASS`'s pairing: the width
+ * is a remembered number that arrives as an inline `flex-basis` from
+ * `useSurfaceColumn`, so the column must not be squeezed below it by a long
+ * task name — and must still be allowed to clip that name rather than push the
+ * detail region off screen.
+ */
+const TASKS_COLUMN_CLASS = "flex min-w-0 shrink-0 flex-col border-border border-r bg-background";
 
 /**
  * The disclosure over one task's recorded runs, and the section it reveals.
@@ -986,7 +1045,117 @@ function TaskRunList({
   );
 }
 
+/**
+ * One task as a single line in the master list (Story 59.1).
+ *
+ * Level 1 of the two the owner asked for: *"the task list it would be good to
+ * see the list of the saved names … -> detail"*. Before this the row WAS the
+ * detail — ten stacked blocks and three buttons, ~250px of card each — so
+ * reaching the eighth task's runs meant scrolling past seven of them, and every
+ * capability epic 58 shipped was on screen and unfindable.
+ *
+ * Five facts and no controls: the kind, the mode, the name, the host and when
+ * it is next due. Four of those are the epic's own list; the mode badge is here
+ * because Story 59.3's acceptance is that *the row* states a task is scheduled,
+ * and a fact that moved into the detail would quietly un-ship it. Everything
+ * else is re-sited into {@link TaskDetail} and **not one word of it is
+ * reworded**.
+ *
+ * No button but the row itself. A control here would be back in the `shrink-0`
+ * cluster Story 58.3 already had to move the `Runs` link out of, on a row that
+ * is now a third of its old width.
+ *
+ * `aria-current` and not `aria-selected`, which is this app's own idiom for a
+ * master list whose selection is single (`chat-row.tsx:266`, asserted at
+ * `chat-row.test.tsx:198-207`). `aria-selected` belongs to the multi-select
+ * model Story 59.4 deliberately refuses, and borrowing its attribute now would
+ * announce a set to a reader when there can only ever be one.
+ */
 function TaskRow({
+  task,
+  now,
+  selected,
+  tabIndex,
+  buttonRef,
+  onSelect,
+}: {
+  task: TaskVm;
+  now: number;
+  selected: boolean;
+  /**
+   * The roving tab stop: `0` on the selected row and `-1` on every other, so the
+   * list is one stop rather than twenty (`chat-list-pane.tsx:756-760`). Selection
+   * IS the cursor here — there is no second highlight to keep in step with it.
+   */
+  tabIndex: number;
+  buttonRef: (element: HTMLButtonElement | null) => void;
+  onSelect: (id: string) => void;
+}) {
+  const unhosted = task.host.kind === "unhosted";
+  return (
+    <li data-testid={TASKS_ROW_TESTID} data-task-id={task.id}>
+      <button
+        ref={buttonRef}
+        type="button"
+        tabIndex={tabIndex}
+        // Only on the selected row: `aria-current="false"` is announced by some
+        // readers as a state worth mentioning, and nineteen rows saying "not
+        // current" is the noise `chat-row.tsx` already refused.
+        aria-current={selected ? "true" : undefined}
+        onClick={() => onSelect(task.id)}
+        className={cn(
+          "flex w-full flex-col gap-1 border-border border-b px-3 py-2 text-left",
+          "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+          selected ? "bg-accent" : "hover:bg-accent",
+        )}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          {/* Both stored spellings, the kind badge's rule: a kind or a mode a
+              newer keeper wrote is shown rather than hidden (NFR-43). */}
+          <Badge variant="secondary">{task.kind}</Badge>
+          <Badge variant="outline">{task.mode}</Badge>
+          <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
+        </span>
+        <span className="flex min-w-0 items-center justify-between gap-2 text-xs">
+          {/* The host WORD only. Its sentence and its reason are Rust's and are
+              rendered whole in the detail — a line this narrow would clip them,
+              and a clipped host claim is the one thing AD-137 cannot tolerate.
+              What the word has to carry alone is the alarm, which is why an
+              unhosted row is coloured here as well as named. */}
+          <span
+            className={unhosted ? "truncate text-destructive" : "truncate text-muted-foreground"}
+          >
+            {HOST_KIND_LABELS[task.host.kind] ?? task.host.kind}
+          </span>
+          <span className="shrink-0 text-muted-foreground">
+            {formatTaskDue(task.nextDueMs, now)}
+          </span>
+        </span>
+      </button>
+    </li>
+  );
+}
+
+/**
+ * The selected task, whole (Story 59.1).
+ *
+ * Level 2, and every line of it is what the flat card used to be: the field
+ * grid, the host block and its Rust-composed sentence, the refusal, the three
+ * controls, the `Runs` disclosure and the edit form. **This is a re-siting, not
+ * a rewrite** — the epic's own instruction, because every fact epic 58 put on
+ * the row is a fact somebody needs. Nothing here is new copy.
+ *
+ * What it gains from the move is room. Story 58.3 pulled the `Runs` control out
+ * of a `shrink-0` strip that already held three buttons, and Story 59.2 then
+ * promoted it to a count and a chevron on the argument that *"the detail region
+ * this now sits in is not competing with three buttons for a narrow row's
+ * width"* — a sentence written against a region that did not exist yet. This is
+ * that region; the sentence is honoured rather than amended.
+ *
+ * A region and not a panel: `PanelStrip`'s targets are documents opened in an
+ * editor, and a task is not one. Nothing here enters `panelsStore`.
+ */
+function TaskDetail({
   task,
   now,
   refusal,
@@ -1008,18 +1177,18 @@ function TaskRow({
   now: number;
   refusal: string | null;
   running: boolean;
-  /** This row's own Forget is in flight, so a second confirm cannot re-issue it. */
+  /** This task's own Forget is in flight, so a second confirm cannot re-issue it. */
   deleting: boolean;
   editing: boolean;
   /** A save is in flight somewhere in the pane — see `formSaving`. */
   writing: boolean;
-  /** Whether this row's runs are the pane's one open section. */
+  /** Whether this task's runs are the pane's one open section. */
   historyOpen: boolean;
   /**
-   * The runs read for this row: `null` while unread, `[]` for a task with none.
+   * The runs read for this task: `null` while unread, `[]` for a task with none.
    *
    * The data rather than a rendered node, so this component stays a pure
-   * function of its task and no caller can hand a row the runs of another one.
+   * function of its task and no caller can hand it another task's runs.
    */
   historyRuns: TaskRunVm[] | null;
   historyError: string | null;
@@ -1038,8 +1207,8 @@ function TaskRow({
   // a screen-reader user nothing to jump to. Passed only while the section
   // exists, `note-editor.tsx`'s form, so there is never a dangling IDREF.
   const historyRegionId = useId();
-  // The header disclosure's rule, per row: the form is closed from inside
-  // itself, so without this focus lands on `<body>`.
+  // The header disclosure's rule: the form is closed from inside itself, so
+  // without this focus lands on `<body>`.
   const editTriggerRef = useRef<HTMLButtonElement>(null);
   const wasEditing = useRef(false);
   useEffect(() => {
@@ -1049,38 +1218,27 @@ function TaskRow({
     wasEditing.current = editing;
   }, [editing]);
   return (
-    <li
-      data-testid={TASKS_ROW_TESTID}
+    <div
+      data-testid={TASKS_DETAIL_TESTID}
       data-task-id={task.id}
-      className="flex flex-col gap-3 border-border border-b px-6 py-4 last:border-b-0"
+      className="flex flex-col gap-3 px-6 py-4"
     >
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            {/* The kind as stored, so a kind a newer keeper wrote is shown
-                rather than hidden (NFR-43). */}
             <Badge variant="secondary">{task.kind}</Badge>
-            {/* The MODE, added by Story 59.3, and the row was silent about it
-                until now. Mode reached the screen only obliquely — through the
-                host badge's `onRequest` / `off` wording — so a `scheduled` row's
-                only visible schedule facts were a cron string and a next-due
-                time, sitting beside a Run now button whose relationship to them
-                was unstated. The owner asked for a button that already existed
-                and worked; this is half of why he could not tell.
-
-                Stored spelling, `PACED_KIND_LABELS`' rule and the kind badge's
-                immediately above: `db::decode_task` diverts a mode this build
-                cannot read into the unknown list, so this can only ever render
-                one of `TASK_MODES`. */}
             <Badge variant="outline">{task.mode}</Badge>
-            <span className="truncate font-medium text-foreground text-sm">{task.id}</span>
+            {/* The name, and the reason it is a heading here and a span in the
+                list: this region is about exactly one task, so the id is its
+                title rather than one cell among five. */}
+            <h2 className="truncate font-medium text-foreground text-sm">{task.id}</h2>
           </div>
-          {/* The task's own words, when it has any (Story 59.5). Under the id
-              because the id is the name and this is the sentence about it, and
-              absent when blank — `TASK_LAST_REPORT_LABEL`'s rule: a heading over
-              an empty string reads as a failed read. */}
+          {/* The task's own words, when it has any (Story 59.5). Under the name
+              because the name is what it describes, and absent when blank —
+              `TASK_LAST_REPORT_LABEL`'s rule: a heading over an empty string
+              reads as a failed read. */}
           {taskDescriptionText(task.description) !== null && (
-            <p data-testid={TASKS_DESCRIPTION_TESTID} className="truncate text-foreground text-xs">
+            <p data-testid={TASKS_DESCRIPTION_TESTID} className="text-foreground text-xs">
               {taskDescriptionText(task.description)}
             </p>
           )}
@@ -1099,9 +1257,9 @@ function TaskRow({
             {TASK_RUN_NOW_TEXT}
           </Button>
           {/* A disclosure, not a dialog: the same component the header reveals,
-              in the row it is about (AD-C7). Disabled while a save is in flight
-              for the reason the header's twin is — pressing it unmounts the form
-              Rust's answer has to land in. */}
+              in the region it is about (AD-C7). Disabled while a save is in
+              flight for the reason the header's twin is — pressing it unmounts
+              the form Rust's answer has to land in. */}
           <Button
             ref={editTriggerRef}
             type="button"
@@ -1155,8 +1313,10 @@ function TaskRow({
         )}
       </dl>
 
-      {/* The host claim, and the one place on screen it comes from. The label
-          is the scannable word; the sentence beside it is Rust's, verbatim. */}
+      {/* The host claim, and the one place on screen it comes from whole. The
+          list beside this carries the WORD so a person can scan for an unhosted
+          task; the sentence and the reason are Rust's, verbatim, and live here
+          because this is the only region wide enough to hold them unclipped. */}
       <div data-testid={TASKS_HOST_TESTID} data-host-kind={task.host.kind} className="min-w-0">
         <dt className="text-muted-foreground text-xs uppercase tracking-wide">{TASK_HOST_LABEL}</dt>
         <dd className="flex flex-wrap items-baseline gap-2 text-sm">
@@ -1174,7 +1334,7 @@ function TaskRow({
       </div>
 
       {/* A refusal, quoted where it was asked — from a Run now, or from a
-          Forget the engine would not do. The row keeps every other value it
+          Forget the engine would not do. The region keeps every other value it
           had: nothing here may read as though the task ran or went away. */}
       {refusal !== null && (
         <p role="alert" data-testid={TASKS_REFUSAL_TESTID} className="text-destructive text-sm">
@@ -1182,7 +1342,7 @@ function TaskRow({
         </p>
       )}
 
-      {/* A control that reads as one, since Story 59.1's review. It was a bare
+      {/* A control that reads as one (Story 59.2). It was a bare
           dotted-underline link at the very bottom of the row, and the owner —
           running the build with tasks in it for the first time — reported that
           he could not see a task's runs at all. The link was there; it was last,
@@ -1195,9 +1355,9 @@ function TaskRow({
           history, which the original comment itself conceded made it "the most
           load-bearing thing on the row". A route is not a fold, and the two
           deserve different weight. Story 58.3's other reason was the `shrink-0`
-          cluster at the top; that reason is answered by 59.1 rather than argued
-          with, because the detail region this now sits in is not competing with
-          three buttons for a narrow row's width.
+          cluster at the top; Story 59.1 answered it rather than arguing with it,
+          because this region is not competing with three buttons for a narrow
+          row's width.
 
           The count is the affordance that costs nothing: `historyRuns` is
           already in hand once opened, so an opened section can say how many it
@@ -1208,7 +1368,7 @@ function TaskRow({
 
           Refused while a write is on its way, the rule Edit and Forget already
           follow: opening this closes an edit form, so pressing it mid-save would
-          unmount the form Rust's answer has to land in — and a row whose Forget
+          unmount the form Rust's answer has to land in — and a task whose Forget
           is in flight is about to go, so answering "no runs recorded" about it
           would be a claim about a record that is leaving.
 
@@ -1221,8 +1381,9 @@ function TaskRow({
         size="sm"
         aria-expanded={historyOpen}
         aria-controls={historyOpen ? historyRegionId : undefined}
-        // Named for its task, `FoldToggle`'s reason: ten rows would otherwise
-        // offer ten controls a screen reader calls "Runs".
+        // Named for its task, `FoldToggle`'s reason — kept even though exactly
+        // one of these is on screen now, because the name a reader hears should
+        // not depend on how many happen to be mounted.
         aria-label={`${TASK_HISTORY_TITLE}: ${task.id}`}
         disabled={writing || deleting}
         onClick={() => onHistoryToggle(task.id)}
@@ -1244,7 +1405,7 @@ function TaskRow({
         />
       )}
 
-      {/* Capped where the row is not, the Sync pane's reason: a form is read
+      {/* Capped where the region is not, the Sync pane's reason: a form is read
           line by line, and a label-and-field pair stretched across a wide
           window is worse than one that sits still. */}
       {editing && (
@@ -1259,7 +1420,7 @@ function TaskRow({
           </CardContent>
         </Card>
       )}
-    </li>
+    </div>
   );
 }
 
@@ -1355,9 +1516,25 @@ function PacedWorkList({
               </span>
               <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
                 <Field label={PACED_FOLDER_LABEL}>{row.profile}</Field>
-                {/* Null only for a paused or a governed row, and the sentence
-                    below says which — so this cell never guesses a reason. */}
-                <Field label={PACED_CADENCE_LABEL}>{row.cadence ?? PACED_NO_CADENCE_TEXT}</Field>
+                {/* The cadence is drawn ONLY for a row something is actually
+                    pacing, and the standing is what decides — not the presence
+                    of the string.
+
+                    `keeper_core::tasks::paced_work` enforces the same pairing,
+                    but it enforces it with a `debug_assert!`, which is compiled
+                    out of the build a person runs. So this is the half that
+                    survives release, and it is the half that matters after
+                    Story 58.8: a folder whose paced backstop has stood down to a
+                    scheduled sync task must not go on advertising the interval
+                    that no longer fires. A row that says *Scheduled* over *about
+                    every 15 seconds* is the exact over-claim AD-141 built this
+                    whole class to prevent, and the sentence beside it already
+                    says which of the three reasons applies. */}
+                <Field label={PACED_CADENCE_LABEL}>
+                  {row.standing === "paced" && row.cadence !== null
+                    ? row.cadence
+                    : PACED_NO_CADENCE_TEXT}
+                </Field>
               </dl>
               {/* Rust's, verbatim. Each of these carries a fact the browser
                   cannot re-derive — that a saved file brings the next look
@@ -1404,6 +1581,31 @@ export function TasksPane() {
    * cleared by a save, by Cancel and by pressing Edit again.
    */
   const [editingId, setEditingId] = useState<string | null>(null);
+  /**
+   * Which task the detail region is showing, or `null` before anything has been
+   * chosen (Story 59.1).
+   *
+   * An **id and not a `TaskVm`**, and never the row object itself: `refresh()`
+   * replaces the whole listing on every mount, Refresh press and Run now settle,
+   * so a stored view model would go stale the moment a run moved its
+   * `lastRun` — the detail would then describe a task as it was one read ago
+   * while the list beside it showed the new state. The id is the only part of a
+   * task that does not move (`task_runs.task_id` joins on it, which is also why
+   * Story 59.1 may not make it editable).
+   *
+   * Nothing prunes it, deliberately: {@link selectedTask} resolves it against
+   * the newest listing and falls back to the first row, so an id the record no
+   * longer holds costs a fallback rather than a stale region. That is one rule
+   * in one place instead of a slot and an effect that can disagree.
+   */
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  /**
+   * Live refs to each rendered row button, so the keyboard handler can move
+   * focus as the selection moves (`chat-list-pane.tsx:142-145`'s idiom).
+   * Rebuilt each render from the current row order, which is `list_tasks`' and
+   * is never re-sorted here.
+   */
+  const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
   /**
    * The task a Forget is asking about, and whether the question is on screen.
    *
@@ -1811,21 +2013,151 @@ export function TasksPane() {
   );
 
   /**
-   * Refusals whose row the listing no longer holds.
+   * The readable rows, and which one the detail region is drawing (Story 59.1).
    *
-   * `refusals` is keyed by task id and drawn by {@link TaskRow}, so a refusal
-   * for a task that is not in the listing had nowhere to be drawn at all — and
-   * the likeliest reason `sync_task_forget` refuses is that another writer on
-   * this shared record removed the row first, at which point the re-read in
-   * `forget`'s own `finally` takes away the row that would have carried the
-   * sentence. A failed delete then looked exactly like a successful one, which
-   * is the invisible-failure shape this whole epic exists to close, so an
-   * orphaned refusal is promoted to the pane's own alert instead of dropped.
+   * Resolved rather than stored. {@link selectedId} is an id the person chose;
+   * this is that id looked up in the **newest** listing, falling back to the
+   * first row. The fallback is what makes three separate rules unnecessary:
+   *
+   * - Nothing is chosen yet, so the first task is shown. A detail region that
+   *   started empty over a list with rows would be a second empty state
+   *   competing with the real one, and defaulting costs **no read** — every
+   *   field the region draws is already on the `TaskVm` the listing carries.
+   * - The chosen task was forgotten here, or by the other host on this shared
+   *   record. The region moves to a task that exists instead of describing one
+   *   that does not.
+   * - The listing emptied. `selectedTask` is `null`, no region renders, and the
+   *   empty state is the only thing on screen.
    */
-  const orphanRefusals =
-    listing === null
-      ? []
-      : Object.entries(refusals).filter(([id]) => !listing.tasks.some((task) => task.id === id));
+  const tasks = listing?.tasks ?? [];
+  const selectedTask = tasks.find((row) => row.id === selectedId) ?? tasks[0] ?? null;
+
+  /**
+   * Choose a task, and close what belonged to the last one.
+   *
+   * **Selection issues no read**, which is the invariant this story is most
+   * able to break. `spec-58-3:40`'s Never clause — *"poll history; hold one
+   * fetch per row in flight at once; register a timer"* — is AD-62's anti-poll
+   * rule, and a master/detail satisfies it *better* than the old per-row
+   * disclosure did, because exactly one task is on screen by construction. It
+   * only stays satisfied while choosing stays inert: the runs are still read on
+   * the deliberate `Runs` press and nowhere else.
+   *
+   * The two closes are the same one-at-a-time rules the disclosures already
+   * had, now enforced by the structure: an edit form seeded from task A must not
+   * survive into task B's region, and a run list read for A must not sit under
+   * B's name. The history token is bumped so A's read, if still in flight,
+   * cannot land in B's section.
+   */
+  const selectTask = useCallback(
+    (id: string) => {
+      setSelectedId(id);
+      setEditingId(null);
+      if (historyRef.current !== null) {
+        historyToken.current += 1;
+        openHistory(null);
+      }
+    },
+    [openHistory],
+  );
+
+  /**
+   * Move the selection with the keyboard, and take focus with it.
+   *
+   * The selection **is** the roving cursor. `chat-list-pane.tsx` keeps a second
+   * `focusedKey` beside its selection because opening a conversation is
+   * expensive and arrowing past one must not open it; choosing a task costs
+   * nothing at all — no read, no write — so a second cursor would be state with
+   * no consumer, and two highlights a person has to tell apart.
+   *
+   * Clamped at both ends rather than wrapping: a list of twenty whose Down at
+   * the bottom silently returns to the top is a list that has lost the reader's
+   * place.
+   */
+  const moveSelection = useCallback(
+    (to: number) => {
+      const next = tasks[to];
+      if (next === undefined) {
+        return;
+      }
+      selectTask(next.id);
+      rowRefs.current[to]?.focus();
+    },
+    [tasks, selectTask],
+  );
+  const onListKeyDown = (event: React.KeyboardEvent<HTMLUListElement>) => {
+    // Chords belong to the global shortcut hooks, `chat-list-pane.tsx`'s rule:
+    // a pane that swallows ⌘↓ breaks a shortcut it knows nothing about.
+    if (event.metaKey || event.altKey || event.ctrlKey || tasks.length === 0) {
+      return;
+    }
+    const at = selectedTask === null ? -1 : tasks.findIndex((row) => row.id === selectedTask.id);
+    const to =
+      event.key === "ArrowDown"
+        ? Math.min(at + 1, tasks.length - 1)
+        : event.key === "ArrowUp"
+          ? Math.max(at - 1, 0)
+          : event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? tasks.length - 1
+              : null;
+    if (to === null) {
+      return;
+    }
+    // Only once a key this list owns has been recognised, so Tab, Enter and
+    // every shortcut above still reach whatever else wants them.
+    event.preventDefault();
+    moveSelection(to);
+  };
+
+  /**
+   * Refusals with nowhere on screen to be drawn.
+   *
+   * `refusals` is keyed by task id and drawn by {@link TaskDetail}, which draws
+   * exactly **one** task — so a refusal is homeless in two ways now, not one.
+   * The row may be gone: the likeliest reason `sync_task_forget` refuses is that
+   * another writer on this shared record removed it first, at which point the
+   * re-read in `forget`'s own `finally` takes away the region that would have
+   * carried the sentence. Or the row may simply no longer be selected, which
+   * Story 59.1 made reachable — a Run now is answered asynchronously and the
+   * person is free to choose another task while it is in flight.
+   *
+   * Either way a failed action would look exactly like a successful one, which
+   * is the invisible-failure shape this whole epic exists to close. So the test
+   * is *is this refusal being rendered somewhere* and not *does this row still
+   * exist*: anything the detail region is not showing is promoted to the pane's
+   * own alert instead of dropped.
+   */
+  const orphanRefusals = Object.entries(refusals).filter(([id]) => id !== selectedTask?.id);
+
+  /**
+   * The names are a surface column: it folds away and it can be dragged wider
+   * (Story 59.1, the convention `0a24b39` settled rather than left to this
+   * story).
+   *
+   * Its rail is one entry, and the reasoning is in {@link TASKS_RAIL_LIST_LABEL}:
+   * this pane's header sits above BOTH columns, so folding takes away neither
+   * Refresh nor Add — it takes away the names. The strip therefore says how many
+   * there are and gives them back, which is what `files-pane.tsx` does with a
+   * selection its strip cannot show.
+   *
+   * The count comes from the listing and not from the rendered rows, which is
+   * `count-label.ts`'s whole enforcement — and `null` counts as none, because
+   * before the first read there is nothing behind the strip yet.
+   */
+  const list = useSurfaceColumn("tasks-list", {
+    rail: [
+      {
+        id: "tasks",
+        icon: ListChecks,
+        label: TASKS_RAIL_LIST_LABEL,
+        detail: countLabel(tasks.length, TASKS),
+        count: tasks.length,
+        onSelect: () => columnFoldStore.getState().toggleColumn("tasks-list"),
+      },
+    ],
+  });
 
   return (
     <section
@@ -1866,83 +2198,208 @@ export function TasksPane() {
         </div>
       </header>
 
-      <ScrollArea fitWidth className="min-h-0 flex-1">
-        <div data-slot="tasks-body" className="flex flex-col">
-          {error !== null && (
-            <p
-              role="alert"
-              data-testid={TASKS_ERROR_TESTID}
-              className="px-6 pt-4 text-destructive text-sm"
-            >
-              {error}
-            </p>
+      {/* Pane-level facts, above both levels and spanning them: a listing that
+          would not read and a refusal with nowhere to be drawn are about the
+          surface rather than about one task, and putting them inside either
+          column would hide them behind that column's fold. */}
+      {error !== null && (
+        <p
+          role="alert"
+          data-testid={TASKS_ERROR_TESTID}
+          className="shrink-0 px-6 pt-4 text-destructive text-sm"
+        >
+          {error}
+        </p>
+      )}
+      {/* A refusal the detail region is not showing — see `orphanRefusals`.
+          Named by its task, because the region that would have said which one
+          is either gone or showing somebody else. */}
+      {orphanRefusals.map(([id, refusal]) => (
+        <p
+          key={id}
+          role="alert"
+          data-testid={TASKS_ORPHAN_REFUSAL_TESTID}
+          className="shrink-0 px-6 pt-4 text-destructive text-sm"
+        >
+          {id}: {refusal}
+        </p>
+      ))}
+
+      <div className="flex min-h-0 min-w-0 flex-1">
+        {/* Level 1 — the names. */}
+        <section {...list.rootProps} className={TASKS_COLUMN_CLASS}>
+          {list.chrome}
+          {!list.folded && (
+            <ScrollArea fitWidth className="min-h-0 flex-1">
+              <div data-slot="tasks-body" className="flex flex-col">
+                {listing === null && error === null && (
+                  <p className="px-3 pt-4 text-muted-foreground text-sm">
+                    {TASKS_PANE_LOADING_SENTENCE}
+                  </p>
+                )}
+                {tasks.length > 0 && (
+                  // Keyboard navigation over the whole list rather than a
+                  // handler per row: the arrows move the selection, and each row
+                  // is already a button so Enter and Space need nothing here.
+                  <ul
+                    aria-label={TASKS_LIST_LABEL}
+                    className="flex flex-col"
+                    onKeyDown={onListKeyDown}
+                  >
+                    {tasks.map((task, index) => (
+                      <TaskRow
+                        key={task.id}
+                        task={task}
+                        now={now}
+                        selected={selectedTask?.id === task.id}
+                        tabIndex={selectedTask?.id === task.id ? 0 : -1}
+                        buttonRef={(element) => {
+                          rowRefs.current[index] = element;
+                        }}
+                        onSelect={(id) => {
+                          // Re-choosing the task already open would otherwise
+                          // close its own edit form and its own runs under the
+                          // person who just clicked its name.
+                          if (id !== selectedTask?.id) {
+                            selectTask(id);
+                          }
+                        }}
+                      />
+                    ))}
+                  </ul>
+                )}
+                {/* These rows carry no controls and are NOT selectable, now that
+                    the readable ones open a detail region. They are not
+                    `TaskVm`s — `db::list_tasks` could not decode them — so there
+                    is nothing to draw a detail from and nothing to seed a form
+                    with, and an upsert built out of a reason string is one
+                    `sync_task_save` would refuse. A row that selects into an
+                    empty region is the same defect as a control that can only
+                    fail. */}
+                {listing !== null && listing.unknown.length > 0 && (
+                  <>
+                    <h2 className="border-border border-t px-3 pt-4 font-heading text-muted-foreground text-sm">
+                      {TASKS_UNKNOWN_HEADING}
+                    </h2>
+                    <ul className="flex flex-col">
+                      {listing.unknown.map((row, index) => (
+                        <li
+                          // The index, because the ID is the thing that is not
+                          // unique here (Story 57.5's finding 10):
+                          // `db::list_tasks` emits
+                          // `UnknownTask { id: String::new(), … }` for a row
+                          // whose `id` column will not read, and two of those
+                          // gave React two siblings keyed `""` — a duplicate-key
+                          // warning, and reconciliation free to reuse one row's
+                          // DOM for the other so the two distinct reasons swap
+                          // or fail to update. This is the one list that exists
+                          // to tolerate malformed rows, and it is `ORDER BY id`
+                          // from the store rather than reorderable by the user,
+                          // so the index is stable across reads.
+                          // biome-ignore lint/suspicious/noArrayIndexKey: see above — the id is not unique
+                          key={`${index}:${row.id}`}
+                          data-testid={TASKS_UNKNOWN_ROW_TESTID}
+                          data-task-id={row.id}
+                          className="flex flex-col gap-1 px-3 py-3"
+                        >
+                          <span className="flex items-center gap-2">
+                            <Badge variant="outline">{TASKS_UNKNOWN_BADGE}</Badge>
+                            <span className="truncate font-medium text-foreground text-sm">
+                              {row.id === "" ? TASKS_UNKNOWN_NO_ID_TEXT : row.id}
+                            </span>
+                          </span>
+                          <span className="text-muted-foreground text-sm">{row.reason}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+                {/* Last in the column and inside the same `ScrollArea`, because
+                    it is a second class in ONE view and not a second view: the
+                    question it answers — "is that everything keeper does on a
+                    clock?" — is only asked once the task list above has been
+                    read. This column is where the lists live, and a projected
+                    row has no detail to open, so it belongs here rather than
+                    beside a task. Rendered unconditionally, so its own loading
+                    line and its own empty sentence are reachable rather than
+                    hidden behind the tasks' states. */}
+                <PacedWorkList rows={paced} error={pacedError} />
+              </div>
+            </ScrollArea>
           )}
-          {/* A refusal whose row the listing no longer has — see
-              `orphanRefusals`. Named by its task, because the row that would
-              have said which one is gone. */}
-          {orphanRefusals.map(([id, refusal]) => (
-            <p
-              key={id}
-              role="alert"
-              data-testid={TASKS_ORPHAN_REFUSAL_TESTID}
-              className="px-6 pt-4 text-destructive text-sm"
-            >
-              {id}: {refusal}
-            </p>
-          ))}
-          {listing === null && error === null && (
-            <p className="px-6 pt-4 text-muted-foreground text-sm">{TASKS_PANE_LOADING_SENTENCE}</p>
-          )}
-          {/* The add form, revealed by the header and mounted at the top of the
-              body — inline, never a dialog (AD-C7): the two configuration
-              surfaces are the same component, so they cannot word or validate a
-              task differently. Closing unmounts it, so the next open starts from
-              a fresh form rather than an abandoned draft. */}
-          {adding && (
-            <Card size="sm" className="m-6 w-full max-w-[720px]">
-              <CardContent>
-                <TaskForm
-                  onSaved={() => {
-                    setAdding(false);
-                    void refresh();
-                  }}
-                  onCancel={() => setAdding(false)}
-                  onSavingChange={setFormSaving}
-                />
-              </CardContent>
-            </Card>
-          )}
-          {listing !== null && listing.tasks.length === 0 && listing.unknown.length === 0 && (
-            <div className="flex flex-col gap-2 px-6 pt-4">
-              <p className="text-muted-foreground text-sm">{TASKS_PANE_EMPTY_SENTENCE}</p>
-              <code className="w-fit max-w-full overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-foreground text-xs">
-                {TASKS_PANE_EMPTY_COMMAND}
-              </code>
-              <p className="text-muted-foreground text-sm">{TASKS_PANE_EMPTY_AFTER}</p>
-            </div>
-          )}
-          {listing !== null && listing.tasks.length > 0 && (
-            <ul className="flex flex-col">
-              {listing.tasks.map((task) => (
-                <TaskRow
-                  key={task.id}
-                  task={task}
+        </section>
+        {list.seam}
+
+        {/* Level 2 — one task at a time. A plain sibling region and NOT a
+            `PanelStrip`: that strip's targets are documents opened in an editor
+            and a task is not one, so nothing here enters `panelsStore`. */}
+        <section
+          aria-label={TASKS_DETAIL_LABEL}
+          className="flex min-w-0 flex-1 flex-col bg-background"
+        >
+          <ScrollArea fitWidth className="min-h-0 flex-1">
+            {/* The add form, revealed by the header or by the folded rail and
+                drawn HERE — inline, never a dialog (AD-C7): the two
+                configuration surfaces are the same component, so they cannot
+                word or validate a task differently. It takes the region rather
+                than sitting above the selected task, because a form and a task's
+                detail are two different answers to "what am I looking at", and
+                720px of form does not fit in a 320px column. Closing unmounts
+                it, so the next open starts from a fresh form rather than an
+                abandoned draft — and `task-form.tsx`'s own reads key off mount. */}
+            {adding ? (
+              <Card size="sm" className="m-6 w-full max-w-[720px]">
+                <CardContent>
+                  <TaskForm
+                    onSaved={(saved) => {
+                      setAdding(false);
+                      // Show what was just made rather than leaving the region
+                      // on whatever was selected before it existed. The id is
+                      // Rust's — a create sends `id: ""` and gets a minted ULID
+                      // back — so this is the only moment the pane learns it.
+                      setSelectedId(saved.id);
+                      void refresh();
+                    }}
+                    onCancel={() => setAdding(false)}
+                    onSavingChange={setFormSaving}
+                  />
+                </CardContent>
+              </Card>
+            ) : listing !== null && tasks.length === 0 && listing.unknown.length === 0 ? (
+              // The empty state is drawn in the wide region rather than in the
+              // 320px column: it is three paragraphs and a shell command, and a
+              // command wrapped over four lines is a command nobody can copy.
+              <div className="flex flex-col gap-2 px-6 pt-4">
+                <p className="text-muted-foreground text-sm">{TASKS_PANE_EMPTY_SENTENCE}</p>
+                <code className="w-fit max-w-full overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-foreground text-xs">
+                  {TASKS_PANE_EMPTY_COMMAND}
+                </code>
+                <p className="text-muted-foreground text-sm">{TASKS_PANE_EMPTY_AFTER}</p>
+              </div>
+            ) : (
+              selectedTask !== null && (
+                <TaskDetail
+                  // Keyed by id so choosing another task remounts the region
+                  // rather than reconciling one task's DOM into another's: the
+                  // edit-form focus-return effect and `useId` both belong to the
+                  // task they were mounted for.
+                  key={selectedTask.id}
+                  task={selectedTask}
                   now={now}
-                  refusal={refusals[task.id] ?? null}
-                  running={running[task.id] === true}
-                  deleting={deleting[task.id] === true}
-                  editing={editingId === task.id}
+                  refusal={refusals[selectedTask.id] ?? null}
+                  running={running[selectedTask.id] === true}
+                  deleting={deleting[selectedTask.id] === true}
+                  editing={editingId === selectedTask.id}
                   writing={formSaving}
-                  // All three read the ONE slot, so a row can never be handed
-                  // another row's runs: the id and the runs it belongs to move
-                  // together or not at all.
-                  historyOpen={history?.id === task.id}
-                  historyRuns={history?.id === task.id ? history.runs : null}
-                  historyError={history?.id === task.id ? history.error : null}
+                  // All three read the ONE slot, so the region can never be
+                  // handed another task's runs: the id and the runs it belongs
+                  // to move together or not at all.
+                  historyOpen={history?.id === selectedTask.id}
+                  historyRuns={history?.id === selectedTask.id ? history.runs : null}
+                  historyError={history?.id === selectedTask.id ? history.error : null}
                   onRunNow={(id) => void runNow(id)}
-                  // Opening an edit form closes this row's runs, the mirror of
-                  // `toggleHistory` closing the form: one of the two, never both,
-                  // on one row.
+                  // Opening an edit form closes this task's runs, the mirror of
+                  // `toggleHistory` closing the form: one of the two, never both.
                   onEditToggle={(id) => {
                     setEditingId((open) => (open === id ? null : id));
                     if (historyRef.current?.id === id) {
@@ -1961,59 +2418,11 @@ export function TasksPane() {
                   }}
                   onHistoryToggle={toggleHistory}
                 />
-              ))}
-            </ul>
-          )}
-          {/* These rows carry no Edit and no Forget, now that the readable ones
-              do. They are not `TaskVm`s — `db::list_tasks` could not decode
-              them — so there is nothing to seed a form from, and an upsert built
-              out of a reason string is one `sync_task_save` would refuse. A
-              control that can only fail is worse than no control. */}
-          {listing !== null && listing.unknown.length > 0 && (
-            <>
-              <h2 className="border-border border-t px-6 pt-4 font-heading text-muted-foreground text-sm">
-                {TASKS_UNKNOWN_HEADING}
-              </h2>
-              <ul className="flex flex-col">
-                {listing.unknown.map((row, index) => (
-                  <li
-                    // The index, because the ID is the thing that is not unique
-                    // here (finding 10): `db::list_tasks` emits
-                    // `UnknownTask { id: String::new(), … }` for a row whose `id`
-                    // column will not read, and two of those gave React two
-                    // siblings keyed `""` — a duplicate-key warning, and
-                    // reconciliation free to reuse one row's DOM for the other so
-                    // the two distinct reasons swap or fail to update. This is
-                    // the one list that exists to tolerate malformed rows, and it
-                    // is `ORDER BY id` from the store rather than reorderable by
-                    // the user, so the index is stable across reads.
-                    // biome-ignore lint/suspicious/noArrayIndexKey: see above — the id is not unique
-                    key={`${index}:${row.id}`}
-                    data-testid={TASKS_UNKNOWN_ROW_TESTID}
-                    data-task-id={row.id}
-                    className="flex flex-col gap-1 px-6 py-3"
-                  >
-                    <span className="flex items-center gap-2">
-                      <Badge variant="outline">{TASKS_UNKNOWN_BADGE}</Badge>
-                      <span className="truncate font-medium text-foreground text-sm">
-                        {row.id === "" ? TASKS_UNKNOWN_NO_ID_TEXT : row.id}
-                      </span>
-                    </span>
-                    <span className="text-muted-foreground text-sm">{row.reason}</span>
-                  </li>
-                ))}
-              </ul>
-            </>
-          )}
-          {/* Last in the body and inside the same `ScrollArea`, because it is a
-              second class in ONE view and not a second view: the question it
-              answers — "is that everything keeper does on a clock?" — is only
-              asked once the task list above has been read. Rendered
-              unconditionally, so its own loading line and its own empty sentence
-              are reachable rather than hidden behind the tasks' states. */}
-          <PacedWorkList rows={paced} error={pacedError} />
-        </div>
-      </ScrollArea>
+              )
+            )}
+          </ScrollArea>
+        </section>
+      </div>
 
       {/* Asked before anything is deleted, and the question says what the answer
           costs. Every word of it is the backend's own framing: this deletes a

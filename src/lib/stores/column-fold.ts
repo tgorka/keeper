@@ -44,12 +44,18 @@ export type ColumnFold = Record<SurfaceColumnId, boolean>;
 /**
  * Every column showing, which is what a keeper that has never been folded does.
  *
- * All four default open, unlike the notes rail's Files section: folding a column
+ * All five default open, unlike the notes rail's Files section: folding a column
  * hides a browser the surface exists to offer, and there is no cold directory
  * scan to avoid by starting one of them away.
  */
 export function columnsUnfolded(): ColumnFold {
-  return { "notes-rail": false, "notes-list": false, "files-tree": false, "chat-list": false };
+  return {
+    "notes-rail": false,
+    "notes-list": false,
+    "files-tree": false,
+    "chat-list": false,
+    "tasks-list": false,
+  };
 }
 
 /**

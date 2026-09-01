@@ -340,7 +340,14 @@ export function AppShell() {
                 // record this build has no database for (AD-137).
                 //
                 // No panel strip: a task is not a document, and there is
-                // nothing here to open in an editor.
+                // nothing here to open in an editor. That refusal stands and
+                // Story 59.1 kept it — but it is scope rather than teeth, and it
+                // is narrower than it used to read. It refuses `PanelStrip`,
+                // whose targets are files opened in the editor
+                // (`{ kind: "file", profileId, relativePath }`); it does not
+                // refuse detail. The pane holds its own master column and a
+                // plain sibling detail region inside itself, and nothing it
+                // draws enters `panelsStore`.
                 <TasksPane />
               ) : primaryView === "bridges" ? (
                 <BridgesPane />

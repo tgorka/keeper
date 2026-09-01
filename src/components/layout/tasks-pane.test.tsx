@@ -26,6 +26,7 @@ vi.mock("@/lib/ipc/client", () => ({
 }));
 
 import { LIST_FOLD_MORE_LABEL } from "@/components/layout/list-fold";
+import { COLUMN_COLLAPSE_PREFIX } from "@/components/layout/surface-column";
 import {
   formatTaskAgo,
   formatTaskDue,
@@ -67,17 +68,22 @@ import {
   TASK_RUN_NOW_TEXT,
   TASK_SCHEDULE_LABEL,
   TASK_UNREADABLE_OUTCOME_TEXT,
+  TASKS,
   TASKS_CLOCK_TICK_MS,
   TASKS_DESCRIPTION_TESTID,
+  TASKS_DETAIL_LABEL,
+  TASKS_DETAIL_TESTID,
   TASKS_ERROR_TESTID,
   TASKS_HISTORY_REFUSAL_TESTID,
   TASKS_HISTORY_ROW_TESTID,
   TASKS_HISTORY_TESTID,
+  TASKS_LIST_LABEL,
   TASKS_ORPHAN_REFUSAL_TESTID,
   TASKS_PANE_EMPTY_AFTER,
   TASKS_PANE_EMPTY_COMMAND,
   TASKS_PANE_EMPTY_SENTENCE,
   TASKS_PANE_TITLE,
+  TASKS_RAIL_LIST_LABEL,
   TASKS_REFUSAL_TESTID,
   TASKS_ROW_TESTID,
   TASKS_RUN_NOW_SENTENCE,
@@ -99,6 +105,8 @@ import {
   TASK_FORM_SCHEDULE_LABEL,
   TASK_HOST_WIDE_TEXT,
 } from "@/components/sync/task-form";
+import { SURFACE_COLUMNS } from "@/lib/column-widths";
+import { countLabel } from "@/lib/count-label";
 import type { PacedWorkVm, TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
 import {
   syncPacedWork,
@@ -213,6 +221,26 @@ function answerPaced(rows: PacedWorkVm[]): void {
   vi.mocked(syncPacedWork).mockResolvedValue(rows);
 }
 
+/**
+ * Choose a task in the master list (Story 59.1).
+ *
+ * The `<li>` holds exactly one button — the row itself — because a projected
+ * control on a 320px line is what Story 58.3 already had to undo once. Selecting
+ * costs no IPC, which several tests below assert directly.
+ */
+function selectRow(id: string): void {
+  const row = screen
+    .getAllByTestId(TASKS_ROW_TESTID)
+    .find((candidate) => candidate.dataset.taskId === id);
+  expect(row, `row ${id}`).toBeDefined();
+  fireEvent.click(within(row as HTMLElement).getByRole("button"));
+}
+
+/** A control in the detail region, which draws exactly one task. */
+function detailButton(name: string): HTMLElement {
+  return within(screen.getByTestId(TASKS_DETAIL_TESTID)).getByRole("button", { name });
+}
+
 beforeEach(() => {
   // Every form this pane reveals reads the folder list as it mounts, so a test
   // that opens one needs an answer here or the read never resolves.
@@ -232,7 +260,7 @@ describe("the Tasks pane", () => {
   it("states, per row, the kind, schedule, host, next due, last run, outcome and report", async () => {
     answer(listing());
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     expect(within(row).getByText("sync")).toBeInTheDocument();
     expect(within(row).getByText("01SCHED")).toBeInTheDocument();
@@ -268,7 +296,7 @@ describe("the Tasks pane", () => {
     // and the row must not imply a background service (AD-137).
     answer(listing());
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
     expect(within(row).getByText(SENTENCE_APP)).toBeInTheDocument();
     expect(within(row).getByText("This app")).toBeInTheDocument();
     expect(within(row).queryByText(SENTENCE_DAEMON)).not.toBeInTheDocument();
@@ -281,7 +309,7 @@ describe("the Tasks pane", () => {
       }),
     );
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
     expect(within(row).getByText(SENTENCE_DAEMON)).toBeInTheDocument();
     expect(within(row).getByText("Daemon")).toBeInTheDocument();
   });
@@ -307,7 +335,7 @@ describe("the Tasks pane", () => {
       }),
     );
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
     expect(within(row).getByText("Unhosted")).toBeInTheDocument();
     expect(within(row).getByText(SENTENCE_UNHOSTED)).toBeInTheDocument();
     expect(within(row).getByText(REASON_FOLDER_GONE)).toBeInTheDocument();
@@ -334,7 +362,7 @@ describe("the Tasks pane", () => {
       }),
     );
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
     expect(within(row).getByText("Off")).toBeInTheDocument();
     expect(within(row).queryByText("Unhosted")).not.toBeInTheDocument();
   });
@@ -362,7 +390,7 @@ describe("the Tasks pane", () => {
     answer(listing());
     vi.mocked(syncTaskRunNow).mockResolvedValue(run({ id: 2, startedMs: NOW }));
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT }));
     await waitFor(() => {
@@ -393,7 +421,7 @@ describe("the Tasks pane", () => {
       retriable: false,
     });
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT }));
     const refusal = await screen.findByTestId(TASKS_REFUSAL_TESTID);
@@ -401,7 +429,7 @@ describe("the Tasks pane", () => {
     // The row keeps the state it had: both the last-run and the last-outcome
     // cell still say never run, so nothing on screen reads as though the
     // refusal produced a run.
-    const after = await screen.findByTestId(TASKS_ROW_TESTID);
+    const after = await screen.findByTestId(TASKS_DETAIL_TESTID);
     expect(within(after).getAllByText(TASK_NEVER_RAN_TEXT)).toHaveLength(2);
     expect(within(after).queryByText(TASK_IN_FLIGHT_TEXT)).not.toBeInTheDocument();
     expect(within(after).queryByText("Succeeded")).not.toBeInTheDocument();
@@ -483,7 +511,7 @@ describe("the pane's own formatters", () => {
   it("says a schedule is absent rather than rendering an empty cell", async () => {
     answer(listing({ tasks: [task({ schedule: null, nextDueMs: null })] }));
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
     expect(within(row).getByText(TASK_NO_SCHEDULE_TEXT)).toBeInTheDocument();
     expect(within(row).getByText(TASK_NEVER_DUE_TEXT)).toBeInTheDocument();
   });
@@ -630,34 +658,37 @@ describe("the Tasks pane's live state", () => {
     await waitFor(() => {
       expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2);
     });
-    const buttonFor = (id: string): HTMLElement => {
-      const row = screen
-        .getAllByTestId(TASKS_ROW_TESTID)
-        .find((candidate) => candidate.dataset.taskId === id);
-      expect(row, `row ${id}`).toBeDefined();
-      return within(row as HTMLElement).getByRole("button", { name: TASK_RUN_NOW_TEXT });
+    // Story 59.1 moved Run now into the detail region, so exactly one of these
+    // is ever mounted. That does not weaken the property — it sharpens it. The
+    // defect was a single `string | null` slot that cleared unconditionally, and
+    // a slot is invisible while both buttons are on screen at once but obvious
+    // the moment you come BACK to a row: what this now asserts is that the pane
+    // still remembers A is running after it has drawn B and returned.
+    const runNowFor = (id: string): HTMLElement => {
+      selectRow(id);
+      return detailButton(TASK_RUN_NOW_TEXT);
     };
 
-    fireEvent.click(buttonFor("A"));
+    fireEvent.click(runNowFor("A"));
     await waitFor(() => {
-      expect(buttonFor("A")).toBeDisabled();
+      expect(detailButton(TASK_RUN_NOW_TEXT)).toBeDisabled();
     });
-    fireEvent.click(buttonFor("B"));
+    fireEvent.click(runNowFor("B"));
     await waitFor(() => {
-      expect(buttonFor("B")).toBeDisabled();
+      expect(detailButton(TASK_RUN_NOW_TEXT)).toBeDisabled();
     });
     // THE PROPERTY: starting B must not re-offer A, which is still running.
-    expect(buttonFor("A")).toBeDisabled();
+    expect(runNowFor("A")).toBeDisabled();
 
     settleA();
     await waitFor(() => {
-      expect(buttonFor("A")).toBeEnabled();
+      expect(runNowFor("A")).toBeEnabled();
     });
     // ...and A settling must not re-offer B either.
-    expect(buttonFor("B")).toBeDisabled();
+    expect(runNowFor("B")).toBeDisabled();
     settleB();
     await waitFor(() => {
-      expect(buttonFor("B")).toBeEnabled();
+      expect(runNowFor("B")).toBeEnabled();
     });
   });
 
@@ -694,7 +725,7 @@ describe("the Tasks pane's live state", () => {
     await waitFor(() => {
       expect(syncTasks).toHaveBeenCalledTimes(3);
     });
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
     expect(within(row).queryByText(TASK_NEVER_RAN_TEXT)).not.toBeInTheDocument();
   });
 
@@ -716,7 +747,7 @@ describe("the Tasks pane's live state", () => {
       retriable: true,
     });
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT }));
     const refusal = await screen.findByTestId(TASKS_REFUSAL_TESTID);
@@ -823,7 +854,7 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
   it("reveals a row's edit form seeded from the row already on screen", async () => {
     answer(listing());
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
 
@@ -858,7 +889,7 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
     answer(listing());
     vi.mocked(syncTaskForget).mockResolvedValue(undefined);
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(within(row).getByRole("button", { name: TASK_FORGET_TEXT }));
 
@@ -889,7 +920,7 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
     vi.mocked(syncTasks).mockResolvedValue(listing({ tasks: [], unknown: [] }));
     vi.mocked(syncTaskForget).mockResolvedValue(undefined);
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(within(row).getByRole("button", { name: TASK_FORGET_TEXT }));
     const dialog = await screen.findByRole("alertdialog");
@@ -901,11 +932,11 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
     expect(screen.getByText(TASKS_PANE_EMPTY_SENTENCE)).toBeInTheDocument();
   });
 
-  it("shows a refused Forget on the row it is about, as a refused Run now is", async () => {
+  it("shows a refused Forget on the task it is about, as a refused Run now is", async () => {
     // An `internal` store error, which is what this path can actually emit:
     // `sync_task_forget` runs two unconditional DELETEs and has no
     // does-this-exist branch, so a "no such task" refusal was an invented
-    // failure. Two rows, so `within` is the assertion and not decoration.
+    // failure. Two tasks, so *which one* is the assertion and not decoration.
     answer(listing({ tasks: [task(), task({ id: "01OTHER" })] }));
     vi.mocked(syncTaskForget).mockRejectedValue({
       code: "internal",
@@ -914,29 +945,74 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
       retriable: false,
     });
     render(<TasksPane />);
-    const rows = await screen.findAllByTestId(TASKS_ROW_TESTID);
-    const mine = rows[1];
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+    // The SECOND task, deliberately: the first is the one selection defaults to,
+    // so a refusal drawn on whatever happens to be open would pass anyway.
+    selectRow("01OTHER");
 
-    fireEvent.click(within(mine).getByRole("button", { name: TASK_FORGET_TEXT }));
+    fireEvent.click(detailButton(TASK_FORGET_TEXT));
     fireEvent.click(
       within(await screen.findByRole("alertdialog")).getByRole("button", {
         name: TASK_FORGET_TEXT,
       }),
     );
 
-    // On its own row and on no other: the refusal names which task did not go.
+    // In the region that is about it, and naming it.
+    const region = await screen.findByTestId(TASKS_DETAIL_TESTID);
+    expect(region).toHaveAttribute("data-task-id", "01OTHER");
     await waitFor(() =>
       expect(
-        within(screen.getAllByTestId(TASKS_ROW_TESTID)[1]).getByTestId(TASKS_REFUSAL_TESTID),
+        within(screen.getByTestId(TASKS_DETAIL_TESTID)).getByTestId(TASKS_REFUSAL_TESTID),
       ).toHaveTextContent("database is locked"),
     );
-    expect(
-      within(screen.getAllByTestId(TASKS_ROW_TESTID)[0]).queryByTestId(TASKS_REFUSAL_TESTID),
-    ).not.toBeInTheDocument();
     // And the task is still there, because it was not deleted.
+    expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2);
+
+    // On no other. Choosing the untouched task must not carry the refusal
+    // across — it is keyed by id, and the region is keyed by the task it draws.
+    selectRow("01SCHED");
     expect(
-      within(screen.getAllByTestId(TASKS_ROW_TESTID)[1]).getByText("01OTHER"),
-    ).toBeInTheDocument();
+      within(screen.getByTestId(TASKS_DETAIL_TESTID)).queryByTestId(TASKS_REFUSAL_TESTID),
+    ).not.toBeInTheDocument();
+  });
+
+  it("promotes a refusal to the pane when its task is no longer the one on screen", async () => {
+    // Story 59.1's own hole, and it did not exist before it: `refusals` is keyed
+    // by task id and drawn by the ONE task the detail region holds, so a Run now
+    // answered after the person has moved to another task had nowhere to be
+    // drawn at all. A refused run would then look exactly like a successful one
+    // — the invisible-failure shape this epic exists to close — so anything the
+    // region is not showing is promoted to the pane's own alert.
+    answer(listing({ tasks: [task(), task({ id: "01OTHER" })] }));
+    let refuse = (): void => {};
+    vi.mocked(syncTaskRunNow).mockImplementation(
+      () =>
+        new Promise<TaskRunVm>((_resolve, reject) => {
+          refuse = () =>
+            reject({
+              code: "busy",
+              message: "01OTHER is already running on dev#2",
+              accountId: null,
+              retriable: false,
+            });
+        }),
+    );
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    selectRow("01OTHER");
+    fireEvent.click(detailButton(TASK_RUN_NOW_TEXT));
+    // Move away while the run is still in flight, which is the whole point.
+    selectRow("01SCHED");
+    refuse();
+
+    const orphan = await screen.findByTestId(TASKS_ORPHAN_REFUSAL_TESTID);
+    expect(orphan).toHaveTextContent("01OTHER");
+    expect(orphan).toHaveTextContent("already running on dev#2");
+    // And not silently duplicated onto the task that IS on screen.
+    expect(
+      within(screen.getByTestId(TASKS_DETAIL_TESTID)).queryByTestId(TASKS_REFUSAL_TESTID),
+    ).not.toBeInTheDocument();
   });
 
   it("still reports a refused Forget when the row it belonged to has gone", async () => {
@@ -954,7 +1030,7 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
       retriable: false,
     });
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(within(row).getByRole("button", { name: TASK_FORGET_TEXT }));
     fireEvent.click(
@@ -986,13 +1062,13 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
         }),
     );
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
     fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
     const form = await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
 
     fireEvent.click(within(form).getByRole("button", { name: TASK_FORM_EDIT_SUBMIT_LABEL }));
 
-    const live = screen.getByTestId(TASKS_ROW_TESTID);
+    const live = screen.getByTestId(TASKS_DETAIL_TESTID);
     await waitFor(() =>
       expect(within(live).getByRole("button", { name: TASK_EDIT_TEXT })).toBeDisabled(),
     );
@@ -1016,7 +1092,7 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
     // a disclosure nobody had opened.
     vi.mocked(syncTasks).mockResolvedValueOnce(listing());
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
     fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
     await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
 
@@ -1031,7 +1107,7 @@ describe("the Tasks pane creates, changes and forgets a task", () => {
 
     vi.mocked(syncTasks).mockResolvedValue(listing());
     fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
-    const back = await screen.findByTestId(TASKS_ROW_TESTID);
+    const back = await screen.findByTestId(TASKS_DETAIL_TESTID);
     expect(within(back).getByRole("button", { name: TASK_EDIT_TEXT })).toHaveAttribute(
       "aria-expanded",
       "false",
@@ -1069,7 +1145,7 @@ describe("the row says what the last run reported", () => {
       }),
     );
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     expect(within(row).getByText(TASK_LAST_REPORT_LABEL)).toBeInTheDocument();
     expect(
@@ -1087,7 +1163,7 @@ describe("the row says what the last run reported", () => {
       "0 synced, 0 already syncing, 0 waiting, 1 failed: could not resolve host git.tgorka.dev";
     answer(listing({ tasks: [task({ lastRun: run({ outcome: "failed", detail }) })] }));
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     expect(within(row).getByText(detail)).toBeInTheDocument();
     expect(
@@ -1110,7 +1186,7 @@ describe("the row says what the last run reported", () => {
       }),
     );
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     expect(within(row).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
     expect(within(row).getByText(TASK_IN_FLIGHT_TEXT)).toBeInTheDocument();
@@ -1123,7 +1199,7 @@ describe("the row says what the last run reported", () => {
     // it.
     answer(listing({ tasks: [task({ lastRun: run({ outcome: "abandoned", detail: null }) })] }));
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     expect(within(row).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
     expect(within(row).getByText("Abandoned by the host that started it")).toBeInTheDocument();
@@ -1137,7 +1213,7 @@ describe("the row says what the last run reported", () => {
     // would have been the third copy.
     answer(listing({ tasks: [task({ lastRun: null })] }));
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     expect(within(row).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
     expect(within(row).queryByText(/nothing recorded|no report/i)).not.toBeInTheDocument();
@@ -1160,7 +1236,7 @@ describe("the row says what the last run reported", () => {
       }),
     );
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     expect(within(row).getByText("sublimated")).toBeInTheDocument();
     expect(within(row).getByText("recorded by keeper 0.9.0")).toBeInTheDocument();
@@ -1179,12 +1255,12 @@ describe("the row says what the last run reported", () => {
 
     answer(listing({ tasks: [task({ lastRun: run({ outcome: "abandoned", detail: null }) })] }));
     const silent = render(<TasksPane />);
-    expect(reportCells(await screen.findByTestId(TASKS_ROW_TESTID))).toBe(0);
+    expect(reportCells(await screen.findByTestId(TASKS_DETAIL_TESTID))).toBe(0);
     silent.unmount();
 
     answer(listing({ tasks: [task()] }));
     render(<TasksPane />);
-    expect(reportCells(await screen.findByTestId(TASKS_ROW_TESTID))).toBe(1);
+    expect(reportCells(await screen.findByTestId(TASKS_DETAIL_TESTID))).toBe(1);
   });
 
   it("stays silent for a stored report that is blank rather than absent", async () => {
@@ -1197,7 +1273,7 @@ describe("the row says what the last run reported", () => {
     for (const detail of ["", "   "]) {
       answer(listing({ tasks: [task({ lastRun: run({ detail }) })] }));
       const view = render(<TasksPane />);
-      const row = await screen.findByTestId(TASKS_ROW_TESTID);
+      const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
       expect(within(row).queryByText(TASK_LAST_REPORT_LABEL), detail).not.toBeInTheDocument();
       // And the row still says everything else it said.
       expect(within(row).getByText("Succeeded")).toBeInTheDocument();
@@ -1213,7 +1289,7 @@ describe("the row says what the last run reported", () => {
     // test and a git error goes back to wrapping five lines in a quarter column.
     answer(listing({ tasks: [task({ lastRun: run({ detail: "3 synced" }) })] }));
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     const cell = within(row).getByText(TASK_LAST_REPORT_LABEL).parentElement;
     expect(cell).toHaveClass("col-span-2", "sm:col-span-4");
@@ -1239,11 +1315,15 @@ describe("the row says what the last run reported", () => {
     );
     render(<TasksPane />);
     await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
-    const [loud, silent] = screen.getAllByTestId(TASKS_ROW_TESTID);
+    const reportRegion = (id: string): HTMLElement => {
+      selectRow(id);
+      return screen.getByTestId(TASKS_DETAIL_TESTID);
+    };
 
     expect(
-      within(loud).getByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
+      within(reportRegion("A")).getByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
     ).toBeInTheDocument();
+    const silent = reportRegion("B");
     expect(within(silent).queryByText(TASK_LAST_REPORT_LABEL)).not.toBeInTheDocument();
     expect(
       within(silent).queryByText("3 synced, 0 already syncing, 0 waiting, 0 failed"),
@@ -1262,12 +1342,12 @@ describe("the row says what the last run reported", () => {
       retriable: true,
     });
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT }));
     await screen.findByTestId(TASKS_REFUSAL_TESTID);
 
-    const after = screen.getByTestId(TASKS_ROW_TESTID);
+    const after = screen.getByTestId(TASKS_DETAIL_TESTID);
     expect(within(after).getByText("3 synced, 0 waiting")).toBeInTheDocument();
   });
 });
@@ -1419,7 +1499,7 @@ describe("a task's runs open on the row, and are read only when asked for", () =
     }
   });
 
-  it("closes the first section when a second row is opened, and reads once for it", async () => {
+  it("closes the first section when another task is chosen, and reads once for it", async () => {
     answer(listing({ tasks: [task({ id: "01SCHED" }), task({ id: "01OTHER" })] }));
     vi.mocked(syncTaskHistory).mockImplementation(async (id) => [
       run({ id: 1, detail: `${id}'s own run` }),
@@ -1430,11 +1510,20 @@ describe("a task's runs open on the row, and are read only when asked for", () =
     fireEvent.click(disclosure("01SCHED"));
     expect(await screen.findByText("01SCHED's own run")).toBeInTheDocument();
 
+    // Story 59.1 turned "open another row's section" into "choose another
+    // task", and the rule it is testing survived the move intact — in fact the
+    // structure now enforces half of it, since only one task is drawn at all.
+    // What is still worth asserting is that choosing does NOT read: the section
+    // closes, and the second read happens only when Runs is pressed again.
+    selectRow("01OTHER");
+    expect(screen.queryByTestId(TASKS_HISTORY_TESTID)).not.toBeInTheDocument();
+    expect(syncTaskHistory).toHaveBeenCalledTimes(1);
+
     fireEvent.click(disclosure("01OTHER"));
     expect(await screen.findByText("01OTHER's own run")).toBeInTheDocument();
 
     // One section open at a time, `editingId`'s rule: the first is gone rather
-    // than scrolled apart from the row it belongs to.
+    // than scrolled apart from the task it belongs to.
     expect(screen.queryByText("01SCHED's own run")).not.toBeInTheDocument();
     expect(screen.getAllByTestId(TASKS_HISTORY_TESTID)).toHaveLength(1);
     expect(syncTaskHistory).toHaveBeenCalledTimes(2);
@@ -1460,6 +1549,7 @@ describe("a task's runs open on the row, and are read only when asked for", () =
     fireEvent.click(disclosure("01SCHED"));
     expect(await screen.findByText(TASK_HISTORY_LOADING_TEXT)).toBeInTheDocument();
 
+    selectRow("01OTHER");
     fireEvent.click(disclosure("01OTHER"));
     expect(await screen.findByText("01OTHER's own run")).toBeInTheDocument();
 
@@ -1837,7 +1927,7 @@ describe("a task's runs open on the row, and are read only when asked for", () =
     answer(listing({ tasks: [task({ id: "01SCHED" })] }));
     vi.mocked(syncTaskHistory).mockResolvedValue(runs(1));
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(disclosure("01SCHED"));
     await screen.findByTestId(TASKS_HISTORY_TESTID);
@@ -1860,7 +1950,7 @@ describe("a task's runs open on the row, and are read only when asked for", () =
     answer(listing({ tasks: [task({ id: "01SCHED" })] }));
     vi.mocked(syncTaskSave).mockImplementation(() => new Promise<TaskVm>(() => {}));
     render(<TasksPane />);
-    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+    const row = await screen.findByTestId(TASKS_DETAIL_TESTID);
 
     fireEvent.click(within(row).getByRole("button", { name: TASK_EDIT_TEXT }));
     const form = await screen.findByRole("form", { name: `${TASK_FORM_EDIT_TITLE}: 01SCHED` });
@@ -2013,6 +2103,66 @@ describe("the pane also lists what this host paces, and says it is not a task", 
     expect(within(row).getByText(/watcher sees settle still brings a look forward/)).toBeVisible();
   });
 
+  // The half of the 58.8 contract this pane CAN hold on its own, and the reason
+  // it is worth holding twice.
+  //
+  // `keeper_core::tasks::paced_work` pairs `cadence` with `standing` and asserts
+  // it — with a `debug_assert!`, which is compiled out of the build a person
+  // runs. So the invariant is proven in `cargo test` and unenforced in the app.
+  // This feeds the pane the contradiction that assert would have caught and
+  // requires the pane to refuse it: a row that has stood its backstop down must
+  // not go on advertising the interval that no longer fires, whatever arrives on
+  // the wire.
+  //
+  // Reachable in exactly the way that matters. #303 added a SECOND gate over
+  // walking a folder — `poll_may_walk` / `POLL_WALK_MIN_INTERVAL` — after both
+  // 58.7 and 58.8 shipped, so this projection is now describing a world with two
+  // gates while it was written against one. `sync_poll_permits` stands the paced
+  // scan down and deliberately leaves the Pending poll's walk alone; the day
+  // somebody widens or reverts that decision, the adapter can start sending a
+  // cadence with a governed standing, and this is where the screen refuses to
+  // print it.
+  it("prints no cadence for a stood-down row even when one arrives on the wire", async () => {
+    answer(listing());
+    answerPaced([
+      pacedRow({
+        standing: "governed",
+        // The contradiction: a cadence beside a standing that says nothing is
+        // pacing this folder. Rust will not build one; the wire could.
+        cadence: "about every 15 seconds",
+        sentence: PACED_SENTENCE_GOVERNED,
+      }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).queryByText("about every 15 seconds")).toBeNull();
+    expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
+    // And it still says WHY, in Rust's words, so the empty cell is explained
+    // rather than merely blank.
+    expect(within(row).getByText(PACED_SENTENCE_GOVERNED)).toBeInTheDocument();
+  });
+
+  it("prints no cadence for a paused folder even when one arrives on the wire", async () => {
+    // The same refusal for the standing a person meets far more often. *Paused,
+    // about every 15 seconds* is the exact phrase Story 58.7's review found on
+    // screen once already — it is what made the badge carry the standing — and
+    // it must be unrenderable rather than merely unsent.
+    answer(listing());
+    answerPaced([
+      pacedRow({
+        standing: "paused",
+        cadence: "about every 15 seconds",
+        sentence: PACED_SENTENCE_PAUSED,
+      }),
+    ]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(PACED_ROW_TESTID);
+
+    expect(within(row).queryByText("about every 15 seconds")).toBeNull();
+    expect(within(row).getByText(PACED_NO_CADENCE_TEXT)).toBeInTheDocument();
+  });
+
   // The over-claim this row's registration fact exists to prevent: a folder can
   // hold a vault keeper has nothing registered to pace, and the cadence cell
   // must not recite an interval nobody is keeping.
@@ -2085,7 +2235,7 @@ describe("the pane also lists what this host paces, and says it is not a task", 
     expect(screen.queryByText(PACED_EMPTY_TEXT)).toBeNull();
     expect(screen.queryByText(PACED_LOADING_TEXT)).toBeNull();
     // And the task list is untouched.
-    const row = screen.getByTestId(TASKS_ROW_TESTID);
+    const row = screen.getByTestId(TASKS_DETAIL_TESTID);
     expect(within(row).getByText("01SCHED")).toBeInTheDocument();
     expect(within(row).getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeInTheDocument();
     expect(screen.queryByTestId(TASKS_ERROR_TESTID)).toBeNull();
@@ -2199,19 +2349,28 @@ describe("the row says enough to act on", () => {
       }),
     );
     render(<TasksPane />);
-    await screen.findAllByTestId(TASKS_ROW_TESTID);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(3));
 
-    const rows = screen.getAllByTestId(TASKS_ROW_TESTID);
-    expect(within(rows[0]).getByTestId(TASKS_DESCRIPTION_TESTID)).toHaveTextContent(
-      "the photos, nightly",
-    );
+    // Story 59.1 re-sited the description under the name in the detail region —
+    // it is a sentence about the task rather than a scannable cell, and a 320px
+    // line cannot hold one. Each task is therefore chosen in turn, which is also
+    // what makes this three assertions about three tasks rather than three reads
+    // of whatever happened to be open.
+    const descriptionOf = (id: string): HTMLElement | null => {
+      selectRow(id);
+      return within(screen.getByTestId(TASKS_DETAIL_TESTID)).queryByTestId(
+        TASKS_DESCRIPTION_TESTID,
+      );
+    };
+
+    expect(descriptionOf("01NAMED")).toHaveTextContent("the photos, nightly");
     // Asserted on the ELEMENT, not on its text. A text query cannot tell a
     // paragraph that was never rendered from one rendered around three spaces,
     // and that is the whole distinction here: mutating `taskDescriptionText` to
     // return its argument unchanged left a text-based version of this test
     // green, which made it a test that could not fail.
-    expect(within(rows[1]).queryByTestId(TASKS_DESCRIPTION_TESTID)).toBeNull();
-    expect(within(rows[2]).queryByTestId(TASKS_DESCRIPTION_TESTID)).toBeNull();
+    expect(descriptionOf("01BLANK")).toBeNull();
+    expect(descriptionOf("01NONE")).toBeNull();
   });
 });
 
@@ -2269,5 +2428,238 @@ describe("the runs control reads as a control", () => {
     await screen.findByTestId(TASKS_HISTORY_TESTID);
 
     expect(screen.queryByText(TASK_HISTORY_BOUND_TEXT)).toBeNull();
+  });
+});
+
+describe("a list of names, and one task at a time", () => {
+  it("gives each name one line and no controls at all", async () => {
+    // The owner's complaint, made mechanical. Before Story 59.1 the row WAS the
+    // detail — ten stacked blocks and three buttons each — so reaching the
+    // eighth task's runs meant scrolling past seven cards. A control that
+    // reappears here is the regression, and it is asserted as an absence
+    // because that is the only shape that fails when somebody adds one back.
+    answer(listing({ tasks: [task({ id: "A" }), task({ id: "B" }), task({ id: "C" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(3));
+
+    for (const row of screen.getAllByTestId(TASKS_ROW_TESTID)) {
+      // Exactly one button: the row itself. Not Run now, not Edit, not Forget,
+      // not Runs.
+      expect(within(row).getAllByRole("button")).toHaveLength(1);
+      for (const name of [
+        TASK_RUN_NOW_TEXT,
+        TASK_EDIT_TEXT,
+        TASK_FORGET_TEXT,
+        `${TASK_HISTORY_TITLE}: ${row.dataset.taskId}`,
+      ]) {
+        expect(within(row).queryByRole("button", { name })).toBeNull();
+      }
+      // And none of the detail's own cells, which is what made the row tall.
+      for (const label of [TASK_SCHEDULE_LABEL, TASK_LAST_RUN_LABEL, TASK_HOST_LABEL]) {
+        expect(within(row).queryByText(label)).toBeNull();
+      }
+      expect(within(row).queryByText(SENTENCE_APP)).toBeNull();
+    }
+  });
+
+  it("still says the four facts a name has to carry", async () => {
+    // Re-siting, not deletion: the epic's list is kind, name, host and next due,
+    // and Story 59.3's acceptance adds the mode — a fact that quietly moved into
+    // the detail would un-ship that story.
+    // Against the real clock and not `NOW`: this pane measures every relative
+    // time from `Date.now()`, and the fixture epoch is nearly a year behind it —
+    // so a `NOW`-relative instant renders as "due now" and would assert nothing
+    // about the next-due cell at all.
+    answer(listing({ tasks: [task({ id: "01SCHED", nextDueMs: Date.now() + 90_000 })] }));
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    expect(within(row).getByText("sync")).toBeInTheDocument();
+    expect(within(row).getByText("scheduled")).toBeInTheDocument();
+    expect(within(row).getByText("01SCHED")).toBeInTheDocument();
+    expect(within(row).getByText("This app")).toBeInTheDocument();
+    expect(within(row).getByText("in 1 min")).toBeInTheDocument();
+  });
+
+  it("opens on the first task rather than on an empty region", async () => {
+    // A detail region that started blank over a list with rows would be a second
+    // empty state competing with the real one — and defaulting costs no read,
+    // because every field it draws is already on the `TaskVm` the listing
+    // carries. That last clause is the one that matters, and the next test is
+    // the one that holds it.
+    answer(listing({ tasks: [task({ id: "01FIRST" }), task({ id: "01SECOND" })] }));
+    render(<TasksPane />);
+
+    const region = await screen.findByTestId(TASKS_DETAIL_TESTID);
+    expect(region).toHaveAttribute("data-task-id", "01FIRST");
+    expect(within(region).getByRole("button", { name: TASK_RUN_NOW_TEXT })).toBeInTheDocument();
+    // Three regions sit inside this surface and a reader jumping between
+    // landmarks has to be able to tell them apart: the pane, the column of
+    // names, and this. All three are named, and named differently.
+    expect(screen.getByRole("region", { name: TASKS_DETAIL_LABEL })).toContainElement(region);
+    expect(
+      screen.getByRole("region", { name: SURFACE_COLUMNS["tasks-list"].title }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: TASKS_PANE_TITLE })).toBeInTheDocument();
+  });
+
+  it("marks exactly one name as current, and moves the mark rather than adding one", async () => {
+    answer(listing({ tasks: [task({ id: "01FIRST" }), task({ id: "01SECOND" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    const current = (): string[] =>
+      screen
+        .getAllByTestId(TASKS_ROW_TESTID)
+        .filter((row) => within(row).getByRole("button").getAttribute("aria-current") === "true")
+        .map((row) => row.dataset.taskId ?? "");
+
+    expect(current()).toEqual(["01FIRST"]);
+    selectRow("01SECOND");
+    // One, and the other one — not two. Story 59.4 refuses a selection SET, and
+    // the refusal is only true while this stays a single mark.
+    expect(current()).toEqual(["01SECOND"]);
+  });
+
+  it("reads nothing at all when a task is chosen", async () => {
+    // `spec-58-3:40`'s Never clause is AD-62's anti-poll invariant and it has
+    // teeth. A master/detail satisfies it BETTER than the old per-row disclosure
+    // — exactly one task is drawn by construction — but only while choosing
+    // stays inert. The moment selection triggers a read, twenty tasks is twenty
+    // reads for a person arrowing through the list.
+    answer(listing({ tasks: [task({ id: "A" }), task({ id: "B" }), task({ id: "C" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(3));
+    expect(syncTasks).toHaveBeenCalledTimes(1);
+    expect(syncPacedWork).toHaveBeenCalledTimes(1);
+
+    selectRow("B");
+    selectRow("C");
+    selectRow("A");
+
+    expect(syncTasks).toHaveBeenCalledTimes(1);
+    expect(syncPacedWork).toHaveBeenCalledTimes(1);
+    expect(syncTaskHistory).not.toHaveBeenCalled();
+  });
+
+  it("moves the selection with the arrow keys, and stops at both ends", async () => {
+    answer(listing({ tasks: [task({ id: "A" }), task({ id: "B" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+    const list = screen.getByRole("list", { name: TASKS_LIST_LABEL });
+    const shown = (): string | undefined => screen.getByTestId(TASKS_DETAIL_TESTID).dataset.taskId;
+
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    expect(shown()).toBe("B");
+    // Clamped rather than wrapping: a list whose Down at the bottom silently
+    // returns to the top is a list that has lost the reader's place.
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    expect(shown()).toBe("B");
+    fireEvent.keyDown(list, { key: "ArrowUp" });
+    expect(shown()).toBe("A");
+    fireEvent.keyDown(list, { key: "ArrowUp" });
+    expect(shown()).toBe("A");
+    fireEvent.keyDown(list, { key: "End" });
+    expect(shown()).toBe("B");
+    fireEvent.keyDown(list, { key: "Home" });
+    expect(shown()).toBe("A");
+  });
+
+  it("leaves a chord to the global shortcuts", async () => {
+    // A pane that swallows ⌘↓ breaks a shortcut it knows nothing about.
+    answer(listing({ tasks: [task({ id: "A" }), task({ id: "B" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    fireEvent.keyDown(screen.getByRole("list", { name: TASKS_LIST_LABEL }), {
+      key: "ArrowDown",
+      metaKey: true,
+    });
+    expect(screen.getByTestId(TASKS_DETAIL_TESTID).dataset.taskId).toBe("A");
+  });
+
+  it("moves off a task the record no longer holds", async () => {
+    // The same pruning rule the edit form and the open runs section already
+    // follow: a region cannot describe a row the listing has dropped, and the
+    // likeliest way that happens is the other host on this shared record.
+    vi.mocked(syncTasks)
+      .mockResolvedValueOnce(listing({ tasks: [task({ id: "A" }), task({ id: "B" })] }))
+      .mockResolvedValue(listing({ tasks: [task({ id: "A" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+    selectRow("B");
+    expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "B");
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "A"),
+    );
+  });
+
+  it("draws no detail region at all when nothing readable is listed", async () => {
+    // Two shapes at once, and they are different facts: an empty record, and a
+    // record whose only rows this build cannot decode. Neither may leave a
+    // region describing a task, and the unknown rows keep their own section.
+    answer(listing({ tasks: [], unknown: [{ id: "01TELEPORT", reason: "invalid kind" }] }));
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_UNKNOWN_ROW_TESTID);
+
+    expect(screen.queryByTestId(TASKS_DETAIL_TESTID)).toBeNull();
+    expect(screen.getByText(TASKS_UNKNOWN_HEADING)).toBeInTheDocument();
+  });
+
+  it("offers no way to choose a row this build cannot read", async () => {
+    // There is no `TaskVm` behind it, so there is nothing to draw a detail from.
+    // A row that selects into an empty region is the same defect as a control
+    // that can only fail.
+    answer(
+      listing({
+        tasks: [task({ id: "A" })],
+        unknown: [{ id: "01TELEPORT", reason: "invalid kind 'teleport'" }],
+      }),
+    );
+    render(<TasksPane />);
+    const unknown = await screen.findByTestId(TASKS_UNKNOWN_ROW_TESTID);
+
+    expect(within(unknown).queryAllByRole("button")).toHaveLength(0);
+    expect(within(unknown).queryByRole("button")).toBeNull();
+    expect(unknown.querySelector("[aria-current]")).toBeNull();
+  });
+
+  it("says how many names it is hiding, and offers no second Refresh", async () => {
+    // The correction this rail needed. The Files tree's strip carries Refresh
+    // because folding that column takes its header with it; this pane's header
+    // sits above BOTH columns, so a Refresh on the strip would have been a
+    // second control with the same accessible name as the one still on screen —
+    // undistinguishable to anyone navigating by name. What the fold really
+    // takes is the names, so that is what the strip answers for.
+    answer(listing({ tasks: [task({ id: "A" }), task({ id: "B" })] }));
+    render(<TasksPane />);
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["tasks-list"].label}`,
+      }),
+    );
+
+    expect(screen.queryByTestId(TASKS_ROW_TESTID)).toBeNull();
+    // Exactly one of each, still: the header's, not a copy on the strip.
+    expect(screen.getAllByRole("button", { name: TASK_REFRESH_TEXT })).toHaveLength(1);
+    expect(screen.getAllByRole("button", { name: TASK_FORM_ADD_TITLE })).toHaveLength(1);
+    // And the strip says what is behind it, from the listing rather than from
+    // the rows it just unmounted — `count-label.ts`'s enforcement.
+    // On the control's accessible NAME, which is where `SurfaceRailControl`
+    // puts `detail` — a badge alone reaches a screen reader not at all, and the
+    // digits in the corner are `aria-hidden` for exactly that reason.
+    expect(
+      screen.getByRole("button", {
+        name: `${TASKS_RAIL_LIST_LABEL}, ${countLabel(2, TASKS)}`,
+      }),
+    ).toBeInTheDocument();
+    // The detail region does NOT fold with the list: a person who put the names
+    // away to read one task must still be reading that task.
+    expect(screen.getByTestId(TASKS_DETAIL_TESTID)).toHaveAttribute("data-task-id", "A");
   });
 });
