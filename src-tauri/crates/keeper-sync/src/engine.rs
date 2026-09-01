@@ -11369,6 +11369,40 @@ impl Engine {
     /// because it is the reason the file is not moving. Saying "modified"
     /// about a file the engine is deliberately holding would make the user
     /// think sync was broken.
+    /// Is a full status walk worth starting for a Pending poll of this folder?
+    ///
+    /// The claim below stops two walks of one folder running at once; this
+    /// stops the poll starting a walk that cannot tell it anything. Two shapes
+    /// answer no, and both were measured on the owner's machine:
+    ///
+    /// * **A paused folder.** `profile.enabled` is the folder's pause switch,
+    ///   and nothing about a paused folder is going to be committed. Paying a
+    ///   full-tree walk for it every five seconds is the poll spending the
+    ///   folder's whole cost for a list nobody is going to act on.
+    /// * **A folder whose first copy never finished.** `HEAD` holds a tree and
+    ///   the index holds nothing, so the walk diffs that whole tree against
+    ///   nothing and emits one deletion per tracked path — a conclusion two
+    ///   integers already state. [`Self::collect_stable_changes`] has refused
+    ///   this since Story 56.15 and gives the arithmetic; the poll was the leg
+    ///   that leg's fix did not reach.
+    ///
+    /// Both were true of `tgdrive-light` at once, and the result is what a
+    /// five-second poll does with a walk that can never converge: passes of
+    /// **310 898 emitted items** — 155 625 tree paths read as deleted plus
+    /// every worktree file read as untracked — one every ten to seventeen
+    /// seconds, for as long as the folder stayed in that state. It outlived the
+    /// pause by hours, because this is the one leg that never asked.
+    ///
+    /// Losing the walk costs the poll only its untracked rows, exactly as
+    /// losing the claim does — the settling rows and the repair backlog are
+    /// assembled before this is asked.
+    ///
+    /// Free in the healthy case: a bool, then one `exists()` and a 12-byte
+    /// read of the index header (see [`Self::first_checkout_is_unfinished`]).
+    fn poll_may_walk(&self, profile: &SyncProfile) -> bool {
+        profile.enabled && !self.first_checkout_is_unfinished(profile)
+    }
+
     pub async fn pending(&self, profile_id: &str) -> Result<Vec<PendingFile>> {
         let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
             return Err(SyncError::Config(format!(
@@ -11537,7 +11571,7 @@ impl Engine {
         // the untracked rows; the settling rows and the repair backlog above
         // are already assembled, and the walk that does hold the claim is
         // computing the same verdicts for the commit path anyway.
-        let walk_claim = (is_repository && repair.is_empty())
+        let walk_claim = (is_repository && repair.is_empty() && self.poll_may_walk(&profile))
             .then(|| self.claim_walk(profile_id))
             .flatten();
         if walk_claim.is_some() {
@@ -17226,6 +17260,94 @@ mod tests {
                 .iter()
                 .any(|row| row.path == "fresh.txt" && row.reason == PendingReason::Untracked),
             "an untracked path is only discoverable by walking: {pending:?}"
+        );
+    }
+
+    /// A paused folder is not walked by the poll either.
+    ///
+    /// `enabled` is the folder's pause switch, and nothing about a paused
+    /// folder is going to be committed — so a full-tree walk every five
+    /// seconds buys a list nobody can act on. The fixture is deliberately the
+    /// one from `a_pending_poll_with_no_backlog_still_walks`, which walks:
+    /// the pause is the only difference between them.
+    #[tokio::test]
+    async fn a_pending_poll_does_not_walk_a_paused_folder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let mut p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        std::fs::write(p.local_path.join("fresh.txt"), b"new").expect("write");
+
+        p.enabled = false;
+        engine.upsert_profile(&p).expect("pause");
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+        engine.pending(&p.id).await.expect("pending");
+
+        let phases: Vec<SyncPhase> = Engine::lock(&published)
+            .iter()
+            .map(|event| event.phase)
+            .collect();
+        assert!(
+            !phases.contains(&SyncPhase::Scanning),
+            "a paused folder must not be walked by a five-second poll: {phases:?}"
+        );
+    }
+
+    /// Nor is a folder whose first copy never finished.
+    ///
+    /// `HEAD` holds a tree and the index holds nothing, so the walk diffs that
+    /// whole tree against nothing and calls every tracked path deleted — which
+    /// two integers already said. `collect_stable_changes` has refused this
+    /// since Story 56.15; the poll is the leg that fix did not reach, and on
+    /// the owner's `tgdrive-light` it kept 310 898-item passes running every
+    /// ten to seventeen seconds — hours after the folder had been paused, and
+    /// with the repair blocked so the state could not clear itself.
+    #[tokio::test]
+    async fn a_pending_poll_does_not_walk_a_folder_whose_first_copy_never_finished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        std::fs::write(p.local_path.join("fresh.txt"), b"new").expect("write");
+
+        // The state itself: commits, a worktree, and no index.
+        std::fs::remove_file(p.local_path.join(".git/index")).expect("drop the index");
+
+        let published: Arc<Mutex<Vec<SyncProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&published);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&sink).push(event);
+            true
+        }));
+        // It still answers — the poll is not an error path — it just answers
+        // from what it already holds.
+        engine.pending(&p.id).await.expect("pending");
+
+        let phases: Vec<SyncPhase> = Engine::lock(&published)
+            .iter()
+            .map(|event| event.phase)
+            .collect();
+        assert!(
+            !phases.contains(&SyncPhase::Scanning),
+            "a walk here can only report every tracked path as deleted: {phases:?}"
         );
     }
 
