@@ -4,6 +4,7 @@ type: 'feature'
 created: '2026-09-01'
 status: 'done'
 baseline_revision: 'd3cb68a'
+final_revision: 'ecc991b'
 warnings: ['oversized']
 review_loop_iteration: 0
 followup_review_recommended: true
