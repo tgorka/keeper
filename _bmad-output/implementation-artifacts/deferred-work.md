@@ -4824,7 +4824,7 @@ status: open
 
 
 - source_spec: spec-56-14-the-surface-side-deferred-sweep
-  summary: CI's own runners flake roughly one test per run, in a different file each time, and three separate names have now been observed failing on branches that do not touch them.
+  summary: CI's own runners flake roughly one test per run, in a different file each time, and FOUR separate names have now been observed failing on branches that do not touch them.
   evidence: |
     On the epic-56 follow-up stack: `files-pane.test.tsx > re-reads a remembered
     folder once when Refresh rescues a failed first list` failed on #285, whose
@@ -4840,6 +4840,19 @@ status: open
     the right fix is a decision about the runner size or about how a
     machine-scaled budget absorbs a noisy neighbour - not a retry around the
     assertions.
+
+    Fourth observation, epic 59 / #301 (2026-09-01):
+    `keeper-core/tests/archive_search_perf.rs::search_p95_under_200ms_at_120k_events`
+    failed at `p95 239.23ms` against its own scaled budget of `229.05ms` — over
+    by **4%** — and passed on an immediate rerun of the same commit. The diff
+    touches exactly one file in that crate, `keeper-core/src/tasks.rs`, which
+    contains no occurrence of `archive` or `search`; `main` was green on the same
+    test at the same time. Note what the failure line itself says: the harness
+    measured `scan 36.65ms vs reference 32ms => 1.15x` and scaled the budget
+    accordingly, so the scaling DID observe the slow machine and still
+    under-predicted it. That is the useful datum for whoever fixes this: the
+    defect is not a missing scale factor, it is that a single scan sample taken
+    before the measurement cannot predict contention DURING it.
   status: open
   keep: |
     Becomes worth doing when a flake blocks a merge train rather than costing one
