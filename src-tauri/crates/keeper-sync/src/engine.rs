@@ -8369,6 +8369,86 @@ impl Engine {
         Ok(())
     }
 
+    /// Take several tasks in or out of service in one call, per id.
+    ///
+    /// [`db::set_tasks_enabled`] carries the transaction-scope decision and the
+    /// receipt's rule — N ids in, N entries out, in request order. Two things
+    /// belong here rather than there.
+    ///
+    /// **One clock reading for the whole batch.** Every row written by this call
+    /// carries the same `updated_ms`, so a bulk disable of five rows is one
+    /// instant in the store rather than five, and a caller re-reading them
+    /// cannot see them as having been written at different times.
+    ///
+    /// **One [`Self::with_db`] hold for the whole batch**, which is what makes
+    /// the per-id transactions safe to reason about: nothing else host-local
+    /// writes between them, because the single connection sits behind that
+    /// mutex.
+    ///
+    /// # The fault bookkeeping is keyed on each id's own outcome
+    ///
+    /// Exactly [`Self::save_task`]'s policy, per entry, and deliberately not
+    /// unified with [`Self::forget_task`]'s: the fault is cleared for a
+    /// [`db::TaskSave::Created`] or [`db::TaskSave::Rearmed`] id and for nothing
+    /// else. An idle re-save is [`db::TaskSave::Updated`] and is **not** a task
+    /// coming back into service, so it must not re-arm the alarm and let an hour
+    /// of failures notify once per save. A `Refused` id was not written at all,
+    /// so clearing its fault would silently discard a live one.
+    ///
+    /// It runs **after** the database work and outside the closure: the two locks
+    /// are then never held at once, and there is nothing to order them by.
+    pub fn set_tasks_enabled(
+        &self,
+        ids: &[db::TaskBatchId],
+        enabled: bool,
+    ) -> Result<Vec<db::TaskBatchEntry>> {
+        let now_ms = self.platform.now_ms();
+        let entries = self.with_db(|conn| db::set_tasks_enabled(conn, ids, enabled, now_ms))?;
+        {
+            let mut faults = Self::lock(&self.task_faults);
+            for entry in &entries {
+                if matches!(
+                    entry.outcome,
+                    db::TaskBatchOutcome::Saved(db::TaskSave::Created | db::TaskSave::Rearmed)
+                ) {
+                    faults.remove(&entry.id);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Forget several tasks and everything they recorded, per id.
+    ///
+    /// [`db::forget_tasks`] carries the receipt's rule and refuses a row this
+    /// build cannot read rather than deleting it (AD-48). One
+    /// [`Self::with_db`] hold for the whole batch, and the fault bookkeeping
+    /// after it, outside the closure.
+    ///
+    /// The clear is [`Self::forget_task`]'s, preserved exactly: it fires for a
+    /// `Forgotten` id **and** for a `Missing` one, which is what
+    /// `forget_task`'s unconditional clear did — that door could not tell "gone
+    /// now" from "was never here" and cleared either way, and the reason it
+    /// clears at all is that re-creating the same id afterwards is the
+    /// documented edit-rather-than-duplicate path. A `Refused` id keeps its
+    /// fault: its row is still there, still on a schedule, and still able to
+    /// fail.
+    pub fn forget_tasks(&self, ids: &[String]) -> Result<Vec<db::TaskBatchEntry>> {
+        let entries = self.with_db(|conn| db::forget_tasks(conn, ids))?;
+        {
+            let mut faults = Self::lock(&self.task_faults);
+            for entry in &entries {
+                if matches!(
+                    entry.outcome,
+                    db::TaskBatchOutcome::Forgotten | db::TaskBatchOutcome::Missing
+                ) {
+                    faults.remove(&entry.id);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     /// Every stored task, with the rows this build cannot read listed beside
     /// them rather than dropped (NFR-43).
     pub fn tasks(&self) -> Result<db::TaskListing> {
@@ -15105,6 +15185,99 @@ mod tests {
             toasts(),
             4,
             "a save that changed nothing is not a task coming back into service"
+        );
+    }
+
+    /// The batch keys the fault clear on **each id's own outcome** (Story 59.4),
+    /// and therefore does exactly what [`Engine::save_task`] does per id rather
+    /// than unifying the two policies into "a batch happened".
+    ///
+    /// Both legs of the mirror above, in **one call**: the id that was disabled
+    /// comes back into service and its next failure is heard again, and the id
+    /// that was already live is an idle re-save whose next failure stays silent.
+    /// A batch that cleared every id it touched would notify twice here, which is
+    /// the once-per-save alarm `:15179` exists to forbid — and a batch that
+    /// cleared none would leave the returning task silent for the life of the
+    /// process, which is the bug the state itself introduced.
+    ///
+    /// Asserted through `notifications_posted`, exactly as `:15128` does: the
+    /// notification is the only surface the fault set is observable on, and the
+    /// per-id `TaskSave` in the receipt is asserted beside it so a passing count
+    /// cannot be a coincidence of two wrong effects.
+    #[test]
+    fn a_batch_clears_the_fault_only_for_the_ids_that_came_back_into_service() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let returning = task("01BACK", None, "every 5m");
+        let live = task("01LIVE", None, "every 5m");
+        let reason = "the remote could not be reached";
+        let toasts = || {
+            notifications_posted(&platform)
+                .into_iter()
+                .filter(|(title, _)| title.starts_with("Task — "))
+                .count()
+        };
+
+        // Both broken, so both hold a fault and both have already been heard.
+        for row in [&returning, &live] {
+            engine.save_task(row, None).expect("save");
+            engine.note_task_outcome(row, tasks::TaskOutcome::Failed, reason);
+        }
+        assert_eq!(toasts(), 2, "each task's first failure is its own onset");
+
+        // One goes out of service; the other stays live. Taking a task out is an
+        // `Updated`, so neither fault is cleared getting here.
+        let mut parked = returning.clone();
+        parked.enabled = false;
+        engine.save_task(&parked, None).expect("disable");
+        assert_eq!(toasts(), 2, "disabling a task notifies nobody");
+
+        // ONE batched enable over both ids.
+        let receipt = engine
+            .set_tasks_enabled(
+                &[
+                    db::TaskBatchId {
+                        id: "01BACK".to_owned(),
+                        baseline_updated_ms: None,
+                    },
+                    db::TaskBatchId {
+                        id: "01LIVE".to_owned(),
+                        baseline_updated_ms: None,
+                    },
+                ],
+                true,
+            )
+            .expect("the store is fine");
+        assert_eq!(
+            receipt
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.outcome.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("01BACK", db::TaskBatchOutcome::Saved(db::TaskSave::Rearmed)),
+                ("01LIVE", db::TaskBatchOutcome::Saved(db::TaskSave::Updated)),
+            ],
+            "the receipt names each id's own effect, which is what the fault \
+             bookkeeping is keyed on"
+        );
+
+        engine.note_task_outcome(&returning, tasks::TaskOutcome::Failed, reason);
+        assert_eq!(
+            toasts(),
+            3,
+            "the id that came back into service reports its next failure, in a \
+             batch exactly as it does alone"
+        );
+        engine.note_task_outcome(&live, tasks::TaskOutcome::Failed, reason);
+        assert_eq!(
+            toasts(),
+            3,
+            "the id that was already live was an idle re-save, so its ongoing \
+             failure stays one notification — a batch must not re-arm the alarm \
+             for every id it touched"
         );
     }
 

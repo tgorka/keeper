@@ -2027,18 +2027,30 @@ keeper-syncd tasks list                       # every task, its target, schedule
 keeper-syncd tasks status <task>              # one task and its recorded runs, newest first
 keeper-syncd tasks run <task>                 # run one now, and exit with what happened
 keeper-syncd tasks set <task> [flags]         # create one, or change one that exists
-keeper-syncd tasks enable <task>              # put it back in service
-keeper-syncd tasks disable <task>             # take it out of service, forgetting nothing
-keeper-syncd tasks forget <task>              # delete it and its whole run history
+keeper-syncd tasks enable <task>...           # put one or more back in service
+keeper-syncd tasks disable <task>...          # take them out of service, forgetting nothing
+keeper-syncd tasks forget <task>...           # delete them and their whole run history
 ```
 
-`list` is the only one that addresses no task; every other verb acts on exactly
-one row, and a missing selector is told rather than read as "all of them" — for
-`run` and `forget` that would be a fan-out nobody asked for. A selector gets one
-of three answers, and they are three different pieces of advice: a spelling
-keeper could never have stored (leading or trailing whitespace, or empty) is
-quoted back; a well-formed id with no such row lists what *is* stored; and a row
-this build cannot read says so with its reason rather than claiming no match.
+`list` is the only one that addresses no task. `status`, `run` and `set` act on
+exactly one row; `enable`, `disable` and `forget` act on **as many as you name**,
+and every one of them requires at least one — a missing selector is told rather
+than read as "all of them", which for `run` and `forget` would be a fan-out
+nobody asked for. A selector gets one of three answers, and they are three
+different pieces of advice: a spelling keeper could never have stored (leading
+or trailing whitespace, or empty) is quoted back; a well-formed id with no such
+row lists what *is* stored; and a row this build cannot read says so with its
+reason rather than claiming no match.
+
+**In a batch every id answers for itself.** Each one gets its own line and its
+own transaction, so a row another host rewrote while you were looking at the
+listing is refused on its own and the ids beside it are still written. That is
+`upsert_task`'s promise held per id — a refused write changes nothing, *that
+row* — rather than an all-or-nothing batch that would also un-change the four
+that worked. An id no row answers to is reported as such rather than as a
+refusal: a refusal is something to act on, and a row another host forgot usually
+is not. The exit code is `2` when any id did not go through, and `0` when they
+all did.
 
 `tasks set` takes six flags:
 
@@ -2164,11 +2176,36 @@ The other envelopes: `tasks status` emits `{ "task": …, "runs": [...] }`;
 `tasks run` emits `{ "task", "run", "outcome", "exit" }`, where `run` is `null`
 when a lease held elsewhere meant no run of ours was ever opened, and `exit`
 repeats the process status so a caller that captured stdout need not consult two
-channels; `tasks set`, `tasks enable` and `tasks disable` all emit
-`{ "task": … }` — the row **read back from the store**, never the row that was
-submitted; and `tasks forget` emits `{ "forgot": "<id>" }` and nothing else,
-because echoing the fields of something that no longer exists would invite a
-consumer to believe it still does.
+channels; and `tasks set` emits `{ "task": … }` — the row **read back from the
+store**, never the row that was submitted.
+
+`tasks enable`, `tasks disable` and `tasks forget` each emit
+`{ "results": [ … ] }`, **one entry per id you named, in the order you named
+them**. The shape does not depend on how many ids that was: a contract whose
+envelope changes with the argument count is one a consumer has to branch on
+before it can parse. Each entry carries a fixed five keys, always all five:
+
+```json
+{ "results": [
+  { "task": "nightly", "outcome": "saved", "effect": "rearmed", "reason": null,
+    "row": { "id": "nightly", "kind": "sync", "…": "…" } },
+  { "task": "weekly", "outcome": "missing", "effect": null, "reason": null,
+    "row": null },
+  { "task": "hourly", "outcome": "refused", "effect": null,
+    "reason": "task 'hourly' was changed elsewhere since this was opened …",
+    "row": null } ] }
+```
+
+`outcome` is `saved`, `forgotten`, `missing` or `refused`. `effect` is
+`created`, `updated` or `rearmed` and is non-null **exactly** when `outcome` is
+`saved` — only `created` and `rearmed` mean the task came back into service and
+armed afresh. `reason` is keeper's own refusal sentence, verbatim, and is
+non-null exactly when `outcome` is `refused`. `row` is the task **read back from
+the store** for a saved entry and `null` otherwise: the row that was written,
+never the row that was submitted, and for a forgotten task there is no row left
+to describe — echoing the fields of something that no longer exists would invite
+a consumer to believe it still does. Every "not applicable" is `null` rather
+than an absent key, so the key set never moves.
 
 ### The release task, and its three modes
 

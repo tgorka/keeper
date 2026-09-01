@@ -3375,6 +3375,197 @@ pub enum TaskSave {
     Rearmed,
 }
 
+/// One id in a batched task write, with the reading the caller is writing back.
+///
+/// `baseline_updated_ms` is [`upsert_task`]'s lost-update guard, carried per id
+/// because that is where it belongs: a bulk action from a rendered list *is* the
+/// case the guard was written for — somebody decided against five rows they were
+/// looking at, and each row has its own reading. `None` is what a caller that
+/// reads and writes inside one call passes, which is every CLI write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskBatchId {
+    /// The task's id, unvalidated: a spelling this keeper could never have
+    /// stored is a [`TaskBatchOutcome::Refused`] entry, not a failed batch.
+    pub id: String,
+    /// The `updated_ms` this write started from, or `None` for no baseline.
+    pub baseline_updated_ms: Option<i64>,
+}
+
+/// What a batch did to **one** id.
+///
+/// Four outcomes and not three: [`Self::Missing`] is deliberately not a
+/// [`Self::Refused`], because the two want different words on screen. A refusal
+/// is something to act on; a well-formed id whose row another host forgot is
+/// usually benign. [`crate::tasks::validate_id`]'s doc draws the same line — *"a
+/// spelling this keeper could never have stored"* versus *"well formed, but no
+/// such task"*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskBatchOutcome {
+    /// The row was written, and this is what [`upsert_task`] did to it.
+    Saved(TaskSave),
+    /// The row and its whole run history are gone ([`delete_task`]).
+    Forgotten,
+    /// Well formed, and no such row on this host. Nothing was written.
+    Missing,
+    /// Nothing was written, and this sentence — keeper's own, verbatim — says
+    /// why. A malformed id, an unreadable stored row (NFR-43), or a baseline
+    /// that moved.
+    Refused(String),
+}
+
+/// One entry of a batch's receipt: the id that was asked about, and its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskBatchEntry {
+    /// The id **as requested**, so a caller can align the receipt with what it
+    /// sent without matching on anything else.
+    pub id: String,
+    /// What happened to it.
+    pub outcome: TaskBatchOutcome,
+}
+
+/// Take several tasks in or out of service, each answering for itself.
+///
+/// # Transaction scope: N inner transactions, never one outer one
+///
+/// Each id goes through the **existing** [`upsert_task`] door and therefore
+/// through that door's own transaction — atomic per id, and not one transaction
+/// for the batch. Three facts decide it, and none of them is convenience.
+///
+/// 1. [`upsert_task`] **cannot be nested.** It opens
+///    `conn.unchecked_transaction()`, which rusqlite implements as a raw
+///    `BEGIN DEFERRED`; an outer `BEGIN` fails at the first inner one. An
+///    all-or-nothing batch would require hoisting that function's body behind a
+///    `&Transaction`-taking inner form, for which this file has no precedent.
+/// 2. All-or-nothing would **revoke** a promise the single-id door already
+///    makes. [`upsert_task`]'s documented guarantee is that a refused write
+///    changes nothing — meaning *that row*. Under all-or-nothing a refused write
+///    would also un-change four unrelated rows, which is a different and weaker
+///    promise wearing the same words.
+/// 3. The house answer is already written down. `FilesDeleteReceiptVm`: *"Partial
+///    success is a real outcome and is reported rather than thrown … Each path
+///    answers for itself."*
+///
+/// The caller holds this connection for the whole batch, so no other host-local
+/// writer interleaves.
+///
+/// # N ids in, N entries out
+///
+/// In request order, with no dedup and no first-error-wins: the same id twice is
+/// two entries. `Err` is reserved for [`list_tasks`] itself failing — the one
+/// whole-batch failure — and is never one id's refusal.
+pub fn set_tasks_enabled(
+    conn: &Connection,
+    ids: &[TaskBatchId],
+    enabled: bool,
+    now_ms: i64,
+) -> Result<Vec<TaskBatchEntry>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Read once for the whole batch rather than per id: the listing is what
+    // decides `Missing` and the NFR-43 refusal, and re-reading it per id would
+    // be N full table scans for an answer that cannot change under the caller's
+    // own connection hold.
+    let listing = list_tasks(conn)?;
+    let mut entries = Vec::with_capacity(ids.len());
+    for wanted in ids {
+        let outcome = match crate::tasks::validate_id(&wanted.id) {
+            Err(err) => TaskBatchOutcome::Refused(err.to_string()),
+            Ok(()) => match unreadable_task_reason(&listing, &wanted.id) {
+                // NFR-43's write half, per id: a row this build cannot read
+                // belongs to a newer keeper, and overwriting it would rewrite it
+                // to one of ours. `upsert_task` refuses it too; refusing here is
+                // what makes the receipt name the right reason rather than
+                // `Missing`, since such a row is not in `listing.tasks`.
+                Some(reason) => TaskBatchOutcome::Refused(reason),
+                None => match listing.tasks.iter().find(|task| task.id == wanted.id) {
+                    None => TaskBatchOutcome::Missing,
+                    Some(stored) => {
+                        let row = TaskRow {
+                            enabled,
+                            updated_ms: now_ms,
+                            ..stored.clone()
+                        };
+                        match upsert_task(conn, &row, wanted.baseline_updated_ms) {
+                            Ok(effect) => TaskBatchOutcome::Saved(effect),
+                            Err(err) => TaskBatchOutcome::Refused(err.to_string()),
+                        }
+                    }
+                },
+            },
+        };
+        entries.push(TaskBatchEntry {
+            id: wanted.id.clone(),
+            outcome,
+        });
+    }
+    Ok(entries)
+}
+
+/// Forget several tasks and their histories, each answering for itself.
+///
+/// Same transaction scope as [`set_tasks_enabled`], for the same three reasons:
+/// each id goes through the existing [`delete_task`] door and therefore through
+/// that door's own transaction, so the task and its runs go together and one
+/// id's refusal leaves the others deleted.
+///
+/// Plain ids and no baseline: [`delete_task`] makes no baseline promise today,
+/// and inventing one here would be a new promise rather than a preserved one.
+///
+/// A stored row this build **cannot read** is refused, never deleted (AD-48).
+/// Deleting a task on somebody else's behalf because we cannot parse it is the
+/// "absence is deletion" mistake that rule exists to prevent.
+pub fn forget_tasks(conn: &Connection, ids: &[String]) -> Result<Vec<TaskBatchEntry>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let listing = list_tasks(conn)?;
+    let mut entries = Vec::with_capacity(ids.len());
+    for wanted in ids {
+        let outcome = match crate::tasks::validate_id(wanted) {
+            Err(err) => TaskBatchOutcome::Refused(err.to_string()),
+            Ok(()) => match unreadable_task_reason(&listing, wanted) {
+                Some(reason) => TaskBatchOutcome::Refused(reason),
+                None => {
+                    if listing.tasks.iter().any(|task| &task.id == wanted) {
+                        delete_task(conn, wanted)?;
+                        TaskBatchOutcome::Forgotten
+                    } else {
+                        // `delete_task` answers `Ok(())` for an id that never
+                        // existed and cannot tell "gone now" from "was never
+                        // here", so the listing is what makes this honest.
+                        TaskBatchOutcome::Missing
+                    }
+                }
+            },
+        };
+        entries.push(TaskBatchEntry {
+            id: wanted.clone(),
+            outcome,
+        });
+    }
+    Ok(entries)
+}
+
+/// Why a stored row cannot be acted on, or `None` when there is no such row.
+///
+/// The sentence is the one the CLI's own `unreadable_task` renders, kept
+/// identical on purpose: a refusal's text is what a person greps for, and the
+/// batch must not invent a second wording for the fact `tasks status` already
+/// has words for.
+fn unreadable_task_reason(listing: &TaskListing, wanted: &str) -> Option<String> {
+    listing
+        .unknown
+        .iter()
+        .find(|row| row.id == wanted)
+        .map(|row| {
+            format!(
+                "task `{}` is stored, but this keeper cannot read it: {}",
+                row.id, row.reason
+            )
+        })
+}
+
 /// Every task, by id, with the unreadable rows listed rather than dropped.
 ///
 /// A row this build cannot read is skipped and named, never fatal — the same
@@ -7276,6 +7467,194 @@ mod tests {
             "{gone}"
         );
         assert!(get_task(&c, "01CAS").expect("get").is_none());
+    }
+
+    /// A `TaskBatchId` with no baseline — the CLI's shape, and the default the
+    /// batch tests below deviate from one id at a time.
+    fn batch_id(id: &str) -> TaskBatchId {
+        TaskBatchId {
+            id: id.to_owned(),
+            baseline_updated_ms: None,
+        }
+    }
+
+    /// **The receipt is the reason this story exists** (Story 59.4).
+    ///
+    /// Five ids go in and five answers come out, and the caller can tell which
+    /// is which: two rows were written, one was rewritten elsewhere while the
+    /// person was looking at it, one belongs to a keeper this build is too old to
+    /// read, and one is not here at all. An all-or-nothing batch would have
+    /// answered one thing about five ids, and a first-error-wins loop would have
+    /// stopped at the third and left the person guessing about the other two.
+    ///
+    /// The last assertion is the promise `upsert_task` already makes, held per
+    /// id: a refused write changes **nothing** — and under an outer transaction
+    /// it would instead have un-changed the two rows that went through.
+    #[test]
+    fn a_batch_answers_for_every_id_separately_and_says_why_each_one_did_not_go() {
+        let c = conn();
+        for id in ["01AAA", "01BBB"] {
+            upsert_task(&c, &task(id, None, TaskMode::Manual), None).expect("a writable row");
+        }
+        // The row somebody else rewrote while this batch's caller was reading
+        // it: stored at 1_000, and the batch carries the reading from before.
+        let mut moved = task("01MOVED", None, TaskMode::Manual);
+        moved.updated_ms = 1_000;
+        upsert_task(&c, &moved, None).expect("the row the other host owns");
+        let before = get_task(&c, "01MOVED").expect("get").expect("row");
+        // The row from a newer keeper, arriving the only way such a row can.
+        raw_task(&c, "01ALIEN", "teleport", "scheduled", None);
+
+        let requested = [
+            batch_id("01AAA"),
+            TaskBatchId {
+                baseline_updated_ms: Some(500),
+                ..batch_id("01MOVED")
+            },
+            batch_id("01ALIEN"),
+            batch_id("01BBB"),
+            batch_id("01GHOST"),
+        ];
+        let receipt = set_tasks_enabled(&c, &requested, false, 9_000).expect("the store is fine");
+
+        assert_eq!(
+            receipt.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["01AAA", "01MOVED", "01ALIEN", "01BBB", "01GHOST"],
+            "five ids in, five entries out, in the order they were asked about"
+        );
+        for (position, id) in [(0, "01AAA"), (3, "01BBB")] {
+            assert!(
+                matches!(receipt[position].outcome, TaskBatchOutcome::Saved(_)),
+                "{id} was writable and nothing about the other four changes that: {:?}",
+                receipt[position].outcome
+            );
+        }
+        assert!(
+            matches!(&receipt[1].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("changed elsewhere")),
+            "the moved baseline is refused in keeper's own words, so the person \
+             knows to re-read that one row rather than all five: {:?}",
+            receipt[1].outcome
+        );
+        assert!(
+            matches!(&receipt[2].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("cannot read")),
+            "a newer keeper's row is refused with that reason and never \
+             overwritten (NFR-43): {:?}",
+            receipt[2].outcome
+        );
+        assert_eq!(
+            receipt[4].outcome,
+            TaskBatchOutcome::Missing,
+            "a well-formed id with no row is Missing, not Refused: the two want \
+             different words on screen"
+        );
+
+        assert_eq!(
+            get_task(&c, "01MOVED").expect("get").expect("row"),
+            before,
+            "a refused write changes nothing — that row, column for column, \
+             including the `updated_ms` and the `enabled` this batch asked for"
+        );
+        for id in ["01AAA", "01BBB"] {
+            let written = get_task(&c, id).expect("get").expect("row");
+            assert!(!written.enabled, "{id} really was disabled");
+            assert_eq!(written.updated_ms, 9_000, "{id} carries the batch's stamp");
+        }
+    }
+
+    /// N ids produce N entries: no collapsing, no dedup, and no first-error-wins.
+    ///
+    /// The refusal is deliberately **first**, because that is the ordering a `?`
+    /// in the loop would have discarded every later answer under — the mistake
+    /// `cmd_verify`'s own loop records: *"let one folder's failure be one
+    /// folder's."*
+    #[test]
+    fn every_id_in_a_batch_gets_its_own_answer_rather_than_the_first_error() {
+        let c = conn();
+        for id in ["01ONE", "01TWO"] {
+            upsert_task(&c, &task(id, None, TaskMode::Manual), None).expect("a writable row");
+        }
+
+        let requested = [batch_id(" 01ONE"), batch_id("01ONE"), batch_id("01TWO")];
+        let receipt = set_tasks_enabled(&c, &requested, false, 4_000).expect("the store is fine");
+        assert_eq!(receipt.len(), 3, "three asked about, three answered");
+        assert!(
+            matches!(&receipt[0].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("whitespace")),
+            "a spelling this keeper could never have stored is refused before any \
+             SQL: {:?}",
+            receipt[0].outcome
+        );
+        assert!(
+            matches!(receipt[1].outcome, TaskBatchOutcome::Saved(_))
+                && matches!(receipt[2].outcome, TaskBatchOutcome::Saved(_)),
+            "the ids after the refusal are written, intact and in order: {receipt:?}"
+        );
+
+        // The same id twice is two entries. Collapsing them would make a receipt
+        // shorter than the request, which is exactly what a caller aligning the
+        // two by position cannot survive.
+        let twice = set_tasks_enabled(&c, &[batch_id("01ONE"), batch_id("01ONE")], true, 5_000)
+            .expect("the store is fine");
+        assert_eq!(
+            twice.len(),
+            2,
+            "no dedup: the receipt is as long as the request, always"
+        );
+        assert_eq!(twice[0].id, "01ONE");
+        assert_eq!(twice[1].id, "01ONE");
+    }
+
+    /// AD-48, per id: a row this build cannot read is **refused, not deleted**.
+    ///
+    /// Deleting a task on somebody else's behalf because we cannot parse it is
+    /// the "absence is deletion" mistake that rule exists to prevent, and a batch
+    /// is where it would be easiest to make: the id is not in `listing.tasks`, so
+    /// a loop that only asked "is it here?" would have answered `Missing` and a
+    /// loop that only called `delete_task` would have removed it.
+    #[test]
+    fn a_batched_forget_refuses_a_row_it_cannot_read_rather_than_deleting_it() {
+        let c = conn();
+        upsert_task(&c, &task("01REAL", None, TaskMode::Manual), None).expect("a writable row");
+        raw_task(&c, "01ALIEN", "teleport", "scheduled", None);
+
+        let receipt = forget_tasks(
+            &c,
+            &[
+                "01ALIEN".to_owned(),
+                "01REAL".to_owned(),
+                "01GHOST".to_owned(),
+            ],
+        )
+        .expect("the store is fine");
+
+        assert!(
+            matches!(&receipt[0].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("cannot read")),
+            "the unreadable row is refused with its own reason: {:?}",
+            receipt[0].outcome
+        );
+        assert_eq!(receipt[1].outcome, TaskBatchOutcome::Forgotten);
+        assert_eq!(
+            receipt[2].outcome,
+            TaskBatchOutcome::Missing,
+            "an id nobody stored is answered rather than reported as a success"
+        );
+
+        let stored: Vec<String> = c
+            .prepare("SELECT id FROM tasks ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("ids");
+        assert_eq!(
+            stored,
+            vec!["01ALIEN".to_owned()],
+            "the row this build cannot read is still there, and the one it could \
+             read is gone"
+        );
     }
 
     /// The policy round-trips through the write door and survives the edges that

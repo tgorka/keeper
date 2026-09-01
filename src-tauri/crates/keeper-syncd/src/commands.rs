@@ -34,7 +34,10 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use keeper_sync::db::{TaskListing, TaskRow, TaskRunRow, UnitStanding, UnknownTask};
+use keeper_sync::db::{
+    TaskBatchEntry, TaskBatchId, TaskBatchOutcome, TaskListing, TaskRow, TaskRunRow, TaskSave,
+    UnitStanding, UnknownTask,
+};
 use keeper_sync::engine::{Engine, VerifyReport};
 use keeper_sync::lfs::audit::RemoteAudit;
 use keeper_sync::lfs::hydrate::{
@@ -489,7 +492,8 @@ pub enum LfsDirection {
     },
 }
 
-/// The seven things an operator does to a task.
+/// The seven things an operator does to a task — three of them to as many tasks
+/// as you name.
 ///
 /// Every doc comment below describes what the verb does **here**, in this
 /// build. Story 56.13 shipped a `--help` for `materialize` that still described
@@ -598,32 +602,47 @@ pub enum TaskCommand {
     /// afresh rather than firing a window that fell into the past while it was
     /// out of service.
     Set(TaskSetArgs),
-    /// Make a task live again, leaving its mode and schedule exactly as they are.
+    /// Make one or more tasks live again, leaving their mode and schedule
+    /// exactly as they are.
     ///
     /// `enabled` and `mode` answer different questions (AD-135): `mode` says who
     /// may trigger the task, `enabled` says whether the row is live at all. A
     /// disabled `scheduled` task keeps its schedule and resumes on it.
+    ///
+    /// Every id answers for itself: one line each, and an id that could not be
+    /// written does not stop the others.
     Enable {
-        /// The task's id, exactly as `tasks list` spells it.
-        task: String,
+        /// The task's id, exactly as `tasks list` spells it. Repeatable.
+        #[arg(required = true, num_args = 1.., value_name = "TASK")]
+        task: Vec<String>,
     },
-    /// Take a task out of service without forgetting anything about it.
+    /// Take one or more tasks out of service without forgetting anything about
+    /// them.
     ///
-    /// Neither the tick nor `tasks run` will touch it while it is disabled — an
-    /// "off" that still runs when asked is not off — and its schedule, its
-    /// binding and its whole run history survive, so re-enabling it is one word.
+    /// Neither the tick nor `tasks run` will touch a disabled task — an "off"
+    /// that still runs when asked is not off — and its schedule, its binding and
+    /// its whole run history survive, so re-enabling it is one word.
+    ///
+    /// Every id answers for itself: one line each, and an id that could not be
+    /// written does not stop the others.
     Disable {
-        /// The task's id, exactly as `tasks list` spells it.
-        task: String,
+        /// The task's id, exactly as `tasks list` spells it. Repeatable.
+        #[arg(required = true, num_args = 1.., value_name = "TASK")]
+        task: Vec<String>,
     },
-    /// Delete a task and everything it recorded.
+    /// Delete one or more tasks and everything they recorded.
     ///
-    /// Its run history goes with it. This is the only destructive verb here, and
-    /// it destroys bookkeeping rather than content: nothing a task ever did is
-    /// undone by forgetting the task.
+    /// Their run history goes with them. This is the only destructive verb here,
+    /// and it destroys bookkeeping rather than content: nothing a task ever did
+    /// is undone by forgetting the task.
+    ///
+    /// Every id answers for itself: one line each, and an id that could not be
+    /// forgotten does not stop the others. A row this build cannot read is
+    /// refused rather than deleted (AD-48).
     Forget {
-        /// The task's id, exactly as `tasks list` spells it.
-        task: String,
+        /// The task's id, exactly as `tasks list` spells it. Repeatable.
+        #[arg(required = true, num_args = 1.., value_name = "TASK")]
+        task: Vec<String>,
     },
 }
 
@@ -1129,7 +1148,7 @@ pub async fn run(
                 TaskCommand::Disable { task } => {
                     cmd_task_set_enabled(&printer, &engine, now_ms, &task, false)
                 }
-                TaskCommand::Forget { task } => cmd_task_forget(&printer, &engine, &task),
+                TaskCommand::Forget { task } => cmd_task_forget(&printer, &engine, now_ms, &task),
             }
         }
     }
@@ -3691,22 +3710,17 @@ fn task_run_document(
     serde_json::json!({ "task": task_id, "run": run, "outcome": outcome, "exit": exit })
 }
 
-/// The document `tasks set`, `tasks enable` and `tasks disable` all emit.
+/// The document `tasks set` emits.
 ///
-/// One envelope for three verbs because all three answer the same question —
-/// *what does the row look like now* — and it is the row **read back from the
-/// store**, never the row that was submitted; see [`report_task`].
+/// It answers *what does the row look like now*, and it is the row **read back
+/// from the store**, never the row that was submitted; see [`report_task`].
+///
+/// `tasks enable`, `tasks disable` and `tasks forget` used to emit this envelope
+/// (and a `{ "forgot": id }` one) and now emit [`tasks_batch_document`] instead:
+/// they act on as many ids as were named, so the read-back row moved inside each
+/// successful receipt entry.
 fn task_saved_document(task: serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "task": task })
-}
-
-/// `tasks forget`'s document.
-///
-/// The id and nothing else: the row is gone, so there is no row to describe, and
-/// echoing the fields of something that no longer exists would invite a consumer
-/// to believe it still does.
-fn task_forgotten_document(id: &str) -> serde_json::Value {
-    serde_json::json!({ "forgot": id })
 }
 
 /// Every stored task, with its target, schedule and last run.
@@ -4094,58 +4108,270 @@ fn cmd_task_set(
     report_task(printer, engine, now_ms, &row.id)
 }
 
-/// Take a task in or out of service, leaving everything else exactly as stored.
+/// Which batched verb is speaking, so a receipt renders the words that verb has
+/// always used.
+///
+/// A three-variant enum rather than the `bool` [`cmd_task_set_enabled`] used to
+/// carry, because `forget` shares the whole receipt-rendering path with the
+/// other two and a boolean cannot name three things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskBatchVerb {
+    Enable,
+    Disable,
+    Forget,
+}
+
+impl TaskBatchVerb {
+    /// The line an id that went through gets — byte for byte what the single-id
+    /// verb printed before this became a batch.
+    fn done_line(self, id: &str) -> String {
+        match self {
+            Self::Enable => format!("Enabled task {id}"),
+            Self::Disable => format!("Disabled task {id}"),
+            Self::Forget => format!("Forgot task {id} and its run history"),
+        }
+    }
+
+    /// What there was nothing of, for an id no row answers to.
+    fn nothing_clause(self) -> &'static str {
+        match self {
+            Self::Enable | Self::Disable => "nothing to change",
+            Self::Forget => "nothing to forget",
+        }
+    }
+}
+
+/// A batch's receipt as a human reads it: **one line per requested id**.
+///
+/// **Pure, and returning lines rather than printing them**, for [`task_lines`]'s
+/// reason: [`Printer`] writes to process stdout, so an assertion about what
+/// these verbs *say* would otherwise need the binary spawned. That matters more
+/// here than anywhere else in this section, because the per-id independence is
+/// the whole point of the batch and it is only visible in the text.
+///
+/// A refusal uses the tasks section's own `{id}: {reason}` shape and carries
+/// keeper's sentence verbatim — a paraphrase here is a second wording for a fact
+/// the write door already has words for. `Missing` gets its own sentence rather
+/// than a refusal's, because the two want different actions from the person
+/// reading: a refusal is something to fix, and a row another host forgot usually
+/// is not.
+///
+/// **No entries is still a line**, on [`task_lines`]'s rule: clap requires at
+/// least one id, so this is unreachable from the CLI — but a renderer that
+/// answers silence is indistinguishable from one that did not run.
+fn task_batch_lines(verb: TaskBatchVerb, entries: &[TaskBatchEntry]) -> Vec<String> {
+    if entries.is_empty() {
+        return vec!["No task ids were given, so nothing was changed.".to_owned()];
+    }
+    entries
+        .iter()
+        .map(|entry| match &entry.outcome {
+            TaskBatchOutcome::Saved(_) | TaskBatchOutcome::Forgotten => verb.done_line(&entry.id),
+            TaskBatchOutcome::Missing => format!(
+                "{}: no such task on this host — {}",
+                entry.id,
+                verb.nothing_clause()
+            ),
+            TaskBatchOutcome::Refused(reason) => format!("{}: {reason}", entry.id),
+        })
+        .collect()
+}
+
+/// One receipt entry as the `--json` document carries it.
+///
+/// **Five keys, always all five**, `null` for "not applicable" — the shape
+/// [`task_run_document`] already has for its own `run`. `effect` is non-null
+/// exactly when `outcome` is `saved`, and `reason` exactly when it is `refused`,
+/// so a consumer branches on `outcome` and never on which keys arrived.
+///
+/// The words are the store's own — [`TaskSave`]'s three effects — so the human
+/// lines and this document cannot come to call one outcome two different things.
+fn task_batch_entry_json(
+    entry: &TaskBatchEntry,
+    row: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let (outcome, effect, reason) = match &entry.outcome {
+        TaskBatchOutcome::Saved(effect) => (
+            "saved",
+            Some(match effect {
+                TaskSave::Created => "created",
+                TaskSave::Updated => "updated",
+                TaskSave::Rearmed => "rearmed",
+            }),
+            None,
+        ),
+        TaskBatchOutcome::Forgotten => ("forgotten", None, None),
+        TaskBatchOutcome::Missing => ("missing", None, None),
+        TaskBatchOutcome::Refused(reason) => ("refused", None, Some(reason.as_str())),
+    };
+    serde_json::json!({
+        "task": entry.id,
+        "outcome": outcome,
+        "effect": effect,
+        "reason": reason,
+        "row": row,
+    })
+}
+
+/// The one document `tasks enable`, `tasks disable` and `tasks forget` emit.
+///
+/// A named function for [`tasks_list_document`]'s reason: the envelope is as much
+/// of the contract as the entries are, and inline in a command nothing could
+/// assert it.
+///
+/// **One shape whatever the argument count is.** The rejected alternative was to
+/// keep the old `{ "task": … }` / `{ "forgot": … }` envelope for one id and this
+/// one for many — a contract whose shape depends on how many arguments were
+/// typed, which is a `--json` consumer that has to branch before it can parse.
+/// Nothing is lost by the change: the read-back row moved **inside** each
+/// successful entry.
+fn tasks_batch_document(results: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({ "results": results })
+}
+
+/// Render a batch's receipt, read back every row it wrote, and earn the exit
+/// code.
+///
+/// The read-back is [`report_task`]'s rule — what a write verb says is what the
+/// store now holds, never the row that was submitted — done **once** for the
+/// whole batch rather than through `report_task` per id, which re-reads the
+/// entire listing on every call.
+///
+/// # The number goes through `Ok`, never through `Err`
+///
+/// [`EXIT_CONFIG`] when any id did not go through, [`EXIT_OK`] otherwise: a
+/// refusal is a selector-or-state problem, and exit 2 already means "retrying
+/// changes nothing, edit something". It is **not** a [`CliError`], for
+/// [`cmd_task_run`]'s reason: `main` prints a JSON failure envelope for every
+/// `Err`, which would put a second document on stdout over the receipt this
+/// function already emitted.
+fn report_task_batch(
+    printer: &Printer,
+    engine: &Engine,
+    now_ms: i64,
+    verb: TaskBatchVerb,
+    entries: &[TaskBatchEntry],
+) -> std::result::Result<u8, CliError> {
+    for line in task_batch_lines(verb, entries) {
+        printer.line(line);
+    }
+
+    let saved: Vec<&str> = entries
+        .iter()
+        .filter(|entry| matches!(entry.outcome, TaskBatchOutcome::Saved(_)))
+        .map(|entry| entry.id.as_str())
+        .collect();
+    // Nothing was written, so there is nothing to read back — and `forget` never
+    // has anything here by construction.
+    let (listing, profiles) = if saved.is_empty() {
+        (TaskListing::default(), Vec::new())
+    } else {
+        (engine.tasks()?, engine.list_profiles()?)
+    };
+    let mut rows: Vec<(&str, serde_json::Value)> = Vec::with_capacity(saved.len());
+    for id in saved {
+        // A row the batch just wrote and this listing cannot find would mean the
+        // other host forgot it between the write and the read; the receipt still
+        // says what happened, so there is nothing to refuse here.
+        let Some(task) = listing.tasks.iter().find(|task| task.id == id) else {
+            continue;
+        };
+        let newest = engine.task_history(id, 1)?;
+        let view = TaskView {
+            task,
+            profile_name: task_profile_name(&profiles, task),
+            last: newest.first(),
+        };
+        for line in task_lines(now_ms, std::slice::from_ref(&view), &[]) {
+            printer.line(line);
+        }
+        rows.push((id, task_json(task, view.profile_name, view.last)));
+    }
+
+    printer.json(&tasks_batch_document(
+        entries
+            .iter()
+            .map(|entry| {
+                let row = rows
+                    .iter()
+                    .find(|(id, _)| *id == entry.id.as_str())
+                    .map(|(_, row)| row.clone());
+                task_batch_entry_json(entry, row)
+            })
+            .collect(),
+    ));
+
+    let every_id_went_through = entries.iter().all(|entry| {
+        matches!(
+            entry.outcome,
+            TaskBatchOutcome::Saved(_) | TaskBatchOutcome::Forgotten
+        )
+    });
+    Ok(if every_id_went_through {
+        EXIT_OK
+    } else {
+        EXIT_CONFIG
+    })
+}
+
+/// Take one or more tasks in or out of service, leaving everything else exactly
+/// as stored.
 ///
 /// One function for both verbs because they differ in one boolean, and the
 /// rest — read the row, keep every other column, write it back — is the part
 /// that must not diverge. `mode` and `schedule` survive untouched: AD-135 keeps
 /// `enabled` and `mode` apart because they answer different questions, so a
 /// disabled `scheduled` task keeps its schedule and resumes on it.
+///
+/// Every id carries `baseline_updated_ms: None`, which is unchanged behaviour and
+/// is what [`keeper_sync::db::upsert_task`] documents for a caller that reads and
+/// writes inside one call: nothing can have moved between two adjacent
+/// statements the way it can across a person's typing. The app's pane is the
+/// caller that passes each row's own reading.
 fn cmd_task_set_enabled(
     printer: &Printer,
     engine: &Engine,
     now_ms: i64,
-    wanted: &str,
+    wanted: &[String],
     enabled: bool,
 ) -> std::result::Result<u8, CliError> {
-    let listing = engine.tasks()?;
-    let stored = select_task(&listing, wanted)?;
-    let row = TaskRow {
-        enabled,
-        updated_ms: now_ms,
-        ..stored.clone()
+    let batch: Vec<TaskBatchId> = wanted
+        .iter()
+        .map(|id| TaskBatchId {
+            id: id.clone(),
+            baseline_updated_ms: None,
+        })
+        .collect();
+    let entries = engine.set_tasks_enabled(&batch, enabled)?;
+    let verb = if enabled {
+        TaskBatchVerb::Enable
+    } else {
+        TaskBatchVerb::Disable
     };
-    engine.save_task(&row, None)?;
-    printer.line(format!(
-        "{} task {}",
-        if enabled { "Enabled" } else { "Disabled" },
-        row.id
-    ));
-    report_task(printer, engine, now_ms, &row.id)
+    report_task_batch(printer, engine, now_ms, verb, &entries)
 }
 
-/// Forget a task and everything it recorded.
+/// Forget one or more tasks and everything they recorded.
 ///
-/// Selected through [`select_task`] first, so forgetting an id nobody stored is
-/// a refusal rather than a silent success: `db::delete_task` cannot tell "gone
-/// now" from "was never here", and a typo that reports success is how somebody
-/// comes to believe a task is deleted while it is still on a schedule.
+/// [`keeper_sync::db::forget_tasks`] reads the listing first, so forgetting an id
+/// nobody stored is answered rather than reported as a silent success:
+/// `db::delete_task` cannot tell "gone now" from "was never here", and a typo
+/// that reports success is how somebody comes to believe a task is deleted while
+/// it is still on a schedule.
 ///
 /// That also means a row this build **cannot read** is refused rather than
 /// deleted, and that is the right way round: it belongs to a newer keeper on the
 /// other host, and deleting a task on somebody else's behalf because we cannot
-/// parse it is the "absence is deletion" mistake AD-48 exists to prevent.
+/// parse it is the "absence is deletion" mistake AD-48 exists to prevent. Per
+/// id: one unreadable row in a batch of five does not stop the other four.
 fn cmd_task_forget(
     printer: &Printer,
     engine: &Engine,
-    wanted: &str,
+    now_ms: i64,
+    wanted: &[String],
 ) -> std::result::Result<u8, CliError> {
-    let listing = engine.tasks()?;
-    let id = select_task(&listing, wanted)?.id.clone();
-    engine.forget_task(&id)?;
-    printer.line(format!("Forgot task {id} and its run history"));
-    printer.json(&task_forgotten_document(&id));
-    Ok(EXIT_OK)
+    let entries = engine.forget_tasks(wanted)?;
+    report_task_batch(printer, engine, now_ms, TaskBatchVerb::Forget, &entries)
 }
 
 /// Run one clean or smudge pass for git.
@@ -4271,18 +4497,38 @@ mod tests {
             &["keeper-syncd", "tasks", "enable", "nightly"],
             &["keeper-syncd", "tasks", "disable", "nightly"],
             &["keeper-syncd", "tasks", "forget", "nightly"],
+            &["keeper-syncd", "tasks", "enable", "nightly", "weekly"],
+            &["keeper-syncd", "tasks", "disable", "a", "b"],
+            &["keeper-syncd", "tasks", "forget", "a", "b", "c"],
         ];
         for args in invocations {
             assert!(parse(args).is_ok(), "must parse: {args:?}");
         }
+
+        // The three repeatable verbs **accumulate**, rather than the last id
+        // winning: `num_args = 1..` is what makes several positionals one
+        // `Vec<String>`, and it is the whole reason a batch exists.
+        let Ok(Cli {
+            command:
+                Command::Tasks {
+                    command: TaskCommand::Disable { task },
+                },
+            ..
+        }) = parse(&["keeper-syncd", "tasks", "disable", "a", "b"])
+        else {
+            panic!("`tasks disable a b` must parse as a Disable over two ids");
+        };
+        assert_eq!(task, vec!["a".to_owned(), "b".to_owned()]);
     }
 
     #[test]
     fn a_task_selector_is_required_by_every_verb_that_names_one() {
         // `tasks list` is the only verb that addresses no task; every other one
-        // acts on exactly one row, and a missing selector must be told rather
+        // names at least one row, and a missing selector must be told rather
         // than read as "all of them" — which for `run` and `forget` would be a
-        // fan-out nobody asked for.
+        // fan-out nobody asked for. For the three repeatable verbs
+        // `#[arg(required = true, …)]` is what keeps that true: `num_args = 1..`
+        // alone would have made an empty `Vec` a legal parse.
         for verb in ["status", "run", "set", "enable", "disable", "forget"] {
             let err = parse(&["keeper-syncd", "tasks", verb])
                 .expect_err("a task id is required to name one");
@@ -6261,10 +6507,200 @@ mod tests {
         let saved = task_saved_document(rendered.clone());
         assert_eq!(sorted_keys(&saved), vec!["task"]);
         assert_eq!(saved["task"], rendered);
+    }
 
-        let forgotten = task_forgotten_document("nightly");
-        assert_eq!(sorted_keys(&forgotten), vec!["forgot"]);
-        assert_eq!(forgotten["forgot"], serde_json::json!("nightly"));
+    /// Every id gets its own rendered line, and a refusal carries keeper's own
+    /// sentence (Story 59.4).
+    ///
+    /// Over a real engine, because the receipt is what is being rendered and a
+    /// hand-built one could not prove the words came from the store. The
+    /// renderer is called directly rather than through the command, for
+    /// [`task_lines`]'s reason: [`Printer`] writes to process stdout, so this is
+    /// the only way to assert what the verb *says*.
+    #[test]
+    fn a_batched_verb_renders_one_line_per_id_and_names_each_refusal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut stored = a_task("nightly");
+        stored.updated_ms = platform.now_ms();
+        engine.save_task(&stored, None).expect("a stored task");
+
+        let requested = ["nightly", "ghost", " nightly"];
+        let batch: Vec<TaskBatchId> = requested
+            .iter()
+            .map(|id| TaskBatchId {
+                id: (*id).to_owned(),
+                baseline_updated_ms: None,
+            })
+            .collect();
+        let entries = engine
+            .set_tasks_enabled(&batch, false)
+            .expect("the store is fine");
+        let lines = task_batch_lines(TaskBatchVerb::Disable, &entries);
+
+        assert_eq!(
+            lines.len(),
+            requested.len(),
+            "one line per requested id, never a summary: {lines:?}"
+        );
+        assert_eq!(
+            lines[0], "Disabled task nightly",
+            "the success line is byte for byte what the single-id verb printed"
+        );
+        assert_eq!(
+            lines[1], "ghost: no such task on this host — nothing to change",
+            "an id nobody stored is said, and said differently from a refusal"
+        );
+        assert!(
+            lines[2].starts_with(" nightly: ") && lines[2].contains("whitespace"),
+            "the refusal names the id and carries keeper's reason verbatim, so a \
+             person meets one wording rather than a paraphrase: {}",
+            lines[2]
+        );
+    }
+
+    /// The batched `--json` document, key by key (Story 59.4).
+    ///
+    /// One envelope per invocation whatever the argument count is, and a **fixed
+    /// five-key set per entry** with `null` for "not applicable" — the shape
+    /// [`task_run_document`] already has. Pure, over a hand-built receipt,
+    /// because the claim is about the document's contract and nothing about it
+    /// needs a store.
+    #[test]
+    fn the_batched_json_document_carries_one_entry_per_id() {
+        let task = a_task("nightly");
+        let row = task_json(&task, None, None);
+        let entries = [
+            TaskBatchEntry {
+                id: "nightly".to_owned(),
+                outcome: TaskBatchOutcome::Saved(TaskSave::Rearmed),
+            },
+            TaskBatchEntry {
+                id: "ghost".to_owned(),
+                outcome: TaskBatchOutcome::Missing,
+            },
+            TaskBatchEntry {
+                id: " nightly".to_owned(),
+                outcome: TaskBatchOutcome::Refused("task id must not begin".to_owned()),
+            },
+        ];
+        let document = tasks_batch_document(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(position, entry)| {
+                    task_batch_entry_json(entry, (position == 0).then(|| row.clone()))
+                })
+                .collect(),
+        );
+
+        assert_eq!(
+            sorted_keys(&document),
+            vec!["results"],
+            "one envelope, and its name is as much of the contract as the entries"
+        );
+        let results = document["results"].as_array().expect("an array");
+        assert_eq!(
+            results
+                .iter()
+                .map(|entry| &entry["task"])
+                .collect::<Vec<_>>(),
+            vec![
+                &serde_json::json!("nightly"),
+                &serde_json::json!("ghost"),
+                &serde_json::json!(" nightly"),
+            ],
+            "one element per requested id, in request order"
+        );
+        for entry in results {
+            assert_eq!(
+                sorted_keys(entry),
+                vec!["effect", "outcome", "reason", "row", "task"],
+                "five keys always, so a consumer branches on `outcome` and never \
+                 on which keys arrived: {entry}"
+            );
+        }
+
+        assert_eq!(results[0]["outcome"], serde_json::json!("saved"));
+        assert_eq!(
+            results[0]["effect"],
+            serde_json::json!("rearmed"),
+            "a saved entry says what the write did, because only `created` and \
+             `rearmed` mean the task came back into service"
+        );
+        assert_eq!(results[0]["reason"], serde_json::Value::Null);
+        assert_eq!(results[0]["row"], row, "the read-back row rides inside");
+
+        assert_eq!(results[1]["outcome"], serde_json::json!("missing"));
+        assert_eq!(
+            results[1]["effect"],
+            serde_json::Value::Null,
+            "nothing was written, so there is no effect to name"
+        );
+        assert_eq!(results[1]["reason"], serde_json::Value::Null);
+        assert_eq!(results[1]["row"], serde_json::Value::Null);
+
+        assert_eq!(results[2]["outcome"], serde_json::json!("refused"));
+        assert_eq!(results[2]["effect"], serde_json::Value::Null);
+        assert_eq!(
+            results[2]["reason"],
+            serde_json::json!("task id must not begin"),
+            "a refusal's sentence is the whole point of the entry"
+        );
+        assert_eq!(results[2]["row"], serde_json::Value::Null);
+    }
+
+    /// A batch with one refusal exits [`EXIT_CONFIG`] **through `Ok`**, and
+    /// therefore emits exactly one document (Story 59.4).
+    ///
+    /// The `Err` shape is the one thing this must not be: `main` prints a JSON
+    /// failure envelope for every `Err`, which would put a second document on
+    /// stdout over the receipt the verb already emitted — [`cmd_task_run`]'s own
+    /// reason for returning its number the same way.
+    #[test]
+    fn a_batch_with_a_refusal_exits_non_zero_without_a_second_document() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+        let mut stored = a_task("nightly");
+        stored.updated_ms = now;
+        engine.save_task(&stored, None).expect("a stored task");
+
+        let mixed = cmd_task_set_enabled(
+            &printer,
+            &engine,
+            now,
+            &["nightly".to_owned(), "ghost".to_owned()],
+            false,
+        );
+        assert_eq!(
+            mixed.map_err(|err| err.to_string()),
+            Ok(EXIT_CONFIG),
+            "the number goes through the Ok channel, so exactly one document \
+             reaches stdout"
+        );
+
+        // And the id that did go through really went through, which is what makes
+        // the non-zero exit a report rather than a rollback.
+        let listing = engine.tasks().expect("tasks");
+        assert!(
+            !select_task(&listing, "nightly").expect("the row").enabled,
+            "one id's refusal does not un-change the ids that were written"
+        );
+
+        // Every id going through is still EXIT_OK, so the number means something.
+        assert_eq!(
+            cmd_task_set_enabled(&printer, &engine, now, &["nightly".to_owned()], true)
+                .expect("the verb itself must not fail"),
+            EXIT_OK
+        );
     }
 
     #[test]
@@ -6643,7 +7079,8 @@ mod tests {
         //    `enabled` from a settings-shaped update is exactly how a restart
         //    un-pauses everything somebody paused.
         assert_eq!(
-            cmd_task_set_enabled(&printer, &engine, now, "nightly", false).expect("disable"),
+            cmd_task_set_enabled(&printer, &engine, now, &["nightly".to_owned()], false)
+                .expect("disable"),
             EXIT_OK
         );
         let row = stored("nightly");
@@ -6658,21 +7095,22 @@ mod tests {
             "`set` must not resurrect a disabled task"
         );
         assert_eq!(
-            cmd_task_set_enabled(&printer, &engine, now, "nightly", true).expect("enable"),
+            cmd_task_set_enabled(&printer, &engine, now, &["nightly".to_owned()], true)
+                .expect("enable"),
             EXIT_OK
         );
         assert!(stored("nightly").enabled);
 
-        // 9. `forget` refuses an id nobody stored, and takes the row when it is
-        //    real.
+        // 9. `forget` answers for an id nobody stored — through the exit code
+        //    rather than through `Err`, so the receipt on stdout is the only
+        //    document — and takes the row when it is real.
         assert_eq!(
-            cmd_task_forget(&printer, &engine, "nope")
-                .expect_err("no such task")
-                .exit_code(),
+            cmd_task_forget(&printer, &engine, now, &["nope".to_owned()])
+                .expect("the verb itself must not fail"),
             EXIT_CONFIG
         );
         assert_eq!(
-            cmd_task_forget(&printer, &engine, "nightly").expect("forget"),
+            cmd_task_forget(&printer, &engine, now, &["nightly".to_owned()]).expect("forget"),
             EXIT_OK
         );
         let listing = engine.tasks().expect("tasks");

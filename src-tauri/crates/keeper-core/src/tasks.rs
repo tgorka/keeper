@@ -1216,6 +1216,93 @@ pub struct TaskSchedulePreviewVm {
     pub instants: Vec<i64>,
 }
 
+/// One id in a batched task write, as the wire carries it.
+///
+/// The baseline is a **request** field because only the caller knows whether it
+/// holds a reading worth checking — `TaskSaveReq::baseline_updated_ms`'s own
+/// rule. A bulk action from a rendered list is the case that has one: the person
+/// decided against the rows they were looking at, so each id carries that row's
+/// `updatedMs`. A caller that reads and writes inside one call passes `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskBatchIdReq {
+    /// The task's id, exactly as the listing spells it.
+    pub id: String,
+    /// The `updatedMs` this write started from, or `null` for no baseline.
+    #[ts(type = "number | null")]
+    pub baseline_updated_ms: Option<i64>,
+}
+
+/// What a batched task write did to **one** id.
+///
+/// Four kinds and not three: [`Self::Missing`] is not a [`Self::Refused`],
+/// because the two want different words on screen. A refusal is something to act
+/// on; a well-formed id whose row another host forgot is usually benign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum TaskBatchOutcomeKind {
+    /// The row was written. [`TaskBatchEntryVm::effect`] says what changed.
+    Saved,
+    /// The row and its whole run history are gone.
+    Forgotten,
+    /// Well formed, and no such row on this host. Nothing was written.
+    Missing,
+    /// Nothing was written, and [`TaskBatchEntryVm::reason`] says why.
+    Refused,
+}
+
+/// One entry of a batch's receipt: the id that was asked about, and its answer.
+///
+/// **Partial success is a real outcome and is reported rather than thrown** —
+/// `FilesDeleteReceiptVm`'s rule (`vm.rs:4744-4750`), for the same reason: a row
+/// can be rewritten by the other host between the render and the command, and
+/// failing the whole call would leave the other four written with an error on
+/// screen saying nothing happened. Each id answers for itself.
+///
+/// **The invariant the surfaces rely on:** [`Self::effect`] is `Some` exactly
+/// when [`Self::outcome`] is [`TaskBatchOutcomeKind::Saved`], and
+/// [`Self::reason`] is `Some` exactly when it is
+/// [`TaskBatchOutcomeKind::Refused`]. As with `TaskSchedulePreviewVm`, a flat
+/// struct with two `Option`s can *represent* a combination the producer never
+/// emits; the exclusion is the shell's to keep, and its match over
+/// `keeper_sync::db::TaskBatchOutcome` is total, so it cannot accidentally emit
+/// both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskBatchEntryVm {
+    /// The id **as requested**, so a caller can align the receipt with what it
+    /// sent without matching on anything else. N ids in, N entries out, in
+    /// request order — the same id twice is two entries.
+    pub id: String,
+    /// What happened to it, for branching and for tests.
+    pub outcome: TaskBatchOutcomeKind,
+    /// What the write did: `"created"`, `"updated"` or `"rearmed"`. `null` for
+    /// every kind but [`TaskBatchOutcomeKind::Saved`].
+    ///
+    /// It matters to a surface because only `created` and `rearmed` mean the task
+    /// came back into service and armed afresh.
+    pub effect: Option<String>,
+    /// keeper's own refusal sentence, verbatim. `null` for every kind but
+    /// [`TaskBatchOutcomeKind::Refused`].
+    ///
+    /// Rendered as it arrives rather than paraphrased, so a person meets one
+    /// wording here and at the single-id write door.
+    pub reason: Option<String>,
+}
+
+/// What a batched task write did, one entry per requested id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskBatchReceiptVm {
+    /// One entry per requested id, in request order. Never shorter than what was
+    /// asked for, and never collapsed.
+    pub entries: Vec<TaskBatchEntryVm>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
