@@ -63,11 +63,18 @@ export const EXPORT_PICKER_TITLE = "Export to…";
 export const EXPORT_UNSAVED_SENTENCE =
   "keeper could not save your latest edits first, so it did not export a copy that would be missing them. Try again in a moment.";
 
-/** What a target keeper has no export path for is told. Not reachable from a
- *  surface today — no control offers it for a recording — and a sentence
- *  rather than a throw, because the alternative to an honest refusal here is a
- *  component crashing on a case the store's own type allows. */
+/** What a target keeper has no export path for is told. Two kinds reach it, and
+ *  neither is reachable from a surface today — no control offers Export for a
+ *  recording, and a task panel draws no controls at all (Story 59.12). A
+ *  sentence rather than a throw, because the alternative to an honest refusal
+ *  here is a component crashing on a case the store's own type allows. */
 export const EXPORT_UNSUPPORTED_SENTENCE = "keeper cannot export a recording yet.";
+
+/** The same, for a task. Worded as a fact about tasks rather than as *yet*: a
+ *  recording is bytes keeper has not learned to copy, and a task is a row in
+ *  keeper's own record with no file behind it to copy anywhere. */
+export const EXPORT_NOT_A_DOCUMENT_SENTENCE =
+  "keeper cannot export a task: a task is a record keeper keeps, not a document.";
 
 /** The fallback when a rejection carries no sentence of its own. Rust words
  *  every refusal this command can produce, so reaching this means something
@@ -109,8 +116,14 @@ async function flushed(vaultId: string, noteId: string): Promise<boolean> {
  * person who pressed the button, and Rust already worded both.
  */
 export async function exportTarget(target: PanelTargetVm): Promise<ExportOutcome> {
+  // The two kinds that are not a document. Named rather than left to fall
+  // through the dispatch below, so the widening of `PanelTargetVm` shows up
+  // here as a compile error and not as a call with the wrong arguments.
   if (target.kind === "recording") {
     return { status: "refused", reason: EXPORT_UNSUPPORTED_SENTENCE };
+  }
+  if (target.kind === "task") {
+    return { status: "refused", reason: EXPORT_NOT_A_DOCUMENT_SENTENCE };
   }
   if (target.kind === "note" && !(await flushed(target.vaultId, target.noteId))) {
     return { status: "refused", reason: EXPORT_UNSAVED_SENTENCE };

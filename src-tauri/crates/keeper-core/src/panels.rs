@@ -29,6 +29,14 @@
 //!   field what [`crate::vm::FilesEntryVm`] renders.
 //! - `Recording` carries the session id — the recordings browser already keys its
 //!   rows by it, and it is the one handle that survives a Story 40.4 retitle.
+//! - `Task` carries the task's id, which is the whole of a task's identity. A
+//!   task id is its primary key and cannot be edited once the task exists —
+//!   every run in the history joins on it, so the record has no way to spell a
+//!   rename — which makes it exactly the kind of handle this list is for: the
+//!   one string that outlives every change a task can undergo, as a note id
+//!   outlives a rename. It is also the handle every task verb already takes,
+//!   one argument and nothing else, so a panel holding a task target can ask
+//!   `sync_task_history` about it without composing anything.
 //!
 //! **No absolute path, anywhere.** A panel is restored after a restart, and a
 //! panel that had stored an absolute path would come back pointing at a volume
@@ -90,6 +98,13 @@ pub enum PanelTargetVm {
         /// of the session folder.
         session_id: String,
     },
+    /// One scheduled task.
+    Task {
+        /// The task's id: its primary key in the task record, unchangeable once
+        /// the task exists because every run joins on it, and the single
+        /// argument every task verb takes.
+        task_id: String,
+    },
 }
 
 #[cfg(test)]
@@ -129,6 +144,13 @@ mod tests {
             .expect("serialize recording"),
             r#"{"kind":"recording","sessionId":"sess-1"}"#
         );
+        assert_eq!(
+            serde_json::to_string(&PanelTargetVm::Task {
+                task_id: "nightly".into(),
+            })
+            .expect("serialize task"),
+            r#"{"kind":"task","taskId":"nightly"}"#
+        );
     }
 
     /// A persisted panel list is read back into these variants, so the reverse
@@ -146,6 +168,9 @@ mod tests {
             },
             PanelTargetVm::Recording {
                 session_id: "sess-1".into(),
+            },
+            PanelTargetVm::Task {
+                task_id: "nightly".into(),
             },
         ] {
             let json = serde_json::to_string(&target).expect("serialize");
@@ -183,6 +208,13 @@ mod tests {
     /// A note target and a file target that share their two strings are still
     /// different panels: the tag is part of the identity, and a panel list that
     /// compared only the payload would focus a note when asked for a file.
+    ///
+    /// The recording/task pair is the sharper half of the same claim, and the
+    /// reason it is asserted rather than assumed: those two carry ONE string
+    /// each, so the payloads are not merely equal by coincidence — they are the
+    /// same shape, and a comparison that reached past the tag would make a task
+    /// panel and a recording panel indistinguishable whenever a session and a
+    /// task happened to be named alike.
     #[test]
     fn kind_is_part_of_a_target_identity() {
         assert_ne!(
@@ -193,6 +225,14 @@ mod tests {
             PanelTargetVm::File {
                 profile_id: "x".into(),
                 relative_path: "y".into(),
+            }
+        );
+        assert_ne!(
+            PanelTargetVm::Recording {
+                session_id: "x".into(),
+            },
+            PanelTargetVm::Task {
+                task_id: "x".into(),
             }
         );
     }

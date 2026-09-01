@@ -104,7 +104,13 @@ export interface SurfaceColumnSpec {
 }
 
 /** Every surface column, in no particular order — ids, not positions. */
-export const SURFACE_COLUMN_IDS = ["notes-rail", "notes-list", "files-tree", "chat-list"] as const;
+export const SURFACE_COLUMN_IDS = [
+  "notes-rail",
+  "notes-list",
+  "files-tree",
+  "chat-list",
+  "tasks-list",
+] as const;
 
 export type SurfaceColumnId = (typeof SURFACE_COLUMN_IDS)[number];
 
@@ -137,6 +143,13 @@ export const SURFACE_COLUMNS: Record<SurfaceColumnId, SurfaceColumnSpec> = {
   // avatar, a name, a preview line and a timestamp; the floor is where the
   // timestamp would start eating the name.
   "chat-list": { label: "chat list", title: "Chat list", defaultWidth: 320, minWidth: 240 },
+  // 320, the chat list's number and for the same shape of reason: a task row is
+  // two badges, a name, the host word and a relative time on one line. The floor
+  // is where the next-due time would start eating the name — and the name is the
+  // thing this column exists to make scannable, since `validate_id` allows
+  // `nightly backup` and the owner's ask was literally "the list of the saved
+  // names".
+  "tasks-list": { label: "task list", title: "Task list", defaultWidth: 320, minWidth: 240 },
 };
 
 /**

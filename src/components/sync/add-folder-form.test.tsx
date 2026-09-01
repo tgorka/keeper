@@ -21,6 +21,15 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(),
 }));
 
+// The one shell call this form makes outside the dialog: where home is (Story
+// 59.8). Mocked rather than left to fail, because every assertion about the
+// Home control, about a resolved `~` and about the home warning is an assertion
+// about what this answered.
+vi.mock("@tauri-apps/api/path", () => ({
+  homeDir: vi.fn(),
+}));
+
+import { homeDir } from "@tauri-apps/api/path";
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import {
   AddFolderForm,
@@ -34,6 +43,8 @@ import {
   SYNC_EXCLUDES_LABEL,
   SYNC_FOLDER_LABEL,
   SYNC_FORM_PATH_TESTID,
+  SYNC_HOME_FOLDER_LABEL,
+  SYNC_HOME_FOLDER_WARNING,
   SYNC_LFS_THRESHOLD_LABEL,
   SYNC_NAME_LABEL,
   SYNC_PATH_FIXED_NOTE,
@@ -94,6 +105,10 @@ const mockSetCredential = vi.mocked(syncSetCredential);
 const mockClearCredential = vi.mocked(syncClearCredential);
 const mockGetCredential = vi.mocked(syncGetCredential);
 const mockPicker = vi.mocked(openFolder);
+const mockHomeDir = vi.mocked(homeDir);
+
+/** This machine's home, for every test that does not say otherwise. */
+const HOME = "/Users/alice";
 
 function profileVm(over: Partial<SyncProfileVm> = {}): SyncProfileVm {
   return {
@@ -165,6 +180,9 @@ beforeEach(() => {
   // an answer here or the read resolves to nothing at all.
   mockGetCredential.mockResolvedValue(null);
   mockPicker.mockResolvedValue("/Users/alice/notes");
+  // Every form asks the shell where home is as it opens (Story 59.8): the Home
+  // control, a typed `~` and the home warning all read this one answer.
+  mockHomeDir.mockResolvedValue(HOME);
 });
 
 afterEach(() => {
@@ -1407,5 +1425,152 @@ describe("AddFolderForm virtual-file controls (Story 56.12)", () => {
         expect.objectContaining({ virtualPatterns: ["media/**"], virtualOverBytes: null }),
       ),
     );
+  });
+});
+
+describe("AddFolderForm choosing a home directory (Story 59.8)", () => {
+  /** The two fields the submit waits on, for tests that name the folder by hand. */
+  function fillNameAndRemote() {
+    fireEvent.change(screen.getByLabelText(SYNC_NAME_LABEL), { target: { value: "home" } });
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "git@github.com:alice/home.git" },
+    });
+  }
+
+  /**
+   * Wait until the shell has answered where home is.
+   *
+   * The Home control is enabled by exactly that answer, so waiting on it is
+   * what makes the assertions after it mean "this is the behaviour" rather than
+   * "the effect had not landed yet".
+   */
+  async function awaitHome() {
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: SYNC_HOME_FOLDER_LABEL })).toBeEnabled(),
+    );
+  }
+
+  it("fills the folder with this machine's home directory in one press", async () => {
+    render(<AddFolderForm />);
+    await awaitHome();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_HOME_FOLDER_LABEL }));
+
+    // The resolved path, not a `~`: from here on the box holds exactly what
+    // will be stored, and the line under it agrees with it.
+    expect(screen.getByLabelText(SYNC_FOLDER_LABEL)).toHaveValue(HOME);
+    expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent(HOME);
+  });
+
+  it("resolves a typed ~/notes instead of sending a folder literally called ~", async () => {
+    mockSave.mockResolvedValue(profileVm());
+    render(<AddFolderForm />);
+    await awaitHome();
+    fillNameAndRemote();
+
+    fireEvent.change(screen.getByLabelText(SYNC_FOLDER_LABEL), { target: { value: "~/notes" } });
+
+    // Resolved on screen before the press: a tilde that only expands inside the
+    // save is a path nobody got to check.
+    expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent(`${HOME}/notes`);
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(
+        expect.objectContaining({ localPath: `${HOME}/notes` }),
+      ),
+    );
+    // The literal is what a directory called `~` under the working directory
+    // would have come from, and it must never be what the wire carries.
+    expect(mockSave).not.toHaveBeenCalledWith(expect.objectContaining({ localPath: "~/notes" }));
+  });
+
+  it("leaves another user's ~ exactly as typed, for the engine to refuse in its own words", async () => {
+    // The form cannot know where `alice`'s home is, and a path that resolved to
+    // *this* user's home would sync a different folder from the one named. Left
+    // alone it is not absolute, so `SyncProfile::validate` refuses it and quotes
+    // it — which is the answer, rather than a silent substitution.
+    mockSave.mockRejectedValue({
+      code: "internal",
+      message: "local path must be absolute, got ~alice/notes",
+    });
+    render(<AddFolderForm />);
+    await awaitHome();
+    fillNameAndRemote();
+
+    fireEvent.change(screen.getByLabelText(SYNC_FOLDER_LABEL), {
+      target: { value: "~alice/notes" },
+    });
+    expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("~alice/notes");
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ localPath: "~alice/notes" })),
+    );
+    expect(
+      await screen.findByText("local path must be absolute, got ~alice/notes"),
+    ).toBeInTheDocument();
+  });
+
+  it("says what a home folder pulls in when home IS the folder, and nowhere else", async () => {
+    render(<AddFolderForm />);
+    await awaitHome();
+
+    // Nothing chosen yet.
+    expect(screen.queryByText(SYNC_HOME_FOLDER_WARNING)).not.toBeInTheDocument();
+
+    // A folder INSIDE home is the ordinary case and gets no sentence: a warning
+    // that fires on the common answer is a warning nobody reads on the rare one.
+    const folder = screen.getByLabelText(SYNC_FOLDER_LABEL);
+    fireEvent.change(folder, { target: { value: "~/notes" } });
+    expect(screen.queryByText(SYNC_HOME_FOLDER_WARNING)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_HOME_FOLDER_LABEL }));
+    expect(screen.getByText(SYNC_HOME_FOLDER_WARNING)).toBeInTheDocument();
+
+    // A typed `~` is the same folder by another name, so it gets the same
+    // sentence — the warning is about the resolved path, not about the press.
+    fireEvent.change(folder, { target: { value: "~" } });
+    expect(screen.getByText(SYNC_HOME_FOLDER_WARNING)).toBeInTheDocument();
+
+    // And it goes away again, so it is a statement about this folder rather
+    // than something the form said once and kept saying.
+    fireEvent.change(folder, { target: { value: `${HOME}/notes` } });
+    expect(screen.queryByText(SYNC_HOME_FOLDER_WARNING)).not.toBeInTheDocument();
+  });
+
+  it("offers no Home and expands no ~ when the shell cannot say where home is", async () => {
+    // No fallback: `/home/$USER` is wrong on macOS and a plausible-but-wrong
+    // home is the one failure nobody would notice. The path then goes to Rust
+    // exactly as typed and comes back refused, which is visible.
+    mockHomeDir.mockRejectedValue(new Error("no home directory"));
+    mockSave.mockResolvedValue(profileVm());
+    render(<AddFolderForm />);
+    await waitFor(() => expect(mockHomeDir).toHaveBeenCalled());
+    fillNameAndRemote();
+
+    expect(screen.getByRole("button", { name: SYNC_HOME_FOLDER_LABEL })).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText(SYNC_FOLDER_LABEL), { target: { value: "~/notes" } });
+    expect(screen.getByTestId(SYNC_FORM_PATH_TESTID)).toHaveTextContent("~/notes");
+
+    fireEvent.click(screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL }));
+
+    await waitFor(() =>
+      expect(mockSave).toHaveBeenCalledWith(expect.objectContaining({ localPath: "~/notes" })),
+    );
+  });
+
+  it("says it on a folder that already IS home, without offering to repoint it", async () => {
+    // The sentence is a claim about what is being synced rather than about the
+    // press, and somebody opening this form is the person it is now true for.
+    render(<AddFolderForm profile={profileVm({ localPath: HOME })} />);
+
+    expect(await screen.findByText(SYNC_HOME_FOLDER_WARNING)).toBeInTheDocument();
+    // The engine binds a profile to its folder, so nothing here can move it.
+    expect(screen.queryByRole("textbox", { name: SYNC_FOLDER_LABEL })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: SYNC_HOME_FOLDER_LABEL })).not.toBeInTheDocument();
   });
 });

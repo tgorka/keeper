@@ -4,8 +4,8 @@ type: 'feature'
 created: '2026-08-31'
 status: 'done'
 baseline_revision: 'ce9fc87'
-final_revision: '1fb6db7'
-review_loop_iteration: 1
+final_revision: 'acaf980'
+review_loop_iteration: 2
 followup_review_recommended: false
 context:
   - '{project-root}/docs/project-context.md'
@@ -224,3 +224,131 @@ that `remove` exists to stop a re-enabled sweep deleting immediately, and a walk
 - `cargo fmt` from inside `src-tauri/` — expected: no diff after.
 - Mutation: delete `&& self.sync_poll_permits(profile)` from `scan_due`, re-run the duplication
   test, confirm it fails, restore, and confirm `git diff` shows the conjunct back.
+
+## Revision 2 — 2026-09-01: the second gate PR #303 added
+
+### What changed underneath this story after it shipped
+
+`1fb6db7` decided *"does a scheduled sync task stand the folder's paced walking down"* in a world
+with **one** gate over walking a folder. PR **#303** (`c0fd6fe`, *"floor the Pending poll's walk at
+one a minute"*, merged as `427aea8`, this branch rebased onto it) added a second, independent one:
+
+- `POLL_WALK_MIN_INTERVAL: Duration = Duration::from_secs(60)` (`engine.rs:428`)
+- `poll_walked: Mutex<HashMap<String, Instant>>` (`engine.rs:1195`, built at `:1389`) — per profile,
+  **in memory**, absent meaning *never walked by a poll in this process*
+- `fn poll_may_walk(&self, profile)` (`engine.rs:11660`) — `false` when `!profile.enabled` or
+  `first_checkout_is_unfinished(profile)`, otherwise `true` only when the last walk is at least
+  `POLL_WALK_MIN_INTERVAL` old
+- `fn poll_walk_finished(&self, profile_id)` (`engine.rs:11676`), called at `:11940` **after** the
+  walk returns and on both outcomes, so the floor is a gap between *walks*, not between *polls*
+
+From that merge until this revision, `sync_poll_permits` accounted for one of two gates. AD-137's
+rule is that a claim on screen must be true, and AD-141's is that a row which claims to govern must
+actually govern — so a governance reasoned against half the gates is the exact defect class both
+exist to forbid, whichever way the second gate is decided.
+
+### The decision, per gate, and it is deliberately asymmetric
+
+| gate | what it stands in front of | verdict under `Some(Scheduled)` |
+| --- | --- | --- |
+| `scan_is_due` / `scan_due` (`engine.rs:3335`, `:3533`) | a **driver**: the walk that discovers work and hands it to the journal | **surrendered** — unchanged from `1fb6db7` |
+| `poll_may_walk` (`engine.rs:11660`) | a **read**: `Engine::pending`'s status walk, for the Sync pane's Pending list | **left standing** — narrowed by nothing, and never consulted about governance |
+
+**The distinguishing fact, verified rather than assumed.** `poll_may_walk` has exactly two
+references in the whole tree: its definition (`engine.rs:11660`) and one production call site
+(`engine.rs:11848`, inside `Engine::pending`). `Engine::pending` is `pub async fn` at
+`engine.rs:11680` and is reached from exactly one place — `sync_pending`
+(`keeper/src/sync_ipc.rs:1471`, `engine.pending(&id)` at `:1476`), a `#[tauri::command]`. No
+`keeper-syncd` caller exists. That path takes no `Engine::reserve`, enqueues no journal unit, opens
+no `task_runs` row and commits nothing: it builds a `Vec<PendingFile>` and returns it. `c0fd6fe`'s
+own message says the same thing from the other side — *"Nothing about syncing changes: the commit
+leg has its own cadence and is untouched."*
+
+So the two gates are not two of a kind. AD-141's rule is about **drivers** —
+*"adding a driver without surrendering the gate ships a folder that syncs twice"* — and the Pending
+poll's walk cannot make a folder sync twice because it cannot make a folder sync at all.
+
+### Both failure modes, named beside the decision
+
+Required by the brief, and each is the other's cure:
+
+1. **Standing only `scan_is_due` down** — the shape a reviewer would call *"a row that claims to
+   govern and does not"*. It is real, and it is a **cost**, not a lie: somebody who put a large
+   folder on an hourly schedule still watches it walked, up to once a minute per folder, for as long
+   as the Sync pane is open. `startSyncDetailPolling` (`src/lib/stores/sync-detail.ts:273`,
+   `SYNC_DETAIL_POLL_MS = 5_000` at `:102`) calls `refreshSyncDetailAll`, which reads **every**
+   mirrored profile, and `sync-pane.tsx:770` starts it when the pane mounts. What makes it
+   acceptable: it is floored at a minute by #303 itself, it happens only while a person is looking,
+   and — the part that is this revision's obligation — `docs/sync.md` now says so in those exact
+   terms rather than letting a *governed* row imply the folder is never touched.
+2. **Standing both down** — the pane goes dead. The Pending list is where the work accruing between
+   two scheduled windows is visible, and its **untracked** rows come from this walk and from nowhere
+   else (`engine.rs:11943-11948`; the settling rows and the repair backlog are assembled before the
+   walk is asked for). So the folder whose sync is hourly would be the folder whose pane says
+   nothing is waiting. That is the same *feels dead to somebody who just saved a file* failure
+   `a_governed_folders_filesystem_triggers_are_not_stood_down_with_its_poll` already forbids one
+   layer down, moved from the engine to the pane.
+
+### `Engine::reserve` is untouched
+
+Both pre-existing paths still take it — `sync_once` at `engine.rs:8456`ff and `tick_profile` at
+`:3168`ff — and this revision adds no path that takes or skips it. The Pending walk never took one
+and still does not; what serialises *it* is `claim_walk` (`engine.rs:1415`), the same one-walk-per-
+folder claim the commit leg takes.
+
+### Tasks
+
+- [x] `engine.rs` — `sync_poll_permits`'s doc grows the section *"The Pending pane's walk is a
+      second gate, and it is deliberately left"*: the driver-versus-read argument, both failure
+      modes, and a reference to the test that guards it. A declined option argued only in prose is
+      what a later reader deletes as stale, so the argument and its guard are named together.
+- [x] `engine.rs` — `poll_may_walk`'s doc records that governance is deliberately **not** a third
+      shape that answers no, pointing at `sync_poll_permits` for the argument. The decision is
+      spelled in the code as an *absence* of a call, and an absence is what a later "make the
+      stand-down thorough" change removes without noticing.
+- [x] `engine.rs` tests — `a_governed_folder_still_answers_the_pending_polls_walk`: ungoverned both
+      gates open; governed the driver is surrendered **and** the read is not; the minute floor still
+      bites after `poll_walk_finished`; a paused folder is walked by nothing. Both halves are
+      required — without the first a governance that stood everything down would pass, without the
+      second one that stood nothing down would.
+- [x] No production behaviour change. The verdict for both gates is the verdict the code already
+      gave; what this revision adds is that it is now a **decision** with a guard, rather than an
+      unexamined consequence of #303 landing after the story.
+
+### Acceptance Criteria
+
+- Given a folder with a `scheduled` Sync task, when an hour of 1 Hz ticks runs through the real
+  pacing, then the paced backstop opens **zero** walks — unchanged, and re-verified on this tree.
+- Given the same governed folder, when the Pending poll asks, then `poll_may_walk` is **true**;
+  and when a walk has just finished, then it is **false** until the minute is up.
+- Given `poll_may_walk` mutated to consult governance, then
+  `a_governed_folder_still_answers_the_pending_polls_walk` fails.
+
+### Verification, this revision
+
+**Scoped run, on this tree, with the change in:**
+
+- `cargo test … -p keeper-sync` — **1116 lib tests passed, 0 failed**, plus every integration
+  target green (28, 7, 4, 3, 2, 2, 1, 1, 1, 1; 0 failed anywhere).
+- `cargo clippy … -p keeper-sync --all-targets -- -D warnings` — clean.
+- `cargo fmt --all -- --check` — clean, exit 0.
+
+**Mutation, both directions, because a one-sided mutation cannot test an asymmetric decision:**
+
+| mutant | edit | result |
+| --- | --- | --- |
+| **A** — governance removed | `sync_poll_permits`: `Some(TaskMode::Scheduled) => true` | `a_scheduled_sync_task_is_the_folders_only_paced_driver` **FAILED**, `left: (240, 2) right: (0, 2)` — literally the pre-58.8 duplicated-driver world; `a_governed_folder_still_answers_the_pending_polls_walk` also FAILED on its first assert |
+| **B** — governance over-applied | `poll_may_walk`: `\|\| !self.sync_poll_permits(profile)` added to the early-return condition | `a_governed_folder_still_answers_the_pending_polls_walk` **FAILED** on *"governed: and the READ is not"* |
+
+**Restore verified by reading the diff, not from memory.** After restoring:
+`grep -n MUTANT engine.rs` → no matches, and `git diff --numstat -- …/engine.rs` →
+`125  0  src-tauri/crates/keeper-sync/src/engine.rs` — 125 insertions, **0 deletions**, i.e. purely
+additive with no residue anywhere in the file.
+
+### Sentences this revision falsified, and where they were corrected
+
+None in `keeper-sync` or `keeper-core`: the governed row's sentence
+(`PACED_SENTENCE_SCAN_GOVERNED`, `keeper-core/src/tasks.rs:832`) says the *paced backstop* has stood
+down and that the watcher still brings a look forward, which stays true under this decision. The
+corrections are in `docs/sync.md` and are carried by 58.9's revision — see
+`spec-58-9-the-chapter-grows-a-policy.md`, *Revision 2*.

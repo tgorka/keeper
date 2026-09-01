@@ -1440,6 +1440,26 @@ Uploads are deliberately not listed: the path an upload carries is already
 reported by `git status` as a local change, and one fact wearing two hats reads
 as two.
 
+**The list refreshes every five seconds; the full walk behind it does not.** A
+poll re-reads every mirrored folder, but a folder's whole-tree status walk is
+floored at **one a minute**, measured from when the last walk *finished* rather
+than from when a poll started it — so a folder whose walk takes eight seconds is
+not walked again until a minute after that. The walk is what finds **untracked**
+files and what re-checks paths the watcher never saw; everything else on the
+list — the settling rows, the incoming queue, the repair backlog — is assembled
+without it and moves at the poll's own five seconds. The visible cost is that a
+file created while keeper was not watching can take up to a minute to appear,
+and nothing else changes. The floor exists because the walk is not free: on a
+155 625-entry folder on a USB volume the unfloored poll walked the whole tree
+every ten to thirty seconds all day, and an `lstat` of every tracked path is the
+single most expensive thing keeper does. A folder that is **paused**, or whose
+first copy never finished, is not walked for this list at all — the first
+because nothing about it is going to be committed, the second because the walk
+would report every tracked path as deleted, which two integers already say.
+
+Nothing about syncing is paced by that floor: the commit leg has its own cadence
+and never consults this one.
+
 Each row leads with one glyph answering two questions, because a row has space
 for one: the arrow's **direction** says which way the file is travelling, and
 whether it is **circled** says whether the far end already holds something. A
@@ -1895,7 +1915,7 @@ doing its job cannot grow `sync.db`. Unlike the activity log, which is
 explicitly not a source of truth, this record **is** the answer to "when did
 this last run, and what happened".
 
-### The two kinds, and the one that will never exist
+### The kinds, and the one that will never exist
 
 A task's `kind` is one of keeper's own verbs, never a shell string:
 
@@ -1903,12 +1923,43 @@ A task's `kind` is one of keeper's own verbs, never a shell string:
 | --- | --- |
 | `sync` | one full sync pass over the named folder, or over every enabled folder when the task is host-wide — the same `sync --once` body, taking the same per-folder reservation |
 | `release` | one release sweep over the named folder, or over every enabled folder — the same body §9 describes, with every one of its refusals |
+| `verify` | one verification pass over the named folder, or over every enabled folder — the same body `keeper-syncd verify` runs, reading only: no worktree file is written, no object is added to the store, and no network is asked |
 
-Both reuse the existing implementation rather than gaining a second one, which
-is what makes "a task is not a privileged caller" true rather than promised: a
-`release` task refuses exactly where `dehydrate` refuses, hashes the actual
-bytes the same way, asks the server the same per-object question at the moment
-of the deletion, and honours the pin, the per-file deadline and both budgets.
+All three reuse the existing implementation rather than gaining a second one,
+which is what makes "a task is not a privileged caller" true rather than
+promised: a `release` task refuses exactly where `dehydrate` refuses, hashes the
+actual bytes the same way, asks the server the same per-object question at the
+moment of the deletion, and honours the pin, the per-file deadline and both
+budgets.
+
+`verify` is the one kind that takes **no per-folder reservation**, and that is
+deliberate rather than an omission: it writes nothing, so there is no second
+writer to serialize, and a check that stood aside whenever the host happened to
+be syncing would report on the quiet folders and skip the busy ones. It follows
+that a `verify` run never ends in `busy` — there is nothing for it to collide
+with. It does the remote half no more than the verb does: `verify --remote` is
+one batch round trip per object, and a nightly schedule over a folder with ten
+thousand virtual paths is the last place that belongs.
+
+A `verify` run that finds a bad path **fails**, and its detail names the first
+one, because a schedule reporting `ok` about the one folder whose content is
+damaged is the exact failure this chapter's opening paragraph is about. A folder
+whose verify could not run at all — an unparseable `.keepervirtual` is the
+ordinary way — is counted apart from a clean one and fails the run too: a check
+that could not run is not a check that passed. A folder whose removable volume
+is not attached is neither; it is `deferred`, and the window is retried rather
+than consumed.
+
+**A kind is a verb keeper already owns, and the vocabulary stays closed.** Not a
+shell string, and not because a third kind was hard to add — the price of a
+closed vocabulary is precisely that somebody has to write the arm, and that
+price is the point. Every remote this machine talks to is disclosed in
+`docs/egress.md`, which the release workflow diffs against the previous tag; a
+user-supplied command could reach any host on the internet and that diff would
+show nothing whatsoever. There is no task timeout either — only the one-hour
+lease — and no capture of what a command printed. Running arbitrary commands
+from a sync daemon is a different security posture and needs its own decision
+with a stated threat model; until there is one, there is no way to write one.
 
 **`update` is not a task kind and never will be.** There is no such value to
 write, and a hand-written row naming one is skipped as an unreadable kind rather
@@ -1976,18 +2027,34 @@ keeper-syncd tasks list                       # every task, its target, schedule
 keeper-syncd tasks status <task>              # one task and its recorded runs, newest first
 keeper-syncd tasks run <task>                 # run one now, and exit with what happened
 keeper-syncd tasks set <task> [flags]         # create one, or change one that exists
-keeper-syncd tasks enable <task>              # put it back in service
-keeper-syncd tasks disable <task>             # take it out of service, forgetting nothing
-keeper-syncd tasks forget <task>              # delete it and its whole run history
+keeper-syncd tasks enable <task>...           # put one or more back in service
+keeper-syncd tasks disable <task>...          # take them out of service, forgetting nothing
+keeper-syncd tasks forget <task>...           # delete them and their whole run history
 ```
 
-`list` is the only one that addresses no task; every other verb acts on exactly
-one row, and a missing selector is told rather than read as "all of them" — for
-`run` and `forget` that would be a fan-out nobody asked for. A selector gets one
-of three answers, and they are three different pieces of advice: a spelling
-keeper could never have stored (leading or trailing whitespace, or empty) is
-quoted back; a well-formed id with no such row lists what *is* stored; and a row
-this build cannot read says so with its reason rather than claiming no match.
+`list` is the only one that addresses no task. `status`, `run` and `set` act on
+exactly one row; `enable`, `disable` and `forget` act on **as many as you name**,
+and every one of them requires at least one — a missing selector is told rather
+than read as "all of them", which for `run` and `forget` would be a fan-out
+nobody asked for. A selector gets one of three answers, and they are three
+different pieces of advice: a spelling keeper could never have stored (leading
+or trailing whitespace, or empty) is quoted back; a well-formed id with no such
+row lists what *is* stored; and a row this build cannot read says so with its
+reason rather than claiming no match.
+
+**In a batch every id answers for itself.** Each one gets its own line and its
+own transaction, so a row another host rewrote while you were looking at the
+listing is refused on its own and the ids beside it are still written. That is
+`upsert_task`'s promise held per id — a refused write changes nothing, *that
+row* — rather than an all-or-nothing batch that would also un-change the four
+that worked. An id no row answers to is distinguished from a refusal in **how it
+is reported** rather than in what it costs: it names no reason, because there is
+none to give — a refusal is something to act on, and a row another host forgot
+usually is not. It **still counts against the exit code**. The exit code is `2`
+when any id did not go through — `missing` included — and `0` only when every id
+you named was written or forgotten. A verb that acted on two of the three ids it
+was given did not do what it was asked, and `tasks disable a b c` with `b`
+already forgotten elsewhere therefore exits `2`.
 
 `tasks set` takes six flags:
 
@@ -2113,11 +2180,43 @@ The other envelopes: `tasks status` emits `{ "task": …, "runs": [...] }`;
 `tasks run` emits `{ "task", "run", "outcome", "exit" }`, where `run` is `null`
 when a lease held elsewhere meant no run of ours was ever opened, and `exit`
 repeats the process status so a caller that captured stdout need not consult two
-channels; `tasks set`, `tasks enable` and `tasks disable` all emit
-`{ "task": … }` — the row **read back from the store**, never the row that was
-submitted; and `tasks forget` emits `{ "forgot": "<id>" }` and nothing else,
-because echoing the fields of something that no longer exists would invite a
-consumer to believe it still does.
+channels; and `tasks set` emits `{ "task": … }` — the row **read back from the
+store**, never the row that was submitted.
+
+`tasks enable`, `tasks disable` and `tasks forget` each emit
+`{ "results": [ … ] }`, **one entry per id you named, in the order you named
+them**. The shape does not depend on how many ids that was: a contract whose
+envelope changes with the argument count is one a consumer has to branch on
+before it can parse. Each entry carries a fixed five keys, always all five:
+
+```json
+{ "results": [
+  { "task": "nightly", "outcome": "saved", "effect": "rearmed", "reason": null,
+    "row": { "id": "nightly", "kind": "sync", "…": "…" } },
+  { "task": "weekly", "outcome": "missing", "effect": null, "reason": null,
+    "row": null },
+  { "task": "hourly", "outcome": "refused", "effect": null,
+    "reason": "task 'hourly' was changed elsewhere since this was opened …",
+    "row": null } ] }
+```
+
+`outcome` is `saved`, `forgotten`, `missing` or `refused`. `effect` is
+`created`, `updated` or `rearmed` and is non-null **exactly** when `outcome` is
+`saved` — only `created` and `rearmed` mean the task came back into service and
+armed afresh. Of these three verbs, none can produce `created`: only `tasks set`
+creates a row, `enable` and `disable` answer `missing` for an id no row answers
+to, and `forget` never saves anything. So a consumer of `enable`/`disable`
+receives `updated` or `rearmed`, and needs no branch for `created`. `reason` is
+keeper's own refusal sentence, verbatim, and is non-null exactly when `outcome`
+is `refused`. `row` is the task **as re-read after the write**: the row that was
+written, never the row that was submitted. It is `null` for every non-`saved`
+entry — for a forgotten task there is no row left to describe, and echoing the
+fields of something that no longer exists would invite a consumer to believe it
+still does — and it can also be `null` on a `saved` entry, when the re-read could
+not find the row (another host forgot it in between) or could not run at all. The
+receipt still says what happened; `row` is only the store's answer afterwards.
+Every "not applicable" is `null` rather than an absent key, so the key set never
+moves.
 
 ### The release task, and its three modes
 
@@ -2211,25 +2310,39 @@ that gate sits above every mode gate. A reason is attached to the unhosted
 verdict and to nothing else, so a reason present at all **is** the alarm.
 
 In the app, ⌘8 opens **Tasks**, and it is now a place you can work rather than
-only look. Every row states its kind, its schedule, the host that will actually
-run it, its next due time, its missed-window policy, and its last run — the
-**outcome word and the line that run reported**, not merely that it ended; a run
-with no detail renders as absence rather than as an empty string, because those
-are different facts. Each row offers **Run now**, **Edit**, **Forget** and
-**Runs**:
+only look. Every row states its kind, **its mode**, its schedule, the host that
+will actually run it, its next due time, its missed-window policy, and its last
+run — the **outcome word and the line that run reported**, not merely that it
+ended; a run with no detail renders as absence rather than as an empty string,
+because those are different facts. A task that carries a **description** shows
+it under its name; a blank one shows nothing, because a heading over an empty
+string reads as a failed read. Each row offers **Run now**, **Edit**, **Forget**
+and **Runs**:
 
 - **Add a task** is a form in the pane's header, and **Edit** is the same form
   seeded from the row you pressed it on. Every refusal keeper makes at the write
   door — a malformed id, a schedule it cannot parse, `scheduled` with no
-  schedule, a kind that differs from the stored one — is shown **verbatim**, in
-  the form that asked for it. The form re-implements none of those rules: it
-  carries no cron regex and does not trim what you typed, so a task is never
-  stored under a name nobody wrote.
+  schedule, a kind that differs from the stored one, a missed-window delay
+  shorter than the grace period — is shown **verbatim**, in the form that asked
+  for it. The form re-implements none of those rules: it carries no cron regex
+  and does not trim what you typed, so a task is never stored under a name
+  nobody wrote.
+- **Run now** performs the work **whether or not a window is open, and does not
+  move the schedule** — the same contract `keeper-syncd tasks run` has always
+  had, said in the pane beside the button rather than only here. A scheduled
+  task can therefore be run by hand at any time; the only three things that
+  refuse a person are a task that does not exist, one that is `off` or disabled,
+  and a live lease held by the other host.
 - **Forget** asks first, and says what it deletes: a record, never content.
   Nothing a task ever did is undone by forgetting the task.
 - **Runs** opens that task's history — the same bounded, newest-first list
   `tasks status` prints, with the outcome, the time, the host and the detail for
-  each run.
+  each run. The control says how many runs the open section holds and nothing at
+  all while it is shut, because the history is read when you open it and a count
+  keeper has not read is one it must not print. A full section says once that
+  older runs are trimmed: the read asks for twenty and the store keeps the fifty
+  most recent for each task, so the end of that list is not the end of the
+  record.
 - **Edit is not offered** on a row whose kind or mode this build cannot read.
   The store would refuse the write, so the control could only fail.
 
@@ -2297,7 +2410,7 @@ Four standings, and they are four different answers:
 | --- | --- |
 | **paced** | the clock really is pacing this, and the cadence beside it is the one in force — `pollIntervalMs` after its floor is applied, never the number stored on the row |
 | **paused** | the folder is paused, so nothing paces it and **no cadence is shown**. A cadence beside *paused* would be a promise nothing is keeping |
-| **governed** | a `scheduled` **sync task** has taken this folder's paced walk over, so the task's schedule is the cadence — see below. No interval is shown, because none is in force |
+| **governed** | a `scheduled` **sync task** has taken this folder's paced sync poll over, so the task's schedule is the cadence — see *What a scheduled sync task does to a folder's polling* below. No interval is shown, because none is in force |
 | **unregistered** | a notes row only: the folder holds a vault, but keeper has no vault *registered* for it, because the vault folder could not be found when the registry was last built. Nothing paces it, and it is not waiting on a clock |
 
 **A configured vault and a paced vault are two different facts**, which is why
@@ -2329,6 +2442,36 @@ folder's own **Sync now** is on the Sync pane, and a vault is flushed every time
 the window hides. A sentence written to stop somebody hunting for a control must
 not hide the control they were looking for.
 
+#### What a scheduled sync task does to a folder's polling
+
+Give a folder a `sync` task in `scheduled` mode and that schedule **replaces**
+the folder's own backstop poll: the folder is no longer looked at every fifteen
+seconds as well. One driver, not two. Before it worked this way, a folder with
+an hourly sync task was synced hourly *and* every fifteen seconds, and the
+task's run line took the credit for work the ordinary poll would have done
+anyway. `off` and `manual` take nothing away — a `manual` task adds a button,
+and a folder is paused by pausing the folder, never by a task row somebody
+forgot to delete.
+
+Two things are deliberately **not** stood down with it, and both are things you
+would miss:
+
+- **The watcher and the settle window.** A file you just saved is still picked
+  up at once. A schedule owns the folder's *idle* cadence and nothing else. If
+  it owned the event triggers too, a folder on an hourly task would look dead
+  for an hour after you saved something, and a file that finished downloading
+  would wait out the schedule instead of its own settle window.
+- **The Sync pane's own status walk.** The Pending list keeps refreshing for a
+  governed folder exactly as it does for any other — every mirrored folder, at
+  most one full walk a minute each, for as long as the Sync pane is open (§12).
+  That list is the one place the work accruing between two scheduled windows is
+  visible, so a governed folder is the last one whose list should go quiet. It
+  costs a walk a minute while somebody is watching, and it is worth it.
+
+The second of those is the honest small print on *governed*. The standing means
+**this folder's paced sync has stood down**, not that nothing ever looks at the
+folder. That walk syncs nothing and queues nothing; it fills a list.
+
 ### A window that passed while nobody was home
 
 Every task carries one answer to *what should happen to a window that fell due
@@ -2349,7 +2492,7 @@ missed-window policy — it would be a re-timing of the schedule you wrote.
 | setting | what it does to a window nobody served |
 | --- | --- |
 | **`run_now`** | serves it on the first tick that sees it, **once**, however many windows went by |
-| **`delay`** | serves it **30 minutes after a host noticed it** (`TASK_MISSED_DELAY_MS`) — the anchor is the noticing, not the window |
+| **`delay`** | serves it **a delay after a host noticed it** — thirty minutes (`TASK_MISSED_DELAY_MS`) unless the task carries its own. The anchor is the noticing, not the window |
 | **`skip`** | abandons it and arms the next natural window instead |
 
 `run_now` is the default, and it is the default because it is textually what
@@ -2358,6 +2501,39 @@ install's meaning.** It is also precisely `Persistent=true` semantics
 in-process, which is the same rule the shipped systemd timer already words for
 itself — a trigger missed while the machine was off fires once when it comes
 back, once and not once per missed day.
+
+**The delay is the task's own, and thirty minutes is only what it falls back
+to.** `keeper-syncd tasks set --missed-delay <MINUTES>` stores one on the row
+and `--no-missed-delay` takes it off again, and those are two genuinely
+different answers rather than an awkward spelling: storing nothing means *follow
+keeper's own number, whatever it becomes*, while `--missed-delay 30` means
+*thirty minutes even if that number moves*. It is kept whatever `--on-missed`
+says, so switching to `skip` and back does not throw it away, and the ⌘8 form
+writes the same field. `tasks list` shows a stored one in the row's bracket as
+`[on missed: delay 45m]` — minutes when the value divides into them, raw
+milliseconds when it does not, and nothing at all when the task simply uses
+keeper's; `--json` carries it as `missedDelayMs` unconditionally.
+
+**A delay below the grace period is refused, with the reason, and that floor is
+not a taste.** Fifteen minutes is how long a window must sit open before keeper
+concludes nobody was home, so a delay shorter than it would be spent before the
+window it holds back counted as missed: the next tick would serve the window and
+`delay` would be spelling `run_now`, at the price of one extra write and one
+`postponed` row per absence. The ceiling is one year — the same one a schedule
+has, and for the same reason. Both refusals come from the store and are shown
+in the form's own words, wherever the write came from.
+
+**One missed window yields one run under every setting, and that is a safety
+property rather than a convenience.** No policy implements it; it is a property
+of the record. A task's next window is **one stored instant and not a queue**,
+so overdue-by-one and overdue-by-two-hundred are the same state, and the
+replacement instant is computed from the moment a run **finishes** rather than
+from the window it served — otherwise a run that overran its own window would
+come due again the instant it ended. Nothing enumerates the windows that went
+by, so nothing can serve them. It matters more than tidiness because of what one
+of the kinds does: a `release` task deletes local content, so N catch-up sweeps
+would be N deletion passes nobody chose. A laptop shut for a week releases once
+when it comes back, not seven times.
 
 The other two act by **writing** rather than by waiting, and the instant they
 write is the row's own `next_due_ms`. Three things follow, and they are the

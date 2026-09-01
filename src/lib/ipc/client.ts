@@ -264,11 +264,16 @@ export type { SyncUnspellableVm } from "./gen/SyncUnspellableVm";
 export type { SyncVerifyVm } from "./gen/SyncVerifyVm";
 export type { TagVocabularyEntryVm } from "./gen/TagVocabularyEntryVm";
 export type { TagVocabularyVm } from "./gen/TagVocabularyVm";
+export type { TaskBatchEntryVm } from "./gen/TaskBatchEntryVm";
+export type { TaskBatchIdReq } from "./gen/TaskBatchIdReq";
+export type { TaskBatchOutcomeKind } from "./gen/TaskBatchOutcomeKind";
+export type { TaskBatchReceiptVm } from "./gen/TaskBatchReceiptVm";
 export type { TaskHostKind } from "./gen/TaskHostKind";
 export type { TaskHostVm } from "./gen/TaskHostVm";
 export type { TaskListingVm } from "./gen/TaskListingVm";
 export type { TaskRunVm } from "./gen/TaskRunVm";
 export type { TaskSaveReq } from "./gen/TaskSaveReq";
+export type { TaskSchedulePreviewVm } from "./gen/TaskSchedulePreviewVm";
 export type { TaskVm } from "./gen/TaskVm";
 export type { TccPermission } from "./gen/TccPermission";
 export type { TemplateChangeVm } from "./gen/TemplateChangeVm";
@@ -415,9 +420,12 @@ import type { SyncProgressVm } from "./gen/SyncProgressVm";
 import type { SyncStatusVm } from "./gen/SyncStatusVm";
 import type { SyncVerifyVm } from "./gen/SyncVerifyVm";
 import type { TagVocabularyVm } from "./gen/TagVocabularyVm";
+import type { TaskBatchIdReq } from "./gen/TaskBatchIdReq";
+import type { TaskBatchReceiptVm } from "./gen/TaskBatchReceiptVm";
 import type { TaskListingVm } from "./gen/TaskListingVm";
 import type { TaskRunVm } from "./gen/TaskRunVm";
 import type { TaskSaveReq } from "./gen/TaskSaveReq";
+import type { TaskSchedulePreviewVm } from "./gen/TaskSchedulePreviewVm";
 import type { TaskVm } from "./gen/TaskVm";
 import type { TccPermission } from "./gen/TccPermission";
 import type { TemplateUpdateApplyReq } from "./gen/TemplateUpdateApplyReq";
@@ -6397,6 +6405,42 @@ export async function syncTaskForget(id: string): Promise<void> {
 }
 
 /**
+ * Take several tasks in or out of service in one call, resolving the per-id
+ * receipt (Story 59.4).
+ *
+ * **The receipt is the half worth handling.** A rejection means the task record
+ * would not read at all; one id refusing — its baseline moved, its row is one
+ * this build cannot decode, its spelling is one keeper could never have stored —
+ * arrives as a `refused` entry with keeper's own sentence, beside the entries
+ * that were written. N ids in, N entries out, in request order.
+ *
+ * Each id carries the `updatedMs` the caller was looking at, so a row another
+ * writer moved since the render is refused rather than overwritten. Pass `null`
+ * per id to skip that check.
+ *
+ * Rejects with: `unsupported`, `internal` (the task record could not be read).
+ */
+export async function syncTasksSetEnabled(
+  ids: TaskBatchIdReq[],
+  enabled: boolean,
+): Promise<TaskBatchReceiptVm> {
+  return await invoke<TaskBatchReceiptVm>("sync_tasks_set_enabled", { ids, enabled });
+}
+
+/**
+ * Forget several tasks in one call, resolving the per-id receipt (Story 59.4).
+ *
+ * Deletes records, never content. An id no longer stored answers `missing`
+ * rather than refusing — a row another host forgot first is usually benign — and
+ * a row this build cannot read is `refused` rather than deleted (AD-48).
+ *
+ * Rejects with: `unsupported`, `internal` (the task record could not be read).
+ */
+export async function syncTasksForget(ids: string[]): Promise<TaskBatchReceiptVm> {
+  return await invoke<TaskBatchReceiptVm>("sync_tasks_forget", { ids });
+}
+
+/**
  * Everything else this host paces: the per-folder scan, the hourly scratch
  * sweep and each vault's notes cadence (Story 58.7).
  *
@@ -6424,4 +6468,39 @@ export async function syncTaskForget(id: string): Promise<void> {
  */
 export async function syncPacedWork(): Promise<PacedWorkVm[]> {
   return await invoke<PacedWorkVm[]>("sync_paced_work");
+}
+
+/**
+ * What one written schedule would actually do, computed in Rust (Story 59.7).
+ *
+ * **There is no second parser in the browser, and there must never be one.** The
+ * dialect is exact and small — five-field cron, `@hourly`/`@daily`/`@weekly`,
+ * `every <n><unit>` with `s`/`m`/`h`/`d`, a sixty-second floor and a one-year
+ * ceiling — and it is implemented once, in `keeper_sync::tasks`. A JavaScript
+ * cron library beside it would be a second opinion about the same string, and
+ * the one that disagrees is always the one the person is looking at. This
+ * follows `recordingPathPreview`'s precedent on its own stated rule: both the
+ * clock and the renderer belong to Rust.
+ *
+ * **A refusal arrives as data and never as a rejection**, because this is called
+ * as somebody types and a half-written expression is the ordinary case rather
+ * than a fault. `refusal` is `TaskSchedule::parse`'s own sentence, verbatim and
+ * quoting the text that was typed rather than a tidied copy — the same sentence
+ * a save would refuse with, so the two surfaces cannot word one rule twice.
+ * `instants` is empty exactly when `refusal` is set.
+ *
+ * `instants` are epoch ms, soonest first, each chained from the one before — so
+ * they are the real cadence rather than one answer repeated — and there may be
+ * fewer than asked for, never more.
+ *
+ * **`expression` is echoed back, and the caller must check it.** Replies can
+ * land out of order, so a slow answer for a half-typed string can arrive after
+ * a fast answer for the finished one; rendering it would show a refusal for text
+ * the field no longer holds. Compare this against the current value before
+ * drawing anything.
+ *
+ * Rejects with: nothing a refusal covers. `unsupported` only.
+ */
+export async function syncTaskSchedulePreview(expression: string): Promise<TaskSchedulePreviewVm> {
+  return await invoke<TaskSchedulePreviewVm>("sync_task_schedule_preview", { expression });
 }

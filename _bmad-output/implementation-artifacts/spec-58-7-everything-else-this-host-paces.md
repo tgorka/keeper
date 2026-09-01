@@ -5,7 +5,7 @@ created: '2026-08-31'
 status: 'done'
 baseline_revision: 'ce9fc87'
 final_revision: '31ac03a'
-review_loop_iteration: 1
+review_loop_iteration: 2
 followup_review_recommended: false
 context:
   - '{project-root}/docs/project-context.md'
@@ -220,6 +220,64 @@ invariant sweep; capping the fold at the unfolded size fails the completeness
 test; making `stand_down` call `finish(false, …)` fails the owed-work test on
 macOS with `left: Idle, right: Ahead` — the exact state loss it exists to
 prevent. All three restored and re-verified green.
+
+**Pass 2 — 2026-09-01, the #303 reconciliation.** `main` merged #303
+(`c0fd6fe perf(sync): floor the Pending poll's walk at one a minute`) *after*
+this story and 58.8 shipped, and this branch was rebased onto it. It adds a
+**second, independent gate** over walking a folder —
+`POLL_WALK_MIN_INTERVAL = 60s` with a per-profile in-memory `poll_walked` map
+(`engine.rs:428`, `:1195`, `:11605`) — so every sentence this projection prints
+about a folder being looked at was written against a world with one gate. That
+is the exact class of defect AD-137 exists to forbid, so it was re-read rather
+than assumed.
+
+**Checked and declined: the scan row does NOT gain a poll-walk sentence.** Two
+grounds, and the second is the one that decides it.
+
+1. *It does not gate the scan.* **The finding and the decision built on it are
+   Story 58.8's**, argued in `sync_poll_permits`' doc at `engine.rs:8821-8867`
+   under *"The Pending pane's walk is a second gate, and it is deliberately
+   left"* and guarded by a test there: `scan_due` gates a **driver**, while
+   `poll_may_walk` gates a **read** — only caller `Engine::pending`, only
+   reachable from `sync_pending`, enqueues nothing, takes no `reserve`, mints no
+   run row. One can make a folder sync twice; the other cannot make it sync at
+   all. This story **corroborated** it rather than found it: the same call graph
+   was read here independently and reached the same answer before 58.8's message
+   landed — `poll_may_walk` has exactly two call sites, its definition at
+   `engine.rs:11605` and `:11793`, and `tick_profile` / `scan_is_due` /
+   `scan_due` never consult it. #303's own commit message agrees: *"Nothing
+   about syncing changes: the commit leg has its own cadence and is untouched."*
+   Two readers arriving separately at one answer is why it is recorded as
+   settled rather than as one person's assertion.
+2. *Projecting it would be the over-claim this class exists to prevent.* The
+   poll walk has no cadence outside a pane being open. `startSyncDetailPolling`
+   (`src/lib/stores/sync-detail.ts:273`) drives `refreshSyncDetailAll` over every
+   mirrored profile, started by `sync-pane.tsx:770` on mount — so the honest
+   sentence is *"every mirrored folder, at most once a minute each, for as long
+   as the Sync pane is open"*, which is a session-scoped fact. The inventory's
+   own rule rules exactly that shape invisible (item 19, the recording disk
+   guard: *"no identity outside a session"*). A row on ⌘8 claiming it would be a
+   cadence that stops existing when a different pane is closed.
+
+Where it *does* belong is the Sync pane's Pending list, whose freshness it
+actually changes. `Story588` took that note into `docs/sync.md` rather than the
+ledger, since that file is theirs.
+
+**Fixed — the invariant now survives release.** `paced_work` pairs `cadence`
+with `standing` and asserts it with a `debug_assert!`, which is compiled out of
+the build a person runs: the invariant was proven in `cargo test` and unenforced
+in the app. The pane drew `row.cadence ?? PACED_NO_CADENCE_TEXT`, so a wire
+answer carrying both a `governed` standing and an interval would have printed
+*Scheduled* over *about every 15 seconds* — the phrase pass 1's finding 10 found
+on screen in its `Paused` spelling. The cell is now drawn from the **standing**
+and not from the presence of the string, with two tests feeding the pane exactly
+that contradiction (governed and paused) and requiring it to refuse. This is the
+half of the 58.8 contract the pane can hold alone, and it is the half that
+matters the day someone widens `sync_poll_permits`.
+
+**Pass 2 mutation proof.** Reverting the cell to `row.cadence ?? …` fails both
+new tests with `expected <dd …(1)></dd> to be null`; restored, and the restore
+verified by reading `git diff` rather than by recalling the edit.
 
 ## Design Notes
 

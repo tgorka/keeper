@@ -292,6 +292,22 @@ pub struct TaskVm {
     pub profile: Option<String>,
     /// The stored schedule expression, `null` when none is stored.
     pub schedule: Option<String>,
+    /// What the operator called this task, `null` when they called it nothing
+    /// (Story 59.5).
+    ///
+    /// The only human-editable name a task will ever have. [`Self::id`] is
+    /// minted by Rust when the form leaves it blank, and it can never be changed
+    /// afterwards because `task_runs.task_id` joins on it — so an id is either a
+    /// ULID nobody chose or a word chosen once, and this is where a second
+    /// thought about the wording has to go.
+    ///
+    /// Carried verbatim, so `null` and `""` both reach the view and are
+    /// different facts: `null` is every row written before the column existed,
+    /// `""` is a person who cleared the box. A surface drawing this renders
+    /// **either** as nothing — `taskReportText`'s rule, for its reason: a
+    /// heading over an empty string is the one shape a reader takes for a failed
+    /// read.
+    pub description: Option<String>,
     /// What to do about a window that fell due while nobody was home: as
     /// stored, `"run_now"`, `"delay"`, `"skip"`, or a spelling this build does
     /// not know (Story 58.4).
@@ -302,6 +318,20 @@ pub struct TaskVm {
     /// could read it — which is why the view may render it verbatim rather than
     /// having to guess.
     pub on_missed: String,
+    /// How long **this** task holds a missed window back, in milliseconds, or
+    /// `null` to use keeper's own default (Story 59.6).
+    ///
+    /// Only meaningful while [`Self::on_missed`] is `"delay"`, and carried on
+    /// every row regardless, because the store keeps the number across a policy
+    /// change rather than forgetting what somebody typed.
+    ///
+    /// `null` is **not** the same fact as the default's own number: a row that
+    /// chose thirty minutes keeps thirty minutes if keeper's constant is ever
+    /// retuned, and a row that chose nothing follows it. A surface that wants to
+    /// state the effective wait therefore composes it from this value *or* the
+    /// mirrored default, and never substitutes one for the other.
+    #[ts(type = "number | null")]
+    pub missed_delay_ms: Option<i64>,
     /// When it next comes due: ms since the Unix epoch, `null` when never.
     #[ts(type = "number | null")]
     pub next_due_ms: Option<i64>,
@@ -373,12 +403,30 @@ pub struct TaskSaveReq {
     pub profile_id: Option<String>,
     /// The schedule expression, `null` to store none.
     pub schedule: Option<String>,
+    /// What to call this task, `null` to store no description.
+    ///
+    /// Sent exactly as typed, and `null` rather than `""` for the absent case on
+    /// `schedule`'s rule above: the empty string is a value, and a form that
+    /// coerced whitespace to absence would be storing something other than what
+    /// was in the box. Nothing refuses a spelling here — there is no vocabulary
+    /// and no grammar to be wrong about, which is what makes this the one task
+    /// field with no refusal attached to it.
+    pub description: Option<String>,
     /// The requested missed-window policy, as one of the stored spellings.
     ///
     /// A `String` rather than an enum for [`TaskVm::on_missed`]'s reason, and
     /// refused rather than coerced when this build cannot read it — the same
     /// answer `kind` and `mode` already get.
     pub on_missed: String,
+    /// The requested per-task missed-window delay in milliseconds, or `null` to
+    /// store none and so use keeper's default (Story 59.6).
+    ///
+    /// Refused rather than clamped when it is shorter than the grace period or
+    /// longer than a schedule may be — `keeper_sync::tasks::validate_missed_delay_ms`
+    /// owns both bounds and the sentences, and the caller renders whichever
+    /// arrives.
+    #[ts(type = "number | null")]
+    pub missed_delay_ms: Option<i64>,
     /// The `updated_ms` the caller's reading of this row carried, or `null`.
     ///
     /// The lost-update guard, and it is a **request** field rather than a
@@ -1096,6 +1144,163 @@ fn plural_words(count: u64, unit: &str) -> String {
     } else {
         format!("{count} {unit}s")
     }
+}
+
+/// What one written schedule fires at, or the refusal it earns (Story 59.7,
+/// FR-368).
+///
+/// The answer to *when does this actually run*, asked by the task form while
+/// somebody is still typing, and answered by the only implementation of the
+/// dialect there is: `keeper_sync::tasks::preview_schedule` runs the same
+/// `TaskSchedule::parse` the write door runs and the same `next_due_after` the
+/// tick runs. The browser gains no cron parser, and the reason is not tidiness
+/// — a second implementation would drift, and its first symptom would be a
+/// preview that disagreed with the engine about when a task runs, which is a
+/// lie about the future told with a straight face. `recording_path_preview` is
+/// the precedent and states the same rule: both the clock and the renderer
+/// belong to Rust.
+///
+/// This type is the wire shape only; it holds no dialect knowledge, because
+/// this crate is deliberately `keeper-sync`-free (AD-40) and could not call the
+/// parser even if it wanted to. The shell composes it.
+///
+/// **[`Self::refusal`] and [`Self::instants`] are mutually exclusive**, and a
+/// struct with an `Option` beside a `Vec` can *represent* both at once where the
+/// `keeper_sync::tasks::SchedulePreview` enum this is composed from cannot. The
+/// exclusion is the shell's to keep and its match over that enum is total, so it
+/// cannot accidentally emit both. A tagged union here would have made the
+/// illegal state unrepresentable and was considered; it was declined because it
+/// buys no behaviour — the surface has to decide what a malformed answer looks
+/// like either way — and because the shape then diverges from
+/// `RecordingPathPreviewVm`, the precedent this read is modelled on. So the rule
+/// is stated here, and the renderer's precedence — **a refusal wins** — is
+/// pinned by a test rather than left to whichever branch happens to be written
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskSchedulePreviewVm {
+    /// The expression this answer is **about**, echoed exactly as it was asked.
+    ///
+    /// On the wire for one reason, and it is a correctness one: a caller that
+    /// asks on every keystroke has replies that can land out of order, so a slow
+    /// answer about `0 3 * * ` can arrive after the answer about `0 3 * * *` and
+    /// paint a refusal over text the box no longer holds. The caller compares
+    /// this against what it currently holds and renders nothing when they
+    /// differ. Without the echo that guard cannot be written at all.
+    pub expression: String,
+    /// keeper's own refusal, verbatim, `null` when the expression parsed.
+    ///
+    /// The same sentence the save would show, from the same `Display` the save's
+    /// error travels on — so a person meets one wording rather than a preview's
+    /// paraphrase and then the real thing. It is a **refusal**, not a fault:
+    /// asking about half-typed text is normal, so this arrives as data on a
+    /// successful read rather than as a failed command, and nothing about it
+    /// blocks a save. The write door still decides, still refuses, and still
+    /// quotes what was typed.
+    pub refusal: Option<String>,
+    /// The next instants this schedule fires at: ms since the Unix epoch,
+    /// soonest first.
+    ///
+    /// Empty when [`Self::refusal`] is set. Each instant is computed from the one
+    /// before it, so this is the schedule's own cadence rather than one answer
+    /// repeated — and it is very often **shorter** than the number asked for. An
+    /// `every <n><unit>` interval carries exactly **one**, because it fires that
+    /// long after the previous run *finishes* and nothing can know how long the
+    /// first run will take; a cron pattern names wall-clock instants and so
+    /// carries as many as were asked for. A surface therefore renders however
+    /// many arrived and claims no count of its own — a sentence saying *the next
+    /// three* over a list of one is the sort of small lie this whole read exists
+    /// to remove.
+    #[ts(type = "Array<number>")]
+    pub instants: Vec<i64>,
+}
+
+/// One id in a batched task write, as the wire carries it.
+///
+/// The baseline is a **request** field because only the caller knows whether it
+/// holds a reading worth checking — `TaskSaveReq::baseline_updated_ms`'s own
+/// rule. A bulk action from a rendered list is the case that has one: the person
+/// decided against the rows they were looking at, so each id carries that row's
+/// `updatedMs`. A caller that reads and writes inside one call passes `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskBatchIdReq {
+    /// The task's id, exactly as the listing spells it.
+    pub id: String,
+    /// The `updatedMs` this write started from, or `null` for no baseline.
+    #[ts(type = "number | null")]
+    pub baseline_updated_ms: Option<i64>,
+}
+
+/// What a batched task write did to **one** id.
+///
+/// Four kinds and not three: [`Self::Missing`] is not a [`Self::Refused`],
+/// because the two want different words on screen. A refusal is something to act
+/// on; a well-formed id whose row another host forgot is usually benign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum TaskBatchOutcomeKind {
+    /// The row was written. [`TaskBatchEntryVm::effect`] says what changed.
+    Saved,
+    /// The row and its whole run history are gone.
+    Forgotten,
+    /// Well formed, and no such row on this host. Nothing was written.
+    Missing,
+    /// Nothing was written, and [`TaskBatchEntryVm::reason`] says why.
+    Refused,
+}
+
+/// One entry of a batch's receipt: the id that was asked about, and its answer.
+///
+/// **Partial success is a real outcome and is reported rather than thrown** —
+/// `FilesDeleteReceiptVm`'s rule (`vm.rs:4744-4750`), for the same reason: a row
+/// can be rewritten by the other host between the render and the command, and
+/// failing the whole call would leave the other four written with an error on
+/// screen saying nothing happened. Each id answers for itself.
+///
+/// **The invariant the surfaces rely on:** [`Self::effect`] is `Some` exactly
+/// when [`Self::outcome`] is [`TaskBatchOutcomeKind::Saved`], and
+/// [`Self::reason`] is `Some` exactly when it is
+/// [`TaskBatchOutcomeKind::Refused`]. As with `TaskSchedulePreviewVm`, a flat
+/// struct with two `Option`s can *represent* a combination the producer never
+/// emits; the exclusion is the shell's to keep, and its match over
+/// `keeper_sync::db::TaskBatchOutcome` is total, so it cannot accidentally emit
+/// both.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskBatchEntryVm {
+    /// The id **as requested**, so a caller can align the receipt with what it
+    /// sent without matching on anything else. N ids in, N entries out, in
+    /// request order — the same id twice is two entries.
+    pub id: String,
+    /// What happened to it, for branching and for tests.
+    pub outcome: TaskBatchOutcomeKind,
+    /// What the write did: `"created"`, `"updated"` or `"rearmed"`. `null` for
+    /// every kind but [`TaskBatchOutcomeKind::Saved`].
+    ///
+    /// It matters to a surface because only `created` and `rearmed` mean the task
+    /// came back into service and armed afresh.
+    pub effect: Option<String>,
+    /// keeper's own refusal sentence, verbatim. `null` for every kind but
+    /// [`TaskBatchOutcomeKind::Refused`].
+    ///
+    /// Rendered as it arrives rather than paraphrased, so a person meets one
+    /// wording here and at the single-id write door.
+    pub reason: Option<String>,
+}
+
+/// What a batched task write did, one entry per requested id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct TaskBatchReceiptVm {
+    /// One entry per requested id, in request order. Never shorter than what was
+    /// asked for, and never collapsed.
+    pub entries: Vec<TaskBatchEntryVm>,
 }
 
 #[cfg(test)]

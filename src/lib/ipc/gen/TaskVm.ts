@@ -43,6 +43,24 @@ profile: string | null,
  */
 schedule: string | null, 
 /**
+ * What the operator called this task, `null` when they called it nothing
+ * (Story 59.5).
+ *
+ * The only human-editable name a task will ever have. [`Self::id`] is
+ * minted by Rust when the form leaves it blank, and it can never be changed
+ * afterwards because `task_runs.task_id` joins on it — so an id is either a
+ * ULID nobody chose or a word chosen once, and this is where a second
+ * thought about the wording has to go.
+ *
+ * Carried verbatim, so `null` and `""` both reach the view and are
+ * different facts: `null` is every row written before the column existed,
+ * `""` is a person who cleared the box. A surface drawing this renders
+ * **either** as nothing — `taskReportText`'s rule, for its reason: a
+ * heading over an empty string is the one shape a reader takes for a failed
+ * read.
+ */
+description: string | null, 
+/**
  * What to do about a window that fell due while nobody was home: as
  * stored, `"run_now"`, `"delay"`, `"skip"`, or a spelling this build does
  * not know (Story 58.4).
@@ -54,6 +72,21 @@ schedule: string | null,
  * having to guess.
  */
 onMissed: string, 
+/**
+ * How long **this** task holds a missed window back, in milliseconds, or
+ * `null` to use keeper's own default (Story 59.6).
+ *
+ * Only meaningful while [`Self::on_missed`] is `"delay"`, and carried on
+ * every row regardless, because the store keeps the number across a policy
+ * change rather than forgetting what somebody typed.
+ *
+ * `null` is **not** the same fact as the default's own number: a row that
+ * chose thirty minutes keeps thirty minutes if keeper's constant is ever
+ * retuned, and a row that chose nothing follows it. A surface that wants to
+ * state the effective wait therefore composes it from this value *or* the
+ * mirrored default, and never substitutes one for the other.
+ */
+missedDelayMs: number | null, 
 /**
  * When it next comes due: ms since the Unix epoch, `null` when never.
  */

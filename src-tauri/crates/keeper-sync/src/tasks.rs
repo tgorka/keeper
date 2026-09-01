@@ -92,6 +92,13 @@ pub const TASK_MISSED_GRACE_MS: i64 = 15 * 60_000;
 /// grace elapses are the busiest — a boot, a login, a mail client and a browser
 /// all waking at once — and housekeeping over a git remote is exactly the work
 /// that should not join that.
+///
+/// **The default rather than the only value** (Story 59.6, FR-366). A task may
+/// carry its own `missed_delay_ms`, and an absent one means exactly this
+/// constant — so every row written before that column existed keeps meaning what
+/// it meant. [`effective_missed_delay_ms`] is the single place that resolution
+/// happens, and [`validate_missed_delay_ms`] is the single place an override is
+/// refused; the number below stays the one a person gets by not choosing.
 pub const TASK_MISSED_DELAY_MS: i64 = 30 * 60_000;
 
 /// Milliseconds in one minute — the resolution of the whole cron dialect.
@@ -138,6 +145,21 @@ const MAX_DAYS_IN_MONTH: [u32; 13] = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31,
 /// `from_stored` returns `None` for `"update"`, a hand-written row naming it is
 /// skipped like any other unknown kind rather than honoured.
 ///
+/// **Why the vocabulary stays closed, stated once here because this is where a
+/// third variant proves it can grow.** A kind names a verb *keeper* owns, so
+/// every kind is code that already exists in this workspace, already has its
+/// own refusals, and already answers to the same reviewer. A shell string
+/// would name a verb nobody in this tree wrote: the daemon's egress is
+/// disclosed in `docs/egress.md` and diffed against the previous tag by the
+/// release workflow, and a user command can reach any host on the internet
+/// while that diff shows nothing whatsoever. There is also no task timeout —
+/// only the one-hour lease — and no stdout capture, so an arbitrary command
+/// that hangs would hold a lease for an hour and report a line nobody wrote.
+/// `ARCHITECTURE-SCHEDULED-TASKS.md`'s `## Deferred` entry is therefore
+/// **still deferred**, and adding a variant here does not touch it: the price
+/// of a closed vocabulary is that somebody must write the arm, which is
+/// exactly the price being kept.
+///
 /// `Sync` is the kind that exists first because its effect is already real and
 /// already safe: `sync --once` is documented as the cron entry point, and
 /// `Engine::sync_once` opens by taking the same per-profile reservation the
@@ -168,6 +190,34 @@ pub enum TaskKind {
     /// of it, which is why "a due task really runs" could be asserted a wave
     /// earlier without a stub.
     Release,
+    /// One verification pass over the named folder, or over every enabled
+    /// folder when the task is host-wide (Story 59.9).
+    ///
+    /// `Engine::verify` is the whole implementation, unchanged and un-widened:
+    /// the same body `keeper-syncd verify` runs, with the same four free
+    /// excuses AD-129 requires before an absent object is called normal. What
+    /// a task adds is a **schedule and a memory** — the one thing a check
+    /// most needs, because a check nobody remembers running is
+    /// indistinguishable from a check that stopped running, which is the
+    /// sentence `verify`'s own `virtual` count already exists to answer.
+    ///
+    /// **Why this kind needed no new machinery, and why that is the test it
+    /// had to pass.** It reads: no worktree file is written, no object is
+    /// added to the store, and it opens the repository through
+    /// `git::repo::open_read_only` precisely so it does not do the ordinary
+    /// door's housekeeping — *"a check that repairs what it is checking is not
+    /// a check"*. So it takes **no reservation** and needs none, which also
+    /// means `TaskOutcome::Busy` is unreachable for this kind: a check that
+    /// stood aside while the host synced would report nothing on exactly the
+    /// folders that are moving. It asks **no network** either — the remote
+    /// half of `verify` is `--remote`, one batch round trip per object, and a
+    /// nightly task over NFR-41's ten-thousand-path fixture is the last place
+    /// that belongs.
+    ///
+    /// It is also the kind whose `detail` line is worth reading on a run that
+    /// went fine: *"1000 paths checked, 0 bad, 1000 virtual in 1 folders"* is
+    /// the answer to a question `sync` and `release` cannot be asked.
+    Verify,
 }
 
 impl TaskKind {
@@ -177,6 +227,7 @@ impl TaskKind {
         match self {
             Self::Sync => "sync",
             Self::Release => "release",
+            Self::Verify => "verify",
         }
     }
 
@@ -186,6 +237,7 @@ impl TaskKind {
         match value {
             "sync" => Some(Self::Sync),
             "release" => Some(Self::Release),
+            "verify" => Some(Self::Verify),
             _ => None,
         }
     }
@@ -695,6 +747,132 @@ impl TaskSchedule {
     }
 }
 
+/// What one written schedule previews to (Story 59.7, FR-368).
+///
+/// No `Result`, deliberately. Every way [`preview_schedule`] can fail is a
+/// sentence for the person who typed the expression, and a `Result` would push
+/// that fact out of the type and into each caller's judgement — the shell's IPC
+/// arm would have to decide which `Err` means *you typed it wrong* and which
+/// means *keeper is broken*, guessing at variants it does not own. There is no
+/// second class of failure here, so there is no second arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchedulePreview {
+    /// [`TaskSchedule::parse`]'s own refusal, rendered exactly as the save door
+    /// renders it, quoting what was typed.
+    Refused(String),
+    /// The next instants in epoch milliseconds, soonest first.
+    ///
+    /// Never more than were asked for and never more than
+    /// [`MAX_SCHEDULE_PREVIEW_INSTANTS`]; very often fewer. An
+    /// `every <n><unit>` interval carries exactly one — see
+    /// [`preview_schedule`] for why only the first is knowable — and a cron
+    /// pattern can run out of search window.
+    ///
+    /// **Non-empty for any expression that parsed, at any clock a machine can
+    /// actually hold, and a `count` above nought** — stated with that
+    /// qualification because the absolute version is false and the exception is
+    /// asserted: at `i64::MAX` a cron overflows its checked arithmetic and an
+    /// interval saturates into an instant that is not *strictly after* the one
+    /// it was given, so both answer an empty list. A renderer therefore treats
+    /// empty as *nothing to say* rather than as impossible.
+    Fires(Vec<i64>),
+}
+
+/// The most instants one preview will answer, whatever was asked for.
+///
+/// A bound rather than a suggestion, because [`preview_schedule`] reserves for
+/// what it was asked and `count` is a `usize`: without this, a caller that
+/// passed `usize::MAX` would allocate for it before the first instant existed.
+/// Eight rather than the three the app asks for, so the number is a ceiling on
+/// a *pathological* request and not a second opinion about how many instants a
+/// surface should show — that choice belongs to the caller.
+pub const MAX_SCHEDULE_PREVIEW_INSTANTS: usize = 8;
+
+/// The next few instants one written schedule fires at, or the refusal it
+/// earns (Story 59.7, FR-368).
+///
+/// This exists so that there is exactly **one** implementation of the dialect.
+/// The form that asks the question could have grown a cron parser of its own in
+/// the browser, and the first symptom would not have been a crash: it would
+/// have been a preview that quietly disagreed with the engine about when a task
+/// runs, which is a lie about the future told with a straight face. So this
+/// walks the same [`TaskSchedule::parse`] the write door walks, the same
+/// [`TaskSchedule::next_due_after`] the tick walks, and reports the refusal
+/// through the same `Display` the save's own error goes out on — so the
+/// sentence a person reads before saving and the sentence they read after
+/// saving are the same sentence, not two spellings of one rule.
+///
+/// Each instant is computed from the previous one rather than from `now_ms`,
+/// which is what makes the list the schedule's own cadence instead of `count`
+/// copies of the first answer.
+///
+/// **An interval previews exactly one instant, however many were asked for**,
+/// and that is the difference between this being a preview and it being a
+/// guess. [`TaskSchedule::Every`] fires `interval_ms` after the **end of the
+/// previous run**, so `Engine::next_task_window` re-derives it from
+/// `finished_ms` every time; the second instant therefore depends on how long
+/// the first run takes, which nothing can know before the task has ever run. A
+/// list of three would have been arithmetic that looked like knowledge — and
+/// this whole function exists so that a preview cannot disagree with the engine.
+/// A cron pattern has no such dependency: it names wall-clock instants, so
+/// walking it forward answers the same instants the tick will, and only a run
+/// that overran a slot moves one.
+///
+/// Nothing here special-cases an empty expression: `""` earns the malformed
+/// refusal, exactly as it does at the write door. A caller that means *store no
+/// schedule* must not ask this question at all, because the answer to *what
+/// does the empty string fire at* is honestly a refusal.
+pub fn preview_schedule(
+    expression: &str,
+    now_ms: i64,
+    utc_offset_minutes: i32,
+    count: usize,
+) -> SchedulePreview {
+    let schedule = match TaskSchedule::parse(expression) {
+        Ok(schedule) => schedule,
+        Err(refusal) => return SchedulePreview::Refused(refusal.to_string()),
+    };
+    // Two clamps, and they answer two different questions.
+    //
+    // `MAX_SCHEDULE_PREVIEW_INSTANTS` bounds what a caller may ask for, because
+    // `count` is a `usize` and the allocation below is eager: a caller that
+    // passed `usize::MAX` would otherwise reserve for it before the first
+    // instant was computed. Nothing in the tree asks for more than three, so
+    // the bound costs nothing and removes the question.
+    //
+    // The second clamp is the interval rule from the doc above: an interval's
+    // second instant is anchored on the first run's completion, so one is all
+    // that is knowable and one is all that is offered. Both are `min` rather
+    // than a branch, so `count == 0` still means nothing at all.
+    let asked = count.min(MAX_SCHEDULE_PREVIEW_INSTANTS);
+    let horizon = match schedule {
+        TaskSchedule::Every { .. } => asked.min(1),
+        TaskSchedule::Cron(_) => asked,
+    };
+    let mut fires = Vec::with_capacity(horizon);
+    let mut from = now_ms;
+    for _ in 0..horizon {
+        let Some(next) = schedule.next_due_after(from, utc_offset_minutes) else {
+            break;
+        };
+        // Strictly increasing or the walk stops. `next_due_after` promises
+        // *strictly after* and both variants keep the promise — `Cron` walks
+        // with checked arithmetic and answers `None` rather than wrapping, and
+        // `Every`'s `saturating_add` could pin at `i64::MAX` but never walks
+        // twice now that an interval previews one instant. So this is an
+        // invariant check rather than a live branch, kept because the list is
+        // rendered to a person: a repeated or backwards instant would read as a
+        // schedule that fires twice at once, and the next variant added to
+        // `TaskSchedule` is the one that would introduce it.
+        if next <= from {
+            break;
+        }
+        fires.push(next);
+        from = next;
+    }
+    SchedulePreview::Fires(fires)
+}
+
 impl CronSpec {
     /// Parse the five whitespace-separated fields, or `None`.
     ///
@@ -973,6 +1151,83 @@ pub fn validate_id(id: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether `delay_ms` is a per-task missed-window delay a task could coherently
+/// carry (Story 59.6, FR-366).
+///
+/// **The single implementation of that rule**, for [`validate_id`]'s reason and
+/// with the same two callers on opposite sides of the database:
+/// [`crate::db::upsert_task`] refuses at the write door, and `keeper-syncd tasks
+/// set` converts a person's minutes before it ever opens a store. Pure, so both
+/// may ask it, and so the two boundaries are asserted against literal integers.
+///
+/// `None` is always fine and always means [`TASK_MISSED_DELAY_MS`] — that is
+/// what keeps a row written before this column existed meaning what it meant.
+///
+/// # The floor is the grace period, and it is not a taste
+///
+/// [`TASK_MISSED_GRACE_MS`] is *the interval that concludes nobody was home*:
+/// nothing is a missed window until it has been open that long. A delay shorter
+/// than it is therefore not a delay at all — it would be over before the window
+/// it holds back was recognised as missed, so the very next tick would serve the
+/// window and `delay` would be spelling `run_now` at a cost of one extra write
+/// and one `postponed` run row per absence. Two settings, one behaviour, is
+/// exactly the collapse 58.4's review moved the anchor to avoid.
+///
+/// # The ceiling is the schedule's ceiling, for the schedule's reason
+///
+/// A delay is stored by writing `next_due_ms` forward, so an enormous one is
+/// indistinguishable from [`MAX_SCHEDULE_INTERVAL_MS`]'s own failure: a row that
+/// reports itself enabled and scheduled while the instant it is waiting for is
+/// past anybody's patience. `every 100000000d` is refused for that; `--missed-delay
+/// 100000000` would arrive at the same place through the other door, so it meets
+/// the same bound. Nothing is lost above it — a task that wants its housekeeping
+/// a year later wants a different schedule, not a delay.
+pub fn validate_missed_delay_ms(delay_ms: Option<i64>) -> Result<()> {
+    let Some(delay_ms) = delay_ms else {
+        return Ok(());
+    };
+    if delay_ms < TASK_MISSED_GRACE_MS {
+        return Err(SyncError::Config(format!(
+            "task missed-window delay must be at least the grace period \
+             ({TASK_MISSED_GRACE_MS} ms), because the grace period is the interval \
+             that concludes nobody was home — a shorter delay would elapse before \
+             the window it holds back counted as missed, which is run_now wearing \
+             delay's name, got {delay_ms} ms"
+        )));
+    }
+    if delay_ms > MAX_SCHEDULE_INTERVAL_MS {
+        return Err(SyncError::Config(format!(
+            "task missed-window delay must not exceed a year \
+             ({MAX_SCHEDULE_INTERVAL_MS} ms), the ceiling a schedule has and for the \
+             same reason: the delay is stored as the instant the window is held \
+             back to, so one that far ahead is a task that reports itself enabled \
+             and scheduled while nothing ever runs, got {delay_ms} ms"
+        )));
+    }
+    Ok(())
+}
+
+/// How long this task holds a missed window back: its own value, or the
+/// constant (Story 59.6, FR-366).
+///
+/// **The one place the override is resolved**, and it is a named function rather
+/// than an `unwrap_or` at the call site so that *"absent means the constant"* is
+/// a rule with a home instead of a habit. There is exactly one production reader
+/// of the answer — `Engine::move_task_window`, which turns it into the stored
+/// instant — and a second one appearing anywhere is a second chance to read a
+/// `None` as a zero.
+///
+/// It does not re-check the bounds, exactly as `db::get_task` does not re-check
+/// [`validate_id`]: the bounds are a rule about what may be *written*, and this
+/// is a read on a 1 Hz tick that has to answer. A value from a newer keeper is
+/// therefore honoured as stored rather than clamped — clamping would hold a
+/// window back to an instant nobody chose and leave no trace of having done it,
+/// and `move_task_window` writes the instant it computes into a `detail` line a
+/// person reads, so an unusual delay explains itself there.
+pub fn effective_missed_delay_ms(delay_ms: Option<i64>) -> i64 {
+    delay_ms.unwrap_or(TASK_MISSED_DELAY_MS)
 }
 
 /// The pure gate: what this host should do about one task, right now.
@@ -1477,7 +1732,14 @@ mod tests {
     /// run (NFR-43).
     #[test]
     fn an_unrecognised_stored_kind_including_update_is_not_a_kind_this_build_runs() {
-        for value in ["update", "Sync", "", "teleport", "Release", "releases"] {
+        for value in [
+            "update", "Sync", "", "teleport", "Release", "releases", "Verify", "verifies",
+            // Story 59.9's own near-miss, and the one that matters most: the
+            // deferred kind is an arbitrary command, so the spelling a
+            // hand-written row would most plausibly try is a verb-looking
+            // string this build does not own.
+            "exec", "run",
+        ] {
             assert_eq!(
                 TaskKind::from_stored(value),
                 None,
@@ -1490,13 +1752,18 @@ mod tests {
         // not widen the vocabulary by anything else, and `update` in particular
         // is still nothing this build can name.
         assert_eq!(TaskKind::from_stored("release"), Some(TaskKind::Release));
+        // Story 59.9's kind, asserted here for the same reason `release` is:
+        // the claim is that a *third* variant widened the vocabulary by
+        // exactly one word, and that `update` is still nothing this build can
+        // name after it.
+        assert_eq!(TaskKind::from_stored("verify"), Some(TaskKind::Verify));
     }
 
     /// The on-disk spellings are the compatibility surface, so every one of
     /// them must survive a round trip through the reader that parses it.
     #[test]
     fn every_stored_spelling_round_trips() {
-        for kind in [TaskKind::Sync, TaskKind::Release] {
+        for kind in [TaskKind::Sync, TaskKind::Release, TaskKind::Verify] {
             assert_eq!(TaskKind::from_stored(kind.as_str()), Some(kind));
         }
         for mode in [TaskMode::Off, TaskMode::Manual, TaskMode::Scheduled] {
@@ -1600,6 +1867,465 @@ mod tests {
                 parsed.is_ok(),
                 "the dev harness shows {literal:?}, which this dialect refuses: {}",
                 parsed.expect_err("refused")
+            );
+        }
+    }
+
+    /// Every form the task form **offers** is one this dialect accepts
+    /// (Story 59.7).
+    ///
+    /// The sibling of the harness guard above, aimed at the person rather than
+    /// at the developer. Story 59.7 puts a menu of starting points beside the
+    /// schedule box so nobody has to know cron by heart; a menu entry the parser
+    /// refuses would be help that produces a refusal, which is worse than no
+    /// help at all — and it is the identical defect the harness guard exists to
+    /// stop, so it gets the identical shape.
+    ///
+    /// Rust reading TypeScript, where this repo's other cross-language guards
+    /// read the other way round. That is not an oversight: only Rust can run
+    /// `TaskSchedule::parse`, so this is the only direction in which the claim
+    /// can actually be checked rather than restated.
+    #[test]
+    fn every_schedule_the_form_offers_is_one_this_dialect_accepts() {
+        let offers = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../src/components/sync/schedule-offers.ts")
+            .canonicalize()
+            .expect("src/components/sync/schedule-offers.ts is in this repository");
+        let source = std::fs::read_to_string(&offers).expect("read the offered forms");
+
+        // `expression: "…"`, which is how the offer objects spell it. The type
+        // declaration's own `expression: string;` carries no quote and is not
+        // matched.
+        let mut found = Vec::new();
+        for rest in source.split("expression: \"").skip(1) {
+            let Some(literal) = rest.split('"').next() else {
+                continue;
+            };
+            found.push(literal.to_owned());
+        }
+
+        // Before anything is asserted about the contents: a renamed field or a
+        // reshaped list would otherwise make this test pass over nothing.
+        assert!(
+            found.len() >= 5,
+            "the extraction found {} offered expressions in {}, which is too few \
+             to be the offered list — has the field been renamed?",
+            found.len(),
+            offers.display()
+        );
+
+        for literal in &found {
+            let parsed = TaskSchedule::parse(literal);
+            assert!(
+                parsed.is_ok(),
+                "the form offers {literal:?}, which this dialect refuses: {}",
+                parsed.expect_err("refused")
+            );
+        }
+    }
+
+    /// Every kind the form **offers** is one this build runs, and every kind it
+    /// runs is one the form offers (Story 59.11).
+    ///
+    /// The guard above's method pointed at a second pair of files, and for a
+    /// defect that had already happened rather than one that might: Story 59.9
+    /// taught [`TaskKind::from_stored`] `"verify"` and left `TASK_KINDS` in
+    /// `src/lib/stores/sync.ts` reading `["sync", "release"]`, so for one epic
+    /// the only kind that *checks* rather than moves bytes was creatable from a
+    /// terminal and from nowhere else. Nothing went red, because the coupling
+    /// between those two lists was a sentence in a doc comment. Direction 2
+    /// below is that sentence made mechanical, and it is the direction that was
+    /// actually violated.
+    ///
+    /// **Why this reads two files instead of enumerating the variants.**
+    /// Direction 1 needs no source reading at all — `from_stored(literal)`
+    /// answers it, which is why it is written that way. Direction 2 cannot be:
+    /// `from_stored` is a function from `&str`, its domain is not enumerable,
+    /// and there is no dependency-free way to list an enum's variants here (no
+    /// `strum` in this workspace, `variant_count` unstable). A hand-written
+    /// `TaskKind::ALL` would make this guard a mirror of a mirror — the same
+    /// hand-maintained coupling one layer deeper, and that layer is precisely
+    /// the one that failed. Reading the match arms is the only version of
+    /// direction 2 that checks rather than restates.
+    ///
+    /// **What text-reading costs, and what is done about it.** Reading source
+    /// is a *syntactic shadow* of `from_stored`, so the shadow has to be
+    /// policed or direction 2 is only as good as an arm's spelling. Three
+    /// checks do that, and each exists because this review found the evasion
+    /// it closes: every acceptance arm must contribute at least one literal
+    /// (so a match-guard or a `strip_prefix` arm the line scan cannot read is
+    /// red, not invisible); the offered slice must be *nothing but* string
+    /// literals (so a spread or a computed entry is red, not skipped); and the
+    /// enum may have exactly one inherent `impl` block (so a second parser
+    /// added elsewhere is red rather than a door direction 2 does not know
+    /// about). What remains uncovered is a kind made runnable by a trait impl
+    /// on `TaskKind` — there is none today, and `perform_task`'s exhaustive
+    /// match is what would make one visible.
+    ///
+    /// **This is one link of a two-link chain, and it owns the first link.**
+    /// Here: `from_stored` ↔ `TASK_KINDS`. There: `TASK_KINDS` ↔ the rendered
+    /// menu, which only a browser-shaped test can see and which
+    /// `task-form.test.tsx`'s *"offers every kind this build can write, in
+    /// order, spelled as it stores them"* asserts. Neither link is worth
+    /// anything alone, so a later reader weakening one should know the other
+    /// exists.
+    #[test]
+    fn every_kind_the_form_offers_is_one_this_build_runs_and_every_kind_it_runs_is_offered() {
+        let store = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../src/lib/stores/sync.ts")
+            .canonicalize()
+            .expect("src/lib/stores/sync.ts is in this repository");
+        let store_source = std::fs::read_to_string(&store).expect("read the offered kinds");
+        let tasks_rs = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/tasks.rs")
+            .canonicalize()
+            .expect("this file is in this repository");
+        let tasks_source = std::fs::read_to_string(&tasks_rs).expect("read this file");
+
+        // The spellings the picker offers: every quoted literal between the
+        // declaration of `TASK_KINDS` and the bracket that closes it. Bounded
+        // by the `]` so the neighbouring `TASK_MODES` list cannot leak in.
+        //
+        // Anchored on `export const` rather than on the bare name, and the
+        // floor below is how that was found out: the store's doc comment names
+        // this guard and quotes the marker it slices on, so a slice from the
+        // first bare mention lands inside the prose and finds no literals at
+        // all. The declaration is the only thing that has to be matched, and
+        // matching it is also the narrower claim.
+        let mut offered = Vec::new();
+        let mut offered_residue = String::new();
+        if let Some(rest) = store_source
+            .split_once("export const TASK_KINDS = [")
+            .map(|(_, tail)| tail)
+        {
+            let list = rest.split(']').next().unwrap_or_default();
+            for (index, chunk) in list.split('"').enumerate() {
+                // Odd chunks are inside quotes, even ones are the punctuation
+                // between them.
+                if index % 2 == 1 {
+                    offered.push(chunk.to_owned());
+                } else {
+                    offered_residue.push_str(chunk);
+                }
+            }
+        }
+
+        // The list must be **nothing but** string literals. Without this the
+        // extraction silently skips whatever it does not understand, and a
+        // spread, a computed entry or an identifier — `[...BASE, VERIFY]` —
+        // would be an offered kind direction 1 never passes through
+        // `from_stored`. Comments are refused for the same reason and not as
+        // fussiness: a quoted word inside one is indistinguishable from an
+        // entry, and this array is the last place to be clever.
+        assert!(
+            offered_residue
+                .chars()
+                .all(|ch| ch.is_whitespace() || ch == ','),
+            "TASK_KINDS in {} holds something this guard cannot read as a plain \
+             string literal ({:?} is left over once the literals are removed). \
+             Keep the array a bare comma-separated list of quoted spellings, or \
+             re-point this extraction in the same change.",
+            store.display(),
+            offered_residue.trim()
+        );
+
+        // The spellings this build runs: `from_stored`'s match keys, taken from
+        // this file's own `impl TaskKind` window — the block holding `as_str`
+        // and `from_stored` and nothing else, since the next unindented `}`
+        // closes it. `as_str`'s arms read `Self::Sync => "sync"` and so do not
+        // start with a quote; `_ => None,` carries no literal at all.
+        //
+        // Every literal *before* the `=>` is taken, not just the first, so an
+        // alternation arm (`"verify" | "check" => …`) contributes both of its
+        // spellings rather than hiding the alias. And the arm is recognised by
+        // `=>` alone rather than by `=> Some(Self::`: `Some(TaskKind::Verify)`
+        // compiles identically, rustfmt does not rewrite one into the other,
+        // and a filter that insisted on one spelling would drop a real
+        // acceptance arm — the exact blindness this test exists to prevent,
+        // wearing the test's own clothes.
+        let mut accepted = Vec::new();
+        let mut window = "";
+        assert_eq!(
+            tasks_source.matches("\nimpl TaskKind {\n").count(),
+            1,
+            "`TaskKind` has more than one inherent impl block in {}, so this \
+             extraction's window no longer holds every place a stored spelling \
+             becomes runnable",
+            tasks_rs.display()
+        );
+        if let Some(rest) = tasks_source
+            .split_once("\nimpl TaskKind {\n")
+            .map(|(_, tail)| tail)
+        {
+            window = rest.split("\n}\n").next().unwrap_or_default();
+            for line in window.lines() {
+                let line = line.trim();
+                let Some((keys, _)) = line.split_once("=>") else {
+                    continue;
+                };
+                if !keys.starts_with('"') {
+                    continue;
+                }
+                for literal in keys.split('"').skip(1).step_by(2) {
+                    accepted.push(literal.to_owned());
+                }
+            }
+        }
+
+        // Floors, before anything is compared, and they are not redundant with
+        // the set equality below — they are what makes it mean anything. If a
+        // rename or a reshape broke BOTH extractions to empty, two empty sets
+        // are equal and this test would pass having checked nothing at all.
+        assert!(
+            offered.len() >= 2,
+            "the extraction found {} kind literals in {}, which is too few to be \
+             the offered list — has the constant been renamed?",
+            offered.len(),
+            store.display()
+        );
+        assert!(
+            accepted.len() >= 2,
+            "the extraction found {} accepted kind literals in {}, which is too \
+             few to be `from_stored`'s arms — has the match been reshaped?",
+            accepted.len(),
+            tasks_rs.display()
+        );
+
+        // Every arm that *accepts* something must have contributed at least one
+        // spelling. This is what keeps direction 2 honest about the arms it
+        // cannot read: a match guard (`v if v.eq_ignore_ascii_case("verify")`),
+        // a `strip_prefix`, or a key written on its own line accepts a string
+        // that leads no arm, so the count of acceptances exceeds the count of
+        // extracted spellings and this fails — loudly and here — rather than
+        // leaving a runnable kind invisible to the comparison below.
+        let acceptances = window.matches("=> Some(").count();
+        assert!(
+            accepted.len() >= acceptances,
+            "`from_stored` in {} has {acceptances} arms that accept something but \
+             only {} spellings could be read off them: an arm this guard cannot \
+             read is a kind direction 2 would not know to demand",
+            tasks_rs.display(),
+            accepted.len()
+        );
+
+        /// Kinds deliberately withheld from the app, each of which must be
+        /// named here rather than merely absent from `TASK_KINDS`.
+        ///
+        /// A silent omission is exactly the state this test exists to catch, so
+        /// a guard that could be satisfied by editing a list would be a guard
+        /// with a back door. Empty today: every kind `from_stored` accepts is
+        /// one a person may reasonably schedule. `update` is not a
+        /// counter-example — `from_stored` refuses it, so it never enters this
+        /// comparison in the first place.
+        const NEVER_OFFERED: [&str; 0] = [];
+
+        // An exemption for a spelling nothing accepts is an exemption that
+        // exempts nothing, and the day somebody misspells one here the kind it
+        // was meant to cover goes on failing direction 2 with a message about
+        // adding it to `TASK_KINDS` — advice that contradicts the decision the
+        // entry records.
+        for exempt in NEVER_OFFERED {
+            assert!(
+                accepted.iter().any(|literal| literal == exempt),
+                "NEVER_OFFERED names {exempt:?}, which `from_stored` does not \
+                 accept, so it withholds nothing"
+            );
+        }
+
+        // Direction 1: nothing offered is unrunnable. Answered by the real
+        // parser rather than by the text it was extracted from.
+        for literal in &offered {
+            assert!(
+                TaskKind::from_stored(literal).is_some(),
+                "the form offers {literal:?}, which this build cannot run"
+            );
+        }
+
+        // Direction 2: nothing runnable is unoffered. The one that was violated.
+        for literal in &accepted {
+            if NEVER_OFFERED.contains(&literal.as_str()) {
+                continue;
+            }
+            assert!(
+                offered.iter().any(|kind| kind == literal),
+                "this build runs {literal:?}, which the form does not offer: a kind \
+                 creatable only from a terminal is born unreachable — add it to \
+                 TASK_KINDS in src/lib/stores/sync.ts, or name it in NEVER_OFFERED \
+                 with a reason"
+            );
+        }
+
+        // And the same list — as a set, sorted, so a duplicate entry is caught
+        // by the length while the *order* of the menu stays the frontend's to
+        // choose. It is deliberately not order-equality: the picker's first
+        // option is the default kind of every task created afterwards and is
+        // worth pinning, but pinning it to the order `from_stored`'s arms
+        // happen to sit in would make a no-op Rust refactor demand a TypeScript
+        // edit. That default is asserted where it is visible, in
+        // `task-form.test.tsx`'s `expect(picker).toHaveValue("sync")`.
+        let mut offered_set = offered.clone();
+        offered_set.sort();
+        let mut expected: Vec<String> = accepted
+            .iter()
+            .filter(|literal| !NEVER_OFFERED.contains(&literal.as_str()))
+            .cloned()
+            .collect();
+        expected.sort();
+        assert_eq!(
+            offered_set, expected,
+            "the two lists hold different spellings, or one of them holds a \
+             spelling twice"
+        );
+    }
+
+    /// The preview is the dialect's own cadence, not one answer repeated
+    /// (Story 59.7).
+    ///
+    /// Each instant is asserted against `next_due_after` chained from the one
+    /// before it, because that is the whole claim: a preview that fed `now_ms`
+    /// to every call would return the same instant three times and look
+    /// perfectly plausible on screen.
+    #[test]
+    fn preview_schedule_walks_the_dialects_own_cadence() {
+        let now = JAN_1_2024_UTC;
+
+        let SchedulePreview::Fires(daily) = preview_schedule("0 3 * * *", now, 0, 3) else {
+            panic!("`0 3 * * *` is in the accepted dialect");
+        };
+        assert_eq!(
+            daily,
+            vec![
+                now + 3 * HOUR_MS,
+                now + DAY_MS + 3 * HOUR_MS,
+                now + 2 * DAY_MS + 3 * HOUR_MS,
+            ],
+            "three successive 03:00s, not one of them three times"
+        );
+
+        // The interval half, and it answers ONE instant however many were asked
+        // for. `Every` fires `interval_ms` after the end of the previous run, so
+        // `Engine::next_task_window` re-derives it from `finished_ms` — which
+        // means the second instant depends on how long the first run takes and
+        // nothing can know it yet. Three chained additions would have been
+        // arithmetic dressed as knowledge, and this function exists precisely so
+        // that a preview cannot claim more than the engine will honour.
+        let SchedulePreview::Fires(interval) = preview_schedule("every 90m", now, 0, 3) else {
+            panic!("`every 90m` is in the accepted dialect");
+        };
+        assert_eq!(interval, vec![now + 90 * 60_000]);
+        // Asserted as an absence too, so a later "improvement" that chains the
+        // interval forward goes red rather than shipping a plausible fiction.
+        assert_eq!(
+            preview_schedule("every 6h", now, 0, 3),
+            SchedulePreview::Fires(vec![now + 6 * HOUR_MS])
+        );
+        // And nought still means nought, for the interval as for the pattern.
+        assert_eq!(
+            preview_schedule("every 90m", now, 0, 0),
+            SchedulePreview::Fires(Vec::new())
+        );
+
+        // The offset is honoured, and it is the same argument the tick passes.
+        // Three hours east the local clock already reads 03:00 at `now`, and
+        // `next_due_after` is strictly after — so the answer is *tomorrow's*
+        // 03:00 local, a full day on, and deliberately not the instant the
+        // zero-offset case above picked. A preview that ignored the offset would
+        // return `now + 3 h` here and be wrong by twenty-one hours.
+        let SchedulePreview::Fires(east) = preview_schedule("0 3 * * *", now, 180, 1) else {
+            panic!("`0 3 * * *` is in the accepted dialect");
+        };
+        assert_eq!(east, vec![now + DAY_MS]);
+        assert_ne!(east, vec![now + 3 * HOUR_MS]);
+
+        // Never longer than asked, and a `count` of nought parses first and then
+        // asks for nothing — an empty list from a *valid* expression, which is
+        // not the same fact as a refusal.
+        let SchedulePreview::Fires(one) = preview_schedule("@hourly", now, 0, 1) else {
+            panic!("`@hourly` is in the accepted dialect");
+        };
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            preview_schedule("@hourly", now, 0, 0),
+            SchedulePreview::Fires(Vec::new())
+        );
+
+        // A hostile `count` is bounded rather than trusted. `Vec::with_capacity`
+        // reserves for what it was asked, so without the clamp `usize::MAX`
+        // would allocate for `usize::MAX` before the first instant existed — and
+        // the only caller in the tree asks for three, so the bound costs nothing
+        // it will ever meet.
+        let SchedulePreview::Fires(bounded) = preview_schedule("@hourly", now, 0, usize::MAX)
+        else {
+            panic!("`@hourly` is in the accepted dialect");
+        };
+        assert_eq!(bounded.len(), MAX_SCHEDULE_PREVIEW_INSTANTS);
+        // Strictly increasing over the whole bounded walk, which is the property
+        // the list is rendered on: a repeated instant would read as a schedule
+        // firing twice at once.
+        assert!(bounded.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // The end of representable time, which is where the monotonicity guard
+        // stops being theoretical. `Every`'s `saturating_add` pins at
+        // `i64::MAX`, so the answer is not *strictly after* the instant it was
+        // given and the walk refuses to offer it; `Cron` overflows its checked
+        // arithmetic and answers `None`. Both come back as an empty list from a
+        // valid expression — which the preview's caller renders as nothing,
+        // rather than as a date eight hundred million years hence.
+        assert_eq!(
+            preview_schedule("every 1m", i64::MAX, 0, 3),
+            SchedulePreview::Fires(Vec::new())
+        );
+        assert_eq!(
+            preview_schedule("@hourly", i64::MAX, 0, 3),
+            SchedulePreview::Fires(Vec::new())
+        );
+        // And the other end: a pre-epoch clock is arithmetic like any other, and
+        // `CronSpec::next_due_after`'s `div_euclid` exists so it floors to the
+        // day that contains it rather than truncating toward the epoch.
+        let SchedulePreview::Fires(before_epoch) = preview_schedule("0 3 * * *", -DAY_MS, 0, 2)
+        else {
+            panic!("`0 3 * * *` is in the accepted dialect");
+        };
+        assert_eq!(before_epoch, vec![-DAY_MS + 3 * HOUR_MS, 3 * HOUR_MS]);
+    }
+
+    /// A refusal previews as a refusal, in the save door's own words
+    /// (Story 59.7).
+    ///
+    /// Asserted against `TaskSchedule::parse`'s own error rather than against a
+    /// copied sentence, and through the same `Display` `sync_ipc_error` puts on
+    /// the wire — so the sentence a person reads *before* saving and the one
+    /// they read *after* a save is refused are the same sentence, and this test
+    /// goes red if either side ever starts rewording the other.
+    ///
+    /// All four refusals, plus the empty string. The empty string is here to pin
+    /// that nothing in the preview special-cases it: *store no schedule* is a
+    /// decision the caller makes by not asking, not a meaning this function
+    /// invents, and the write door treats `""` exactly the same way.
+    #[test]
+    fn preview_schedule_answers_a_refusal_in_the_save_doors_own_words() {
+        for expression in [
+            "eee",          // malformed
+            "every 30s",    // below the floor
+            "every 400d",   // above the ceiling
+            "0 0 30 2 *",   // parses, matches no instant
+            "",             // no schedule at all
+            "   ",          // not an empty box; whitespace goes verbatim
+            "@daily 03:00", // the syntax the 58.4 fixtures wrongly taught
+        ] {
+            let refusal = TaskSchedule::parse(expression)
+                .expect_err("this expression is outside the dialect")
+                .to_string();
+            assert_eq!(
+                preview_schedule(expression, JAN_1_2024_UTC, 0, 3),
+                SchedulePreview::Refused(refusal.clone()),
+                "{expression:?} must preview as the refusal it earns"
+            );
+            // The refusal quotes what was typed, which is what makes it usable
+            // beside the box that still holds it.
+            assert!(
+                refusal.contains(&format!("{:?}", expression.trim())),
+                "the refusal for {expression:?} must quote it: {refusal}"
             );
         }
     }
@@ -1725,6 +2451,86 @@ mod tests {
                 TaskMissedPolicy::from_stored(spelling),
                 None,
                 "{spelling:?} is not a policy this build may act on"
+            );
+        }
+    }
+
+    /// An absent override *is* the constant, and that is the whole compatibility
+    /// claim of this column (Story 59.6, FR-366).
+    ///
+    /// Asserted as an equality against `TASK_MISSED_DELAY_MS` rather than against
+    /// `30 * 60_000`, so changing the constant cannot make this test the thing
+    /// that has to be edited — and so a future `unwrap_or(0)`, which is the one
+    /// typo this function can contain, fails here rather than in a field install
+    /// where `delay` would silently have become `run_now`.
+    #[test]
+    fn a_task_with_no_delay_of_its_own_waits_exactly_the_constant() {
+        assert_eq!(effective_missed_delay_ms(None), TASK_MISSED_DELAY_MS);
+        assert_ne!(
+            effective_missed_delay_ms(None),
+            0,
+            "a zero default would make every delay task a run_now task, at the \
+             cost of one extra write per absence"
+        );
+        // And an override is honoured verbatim: the floor is a write-door rule,
+        // so nothing on the read path may quietly raise a stored value to it.
+        for delay_ms in [
+            TASK_MISSED_GRACE_MS,
+            TASK_MISSED_DELAY_MS + 1,
+            MAX_SCHEDULE_INTERVAL_MS,
+        ] {
+            assert_eq!(effective_missed_delay_ms(Some(delay_ms)), delay_ms);
+        }
+    }
+
+    /// The two bounds, at the boundary rather than near it, and each refusal
+    /// quotes the value (Story 59.6, FR-366).
+    ///
+    /// The floor is `TASK_MISSED_GRACE_MS` exactly — inclusive, because a delay
+    /// equal to the grace is coherent: the window is recognised as missed and
+    /// held back by the same interval again, which is a real, if impatient,
+    /// answer. One millisecond below it is not, and that is the assertion that
+    /// pins the inclusivity rather than leaving it to a reader of `<`.
+    #[test]
+    fn a_delay_shorter_than_the_grace_or_longer_than_a_year_is_refused() {
+        for accepted in [
+            None,
+            Some(TASK_MISSED_GRACE_MS),
+            Some(TASK_MISSED_DELAY_MS),
+            Some(MAX_SCHEDULE_INTERVAL_MS),
+        ] {
+            assert!(
+                validate_missed_delay_ms(accepted).is_ok(),
+                "{accepted:?} is a delay a task may carry"
+            );
+        }
+
+        for refused in [0, -1, 1, TASK_MISSED_GRACE_MS - 1, i64::MIN] {
+            let err = validate_missed_delay_ms(Some(refused))
+                .expect_err("shorter than the interval that concludes nobody was home");
+            let message = err.to_string();
+            assert!(
+                message.contains("concludes nobody was home"),
+                "the refusal must say why the grace period is the floor; got {message}"
+            );
+            assert!(
+                message.contains(&refused.to_string()),
+                "a refusal quotes the value it refused, as every other one in this \
+                 module does; got {message}"
+            );
+        }
+
+        for refused in [MAX_SCHEDULE_INTERVAL_MS + 1, i64::MAX] {
+            let message = validate_missed_delay_ms(Some(refused))
+                .expect_err("longer than a schedule may be")
+                .to_string();
+            assert!(
+                message.contains("must not exceed a year"),
+                "the refusal must name the ceiling it shares with the schedule; got {message}"
+            );
+            assert!(
+                message.contains(&refused.to_string()),
+                "a refusal quotes the value it refused; got {message}"
             );
         }
     }

@@ -18,6 +18,8 @@ const B: PanelTargetVm = { kind: "file", profileId: "p1", relativePath: "b.pdf" 
 const C: PanelTargetVm = { kind: "file", profileId: "p1", relativePath: "c.csv" };
 const NOTE_ONE: PanelTargetVm = { kind: "note", vaultId: "v1", noteId: "n1" };
 const NOTE_TWO: PanelTargetVm = { kind: "note", vaultId: "v1", noteId: "n2" };
+const TASK_ONE: PanelTargetVm = { kind: "task", taskId: "nightly" };
+const TASK_TWO: PanelTargetVm = { kind: "task", taskId: "weekly-verify" };
 
 function store() {
   return panelsStore.getState();
@@ -137,6 +139,43 @@ describe("the panel list", () => {
 
     expect(shown()).toEqual([A, NOTE_ONE, NOTE_TWO]);
     expect(store().panels.filter((panel) => panel.target?.kind === "note")).toHaveLength(2);
+  });
+
+  it("previews and pins a task exactly as it does a file", () => {
+    // Story 59.12. A task is an ordinary target, so it needs no gesture of its
+    // own: the Tasks pane calls the same two verbs the Files tree calls, and
+    // this is the assertion that they answer a task target the same way. The
+    // sequence is the one the DOM delivers for a double click on a second row —
+    // a real `click` before the `dblclick` — so a build where the task arm of
+    // `sameTarget` never matched would leave two panels of `TASK_TWO` here and
+    // lose `TASK_ONE`.
+    // Pinned first, so there is something under the preview for the pin to put
+    // back — previewing into the empty starting panel displaces nothing, and
+    // `Panel.replaced` treats that third state differently on purpose.
+    store().openPanel(TASK_ONE);
+    expect(shown()).toEqual([TASK_ONE]);
+
+    store().setActiveTarget(TASK_TWO);
+    expect(shown()).toEqual([TASK_TWO]);
+
+    store().openPanel(TASK_TWO);
+
+    expect(shown()).toEqual([TASK_ONE, TASK_TWO]);
+    expect(activePanel(store()).target).toEqual(TASK_TWO);
+  });
+
+  it("focuses the panel already holding a task rather than opening a second", () => {
+    store().setActiveTarget(TASK_ONE);
+    store().openPanel(TASK_TWO);
+    const [first] = store().panels;
+    if (first === undefined) {
+      throw new Error("expected two panels");
+    }
+
+    store().openPanel(TASK_ONE);
+
+    expect(shown()).toEqual([TASK_ONE, TASK_TWO]);
+    expect(store().activeId).toBe(first.id);
   });
 });
 
@@ -485,6 +524,20 @@ describe("what a restored target is allowed to be", () => {
     expect(isRestorableTarget({ kind: "recording", sessionId: "" })).toBe(false);
   });
 
+  it("restores nothing from a cookie holding an empty task id", () => {
+    // Rust cannot mint an empty task id — the record is keyed by it — so this
+    // only ever arrives from a hand-edited cookie, and a panel restored on it
+    // would name nothing and resolve to nothing for the rest of the session.
+    expect(isRestorableTarget({ kind: "task", taskId: "" })).toBe(false);
+    expect(isRestorableTarget(TASK_ONE)).toBe(true);
+
+    const cookie = `${PANELS_COOKIE}=${encodeURIComponent(
+      JSON.stringify({ v: 1, a: 0, t: [{ kind: "task", taskId: "" }, TASK_ONE] }),
+    )}`;
+
+    expect(readPanelTargets(cookie).targets).toEqual([TASK_ONE]);
+  });
+
   it("drops a refused target on the way back in", () => {
     const cookie = `${PANELS_COOKIE}=${encodeURIComponent(
       JSON.stringify({
@@ -519,6 +572,13 @@ describe("target identity", () => {
         { kind: "file", profileId: "x", relativePath: "y" },
       ),
     ).toBe(false);
+    // The sharper half of the same claim: a recording target and a task target
+    // carry ONE string each, so a comparison that reached past the tag would
+    // make them indistinguishable whenever a session and a task were named
+    // alike — and focus a recording when the Tasks pane asked for a task.
+    expect(sameTarget({ kind: "recording", sessionId: "x" }, { kind: "task", taskId: "x" })).toBe(
+      false,
+    );
   });
 });
 

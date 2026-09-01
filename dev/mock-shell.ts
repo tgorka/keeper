@@ -61,9 +61,13 @@ import type {
   SyncProfileReq,
   SyncProfileVm,
   SyncVerifyVm,
+  TaskBatchEntryVm,
+  TaskBatchIdReq,
+  TaskBatchReceiptVm,
   TaskListingVm,
   TaskRunVm,
   TaskSaveReq,
+  TaskSchedulePreviewVm,
   TaskVm,
 } from "@/lib/ipc/client";
 
@@ -1707,7 +1711,9 @@ const TASKS: TaskVm[] = [
     profileId: null,
     profile: null,
     schedule: "0 3 * * *",
+    description: "nightly backup of the photos",
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: ahead(957),
     runningHost: null,
     leaseUntilMs: null,
@@ -1723,9 +1729,18 @@ const TASKS: TaskVm[] = [
     profileId: "p1",
     profile: "keeper",
     schedule: "every 6h",
+    // Blank rather than absent, and the only fixture that is: a person cleared
+    // the box once. It must render as nothing, exactly as a null does — the
+    // store keeps the two apart and the view deliberately does not.
+    description: "",
     // skip, because a release sweep deletes: a window nobody
     // served is better dropped than served at an instant nobody chose.
     onMissed: "skip",
+    // Stored even though `skip` never reads it, which is the store's rule: a
+    // policy change must not throw away a number somebody typed. So the ⌘8 form
+    // shows the box on this row too, because a value it holds may never be
+    // hidden behind a policy that ignores it.
+    missedDelayMs: 45 * 60_000,
     nextDueMs: ahead(358),
     // Mid-run and holding the lease: the other host on this machine cannot
     // claim this task until the lease expires or this one hands it back.
@@ -1743,9 +1758,14 @@ const TASKS: TaskVm[] = [
     profileId: null,
     profile: null,
     schedule: "0 4 * * *",
+    description: null,
     // delay, so a 04:00 sweep missed overnight does not fire in the
     // same second the machine comes back.
     onMissed: "delay",
+    // Four hours, and the reason this fixture exists: it is the only row whose
+    // delay is NOT keeper's own thirty minutes, so the form's note has to compose
+    // its sentence rather than recite a constant.
+    missedDelayMs: 4 * 60 * 60_000,
     nextDueMs: ahead(1_017),
     runningHost: null,
     leaseUntilMs: null,
@@ -1767,7 +1787,9 @@ const TASKS: TaskVm[] = [
     profileId: "p2",
     profile: "notes",
     schedule: "@hourly",
+    description: null,
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: ahead(51),
     runningHost: null,
     leaseUntilMs: null,
@@ -1788,7 +1810,9 @@ const TASKS: TaskVm[] = [
     // Remembered, not obeyed: a manual task's schedule is stored and ignored,
     // so the row must not read as though something will fire it.
     schedule: "@weekly",
+    description: "trim the archive by hand, quarterly",
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: null,
     runningHost: null,
     leaseUntilMs: null,
@@ -1807,7 +1831,12 @@ const TASKS: TaskVm[] = [
     profileId: "01JNOSUCHPROFILE",
     profile: null,
     schedule: "30 4 * * *",
+    // Named, and this is the row where a name earns its keep: the id is a ULID
+    // nobody chose and the folder it pointed at is gone, so without this there
+    // is nothing on the row a person could recognise it by.
+    description: "push the old vault — folder was moved, needs repointing",
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: ahead(1_407),
     runningHost: null,
     leaseUntilMs: null,
@@ -1827,7 +1856,9 @@ const TASKS: TaskVm[] = [
     profileId: "p1",
     profile: "keeper",
     schedule: "0 2 * * *",
+    description: null,
     onMissed: "run_now",
+    missedDelayMs: null,
     nextDueMs: null,
     runningHost: null,
     leaseUntilMs: null,
@@ -1967,6 +1998,103 @@ const PACED_WORK = [
   },
 ] satisfies PacedWorkVm[];
 
+/**
+ * What a written schedule would do (Story 59.7). Answered from the REAL
+ * dialect rather than with a fixed happy preview, because Story 58.4 already
+ * shipped three mock fixtures describing schedules the parser refuses and the
+ * trap is the same one: a mock that accepts everything makes the dev shell
+ * the only place a bad expression looks fine. `keeper-sync/src/tasks.rs`'s
+ * `every_schedule_the_dev_harness_shows_is_one_this_dialect_accepts` reads
+ * every schedule literal in this file through `TaskSchedule::parse` — and it
+ * extracts them by splitting on the field name, so this comment deliberately
+ * does not spell that token out: it tripped the guard once by describing it.
+ *
+ * The refusal sentences are `TaskSchedule::parse`'s own, copied verbatim —
+ * including the `{original:?}` quoting, which is Rust's `Debug` for a string
+ * and therefore double quotes. A paraphrase here would let the app's real
+ * wording change while the dev shell went on showing the old one.
+ */
+export function mockSchedulePreview(expression: string): TaskSchedulePreviewVm {
+  const original = expression.trim();
+  const lowered = original.toLowerCase();
+  const quoted = JSON.stringify(original);
+  const refuse = (sentence: string) => ({ expression, refusal: sentence, instants: [] });
+  const malformed = () =>
+    refuse(
+      "task schedule must be a 5-field cron expression (minute hour day-of-month month day-of-week), one of @hourly, @daily or @weekly, or every <n><unit> with unit s/m/h/d, got " +
+        quoted,
+    );
+  // Each branch settles two things: the gap between fires, and HOW MANY the
+  // real command will answer with. That second one is not cosmetic. An
+  // interval schedule fires `interval_ms` after the END of the previous run
+  // (`tasks.rs:534-541`, re-derived by `Engine::next_task_window` from
+  // `finished_ms`), so instants two and three would depend on how long the
+  // first run takes — arithmetic dressed as knowledge. `preview_schedule`
+  // therefore answers exactly ONE instant for an interval and up to the full
+  // count for a cron pattern, which names wall-clock instants and has no such
+  // dependency. A dev shell that showed three for `every 6h` would be more
+  // generous than the app.
+  //
+  // The gap for a cron form here is a plain day: the real command walks a
+  // calendar and this does not, and it says so rather than pretending. What
+  // the dev shell exercises is the SHAPE of the answer and the refusals,
+  // which is what the form renders.
+  let everyMs: number;
+  let chained: boolean;
+  if (lowered.startsWith("@")) {
+    const alias = { "@hourly": 3_600_000, "@daily": 86_400_000, "@weekly": 604_800_000 }[lowered];
+    if (alias === undefined) {
+      return malformed();
+    }
+    everyMs = alias;
+    // Aliases desugar to cron, never to an interval — `@daily` keeps meaning
+    // night rather than drifting to the last restart.
+    chained = true;
+  } else if (lowered.startsWith("every")) {
+    const match =
+      /^every\s+(\d+)\s*(s|m|h|d|sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days)$/.exec(
+        lowered,
+      );
+    if (match === null) {
+      return malformed();
+    }
+    const unit = match[2].charAt(0) as "s" | "m" | "h" | "d";
+    everyMs = Number(match[1]) * { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[unit];
+    // The floor and the ceiling, with the parser's own two sentences. `every
+    // 30s` is in the grammar precisely so it is told about the floor rather
+    // than about an unknown unit.
+    if (everyMs < 60_000) {
+      return refuse(
+        `task schedule must not fire more often than once a minute (60000 ms), got ${quoted}`,
+      );
+    }
+    if (everyMs > 366 * 86_400_000) {
+      return refuse(
+        `task schedule must not fire less often than once a year (${366 * 86_400_000} ms) — write a calendar pattern instead, got ${quoted}`,
+      );
+    }
+    chained = false;
+  } else {
+    const fields = original.split(/\s+/);
+    if (original === "" || fields.length !== 5) {
+      return malformed();
+    }
+    // The one cron refusal a person actually meets: a date that parses and
+    // names no instant. 30 February is the parser's own example.
+    if (fields[2] === "30" && fields[3] === "2") {
+      return refuse(`task schedule matches no instant, got ${quoted}`);
+    }
+    everyMs = 86_400_000;
+    chained = true;
+  }
+  const from = Date.now();
+  return {
+    expression,
+    refusal: null,
+    instants: (chained ? [1, 2, 3] : [1]).map((n) => from + everyMs * n),
+  };
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   // --- Tasks (Epic 57, Story 57.6) ---------------------------------------
   //
@@ -1978,6 +2106,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // pass. A static answer: nothing about it depends on the payload, and nothing
   // in the app can change it — the class is read-only by construction.
   sync_paced_work: () => PACED_WORK,
+  sync_task_schedule_preview: (payload) => mockSchedulePreview(String(payload.expression ?? "")),
   sync_task_history: (payload) => {
     const runs = TASK_RUNS[String(payload.id)] ?? [];
     // The clamp the command applies, mirrored so a caller asking for two rows
@@ -2054,6 +2183,21 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
         };
       }
     }
+    // The delay's floor, mirrored for the reason the lost-update refusal above
+    // is: the sentence a person meets when they type five minutes is worth being
+    // able to look at. Only the floor, and only its own words — the ceiling is
+    // unreachable from a box that speaks minutes without deliberate effort, and a
+    // second copy of a rule is a second copy to drift. `900000` and `1800000` are
+    // `TASK_MISSED_GRACE_MS` and `TASK_MISSED_DELAY_MS`; if either moves, this
+    // string is prose in a dev harness and the real refusal is still Rust's.
+    if (req.missedDelayMs !== null && req.missedDelayMs < 900_000) {
+      throw {
+        code: "internal",
+        message: `invalid sync configuration: task missed-window delay must be at least the grace period (900000 ms), because the grace period is the interval that concludes nobody was home — a shorter delay would elapse before the window it holds back counted as missed, which is run_now wearing delay's name, got ${req.missedDelayMs} ms`,
+        accountId: null,
+        retriable: false,
+      };
+    }
     const prior = existing ?? TASKS[0];
     const saved: TaskVm = {
       ...prior,
@@ -2063,7 +2207,15 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       enabled: req.enabled,
       profileId: req.profileId,
       schedule: req.schedule,
+      // Echoed verbatim, `""` included: the real store keeps a blank a person
+      // typed apart from a description that was never there, so a mock that
+      // collapsed them would hide the one case the view has to render as absence.
+      description: req.description,
       onMissed: req.onMissed,
+      // Echoed verbatim too, `null` included: `null` is *use keeper's own
+      // delay*, and a mock that filled the constant in here would hide the one
+      // fact the form's note is composed around.
+      missedDelayMs: req.missedDelayMs,
       // The store owns the window and clears it on any of these three moving,
       // so echoing the request's value back would show a "next due" the real
       // command would have discarded.
@@ -2087,6 +2239,68 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       TASKS.splice(at, 1);
     }
     return null;
+  },
+  // The batched pair the Tasks pane's multi-selection drives (Story 59.4).
+  // Stateful and per-id, for the reason `sync_task_save` above is: the flow
+  // worth looking at is selecting five rows, pressing Disable, and reading a
+  // receipt in which the ids that went and the ids that did not are told apart.
+  // Each entry keeps the wire's invariant — `effect` only on `saved`, `reason`
+  // only on `refused` — because the pane branches on exactly that.
+  sync_tasks_set_enabled: (payload) => {
+    const ids = (payload.ids ?? []) as TaskBatchIdReq[];
+    const enabled = payload.enabled === true;
+    const entries: TaskBatchEntryVm[] = ids.map((wanted) => {
+      const existing = TASKS.find((candidate) => candidate.id === wanted.id);
+      if (existing === undefined) {
+        // `missing` and not `refused`: a well-formed id whose row another host
+        // forgot is usually benign, and the two want different words on screen.
+        return { id: wanted.id, outcome: "missing", effect: null, reason: null };
+      }
+      // The lost-update refusal, per id — the same rule and the same sentence
+      // `sync_task_save` above mirrors. Unreachable in a shell with one writer
+      // unless two batches race, which is the honest state of affairs. The
+      // sentence below is a stand-in: the shipped wording is Rust's
+      // (`db::upsert_task`), and this copy only exists so the pane has something
+      // to render against the mock.
+      //
+      // `!= null` and not `!== null`: a caller that omits the baseline sends
+      // `undefined`, and refusing that as stale would be a refusal production
+      // never makes.
+      if (wanted.baselineUpdatedMs != null && existing.updatedMs !== wanted.baselineUpdatedMs) {
+        return {
+          id: wanted.id,
+          outcome: "refused",
+          effect: null,
+          reason: `task '${wanted.id}' was changed elsewhere since this was opened (last written at ${existing.updatedMs}, this edit started from ${wanted.baselineUpdatedMs}): refusing to write stale values over it — re-read it and try again`,
+        };
+      }
+      // `rearmed` only when the row was out of service and is coming back,
+      // because that is the distinction the effect exists to carry.
+      const effect = !existing.enabled && enabled ? "rearmed" : "updated";
+      existing.enabled = enabled;
+      // The window follows `db::upsert_task`'s three rearm edges
+      // (`db.rs:3316-3329`): a disable returns `updated` and **keeps** the
+      // window, while a disabled→enabled transition returns `rearmed` and clears
+      // it (`next_due_ms = NULL`) — deliberate anti-catch-up, `db.rs:3181-3185`.
+      if (effect === "rearmed") {
+        existing.nextDueMs = null;
+      }
+      existing.updatedMs = Date.now();
+      return { id: wanted.id, outcome: "saved", effect, reason: null };
+    });
+    return { entries } satisfies TaskBatchReceiptVm;
+  },
+  sync_tasks_forget: (payload) => {
+    const ids = (payload.ids ?? []) as string[];
+    const entries: TaskBatchEntryVm[] = ids.map((id) => {
+      const at = TASKS.findIndex((candidate) => candidate.id === id);
+      if (at < 0) {
+        return { id, outcome: "missing", effect: null, reason: null };
+      }
+      TASKS.splice(at, 1);
+      return { id, outcome: "forgotten", effect: null, reason: null };
+    });
+    return { entries } satisfies TaskBatchReceiptVm;
   },
   // Two sessions, two shapes: a table would answer the flat one for both and
   // the folder-shaped row would render as something it is not.
@@ -2603,6 +2817,19 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       write: { writable: true, reason: null, caveat: null, caveatShort: null },
     };
   },
+  /**
+   * The path plugin's directory lookup, which is not one of the app's own
+   * commands and is the only non-`keeper` invoke any screen makes (Story 59.8).
+   *
+   * Without it the Add-folder form's Home control sits permanently disabled in
+   * `bun run dev` and a typed `~` never resolves — the whole of that story is
+   * invisible here, and the disabled button reads as a frontend bug, which is
+   * exactly what this file exists to stop. `21` is `BaseDirectory.Home`; every
+   * other directory is answered `null`, which is what the form treats as "the
+   * shell could not say" rather than a wrong answer dressed as a right one.
+   */
+  "plugin:path|resolve_directory": (payload) =>
+    Number(payload.directory) === 21 ? "/Users/tgorka" : null,
 };
 
 /** True when a real Tauri shell is already answering. */

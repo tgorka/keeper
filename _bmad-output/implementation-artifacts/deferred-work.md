@@ -4824,7 +4824,7 @@ status: open
 
 
 - source_spec: spec-56-14-the-surface-side-deferred-sweep
-  summary: CI's own runners flake roughly one test per run, in a different file each time, and three separate names have now been observed failing on branches that do not touch them.
+  summary: CI's own runners flake roughly one test per run, in a different file each time, and FOUR separate names have now been observed failing on branches that do not touch them.
   evidence: |
     On the epic-56 follow-up stack: `files-pane.test.tsx > re-reads a remembered
     folder once when Refresh rescues a failed first list` failed on #285, whose
@@ -4840,6 +4840,19 @@ status: open
     the right fix is a decision about the runner size or about how a
     machine-scaled budget absorbs a noisy neighbour - not a retry around the
     assertions.
+
+    Fourth observation, epic 59 / #301 (2026-09-01):
+    `keeper-core/tests/archive_search_perf.rs::search_p95_under_200ms_at_120k_events`
+    failed at `p95 239.23ms` against its own scaled budget of `229.05ms` — over
+    by **4%** — and passed on an immediate rerun of the same commit. The diff
+    touches exactly one file in that crate, `keeper-core/src/tasks.rs`, which
+    contains no occurrence of `archive` or `search`; `main` was green on the same
+    test at the same time. Note what the failure line itself says: the harness
+    measured `scan 36.65ms vs reference 32ms => 1.15x` and scaled the budget
+    accordingly, so the scaling DID observe the slow machine and still
+    under-predicted it. That is the useful datum for whoever fixes this: the
+    defect is not a missing scale factor, it is that a single scan sample taken
+    before the measurement cannot predict contention DURING it.
   status: open
   keep: |
     Becomes worth doing when a flake blocks a merge train rather than costing one
@@ -5138,3 +5151,62 @@ status: open
     idiom the rest of the tree uses — kill on an observed condition (bytes in flight, a `tmp/`
     object present) rather than on an elapsed duration — so the guard still fails when the
     kill-sweep is broken and cannot fail because the machine was busy.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-59-4-several-tasks-at-once.md`
+  summary: |
+    `src/components/layout/files-pane.test.tsx:3278` is load-sensitive — a `findByRole("treeitem",
+    { name: "Notes" })` after a Refresh times out when the box is busy.
+  evidence: |
+    Surfaced 2026-09-01 by story 59.4's frontend gate, which this file does not touch. It failed on
+    2 of 4 full-suite runs while a 146 MB apt download and a headless Chrome competed for the
+    container, and passed on 5 subsequent runs on an idle box, on 3/3 runs paired with
+    `tasks-pane.test.tsx`, and on 2/2 baseline runs with 59.4's frontend changes stashed. Same class
+    as the epic-58 transfer-kill flake already in this ledger: a wait whose budget is a duration
+    rather than an observed condition, so it can fail because the machine was busy. The honest fix
+    is a `waitFor` budget or a fake-timer pass on that one assertion.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-59-4-several-tasks-at-once.md`
+  summary: |
+    `columnFoldStore` is module state that pane test files leak into every test declared after the
+    one that folds a column; only `tasks-pane.test.tsx` has been inoculated.
+  evidence: |
+    Found 2026-09-01 while adding tests to `tasks-pane.test.tsx` for story 59.4. Its
+    `says how many names it is hiding, and offers no second Refresh` folds the names column and
+    never restores it — harmless only because it happened to be the last test in the file. Every
+    test added after it rendered a 48px rail with no rows. Fixed inside that file with
+    `resetColumnFoldForTest()` in the top-level `beforeEach`; `files-pane.test.tsx` and any other
+    pane suite that exercises the fold carry the same latent ordering trap, and the next person to
+    append a test to one of them pays for it the same way.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-59-11-every-kind-this-build-can-write.md`
+  summary: |
+    `TASK_FORM_KIND_NOTE` is sourced from `TaskKindArg`'s per-value `--help` lines but nothing pins
+    it there, so the CLI and the app can drift into describing the same task kind differently.
+  evidence: |
+    Raised 2026-09-01 by story 59.11's adversarial review. That story made the *vocabulary* of task
+    kinds drift-proof — `TASK_KINDS` and `TaskKind::from_stored` are now compared in both directions
+    by a Rust test — but the *description* of each kind is copied prose. The three sentences in
+    `src/components/sync/task-form.tsx` were transcribed from the doc comments on `TaskKindArg`
+    (`keeper-syncd/src/commands.rs:876-884`) and corroborated against `docs/sync.md` §14's kind
+    table, which is three statements of the same fact with two of them unguarded. The precedent for
+    closing it exists in the same file: `every_kind_the_cli_offers_is_a_documented_row_and_the_
+    heading_counts_nothing` already drives a `docs/sync.md` assertion off `TaskKindArg::value_
+    variants`, so extending that test to also demand the frontend note is the shape. Not done in
+    59.11 because the note lives in a file that crate's tests do not otherwise read, and because the
+    story's own guard had five evasions to close first.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-59-12-a-task-you-can-open-in-a-tab.md`
+  summary: |
+    No keyboard route puts anything in the panel strip — in the Tasks pane or in the Files tree.
+    Enter and the arrow keys move the selection and the pane's own detail region; only a pointer
+    can preview a target into a panel or open one beside.
+  evidence: |
+    Raised 2026-09-01 by story 59.12's two adversarial reviews, independently. In
+    `tasks-pane.tsx` the panel verbs hang off `handleRowClick`/`handleRowDoubleClick` only;
+    `onActivate` (Enter) is `select(id, "replace")` and `moveSelection` is the same, so neither
+    touches `panelsStore`. This is not a 59.12 regression: `files-pane.tsx:2146-2176` has the
+    identical shape and has since Story 45.1, so the gap is app-wide and predates the task target
+    by fourteen epics. It is deferred rather than fixed here because closing it in one surface
+    would BE the second interaction idiom `spec-45-17…:200` forbids by name — the fix is one
+    decision taken once for every browsing surface (which key opens beside, and whether Enter
+    should preview), and then applied to Files, Notes, Sessions and Tasks together.

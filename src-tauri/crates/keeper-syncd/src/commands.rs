@@ -34,7 +34,10 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use keeper_sync::db::{TaskListing, TaskRow, TaskRunRow, UnitStanding, UnknownTask};
+use keeper_sync::db::{
+    TaskBatchEntry, TaskBatchId, TaskBatchOutcome, TaskListing, TaskRow, TaskRunRow, TaskSave,
+    UnitStanding, UnknownTask,
+};
 use keeper_sync::engine::{Engine, VerifyReport};
 use keeper_sync::lfs::audit::RemoteAudit;
 use keeper_sync::lfs::hydrate::{
@@ -489,7 +492,8 @@ pub enum LfsDirection {
     },
 }
 
-/// The seven things an operator does to a task.
+/// The seven things an operator does to a task — three of them to as many tasks
+/// as you name.
 ///
 /// Every doc comment below describes what the verb does **here**, in this
 /// build. Story 56.13 shipped a `--help` for `materialize` that still described
@@ -598,39 +602,54 @@ pub enum TaskCommand {
     /// afresh rather than firing a window that fell into the past while it was
     /// out of service.
     Set(TaskSetArgs),
-    /// Make a task live again, leaving its mode and schedule exactly as they are.
+    /// Make one or more tasks live again, leaving their mode and schedule
+    /// exactly as they are.
     ///
     /// `enabled` and `mode` answer different questions (AD-135): `mode` says who
     /// may trigger the task, `enabled` says whether the row is live at all. A
     /// disabled `scheduled` task keeps its schedule and resumes on it.
+    ///
+    /// Every id answers for itself: one line each, and an id that could not be
+    /// written does not stop the others.
     Enable {
-        /// The task's id, exactly as `tasks list` spells it.
-        task: String,
+        /// The task's id, exactly as `tasks list` spells it. Repeatable.
+        #[arg(required = true, num_args = 1.., value_name = "TASK")]
+        task: Vec<String>,
     },
-    /// Take a task out of service without forgetting anything about it.
+    /// Take one or more tasks out of service without forgetting anything about
+    /// them.
     ///
-    /// Neither the tick nor `tasks run` will touch it while it is disabled — an
-    /// "off" that still runs when asked is not off — and its schedule, its
-    /// binding and its whole run history survive, so re-enabling it is one word.
+    /// Neither the tick nor `tasks run` will touch a disabled task — an "off"
+    /// that still runs when asked is not off — and its schedule, its binding and
+    /// its whole run history survive, so re-enabling it is one word.
+    ///
+    /// Every id answers for itself: one line each, and an id that could not be
+    /// written does not stop the others.
     Disable {
-        /// The task's id, exactly as `tasks list` spells it.
-        task: String,
+        /// The task's id, exactly as `tasks list` spells it. Repeatable.
+        #[arg(required = true, num_args = 1.., value_name = "TASK")]
+        task: Vec<String>,
     },
-    /// Delete a task and everything it recorded.
+    /// Delete one or more tasks and everything they recorded.
     ///
-    /// Its run history goes with it. This is the only destructive verb here, and
-    /// it destroys bookkeeping rather than content: nothing a task ever did is
-    /// undone by forgetting the task.
+    /// Their run history goes with them. This is the only destructive verb here,
+    /// and it destroys bookkeeping rather than content: nothing a task ever did
+    /// is undone by forgetting the task.
+    ///
+    /// Every id answers for itself: one line each, and an id that could not be
+    /// forgotten does not stop the others. A row this build cannot read is
+    /// refused rather than deleted (AD-48).
     Forget {
-        /// The task's id, exactly as `tasks list` spells it.
-        task: String,
+        /// The task's id, exactly as `tasks list` spells it. Repeatable.
+        #[arg(required = true, num_args = 1.., value_name = "TASK")]
+        task: Vec<String>,
     },
 }
 
 /// Everything `tasks set` can write, as one `Args` struct.
 ///
 /// A struct rather than an inline variant, the shape [`AddArgs`] already has,
-/// because a verb with seven knobs read by one function is a verb whose
+/// because a verb with nine knobs read by one function is a verb whose
 /// arguments want a name — and because `conflicts_with` reads far better beside
 /// the field it contradicts than in a `#[command(group)]` somewhere else.
 #[derive(Debug, Args)]
@@ -694,6 +713,51 @@ pub struct TaskSetArgs {
     /// value.
     #[arg(long, value_enum)]
     pub on_missed: Option<TaskMissedArg>,
+    /// How long `--on-missed delay` holds a missed window back, in minutes.
+    ///
+    /// Defaults to 30 minutes — keeper's own, which is what every task waited
+    /// before this option existed and what a task that never sets it goes on
+    /// waiting, including if that number is ever retuned. At least 15 minutes:
+    /// that is how long a window must sit open before keeper concludes nobody was
+    /// home, and a delay shorter than it would be over before the window it holds
+    /// back counted as missed — which is `run-now` under another name. Refused
+    /// above one year, the ceiling a schedule has and for the same reason.
+    ///
+    /// Measured from the instant a host **noticed** the window, exactly as the
+    /// default is: a value measured from the window would already be spent for
+    /// any absence longer than itself.
+    ///
+    /// Stored whatever `--on-missed` says, so switching to `skip` and back does
+    /// not throw the number away. On update it keeps its stored value.
+    #[arg(long, value_name = "MINUTES")]
+    pub missed_delay: Option<i64>,
+    /// Go back to keeper's own delay. `--missed-delay`'s inverse.
+    ///
+    /// Its own flag for the reason `--no-description` is one, and here the two
+    /// answers are genuinely different rather than merely awkward to spell:
+    /// storing nothing means *follow keeper's constant, whatever it becomes*,
+    /// while `--missed-delay 30` means *thirty minutes, even if the constant
+    /// moves*.
+    #[arg(long, conflicts_with = "missed_delay")]
+    pub no_missed_delay: bool,
+    /// What to call the task, in your own words.
+    ///
+    /// The only name a task has that you can change. Its id cannot: the run
+    /// history is joined to it, so a task created without an id got a ULID and
+    /// keeps it. Stored exactly as given, and nothing refuses it — there is no
+    /// vocabulary and no grammar here to be wrong about.
+    ///
+    /// On create there is none unless you give one. On update it keeps what is
+    /// stored.
+    #[arg(long, value_name = "TEXT")]
+    pub description: Option<String>,
+    /// Forget the description. `--description`'s inverse.
+    ///
+    /// Its own flag for the reason `--no-schedule` is one: an option that took
+    /// an empty string to mean "remove this" cannot be told apart from a shell
+    /// that expanded a variable to nothing, and those want opposite answers.
+    #[arg(long, conflicts_with = "description")]
+    pub no_description: bool,
 }
 
 #[derive(Debug, Args)]
@@ -803,10 +867,20 @@ pub enum LfsModeArg {
 /// such variant by design — a schedule that replaces the keeper binary is what
 /// the anti-timer stance forbids — and adding one to this enum could not
 /// convert.
+///
+/// Each value carries a line of its own, which a two-value enum did not need
+/// and a three-value one does: `sync` and `release` are the two halves of
+/// moving bytes, `verify` moves none, and a bare `[possible values: …]` list
+/// cannot say which of the three a nightly schedule should be pointed at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TaskKindArg {
+    /// One sync pass over the folder, or over every enabled folder.
     Sync,
+    /// One release sweep, with every refusal `dehydrate` has.
     Release,
+    /// Re-check stored content against its recorded digests. Reads only, asks
+    /// no network, and takes no per-folder reservation.
+    Verify,
 }
 
 /// `--mode`'s vocabulary, which is [`TaskMode`]'s and nothing more.
@@ -881,6 +955,7 @@ impl From<TaskKindArg> for TaskKind {
         match value {
             TaskKindArg::Sync => Self::Sync,
             TaskKindArg::Release => Self::Release,
+            TaskKindArg::Verify => Self::Verify,
         }
     }
 }
@@ -1073,7 +1148,7 @@ pub async fn run(
                 TaskCommand::Disable { task } => {
                     cmd_task_set_enabled(&printer, &engine, now_ms, &task, false)
                 }
-                TaskCommand::Forget { task } => cmd_task_forget(&printer, &engine, &task),
+                TaskCommand::Forget { task } => cmd_task_forget(&printer, &engine, now_ms, &task),
             }
         }
     }
@@ -3290,6 +3365,33 @@ struct TaskView<'a> {
     last: Option<&'a TaskRunRow>,
 }
 
+/// The task's own name, or `None` when there is none worth drawing
+/// (Story 59.5).
+///
+/// **Blank counts as absent, and that is the rule rather than a nicety.**
+/// `description` is `TEXT NULL` with no non-empty constraint and the store binds
+/// whatever it is handed — deliberately, because it is the one column a person
+/// authored and normalizing it would be rewriting what they wrote. So `""` and
+/// `"  "` are both reachable: a person who cleared the box produces the first,
+/// and a writer this build never met can produce either. On `is_some()` alone
+/// that prints `  name: ` with nothing after it, which is the one shape a reader
+/// takes for a failed read rather than for an empty field.
+///
+/// Trimmed to decide, untrimmed to draw: what is stored is what is shown. That
+/// is `taskReportText`'s rule in the app's Tasks pane, arrived at there for the
+/// same reason about the same class of writer — the two are separate because
+/// they are in separate languages, not because they are separate decisions, and
+/// a change to one is a change to both.
+///
+/// The `--json` document does **not** go through here: it carries the stored
+/// value verbatim, `""` included, because a machine consumer is owed the row and
+/// not a rendering of it.
+fn task_description_text(task: &TaskRow) -> Option<&str> {
+    task.description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+}
+
 /// A listing of tasks as a human reads it, unreadable rows included.
 ///
 /// **Pure, and returning lines rather than printing them**, for
@@ -3344,9 +3446,30 @@ fn task_lines(now_ms: i64, views: &[TaskView<'_>], unknown: &[UnknownTask]) -> V
             // would say the same thing about every row on most machines. The
             // `--json` document carries it unconditionally, because a fixed key
             // set is that document's contract.
-            on_missed = match task.on_missed {
-                TaskMissedPolicy::RunNow => String::new(),
-                other => format!("  [on missed: {}]", other.as_str()),
+            //
+            // The chosen delay rides inside the same marker rather than earning
+            // its own, and only when the row chose one: it is a qualifier on
+            // `delay` and means nothing beside the other two settings, so a
+            // second bracket would be a second thing to scan past on every row.
+            // Absent means keeper's own, which `--help` states and this line
+            // therefore does not repeat per row.
+            //
+            // Minutes when the value divides into them, because minutes are the
+            // unit every sentence about this setting is written in, and raw
+            // milliseconds otherwise. Integer arithmetic in both branches, so a
+            // value from a newer keeper that is not a whole number of minutes is
+            // shown as itself rather than rounded into a number the row does not
+            // hold — an operator reading this line is usually reading it because
+            // something waited longer than they expected.
+            on_missed = match (task.on_missed, task.missed_delay_ms) {
+                (TaskMissedPolicy::RunNow, _) => String::new(),
+                (TaskMissedPolicy::Delay, Some(delay_ms)) if delay_ms % 60_000 == 0 => {
+                    format!("  [on missed: delay {}m]", delay_ms / 60_000)
+                }
+                (TaskMissedPolicy::Delay, Some(delay_ms)) => {
+                    format!("  [on missed: delay {delay_ms}ms]")
+                }
+                (other, _) => format!("  [on missed: {}]", other.as_str()),
             },
             disabled = if task.enabled { "" } else { "  [disabled]" },
             running = match &task.running_host {
@@ -3354,6 +3477,18 @@ fn task_lines(now_ms: i64, views: &[TaskView<'_>], unknown: &[UnknownTask]) -> V
                 None => String::new(),
             },
         ));
+        // A name belongs above the mechanics, not among them: the line above is
+        // positional and a description has no bound, so appending it there would
+        // put unbounded prose where a reader is counting columns.
+        //
+        // A line only when there is one, on `[on missed: …]`'s rule rather than
+        // `last:`'s: every row on every install predates this column, so
+        // `name: none stored` on all of them would be a line that says nothing
+        // about anything. `--json` carries the key unconditionally, because a
+        // fixed key set is that document's contract.
+        if let Some(description) = task_description_text(task) {
+            lines.push(format!("  name: {description}"));
+        }
         lines.push(match view.last {
             Some(run) => format!(
                 "  last: {outcome}  {when}{detail}",
@@ -3421,11 +3556,24 @@ fn task_run_lines(now_ms: i64, task_id: &str, runs: &[TaskRunRow]) -> Vec<String
 
 /// One task as the `--json` document carries it.
 ///
-/// The key set is the contract, and it is **fixed**: all twelve keys are always
-/// present. Wave 3's Tasks view reads exactly this document, so a key that
-/// appears only sometimes would be a key every consumer has to guard —
+/// The key set is the contract, and it is **fixed**: all fourteen keys are
+/// always present. Wave 3's Tasks view reads exactly this document, so a key
+/// that appears only sometimes would be a key every consumer has to guard —
 /// `onMissed` therefore appears on every row, including the `run_now` ones the
-/// human rendering leaves unmarked.
+/// human rendering leaves unmarked, `description` appears on every row
+/// including the overwhelming majority that have none, and `missedDelayMs`
+/// appears on every row including the ones that chose no delay of their own.
+///
+/// `missedDelayMs` is `null` for *not chosen*, which a consumer must not read as
+/// zero and must not fill in with keeper's constant: a row that chose thirty
+/// minutes keeps thirty minutes if that constant is ever retuned, and a row that
+/// chose nothing follows it.
+///
+/// `description` is also the one key carried **verbatim** where the human
+/// rendering does not: a stored `""` reaches this document as `""` rather than
+/// as `null`, because a machine consumer is owed the row and not a rendering of
+/// it. [`task_description_text`] holds the rendering rule and this function
+/// deliberately does not call it.
 ///
 /// camelCase, matching `sizeBytes` and `profileId` across `ls-files`, `verify`,
 /// `materialize` and `dehydrate`, so an operator reads every document the same
@@ -3463,10 +3611,12 @@ fn task_json(
         "profileId": task.profile_id,
         "profile": profile_name,
         "schedule": task.schedule,
+        "description": task.description,
         "nextDueMs": task.next_due_ms,
         "runningHost": task.running_host,
         "leaseUntilMs": task.lease_until_ms,
         "onMissed": task.on_missed.as_str(),
+        "missedDelayMs": task.missed_delay_ms,
         "lastRun": last.map(task_run_json),
     })
 }
@@ -3560,22 +3710,17 @@ fn task_run_document(
     serde_json::json!({ "task": task_id, "run": run, "outcome": outcome, "exit": exit })
 }
 
-/// The document `tasks set`, `tasks enable` and `tasks disable` all emit.
+/// The document `tasks set` emits.
 ///
-/// One envelope for three verbs because all three answer the same question —
-/// *what does the row look like now* — and it is the row **read back from the
-/// store**, never the row that was submitted; see [`report_task`].
+/// It answers *what does the row look like now*, and it is the row **read back
+/// from the store**, never the row that was submitted; see [`report_task`].
+///
+/// `tasks enable`, `tasks disable` and `tasks forget` used to emit this envelope
+/// (and a `{ "forgot": id }` one) and now emit [`tasks_batch_document`] instead:
+/// they act on as many ids as were named, so the read-back row moved inside each
+/// successful receipt entry.
 fn task_saved_document(task: serde_json::Value) -> serde_json::Value {
     serde_json::json!({ "task": task })
-}
-
-/// `tasks forget`'s document.
-///
-/// The id and nothing else: the row is gone, so there is no row to describe, and
-/// echoing the fields of something that no longer exists would invite a consumer
-/// to believe it still does.
-fn task_forgotten_document(id: &str) -> serde_json::Value {
-    serde_json::json!({ "forgot": id })
 }
 
 /// Every stored task, with its target, schedule and last run.
@@ -3914,6 +4059,32 @@ fn cmd_task_set(
         (None, None) => TaskMissedPolicy::RunNow,
     };
 
+    // `schedule`'s three-way shape above, verbatim, because it is the same
+    // question: an optional free-text column with an explicit way to clear it.
+    // The flag is what makes clearing expressible at all — see
+    // `TaskSetArgs::no_description`.
+    let description = if args.no_description {
+        None
+    } else if args.description.is_some() {
+        args.description.clone()
+    } else {
+        existing.and_then(|row| row.description.clone())
+    };
+
+    // `description`'s three-way shape, and the conversion from minutes is here
+    // because minutes are the CLI's unit and milliseconds are the row's — the
+    // same boundary the app's form crosses. `saturating_mul`, so
+    // `--missed-delay 9223372036854775807` meets the write door's ceiling and its
+    // sentence rather than wrapping into a plausible small number and being
+    // stored.
+    let missed_delay_ms = if args.no_missed_delay {
+        None
+    } else if let Some(minutes) = args.missed_delay {
+        Some(minutes.saturating_mul(60_000))
+    } else {
+        existing.and_then(|row| row.missed_delay_ms)
+    };
+
     let row = TaskRow {
         id: args.task.clone(),
         profile_id,
@@ -3930,63 +4101,320 @@ fn cmd_task_set(
         running_host: existing.and_then(|row| row.running_host.clone()),
         lease_until_ms: existing.and_then(|row| row.lease_until_ms),
         on_missed,
+        description,
+        missed_delay_ms,
     };
     engine.save_task(&row, None)?;
     report_task(printer, engine, now_ms, &row.id)
 }
 
-/// Take a task in or out of service, leaving everything else exactly as stored.
+/// Which batched verb is speaking, so a receipt renders the words that verb has
+/// always used.
+///
+/// A three-variant enum rather than the `bool` [`cmd_task_set_enabled`] used to
+/// carry, because `forget` shares the whole receipt-rendering path with the
+/// other two and a boolean cannot name three things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskBatchVerb {
+    Enable,
+    Disable,
+    Forget,
+}
+
+impl TaskBatchVerb {
+    /// The line an id that went through gets — byte for byte what the single-id
+    /// verb printed before this became a batch.
+    fn done_line(self, id: &str) -> String {
+        match self {
+            Self::Enable => format!("Enabled task {id}"),
+            Self::Disable => format!("Disabled task {id}"),
+            Self::Forget => format!("Forgot task {id} and its run history"),
+        }
+    }
+
+    /// What there was nothing of, for an id no row answers to.
+    fn nothing_clause(self) -> &'static str {
+        match self {
+            Self::Enable | Self::Disable => "nothing to change",
+            Self::Forget => "nothing to forget",
+        }
+    }
+}
+
+/// A batch's receipt as a human reads it: **one line per requested id**.
+///
+/// **Pure, and returning lines rather than printing them**, for [`task_lines`]'s
+/// reason: [`Printer`] writes to process stdout, so an assertion about what
+/// these verbs *say* would otherwise need the binary spawned. That matters more
+/// here than anywhere else in this section, because the per-id independence is
+/// the whole point of the batch and it is only visible in the text.
+///
+/// A refusal uses the tasks section's own `{id}: {reason}` shape and carries
+/// keeper's sentence verbatim — a paraphrase here is a second wording for a fact
+/// the write door already has words for. `Missing` gets its own sentence rather
+/// than a refusal's, because the two want different actions from the person
+/// reading: a refusal is something to fix, and a row another host forgot usually
+/// is not.
+///
+/// **No entries is still a line**, on [`task_lines`]'s rule: clap requires at
+/// least one id, so this is unreachable from the CLI — but a renderer that
+/// answers silence is indistinguishable from one that did not run.
+fn task_batch_lines(verb: TaskBatchVerb, entries: &[TaskBatchEntry]) -> Vec<String> {
+    if entries.is_empty() {
+        return vec!["No task ids were given, so nothing was changed.".to_owned()];
+    }
+    entries
+        .iter()
+        .map(|entry| match &entry.outcome {
+            TaskBatchOutcome::Saved(_) | TaskBatchOutcome::Forgotten => verb.done_line(&entry.id),
+            TaskBatchOutcome::Missing => format!(
+                "{}: no such task on this host — {}",
+                entry.id,
+                verb.nothing_clause()
+            ),
+            TaskBatchOutcome::Refused(reason) => format!("{}: {reason}", entry.id),
+        })
+        .collect()
+}
+
+/// One receipt entry as the `--json` document carries it.
+///
+/// **Five keys, always all five**, `null` for "not applicable" — the shape
+/// [`task_run_document`] already has for its own `run`. `effect` is non-null
+/// exactly when `outcome` is `saved`, and `reason` exactly when it is `refused`,
+/// so a consumer branches on `outcome` and never on which keys arrived.
+///
+/// The words are the store's own — [`TaskSave`]'s three effects — so the human
+/// lines and this document cannot come to call one outcome two different things.
+///
+/// `row` is the task **as re-read after the write**, and is `null` when that
+/// re-read could not find the row — another host forgot it in between — or could
+/// not run at all. It is not a promise that a `saved` entry carries a row: the
+/// receipt is what says what happened, and `row` is only the store's answer
+/// afterwards.
+fn task_batch_entry_json(
+    entry: &TaskBatchEntry,
+    row: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let (outcome, effect, reason) = match &entry.outcome {
+        TaskBatchOutcome::Saved(effect) => (
+            "saved",
+            Some(match effect {
+                TaskSave::Created => "created",
+                TaskSave::Updated => "updated",
+                TaskSave::Rearmed => "rearmed",
+            }),
+            None,
+        ),
+        TaskBatchOutcome::Forgotten => ("forgotten", None, None),
+        TaskBatchOutcome::Missing => ("missing", None, None),
+        TaskBatchOutcome::Refused(reason) => ("refused", None, Some(reason.as_str())),
+    };
+    serde_json::json!({
+        "task": entry.id,
+        "outcome": outcome,
+        "effect": effect,
+        "reason": reason,
+        "row": row,
+    })
+}
+
+/// The one document `tasks enable`, `tasks disable` and `tasks forget` emit.
+///
+/// A named function for [`tasks_list_document`]'s reason: the envelope is as much
+/// of the contract as the entries are, and inline in a command nothing could
+/// assert it.
+///
+/// **One shape whatever the argument count is.** The rejected alternative was to
+/// keep the old `{ "task": … }` / `{ "forgot": … }` envelope for one id and this
+/// one for many — a contract whose shape depends on how many arguments were
+/// typed, which is a `--json` consumer that has to branch before it can parse.
+/// Nothing is lost by the change: the read-back row moved **inside** each
+/// successful entry.
+fn tasks_batch_document(results: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({ "results": results })
+}
+
+/// Render a batch's receipt, read back every row it wrote, and earn the exit
+/// code.
+///
+/// The read-back is [`report_task`]'s rule — what a write verb says is what the
+/// store now holds, never the row that was submitted — done **once** for the
+/// whole batch rather than through `report_task` per id, which re-reads the
+/// entire listing on every call.
+///
+/// # The read-back is best-effort, because the writes are already committed
+///
+/// By the time it runs, the store has been changed and the human lines are on
+/// stdout. A `?` on any of these reads would hand `main` an `Err`, which prints
+/// a JSON failure envelope **in place of** the receipt — a `--json` consumer
+/// would believe nothing happened when in fact rows went. So a failed read-back
+/// falls back to no read-back rows (those entries carry `row: null`, which the
+/// document's contract already allows), logs at `warn`, and leaves the exit code
+/// exactly the one the receipt earned. It is [`verify_entry`]'s line held one
+/// level up: a consumer must be able to tell "checked, nothing wrong" from
+/// "never checked", and dropping the whole document says neither.
+///
+/// # The number goes through `Ok`, never through `Err`
+///
+/// [`EXIT_CONFIG`] when any id did not go through, [`EXIT_OK`] otherwise: a
+/// refusal is a selector-or-state problem, and exit 2 already means "retrying
+/// changes nothing, edit something". It is **not** a [`CliError`], for
+/// [`cmd_task_run`]'s reason: `main` prints a JSON failure envelope for every
+/// `Err`, which would put a second document on stdout over the receipt this
+/// function already emitted.
+fn report_task_batch(
+    printer: &Printer,
+    engine: &Engine,
+    now_ms: i64,
+    verb: TaskBatchVerb,
+    entries: &[TaskBatchEntry],
+) -> std::result::Result<u8, CliError> {
+    for line in task_batch_lines(verb, entries) {
+        printer.line(line);
+    }
+
+    let saved: Vec<&str> = entries
+        .iter()
+        .filter(|entry| matches!(entry.outcome, TaskBatchOutcome::Saved(_)))
+        .map(|entry| entry.id.as_str())
+        .collect();
+    // Nothing was written, so there is nothing to read back — and `forget` never
+    // has anything here by construction.
+    let (listing, profiles) = if saved.is_empty() {
+        (TaskListing::default(), Vec::new())
+    } else {
+        match engine
+            .tasks()
+            .and_then(|listing| engine.list_profiles().map(|profiles| (listing, profiles)))
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not read back the rows this batch wrote; the receipt \
+                     still says what happened, with no row for those entries"
+                );
+                (TaskListing::default(), Vec::new())
+            }
+        }
+    };
+    let mut rows: Vec<(&str, serde_json::Value)> = Vec::with_capacity(saved.len());
+    for id in saved {
+        // A row the batch just wrote and this listing cannot find would mean the
+        // other host forgot it between the write and the read; the receipt still
+        // says what happened, so there is nothing to refuse here.
+        let Some(task) = listing.tasks.iter().find(|task| task.id == id) else {
+            continue;
+        };
+        // Same reason as the listing above: a history that will not read costs
+        // this row its last-run line, never the receipt.
+        let newest = match engine.task_history(id, 1) {
+            Ok(runs) => runs,
+            Err(err) => {
+                tracing::warn!(
+                    task = id,
+                    error = %err,
+                    "could not read back this task's newest run"
+                );
+                Vec::new()
+            }
+        };
+        let view = TaskView {
+            task,
+            profile_name: task_profile_name(&profiles, task),
+            last: newest.first(),
+        };
+        for line in task_lines(now_ms, std::slice::from_ref(&view), &[]) {
+            printer.line(line);
+        }
+        rows.push((id, task_json(task, view.profile_name, view.last)));
+    }
+
+    printer.json(&tasks_batch_document(
+        entries
+            .iter()
+            .map(|entry| {
+                let row = rows
+                    .iter()
+                    .find(|(id, _)| *id == entry.id.as_str())
+                    .map(|(_, row)| row.clone());
+                task_batch_entry_json(entry, row)
+            })
+            .collect(),
+    ));
+
+    let every_id_went_through = entries.iter().all(|entry| {
+        matches!(
+            entry.outcome,
+            TaskBatchOutcome::Saved(_) | TaskBatchOutcome::Forgotten
+        )
+    });
+    Ok(if every_id_went_through {
+        EXIT_OK
+    } else {
+        EXIT_CONFIG
+    })
+}
+
+/// Take one or more tasks in or out of service, leaving everything else exactly
+/// as stored.
 ///
 /// One function for both verbs because they differ in one boolean, and the
 /// rest — read the row, keep every other column, write it back — is the part
 /// that must not diverge. `mode` and `schedule` survive untouched: AD-135 keeps
 /// `enabled` and `mode` apart because they answer different questions, so a
 /// disabled `scheduled` task keeps its schedule and resumes on it.
+///
+/// Every id carries `baseline_updated_ms: None`, which is unchanged behaviour and
+/// is what [`keeper_sync::db::upsert_task`] documents for a caller that reads and
+/// writes inside one call: nothing can have moved between two adjacent
+/// statements the way it can across a person's typing. The app's pane is the
+/// caller that passes each row's own reading.
 fn cmd_task_set_enabled(
     printer: &Printer,
     engine: &Engine,
     now_ms: i64,
-    wanted: &str,
+    wanted: &[String],
     enabled: bool,
 ) -> std::result::Result<u8, CliError> {
-    let listing = engine.tasks()?;
-    let stored = select_task(&listing, wanted)?;
-    let row = TaskRow {
-        enabled,
-        updated_ms: now_ms,
-        ..stored.clone()
+    let batch: Vec<TaskBatchId> = wanted
+        .iter()
+        .map(|id| TaskBatchId {
+            id: id.clone(),
+            baseline_updated_ms: None,
+        })
+        .collect();
+    let entries = engine.set_tasks_enabled(&batch, enabled)?;
+    let verb = if enabled {
+        TaskBatchVerb::Enable
+    } else {
+        TaskBatchVerb::Disable
     };
-    engine.save_task(&row, None)?;
-    printer.line(format!(
-        "{} task {}",
-        if enabled { "Enabled" } else { "Disabled" },
-        row.id
-    ));
-    report_task(printer, engine, now_ms, &row.id)
+    report_task_batch(printer, engine, now_ms, verb, &entries)
 }
 
-/// Forget a task and everything it recorded.
+/// Forget one or more tasks and everything they recorded.
 ///
-/// Selected through [`select_task`] first, so forgetting an id nobody stored is
-/// a refusal rather than a silent success: `db::delete_task` cannot tell "gone
-/// now" from "was never here", and a typo that reports success is how somebody
-/// comes to believe a task is deleted while it is still on a schedule.
+/// [`keeper_sync::db::forget_tasks`] reads the listing first, so forgetting an id
+/// nobody stored is answered rather than reported as a silent success:
+/// `db::delete_task` cannot tell "gone now" from "was never here", and a typo
+/// that reports success is how somebody comes to believe a task is deleted while
+/// it is still on a schedule.
 ///
 /// That also means a row this build **cannot read** is refused rather than
 /// deleted, and that is the right way round: it belongs to a newer keeper on the
 /// other host, and deleting a task on somebody else's behalf because we cannot
-/// parse it is the "absence is deletion" mistake AD-48 exists to prevent.
+/// parse it is the "absence is deletion" mistake AD-48 exists to prevent. Per
+/// id: one unreadable row in a batch of five does not stop the other four.
 fn cmd_task_forget(
     printer: &Printer,
     engine: &Engine,
-    wanted: &str,
+    now_ms: i64,
+    wanted: &[String],
 ) -> std::result::Result<u8, CliError> {
-    let listing = engine.tasks()?;
-    let id = select_task(&listing, wanted)?.id.clone();
-    engine.forget_task(&id)?;
-    printer.line(format!("Forgot task {id} and its run history"));
-    printer.json(&task_forgotten_document(&id));
-    Ok(EXIT_OK)
+    let entries = engine.forget_tasks(wanted)?;
+    report_task_batch(printer, engine, now_ms, TaskBatchVerb::Forget, &entries)
 }
 
 /// Run one clean or smudge pass for git.
@@ -4112,18 +4540,38 @@ mod tests {
             &["keeper-syncd", "tasks", "enable", "nightly"],
             &["keeper-syncd", "tasks", "disable", "nightly"],
             &["keeper-syncd", "tasks", "forget", "nightly"],
+            &["keeper-syncd", "tasks", "enable", "nightly", "weekly"],
+            &["keeper-syncd", "tasks", "disable", "a", "b"],
+            &["keeper-syncd", "tasks", "forget", "a", "b", "c"],
         ];
         for args in invocations {
             assert!(parse(args).is_ok(), "must parse: {args:?}");
         }
+
+        // The three repeatable verbs **accumulate**, rather than the last id
+        // winning: `num_args = 1..` is what makes several positionals one
+        // `Vec<String>`, and it is the whole reason a batch exists.
+        let Ok(Cli {
+            command:
+                Command::Tasks {
+                    command: TaskCommand::Disable { task },
+                },
+            ..
+        }) = parse(&["keeper-syncd", "tasks", "disable", "a", "b"])
+        else {
+            panic!("`tasks disable a b` must parse as a Disable over two ids");
+        };
+        assert_eq!(task, vec!["a".to_owned(), "b".to_owned()]);
     }
 
     #[test]
     fn a_task_selector_is_required_by_every_verb_that_names_one() {
         // `tasks list` is the only verb that addresses no task; every other one
-        // acts on exactly one row, and a missing selector must be told rather
+        // names at least one row, and a missing selector must be told rather
         // than read as "all of them" — which for `run` and `forget` would be a
-        // fan-out nobody asked for.
+        // fan-out nobody asked for. For the three repeatable verbs
+        // `#[arg(required = true, …)]` is what keeps that true: `num_args = 1..`
+        // alone would have made an empty `Vec` a legal parse.
         for verb in ["status", "run", "set", "enable", "disable", "forget"] {
             let err = parse(&["keeper-syncd", "tasks", verb])
                 .expect_err("a task id is required to name one");
@@ -4157,6 +4605,15 @@ mod tests {
                 "--schedule",
                 "every 5m",
                 "--no-schedule",
+            ],
+            vec![
+                "keeper-syncd",
+                "tasks",
+                "set",
+                "nightly",
+                "--missed-delay",
+                "240",
+                "--no-missed-delay",
             ],
         ] {
             let err = parse(&args).expect_err("contradictory flags must be refused");
@@ -4231,9 +4688,18 @@ mod tests {
         // satisfied by the very phrase warning against the error. The number and
         // the instant it is measured from are one claim, so they are one
         // assertion.
+        //
+        // Story 59.6 adds `--missed-delay`, whose help states the same two
+        // numbers in two more roles: the delay as the **default** a task gets by
+        // not choosing, and the grace as the **floor** below which a delay is
+        // refused. Both are pinned here for the same reason — they are prose on a
+        // clap argument, which is exactly the distance that let the first one go
+        // wrong.
         for expected in [
             format!("concludes after {grace_minutes} minutes"),
             format!("runs it {delay_minutes} minutes after a host noticed it"),
+            format!("Defaults to {delay_minutes} minutes"),
+            format!("At least {grace_minutes} minutes"),
         ] {
             assert!(
                 help.contains(&expected),
@@ -5648,6 +6114,8 @@ mod tests {
             running_host: None,
             lease_until_ms: None,
             on_missed: TaskMissedPolicy::RunNow,
+            description: None,
+            missed_delay_ms: None,
         }
     }
 
@@ -5677,6 +6145,10 @@ mod tests {
             no_schedule: false,
             mode: None,
             on_missed: None,
+            missed_delay: None,
+            no_missed_delay: false,
+            description: None,
+            no_description: false,
         }
     }
 
@@ -5837,11 +6309,13 @@ mod tests {
         assert_eq!(
             sorted_keys(&document),
             vec![
+                "description",
                 "enabled",
                 "id",
                 "kind",
                 "lastRun",
                 "leaseUntilMs",
+                "missedDelayMs",
                 "mode",
                 "nextDueMs",
                 "onMissed",
@@ -5862,6 +6336,13 @@ mod tests {
         assert_eq!(document["nextDueMs"], serde_json::Value::Null);
         assert_eq!(document["runningHost"], serde_json::Value::Null);
         assert_eq!(document["leaseUntilMs"], serde_json::Value::Null);
+        // Null and not `""`: this row predates the column, and "nobody named it"
+        // is not "somebody named it nothing".
+        assert_eq!(document["description"], serde_json::Value::Null);
+        // Null and not keeper's own 1_800_000: *not chosen* is a different fact
+        // from *chose the current default*, and a consumer that filled the
+        // constant in here would opt the row out of ever tracking it again.
+        assert_eq!(document["missedDelayMs"], serde_json::Value::Null);
         // Present on every row including the default ones, unlike the human
         // rendering's marker: a fixed key set is this document's contract.
         assert_eq!(document["onMissed"], serde_json::json!("run_now"));
@@ -6069,10 +6550,248 @@ mod tests {
         let saved = task_saved_document(rendered.clone());
         assert_eq!(sorted_keys(&saved), vec!["task"]);
         assert_eq!(saved["task"], rendered);
+    }
 
-        let forgotten = task_forgotten_document("nightly");
-        assert_eq!(sorted_keys(&forgotten), vec!["forgot"]);
-        assert_eq!(forgotten["forgot"], serde_json::json!("nightly"));
+    /// Every id gets its own rendered line, and a refusal carries keeper's own
+    /// sentence (Story 59.4).
+    ///
+    /// Over a real engine, because the receipt is what is being rendered and a
+    /// hand-built one could not prove the words came from the store. The
+    /// renderer is called directly rather than through the command, for
+    /// [`task_lines`]'s reason: [`Printer`] writes to process stdout, so this is
+    /// the only way to assert what the verb *says*.
+    #[test]
+    fn a_batched_verb_renders_one_line_per_id_and_names_each_refusal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut stored = a_task("nightly");
+        stored.updated_ms = platform.now_ms();
+        engine.save_task(&stored, None).expect("a stored task");
+
+        let requested = ["nightly", "ghost", " nightly"];
+        let batch: Vec<TaskBatchId> = requested
+            .iter()
+            .map(|id| TaskBatchId {
+                id: (*id).to_owned(),
+                baseline_updated_ms: None,
+            })
+            .collect();
+        let entries = engine
+            .set_tasks_enabled(&batch, false)
+            .expect("the store is fine");
+        let lines = task_batch_lines(TaskBatchVerb::Disable, &entries);
+
+        assert_eq!(
+            lines.len(),
+            requested.len(),
+            "one line per requested id, never a summary: {lines:?}"
+        );
+        assert_eq!(
+            lines[0], "Disabled task nightly",
+            "the success line is byte for byte what the single-id verb printed"
+        );
+        assert_eq!(
+            lines[1], "ghost: no such task on this host — nothing to change",
+            "an id nobody stored is said, and said differently from a refusal"
+        );
+        assert!(
+            lines[2].starts_with(" nightly: ") && lines[2].contains("whitespace"),
+            "the refusal names the id and carries keeper's reason verbatim, so a \
+             person meets one wording rather than a paraphrase: {}",
+            lines[2]
+        );
+    }
+
+    /// The batched `--json` document, key by key (Story 59.4).
+    ///
+    /// One envelope per invocation whatever the argument count is, and a **fixed
+    /// five-key set per entry** with `null` for "not applicable" — the shape
+    /// [`task_run_document`] already has. Pure, over a hand-built receipt,
+    /// because the claim is about the document's contract and nothing about it
+    /// needs a store.
+    #[test]
+    fn the_batched_json_document_carries_one_entry_per_id() {
+        let task = a_task("nightly");
+        let row = task_json(&task, None, None);
+        let entries = [
+            TaskBatchEntry {
+                id: "nightly".to_owned(),
+                outcome: TaskBatchOutcome::Saved(TaskSave::Rearmed),
+            },
+            TaskBatchEntry {
+                id: "ghost".to_owned(),
+                outcome: TaskBatchOutcome::Missing,
+            },
+            TaskBatchEntry {
+                id: " nightly".to_owned(),
+                outcome: TaskBatchOutcome::Refused("task id must not begin".to_owned()),
+            },
+        ];
+        let document = tasks_batch_document(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(position, entry)| {
+                    task_batch_entry_json(entry, (position == 0).then(|| row.clone()))
+                })
+                .collect(),
+        );
+
+        assert_eq!(
+            sorted_keys(&document),
+            vec!["results"],
+            "one envelope, and its name is as much of the contract as the entries"
+        );
+        let results = document["results"].as_array().expect("an array");
+        assert_eq!(
+            results
+                .iter()
+                .map(|entry| &entry["task"])
+                .collect::<Vec<_>>(),
+            vec![
+                &serde_json::json!("nightly"),
+                &serde_json::json!("ghost"),
+                &serde_json::json!(" nightly"),
+            ],
+            "one element per requested id, in request order"
+        );
+        for entry in results {
+            assert_eq!(
+                sorted_keys(entry),
+                vec!["effect", "outcome", "reason", "row", "task"],
+                "five keys always, so a consumer branches on `outcome` and never \
+                 on which keys arrived: {entry}"
+            );
+        }
+
+        assert_eq!(results[0]["outcome"], serde_json::json!("saved"));
+        assert_eq!(
+            results[0]["effect"],
+            serde_json::json!("rearmed"),
+            "a saved entry says what the write did, because only `created` and \
+             `rearmed` mean the task came back into service"
+        );
+        assert_eq!(results[0]["reason"], serde_json::Value::Null);
+        assert_eq!(results[0]["row"], row, "the read-back row rides inside");
+
+        assert_eq!(results[1]["outcome"], serde_json::json!("missing"));
+        assert_eq!(
+            results[1]["effect"],
+            serde_json::Value::Null,
+            "nothing was written, so there is no effect to name"
+        );
+        assert_eq!(results[1]["reason"], serde_json::Value::Null);
+        assert_eq!(results[1]["row"], serde_json::Value::Null);
+
+        assert_eq!(results[2]["outcome"], serde_json::json!("refused"));
+        assert_eq!(results[2]["effect"], serde_json::Value::Null);
+        assert_eq!(
+            results[2]["reason"],
+            serde_json::json!("task id must not begin"),
+            "a refusal's sentence is the whole point of the entry"
+        );
+        assert_eq!(results[2]["row"], serde_json::Value::Null);
+    }
+
+    /// A batch with one refusal exits [`EXIT_CONFIG`] **through `Ok`**, and
+    /// therefore emits exactly one document (Story 59.4).
+    ///
+    /// The `Err` shape is the one thing this must not be: `main` prints a JSON
+    /// failure envelope for every `Err`, which would put a second document on
+    /// stdout over the receipt the verb already emitted — [`cmd_task_run`]'s own
+    /// reason for returning its number the same way.
+    #[test]
+    fn a_batch_with_a_refusal_exits_non_zero_without_a_second_document() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+        let mut stored = a_task("nightly");
+        stored.updated_ms = now;
+        engine.save_task(&stored, None).expect("a stored task");
+
+        let mixed = cmd_task_set_enabled(
+            &printer,
+            &engine,
+            now,
+            &["nightly".to_owned(), "ghost".to_owned()],
+            false,
+        );
+        assert_eq!(
+            mixed.map_err(|err| err.to_string()),
+            Ok(EXIT_CONFIG),
+            "the number goes through the Ok channel, so exactly one document \
+             reaches stdout"
+        );
+
+        // And the id that did go through really went through, which is what makes
+        // the non-zero exit a report rather than a rollback.
+        let listing = engine.tasks().expect("tasks");
+        assert!(
+            !select_task(&listing, "nightly").expect("the row").enabled,
+            "one id's refusal does not un-change the ids that were written"
+        );
+
+        // Every id going through is still EXIT_OK, so the number means something.
+        assert_eq!(
+            cmd_task_set_enabled(&printer, &engine, now, &["nightly".to_owned()], true)
+                .expect("the verb itself must not fail"),
+            EXIT_OK
+        );
+    }
+
+    /// A read-back that yields nothing still emits the receipt (Story 59.4
+    /// review, P2).
+    ///
+    /// The receipt is handed in claiming a `Saved` id no row backs, which is the
+    /// shape a read-back failure and a row another host forgot in between both
+    /// collapse to: no read-back rows at all. The number must still come out
+    /// through `Ok` — an `Err` would make `main` print a failure envelope in
+    /// place of the document, and a `--json` consumer would believe nothing
+    /// happened when the writes are already committed.
+    #[test]
+    fn a_read_back_that_finds_nothing_still_emits_the_receipt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+
+        let entries = [
+            TaskBatchEntry {
+                id: "vanished".to_owned(),
+                outcome: TaskBatchOutcome::Saved(TaskSave::Updated),
+            },
+            TaskBatchEntry {
+                id: "ghost".to_owned(),
+                outcome: TaskBatchOutcome::Missing,
+            },
+        ];
+        assert_eq!(
+            report_task_batch(&printer, &engine, now, TaskBatchVerb::Disable, &entries,)
+                .map_err(|err| err.to_string()),
+            Ok(EXIT_CONFIG),
+            "no read-back row costs the entry its `row`, never the receipt: the \
+             number is still the one the receipt earned"
+        );
+
+        // ...and the entry the read-back could not fill in is `row: null` rather
+        // than absent, which is the document's own five-key contract.
+        let entry = task_batch_entry_json(&entries[0], None);
+        assert_eq!(
+            sorted_keys(&entry),
+            vec!["effect", "outcome", "reason", "row", "task"]
+        );
+        assert_eq!(entry["outcome"], serde_json::json!("saved"));
+        assert_eq!(entry["row"], serde_json::Value::Null);
     }
 
     #[test]
@@ -6451,7 +7170,8 @@ mod tests {
         //    `enabled` from a settings-shaped update is exactly how a restart
         //    un-pauses everything somebody paused.
         assert_eq!(
-            cmd_task_set_enabled(&printer, &engine, now, "nightly", false).expect("disable"),
+            cmd_task_set_enabled(&printer, &engine, now, &["nightly".to_owned()], false)
+                .expect("disable"),
             EXIT_OK
         );
         let row = stored("nightly");
@@ -6466,21 +7186,22 @@ mod tests {
             "`set` must not resurrect a disabled task"
         );
         assert_eq!(
-            cmd_task_set_enabled(&printer, &engine, now, "nightly", true).expect("enable"),
+            cmd_task_set_enabled(&printer, &engine, now, &["nightly".to_owned()], true)
+                .expect("enable"),
             EXIT_OK
         );
         assert!(stored("nightly").enabled);
 
-        // 9. `forget` refuses an id nobody stored, and takes the row when it is
-        //    real.
+        // 9. `forget` answers for an id nobody stored — through the exit code
+        //    rather than through `Err`, so the receipt on stdout is the only
+        //    document — and takes the row when it is real.
         assert_eq!(
-            cmd_task_forget(&printer, &engine, "nope")
-                .expect_err("no such task")
-                .exit_code(),
+            cmd_task_forget(&printer, &engine, now, &["nope".to_owned()])
+                .expect("the verb itself must not fail"),
             EXIT_CONFIG
         );
         assert_eq!(
-            cmd_task_forget(&printer, &engine, "nightly").expect("forget"),
+            cmd_task_forget(&printer, &engine, now, &["nightly".to_owned()]).expect("forget"),
             EXIT_OK
         );
         let listing = engine.tasks().expect("tasks");
@@ -6596,6 +7317,247 @@ mod tests {
                 "and the stored spelling this writes is one the store reads back"
             );
         }
+    }
+
+    /// `--missed-delay` writes the task's own delay, `--no-missed-delay` takes it
+    /// away, omitting both keeps what is stored, and the write door refuses one
+    /// that is not a delay (Story 59.6, FR-366).
+    ///
+    /// The **pair** is the claim, for `--description`'s reason below and one that
+    /// is sharper here: the two states are genuinely different rather than merely
+    /// awkward to spell. Storing nothing means *follow keeper's constant, whatever
+    /// it becomes*; `--missed-delay 30` means *thirty minutes even if that
+    /// constant moves*. A CLI that could only set would have made the first state
+    /// unreachable after one save.
+    #[test]
+    fn the_per_task_delay_is_writable_clearable_and_refused_when_it_is_not_a_delay() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+        let stored = |id: &str| -> TaskRow {
+            let listing = engine.tasks().expect("tasks");
+            select_task(&listing, id).expect("a stored row").clone()
+        };
+        let rendered = |id: &str| -> (String, serde_json::Value) {
+            let row = stored(id);
+            let view = TaskView {
+                task: &row,
+                profile_name: None,
+                last: None,
+            };
+            (
+                task_lines(now, std::slice::from_ref(&view), &[]).join("\n"),
+                task_json(&row, None, None),
+            )
+        };
+
+        // Create with the policy and no delay: absent, which means the constant.
+        let mut args = set_args("nightly");
+        args.kind = Some(TaskKindArg::Sync);
+        args.schedule = Some("0 3 * * *".to_owned());
+        args.on_missed = Some(TaskMissedArg::Delay);
+        cmd_task_set(&printer, &engine, now, &args).expect("create");
+        assert_eq!(stored("nightly").missed_delay_ms, None);
+        let (line, document) = rendered("nightly");
+        assert!(
+            line.contains("[on missed: delay]"),
+            "no chosen delay, so the marker names the policy and nothing else: {line}"
+        );
+        assert_eq!(document["missedDelayMs"], serde_json::Value::Null);
+
+        // Set it, in minutes, and read it back from both.
+        args.missed_delay = Some(240);
+        cmd_task_set(&printer, &engine, now, &args).expect("set the delay");
+        assert_eq!(
+            stored("nightly").missed_delay_ms,
+            Some(240 * 60_000),
+            "minutes at the prompt, milliseconds on the row"
+        );
+        let (line, document) = rendered("nightly");
+        assert!(
+            line.contains("[on missed: delay 240m]"),
+            "and the chosen delay rides in the same marker rather than a second one: {line}"
+        );
+        assert_eq!(document["missedDelayMs"], 240 * 60_000);
+
+        // Omitted keeps stored, the rule every other flag here follows.
+        let mut only_schedule = set_args("nightly");
+        only_schedule.schedule = Some("0 4 * * *".to_owned());
+        cmd_task_set(&printer, &engine, now, &only_schedule).expect("change the schedule");
+        assert_eq!(stored("nightly").missed_delay_ms, Some(240 * 60_000));
+
+        // Cleared, and back to *not chosen* rather than to the constant's own
+        // number — which is the whole difference the second flag exists for.
+        let mut clearing = set_args("nightly");
+        clearing.no_missed_delay = true;
+        cmd_task_set(&printer, &engine, now, &clearing).expect("clear the delay");
+        assert_eq!(stored("nightly").missed_delay_ms, None);
+
+        // Refused below the grace, in Rust's own words, and nothing is stored.
+        let mut impatient = set_args("nightly");
+        impatient.missed_delay = Some(5);
+        let err = cmd_task_set(&printer, &engine, now, &impatient)
+            .expect_err("five minutes is not a delay");
+        assert_eq!(err.exit_code(), EXIT_CONFIG);
+        assert!(
+            err.to_string().contains("concludes nobody was home"),
+            "the refusal must say why the grace period is the floor: {err}"
+        );
+        assert_eq!(stored("nightly").missed_delay_ms, None);
+
+        // And an absurd number of minutes meets the ceiling rather than wrapping:
+        // `i64::MAX` minutes in milliseconds overflows, and a wrapped product
+        // could land anywhere — including inside the bounds, which would store a
+        // delay nobody asked for.
+        let mut absurd = set_args("nightly");
+        absurd.missed_delay = Some(i64::MAX);
+        let err = cmd_task_set(&printer, &engine, now, &absurd).expect_err("longer than a year");
+        assert!(err.to_string().contains("must not exceed a year"), "{err}");
+
+        // A delay is stored under a policy that does not read it, because a
+        // policy change must not throw away a number somebody typed — and the
+        // marker then names the policy only, since the number is not in play.
+        let mut skipping = set_args("nightly");
+        skipping.on_missed = Some(TaskMissedArg::Skip);
+        skipping.missed_delay = Some(90);
+        cmd_task_set(&printer, &engine, now, &skipping).expect("store it anyway");
+        assert_eq!(stored("nightly").missed_delay_ms, Some(90 * 60_000));
+        let (line, _) = rendered("nightly");
+        assert!(
+            line.contains("[on missed: skip]"),
+            "the delay is stored but not in play, so the marker does not claim it: {line}"
+        );
+    }
+
+    /// `--description` writes the task's name, `--no-description` takes it away,
+    /// omitting both keeps what is stored, and both renderings read it back
+    /// (Story 59.5, AD-139).
+    ///
+    /// The **pair** is the claim, not the option. A knob you can set and never
+    /// unset is the dead knob this epic exists to close, and here it could not
+    /// have been one option: `--description ''` cannot be told apart from a shell
+    /// that expanded a variable to nothing, and those two want opposite answers.
+    /// So clearing has its own flag, exactly as `--no-schedule` does.
+    ///
+    /// The other claim is that the two renderings **disagree on purpose** about a
+    /// blank one. The human line draws nothing, because `  name: ` with nothing
+    /// after it is the one shape a reader takes for a failed read; the `--json`
+    /// document carries `""` verbatim, because a machine consumer is owed the row
+    /// and not a rendering of it. Asserting both together is what stops a later
+    /// tidy-up from collapsing them into one answer.
+    #[test]
+    fn a_task_description_is_writable_and_clearable_from_the_cli_and_read_back_by_both() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+        let stored = |id: &str| -> TaskRow {
+            let listing = engine.tasks().expect("tasks");
+            select_task(&listing, id).expect("a stored row").clone()
+        };
+        let rendered = |id: &str| -> (String, serde_json::Value) {
+            let row = stored(id);
+            let view = TaskView {
+                task: &row,
+                profile_name: None,
+                last: None,
+            };
+            (
+                task_lines(now, std::slice::from_ref(&view), &[]).join("\n"),
+                task_json(&row, None, None),
+            )
+        };
+
+        // Created without the flag: no description, and no line about one. Every
+        // task on every install is this row, which is why the human rendering
+        // says nothing rather than saying "none stored" on all of them.
+        let mut args = set_args("nightly");
+        args.kind = Some(TaskKindArg::Sync);
+        args.schedule = Some("0 3 * * *".to_owned());
+        cmd_task_set(&printer, &engine, now, &args).expect("create");
+        assert_eq!(stored("nightly").description, None);
+        let (line, document) = rendered("nightly");
+        assert!(
+            !line.contains("name:"),
+            "a task nobody named draws no name: {line}"
+        );
+        assert_eq!(
+            document["description"],
+            serde_json::Value::Null,
+            "but the document carries the key on every row"
+        );
+
+        // Written, and read back from both. Untrimmed on the way out, which is
+        // the store's rule: this is the one column a person authored.
+        args.description = Some("  nightly backup of the photos  ".to_owned());
+        cmd_task_set(&printer, &engine, now, &args).expect("name it");
+        assert_eq!(
+            stored("nightly").description.as_deref(),
+            Some("  nightly backup of the photos  "),
+            "stored exactly as given"
+        );
+        let (line, document) = rendered("nightly");
+        assert!(
+            line.contains("name:   nightly backup of the photos  "),
+            "drawn untrimmed, because what is stored is what is shown: {line}"
+        );
+        assert_eq!(document["description"], "  nightly backup of the photos  ");
+
+        // Omitted keeps stored, the rule every other flag here follows: a caller
+        // changing a schedule must not silently un-name the task.
+        let mut only_schedule = set_args("nightly");
+        only_schedule.schedule = Some("0 4 * * *".to_owned());
+        cmd_task_set(&printer, &engine, now, &only_schedule).expect("change the schedule");
+        assert_eq!(
+            stored("nightly").description.as_deref(),
+            Some("  nightly backup of the photos  "),
+            "an omitted flag keeps what was stored"
+        );
+
+        // A blank one is a value the store keeps and the two renderings disagree
+        // about, on purpose. Reachable from here because `--description ''` is a
+        // thing a person can type, and it must not become `null`.
+        args.description = Some(String::new());
+        args.schedule = Some("0 4 * * *".to_owned());
+        cmd_task_set(&printer, &engine, now, &args).expect("clear the text but keep the value");
+        assert_eq!(
+            stored("nightly").description,
+            Some(String::new()),
+            "an empty string a person typed is not an absent description"
+        );
+        let (line, document) = rendered("nightly");
+        assert!(
+            !line.contains("name:"),
+            "blank draws nothing: a heading over an empty string reads as a \
+             failed read, which is `task_description_text`'s whole rule: {line}"
+        );
+        assert_eq!(
+            document["description"], "",
+            "and the document says `\"\"` rather than null, because that is what \
+             is stored and a machine consumer is owed the row"
+        );
+
+        // And it is genuinely removable, which is the half an option alone could
+        // not express.
+        let mut clearing = set_args("nightly");
+        clearing.no_description = true;
+        cmd_task_set(&printer, &engine, now, &clearing).expect("forget the description");
+        assert_eq!(
+            stored("nightly").description,
+            None,
+            "`--no-description` restores the absent case, not the blank one"
+        );
+        assert_eq!(
+            rendered("nightly").1["description"],
+            serde_json::Value::Null
+        );
     }
 
     /// A stored task cannot be repurposed into another kind.
@@ -7154,6 +8116,76 @@ mod tests {
             assert!(
                 chapter.contains(name),
                 "§14 must name {name}, the file an operator has to install"
+            );
+        }
+    }
+
+    /// Every kind `--kind` offers is a row in §14's table, and the heading over
+    /// it counts nothing (Story 59.9).
+    ///
+    /// Driven off [`TaskKindArg::value_variants`] rather than a list written
+    /// here, which is the only version of this test worth having: the `From`
+    /// bridge to [`TaskKind`] is exhaustive, so a kind added to the engine must
+    /// appear in that enum to compile, and from there this test demands a row
+    /// in the chapter. A hardcoded list would go stale in exactly the same
+    /// motion as the documentation it is guarding.
+    ///
+    /// **The heading is asserted too, and that is not pedantry.** It read *"The
+    /// two kinds, and the one that will never exist"* for two whole stories,
+    /// and a third kind made it a false sentence that no test, no compiler and
+    /// no reviewer of the Rust diff would ever have looked at. A counted
+    /// heading over a growable table is a claim with a built-in expiry date, so
+    /// the count is banned rather than corrected.
+    ///
+    /// **And the refusals are asserted as text**, because they are the two
+    /// things a later story is most likely to quietly drop while adding to this
+    /// table: `update`, which must never be a kind, and the arbitrary-command
+    /// deferral, whose price — a threat model — is the reason the vocabulary is
+    /// closed at all.
+    #[test]
+    fn every_kind_the_cli_offers_is_a_documented_row_and_the_heading_counts_nothing() {
+        let chapter = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../docs/sync.md")
+                .canonicalize()
+                .expect("docs/sync.md must be reachable from this crate"),
+        )
+        .expect("docs/sync.md must be readable");
+
+        for arg in TaskKindArg::value_variants() {
+            // The **stored** spelling, which is what `tasks list` prints and
+            // what an operator types, taken through the same bridge the CLI
+            // uses so the test cannot document a word nothing accepts.
+            let spelling = TaskKind::from(*arg).as_str();
+            assert!(
+                chapter.contains(&format!("| `{spelling}` |")),
+                "§14's kind table must carry a row for `{spelling}` — a kind an \
+                 operator can type and cannot look up is a kind nobody will use"
+            );
+        }
+
+        for counted in ["The two kinds", "The three kinds", "The four kinds"] {
+            assert!(
+                !chapter.contains(counted),
+                "§14 must not count the kinds in a heading ({counted:?}): the \
+                 table grows and the sentence does not"
+            );
+        }
+
+        for (claim, why) in [
+            (
+                "**`update` is not a task kind and never will be.**",
+                "the one refusal a task kind could quietly undo",
+            ),
+            (
+                "needs its own decision",
+                "the arbitrary-command deferral, which a closed vocabulary is \
+                 the price of keeping",
+            ),
+        ] {
+            assert!(
+                chapter.contains(claim),
+                "§14 must still say {claim:?} — {why}"
             );
         }
     }

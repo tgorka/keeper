@@ -15,7 +15,7 @@ import { RecordingPane } from "@/components/layout/recording-pane";
 import { SettingsPane } from "@/components/layout/settings-pane";
 import { SIDEBAR_WIDTH_CLASS, SidebarPane } from "@/components/layout/sidebar-pane";
 import { SyncPane } from "@/components/layout/sync-pane";
-import { TasksPane } from "@/components/layout/tasks-pane";
+import { TASKS_PANEL_EMPTY_SENTENCE, TasksPane } from "@/components/layout/tasks-pane";
 import { VerifyBanner } from "@/components/layout/verify-banner";
 import { NotesPane } from "@/components/notes/notes-pane";
 import { RecordingsPane } from "@/components/recordings/recordings-pane";
@@ -339,9 +339,41 @@ export function AppShell() {
                 // stale "tasks" primary-view can never render a pane over a
                 // record this build has no database for (AD-137).
                 //
-                // No panel strip: a task is not a document, and there is
-                // nothing here to open in an editor.
-                <TasksPane />
+                // # A retired refusal (Story 59.12)
+                //
+                // This comment said "no panel strip: a task is not a document,
+                // and there is nothing here to open in an editor", and it went
+                // on to concede that the refusal "is scope rather than teeth" —
+                // it refused `PanelStrip`, whose targets were files opened in
+                // the editor, and it did not refuse detail. Story 59.1 kept it
+                // and built the pane's own master/detail inside itself instead.
+                //
+                // The owner has now asked for the declined thing in as many
+                // words: he could not open a task in a tab. So the refusal is
+                // retired rather than deleted, the way this epic's own refusal
+                // of multi-select was overturned at 59.4 — a refusal whose
+                // reason has expired is worth keeping on the page, because the
+                // next reader is owed the difference between "nobody thought of
+                // it" and "it was declined, and then this changed".
+                //
+                // What makes retiring it safe, in three facts a reader can
+                // check. The target is an identity and nothing else — a task id
+                // — carrying no cached facts at all, so a panel resolves it
+                // against `sync_tasks` and says *this is no longer here* rather
+                // than drawing a task the record has lost
+                // (`keeper_core::panels`). It resolves on mount, on unfold and
+                // when the target changes, and not on a timer: `useTaskResolution`
+                // states that boundary out loud, because a panel nobody has
+                // touched holds the facts of its last read. The panel draws the
+                // pane's OWN `TaskDetail`, so there is one rendering of a task
+                // and not two that could word it differently. And the pane
+                // remains the only writer: the panel is handed `verbs={null}`,
+                // because `formSaving`, `deleting` and `running` are pane-wide
+                // precisely so that two write surfaces cannot undo each other.
+                <>
+                  <TasksPane />
+                  <PanelStrip emptySentence={TASKS_PANEL_EMPTY_SENTENCE} />
+                </>
               ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (

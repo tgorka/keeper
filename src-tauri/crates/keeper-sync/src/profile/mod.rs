@@ -1632,6 +1632,34 @@ mod tests {
     }
 
     #[test]
+    fn an_unexpanded_tilde_can_never_be_stored_as_a_folder_name() {
+        // Story 59.8: the app resolves a typed `~` against the home directory
+        // the shell reports, because that is the layer where "home" is a fact
+        // about the person rather than about whichever process wrote the row.
+        // This is the other half of that decision — the reason it is safe to
+        // resolve `~` outside the engine at all. If an expansion is ever missed
+        // — the shell could not answer, a second caller forgets, `keeper-syncd`
+        // reads a hand-written `config.toml` — the path arrives literal, and a
+        // literal tilde is not absolute, so it is refused here instead of
+        // becoming a directory called `~` under the current working directory.
+        // Every route to the store passes this check: `db::upsert_profile`
+        // validates before it writes, whatever route the profile arrived by.
+        for typed in ["~", "~/notes", "~alice/notes"] {
+            let mut p = profile();
+            p.local_path = PathBuf::from(typed);
+            let err = p
+                .validate()
+                .expect_err("an unexpanded tilde must not reach the store");
+            // The refusal quotes what was typed, so the person who typed it can
+            // see that the tilde is the thing that was not understood.
+            assert!(
+                err.to_string().contains(typed),
+                "the refusal must name the path it refused: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn subpaths_may_not_escape_the_repository() {
         // Otherwise the cone sparse-checkout would point outside the repo.
         for bad in ["/etc", "a/../../etc", ".."] {

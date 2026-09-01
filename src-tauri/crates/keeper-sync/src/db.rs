@@ -445,8 +445,9 @@ fn ensure_journal_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add the tasks table's late columns — `on_missed` so far — if they are not
-/// there yet (Story 58.4, FR-356, AD-139).
+/// Add the tasks table's late columns — `on_missed`, `description` and
+/// `missed_delay_ms` so far — if they are not there yet (Stories 58.4, 59.5 and
+/// 59.6, FR-356, FR-366, AD-139).
 ///
 /// The helper the DDL above has demanded since Story 57.1 and nobody had needed
 /// yet. Written on [`ensure_journal_columns`]' shape and for its reasons: one
@@ -454,14 +455,35 @@ fn ensure_journal_columns(conn: &Connection) -> Result<()> {
 /// its own idempotence, and `PRAGMA table_info`'s statement dropped before any
 /// `conn.execute` runs on the same connection.
 ///
-/// **The `DEFAULT` is mandatory rather than tidy**, and it is the reason this
-/// column could not go into the batch above. [`upsert_task`]'s `INSERT` names
-/// its columns, so an older binary — the app and the daemon share one `sync.db`
-/// and are upgraded separately — writes a row without mentioning `on_missed`.
-/// Against a `NOT NULL` column with no default that write fails outright, which
-/// is NFR-43's other half. `'run_now'` is also the only defensible value: it is
-/// what an ordinary restart already does, so no stored row changes meaning when
-/// this migration runs.
+/// **`on_missed`'s `DEFAULT` is mandatory rather than tidy**, and it is the
+/// reason that column could not go into the batch above. [`upsert_task`]'s
+/// `INSERT` names its columns, so an older binary — the app and the daemon share
+/// one `sync.db` and are upgraded separately — writes a row without mentioning
+/// `on_missed`. Against a `NOT NULL` column with no default that write fails
+/// outright, which is NFR-43's other half. `'run_now'` is also the only
+/// defensible value: it is what an ordinary restart already does, so no stored
+/// row changes meaning when this migration runs.
+///
+/// **`description` takes the other branch of that same rule, and deliberately.**
+/// It is nullable and carries **no** `DEFAULT`, which is [`ensure_journal_columns`]'
+/// reading of a row written before a column existed: a task stored last year has
+/// *no* description, and that is a different fact from having an empty one. A
+/// `DEFAULT ''` would make every pre-existing row claim a description that is
+/// blank, and every surface would then have to un-tell that story by treating
+/// `""` as absence anyway. Nullable satisfies NFR-43's write half for free —
+/// SQLite fills a nullable column with `NULL` when an `INSERT` omits it — so
+/// there is nothing here for a default to buy.
+///
+/// **`missed_delay_ms` takes that same branch, and could not take the other
+/// one** (Story 59.6). It is nullable with no `DEFAULT` because the default is
+/// not a *value*: an absent delay means *"whatever this build's
+/// [`crate::tasks::TASK_MISSED_DELAY_MS`] is"*, which no SQL default can
+/// express. `DEFAULT 1800000` would freeze today's thirty minutes into every
+/// pre-existing row, so the next person to retune the constant would silently
+/// change it for new tasks only and leave every old one waiting the old number —
+/// a lie about rows nobody edited. `NULL` says *not chosen*, and
+/// [`crate::tasks::effective_missed_delay_ms`] is the one place that is turned
+/// into a duration.
 fn ensure_task_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(tasks)")?;
     let existing: Vec<String> = stmt
@@ -473,6 +495,12 @@ fn ensure_task_columns(conn: &Connection) -> Result<()> {
             "ALTER TABLE tasks ADD COLUMN on_missed TEXT NOT NULL DEFAULT 'run_now'",
             [],
         )?;
+    }
+    if !existing.iter().any(|c| c == "description") {
+        conn.execute("ALTER TABLE tasks ADD COLUMN description TEXT", [])?;
+    }
+    if !existing.iter().any(|c| c == "missed_delay_ms") {
+        conn.execute("ALTER TABLE tasks ADD COLUMN missed_delay_ms INTEGER", [])?;
     }
     Ok(())
 }
@@ -2866,7 +2894,7 @@ pub const TASK_RUNS_CAP: usize = 50;
 /// constant so a reader added later cannot drift out of step with the decoder.
 const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
                             enabled, updated_ms, running_host, lease_until_ms, \
-                            on_missed";
+                            on_missed, description, missed_delay_ms";
 
 /// One stored task.
 ///
@@ -2895,6 +2923,32 @@ pub struct TaskRow {
     /// (Story 58.4). `run_now` on every row written before the column existed,
     /// which is what an ordinary restart already did.
     pub on_missed: crate::tasks::TaskMissedPolicy,
+    /// The operator's own words for what this task is, or `None` when there are
+    /// none (Story 59.5).
+    ///
+    /// Stored **verbatim**, on [`Self::schedule`]'s rule and for a sharper
+    /// version of its reason: this is the one field on the row that nothing but
+    /// a person authored, so normalizing it would be rewriting what somebody
+    /// wrote. `None` and `Some("")` are therefore both reachable and are
+    /// different facts — every row written before this column existed is `None`,
+    /// and only a person who typed nothing into a box that was already there can
+    /// produce the second. Deciding that a blank one renders as nothing is a
+    /// job for whatever draws it, not for the store.
+    pub description: Option<String>,
+    /// How long **this** task holds a missed window back, or `None` to use
+    /// [`crate::tasks::TASK_MISSED_DELAY_MS`] (Story 59.6).
+    ///
+    /// Only [`crate::tasks::TaskMissedPolicy::Delay`] consults it, and it is
+    /// stored regardless of the policy on purpose: switching a task to `skip`
+    /// and back must not throw away the number somebody chose, which is the same
+    /// rule that keeps a `manual` task's [`Self::schedule`] on the row.
+    ///
+    /// A **duration**, not an instant, which is what keeps AD-139 intact: the
+    /// postponement is still written into [`Self::next_due_ms`] itself, so the
+    /// row still holds exactly one forward instant and nothing can enumerate
+    /// missed windows. Refused outside [`crate::tasks::validate_missed_delay_ms`]'
+    /// bounds at the write door, and honoured as stored on the read path.
+    pub missed_delay_ms: Option<i64>,
 }
 
 impl TaskRow {
@@ -2981,6 +3035,8 @@ type StoredTask = (
     Option<String>,
     Option<i64>,
     String,
+    Option<String>,
+    Option<i64>,
 );
 
 /// Read one `tasks` row, tolerating every column but the primary key.
@@ -2997,6 +3053,16 @@ type StoredTask = (
 /// an empty string, and no variant answers to that. `id` stays strict because a
 /// row whose primary key cannot be read cannot be named in a report either, and
 /// [`list_tasks`] handles that failure separately.
+///
+/// `description` and `missed_delay_ms` are the two columns where the fallback is
+/// not a route to that path but the answer itself: both default to `None`, which
+/// is exactly what an absent description and an unchosen delay are, so a value
+/// stored under a type this build cannot read costs a name or a number and never
+/// a run. That is the right trade for the only two columns on the row with no
+/// vocabulary to be wrong about — refusing the row over either would stop a task
+/// for a reason that is cosmetic in one case and recoverable in the other, which
+/// is the outcome NFR-43 is about. An unreadable delay reads as *not chosen*, so
+/// the task falls back to the constant and keeps running.
 fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
     Ok((
         row.get(0)?,
@@ -3010,6 +3076,8 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
         row.get(8).unwrap_or_default(),
         row.get(9).unwrap_or_default(),
         row.get(10).unwrap_or_default(),
+        row.get(11).unwrap_or_default(),
+        row.get(12).unwrap_or_default(),
     ))
 }
 
@@ -3034,6 +3102,8 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         running_host,
         lease_until_ms,
         on_missed,
+        description,
+        missed_delay_ms,
     ) = stored;
     let unknown = |reason: String| UnknownTask {
         id: id.clone(),
@@ -3062,6 +3132,8 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         running_host,
         lease_until_ms,
         on_missed,
+        description,
+        missed_delay_ms,
     };
     if let Err(err) = row.parsed_schedule() {
         return Err(unknown(format!("unreadable schedule: {err}")));
@@ -3167,6 +3239,12 @@ pub fn upsert_task(
             task.id
         )));
     }
+    // The delay's own two bounds, from the module that owns the constant they
+    // are derived from. Here rather than in `TaskSchedule::parse`'s neighbours
+    // because it is not a schedule, and here rather than in either writer
+    // because both writers reach this door and only one of them has a person
+    // standing at it.
+    crate::tasks::validate_missed_delay_ms(task.missed_delay_ms)?;
     let tx = conn.unchecked_transaction()?;
     let stored: Option<(String, String, Option<String>, i64, i64)> = tx
         .query_row(
@@ -3252,17 +3330,20 @@ pub fn upsert_task(
     };
     tx.execute(
         "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
-                            updated_ms, running_host, lease_until_ms, on_missed)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9)
+                            updated_ms, running_host, lease_until_ms, on_missed,
+                            description, missed_delay_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL, NULL, ?9, ?10, ?11)
          ON CONFLICT(id) DO UPDATE SET
-             profile_id  = excluded.profile_id,
-             kind        = excluded.kind,
-             schedule    = excluded.schedule,
-             mode        = excluded.mode,
-             next_due_ms = CASE WHEN ?8 = 1 THEN NULL ELSE tasks.next_due_ms END,
-             enabled     = excluded.enabled,
-             updated_ms  = excluded.updated_ms,
-             on_missed   = excluded.on_missed",
+             profile_id      = excluded.profile_id,
+             kind            = excluded.kind,
+             schedule        = excluded.schedule,
+             mode            = excluded.mode,
+             next_due_ms     = CASE WHEN ?8 = 1 THEN NULL ELSE tasks.next_due_ms END,
+             enabled         = excluded.enabled,
+             updated_ms      = excluded.updated_ms,
+             on_missed       = excluded.on_missed,
+             description     = excluded.description,
+             missed_delay_ms = excluded.missed_delay_ms",
         (
             &task.id,
             &task.profile_id,
@@ -3273,6 +3354,8 @@ pub fn upsert_task(
             task.updated_ms,
             i64::from(effect == TaskSave::Rearmed),
             task.on_missed.as_str(),
+            &task.description,
+            task.missed_delay_ms,
         ),
     )?;
     tx.commit()?;
@@ -3290,6 +3373,213 @@ pub enum TaskSave {
     /// The row **came back into service** — see [`upsert_task`]'s three edges.
     /// Its window was cleared and it arms afresh on the next tick.
     Rearmed,
+}
+
+/// One id in a batched task write, with the reading the caller is writing back.
+///
+/// `baseline_updated_ms` is [`upsert_task`]'s lost-update guard, carried per id
+/// because that is where it belongs: a bulk action from a rendered list *is* the
+/// case the guard was written for — somebody decided against five rows they were
+/// looking at, and each row has its own reading. `None` is what a caller that
+/// reads and writes inside one call passes, which is every CLI write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskBatchId {
+    /// The task's id, unvalidated: a spelling this keeper could never have
+    /// stored is a [`TaskBatchOutcome::Refused`] entry, not a failed batch.
+    pub id: String,
+    /// The `updated_ms` this write started from, or `None` for no baseline.
+    pub baseline_updated_ms: Option<i64>,
+}
+
+/// What a batch did to **one** id.
+///
+/// Four outcomes and not three: [`Self::Missing`] is deliberately not a
+/// [`Self::Refused`], because the two want different words on screen. A refusal
+/// is something to act on; a well-formed id whose row another host forgot is
+/// usually benign. [`crate::tasks::validate_id`]'s doc draws the same line — *"a
+/// spelling this keeper could never have stored"* versus *"well formed, but no
+/// such task"*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskBatchOutcome {
+    /// The row was written, and this is what [`upsert_task`] did to it.
+    Saved(TaskSave),
+    /// The row and its whole run history are gone ([`delete_task`]).
+    Forgotten,
+    /// Well formed, and no such row on this host. Nothing was written.
+    Missing,
+    /// Nothing was written, and this sentence — keeper's own, verbatim — says
+    /// why. A malformed id, an unreadable stored row (NFR-43), or a baseline
+    /// that moved.
+    Refused(String),
+}
+
+/// One entry of a batch's receipt: the id that was asked about, and its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskBatchEntry {
+    /// The id **as requested**, so a caller can align the receipt with what it
+    /// sent without matching on anything else.
+    pub id: String,
+    /// What happened to it.
+    pub outcome: TaskBatchOutcome,
+}
+
+/// Take several tasks in or out of service, each answering for itself.
+///
+/// # Transaction scope: N inner transactions, never one outer one
+///
+/// Each id goes through the **existing** [`upsert_task`] door and therefore
+/// through that door's own transaction — atomic per id, and not one transaction
+/// for the batch. Three facts decide it, and none of them is convenience.
+///
+/// 1. [`upsert_task`] **cannot be nested.** It opens
+///    `conn.unchecked_transaction()`, which rusqlite implements as a raw
+///    `BEGIN DEFERRED`; an outer `BEGIN` fails at the first inner one. An
+///    all-or-nothing batch would require hoisting that function's body behind a
+///    `&Transaction`-taking inner form, for which this file has no precedent.
+/// 2. All-or-nothing would **revoke** a promise the single-id door already
+///    makes. [`upsert_task`]'s documented guarantee is that a refused write
+///    changes nothing — meaning *that row*. Under all-or-nothing a refused write
+///    would also un-change four unrelated rows, which is a different and weaker
+///    promise wearing the same words.
+/// 3. The house answer is already written down. `FilesDeleteReceiptVm`: *"Partial
+///    success is a real outcome and is reported rather than thrown … Each path
+///    answers for itself."*
+///
+/// The caller holds this connection for the whole batch, so no other host-local
+/// writer interleaves.
+///
+/// # N ids in, N entries out
+///
+/// In request order, with no dedup and no first-error-wins: the same id twice is
+/// two entries. `Err` is reserved for [`list_tasks`] itself failing — the one
+/// whole-batch failure — and is never one id's refusal.
+///
+/// Every id is resolved against the **one** pre-batch [`list_tasks`] snapshot
+/// read above, so a duplicated id's `Missing`, unreadable or stored decision
+/// ignores whatever the earlier occurrence wrote. Benign here because the
+/// per-id payload is identical within a batch — `enabled` and `now_ms` are the
+/// batch's, not the id's — but a future reuse that varies the payload per id
+/// would break the assumption, and would have to re-read.
+pub fn set_tasks_enabled(
+    conn: &Connection,
+    ids: &[TaskBatchId],
+    enabled: bool,
+    now_ms: i64,
+) -> Result<Vec<TaskBatchEntry>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Read once for the whole batch rather than per id: the listing is what
+    // decides `Missing` and the NFR-43 refusal, and re-reading it per id would
+    // be N full table scans for an answer that cannot change under the caller's
+    // own connection hold.
+    let listing = list_tasks(conn)?;
+    let mut entries = Vec::with_capacity(ids.len());
+    for wanted in ids {
+        let outcome = match crate::tasks::validate_id(&wanted.id) {
+            Err(err) => TaskBatchOutcome::Refused(err.to_string()),
+            Ok(()) => match unreadable_task_reason(&listing, &wanted.id) {
+                // NFR-43's write half, per id: a row this build cannot read
+                // belongs to a newer keeper, and overwriting it would rewrite it
+                // to one of ours. `upsert_task` refuses it too; refusing here is
+                // what makes the receipt name the right reason rather than
+                // `Missing`, since such a row is not in `listing.tasks`.
+                Some(reason) => TaskBatchOutcome::Refused(reason),
+                None => match listing.tasks.iter().find(|task| task.id == wanted.id) {
+                    None => TaskBatchOutcome::Missing,
+                    Some(stored) => {
+                        let row = TaskRow {
+                            enabled,
+                            updated_ms: now_ms,
+                            ..stored.clone()
+                        };
+                        match upsert_task(conn, &row, wanted.baseline_updated_ms) {
+                            Ok(effect) => TaskBatchOutcome::Saved(effect),
+                            Err(err) => TaskBatchOutcome::Refused(err.to_string()),
+                        }
+                    }
+                },
+            },
+        };
+        entries.push(TaskBatchEntry {
+            id: wanted.id.clone(),
+            outcome,
+        });
+    }
+    Ok(entries)
+}
+
+/// Forget several tasks and their histories, each answering for itself.
+///
+/// Same transaction scope as [`set_tasks_enabled`], for the same three reasons:
+/// each id goes through the existing [`delete_task`] door and therefore through
+/// that door's own transaction, so the task and its runs go together and one
+/// id's refusal leaves the others deleted.
+///
+/// Plain ids and no baseline: [`delete_task`] makes no baseline promise today,
+/// and inventing one here would be a new promise rather than a preserved one.
+///
+/// A stored row this build **cannot read** is refused, never deleted (AD-48).
+/// Deleting a task on somebody else's behalf because we cannot parse it is the
+/// "absence is deletion" mistake that rule exists to prevent.
+pub fn forget_tasks(conn: &Connection, ids: &[String]) -> Result<Vec<TaskBatchEntry>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let listing = list_tasks(conn)?;
+    let mut entries = Vec::with_capacity(ids.len());
+    for wanted in ids {
+        let outcome = match crate::tasks::validate_id(wanted) {
+            Err(err) => TaskBatchOutcome::Refused(err.to_string()),
+            Ok(()) => match unreadable_task_reason(&listing, wanted) {
+                Some(reason) => TaskBatchOutcome::Refused(reason),
+                None => {
+                    if listing.tasks.iter().any(|task| &task.id == wanted) {
+                        // A store failure on this id is **this id's** refusal,
+                        // never the batch's: a `?` here would commit the deletes
+                        // that already happened, never look at the ids after it,
+                        // and hand the caller an `Err` that says nothing went —
+                        // while rows really did go. Same shape as
+                        // `set_tasks_enabled`'s `upsert_task` arm above, and the
+                        // rule `FilesDeleteReceiptVm` already writes down.
+                        match delete_task(conn, wanted) {
+                            Ok(()) => TaskBatchOutcome::Forgotten,
+                            Err(err) => TaskBatchOutcome::Refused(err.to_string()),
+                        }
+                    } else {
+                        // `delete_task` answers `Ok(())` for an id that never
+                        // existed and cannot tell "gone now" from "was never
+                        // here", so the listing is what makes this honest.
+                        TaskBatchOutcome::Missing
+                    }
+                }
+            },
+        };
+        entries.push(TaskBatchEntry {
+            id: wanted.clone(),
+            outcome,
+        });
+    }
+    Ok(entries)
+}
+
+/// Why a stored row cannot be acted on, or `None` when there is no such row.
+///
+/// The sentence is the one the CLI's own `unreadable_task` renders, kept
+/// identical on purpose: a refusal's text is what a person greps for, and the
+/// batch must not invent a second wording for the fact `tasks status` already
+/// has words for.
+fn unreadable_task_reason(listing: &TaskListing, wanted: &str) -> Option<String> {
+    listing
+        .unknown
+        .iter()
+        .find(|row| row.id == wanted)
+        .map(|row| {
+            format!(
+                "task `{}` is stored, but this keeper cannot read it: {}",
+                row.id, row.reason
+            )
+        })
 }
 
 /// Every task, by id, with the unreadable rows listed rather than dropped.
@@ -5820,6 +6110,8 @@ mod tests {
             running_host: None,
             lease_until_ms: None,
             on_missed: crate::tasks::TaskMissedPolicy::RunNow,
+            description: None,
+            missed_delay_ms: None,
         }
     }
 
@@ -5904,9 +6196,12 @@ mod tests {
                 "running_host",
                 "lease_until_ms",
                 // Added by `ensure_task_columns` rather than by the batch, which
-                // is why it comes last: a store that predates it reaches this
-                // same shape down the additive path (Story 58.4).
+                // is why these come last, in the order it adds them: a store that
+                // predates any of them reaches this same shape down the additive
+                // path (Stories 58.4, 59.5 and 59.6).
                 "on_missed",
+                "description",
+                "missed_delay_ms",
             ]
         );
         assert_eq!(
@@ -6619,6 +6914,260 @@ mod tests {
         ensure_task_columns(&c).expect("a second pass");
     }
 
+    /// A task stored before `description` existed has **no** description, and
+    /// that is not the same fact as having a blank one (Story 59.5, NFR-43).
+    ///
+    /// This is the whole argument for the column being nullable with no
+    /// `DEFAULT`, and it is worth a test rather than a comment because the
+    /// tidy-looking alternative — `DEFAULT ''`, which is what `on_missed`
+    /// needed — is one word away and reads as harmless. It is not: with it,
+    /// every task on every install would come back claiming a description that
+    /// happens to be empty, and every surface that draws one would then have to
+    /// un-tell that story by treating `""` as absence. So the assertion is
+    /// `None` **and explicitly not** `Some("")`, because those two are what the
+    /// two schemas differ by and an `is_none()` check would pass under either
+    /// reading of what the column means.
+    ///
+    /// The second claim is NFR-43's write half, and nullability buys it for
+    /// nothing: SQLite fills an omitted nullable column with `NULL`, so an older
+    /// binary's `INSERT` — which names only the columns it knows — still
+    /// succeeds against the migrated schema. `on_missed` needed a `DEFAULT` for
+    /// this only because it is `NOT NULL`.
+    ///
+    /// The pre-migration store is built by dropping the column, its sibling
+    /// above's technique and for that test's stated reason.
+    #[test]
+    fn the_description_column_is_additive_and_a_row_without_one_has_none() {
+        let c = conn();
+        let mut named = task("01NAMED", Some("@daily"), TaskMode::Scheduled);
+        named.description = Some("nightly backup of the photos".to_owned());
+        upsert_task(&c, &named, None).expect("save");
+        c.execute("ALTER TABLE tasks DROP COLUMN description", [])
+            .expect("a store from before the column existed");
+
+        // An older binary's write: the eleven columns it knows about.
+        c.execute(
+            "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
+                                updated_ms, running_host, lease_until_ms, on_missed)
+             VALUES ('01OLDER', NULL, 'sync', 'every 5m', 'scheduled', NULL, 1, 1, NULL, NULL,
+                     'run_now')",
+            [],
+        )
+        .expect("an older binary's INSERT names only the columns it knows");
+
+        ensure_task_columns(&c).expect("the additive migration");
+        for id in ["01NAMED", "01OLDER"] {
+            let row = get_task(&c, id).expect("get").expect("row");
+            assert_eq!(
+                row.description, None,
+                "{id} predates the column, so it has no description"
+            );
+            assert_ne!(
+                row.description,
+                Some(String::new()),
+                "{id} must not read as having a description that is blank — that is \
+                 what a DEFAULT '' would have made it, and it is a different fact"
+            );
+        }
+
+        // And the same write against the migrated schema, which is the mixed-fleet
+        // case: an older binary is still running beside the newer one.
+        c.execute(
+            "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
+                                updated_ms, running_host, lease_until_ms, on_missed)
+             VALUES ('01MIXED', NULL, 'sync', 'every 5m', 'scheduled', NULL, 1, 1, NULL, NULL,
+                     'run_now')",
+            [],
+        )
+        .expect("a nullable column with no default needs nothing to keep that write working");
+        assert_eq!(
+            get_task(&c, "01MIXED")
+                .expect("get")
+                .expect("row")
+                .description,
+            None
+        );
+
+        // A description written *after* the migration round-trips verbatim, which
+        // is what makes the `None` above a fact about the schema rather than about
+        // the column being ignored. `Some("")` too: a person who cleared a box is
+        // not a row that never had one, and the store keeps them apart.
+        let mut renamed = task("01NEW", Some("@daily"), TaskMode::Scheduled);
+        renamed.description = Some("  what they typed, spaces and all  ".to_owned());
+        upsert_task(&c, &renamed, None).expect("save");
+        assert_eq!(
+            get_task(&c, "01NEW").expect("get"),
+            Some(renamed),
+            "stored verbatim: this is the one column a person authored"
+        );
+        let mut cleared = task("01BLANK", Some("@daily"), TaskMode::Scheduled);
+        cleared.description = Some(String::new());
+        upsert_task(&c, &cleared, None).expect("save");
+        assert_eq!(
+            get_task(&c, "01BLANK")
+                .expect("get")
+                .expect("row")
+                .description,
+            Some(String::new()),
+            "a blank a person typed is stored as one; deciding it renders as \
+             nothing is the drawing surface's job, not the store's"
+        );
+
+        // Idempotent, like its siblings: a second pass adds nothing.
+        ensure_task_columns(&c).expect("a second pass");
+    }
+
+    /// A task stored before `missed_delay_ms` existed has **not chosen** a delay,
+    /// which means the constant — the whole compatibility claim of Story 59.6
+    /// (FR-366, NFR-43).
+    ///
+    /// The sibling of the test above, and it exists for a reason that one does
+    /// not have: `description`'s alternative was a `DEFAULT ''` that would have
+    /// been merely untidy, while this column's would have been a `DEFAULT
+    /// 1800000` that is *wrong the next time somebody retunes the constant* — new
+    /// rows would follow the new number and every existing row would keep waiting
+    /// the old one, with nothing anywhere saying so. `None` is what makes the
+    /// constant the single authority it is documented to be.
+    #[test]
+    fn the_missed_delay_column_is_additive_and_a_row_without_one_reads_as_unchosen() {
+        let c = conn();
+        let mut patient = task("01PATIENT", Some("@daily"), TaskMode::Scheduled);
+        patient.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        patient.missed_delay_ms = Some(4 * 3_600_000);
+        upsert_task(&c, &patient, None).expect("save");
+        c.execute("ALTER TABLE tasks DROP COLUMN missed_delay_ms", [])
+            .expect("a store from before the column existed");
+
+        // An older binary's write: the twelve columns it knows about.
+        c.execute(
+            "INSERT INTO tasks (id, profile_id, kind, schedule, mode, next_due_ms, enabled,
+                                updated_ms, running_host, lease_until_ms, on_missed, description)
+             VALUES ('01OLDER', NULL, 'sync', 'every 5m', 'scheduled', NULL, 1, 1, NULL, NULL,
+                     'delay', NULL)",
+            [],
+        )
+        .expect("an older binary's INSERT names only the columns it knows");
+
+        ensure_task_columns(&c).expect("the additive migration");
+        for id in ["01PATIENT", "01OLDER"] {
+            let row = get_task(&c, id).expect("get").expect("row");
+            assert_eq!(
+                row.missed_delay_ms, None,
+                "{id} predates the column, so it chose no delay"
+            );
+            assert_eq!(
+                crate::tasks::effective_missed_delay_ms(row.missed_delay_ms),
+                crate::tasks::TASK_MISSED_DELAY_MS,
+                "{id} therefore waits exactly what it waited before this column \
+                 existed, which is the only reading of an absent value that leaves \
+                 a shipped install alone"
+            );
+        }
+
+        // A delay written *after* the migration round-trips, which is what makes
+        // the `None` above a fact about the schema rather than about the column
+        // being ignored.
+        let mut chosen = task("01CHOSEN", Some("@daily"), TaskMode::Scheduled);
+        chosen.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        chosen.missed_delay_ms = Some(4 * 3_600_000);
+        upsert_task(&c, &chosen, None).expect("save");
+        assert_eq!(get_task(&c, "01CHOSEN").expect("get"), Some(chosen));
+
+        // And it is writable back to absence, which is the other half of the
+        // dead-knob rule this table already states about `on_missed`: a setting
+        // you can set and never unset is a dead knob. Back to `None`, not to
+        // `Some(TASK_MISSED_DELAY_MS)` — the difference is that a row which
+        // *chose* thirty minutes keeps thirty minutes if the constant moves, and
+        // a row that chose nothing follows it.
+        let mut cleared = task("01CHOSEN", Some("@daily"), TaskMode::Scheduled);
+        cleared.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        cleared.updated_ms = 2;
+        upsert_task(&c, &cleared, None).expect("save");
+        assert_eq!(
+            get_task(&c, "01CHOSEN")
+                .expect("get")
+                .expect("row")
+                .missed_delay_ms,
+            None
+        );
+
+        // Kept across a policy change, so switching to `skip` and back does not
+        // throw the number away — the rule a `manual` task's schedule already has.
+        let mut skipping = task("01CHOSEN", Some("@daily"), TaskMode::Scheduled);
+        skipping.on_missed = crate::tasks::TaskMissedPolicy::Skip;
+        skipping.missed_delay_ms = Some(2 * 3_600_000);
+        skipping.updated_ms = 3;
+        upsert_task(&c, &skipping, None).expect("save");
+        assert_eq!(
+            get_task(&c, "01CHOSEN")
+                .expect("get")
+                .expect("row")
+                .missed_delay_ms,
+            Some(2 * 3_600_000),
+            "stored under a policy that does not read it, because a policy is not \
+             a reason to forget what somebody typed"
+        );
+
+        // Idempotent, like its siblings: a second pass adds nothing.
+        ensure_task_columns(&c).expect("a second pass");
+    }
+
+    /// The write door refuses a delay that is not one, and says why in the
+    /// sentence a person reads (Story 59.6, FR-366).
+    ///
+    /// Asserted **here** and not only in `tasks.rs` because the pure rule being
+    /// right is worth nothing if the door does not call it: this is the test that
+    /// fails if `upsert_task` forgets the line, and the failure a person would
+    /// otherwise meet is a task silently storing a five-minute delay that behaves
+    /// as `run_now`.
+    #[test]
+    fn the_write_door_refuses_a_delay_shorter_than_the_grace_or_longer_than_a_year() {
+        let c = conn();
+        let mut impatient = task("01FAST", Some("@daily"), TaskMode::Scheduled);
+        impatient.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        impatient.missed_delay_ms = Some(crate::tasks::TASK_MISSED_GRACE_MS - 1);
+        let err = upsert_task(&c, &impatient, None)
+            .expect_err("a delay shorter than the interval that concludes nobody was home")
+            .to_string();
+        assert!(
+            err.contains("concludes nobody was home"),
+            "the refusal has to say why the grace period is the floor, not merely \
+             that a bound was crossed: {err}"
+        );
+        assert_eq!(
+            get_task(&c, "01FAST").expect("get"),
+            None,
+            "and nothing was stored — a refusal that half-wrote the row would be \
+             worse than no refusal"
+        );
+
+        let mut glacial = task("01SLOW", Some("@daily"), TaskMode::Scheduled);
+        glacial.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        glacial.missed_delay_ms = Some(i64::MAX);
+        let err = upsert_task(&c, &glacial, None)
+            .expect_err("a delay longer than a schedule may be")
+            .to_string();
+        assert!(err.contains("must not exceed a year"), "{err}");
+        assert_eq!(get_task(&c, "01SLOW").expect("get"), None);
+
+        // The floor is inclusive, and this is where that is pinned against the
+        // door rather than against the pure function alone.
+        let mut exact = task("01EXACT", Some("@daily"), TaskMode::Scheduled);
+        exact.on_missed = crate::tasks::TaskMissedPolicy::Delay;
+        exact.missed_delay_ms = Some(crate::tasks::TASK_MISSED_GRACE_MS);
+        upsert_task(&c, &exact, None).expect("equal to the grace is impatient, not incoherent");
+
+        // Refused for every policy, not only for `delay`. The column is stored
+        // regardless of the policy, so a value that is nonsense under `delay` must
+        // not be smuggled in under `skip` and become live the moment somebody
+        // changes one menu.
+        let mut smuggled = task("01SMUGGLE", Some("@daily"), TaskMode::Scheduled);
+        smuggled.on_missed = crate::tasks::TaskMissedPolicy::Skip;
+        smuggled.missed_delay_ms = Some(1);
+        upsert_task(&c, &smuggled, None)
+            .expect_err("the bound is a property of the number, not of the policy");
+    }
+
     /// A policy spelling this build cannot read is **skipped and listed**, never
     /// guessed (Story 58.4, NFR-43).
     ///
@@ -6934,6 +7483,259 @@ mod tests {
             "{gone}"
         );
         assert!(get_task(&c, "01CAS").expect("get").is_none());
+    }
+
+    /// A `TaskBatchId` with no baseline — the CLI's shape, and the default the
+    /// batch tests below deviate from one id at a time.
+    fn batch_id(id: &str) -> TaskBatchId {
+        TaskBatchId {
+            id: id.to_owned(),
+            baseline_updated_ms: None,
+        }
+    }
+
+    /// **The receipt is the reason this story exists** (Story 59.4).
+    ///
+    /// Five ids go in and five answers come out, and the caller can tell which
+    /// is which: two rows were written, one was rewritten elsewhere while the
+    /// person was looking at it, one belongs to a keeper this build is too old to
+    /// read, and one is not here at all. An all-or-nothing batch would have
+    /// answered one thing about five ids, and a first-error-wins loop would have
+    /// stopped at the third and left the person guessing about the other two.
+    ///
+    /// The last assertion is the promise `upsert_task` already makes, held per
+    /// id: a refused write changes **nothing** — and under an outer transaction
+    /// it would instead have un-changed the two rows that went through.
+    #[test]
+    fn a_batch_answers_for_every_id_separately_and_says_why_each_one_did_not_go() {
+        let c = conn();
+        for id in ["01AAA", "01BBB"] {
+            upsert_task(&c, &task(id, None, TaskMode::Manual), None).expect("a writable row");
+        }
+        // The row somebody else rewrote while this batch's caller was reading
+        // it: stored at 1_000, and the batch carries the reading from before.
+        let mut moved = task("01MOVED", None, TaskMode::Manual);
+        moved.updated_ms = 1_000;
+        upsert_task(&c, &moved, None).expect("the row the other host owns");
+        let before = get_task(&c, "01MOVED").expect("get").expect("row");
+        // The row from a newer keeper, arriving the only way such a row can.
+        raw_task(&c, "01ALIEN", "teleport", "scheduled", None);
+
+        let requested = [
+            batch_id("01AAA"),
+            TaskBatchId {
+                baseline_updated_ms: Some(500),
+                ..batch_id("01MOVED")
+            },
+            batch_id("01ALIEN"),
+            batch_id("01BBB"),
+            batch_id("01GHOST"),
+        ];
+        let receipt = set_tasks_enabled(&c, &requested, false, 9_000).expect("the store is fine");
+
+        assert_eq!(
+            receipt.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["01AAA", "01MOVED", "01ALIEN", "01BBB", "01GHOST"],
+            "five ids in, five entries out, in the order they were asked about"
+        );
+        for (position, id) in [(0, "01AAA"), (3, "01BBB")] {
+            assert!(
+                matches!(receipt[position].outcome, TaskBatchOutcome::Saved(_)),
+                "{id} was writable and nothing about the other four changes that: {:?}",
+                receipt[position].outcome
+            );
+        }
+        assert!(
+            matches!(&receipt[1].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("changed elsewhere")),
+            "the moved baseline is refused in keeper's own words, so the person \
+             knows to re-read that one row rather than all five: {:?}",
+            receipt[1].outcome
+        );
+        assert!(
+            matches!(&receipt[2].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("cannot read")),
+            "a newer keeper's row is refused with that reason and never \
+             overwritten (NFR-43): {:?}",
+            receipt[2].outcome
+        );
+        assert_eq!(
+            receipt[4].outcome,
+            TaskBatchOutcome::Missing,
+            "a well-formed id with no row is Missing, not Refused: the two want \
+             different words on screen"
+        );
+
+        assert_eq!(
+            get_task(&c, "01MOVED").expect("get").expect("row"),
+            before,
+            "a refused write changes nothing — that row, column for column, \
+             including the `updated_ms` and the `enabled` this batch asked for"
+        );
+        for id in ["01AAA", "01BBB"] {
+            let written = get_task(&c, id).expect("get").expect("row");
+            assert!(!written.enabled, "{id} really was disabled");
+            assert_eq!(written.updated_ms, 9_000, "{id} carries the batch's stamp");
+        }
+    }
+
+    /// N ids produce N entries: no collapsing, no dedup, and no first-error-wins.
+    ///
+    /// The refusal is deliberately **first**, because that is the ordering a `?`
+    /// in the loop would have discarded every later answer under — the mistake
+    /// `cmd_verify`'s own loop records: *"let one folder's failure be one
+    /// folder's."*
+    #[test]
+    fn every_id_in_a_batch_gets_its_own_answer_rather_than_the_first_error() {
+        let c = conn();
+        for id in ["01ONE", "01TWO"] {
+            upsert_task(&c, &task(id, None, TaskMode::Manual), None).expect("a writable row");
+        }
+
+        let requested = [batch_id(" 01ONE"), batch_id("01ONE"), batch_id("01TWO")];
+        let receipt = set_tasks_enabled(&c, &requested, false, 4_000).expect("the store is fine");
+        assert_eq!(receipt.len(), 3, "three asked about, three answered");
+        assert!(
+            matches!(&receipt[0].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("whitespace")),
+            "a spelling this keeper could never have stored is refused before any \
+             SQL: {:?}",
+            receipt[0].outcome
+        );
+        assert!(
+            matches!(receipt[1].outcome, TaskBatchOutcome::Saved(_))
+                && matches!(receipt[2].outcome, TaskBatchOutcome::Saved(_)),
+            "the ids after the refusal are written, intact and in order: {receipt:?}"
+        );
+
+        // The same id twice is two entries. Collapsing them would make a receipt
+        // shorter than the request, which is exactly what a caller aligning the
+        // two by position cannot survive.
+        let twice = set_tasks_enabled(&c, &[batch_id("01ONE"), batch_id("01ONE")], true, 5_000)
+            .expect("the store is fine");
+        assert_eq!(
+            twice.len(),
+            2,
+            "no dedup: the receipt is as long as the request, always"
+        );
+        assert_eq!(twice[0].id, "01ONE");
+        assert_eq!(twice[1].id, "01ONE");
+    }
+
+    /// AD-48, per id: a row this build cannot read is **refused, not deleted**.
+    ///
+    /// Deleting a task on somebody else's behalf because we cannot parse it is
+    /// the "absence is deletion" mistake that rule exists to prevent, and a batch
+    /// is where it would be easiest to make: the id is not in `listing.tasks`, so
+    /// a loop that only asked "is it here?" would have answered `Missing` and a
+    /// loop that only called `delete_task` would have removed it.
+    #[test]
+    fn a_batched_forget_refuses_a_row_it_cannot_read_rather_than_deleting_it() {
+        let c = conn();
+        upsert_task(&c, &task("01REAL", None, TaskMode::Manual), None).expect("a writable row");
+        raw_task(&c, "01ALIEN", "teleport", "scheduled", None);
+
+        let receipt = forget_tasks(
+            &c,
+            &[
+                "01ALIEN".to_owned(),
+                "01REAL".to_owned(),
+                "01GHOST".to_owned(),
+            ],
+        )
+        .expect("the store is fine");
+
+        assert!(
+            matches!(&receipt[0].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("cannot read")),
+            "the unreadable row is refused with its own reason: {:?}",
+            receipt[0].outcome
+        );
+        assert_eq!(receipt[1].outcome, TaskBatchOutcome::Forgotten);
+        assert_eq!(
+            receipt[2].outcome,
+            TaskBatchOutcome::Missing,
+            "an id nobody stored is answered rather than reported as a success"
+        );
+
+        let stored: Vec<String> = c
+            .prepare("SELECT id FROM tasks ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("ids");
+        assert_eq!(
+            stored,
+            vec!["01ALIEN".to_owned()],
+            "the row this build cannot read is still there, and the one it could \
+             read is gone"
+        );
+    }
+
+    /// A store failure on one id is **that id's refusal**, and the other ids
+    /// keep their receipt (Story 59.4 review, P1).
+    ///
+    /// The failure is made deterministic in the store rather than by mocking:
+    /// a `BEFORE DELETE` trigger on `tasks` aborts the middle id's delete, which
+    /// is exactly the shape a real constraint or a busy writer produces —
+    /// `delete_task`'s transaction fails and rolls back. A `?` in the loop would
+    /// have thrown the whole receipt away: the first id's delete is already
+    /// committed, the third is never looked at, and the caller is told nothing
+    /// happened while a row really went.
+    #[test]
+    fn a_store_failure_on_one_forget_does_not_throw_away_the_other_ids_receipt() {
+        let c = conn();
+        for id in ["01AAA", "01MID", "01ZZZ"] {
+            upsert_task(&c, &task(id, None, TaskMode::Manual), None).expect("a writable row");
+        }
+        c.execute_batch(
+            "CREATE TRIGGER no_mid BEFORE DELETE ON tasks WHEN old.id = '01MID'
+             BEGIN SELECT RAISE(ABORT, 'the store said no'); END",
+        )
+        .expect("a store that refuses one row");
+
+        let receipt = forget_tasks(
+            &c,
+            &["01AAA".to_owned(), "01MID".to_owned(), "01ZZZ".to_owned()],
+        )
+        .expect("a store failure on one id is not the batch's failure");
+
+        assert_eq!(
+            receipt.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["01AAA", "01MID", "01ZZZ"],
+            "three ids in, three entries out, in request order"
+        );
+        assert_eq!(
+            receipt[0].outcome,
+            TaskBatchOutcome::Forgotten,
+            "the id before the failure keeps its receipt: it really is gone"
+        );
+        assert!(
+            matches!(&receipt[1].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("the store said no")),
+            "the failing id is refused in the store's own words: {:?}",
+            receipt[1].outcome
+        );
+        assert_eq!(
+            receipt[2].outcome,
+            TaskBatchOutcome::Forgotten,
+            "the ids after the failure are still looked at, not abandoned"
+        );
+
+        let stored: Vec<String> = c
+            .prepare("SELECT id FROM tasks ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("ids");
+        assert_eq!(
+            stored,
+            vec!["01MID".to_owned()],
+            "the refused row is still there and the other two are gone — which \
+             is precisely what an `Err` would have hidden"
+        );
     }
 
     /// The policy round-trips through the write door and survives the edges that

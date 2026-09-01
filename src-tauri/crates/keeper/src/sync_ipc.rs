@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use keeper_core::tasks::{
     paced_work, task_host, DaemonPresence, PacedFolderFacts, PacedNotesFacts, PacedWorkVm,
-    TaskHostFacts, TaskListingVm, TaskRunVm, TaskSaveReq, TaskVm, UnknownTaskVm,
+    TaskBatchEntryVm, TaskBatchIdReq, TaskBatchOutcomeKind, TaskBatchReceiptVm, TaskHostFacts,
+    TaskListingVm, TaskRunVm, TaskSaveReq, TaskSchedulePreviewVm, TaskVm, UnknownTaskVm,
 };
 use keeper_core::vm::{
     ExportReceiptVm, FilesDeleteDestinationVm, FilesDeletePlanVm, FilesDeleteReceiptVm,
@@ -1824,7 +1825,9 @@ fn task_vm(
         profile_id: row.profile_id.clone(),
         profile,
         schedule: row.schedule.clone(),
+        description: row.description.clone(),
         on_missed: row.on_missed.as_str().to_owned(),
+        missed_delay_ms: row.missed_delay_ms,
         next_due_ms: row.next_due_ms,
         running_host: row.running_host.clone(),
         lease_until_ms: row.lease_until_ms,
@@ -2182,6 +2185,72 @@ pub async fn sync_paced_work(
     Ok(paced_work(&facts))
 }
 
+/// How many upcoming instants a schedule preview answers with.
+///
+/// Three, because the question the preview answers is *"is this the cadence I
+/// meant"* and one instant cannot answer it — `@daily` and `every 24h` both say
+/// "tomorrow" and differ only from the second one onward. More than three turns
+/// a hint under a text field into a list a person has to read.
+const TASK_SCHEDULE_PREVIEW_COUNT: usize = 3;
+
+/// What one written schedule would actually do, computed in Rust (Story 59.7).
+///
+/// **The browser gains no second parser.** The dialect is exact, small and
+/// already implemented once — five-field cron, three aliases, `every <n><unit>`,
+/// a sixty-second floor and a one-year ceiling, plus the refusal for a cron that
+/// parses and names no real date (`0 0 30 2 *`). A JavaScript cron library
+/// beside it would be a second opinion about the same string, and the one that
+/// disagrees is always the one the user is looking at. This is
+/// `recording_path_preview`'s precedent, on its stated rule: both the clock and
+/// the renderer belong to Rust.
+///
+/// **A refusal is data, not an error.** This is called as a person types, so a
+/// half-written expression is the ordinary case rather than a fault — and
+/// [`keeper_sync::tasks::SchedulePreview`] has no third variant, so the mapping
+/// below is total and this command has no judgement in it about which failures
+/// are the user's. The refusal is `TaskSchedule::parse`'s own `Display` string,
+/// which is exactly what [`sync_ipc_error`] would have put in `message` — so the
+/// preview and the save quote one wording rather than two.
+///
+/// **It takes state for the clock, and that is load-bearing.** `preview_schedule`
+/// needs a zone, and the port's default answer reads it through `gix`, which
+/// falls back to UTC when it cannot determine one. [`crate::sync::sync_platform`]
+/// overrides both `now_ms` and `utc_offset_minutes` for precisely that reason
+/// (`sync.rs:114-131`), and it is the platform the engine's own tick reasons
+/// with. A preview computed on a different clock than the save path would show a
+/// person one set of instants and then schedule another.
+///
+/// Rejects with: nothing. The only failure this verb can have is a refusal, and
+/// a refusal comes back inside the answer.
+#[tauri::command]
+pub async fn sync_task_schedule_preview(
+    state: tauri::State<'_, AppState>,
+    expression: String,
+) -> Result<TaskSchedulePreviewVm, IpcError> {
+    let platform = crate::sync::sync_platform(Arc::clone(&state.platform));
+    // Whitespace and all, exactly as the save door receives it: `validate_id`'s
+    // sibling rule is that a refusal quotes the original text and not a tidied
+    // copy, and a preview that silently trimmed would approve a string the save
+    // then refuses.
+    let (refusal, instants) = match keeper_sync::tasks::preview_schedule(
+        &expression,
+        platform.now_ms(),
+        platform.utc_offset_minutes(),
+        TASK_SCHEDULE_PREVIEW_COUNT,
+    ) {
+        keeper_sync::tasks::SchedulePreview::Refused(sentence) => (Some(sentence), Vec::new()),
+        keeper_sync::tasks::SchedulePreview::Fires(instants) => (None, instants),
+    };
+    Ok(TaskSchedulePreviewVm {
+        // Echoed back so the caller can drop a reply that a newer keystroke has
+        // already made stale: these land out of order under load, and a refusal
+        // rendered for text the box no longer holds is worse than no preview.
+        expression,
+        refusal,
+        instants,
+    })
+}
+
 /// One task's run history, newest first.
 ///
 /// Rejects with: `unsupported`, `internal`.
@@ -2290,6 +2359,10 @@ pub async fn sync_task_save(
         profile_id: req.profile_id.clone(),
         kind,
         schedule: req.schedule.clone(),
+        // Verbatim, and nothing above refuses it: unlike `kind`, `mode` and
+        // `on_missed` there is no vocabulary here to fail to read, so the only
+        // thing this could do to a description is change it.
+        description: req.description.clone(),
         mode,
         // The engine's columns, never the view's: `upsert_task` writes all three
         // itself and ignores whatever is passed here.
@@ -2299,6 +2372,12 @@ pub async fn sync_task_save(
         running_host: None,
         lease_until_ms: None,
         on_missed,
+        // Verbatim too, and refused rather than read: `upsert_task` calls
+        // `tasks::validate_missed_delay_ms`, so a value shorter than the grace or
+        // longer than a year arrives back at the form as the sentence Rust wrote.
+        // Bounding it here would be a second copy of the rule and would leave the
+        // CLI's door unguarded.
+        missed_delay_ms: req.missed_delay_ms,
     };
     // The one caller that passes a baseline, and the reason the parameter
     // exists: this form seeded its six values once, so every field it is about
@@ -2355,6 +2434,116 @@ pub async fn sync_task_forget(
 ) -> Result<(), IpcError> {
     let engine = engine_of(&state)?;
     engine.forget_task(&id).map_err(|err| sync_ipc_error(&err))
+}
+
+/// Word one batch's receipt for the wire, one entry per id and in request order.
+///
+/// The match over [`keeper_sync::db::TaskBatchOutcome`] is **total** — no `_`
+/// arm, this file's convention — so a fifth outcome breaks the compile here
+/// rather than reaching a surface as a silent nothing. That totality is exactly
+/// what `TaskBatchEntryVm`'s doc leans on when it promises `effect` is `Some`
+/// only for `saved` and `reason` only for `refused`: a flat struct with two
+/// `Option`s can represent the forbidden combinations, and this is the one place
+/// that can emit them.
+fn task_batch_receipt_vm(entries: Vec<keeper_sync::db::TaskBatchEntry>) -> TaskBatchReceiptVm {
+    TaskBatchReceiptVm {
+        entries: entries
+            .into_iter()
+            .map(|entry| {
+                let (outcome, effect, reason) = match entry.outcome {
+                    keeper_sync::db::TaskBatchOutcome::Saved(effect) => (
+                        TaskBatchOutcomeKind::Saved,
+                        // The same three words `cmd_task_set_enabled` prints
+                        // (`commands.rs`, the `TaskSave` match), so the CLI and
+                        // the IPC cannot drift into two vocabularies for one
+                        // write — and only `created` and `rearmed` mean the task
+                        // came back into service.
+                        Some(
+                            match effect {
+                                keeper_sync::db::TaskSave::Created => "created",
+                                keeper_sync::db::TaskSave::Updated => "updated",
+                                keeper_sync::db::TaskSave::Rearmed => "rearmed",
+                            }
+                            .to_owned(),
+                        ),
+                        None,
+                    ),
+                    keeper_sync::db::TaskBatchOutcome::Forgotten => {
+                        (TaskBatchOutcomeKind::Forgotten, None, None)
+                    }
+                    keeper_sync::db::TaskBatchOutcome::Missing => {
+                        (TaskBatchOutcomeKind::Missing, None, None)
+                    }
+                    // keeper's own sentence, moved rather than copied: the
+                    // surface renders it verbatim, so a person meets one wording
+                    // here and at the single-id write door.
+                    keeper_sync::db::TaskBatchOutcome::Refused(reason) => {
+                        (TaskBatchOutcomeKind::Refused, None, Some(reason))
+                    }
+                };
+                TaskBatchEntryVm {
+                    id: entry.id,
+                    outcome,
+                    effect,
+                    reason,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Take several tasks in or out of service at once, answering for every id.
+///
+/// **`Err` is reserved for the store failing outright** — the listing would not
+/// read — and is never one id's refusal: `FilesDeleteReceiptVm`'s rule, *partial
+/// success is a real outcome and is reported rather than thrown*. N ids in, N
+/// entries out, in request order, with no dedup and no first-error-wins.
+///
+/// Each id carries **its own baseline**, unlike the CLI's batch which passes
+/// `None`. A bulk action from a rendered list is the case that has one: the
+/// person decided against the rows they were looking at, so the pane passes each
+/// row's `updatedMs` and this door is no weaker than [`sync_task_save`]'s.
+///
+/// Rejects with: `unsupported`, `internal` (the task record could not be read).
+#[tauri::command]
+pub async fn sync_tasks_set_enabled(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<TaskBatchIdReq>,
+    enabled: bool,
+) -> Result<TaskBatchReceiptVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let wanted: Vec<keeper_sync::db::TaskBatchId> = ids
+        .iter()
+        .map(|req| keeper_sync::db::TaskBatchId {
+            id: req.id.clone(),
+            baseline_updated_ms: req.baseline_updated_ms,
+        })
+        .collect();
+    let entries = engine
+        .set_tasks_enabled(&wanted, enabled)
+        .map_err(|err| sync_ipc_error(&err))?;
+    Ok(task_batch_receipt_vm(entries))
+}
+
+/// Forget several tasks and everything they recorded, answering for every id.
+///
+/// Deletes records, never content — [`sync_task_forget`]'s promise, per id.
+///
+/// **Plain ids and no baseline**, deliberately: `db::delete_task` makes no
+/// baseline promise today, and inventing one here would be a new promise rather
+/// than a preserved one.
+///
+/// Rejects with: `unsupported`, `internal` (the task record could not be read).
+#[tauri::command]
+pub async fn sync_tasks_forget(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<TaskBatchReceiptVm, IpcError> {
+    let engine = engine_of(&state)?;
+    let entries = engine
+        .forget_tasks(&ids)
+        .map_err(|err| sync_ipc_error(&err))?;
+    Ok(task_batch_receipt_vm(entries))
 }
 
 /// Find `id` among the stored profiles, or report it as a config error naming

@@ -44,9 +44,11 @@
  *     leaves a paused folder paused and cannot move any field this form does not
  *     show. An edit must therefore never be routed through anything that also
  *     toggles pause.
- *   - The local path is not editable. The engine binds a profile to its folder
- *     — and on removable media to a marker written inside it — so repointing a
- *     profile is not an edit to it but a different folder.
+ *   - The local path of an EXISTING profile is not editable. The engine binds a
+ *     profile to its folder — and on removable media to a marker written inside
+ *     it — so repointing a profile is not an edit to it but a different folder.
+ *     While adding, the path is both picked and typeable, and a leading `~` is
+ *     resolved here rather than in Rust ({@link syncExpandHome} says why).
  *
  * The heading is deliberately not part of this component: each surface titles
  * it in its own chrome — Settings with a section heading, the Sync view with
@@ -55,6 +57,7 @@
  * its accessible name instead, so it is named for a screen reader wherever it
  * is rendered, including where nothing visible repeats the title.
  */
+import { homeDir } from "@tauri-apps/api/path";
 import { open as openFolder } from "@tauri-apps/plugin-dialog";
 import { ChevronDown, ChevronRight, Eye, EyeOff } from "lucide-react";
 import { type FormEvent, useEffect, useId, useState } from "react";
@@ -123,6 +126,97 @@ export const SYNC_NAME_LABEL = "Name";
 export const SYNC_FOLDER_LABEL = "Folder";
 export const SYNC_CHOOSE_FOLDER_LABEL = "Choose folder";
 export const SYNC_NO_FOLDER_CHOSEN_LABEL = "No folder chosen";
+
+/**
+ * The Home affordance beside the picker, and the box's placeholder (Story
+ * 59.8).
+ *
+ * The placeholder is the only documentation `~` gets: a box that silently
+ * accepts a tilde teaches nobody that it does, and a note under this row would
+ * be a fourth line under a field that already carries three.
+ */
+export const SYNC_HOME_FOLDER_LABEL = "Home";
+export const SYNC_FOLDER_PLACEHOLDER = "~/notes";
+
+/**
+ * What syncing a home directory pulls in, said once, where the choice is made
+ * (Story 59.8, the epic's own acceptance for it).
+ *
+ * The owner asked for "option of home dir" and this is the half of that ask
+ * that is not a button. Home is a legal folder — `SyncProfile::validate`
+ * refuses nothing about it and this form must not either — but it is the one
+ * choice on this screen whose consequences are invisible until the first sync
+ * has already pushed them: a home directory is not a folder of documents, it is
+ * every application's private state plus the keys that unlock the remote this
+ * folder is about to be pushed to.
+ *
+ * Named things rather than a category, because "large and sensitive files" is
+ * something everybody agrees with and nobody acts on, and each name here is one
+ * a person can go and look at. It points at the box that solves it rather than
+ * at documentation: the decision is being made in this form, so its remedy has
+ * to be in this form.
+ */
+export const SYNC_HOME_FOLDER_WARNING =
+  "This is your whole home folder, so keeper would sync everything under it: every app's caches and databases, ~/Library or ~/.config, your ~/.ssh and ~/.gnupg keys, every node_modules and build directory, every virtual-machine image — tens of gigabytes that change constantly, and secrets that would be pushed to the remote along with them. A folder inside home is almost always the folder you mean. If you do mean this one, fill in Skip these files under Advanced options before you add it.";
+
+/**
+ * What the folder box means, with a leading `~` resolved against this machine's
+ * home directory (Story 59.8).
+ *
+ * **Why here and not in Rust, which is the whole of this story's second half.**
+ * The invariant worth protecting is that a literal `~` can never reach the
+ * store as a directory name — and that invariant is already held, in Rust, by
+ * something this file cannot weaken: `SyncProfile::validate` refuses a
+ * `local_path` that is not absolute (`keeper-sync/src/profile/mod.rs:1158`),
+ * `~/notes` is not absolute, and every entrance goes through it — this form's
+ * IPC save, `keeper-syncd profile add`, a hand-edited `config.toml`, and
+ * `db::upsert_profile`, which validates before the row is written whatever
+ * route it arrived by. So expansion is not the guard. The guard exists, and the
+ * worst case of an expansion that does not happen is a refusal quoting the path
+ * rather than a folder called `~`.
+ *
+ * What is left is a convenience, and it belongs to the layer where the home
+ * directory is a fact about the *person*: this app runs as them, so `homeDir()`
+ * is their home. Expanding inside `keeper-sync` would expand against the `HOME`
+ * of whichever process happened to perform the write, and `keeper-syncd` can
+ * run as a different user from the one who edited its config — so the same `~`
+ * in the same file would mean different folders depending on who saved it. An
+ * expansion whose meaning depends on the writer is worse than no expansion,
+ * because nothing about it looks wrong. (The daemon's own `platform.rs:189`
+ * home lookup is not a precedent for this: it resolves the home of the process
+ * for the process's own data directory, which is exactly the question that has
+ * one right answer there and no right answer here.)
+ *
+ * It also costs nothing extra: the form has to know where home is anyway, for
+ * the Home control and for the warning, so this is one fact used three times
+ * rather than a second source of truth.
+ *
+ * **`~` and `~/…` only.** `~alice/notes` is left exactly as typed: this form
+ * cannot know another user's home directory, and expanding it to *this* user's
+ * would silently sync a different folder from the one that was named. Left
+ * alone it is not absolute, so it comes back from Rust as "local path must be
+ * absolute, got ~alice/notes" — a refusal naming the path, which is the honest
+ * answer to a path this layer cannot resolve.
+ *
+ * `home === null` leaves the text alone for the same reason and it is the case
+ * that matters most: the home directory is a fact about the machine, read from
+ * the shell, and a browser that could not read it must not fall back to a
+ * guess. `/home/$USER` is wrong on macOS, `$HOME` is not readable from a
+ * webview, and either would be wrong in the one direction that cannot be
+ * noticed — a plausible path that is not this person's home.
+ *
+ * **Nothing else is normalized.** No `..` collapsing, no trailing-slash
+ * trimming, no symlink resolution: those are the engine's business and a second
+ * opinion about them here would be a second answer to disagree with. This
+ * function does exactly one substitution.
+ */
+export function syncExpandHome(raw: string, home: string | null): string {
+  if (home === null || (raw !== "~" && !raw.startsWith("~/"))) {
+    return raw;
+  }
+  const rest = raw.slice(2);
+  return rest === "" ? home : `${home}/${rest}`;
+}
 
 /**
  * Why an existing profile's folder is shown but not offered. Explaining beats
@@ -1103,6 +1197,15 @@ export function AddFolderForm({
    * open it happened in and the next open starts masked.
    */
   const [tokenVisible, setTokenVisible] = useState(false);
+  /**
+   * This machine's home directory, or `null` while it is unknown (Story 59.8).
+   *
+   * Read from the shell rather than composed here, and read once per open: it
+   * is what the Home control fills in, what a typed `~` resolves against, and
+   * what the warning below compares the chosen folder to — so all three say the
+   * same thing about the same machine or none of them do.
+   */
+  const [home, setHome] = useState<string | null>(null);
   const fieldId = useId();
   // Several folders can have an edit form open at once, so the name carries the
   // one it belongs to. A folder being added has no name of its own yet.
@@ -1202,6 +1305,53 @@ export function AddFolderForm({
     };
   }, [profileId]);
 
+  /**
+   * Ask the shell where home is, once per open (Story 59.8).
+   *
+   * `homeDir()` is the path plugin's own answer — `dirs::home_dir()` in Rust,
+   * which is `$HOME` on Linux and the `NSHomeDirectory` container on macOS —
+   * so the one platform-specific rule in this story is answered by the layer
+   * that knows the platform, not mirrored into TypeScript. Its permission is
+   * already granted: `core:default` in `capabilities/default.json` carries
+   * `core:path:default`, so this needs no new grant and no new command.
+   *
+   * A failure is swallowed and leaves `home` at `null`, which switches the
+   * Home control off, stops `~` expanding and hides the warning. That is the
+   * whole handling: nothing here is load-bearing enough to interrupt somebody
+   * filling in a form with, and every path they can still type is checked by
+   * Rust exactly as before. It also keeps this component mountable in the
+   * suites that do not stub the shell at all, which is most of them.
+   */
+  useEffect(() => {
+    let abandoned = false;
+    void (async () => {
+      try {
+        const resolved = await homeDir();
+        if (!abandoned) {
+          // A trailing separator would make the warning's `=== home` comparison
+          // fail against the very path the Home control just wrote.
+          setHome(resolved.replace(/\/+$/, "") || "/");
+        }
+      } catch {
+        // No home known; see above.
+      }
+    })();
+    return () => {
+      abandoned = true;
+    };
+  }, []);
+
+  /**
+   * The folder this form will actually send, and whether it IS home.
+   *
+   * Computed once for the same reason `virtualOverBandNote` is: the box, the
+   * line under it, the warning and the save all have to be talking about one
+   * path, and four calls to the same helper are four places for them to come
+   * apart.
+   */
+  const resolvedPath = syncExpandHome(form.localPath, home);
+  const homeChosen = home !== null && resolvedPath === home;
+
   /** Open the OS-native directory picker; a cancellation writes nothing. */
   const pickFolder = async () => {
     try {
@@ -1272,10 +1422,14 @@ export function AddFolderForm({
         // token, so the retry finishes that folder instead of adding another.
         id: profile?.id ?? createdId,
         name: form.name.trim(),
-        // Carried back unchanged on an edit: the engine binds a profile to this
-        // path (and, on removable media, to a marker under it), which is why
-        // the field above is read-only rather than a second picker.
-        localPath: form.localPath,
+        // The path with `~` already resolved (Story 59.8), so what the line
+        // under the box says is exactly what gets stored. On an edit this is a
+        // no-op by construction — a stored path cleared `validate`'s absolute
+        // check, so it cannot begin with a tilde — and the value is carried
+        // back unchanged: the engine binds a profile to this path (and, on
+        // removable media, to a marker under it), which is why the field above
+        // is read-only rather than a second picker.
+        localPath: resolvedPath,
         remoteUrl: form.remoteUrl.trim(),
         branch: form.branch.trim(),
         direction: form.direction,
@@ -1470,32 +1624,97 @@ export function AddFolderForm({
           onChange={(event) => setForm((live) => ({ ...live, name: event.target.value }))}
         />
       </div>
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 flex-col gap-0.5">
-          <Label>{SYNC_FOLDER_LABEL}</Label>
-          <p
-            className="truncate font-mono text-muted-foreground text-xs"
-            data-testid={SYNC_FORM_PATH_TESTID}
-            title={form.localPath === "" ? undefined : form.localPath}
-          >
-            {form.localPath === "" ? SYNC_NO_FOLDER_CHOSEN_LABEL : form.localPath}
-          </p>
+      {/* The folder, in two shapes rather than one (Story 59.8).
+
+          EDITING is unchanged: a read-only line and no control at all, because
+          the engine binds a profile to its folder. ADDING now offers a typed
+          box beside the picker, which is what makes `~` reachable — the owner
+          asked for a home-directory option and a picker alone cannot express
+          one, since a native directory dialog has no way to say "the folder I
+          mean is the one I can name". The box holds what was typed; the line
+          under it says where that lands. */}
+      {editing ? (
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <Label>{SYNC_FOLDER_LABEL}</Label>
+            <p
+              className="truncate font-mono text-muted-foreground text-xs"
+              data-testid={SYNC_FORM_PATH_TESTID}
+              title={form.localPath === "" ? undefined : form.localPath}
+            >
+              {form.localPath === "" ? SYNC_NO_FOLDER_CHOSEN_LABEL : form.localPath}
+            </p>
+          </div>
         </div>
-        {!editing && (
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            disabled={disabled || saving}
-            onClick={() => {
-              void pickFolder();
-            }}
-          >
-            {SYNC_CHOOSE_FOLDER_LABEL}
-          </Button>
-        )}
-      </div>
+      ) : (
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-path`}>{SYNC_FOLDER_LABEL}</Label>
+            <Input
+              id={`${fieldId}-path`}
+              className="w-56 font-mono"
+              placeholder={SYNC_FOLDER_PLACEHOLDER}
+              value={form.localPath}
+              disabled={disabled || saving}
+              onChange={(event) => setForm((live) => ({ ...live, localPath: event.target.value }))}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            {/* The path as it will be stored, which is the same text as the box
+                above unless a `~` was resolved out of it. Kept on screen even
+                when it is a repetition: it is the only place a resolved tilde
+                becomes a fact somebody can check before pressing Add, and the
+                only line wide enough to read a long path in. */}
+            <p
+              className="min-w-0 truncate font-mono text-muted-foreground text-xs"
+              data-testid={SYNC_FORM_PATH_TESTID}
+              title={resolvedPath === "" ? undefined : resolvedPath}
+            >
+              {resolvedPath === "" ? SYNC_NO_FOLDER_CHOSEN_LABEL : resolvedPath}
+            </p>
+            <div className="flex shrink-0 items-center gap-2">
+              {/* Fills the box with the resolved home directory rather than
+                  with a `~`, so what is on screen from here on is the path that
+                  will be stored. Off while the home directory is unknown: a
+                  control that writes a guess is worse than one that is not
+                  offered. */}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={disabled || saving || home === null}
+                onClick={() => {
+                  if (home !== null) {
+                    setForm((live) => ({ ...live, localPath: home }));
+                  }
+                }}
+              >
+                {SYNC_HOME_FOLDER_LABEL}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={disabled || saving}
+                onClick={() => {
+                  void pickFolder();
+                }}
+              >
+                {SYNC_CHOOSE_FOLDER_LABEL}
+              </Button>
+            </div>
+          </div>
+        </>
+      )}
+      {/* Said in both modes, because it is a claim about what is being synced
+          rather than about the press: somebody opening the form of a folder
+          that already IS home needs it at least as much as somebody about to
+          choose one. Not muted, unlike every other note in this form — the
+          whole point of the sentence is that it is read once — and not
+          `text-destructive` either, which in this file means a refusal, and
+          this is not one: home is a legal folder and the save will go through.
+          */}
+      {homeChosen && <p className="text-foreground text-xs">{SYNC_HOME_FOLDER_WARNING}</p>}
       {editing && <p className="text-muted-foreground text-xs">{SYNC_PATH_FIXED_NOTE}</p>}
       <div className="flex items-center justify-between gap-2">
         <Label htmlFor={`${fieldId}-remote`}>{SYNC_REMOTE_URL_LABEL}</Label>

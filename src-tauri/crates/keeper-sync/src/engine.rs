@@ -2319,10 +2319,16 @@ impl Engine {
         };
         // The two policies differ here and nowhere else: `skip` gives up on this
         // window and arms the next natural one, `delay` keeps this window's work
-        // and arms it for `TASK_MISSED_DELAY_MS` from **now** — the instant this
+        // and arms it for **this task's** delay from **now** — the instant this
         // host noticed, which is the only anchor that survives a two-hour
-        // absence. `saturating_add` because a stored window from a newer keeper
-        // can be any `i64`.
+        // absence, and the only anchor under which a per-task delay means
+        // anything at all: measured from the window, one row's chosen quarter
+        // hour and another's chosen four hours would both already be spent, and
+        // Story 59.6's column would be as dead as the option was before 58.4's
+        // review moved the anchor here. `saturating_add` because a stored window
+        // from a newer keeper can be any `i64`, and because
+        // `effective_missed_delay_ms` hands back a stored value verbatim rather
+        // than a bounded one.
         let next = if declining {
             let Some(scheduled) =
                 schedule.and_then(|s| s.next_due_after(now_ms, utc_offset_minutes))
@@ -2341,7 +2347,7 @@ impl Engine {
             };
             scheduled
         } else {
-            now_ms.saturating_add(tasks::TASK_MISSED_DELAY_MS)
+            now_ms.saturating_add(tasks::effective_missed_delay_ms(task.missed_delay_ms))
         };
         let outcome = if declining {
             tasks::TaskOutcome::Declined
@@ -2571,6 +2577,10 @@ impl Engine {
             // parameter stays on this function for the `Sync` arm, where a
             // commit message keeps the answer forever.
             tasks::TaskKind::Release => self.perform_release_task(task, profiles).await,
+            // Nor here, and for a stronger reason than the release arm's: a
+            // verification writes nothing at all, so there is not even a
+            // deletion for a provenance to be attached to.
+            tasks::TaskKind::Verify => self.perform_verify_task(task, profiles).await,
         }
     }
 
@@ -2844,6 +2854,171 @@ impl Engine {
             // busy, or told this sweep not to run. The window is retried rather
             // than consumed — see [`Self::next_task_window`].
             None if swept == 0 => (tasks::TaskOutcome::Deferred, detail),
+            None => (tasks::TaskOutcome::Ok, detail),
+        }
+    }
+
+    /// One verification pass over the named folder, or over every enabled
+    /// folder when the task is host-wide (Story 59.9).
+    ///
+    /// [`Self::verify`] is the whole implementation and is not touched by this
+    /// kind existing, which is the entire argument for the kind: the verb is
+    /// one keeper already owns, the arm is a driver, and a task is not a
+    /// privileged caller. Target selection is [`Self::perform_release_task`]'s,
+    /// line for line, because the two kinds answer to one record and a reader
+    /// comparing them should find no difference to explain.
+    ///
+    /// # No reservation, and that is the honest choice rather than the lazy one
+    ///
+    /// [`Self::verify`]'s own doc settles it: it is *"the one pass that takes
+    /// no reservation"*, and it opens the repository through
+    /// `git::repo::open_read_only` precisely so that running beside a keeper
+    /// commit is safe — *"a check that repairs what it is checking is not a
+    /// check"*. Taking one here would gain nothing NFR-42 asks for (nothing is
+    /// written, so there is no second writer to serialize) and would lose the
+    /// only folders worth checking: a nightly verification that stood aside
+    /// whenever the host happened to be syncing would report on the quiet
+    /// folders and skip the busy ones.
+    ///
+    /// So [`tasks::TaskOutcome::Busy`] is **unreachable for this kind**. That
+    /// is a property of the verb and not a gap: `tasks run --help`'s exit 4 —
+    /// *"the folder was already syncing"* — remains true of the two kinds that
+    /// can collide, and a kind that cannot collide has nothing to report.
+    ///
+    /// # No network, for NFR-41's reason
+    ///
+    /// Plain `verify` is deliberately the half answerable without a server;
+    /// the remote proof is `verify --remote`, one batch round trip **per
+    /// object**, whose own fixture is a folder with ten thousand authorized
+    /// virtual paths. A scheduled task is the last place that belongs, and a
+    /// `--remote` flag on a task kind would need an argument column this story
+    /// does not have and Epic 60 has not decided.
+    ///
+    /// # An absent volume is a deferral, and here it is worse than a failure
+    ///
+    /// [`Self::volume_ready`] is asked first, for AD-48's reason — *"an
+    /// unplugged volume is absence, never failure"* — and for one specific to
+    /// this verb: [`Self::verify`] records an unreadable directory as a `bad`
+    /// path, so a detached drive walked without this gate would not merely
+    /// fail, it would fail *claiming the folder's content is damaged*. That is
+    /// the one wrong answer a check must never give.
+    ///
+    /// # What a bad path does to the record
+    ///
+    /// It fails the run. A verification that finds damage and records
+    /// [`tasks::TaskOutcome::Ok`] would be a schedule reporting that everything
+    /// is fine about the one folder where it is not, and `keeper-syncd verify`
+    /// already exits non-zero on the same finding — the record and the exit
+    /// code must not disagree about the same walk. The first bad path is what
+    /// the detail carries, because a person can act on a path and cannot act on
+    /// a count.
+    ///
+    /// A folder whose verify could not run **at all** — a `.keepervirtual` that
+    /// will not compile is the ordinary way (FR-329) — is counted separately
+    /// and also fails the run, for [`crate::lfs`]-adjacent reasons `cmd_verify`
+    /// states in the CLI: a check that could not run is not a check that
+    /// passed, and an operator must be able to tell it from a clean one.
+    async fn perform_verify_task(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+    ) -> (tasks::TaskOutcome, String) {
+        // Borrowed, never cloned, for [`Self::perform_release_task`]'s reason:
+        // `profiles` outlives this call.
+        let targets: Vec<&SyncProfile> = match &task.profile_id {
+            Some(id) => match profiles.iter().find(|profile| profile.id == *id) {
+                // Named a folder that is gone: the one real misconfiguration
+                // this kind can have.
+                None => {
+                    return (tasks::TaskOutcome::Failed, format!("no such folder: {id}"));
+                }
+                // A pause is an answer, not an error. Checked here rather than
+                // inside [`Self::verify`], which has no opinion about `enabled`
+                // — it is the door a person's explicit request comes through,
+                // and a task is not a person.
+                Some(profile) if !profile.enabled => {
+                    return (
+                        tasks::TaskOutcome::Deferred,
+                        format!("{} is paused, so nothing was checked", profile.name),
+                    );
+                }
+                Some(profile) => vec![profile],
+            },
+            None => profiles.iter().filter(|profile| profile.enabled).collect(),
+        };
+        if targets.is_empty() {
+            // The same two distinct facts the release arm separates: a host
+            // with no folders has nothing to check and never will until
+            // somebody adds one, while a host whose every folder is paused has
+            // work waiting behind a pause.
+            return if profiles.is_empty() {
+                (
+                    tasks::TaskOutcome::Ok,
+                    "no folders are configured, so there is nothing to check".to_owned(),
+                )
+            } else {
+                (
+                    tasks::TaskOutcome::Deferred,
+                    "every folder is paused, so nothing was checked".to_owned(),
+                )
+            };
+        }
+        let mut walked = 0usize;
+        let mut refused = 0usize;
+        let mut unavailable = 0usize;
+        let mut checked = 0u64;
+        let mut bad = 0usize;
+        let mut virtual_paths = 0u64;
+        let mut failure: Option<String> = None;
+        for profile in targets {
+            // The volume first, and before anything opens a directory — see
+            // this method's doc: an unreadable root is a `bad` path, so without
+            // this a detached drive is reported as damage.
+            match self.volume_ready(profile) {
+                Ok(true) => {}
+                Ok(false) => {
+                    unavailable += 1;
+                    continue;
+                }
+                Err(err) => {
+                    failure.get_or_insert_with(|| err.to_string());
+                    continue;
+                }
+            }
+            let report = match self.verify(&profile.id).await {
+                Ok(report) => report,
+                // Contained rather than propagated, which is `cmd_verify`'s own
+                // correction: a `?` here would let one folder's unparseable
+                // policy hide whether the folders beside it are intact.
+                Err(err) => {
+                    refused += 1;
+                    failure.get_or_insert_with(|| format!("{}: {err}", profile.name));
+                    continue;
+                }
+            };
+            walked += 1;
+            checked = checked.saturating_add(report.checked);
+            virtual_paths = virtual_paths.saturating_add(report.virtual_paths);
+            bad += report.bad.len();
+            // A path, not a count: the first thing a person can actually go and
+            // look at. Ordered after the refusal above so a folder that could
+            // not be checked is the louder of the two — it is the one that says
+            // nothing was learned.
+            if let Some((path, reason)) = report.bad.first() {
+                failure.get_or_insert_with(|| format!("{}: {path}: {reason}", profile.name));
+            }
+        }
+        let detail = format!(
+            "{checked} paths checked, {bad} bad, {virtual_paths} virtual in {walked} folders, \
+             {refused} could not be checked, {unavailable} unavailable"
+        );
+        match failure {
+            Some(reason) => (tasks::TaskOutcome::Failed, format!("{detail}: {reason}")),
+            // Nothing was checked and nothing went wrong: every folder is away.
+            // The window is retried rather than consumed — see
+            // [`Self::next_task_window`]. There is no `Busy` arm because this
+            // kind takes no reservation and therefore cannot report one.
+            None if walked == 0 => (tasks::TaskOutcome::Deferred, detail),
             None => (tasks::TaskOutcome::Ok, detail),
         }
     }
@@ -8194,6 +8369,92 @@ impl Engine {
         Ok(())
     }
 
+    /// Take several tasks in or out of service in one call, per id.
+    ///
+    /// [`db::set_tasks_enabled`] carries the transaction-scope decision and the
+    /// receipt's rule — N ids in, N entries out, in request order. Two things
+    /// belong here rather than there.
+    ///
+    /// **One clock reading for the whole batch.** Every row written by this call
+    /// carries the same `updated_ms`, so a bulk disable of five rows is one
+    /// instant in the store rather than five, and a caller re-reading them
+    /// cannot see them as having been written at different times.
+    ///
+    /// **One [`Self::with_db`] hold for the whole batch**, which is what makes
+    /// the per-id transactions safe to reason about: nothing else host-local
+    /// writes between them, because the single connection sits behind that
+    /// mutex.
+    ///
+    /// # The fault bookkeeping is keyed on each id's own outcome
+    ///
+    /// Exactly [`Self::save_task`]'s policy, per entry, and deliberately not
+    /// unified with [`Self::forget_task`]'s: the fault is cleared for a
+    /// [`db::TaskSave::Created`] or [`db::TaskSave::Rearmed`] id and for nothing
+    /// else. An idle re-save is [`db::TaskSave::Updated`] and is **not** a task
+    /// coming back into service, so it must not re-arm the alarm and let an hour
+    /// of failures notify once per save. A `Refused` id was not written at all,
+    /// so clearing its fault would silently discard a live one.
+    ///
+    /// [`db::TaskSave::Created`] is unreachable on this path —
+    /// [`db::set_tasks_enabled`] answers `Missing` for an absent id and so never
+    /// inserts — and the arm is kept anyway so the batch's policy is
+    /// [`Self::save_task`]'s policy verbatim rather than a second, subtly
+    /// different one.
+    ///
+    /// It runs **after** the database work and outside the closure: the two locks
+    /// are then never held at once, and there is nothing to order them by.
+    pub fn set_tasks_enabled(
+        &self,
+        ids: &[db::TaskBatchId],
+        enabled: bool,
+    ) -> Result<Vec<db::TaskBatchEntry>> {
+        let now_ms = self.platform.now_ms();
+        let entries = self.with_db(|conn| db::set_tasks_enabled(conn, ids, enabled, now_ms))?;
+        {
+            let mut faults = Self::lock(&self.task_faults);
+            for entry in &entries {
+                if matches!(
+                    entry.outcome,
+                    db::TaskBatchOutcome::Saved(db::TaskSave::Created | db::TaskSave::Rearmed)
+                ) {
+                    faults.remove(&entry.id);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Forget several tasks and everything they recorded, per id.
+    ///
+    /// [`db::forget_tasks`] carries the receipt's rule and refuses a row this
+    /// build cannot read rather than deleting it (AD-48). One
+    /// [`Self::with_db`] hold for the whole batch, and the fault bookkeeping
+    /// after it, outside the closure.
+    ///
+    /// The clear is [`Self::forget_task`]'s, preserved exactly: it fires for a
+    /// `Forgotten` id **and** for a `Missing` one, which is what
+    /// `forget_task`'s unconditional clear did — that door could not tell "gone
+    /// now" from "was never here" and cleared either way, and the reason it
+    /// clears at all is that re-creating the same id afterwards is the
+    /// documented edit-rather-than-duplicate path. A `Refused` id keeps its
+    /// fault: its row is still there, still on a schedule, and still able to
+    /// fail.
+    pub fn forget_tasks(&self, ids: &[String]) -> Result<Vec<db::TaskBatchEntry>> {
+        let entries = self.with_db(|conn| db::forget_tasks(conn, ids))?;
+        {
+            let mut faults = Self::lock(&self.task_faults);
+            for entry in &entries {
+                if matches!(
+                    entry.outcome,
+                    db::TaskBatchOutcome::Forgotten | db::TaskBatchOutcome::Missing
+                ) {
+                    faults.remove(&entry.id);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     /// Every stored task, with the rows this build cannot read listed beside
     /// them rather than dropped (NFR-43).
     pub fn tasks(&self) -> Result<db::TaskListing> {
@@ -8643,6 +8904,53 @@ impl Engine {
     /// stands down is the walk that **discovers** new work, never the draining of
     /// work already queued — standing that down would strand an in-flight upload
     /// behind a schedule.
+    ///
+    /// # The Pending pane's walk is a second gate, and it is deliberately left
+    ///
+    /// PR #303 (`c0fd6fe`) landed after this method and added
+    /// [`POLL_WALK_MIN_INTERVAL`] and [`Self::poll_may_walk`], so there are now
+    /// **two** gates over walking one folder, and a sentence that accounts for
+    /// only one of them is false. This one surrenders the paced backstop; the
+    /// other is left standing, and the asymmetry is the decision rather than an
+    /// oversight.
+    ///
+    /// What settles it is what each gate is gating. This one stands in front of
+    /// a **driver**: [`Self::scan_due`] opens the walk that discovers work and
+    /// hands it to the journal, so leaving it running beside a schedule is
+    /// exactly what AD-141 means by *"adding a driver without surrendering the
+    /// gate ships a folder that syncs twice"*. [`Self::poll_may_walk`] stands in
+    /// front of a **read**: its only caller is [`Self::pending`], reached only
+    /// from the app's `sync_pending` command, and that walk enqueues nothing,
+    /// takes no [`Self::reserve`], commits nothing and mints no `task_runs`
+    /// row. It cannot make a folder sync twice because it cannot make a folder
+    /// sync at all — which is also what `c0fd6fe`'s own message says of it:
+    /// *"Nothing about syncing changes: the commit leg has its own cadence and
+    /// is untouched."*
+    ///
+    /// Both ways of being wrong here, named, because each one is the other's
+    /// cure:
+    ///
+    /// * **Standing only this gate down** leaves somebody who put a large
+    ///   folder on a schedule still watching it walked — up to once a minute
+    ///   per folder, for as long as the Sync pane is open, because
+    ///   `startSyncDetailPolling` re-reads *every* mirrored profile every five
+    ///   seconds. That cost is real and it is the one #303 measured. What makes
+    ///   it acceptable is that it is bounded to a minute, that it happens only
+    ///   while a person is looking at the pane, and that `docs/sync.md` says so
+    ///   plainly instead of letting a *governed* row imply the folder is never
+    ///   touched.
+    /// * **Standing both gates down** would empty the one surface that makes a
+    ///   governed folder legible. The Pending list is where work accruing
+    ///   between two scheduled windows is visible, and its untracked rows come
+    ///   from this walk and nowhere else — so the folder whose sync is hourly
+    ///   would be the folder whose pane says nothing is waiting. That is the
+    ///   *feels dead to somebody who just saved a file* failure the section
+    ///   above refuses one layer down, moved from the engine to the pane.
+    ///
+    /// So the driver yields and the read does not. [`Self::poll_may_walk`] never
+    /// consults governance, and
+    /// `a_governed_folder_still_answers_the_pending_polls_walk` fails if it ever
+    /// starts to.
     ///
     /// # An unreadable table permits the poll, which is the opposite answer
     ///
@@ -11425,6 +11733,14 @@ impl Engine {
     /// losing the claim does — the settling rows and the repair backlog are
     /// assembled before this is asked.
     ///
+    /// **A sync task's governance is deliberately not a third shape that
+    /// answers no.** A `scheduled` sync task surrenders the folder's paced
+    /// *backstop* and this read is not part of that surrender —
+    /// [`Self::sync_poll_permits`] carries the argument, and the short of it is
+    /// that the backstop is a driver of work while this is a walk somebody is
+    /// waiting on. Governed the other way, the folder whose sync happens hourly
+    /// would be the folder whose Pending list never gained an untracked row.
+    ///
     /// Free in the healthy case: a bool, then one `exists()` and a 12-byte
     /// read of the index header (see [`Self::first_checkout_is_unfinished`]).
     fn poll_may_walk(&self, profile: &SyncProfile) -> bool {
@@ -13256,6 +13572,8 @@ mod tests {
             running_host: None,
             lease_until_ms: None,
             on_missed: tasks::TaskMissedPolicy::RunNow,
+            description: None,
+            missed_delay_ms: None,
         }
     }
 
@@ -13267,6 +13585,15 @@ mod tests {
     fn release_task(id: &str, profile_id: Option<&str>, schedule: &str) -> db::TaskRow {
         db::TaskRow {
             kind: tasks::TaskKind::Release,
+            ..task(id, profile_id, schedule)
+        }
+    }
+
+    /// [`task`] for Story 59.9's kind, spelled as an override for
+    /// [`release_task`]'s reason.
+    fn verify_task(id: &str, profile_id: Option<&str>, schedule: &str) -> db::TaskRow {
+        db::TaskRow {
+            kind: tasks::TaskKind::Verify,
             ..task(id, profile_id, schedule)
         }
     }
@@ -13462,13 +13789,25 @@ mod tests {
     /// however due it looks. `update` above all — `docs/sync.md` refuses
     /// unattended replacement of this binary, and there is no
     /// [`tasks::TaskKind`] variant that could name it.
+    ///
+    /// Story 59.9 added a third variant and this test is where that had to be
+    /// felt rather than in one of its own: the vocabulary grew by exactly one
+    /// word, so `exec` — the shape the ARCHITECTURE deferral is about, an
+    /// arbitrary command wearing a verb's name — is still a row this build
+    /// lists and refuses to run. A `_` arm in
+    /// [`Engine::perform_task`], or a kind decoded by guessing, is what this
+    /// asserts against.
     #[tokio::test]
     async fn a_kind_this_build_does_not_have_is_listed_and_never_runs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let Some(engine) = engine(dir.path()) else {
             return;
         };
-        for (id, kind) in [("01UPD", "update"), ("01TEL", "teleport")] {
+        for (id, kind) in [
+            ("01UPD", "update"),
+            ("01TEL", "teleport"),
+            ("01EXEC", "exec"),
+        ] {
             engine
                 .with_db(|conn| {
                     // Past the typed door on purpose: `save_task` takes a
@@ -13496,8 +13835,8 @@ mod tests {
         );
         assert_eq!(
             listing.unknown.len(),
-            2,
-            "and both are listed rather than swallowed"
+            3,
+            "and all three are listed rather than swallowed"
         );
         assert!(
             engine
@@ -13507,13 +13846,14 @@ mod tests {
             "a schedule may never replace this binary, and no variant exists \
              through which it could"
         );
-        assert!(
-            engine
-                .task_history("01TEL", 10)
-                .expect("history")
-                .is_empty(),
-            "a task from a newer keeper is skipped, not attempted"
-        );
+        for id in ["01TEL", "01EXEC"] {
+            assert!(
+                engine.task_history(id, 10).expect("history").is_empty(),
+                "{id} is a kind this build cannot name, so it is skipped rather \
+                 than attempted — and `exec` in particular stays deferred, not \
+                 half-shipped"
+            );
+        }
     }
 
     /// `Off` and `enabled = false` are the two ways a task is switched off, and
@@ -14069,6 +14409,131 @@ mod tests {
             "the newest row is the run, so `delay` really does serve the window \
              rather than dropping it — which is the whole difference from `skip`"
         );
+        assert_eq!(runs[1].outcome, Some(tasks::TaskOutcome::Postponed));
+    }
+
+    /// A task's **own** delay is what holds its window back, and the constant is
+    /// only what a task that chose nothing gets (Story 59.6, FR-366).
+    ///
+    /// The sibling of the test above, and it exists because that one would pass
+    /// unchanged if `move_task_window` had never learned to read the column: with
+    /// `missed_delay_ms` absent from every fixture there,
+    /// `effective_missed_delay_ms(None)` and a bare `TASK_MISSED_DELAY_MS` are the
+    /// same expression. So this fixture carries a value **larger** than the
+    /// constant and the clock is advanced past the constant first — a reader that
+    /// ignored the column would have run the window by then, and the assertion
+    /// that nothing has run is the one that catches it.
+    ///
+    /// Four hours, not four minutes: the setting exists for a machine that has
+    /// just come back and is at its busiest, and the owner asking *how much delay*
+    /// was asking to wait longer than half an hour rather than shorter.
+    #[tokio::test]
+    async fn a_task_that_carries_its_own_delay_waits_that_long_and_not_the_constant() {
+        const OWN_DELAY_MS: i64 = 4 * 3_600_000;
+        // A `const` block, so the guard is checked when this file compiles rather
+        // than when the test runs — which is both what clippy's
+        // `assertions_on_constants` asks for and the stronger thing: a fixture
+        // that stopped differing from the default would fail the build instead of
+        // waiting for somebody to run this test.
+        const {
+            assert!(
+                OWN_DELAY_MS > tasks::TASK_MISSED_DELAY_MS,
+                "the fixture has to differ from the default in a direction the \
+                 clock can distinguish, or this test cannot fail"
+            )
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        engine
+            .save_task(
+                &db::TaskRow {
+                    missed_delay_ms: Some(OWN_DELAY_MS),
+                    ..task_on_missed("01OWN", "@hourly", tasks::TaskMissedPolicy::Delay)
+                },
+                None,
+            )
+            .expect("save");
+        let _ = engine.tick().await;
+        let missed = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .expect("row")
+            .next_due_ms
+            .expect("armed");
+
+        // The same scenario 58.4's test drives: an hourly task, a host back two
+        // hours after the window opened.
+        platform.advance_ms(missed + 2 * 3_600_000 - platform.now_ms());
+        let noticed = platform.now_ms();
+        let _ = engine.tick().await;
+
+        let held = engine
+            .tasks()
+            .expect("tasks")
+            .tasks
+            .first()
+            .cloned()
+            .expect("row");
+        assert_eq!(
+            held.next_due_ms,
+            Some(noticed + OWN_DELAY_MS),
+            "the row's own delay, anchored on the same noticing — the anchor is \
+             what makes a per-task value coherent, because a value measured from a \
+             two-hour-old window would already be spent"
+        );
+        assert_ne!(
+            held.next_due_ms,
+            Some(noticed + tasks::TASK_MISSED_DELAY_MS),
+            "and emphatically not the constant, which is what this column exists \
+             to override"
+        );
+        let postponement = engine.task_history("01OWN", 1).expect("history");
+        assert!(
+            postponement[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains(&(noticed + OWN_DELAY_MS).to_string())),
+            "the postponement's detail names the instant it chose, so an unusual \
+             delay explains itself to whoever reads the run: {:?}",
+            postponement[0].detail
+        );
+
+        // Past the *constant*, and nothing may have run: this is the assertion
+        // that fails if the reader goes back to `TASK_MISSED_DELAY_MS`.
+        const PAST_THE_CONSTANT_MS: i64 = tasks::TASK_MISSED_DELAY_MS + 60_000;
+        platform.advance_ms(PAST_THE_CONSTANT_MS);
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        assert_eq!(
+            engine.task_history("01OWN", 10).expect("history").len(),
+            1,
+            "half an hour is this build's default and not this task's answer, so \
+             only the postponement exists"
+        );
+
+        // Past its own delay, and it runs. Once. One second past and not an hour
+        // past, which is 58.4's step and its reason: a tick arriving more than
+        // `TASK_MISSED_GRACE_MS` after the postponed window finds a window nobody
+        // served and postpones it *again* — correct (the host was still away, and
+        // it is still one stored instant) but not the fact under test here.
+        platform.advance_ms(OWN_DELAY_MS - PAST_THE_CONSTANT_MS + 1_000);
+        for _ in 0..3 {
+            let _ = engine.tick().await;
+        }
+        let runs = engine.task_history("01OWN", 10).expect("history");
+        assert_eq!(
+            runs.len(),
+            2,
+            "the postponement, then the one run it was holding back (AD-138)"
+        );
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
         assert_eq!(runs[1].outcome, Some(tasks::TaskOutcome::Postponed));
     }
 
@@ -14726,6 +15191,99 @@ mod tests {
             toasts(),
             4,
             "a save that changed nothing is not a task coming back into service"
+        );
+    }
+
+    /// The batch keys the fault clear on **each id's own outcome** (Story 59.4),
+    /// and therefore does exactly what [`Engine::save_task`] does per id rather
+    /// than unifying the two policies into "a batch happened".
+    ///
+    /// Both legs of the mirror above, in **one call**: the id that was disabled
+    /// comes back into service and its next failure is heard again, and the id
+    /// that was already live is an idle re-save whose next failure stays silent.
+    /// A batch that cleared every id it touched would notify twice here, which is
+    /// the once-per-save alarm `:15179` exists to forbid — and a batch that
+    /// cleared none would leave the returning task silent for the life of the
+    /// process, which is the bug the state itself introduced.
+    ///
+    /// Asserted through `notifications_posted`, exactly as `:15128` does: the
+    /// notification is the only surface the fault set is observable on, and the
+    /// per-id `TaskSave` in the receipt is asserted beside it so a passing count
+    /// cannot be a coincidence of two wrong effects.
+    #[test]
+    fn a_batch_clears_the_fault_only_for_the_ids_that_came_back_into_service() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let returning = task("01BACK", None, "every 5m");
+        let live = task("01LIVE", None, "every 5m");
+        let reason = "the remote could not be reached";
+        let toasts = || {
+            notifications_posted(&platform)
+                .into_iter()
+                .filter(|(title, _)| title.starts_with("Task — "))
+                .count()
+        };
+
+        // Both broken, so both hold a fault and both have already been heard.
+        for row in [&returning, &live] {
+            engine.save_task(row, None).expect("save");
+            engine.note_task_outcome(row, tasks::TaskOutcome::Failed, reason);
+        }
+        assert_eq!(toasts(), 2, "each task's first failure is its own onset");
+
+        // One goes out of service; the other stays live. Taking a task out is an
+        // `Updated`, so neither fault is cleared getting here.
+        let mut parked = returning.clone();
+        parked.enabled = false;
+        engine.save_task(&parked, None).expect("disable");
+        assert_eq!(toasts(), 2, "disabling a task notifies nobody");
+
+        // ONE batched enable over both ids.
+        let receipt = engine
+            .set_tasks_enabled(
+                &[
+                    db::TaskBatchId {
+                        id: "01BACK".to_owned(),
+                        baseline_updated_ms: None,
+                    },
+                    db::TaskBatchId {
+                        id: "01LIVE".to_owned(),
+                        baseline_updated_ms: None,
+                    },
+                ],
+                true,
+            )
+            .expect("the store is fine");
+        assert_eq!(
+            receipt
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.outcome.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("01BACK", db::TaskBatchOutcome::Saved(db::TaskSave::Rearmed)),
+                ("01LIVE", db::TaskBatchOutcome::Saved(db::TaskSave::Updated)),
+            ],
+            "the receipt names each id's own effect, which is what the fault \
+             bookkeeping is keyed on"
+        );
+
+        engine.note_task_outcome(&returning, tasks::TaskOutcome::Failed, reason);
+        assert_eq!(
+            toasts(),
+            3,
+            "the id that came back into service reports its next failure, in a \
+             batch exactly as it does alone"
+        );
+        engine.note_task_outcome(&live, tasks::TaskOutcome::Failed, reason);
+        assert_eq!(
+            toasts(),
+            3,
+            "the id that was already live was an idle re-save, so its ongoing \
+             failure stays one notification — a batch must not re-arm the alarm \
+             for every id it touched"
         );
     }
 
@@ -15597,6 +16155,76 @@ mod tests {
         );
     }
 
+    /// The **other** gate over walking this folder, and the one governance does
+    /// not take: the Pending pane's walk (Story 58.8 revised for PR #303).
+    ///
+    /// [`POLL_WALK_MIN_INTERVAL`] and [`Engine::poll_may_walk`] landed after
+    /// Story 58.8 shipped, so from that moment there were two gates over
+    /// walking one folder and only one of them had been reasoned about. This
+    /// asserts the answer for the second one directly, because the decision is
+    /// invisible in the code — it is spelled as an *absence* of a governance
+    /// call, and an absence is what a later "make the stand-down thorough"
+    /// change deletes without noticing.
+    ///
+    /// Both halves matter and neither alone is enough. Without the first, a
+    /// governance that stood this down too would pass; without the second, a
+    /// governance that stood nothing down would.
+    #[test]
+    fn a_governed_folder_still_answers_the_pending_polls_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        // A real repository with a real index, because the first thing
+        // `poll_may_walk` asks is whether the first copy ever finished.
+        let p = committed_tree(&engine, &platform, dir.path());
+
+        assert!(
+            engine.sync_poll_permits(&p),
+            "ungoverned: the paced backstop runs"
+        );
+        assert!(
+            engine.poll_may_walk(&p),
+            "ungoverned: and so does the pane's walk"
+        );
+
+        let mut governing = task("01HOURLY", Some(&p.id), "@hourly");
+        governing.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&governing, None).expect("save");
+
+        assert!(
+            !engine.sync_poll_permits(&p),
+            "governed: the driver is surrendered, which is the whole of 58.8"
+        );
+        assert!(
+            engine.poll_may_walk(&p),
+            "governed: and the READ is not. Stand this down as well and the \
+             folder whose sync is hourly becomes the folder whose Pending list \
+             never gains an untracked row — the pane going dead for exactly the \
+             person who most needs to see what is waiting"
+        );
+
+        // What does still pace it, unchanged by governance: its own floor,
+        // measured between walks rather than between polls.
+        engine.poll_walk_finished(&p.id);
+        assert!(
+            !engine.poll_may_walk(&p),
+            "inside the minute after a walk, governed or not — this is the gate \
+             that bounds the cost governance chose not to remove"
+        );
+
+        // And the folder's own pause still beats everything, as it does on
+        // every projected row.
+        let mut paused = p.clone();
+        paused.enabled = false;
+        assert!(
+            !engine.poll_may_walk(&paused),
+            "a paused folder is walked by nothing, which is the one stand-down \
+             the owner asked for explicitly"
+        );
+    }
+
     /// A refusal does not merely decline to arm a window — it **clears** one
     /// that is already armed (Story 57.4).
     ///
@@ -15811,6 +16439,167 @@ mod tests {
                      0 declined, 0 already syncing, 1 unavailable"
                 ),
                 "and the record says which of the four it was ({bound:?})"
+            );
+        }
+    }
+
+    /// Story 59.9's whole claim: the arm **performs the verb**, and the record
+    /// carries the numbers `verify` itself produces.
+    ///
+    /// Asserted on the detail line in full rather than on an `Ok` outcome,
+    /// because an arm that returned `(Ok, String::new())` without walking
+    /// anything would satisfy every weaker assertion — and a kind that reports
+    /// a cheerful nothing is exactly the invisible non-execution the whole
+    /// mechanism exists to close. Two real files in the folder is what makes
+    /// `2 paths checked` a fact about the walk rather than a constant.
+    #[tokio::test]
+    async fn a_verify_task_walks_the_folder_and_records_what_the_verb_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        std::fs::create_dir_all(p.local_path.join("inner")).expect("a folder to check");
+        std::fs::write(p.local_path.join("notes.txt"), b"plain bytes").expect("a file");
+        std::fs::write(p.local_path.join("inner/more.txt"), b"more bytes").expect("another");
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&verify_task("01VER", None, "every 5m"), None)
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01VER", 10).expect("history");
+        assert_eq!(runs.len(), 1, "the task came due and ran");
+        assert_eq!(runs[0].outcome, Some(tasks::TaskOutcome::Ok));
+        assert_eq!(
+            runs[0].detail.as_deref(),
+            Some(
+                "2 paths checked, 0 bad, 0 virtual in 1 folders, \
+                 0 could not be checked, 0 unavailable"
+            ),
+            "the record is the verb's own report, including the subdirectory — \
+             a walk that stopped at the root would say 1"
+        );
+    }
+
+    /// A verification that finds damage **fails the run**, and the detail names
+    /// the path rather than only counting it.
+    ///
+    /// The fixture is the ordinary shape of real damage this verb was written
+    /// for: a committed pointer whose object is not in the store. Nothing
+    /// authorizes it to be away — no `.keepervirtual`, no `virtualPatterns`,
+    /// `lfs_mode` at its default — so AD-129's four free facts are not earned
+    /// and `verify` reports it, exactly as `keeper-syncd verify` would and with
+    /// the same non-zero verdict.
+    ///
+    /// This is the assertion that stops the kind being cosmetic. An arm that
+    /// called `verify` and threw the report away would still record `ok` here,
+    /// and a nightly schedule reporting `ok` about the one folder whose content
+    /// is damaged is worse than no schedule at all.
+    #[tokio::test]
+    async fn a_verify_task_that_finds_a_bad_path_fails_and_names_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        std::fs::create_dir_all(&p.local_path).expect("a folder to check");
+        // A syntactically valid pointer whose object was never stored. The oid
+        // is a literal so the assertion can name it: this is the string an
+        // operator would go and look for.
+        const OID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        std::fs::write(
+            p.local_path.join("big.bin"),
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{OID}\nsize 1234\n"),
+        )
+        .expect("a pointer with nothing behind it");
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .save_task(&verify_task("01VERBAD", Some(&p.id), "every 5m"), None)
+            .expect("save");
+
+        let _ = engine.tick().await;
+        platform.advance_ms(300_000);
+        let _ = engine.tick().await;
+
+        let runs = engine.task_history("01VERBAD", 10).expect("history");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].outcome,
+            Some(tasks::TaskOutcome::Failed),
+            "damage found is a failed run, or the schedule reports that \
+             everything is fine about the one folder where it is not"
+        );
+        let detail = runs[0].detail.as_deref().expect("a detail line");
+        assert!(
+            detail.starts_with("1 paths checked, 1 bad, 0 virtual in 1 folders, "),
+            "the counters distinguish a bad path from a folder that could not be \
+             checked, got {detail:?}"
+        );
+        assert!(
+            detail.contains("big.bin") && detail.contains(OID),
+            "and the first bad path is named, because a person can act on a \
+             path and cannot act on a count, got {detail:?}"
+        );
+    }
+
+    /// An unplugged drive is absence, never failure (AD-48) — and for this kind
+    /// the gate does more than spare a notification.
+    ///
+    /// [`Engine::verify`] records an unreadable directory as a **bad path**, so
+    /// a detached volume walked without [`Engine::volume_ready`] in front of it
+    /// would not merely fail: it would fail claiming the folder's content is
+    /// damaged. That is the one wrong answer a check must never give, and it is
+    /// what the `0 bad` below is asserting — not merely that the outcome is
+    /// `deferred`.
+    ///
+    /// **Both target shapes**, for the reason
+    /// [`a_release_task_on_an_unplugged_drive_waits_rather_than_failing`]
+    /// states: the folder-scoped early return fires only for a *paused* folder,
+    /// so an enabled folder-scoped target falls straight through to the volume
+    /// gate, and a task bound to one removable folder is how somebody actually
+    /// schedules a check on an external drive.
+    #[tokio::test]
+    async fn a_verify_task_on_an_unplugged_drive_waits_rather_than_calling_it_damage() {
+        for bound in [None, Some("01JTESTPROFILE")] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let platform = Arc::new(TestPlatform::new(dir.path()));
+            let Ok(engine) = Engine::open(platform.clone()) else {
+                return;
+            };
+            let mut p = profile(dir.path());
+            p.removable = true;
+            p.volume_id = Some("01NOSUCHVOLUME".to_owned());
+            engine.upsert_profile(&p).expect("upsert");
+            engine
+                .save_task(&verify_task("01VERABSENT", bound, "every 5m"), None)
+                .expect("save");
+
+            let _ = engine.tick().await;
+            platform.advance_ms(300_000);
+            let _ = engine.tick().await;
+
+            let runs = engine.task_history("01VERABSENT", 10).expect("history");
+            assert_eq!(runs.len(), 1, "the attempt is recorded ({bound:?})");
+            assert_eq!(
+                runs[0].outcome,
+                Some(tasks::TaskOutcome::Deferred),
+                "absence is not failure, so nothing here is worth a \
+                 notification ({bound:?})"
+            );
+            assert_eq!(
+                runs[0].detail.as_deref(),
+                Some(
+                    "0 paths checked, 0 bad, 0 virtual in 0 folders, \
+                     0 could not be checked, 1 unavailable"
+                ),
+                "and above all NOT one bad path per unreadable directory — a \
+                 drive that is out is not damage ({bound:?})"
             );
         }
     }
