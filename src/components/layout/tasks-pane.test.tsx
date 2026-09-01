@@ -76,8 +76,10 @@ import {
   TASKS,
   TASKS_BULK_DISABLE_TEXT,
   TASKS_BULK_ENABLE_TEXT,
+  TASKS_BULK_ERROR_TESTID,
   TASKS_BULK_FORGET_TEXT,
   TASKS_BULK_MISSING_TEXT,
+  TASKS_BULK_NO_REASON_TEXT,
   TASKS_CLOCK_TICK_MS,
   TASKS_DESCRIPTION_TESTID,
   TASKS_DETAIL_LABEL,
@@ -120,7 +122,13 @@ import {
 } from "@/components/sync/task-form";
 import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { countLabel } from "@/lib/count-label";
-import type { PacedWorkVm, TaskListingVm, TaskRunVm, TaskVm } from "@/lib/ipc/client";
+import type {
+  PacedWorkVm,
+  TaskBatchReceiptVm,
+  TaskListingVm,
+  TaskRunVm,
+  TaskVm,
+} from "@/lib/ipc/client";
 import {
   syncPacedWork,
   syncProfiles,
@@ -280,6 +288,19 @@ function selectedRows(): string[] {
   return screen
     .getAllByTestId(TASKS_ROW_TESTID)
     .filter((row) => row.getAttribute("aria-selected") === "true")
+    .map((row) => row.dataset.taskId ?? "");
+}
+
+/**
+ * Which rows carry the roving tab stop, by id and in the list's own order.
+ *
+ * There must always be exactly one while the listing is non-empty: a listbox
+ * whose every option is `tabIndex -1` is unreachable by Tab.
+ */
+function tabStops(): string[] {
+  return screen
+    .getAllByTestId(TASKS_ROW_TESTID)
+    .filter((row) => row.getAttribute("tabindex") === "0")
     .map((row) => row.dataset.taskId ?? "");
 }
 
@@ -2568,7 +2589,7 @@ describe("a list of names, and one task at a time", () => {
     expect(screen.getByRole("region", { name: TASKS_PANE_TITLE })).toBeInTheDocument();
   });
 
-  it("marks exactly one name as selected, and moves the mark rather than adding one", async () => {
+  it("selects nothing on mount, and a click moves the mark rather than adding one", async () => {
     // Story 59.1's test, rewritten rather than worked around. It asserted one
     // `aria-current` row on the ground that `aria-selected` announces a SET to a
     // reader when only one thing can be chosen — and Story 59.4 removed that
@@ -2578,21 +2599,40 @@ describe("a list of names, and one task at a time", () => {
     // What has NOT changed is the claim: the selection's **contents**, not its
     // size. "Exactly one" and "the right one" are different claims, and a test
     // that counted would pass while the mark sat on the wrong row.
+    //
+    // **Nothing is selected on mount** (Story 59.4 review, P6). The detail
+    // region's `tasks[0]` fallback decides which task is *drawn* with nobody
+    // chosen; it is not a selection, and announcing "01FIRST, selected" inside
+    // an `aria-multiselectable` listbox while no bulk verb is offered told a
+    // screen-reader user about a choice nobody made. `files-pane.tsx` has no
+    // such fallback and marks nothing on its own mount.
     answer(listing({ tasks: [task({ id: "01FIRST" }), task({ id: "01SECOND" })] }));
     render(<TasksPane />);
     await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
 
-    expect(selectedRows()).toEqual(["01FIRST"]);
+    expect(selectedRows()).toEqual([]);
     // On EVERY row, `"false"` included: a list that marked only the selected
     // rows would leave a screen reader unable to say "not selected" about the
     // others (`files-pane.tsx:2528-2532`).
+    expect(rowOption("01FIRST")).toHaveAttribute("aria-selected", "false");
     expect(rowOption("01SECOND")).toHaveAttribute("aria-selected", "false");
+    // The detail region still draws the first task — the fallback is unchanged,
+    // and it is the thing `aria-selected` was conflated with.
+    expect(
+      within(screen.getByRole("region", { name: TASKS_DETAIL_LABEL })).getByText("01FIRST"),
+    ).toBeInTheDocument();
+    // ...and the list still has exactly one tab stop with nothing selected,
+    // which is the cursor's job rather than the selection's (see `cursorId`).
+    expect(tabStops()).toEqual(["01FIRST"]);
     // And the container says a set is possible at all, which is the half a
     // reader learns before touching anything.
     expect(screen.getByRole("listbox", { name: TASKS_LIST_LABEL })).toHaveAttribute(
       "aria-multiselectable",
       "true",
     );
+
+    selectRow("01FIRST");
+    expect(selectedRows()).toEqual(["01FIRST"]);
 
     selectRow("01SECOND");
     // One, and the other one — not two: a plain click REPLACES.
@@ -3069,5 +3109,142 @@ describe("several tasks at once", () => {
     });
     expect(screen.queryByTestId(TASKS_SELECTED_TESTID)).toBeNull();
     expect(screen.queryByRole("button", { name: TASKS_BULK_FORGET_TEXT })).toBeNull();
+  });
+
+  it("names a whole batch that would not run at all, and keeps the selection", async () => {
+    // The one whole-batch failure the design keeps distinct from a per-id
+    // refusal: the batched verbs reject only when the task record would not read
+    // at all, and every per-id outcome comes back inside the receipt instead. So
+    // this alert must carry keeper's sentence and NOT be a place a single id's
+    // reason can land — and the selection must survive, because the rows are
+    // still there and still the same set. Clearing it would tell the person the
+    // action was taken.
+    const refused = { message: "the task record could not be read" };
+    await threeTasks();
+    vi.mocked(syncTasksSetEnabled).mockRejectedValue(refused);
+
+    selectRow("A");
+    await clickRowWith("C", { shiftKey: true });
+    await pressBulk(TASKS_BULK_DISABLE_TEXT);
+
+    const alert = await waitFor(() => screen.getByTestId(TASKS_BULK_ERROR_TESTID));
+    expect(alert).toHaveAttribute("role", "alert");
+    expect(alert).toHaveTextContent(refused.message);
+    expect(selectedRows()).toEqual(["A", "B", "C"]);
+    expect(screen.getByRole("status", { name: "3 tasks selected" })).toHaveTextContent("3");
+
+    // The same for Forget, whose success path is the one that DOES empty the
+    // selection — so a rejection there is the case where the two diverge, and
+    // the rows are still on screen to be tried again.
+    vi.mocked(syncTasksForget).mockRejectedValue({ message: "the record is held elsewhere" });
+    await pressBulk(TASKS_BULK_FORGET_TEXT);
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: TASK_FORGET_TEXT }));
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId(TASKS_BULK_ERROR_TESTID)).toHaveTextContent(
+        "the record is held elsewhere",
+      ),
+    );
+    expect(selectedRows()).toEqual(["A", "B", "C"]);
+  });
+
+  it("says a refused id was refused even when keeper gave no reason", async () => {
+    // `reason` is non-null exactly when `outcome` is `refused`, by
+    // `TaskBatchEntryVm`'s documented invariant — but the wire type is nullable,
+    // and a `refused` entry that rendered nothing would read exactly like a
+    // success. The pane owns a sentence for that, and this is the guard.
+    await threeTasks();
+    vi.mocked(syncTasksSetEnabled).mockResolvedValue({
+      entries: [
+        { id: "A", outcome: "saved", effect: "updated", reason: null },
+        { id: "B", outcome: "refused", effect: null, reason: null },
+      ],
+    });
+
+    selectRow("A");
+    await clickRowWith("B", { metaKey: true });
+    await pressBulk(TASKS_BULK_ENABLE_TEXT);
+
+    await waitFor(() =>
+      expect(screen.getByTestId(TASKS_ORPHAN_REFUSAL_TESTID)).toHaveTextContent(
+        `B: ${TASKS_BULK_NO_REASON_TEXT}`,
+      ),
+    );
+  });
+
+  it("issues no second call while a bulk write is still in flight", async () => {
+    // Both calls would carry the SAME pre-bump `baselineUpdatedMs` values, so
+    // the second is refused `changed elsewhere` for every id — by the caller's
+    // own first write. A person double-clicking Disable saw five spurious
+    // "changed elsewhere" refusals, which is worse than no feedback at all.
+    await threeTasks();
+    // The executor form, not `Promise.withResolvers`: this project compiles
+    // against `lib: ES2020`, which predates it — the reason this file already
+    // gives twice above.
+    let settle!: (receipt: TaskBatchReceiptVm) => void;
+    vi.mocked(syncTasksSetEnabled).mockReturnValue(
+      new Promise<TaskBatchReceiptVm>((resolve) => {
+        settle = resolve;
+      }),
+    );
+
+    selectRow("A");
+    await clickRowWith("C", { shiftKey: true });
+    await pressBulk(TASKS_BULK_DISABLE_TEXT);
+    expect(syncTasksSetEnabled).toHaveBeenCalledTimes(1);
+
+    // The control is disabled rather than merely inert, so the person can see
+    // that the first press is still going.
+    expect(screen.getByRole("button", { name: TASKS_BULK_DISABLE_TEXT })).toBeDisabled();
+    await pressBulk(TASKS_BULK_DISABLE_TEXT);
+    expect(syncTasksSetEnabled).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      settle({ entries: [] });
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: TASKS_BULK_DISABLE_TEXT })).toBeEnabled(),
+    );
+  });
+
+  it("keeps exactly one tab stop when the anchor row leaves the listing", async () => {
+    // With two or more rows selected the resolved task is `null`, so a cursor
+    // that fell back no further left NO row with `tabIndex 0` the moment another
+    // host forgot the anchor row — and a listbox whose every option is
+    // `tabIndex -1` is unreachable by Tab.
+    await threeTasks();
+
+    // Three held, so the resolved task is `null`, and the anchor is the row the
+    // last Cmd-click landed on.
+    selectRow("A");
+    await clickRowWith("B", { metaKey: true });
+    await clickRowWith("C", { metaKey: true });
+    expect(selectedRows()).toEqual(["A", "B", "C"]);
+    expect(tabStops()).toEqual(["C"]);
+
+    // Another host forgot the anchor row. Two rows are still held, so
+    // `resolvedId` stays `null` and the cursor has to fall back to the
+    // selection's own first row.
+    answer(
+      listing({
+        tasks: [
+          task({ id: "A", updatedMs: NOW - 3_000 }),
+          task({ id: "B", updatedMs: NOW - 2_000 }),
+        ],
+      }),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: TASK_REFRESH_TEXT }));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.getAllByTestId(TASKS_ROW_TESTID)).toHaveLength(2));
+
+    expect(selectedRows()).toEqual(["A", "B"]);
+    expect(tabStops()).toEqual(["A"]);
   });
 });

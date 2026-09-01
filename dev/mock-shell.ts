@@ -2258,9 +2258,15 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       }
       // The lost-update refusal, per id — the same rule and the same sentence
       // `sync_task_save` above mirrors. Unreachable in a shell with one writer
-      // unless two batches race, which is the honest state of affairs: the
-      // wording is Rust's and this is where it lands.
-      if (wanted.baselineUpdatedMs !== null && existing.updatedMs !== wanted.baselineUpdatedMs) {
+      // unless two batches race, which is the honest state of affairs. The
+      // sentence below is a stand-in: the shipped wording is Rust's
+      // (`db::upsert_task`), and this copy only exists so the pane has something
+      // to render against the mock.
+      //
+      // `!= null` and not `!== null`: a caller that omits the baseline sends
+      // `undefined`, and refusing that as stale would be a refusal production
+      // never makes.
+      if (wanted.baselineUpdatedMs != null && existing.updatedMs !== wanted.baselineUpdatedMs) {
         return {
           id: wanted.id,
           outcome: "refused",
@@ -2272,7 +2278,13 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       // because that is the distinction the effect exists to carry.
       const effect = !existing.enabled && enabled ? "rearmed" : "updated";
       existing.enabled = enabled;
-      existing.nextDueMs = enabled ? existing.nextDueMs : null;
+      // The window follows `db::upsert_task`'s three rearm edges
+      // (`db.rs:3316-3329`): a disable returns `updated` and **keeps** the
+      // window, while a disabled→enabled transition returns `rearmed` and clears
+      // it (`next_due_ms = NULL`) — deliberate anti-catch-up, `db.rs:3181-3185`.
+      if (effect === "rearmed") {
+        existing.nextDueMs = null;
+      }
       existing.updatedMs = Date.now();
       return { id: wanted.id, outcome: "saved", effect, reason: null };
     });

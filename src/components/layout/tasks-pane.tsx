@@ -1763,6 +1763,20 @@ export function TasksPane() {
    */
   const [bulkError, setBulkError] = useState<string | null>(null);
   /**
+   * Whether a batched verb is in flight, so the three bulk controls cannot
+   * re-issue one (Story 59.4 review, P5).
+   *
+   * {@link deleting}'s reason at the batch's scale, and the reason it is one flag
+   * rather than a set: every id in the batch carries the `updatedMs` the *last
+   * listing* gave it, so two rapid clicks send two calls with the same
+   * pre-bump baselines and the second is refused `changed elsewhere` for every
+   * id — by the caller's own first write. A person double-clicking Disable saw
+   * five spurious "changed elsewhere" refusals, which is worse than no feedback.
+   * One flag because one call is outstanding at a time by construction, which is
+   * the point.
+   */
+  const [bulkWriting, setBulkWriting] = useState(false);
+  /**
    * Live refs to each rendered row, so the keyboard handler can move focus as
    * the selection moves (`chat-list-pane.tsx:142-145`'s idiom). Rebuilt each
    * render from the current row order, which is `list_tasks`' and is never
@@ -2232,9 +2246,20 @@ export function TasksPane() {
    * shipped; under a set it is the one row that a keyboard user is meaningfully
    * "at". Falls back to the resolved task, which covers the mount, when nothing
    * has been clicked yet.
+   *
+   * ...and falls back **further**, because `resolvedId` is `null` under a set of
+   * two or more: to the first selected row, then to the first row of the
+   * listing. Neither is a nicety. With the anchor row forgotten by another host
+   * mid-selection, `resolvedId` is already `null`, so stopping there left **no**
+   * row with `tabIndex 0` and the listbox unreachable by Tab. And with nothing
+   * selected — where nothing is `aria-selected` either — the cursor is the only
+   * thing giving the list a tab stop at all. There is always exactly one while
+   * {@link tasks} is non-empty.
    */
   const cursorId =
-    anchorKey !== null && tasks.some((row) => row.id === anchorKey) ? anchorKey : resolvedId;
+    anchorKey !== null && tasks.some((row) => row.id === anchorKey)
+      ? anchorKey
+      : (resolvedId ?? selection[0]?.id ?? tasks[0]?.id ?? null);
 
   /**
    * Replace, extend or toggle the selection from one row (Story 59.4).
@@ -2493,6 +2518,7 @@ export function TasksPane() {
     async (enabled: boolean) => {
       const ids = selection.map((row) => ({ id: row.id, baselineUpdatedMs: row.updatedMs }));
       setBulkError(null);
+      setBulkWriting(true);
       try {
         applyReceipt(await syncTasksSetEnabled(ids, enabled));
       } catch (cause) {
@@ -2503,6 +2529,9 @@ export function TasksPane() {
         // attempt rather than newer than it, so clearing the receipt's refusals
         // here would erase them in the tick they appeared.
         await refresh(true);
+        // Cleared only after the re-read, so the baselines the next click sends
+        // are the ones this write bumped rather than the ones it consumed.
+        setBulkWriting(false);
       }
     },
     [applyReceipt, refresh, selection],
@@ -2521,6 +2550,7 @@ export function TasksPane() {
     async (ids: readonly string[]) => {
       setForgetAsking(false);
       setBulkError(null);
+      setBulkWriting(true);
       try {
         applyReceipt(await syncTasksForget([...ids]));
         setSelected(new Set());
@@ -2529,6 +2559,7 @@ export function TasksPane() {
         setBulkError(messageOf(cause));
       } finally {
         await refresh(true);
+        setBulkWriting(false);
       }
     },
     [applyReceipt, refresh],
@@ -2628,10 +2659,15 @@ export function TasksPane() {
               >
                 {selection.length}
               </Badge>
+              {/* All three disabled while a batched call is outstanding — see
+                  `bulkWriting`. Two rapid clicks would otherwise carry the same
+                  pre-bump baselines and the second would be refused `changed
+                  elsewhere` for every id, by the first's own write. */}
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
+                disabled={bulkWriting}
                 onClick={() => void setSelectionEnabled(true)}
               >
                 {TASKS_BULK_ENABLE_TEXT}
@@ -2640,6 +2676,7 @@ export function TasksPane() {
                 type="button"
                 variant="outline"
                 size="sm"
+                disabled={bulkWriting}
                 onClick={() => void setSelectionEnabled(false)}
               >
                 {TASKS_BULK_DISABLE_TEXT}
@@ -2652,6 +2689,7 @@ export function TasksPane() {
                 type="button"
                 variant="destructive"
                 size="sm"
+                disabled={bulkWriting}
                 onClick={() => {
                   setForgetSubject({ kind: "several", ids: selection.map((row) => row.id) });
                   setForgetAsking(true);
@@ -2763,13 +2801,18 @@ export function TasksPane() {
                         key={task.id}
                         task={task}
                         now={now}
-                        // The set, OR the row the region resolved to with nothing
-                        // selected. That second half is Story 59.1's
-                        // empty-selection fallback: the region is drawing this
-                        // task, so the row it is drawing has to say so. With a
-                        // selection of one the two agree by construction, and
-                        // with a set only membership can be true.
-                        selected={selected.has(task.id) || resolvedId === task.id}
+                        // **Membership in the set, and nothing else.** The
+                        // detail region's empty-selection fallback (`tasks[0]`,
+                        // see `selectedTask`) is about which task is *drawn*
+                        // when nobody has chosen yet — it is not a selection.
+                        // Folding it in here announced "01FIRST, selected" on
+                        // mount inside an `aria-multiselectable` listbox while
+                        // `selection.length === 0` and no bulk verb was offered.
+                        // `files-pane.tsx` has no such fallback and nothing is
+                        // `aria-selected` on its mount either. The list still
+                        // has a tab stop with nothing selected, because that is
+                        // the cursor's job — see `cursorId`.
+                        selected={selected.has(task.id)}
                         tabIndex={cursorId === task.id ? 0 : -1}
                         optionRef={(element) => {
                           rowRefs.current[index] = element;

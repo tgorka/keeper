@@ -4186,6 +4186,12 @@ fn task_batch_lines(verb: TaskBatchVerb, entries: &[TaskBatchEntry]) -> Vec<Stri
 ///
 /// The words are the store's own — [`TaskSave`]'s three effects — so the human
 /// lines and this document cannot come to call one outcome two different things.
+///
+/// `row` is the task **as re-read after the write**, and is `null` when that
+/// re-read could not find the row — another host forgot it in between — or could
+/// not run at all. It is not a promise that a `saved` entry carries a row: the
+/// receipt is what says what happened, and `row` is only the store's answer
+/// afterwards.
 fn task_batch_entry_json(
     entry: &TaskBatchEntry,
     row: Option<serde_json::Value>,
@@ -4237,6 +4243,18 @@ fn tasks_batch_document(results: Vec<serde_json::Value>) -> serde_json::Value {
 /// whole batch rather than through `report_task` per id, which re-reads the
 /// entire listing on every call.
 ///
+/// # The read-back is best-effort, because the writes are already committed
+///
+/// By the time it runs, the store has been changed and the human lines are on
+/// stdout. A `?` on any of these reads would hand `main` an `Err`, which prints
+/// a JSON failure envelope **in place of** the receipt — a `--json` consumer
+/// would believe nothing happened when in fact rows went. So a failed read-back
+/// falls back to no read-back rows (those entries carry `row: null`, which the
+/// document's contract already allows), logs at `warn`, and leaves the exit code
+/// exactly the one the receipt earned. It is [`verify_entry`]'s line held one
+/// level up: a consumer must be able to tell "checked, nothing wrong" from
+/// "never checked", and dropping the whole document says neither.
+///
 /// # The number goes through `Ok`, never through `Err`
 ///
 /// [`EXIT_CONFIG`] when any id did not go through, [`EXIT_OK`] otherwise: a
@@ -4266,7 +4284,20 @@ fn report_task_batch(
     let (listing, profiles) = if saved.is_empty() {
         (TaskListing::default(), Vec::new())
     } else {
-        (engine.tasks()?, engine.list_profiles()?)
+        match engine
+            .tasks()
+            .and_then(|listing| engine.list_profiles().map(|profiles| (listing, profiles)))
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not read back the rows this batch wrote; the receipt \
+                     still says what happened, with no row for those entries"
+                );
+                (TaskListing::default(), Vec::new())
+            }
+        }
     };
     let mut rows: Vec<(&str, serde_json::Value)> = Vec::with_capacity(saved.len());
     for id in saved {
@@ -4276,7 +4307,19 @@ fn report_task_batch(
         let Some(task) = listing.tasks.iter().find(|task| task.id == id) else {
             continue;
         };
-        let newest = engine.task_history(id, 1)?;
+        // Same reason as the listing above: a history that will not read costs
+        // this row its last-run line, never the receipt.
+        let newest = match engine.task_history(id, 1) {
+            Ok(runs) => runs,
+            Err(err) => {
+                tracing::warn!(
+                    task = id,
+                    error = %err,
+                    "could not read back this task's newest run"
+                );
+                Vec::new()
+            }
+        };
         let view = TaskView {
             task,
             profile_name: task_profile_name(&profiles, task),
@@ -6701,6 +6744,54 @@ mod tests {
                 .expect("the verb itself must not fail"),
             EXIT_OK
         );
+    }
+
+    /// A read-back that yields nothing still emits the receipt (Story 59.4
+    /// review, P2).
+    ///
+    /// The receipt is handed in claiming a `Saved` id no row backs, which is the
+    /// shape a read-back failure and a row another host forgot in between both
+    /// collapse to: no read-back rows at all. The number must still come out
+    /// through `Ok` — an `Err` would make `main` print a failure envelope in
+    /// place of the document, and a `--json` consumer would believe nothing
+    /// happened when the writes are already committed.
+    #[test]
+    fn a_read_back_that_finds_nothing_still_emits_the_receipt() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+
+        let entries = [
+            TaskBatchEntry {
+                id: "vanished".to_owned(),
+                outcome: TaskBatchOutcome::Saved(TaskSave::Updated),
+            },
+            TaskBatchEntry {
+                id: "ghost".to_owned(),
+                outcome: TaskBatchOutcome::Missing,
+            },
+        ];
+        assert_eq!(
+            report_task_batch(&printer, &engine, now, TaskBatchVerb::Disable, &entries,)
+                .map_err(|err| err.to_string()),
+            Ok(EXIT_CONFIG),
+            "no read-back row costs the entry its `row`, never the receipt: the \
+             number is still the one the receipt earned"
+        );
+
+        // ...and the entry the read-back could not fill in is `row: null` rather
+        // than absent, which is the document's own five-key contract.
+        let entry = task_batch_entry_json(&entries[0], None);
+        assert_eq!(
+            sorted_keys(&entry),
+            vec!["effect", "outcome", "reason", "row", "task"]
+        );
+        assert_eq!(entry["outcome"], serde_json::json!("saved"));
+        assert_eq!(entry["row"], serde_json::Value::Null);
     }
 
     #[test]

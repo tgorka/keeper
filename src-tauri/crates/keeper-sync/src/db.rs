@@ -3453,6 +3453,13 @@ pub struct TaskBatchEntry {
 /// In request order, with no dedup and no first-error-wins: the same id twice is
 /// two entries. `Err` is reserved for [`list_tasks`] itself failing — the one
 /// whole-batch failure — and is never one id's refusal.
+///
+/// Every id is resolved against the **one** pre-batch [`list_tasks`] snapshot
+/// read above, so a duplicated id's `Missing`, unreadable or stored decision
+/// ignores whatever the earlier occurrence wrote. Benign here because the
+/// per-id payload is identical within a batch — `enabled` and `now_ms` are the
+/// batch's, not the id's — but a future reuse that varies the payload per id
+/// would break the assumption, and would have to re-read.
 pub fn set_tasks_enabled(
     conn: &Connection,
     ids: &[TaskBatchId],
@@ -3528,8 +3535,17 @@ pub fn forget_tasks(conn: &Connection, ids: &[String]) -> Result<Vec<TaskBatchEn
                 Some(reason) => TaskBatchOutcome::Refused(reason),
                 None => {
                     if listing.tasks.iter().any(|task| &task.id == wanted) {
-                        delete_task(conn, wanted)?;
-                        TaskBatchOutcome::Forgotten
+                        // A store failure on this id is **this id's** refusal,
+                        // never the batch's: a `?` here would commit the deletes
+                        // that already happened, never look at the ids after it,
+                        // and hand the caller an `Err` that says nothing went —
+                        // while rows really did go. Same shape as
+                        // `set_tasks_enabled`'s `upsert_task` arm above, and the
+                        // rule `FilesDeleteReceiptVm` already writes down.
+                        match delete_task(conn, wanted) {
+                            Ok(()) => TaskBatchOutcome::Forgotten,
+                            Err(err) => TaskBatchOutcome::Refused(err.to_string()),
+                        }
                     } else {
                         // `delete_task` answers `Ok(())` for an id that never
                         // existed and cannot tell "gone now" from "was never
@@ -7654,6 +7670,71 @@ mod tests {
             vec!["01ALIEN".to_owned()],
             "the row this build cannot read is still there, and the one it could \
              read is gone"
+        );
+    }
+
+    /// A store failure on one id is **that id's refusal**, and the other ids
+    /// keep their receipt (Story 59.4 review, P1).
+    ///
+    /// The failure is made deterministic in the store rather than by mocking:
+    /// a `BEFORE DELETE` trigger on `tasks` aborts the middle id's delete, which
+    /// is exactly the shape a real constraint or a busy writer produces —
+    /// `delete_task`'s transaction fails and rolls back. A `?` in the loop would
+    /// have thrown the whole receipt away: the first id's delete is already
+    /// committed, the third is never looked at, and the caller is told nothing
+    /// happened while a row really went.
+    #[test]
+    fn a_store_failure_on_one_forget_does_not_throw_away_the_other_ids_receipt() {
+        let c = conn();
+        for id in ["01AAA", "01MID", "01ZZZ"] {
+            upsert_task(&c, &task(id, None, TaskMode::Manual), None).expect("a writable row");
+        }
+        c.execute_batch(
+            "CREATE TRIGGER no_mid BEFORE DELETE ON tasks WHEN old.id = '01MID'
+             BEGIN SELECT RAISE(ABORT, 'the store said no'); END",
+        )
+        .expect("a store that refuses one row");
+
+        let receipt = forget_tasks(
+            &c,
+            &["01AAA".to_owned(), "01MID".to_owned(), "01ZZZ".to_owned()],
+        )
+        .expect("a store failure on one id is not the batch's failure");
+
+        assert_eq!(
+            receipt.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["01AAA", "01MID", "01ZZZ"],
+            "three ids in, three entries out, in request order"
+        );
+        assert_eq!(
+            receipt[0].outcome,
+            TaskBatchOutcome::Forgotten,
+            "the id before the failure keeps its receipt: it really is gone"
+        );
+        assert!(
+            matches!(&receipt[1].outcome, TaskBatchOutcome::Refused(reason)
+                if reason.contains("the store said no")),
+            "the failing id is refused in the store's own words: {:?}",
+            receipt[1].outcome
+        );
+        assert_eq!(
+            receipt[2].outcome,
+            TaskBatchOutcome::Forgotten,
+            "the ids after the failure are still looked at, not abandoned"
+        );
+
+        let stored: Vec<String> = c
+            .prepare("SELECT id FROM tasks ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("ids");
+        assert_eq!(
+            stored,
+            vec!["01MID".to_owned()],
+            "the refused row is still there and the other two are gone — which \
+             is precisely what an `Err` would have hidden"
         );
     }
 

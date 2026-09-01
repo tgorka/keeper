@@ -8395,6 +8395,12 @@ impl Engine {
     /// of failures notify once per save. A `Refused` id was not written at all,
     /// so clearing its fault would silently discard a live one.
     ///
+    /// [`db::TaskSave::Created`] is unreachable on this path —
+    /// [`db::set_tasks_enabled`] answers `Missing` for an absent id and so never
+    /// inserts — and the arm is kept anyway so the batch's policy is
+    /// [`Self::save_task`]'s policy verbatim rather than a second, subtly
+    /// different one.
+    ///
     /// It runs **after** the database work and outside the closure: the two locks
     /// are then never held at once, and there is nothing to order them by.
     pub fn set_tasks_enabled(

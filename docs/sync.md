@@ -2047,10 +2047,14 @@ own transaction, so a row another host rewrote while you were looking at the
 listing is refused on its own and the ids beside it are still written. That is
 `upsert_task`'s promise held per id — a refused write changes nothing, *that
 row* — rather than an all-or-nothing batch that would also un-change the four
-that worked. An id no row answers to is reported as such rather than as a
-refusal: a refusal is something to act on, and a row another host forgot usually
-is not. The exit code is `2` when any id did not go through, and `0` when they
-all did.
+that worked. An id no row answers to is distinguished from a refusal in **how it
+is reported** rather than in what it costs: it names no reason, because there is
+none to give — a refusal is something to act on, and a row another host forgot
+usually is not. It **still counts against the exit code**. The exit code is `2`
+when any id did not go through — `missing` included — and `0` only when every id
+you named was written or forgotten. A verb that acted on two of the three ids it
+was given did not do what it was asked, and `tasks disable a b c` with `b`
+already forgotten elsewhere therefore exits `2`.
 
 `tasks set` takes six flags:
 
@@ -2199,13 +2203,20 @@ before it can parse. Each entry carries a fixed five keys, always all five:
 `outcome` is `saved`, `forgotten`, `missing` or `refused`. `effect` is
 `created`, `updated` or `rearmed` and is non-null **exactly** when `outcome` is
 `saved` — only `created` and `rearmed` mean the task came back into service and
-armed afresh. `reason` is keeper's own refusal sentence, verbatim, and is
-non-null exactly when `outcome` is `refused`. `row` is the task **read back from
-the store** for a saved entry and `null` otherwise: the row that was written,
-never the row that was submitted, and for a forgotten task there is no row left
-to describe — echoing the fields of something that no longer exists would invite
-a consumer to believe it still does. Every "not applicable" is `null` rather
-than an absent key, so the key set never moves.
+armed afresh. Of these three verbs, none can produce `created`: only `tasks set`
+creates a row, `enable` and `disable` answer `missing` for an id no row answers
+to, and `forget` never saves anything. So a consumer of `enable`/`disable`
+receives `updated` or `rearmed`, and needs no branch for `created`. `reason` is
+keeper's own refusal sentence, verbatim, and is non-null exactly when `outcome`
+is `refused`. `row` is the task **as re-read after the write**: the row that was
+written, never the row that was submitted. It is `null` for every non-`saved`
+entry — for a forgotten task there is no row left to describe, and echoing the
+fields of something that no longer exists would invite a consumer to believe it
+still does — and it can also be `null` on a `saved` entry, when the re-read could
+not find the row (another host forgot it in between) or could not run at all. The
+receipt still says what happened; `row` is only the store's answer afterwards.
+Every "not applicable" is `null` rather than an absent key, so the key set never
+moves.
 
 ### The release task, and its three modes
 
