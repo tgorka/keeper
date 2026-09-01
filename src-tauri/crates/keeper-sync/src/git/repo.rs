@@ -2209,10 +2209,69 @@ pub fn restore_missing_checkout(
         .index_from_tree(&tree)
         .map_err(|err| SyncError::Git(format!("could not rebuild the index from HEAD: {err}")))?;
 
+    // What is already on disk, decided BEFORE the checkout rather than by
+    // colliding with it (Story 56.15 follow-up).
+    //
+    // # Why the order is the whole bug
+    //
+    // `gix_worktree_state::checkout::entry` filters first and opens the
+    // destination second: for a path routed through `filter.lfs.process` it
+    // asks the filter for the file's content, and only then calls `open_file`,
+    // which fails with `AlreadyExists` when something is already standing
+    // there. The `?` on that call drops the filter's response **undrained** —
+    // and unlike the delayed path, which sinks it explicitly, the immediate
+    // path does not. The filter process is then stuck mid-write on a pipe
+    // nobody is reading, the next request blocks writing to its stdin, and
+    // both sides sit there.
+    //
+    // Measured on the owner's `/Users/tgorka/tgdrive`, whose worktree holds
+    // 155 112 of `HEAD`'s 155 625 paths, so nearly every entry collided: the
+    // checkout emitted thousands of collisions in under a second and then
+    // stopped dead for **exactly 900 s** — `lfs::filter::REQUEST_LIMIT`, the
+    // watchdog killing the wedged filter — over and over, each stall costing
+    // the paths in flight. That is what "52 052 of its files could not be
+    // written (Failed to invoke 'smudge' command)" was, and why this folder
+    // could not repair itself for three days.
+    //
+    // Asking `lstat` first costs one syscall per entry and removes the
+    // precondition entirely: the filter is never asked for content that is
+    // going to be thrown away. It also turns the repair from 155 625 filter
+    // round trips into one per genuinely missing file — 513 of them here.
+    //
+    // `SKIP_WORKTREE` is how the checkout is told to leave an entry alone
+    // (`chunk.rs` skips those before it does anything else). The flags are
+    // cleared again before the index is written: an index carrying them says
+    // "sparse checkout, do not materialize", and a status walk treats such
+    // entries as unchanged — which on this folder would mean 155 112 files
+    // that silently stop syncing.
+    let mut kept = 0usize;
+    let mut blocked: Vec<gix::bstr::BString> = Vec::new();
+    let mut standing: Vec<usize> = Vec::new();
+    for (position, (entry, rela)) in index.entries_mut_with_paths().enumerate() {
+        let path = workdir.join(gix::path::from_bstr(rela));
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            // Absent, which is the only thing this repair exists to write.
+            continue;
+        };
+        if metadata.is_file() || metadata.is_symlink() {
+            kept += 1;
+        } else {
+            // A directory where `HEAD` holds a file. The path stays as it is,
+            // so an index entry claiming it would be false — and the very next
+            // status walk would read that as a deletion.
+            blocked.push(rela.into());
+        }
+        entry.flags |= gix::index::entry::Flags::SKIP_WORKTREE;
+        standing.push(position);
+    }
+
     let mut options = repo
         .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
         .map_err(|err| SyncError::Git(format!("could not read checkout options: {err}")))?;
     // The two lines the whole safety argument rests on. See the doc above.
+    // They stay even though nothing standing on disk now reaches the checkout:
+    // a file created between the `lstat` above and the write below is a race
+    // this must still lose safely rather than overwrite.
     options.destination_is_initially_empty = true;
     options.overwrite_existing = false;
     // One failure must not abandon the rest: a repair that stops at the first
@@ -2242,20 +2301,22 @@ pub fn restore_missing_checkout(
         ))
     })?;
 
-    // A collision means the path was left alone, so the index entry about to
-    // claim it is only true if a FILE is what is standing there. That has to
-    // be measured rather than read off the error kind: a directory where
-    // `HEAD` holds a file collides with `AlreadyExists` on Linux, exactly like
-    // a real file does, and writing an index over it would leave an entry
-    // whose worktree object is a directory — which the very next status walk
-    // reads as a deletion. One `lstat` per collision, and collisions are the
-    // exception, so this is bounded by them and not by the tree.
-    let (kept, blocked): (Vec<&_>, Vec<&_>) = outcome.collisions.iter().partition(|collision| {
+    // A collision can still happen — something created between the `lstat`
+    // above and the write here — and it is classified the same way, for the
+    // same reason: the index entry about to claim the path is only true if a
+    // FILE is what is standing there. A directory where `HEAD` holds a file
+    // collides with `AlreadyExists` exactly like a real file does, and an
+    // index written over it leaves an entry whose worktree object is a
+    // directory, which the very next status walk reads as a deletion.
+    for collision in &outcome.collisions {
         let rela: &gix::bstr::BStr = collision.path.as_ref();
         let path = workdir.join(gix::path::from_bstr(rela));
-        std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file() || meta.is_symlink())
-    });
-    let kept = kept.len();
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file() || meta.is_symlink()) {
+            kept += 1;
+        } else {
+            blocked.push(collision.path.clone());
+        }
+    }
     let unfinished = if interrupt.load(Ordering::Relaxed) {
         Some("it was interrupted before every file was written".to_owned())
     } else if let Some(first) = outcome.errors.first() {
@@ -2270,18 +2331,32 @@ pub fn restore_missing_checkout(
             format!(
                 "{} of its paths are blocked by something else on disk (first: {})",
                 blocked.len(),
-                first.path
+                first
             )
         })
     };
     if unfinished.is_none() {
+        // Only the flags this function set, and only now: see the note above
+        // for what a written `SKIP_WORKTREE` would mean to the next walk.
+        // Positions, because the entries have not been re-sorted — the
+        // checkout does not touch their order.
+        let entries = index.entries_mut();
+        for position in &standing {
+            entries[*position]
+                .flags
+                .remove(gix::index::entry::Flags::SKIP_WORKTREE);
+        }
         index
             .write(gix::index::write::Options::default())
             .map_err(|err| SyncError::Git(format!("could not write the restored index: {err}")))?;
     }
     Ok(CheckoutRepair {
+        // `files_updated` counts every entry the chunk loop saw, including the
+        // ones it skipped for `SKIP_WORKTREE`, so both have to come off it for
+        // this to mean "files this repair actually wrote".
         restored: outcome
             .files_updated
+            .saturating_sub(standing.len())
             .saturating_sub(outcome.collisions.len()),
         kept,
         unfinished,
@@ -3670,6 +3745,135 @@ mod tests {
         assert!(
             !index_is_unpopulated(&repo).expect("index"),
             "the index is written, so the next walk stops reading a mass deletion"
+        );
+    }
+
+    /// The filter is never asked for content the repair is going to discard.
+    ///
+    /// `gix_worktree_state::checkout::entry` filters first and opens the
+    /// destination second, and the `?` on that open drops the filter's
+    /// response **undrained** when the path already exists — unlike the
+    /// delayed path, which sinks it explicitly. A long-running
+    /// `filter.<driver>.process` is then wedged mid-write on a pipe nobody
+    /// reads, and the next request blocks writing to its stdin.
+    ///
+    /// On the owner's `/Users/tgorka/tgdrive`, where 155 112 of `HEAD`'s
+    /// 155 625 paths were already on disk, that produced stalls of **exactly
+    /// 900 s** — `lfs::filter::REQUEST_LIMIT` killing the wedged filter — one
+    /// after another, and a repair that could not finish in three days.
+    ///
+    /// So the assertion is about invocations, not about output: a path that is
+    /// already there must not reach the filter at all.
+    #[test]
+    fn a_repair_never_runs_the_filter_for_a_path_that_is_already_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // Both outside the worktree, so neither becomes an untracked file the
+        // checkout has an opinion about.
+        let marker = root.join(".git/smudge-invocations");
+        let script = root.join(".git/smudge.sh");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join(".gitattributes"), "*.txt filter=mark\n").expect("attributes");
+        std::fs::write(root.join("here.txt"), "already on disk").expect("write here");
+        std::fs::write(root.join("gone.txt"), "will be deleted").expect("write gone");
+        git(&["-c", "filter.mark.clean=cat", "add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "-c",
+            "filter.mark.clean=cat",
+            "commit",
+            "-qm",
+            "seed",
+        ]);
+        // A smudge that records every invocation and is otherwise `cat`. The
+        // count is the whole assertion.
+        //
+        // A script rather than an inline `sh -c`: git config treats `;` as the
+        // start of a comment outside quotes, so an inline command containing
+        // one is silently truncated and the filter fails to run at all —
+        // which reads exactly like the thing this test is asserting.
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho ran >> {}\ncat\n", marker.display()),
+        )
+        .expect("write the smudge script");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("make it executable");
+        let config = format!(
+            "[filter \"mark\"]\n\tclean = cat\n\tsmudge = {}\n\trequired = false\n",
+            script.display()
+        );
+        let mut existing = std::fs::read_to_string(root.join(".git/config")).expect("config");
+        existing.push_str(&config);
+        std::fs::write(root.join(".git/config"), existing).expect("write config");
+
+        // The state the repair is for, with one path of each kind: `here.txt`
+        // standing on disk (must be left alone, and must not be filtered) and
+        // `gone.txt` missing (must be restored, and may be filtered).
+        std::fs::remove_file(root.join(".git/index")).expect("drop the index");
+        std::fs::remove_file(root.join("gone.txt")).expect("drop one file");
+
+        let repo = open(root, false).expect("reopen without an index");
+        assert!(checkout_is_unfinished(&repo).expect("classify"));
+        let interrupt = AtomicBool::new(false);
+        let repair = restore_missing_checkout(&repo, &interrupt).expect("repair");
+
+        assert_eq!(repair.unfinished, None, "nothing here blocks the repair");
+        // These two numbers are the deterministic half of the assertion: with
+        // the classification removed they come back as `restored: 0, kept: 4`,
+        // because every present path reaches the checkout, collides, and is
+        // counted a second time by the collision pass.
+        assert_eq!(repair.restored, 1, "only the missing file was written");
+        assert_eq!(
+            repair.kept, 2,
+            "`here.txt` and `.gitattributes` were already there"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("here.txt")).expect("here.txt"),
+            "already on disk",
+            "NOT OVERWRITTEN, which is the property the old collision path also had"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("gone.txt")).expect("gone.txt"),
+            "will be deleted",
+            "and the missing one is back from the commit"
+        );
+
+        let invocations = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            invocations.lines().count(),
+            1,
+            "exactly one smudge — for the missing path. A second one means the \
+             filter was asked for content that was then thrown away, which is \
+             what wedges a long-running filter process: {invocations:?}"
+        );
+
+        // And the flags this repair sets must never reach disk: an index
+        // carrying `SKIP_WORKTREE` says "sparse checkout, do not materialize",
+        // and a status walk reads those entries as unchanged forever.
+        let written = gix::index::File::at(
+            repo.index_path(),
+            repo.object_hash(),
+            false,
+            Default::default(),
+        )
+        .expect("the repair wrote an index");
+        assert!(
+            written.entries().iter().all(|entry| !entry
+                .flags
+                .contains(gix::index::entry::Flags::SKIP_WORKTREE)),
+            "a written SKIP_WORKTREE would stop those paths syncing, silently"
         );
     }
 
