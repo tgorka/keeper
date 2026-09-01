@@ -8819,6 +8819,53 @@ impl Engine {
     /// work already queued — standing that down would strand an in-flight upload
     /// behind a schedule.
     ///
+    /// # The Pending pane's walk is a second gate, and it is deliberately left
+    ///
+    /// PR #303 (`c0fd6fe`) landed after this method and added
+    /// [`POLL_WALK_MIN_INTERVAL`] and [`Self::poll_may_walk`], so there are now
+    /// **two** gates over walking one folder, and a sentence that accounts for
+    /// only one of them is false. This one surrenders the paced backstop; the
+    /// other is left standing, and the asymmetry is the decision rather than an
+    /// oversight.
+    ///
+    /// What settles it is what each gate is gating. This one stands in front of
+    /// a **driver**: [`Self::scan_due`] opens the walk that discovers work and
+    /// hands it to the journal, so leaving it running beside a schedule is
+    /// exactly what AD-141 means by *"adding a driver without surrendering the
+    /// gate ships a folder that syncs twice"*. [`Self::poll_may_walk`] stands in
+    /// front of a **read**: its only caller is [`Self::pending`], reached only
+    /// from the app's `sync_pending` command, and that walk enqueues nothing,
+    /// takes no [`Self::reserve`], commits nothing and mints no `task_runs`
+    /// row. It cannot make a folder sync twice because it cannot make a folder
+    /// sync at all — which is also what `c0fd6fe`'s own message says of it:
+    /// *"Nothing about syncing changes: the commit leg has its own cadence and
+    /// is untouched."*
+    ///
+    /// Both ways of being wrong here, named, because each one is the other's
+    /// cure:
+    ///
+    /// * **Standing only this gate down** leaves somebody who put a large
+    ///   folder on a schedule still watching it walked — up to once a minute
+    ///   per folder, for as long as the Sync pane is open, because
+    ///   `startSyncDetailPolling` re-reads *every* mirrored profile every five
+    ///   seconds. That cost is real and it is the one #303 measured. What makes
+    ///   it acceptable is that it is bounded to a minute, that it happens only
+    ///   while a person is looking at the pane, and that `docs/sync.md` says so
+    ///   plainly instead of letting a *governed* row imply the folder is never
+    ///   touched.
+    /// * **Standing both gates down** would empty the one surface that makes a
+    ///   governed folder legible. The Pending list is where work accruing
+    ///   between two scheduled windows is visible, and its untracked rows come
+    ///   from this walk and nowhere else — so the folder whose sync is hourly
+    ///   would be the folder whose pane says nothing is waiting. That is the
+    ///   *feels dead to somebody who just saved a file* failure the section
+    ///   above refuses one layer down, moved from the engine to the pane.
+    ///
+    /// So the driver yields and the read does not. [`Self::poll_may_walk`] never
+    /// consults governance, and
+    /// `a_governed_folder_still_answers_the_pending_polls_walk` fails if it ever
+    /// starts to.
+    ///
     /// # An unreadable table permits the poll, which is the opposite answer
     ///
     /// [`Self::release_permits`] declines on `Err` because the honest answer to
@@ -11599,6 +11646,14 @@ impl Engine {
     /// Losing the walk costs the poll only its untracked rows, exactly as
     /// losing the claim does — the settling rows and the repair backlog are
     /// assembled before this is asked.
+    ///
+    /// **A sync task's governance is deliberately not a third shape that
+    /// answers no.** A `scheduled` sync task surrenders the folder's paced
+    /// *backstop* and this read is not part of that surrender —
+    /// [`Self::sync_poll_permits`] carries the argument, and the short of it is
+    /// that the backstop is a driver of work while this is a walk somebody is
+    /// waiting on. Governed the other way, the folder whose sync happens hourly
+    /// would be the folder whose Pending list never gained an untracked row.
     ///
     /// Free in the healthy case: a bool, then one `exists()` and a 12-byte
     /// read of the index header (see [`Self::first_checkout_is_unfinished`]).
@@ -15918,6 +15973,76 @@ mod tests {
         assert!(
             engine.scan_due(&p),
             "and its own deadline still reopens the walk, not the task's schedule"
+        );
+    }
+
+    /// The **other** gate over walking this folder, and the one governance does
+    /// not take: the Pending pane's walk (Story 58.8 revised for PR #303).
+    ///
+    /// [`POLL_WALK_MIN_INTERVAL`] and [`Engine::poll_may_walk`] landed after
+    /// Story 58.8 shipped, so from that moment there were two gates over
+    /// walking one folder and only one of them had been reasoned about. This
+    /// asserts the answer for the second one directly, because the decision is
+    /// invisible in the code — it is spelled as an *absence* of a governance
+    /// call, and an absence is what a later "make the stand-down thorough"
+    /// change deletes without noticing.
+    ///
+    /// Both halves matter and neither alone is enough. Without the first, a
+    /// governance that stood this down too would pass; without the second, a
+    /// governance that stood nothing down would.
+    #[test]
+    fn a_governed_folder_still_answers_the_pending_polls_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        // A real repository with a real index, because the first thing
+        // `poll_may_walk` asks is whether the first copy ever finished.
+        let p = committed_tree(&engine, &platform, dir.path());
+
+        assert!(
+            engine.sync_poll_permits(&p),
+            "ungoverned: the paced backstop runs"
+        );
+        assert!(
+            engine.poll_may_walk(&p),
+            "ungoverned: and so does the pane's walk"
+        );
+
+        let mut governing = task("01HOURLY", Some(&p.id), "@hourly");
+        governing.mode = tasks::TaskMode::Scheduled;
+        engine.save_task(&governing, None).expect("save");
+
+        assert!(
+            !engine.sync_poll_permits(&p),
+            "governed: the driver is surrendered, which is the whole of 58.8"
+        );
+        assert!(
+            engine.poll_may_walk(&p),
+            "governed: and the READ is not. Stand this down as well and the \
+             folder whose sync is hourly becomes the folder whose Pending list \
+             never gains an untracked row — the pane going dead for exactly the \
+             person who most needs to see what is waiting"
+        );
+
+        // What does still pace it, unchanged by governance: its own floor,
+        // measured between walks rather than between polls.
+        engine.poll_walk_finished(&p.id);
+        assert!(
+            !engine.poll_may_walk(&p),
+            "inside the minute after a walk, governed or not — this is the gate \
+             that bounds the cost governance chose not to remove"
+        );
+
+        // And the folder's own pause still beats everything, as it does on
+        // every projected row.
+        let mut paused = p.clone();
+        paused.enabled = false;
+        assert!(
+            !engine.poll_may_walk(&paused),
+            "a paused folder is walked by nothing, which is the one stand-down \
+             the owner asked for explicitly"
         );
     }
 
