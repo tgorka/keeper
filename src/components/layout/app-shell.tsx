@@ -51,7 +51,7 @@ import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { hydrateColumnFold } from "@/lib/stores/column-fold";
 import { useDetailStore } from "@/lib/stores/detail-ui";
 import { hydrateFilesTree } from "@/lib/stores/files-tree";
-import { hydratePanels } from "@/lib/stores/panels";
+import { hydratePanels, usePanelsStore } from "@/lib/stores/panels";
 import { usePrimaryView } from "@/lib/stores/primary-view";
 import { hydrateSidebarFold, sidebarFoldStore, useSidebarFold } from "@/lib/stores/sidebar-fold";
 import { beginTitleBarDrag } from "@/lib/titlebar-drag";
@@ -169,6 +169,14 @@ export function AppShell() {
   // Which primary view the shell renders. "bridges" and "approval" each replace the
   // chat-list + conversation cluster with a full-surface pane (Story 6.1 / 7.3).
   const primaryView = usePrimaryView();
+  // Whether ANY panel is holding something (Story 59.13).
+  //
+  // Read here rather than inside `PanelStrip`, because it decides whether the
+  // strip is mounted at all in the Tasks view — see that branch for why. A
+  // target of any kind counts: a file left open in the Files surface is still a
+  // document somebody asked to keep, and the strip's job does not depend on
+  // which surface filled it.
+  const anyPanelHolds = usePanelsStore((s) => s.panels.some((panel) => panel.target !== null));
   // Detail-open lives in the lifted `detailStore` (Story 13.1) so the desktop
   // frame and the phone stack project one shared signal; the toggle-focus-return
   // on close stays here, wrapping the store's `closeDetail`.
@@ -370,9 +378,35 @@ export function AppShell() {
                 // remains the only writer: the panel is handed `verbs={null}`,
                 // because `formSaving`, `deleting` and `running` are pane-wide
                 // precisely so that two write surfaces cannot undo each other.
+                //
+                // # What retiring it cost, and the correction (Story 59.13)
+                //
+                // The strip above was mounted unconditionally, and an EMPTY
+                // strip is still a claimant: `grow shrink basis-[280px]
+                // min-w-[280px]`. Measured in a real browser at three widths, it
+                // took 628 of 1024, 702 of 1280 and 837 of 1550 to render one
+                // sentence advertising a gesture — and the Tasks pane's detail
+                // region, which had no floor of its own, was left 28, 102 and
+                // 237px. The add form draws in that region, so at 1024 it was
+                // 0px wide with its controls at 22px, and the owner could not
+                // create a task. Story 59.12 was verified with a DOM probe that
+                // never measured a box, and jsdom lays nothing out, so nothing
+                // caught it.
+                //
+                // Being a claimant is RIGHT for the Files, Sessions and Notes
+                // surfaces: there the strip IS the document area, and an empty
+                // one advertises the only route to a document at all. It is
+                // wrong here alone, because this surface already has a document
+                // area — Story 59.1's detail region — so an empty strip beside
+                // it is a second host for a rendering that has one, claiming the
+                // window to say so. Hence the condition rather than a change to
+                // `PanelStrip`: in this view the strip is mounted only while
+                // some panel holds a target. The gesture is advertised by
+                // `TASKS_OPEN_BESIDE_HINT` under the drawn task instead, where a
+                // reader can act on it before ever having opened a panel.
                 <>
                   <TasksPane />
-                  <PanelStrip emptySentence={TASKS_PANEL_EMPTY_SENTENCE} />
+                  {anyPanelHolds && <PanelStrip emptySentence={TASKS_PANEL_EMPTY_SENTENCE} />}
                 </>
               ) : primaryView === "bridges" ? (
                 <BridgesPane />

@@ -1,7 +1,13 @@
 import * as React from "react";
 
 const PHONE_BREAKPOINT = 768;
-const SIDEBAR_COLLAPSE_BREAKPOINT = 1080;
+/**
+ * Where the drawer becomes the 48px rail — exported because the width of the
+ * sidebar is an input to the layout's own floor arithmetic, and the surface with
+ * the most boxes in it (Tasks) has to fit both sides of this line.
+ * `src/lib/window-minimum.test.ts` is the only reader.
+ */
+export const SIDEBAR_COLLAPSE_BREAKPOINT = 1080;
 const DETAIL_FLOAT_BREAKPOINT = 1280;
 
 export interface ShellLayout {

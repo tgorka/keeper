@@ -252,16 +252,42 @@ describe("AppShell", () => {
     expect(screen.queryByRole("region", { name: "Files" })).not.toBeInTheDocument();
   });
 
-  // ── Tasks view (Story 59.12) ───────────────────────────────────────────────
-  it("puts the panel strip beside the Tasks pane, so a task can be opened in a tab", () => {
-    // The reachability half of the story, and it belongs here because nothing
-    // else can assert it: the pane writes a `task` target into `panelsStore`
-    // and the strip renders it, but the two are only ever siblings HERE. Tested
-    // for a whole epic, a pane that composed no strip would have shipped a
-    // gesture with nothing on the other end of it — which is the shape of the
-    // owner's report that started this story.
+  // ── Tasks view (Story 59.12, corrected by 59.13) ───────────────────────────
+  it("keeps an empty panel strip out of the Tasks view, so the pane owns the surface", () => {
+    // The defect Story 59.13 measured. The strip is a claimant — `grow shrink
+    // basis-[280px] min-w-[280px]` — and mounted unconditionally it took 628 of
+    // a 1024px window to render one sentence, leaving the pane's detail region
+    // 28px and the add form inside it 0px wide. Right for Files and Notes, where
+    // the strip IS the document area; wrong here, where Story 59.1's detail
+    // region already is.
+    //
+    // A `queryByLabelText` and not a width assertion, deliberately: jsdom lays
+    // nothing out, so the only thing a component test can own is whether the
+    // claimant is in the tree at all. The widths are measured with `dev/probe`.
     capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sessions: true });
     primaryViewStore.getState().setView("tasks");
+    render(<AppShell />);
+
+    expect(screen.getByRole("region", { name: "Tasks" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("Open panels")).not.toBeInTheDocument();
+  });
+
+  it("puts the panel strip beside the Tasks pane once a panel is holding something", () => {
+    // The reachability half of Story 59.12, and it belongs here because nothing
+    // else can assert it: the pane writes a `task` target into `panelsStore` and
+    // the strip renders it, but the two are only ever siblings HERE. Untested, a
+    // pane that composed no strip would ship a gesture with nothing on the other
+    // end of it — which is the shape of the report that started 59.12.
+    //
+    // A FILE target on purpose: the condition is "some panel holds something",
+    // not "some panel holds a task". A file left open in the Files surface is
+    // still a document somebody asked to keep, and it must not vanish because
+    // the reader pressed ⌘8.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sessions: true });
+    primaryViewStore.getState().setView("tasks");
+    act(() => {
+      panelsStore.getState().openPanel({ kind: "file", profileId: "p1", relativePath: "notes.md" });
+    });
     render(<AppShell />);
 
     expect(screen.getByRole("region", { name: "Tasks" })).toBeInTheDocument();

@@ -44,6 +44,7 @@ import {
   PACED_LOADING_TEXT,
   PACED_NO_CADENCE_TEXT,
   PACED_REFUSAL_TESTID,
+  PACED_RESTING_ROWS,
   PACED_ROW_TESTID,
   PACED_STANDING_LABELS,
   PACED_SUBTITLE,
@@ -83,16 +84,20 @@ import {
   TASKS_CLOCK_TICK_MS,
   TASKS_DESCRIPTION_TESTID,
   TASKS_DETAIL_LABEL,
+  TASKS_DETAIL_MIN_WIDTH_PX,
   TASKS_DETAIL_TESTID,
   TASKS_ERROR_TESTID,
   TASKS_HISTORY_REFUSAL_TESTID,
   TASKS_HISTORY_ROW_TESTID,
   TASKS_HISTORY_TESTID,
+  TASKS_LIST_EMPTY_TEXT,
   TASKS_LIST_LABEL,
+  TASKS_OPEN_BESIDE_HINT,
   TASKS_ORPHAN_REFUSAL_TESTID,
   TASKS_PANE_EMPTY_AFTER,
   TASKS_PANE_EMPTY_COMMAND,
   TASKS_PANE_EMPTY_SENTENCE,
+  TASKS_PANE_MIN_WIDTH_PX,
   TASKS_PANE_TITLE,
   TASKS_RAIL_LIST_LABEL,
   TASKS_REFUSAL_TESTID,
@@ -120,7 +125,7 @@ import {
   TASK_FORM_SCHEDULE_LABEL,
   TASK_HOST_WIDE_TEXT,
 } from "@/components/sync/task-form";
-import { SURFACE_COLUMNS } from "@/lib/column-widths";
+import { columnMinWidth, SURFACE_COLUMNS } from "@/lib/column-widths";
 import { countLabel } from "@/lib/count-label";
 import type {
   PacedWorkVm,
@@ -2275,6 +2280,11 @@ describe("the pane also lists what this host paces, and says it is not a task", 
   // behind it; this one has no query, so a cap on the expanded view would drop
   // rows with no control left to reveal them.
   it("unfolds to every projected row rather than to the global unfolded size", async () => {
+    // `folded: 2` is still set, and is deliberately IGNORED now: Story 59.13
+    // gave this section its own resting count because the global one (10) meant
+    // a real host's eight paced rows never folded at all. The subject here is
+    // the other end — what a press reveals — and that is still the list's own
+    // length and never the `unfolded` setting.
     setSyncListSizes({ folded: 2, unfolded: 3 });
     answer(listing());
     const rows = Array.from({ length: 7 }, (_unused, index) =>
@@ -2284,7 +2294,7 @@ describe("the pane also lists what this host paces, and says it is not a task", 
     render(<TasksPane />);
     await screen.findAllByTestId(PACED_ROW_TESTID);
 
-    expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(2);
+    expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(PACED_RESTING_ROWS);
     // The control promises the list's own length, not the setting's.
     fireEvent.click(
       screen.getByRole("button", {
@@ -3416,5 +3426,148 @@ describe("a task you can open beside the list", () => {
       { kind: "task", taskId: "A" },
       { kind: "task", taskId: "B" },
     ]);
+  });
+});
+
+/**
+ * What the layout depends on, as facts a test can hold (Story 59.13).
+ *
+ * jsdom performs no layout, so nothing here is a width and nothing here pretends
+ * to be. Story 59.12 shipped a 60%-of-the-window regression past a full green
+ * suite and past a DOM probe that read stores and option values and never called
+ * `getBoundingClientRect` — so the honest split is: `dev/probe` measures the
+ * pixels on a real browser, and this block guards the structure those pixels
+ * were measured over. Each of these fails if the corresponding decision is
+ * reverted, and none of them can tell you the view is readable.
+ */
+describe("the Tasks pane's layout floors", () => {
+  it("gives the detail region a floor, because it is the box that held the form", () => {
+    // 28px, measured, in a 1024px window — with the add form inside it at 0px
+    // and that form's controls at 22px. The region had no `min-width` at all, so
+    // it absorbed every shortfall in the surface.
+    answer(listing());
+    render(<TasksPane />);
+
+    const region = screen.getByRole("region", { name: TASKS_DETAIL_LABEL });
+    expect(region.style.minWidth).toBe(`${TASKS_DETAIL_MIN_WIDTH_PX}px`);
+  });
+
+  it("makes the pane claim its two columns' floors instead of waiving them", () => {
+    // The pane root carried `min-w-0`, which tells flexbox to squeeze the
+    // columns inside rather than take a share of the deficit — while the panel
+    // strip beside it claimed a basis AND a floor. That asymmetry is the whole
+    // mechanism of the defect.
+    answer(listing());
+    render(<TasksPane />);
+
+    const pane = screen.getByRole("region", { name: TASKS_PANE_TITLE });
+    expect(pane.style.minWidth).toBe(`${TASKS_PANE_MIN_WIDTH_PX}px`);
+    // The basis too, and it is the floor rather than 0: that is what makes the
+    // surplus split evenly above the two floors instead of going to whichever
+    // box started at 280. With a basis of 0 the pane sat at exactly its floor in
+    // a 1550px window while the strip took 794.
+    expect(pane.style.flexBasis).toBe(`${TASKS_PANE_MIN_WIDTH_PX}px`);
+    expect(pane).not.toHaveClass("min-w-0");
+
+    // And the list column must be able to GIVE, or the pane's floor is a lie:
+    // `shrink-0` made its real floor the remembered width (up to 640), and
+    // measured with a task open beside, 80px of the detail region was laid out
+    // past the pane's own right edge.
+    const column = document.querySelector("#column-tasks-list");
+    expect(column).not.toHaveClass("shrink-0");
+    expect((column as HTMLElement).style.minWidth).toBe(`${columnMinWidth("tasks-list")}px`);
+  });
+
+  it("draws the add form inside the region that has the floor", async () => {
+    // The form is only as wide as its host, so "the region has a floor" and "the
+    // form lives in that region" are one guarantee in two halves. Assert the
+    // second half, or a later change could move the form into the 320px column
+    // and leave every number above still true.
+    answer(listing());
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_DETAIL_TESTID);
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE }));
+    const form = await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE });
+
+    expect(screen.getByRole("region", { name: TASKS_DETAIL_LABEL })).toContainElement(form);
+  });
+
+  it("advertises the open-beside gesture under the drawn task, not in an empty panel", async () => {
+    // The sentence used to live in a panel that only exists once the gesture has
+    // been performed, and an empty strip claimed the window to say it. Under the
+    // task is where a reader can act on it.
+    answer(listing());
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_DETAIL_TESTID);
+
+    const region = screen.getByRole("region", { name: TASKS_DETAIL_LABEL });
+    expect(within(region).getByText(TASKS_OPEN_BESIDE_HINT)).toBeInTheDocument();
+  });
+
+  it("says nothing about the gesture while the add form has the region", async () => {
+    // There is no task under it to double-click, so the sentence would point at
+    // nothing — and it would sit in the middle of a form somebody is filling.
+    answer(listing());
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_DETAIL_TESTID);
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_TITLE }));
+    await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE });
+
+    expect(screen.queryByText(TASKS_OPEN_BESIDE_HINT)).not.toBeInTheDocument();
+  });
+
+  it("names an empty task list in the column, above the projection", async () => {
+    // With no tasks the column held nothing but Story 58.7's projected rows, so
+    // the only thing under the heading *Task list* was work that is explicitly
+    // not a task. Order asserted, not just presence: which of the two is the
+    // subject is the entire point.
+    answer(listing({ tasks: [] }));
+    answerPaced([pacedRow()]);
+    render(<TasksPane />);
+
+    const empty = await screen.findByText(TASKS_LIST_EMPTY_TEXT);
+    const paced = screen.getByText(PACED_HEADING);
+    expect(empty.compareDocumentPosition(paced) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("keeps the task rows ahead of the projection in the column", async () => {
+    // The report said the projection renders above the tasks. It does not, at
+    // any width — but nothing asserted it, and the section and the rows share
+    // one scroller, so a reorder would have been invisible to this suite.
+    answer(listing());
+    answerPaced([pacedRow()]);
+    render(<TasksPane />);
+    const row = await screen.findByTestId(TASKS_ROW_TESTID);
+
+    const paced = screen.getByText(PACED_HEADING);
+    expect(row.compareDocumentPosition(paced) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("rests the projection at three rows, whatever the global folded size says", async () => {
+    // The global resting size is 10 and a real host paces about eight things, so
+    // this section folded NOTHING and `FoldToggle` rendered nothing at all —
+    // eight full-prose rows, measured at 1609px in a 320px column, with no
+    // control on screen naming the length.
+    answer(listing());
+    answerPaced([
+      pacedRow({ id: "scan:p1" }),
+      pacedRow({ id: "scan:p2" }),
+      pacedRow({ id: "scan:p3" }),
+      pacedRow({ id: "scan:p4" }),
+      pacedRow({ id: "scan:p5" }),
+    ]);
+    render(<TasksPane />);
+    await screen.findByTestId(TASKS_DETAIL_TESTID);
+
+    expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(PACED_RESTING_ROWS);
+    // And the control that gives the rest back, promising the whole list —
+    // which is what makes a resting count a fold rather than a silent cap.
+    const more = screen.getByRole("button", {
+      name: `${LIST_FOLD_MORE_LABEL(5)}: ${PACED_HEADING}`,
+    });
+    fireEvent.click(more);
+    expect(screen.getAllByTestId(PACED_ROW_TESTID)).toHaveLength(5);
   });
 });
