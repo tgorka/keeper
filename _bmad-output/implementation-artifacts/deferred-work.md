@@ -5151,3 +5151,29 @@ status: open
     idiom the rest of the tree uses — kill on an observed condition (bytes in flight, a `tmp/`
     object present) rather than on an elapsed duration — so the guard still fails when the
     kill-sweep is broken and cannot fail because the machine was busy.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-59-4-several-tasks-at-once.md`
+  summary: |
+    `src/components/layout/files-pane.test.tsx:3278` is load-sensitive — a `findByRole("treeitem",
+    { name: "Notes" })` after a Refresh times out when the box is busy.
+  evidence: |
+    Surfaced 2026-09-01 by story 59.4's frontend gate, which this file does not touch. It failed on
+    2 of 4 full-suite runs while a 146 MB apt download and a headless Chrome competed for the
+    container, and passed on 5 subsequent runs on an idle box, on 3/3 runs paired with
+    `tasks-pane.test.tsx`, and on 2/2 baseline runs with 59.4's frontend changes stashed. Same class
+    as the epic-58 transfer-kill flake already in this ledger: a wait whose budget is a duration
+    rather than an observed condition, so it can fail because the machine was busy. The honest fix
+    is a `waitFor` budget or a fake-timer pass on that one assertion.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-59-4-several-tasks-at-once.md`
+  summary: |
+    `columnFoldStore` is module state that pane test files leak into every test declared after the
+    one that folds a column; only `tasks-pane.test.tsx` has been inoculated.
+  evidence: |
+    Found 2026-09-01 while adding tests to `tasks-pane.test.tsx` for story 59.4. Its
+    `says how many names it is hiding, and offers no second Refresh` folds the names column and
+    never restores it — harmless only because it happened to be the last test in the file. Every
+    test added after it rendered a 48px rail with no rows. Fixed inside that file with
+    `resetColumnFoldForTest()` in the top-level `beforeEach`; `files-pane.test.tsx` and any other
+    pane suite that exercises the fold carry the same latent ordering trap, and the next person to
+    append a test to one of them pays for it the same way.
