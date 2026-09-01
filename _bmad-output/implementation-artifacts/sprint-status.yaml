@@ -1049,6 +1049,16 @@ development_status:
   # frontend file in it) and only then copied the Files pane's selection model.
   # The `aria-current` 59.1 chose was flipped to `aria-selected` by agreement
   # between the two stories once a set could genuinely be chosen.
+  # AMENDED 2026-09-01. Two stories were added after the epic closed, both from
+  # the owner running 0.8.24 — the build this epic produced — and reporting what
+  # it still would not do. 59.11 fills in the kind picker 59.9 deliberately left
+  # one word short, and guards the two lists against drifting again. 59.12
+  # retires this epic's OWN refusal of a task as a panel target: the epic wrote
+  # "a task is not a document and must never become a panel target", the owner
+  # asked to open a task in a tab, and the refusal's own comment had already
+  # conceded it was scope rather than teeth. Overturned the way 59.4 overturned
+  # the multi-select refusal — the consumer first, then the gesture, and the
+  # retired refusal left on the page with the reason it expired.
   epic-59: review
   59-1-a-list-of-names-and-one-task-at-a-time: review
   59-2-a-run-you-can-open: review
@@ -1060,6 +1070,8 @@ development_status:
   59-8-home-in-one-click: review
   59-9-a-task-that-runs-a-verb-keeper-already-owns: review
   59-10-the-chapter-grows-a-view: review
+  59-11-every-kind-this-build-can-write: review
+  59-12-a-task-you-can-open-in-a-tab: review
   epic-59-retrospective: optional
 
   # -- EPIC 58, 2026-08-31: a task you can drive ------------------------------

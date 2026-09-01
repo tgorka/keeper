@@ -5194,3 +5194,19 @@ status: open
     variants`, so extending that test to also demand the frontend note is the shape. Not done in
     59.11 because the note lives in a file that crate's tests do not otherwise read, and because the
     story's own guard had five evasions to close first.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-59-12-a-task-you-can-open-in-a-tab.md`
+  summary: |
+    No keyboard route puts anything in the panel strip — in the Tasks pane or in the Files tree.
+    Enter and the arrow keys move the selection and the pane's own detail region; only a pointer
+    can preview a target into a panel or open one beside.
+  evidence: |
+    Raised 2026-09-01 by story 59.12's two adversarial reviews, independently. In
+    `tasks-pane.tsx` the panel verbs hang off `handleRowClick`/`handleRowDoubleClick` only;
+    `onActivate` (Enter) is `select(id, "replace")` and `moveSelection` is the same, so neither
+    touches `panelsStore`. This is not a 59.12 regression: `files-pane.tsx:2146-2176` has the
+    identical shape and has since Story 45.1, so the gap is app-wide and predates the task target
+    by fourteen epics. It is deferred rather than fixed here because closing it in one surface
+    would BE the second interaction idiom `spec-45-17…:200` forbids by name — the fix is one
+    decision taken once for every browsing surface (which key opens beside, and whether Enter
+    should preview), and then applied to Files, Notes, Sessions and Tasks together.
