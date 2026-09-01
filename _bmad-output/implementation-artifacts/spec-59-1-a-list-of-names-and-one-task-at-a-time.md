@@ -2,7 +2,7 @@
 title: 'Story 59.1: a list of names, and one task at a time'
 type: 'feature'
 status: 'done'
-final_revision: '5684b02'
+final_revision: '7f41e61'
 review_loop_iteration: 1
 followup_review_recommended: false
 context:
