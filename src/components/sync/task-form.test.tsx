@@ -1170,6 +1170,56 @@ describe("TaskForm, help for writing a schedule", () => {
     await waitFor(() => expect(mockPreview).toHaveBeenCalledWith("@weekly"));
     expect(screen.queryByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID)).toBeNull();
   });
+
+  it("lets a refusal win when the wire carries both, rather than either branch", async () => {
+    // The wire type is a struct — an `Option<String>` beside a `Vec<i64>` — so it
+    // can represent a refusal AND instants at once, where the Rust enum it is
+    // composed from cannot. The shell's match over that enum is total, so this
+    // state should never arrive; the exclusion is nevertheless an invariant this
+    // component *borrows*, and a borrowed invariant with no test is a decision
+    // nobody made. So the precedence is pinned: a refusal wins, and instants
+    // that arrive beside one are not shown. Silently rendering a next-fire time
+    // under a sentence explaining that the expression will never fire is the one
+    // outcome that would be worse than either half alone.
+    mockPreview.mockResolvedValue(
+      previewVm({
+        expression: "@daily",
+        refusal: 'invalid sync configuration: task schedule matches no instant, got "@daily"',
+        instants: [NOW + 60_000],
+      }),
+    );
+    render(<TaskForm />);
+    fireEvent.change(screen.getByLabelText(TASK_FORM_SCHEDULE_LABEL), {
+      target: { value: "@daily" },
+    });
+
+    const preview = await screen.findByTestId(TASK_FORM_SCHEDULE_PREVIEW_TESTID);
+    expect(preview).toHaveTextContent("matches no instant");
+    expect(preview).not.toHaveTextContent(new Date(NOW + 60_000).toLocaleString());
+  });
+
+  it("closes the offers menu to input while a save is in flight", async () => {
+    // Every other control in this form is disabled while `saving`, and this one
+    // must be too: a menu that could still type into the schedule box mid-save
+    // would change the value under a request that has already been sent, leaving
+    // the box holding something the store was never asked about.
+    let finish = (_saved: TaskVm) => {};
+    mockSave.mockImplementation(
+      () =>
+        new Promise<TaskVm>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    render(<TaskForm />);
+    const menu = await screen.findByLabelText(TASK_FORM_SCHEDULE_OFFER_LABEL);
+    expect(menu).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: TASK_FORM_ADD_SUBMIT_LABEL }));
+    await waitFor(() => expect(menu).toBeDisabled());
+
+    finish(taskVm());
+    await waitFor(() => expect(menu).toBeEnabled());
+  });
 });
 
 /**

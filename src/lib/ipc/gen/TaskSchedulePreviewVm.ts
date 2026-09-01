@@ -18,6 +18,19 @@
  * This type is the wire shape only; it holds no dialect knowledge, because
  * this crate is deliberately `keeper-sync`-free (AD-40) and could not call the
  * parser even if it wanted to. The shell composes it.
+ *
+ * **[`Self::refusal`] and [`Self::instants`] are mutually exclusive**, and a
+ * struct with an `Option` beside a `Vec` can *represent* both at once where the
+ * `keeper_sync::tasks::SchedulePreview` enum this is composed from cannot. The
+ * exclusion is the shell's to keep and its match over that enum is total, so it
+ * cannot accidentally emit both. A tagged union here would have made the
+ * illegal state unrepresentable and was considered; it was declined because it
+ * buys no behaviour — the surface has to decide what a malformed answer looks
+ * like either way — and because the shape then diverges from
+ * `RecordingPathPreviewVm`, the precedent this read is modelled on. So the rule
+ * is stated here, and the renderer's precedence — **a refusal wins** — is
+ * pinned by a test rather than left to whichever branch happens to be written
+ * first.
  */
 export type TaskSchedulePreviewVm = { 
 /**
@@ -49,8 +62,13 @@ refusal: string | null,
  *
  * Empty when [`Self::refusal`] is set. Each instant is computed from the one
  * before it, so this is the schedule's own cadence rather than one answer
- * repeated — and it may be **shorter** than the number asked for, because
- * the search window is finite. A surface renders however many arrived and
- * claims no count of its own.
+ * repeated — and it is very often **shorter** than the number asked for. An
+ * `every <n><unit>` interval carries exactly **one**, because it fires that
+ * long after the previous run *finishes* and nothing can know how long the
+ * first run will take; a cron pattern names wall-clock instants and so
+ * carries as many as were asked for. A surface therefore renders however
+ * many arrived and claims no count of its own — a sentence saying *the next
+ * three* over a list of one is the sort of small lie this whole read exists
+ * to remove.
  */
 instants: Array<number>, };

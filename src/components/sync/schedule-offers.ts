@@ -105,6 +105,13 @@ export const TASK_SCHEDULE_CEILING_DAYS = 366;
  * phrase it expects, and a guard that retyped the phrasing would pass while the
  * sentence drifted — which is the precise defect this whole family of composed
  * notes exists to prevent.
+ *
+ * Assumes a positive whole number, which is all either caller can hold: the two
+ * constants are integer literals, and the mirror guard fails on a Rust constant
+ * that stops dividing into whole minutes or days before one could reach here. At
+ * nought or below the phrasing would read "once every 0 minutes", which is why
+ * the assumption is written down rather than defended — there is no honest
+ * sentence for a floor of nought, and the guard is the right place to notice it.
  */
 export function taskSchedulePeriodPhrase(count: number, unit: string): string {
   return count === 1 ? `once a ${unit}` : `once every ${count} ${unit}s`;

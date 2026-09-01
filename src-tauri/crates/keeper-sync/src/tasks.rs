@@ -762,11 +762,31 @@ pub enum SchedulePreview {
     Refused(String),
     /// The next instants in epoch milliseconds, soonest first.
     ///
-    /// At most `count` of them and never more; possibly fewer, because the
-    /// search window is finite. Never empty for an expression that parsed and a
-    /// `count` above nought.
+    /// Never more than were asked for and never more than
+    /// [`MAX_SCHEDULE_PREVIEW_INSTANTS`]; very often fewer. An
+    /// `every <n><unit>` interval carries exactly one — see
+    /// [`preview_schedule`] for why only the first is knowable — and a cron
+    /// pattern can run out of search window.
+    ///
+    /// **Non-empty for any expression that parsed, at any clock a machine can
+    /// actually hold, and a `count` above nought** — stated with that
+    /// qualification because the absolute version is false and the exception is
+    /// asserted: at `i64::MAX` a cron overflows its checked arithmetic and an
+    /// interval saturates into an instant that is not *strictly after* the one
+    /// it was given, so both answer an empty list. A renderer therefore treats
+    /// empty as *nothing to say* rather than as impossible.
     Fires(Vec<i64>),
 }
+
+/// The most instants one preview will answer, whatever was asked for.
+///
+/// A bound rather than a suggestion, because [`preview_schedule`] reserves for
+/// what it was asked and `count` is a `usize`: without this, a caller that
+/// passed `usize::MAX` would allocate for it before the first instant existed.
+/// Eight rather than the three the app asks for, so the number is a ceiling on
+/// a *pathological* request and not a second opinion about how many instants a
+/// surface should show — that choice belongs to the caller.
+pub const MAX_SCHEDULE_PREVIEW_INSTANTS: usize = 8;
 
 /// The next few instants one written schedule fires at, or the refusal it
 /// earns (Story 59.7, FR-368).
@@ -786,6 +806,18 @@ pub enum SchedulePreview {
 /// which is what makes the list the schedule's own cadence instead of `count`
 /// copies of the first answer.
 ///
+/// **An interval previews exactly one instant, however many were asked for**,
+/// and that is the difference between this being a preview and it being a
+/// guess. [`TaskSchedule::Every`] fires `interval_ms` after the **end of the
+/// previous run**, so `Engine::next_task_window` re-derives it from
+/// `finished_ms` every time; the second instant therefore depends on how long
+/// the first run takes, which nothing can know before the task has ever run. A
+/// list of three would have been arithmetic that looked like knowledge — and
+/// this whole function exists so that a preview cannot disagree with the engine.
+/// A cron pattern has no such dependency: it names wall-clock instants, so
+/// walking it forward answers the same instants the tick will, and only a run
+/// that overran a slot moves one.
+///
 /// Nothing here special-cases an empty expression: `""` earns the malformed
 /// refusal, exactly as it does at the write door. A caller that means *store no
 /// schedule* must not ask this question at all, because the answer to *what
@@ -800,17 +832,38 @@ pub fn preview_schedule(
         Ok(schedule) => schedule,
         Err(refusal) => return SchedulePreview::Refused(refusal.to_string()),
     };
-    let mut fires = Vec::with_capacity(count);
+    // Two clamps, and they answer two different questions.
+    //
+    // `MAX_SCHEDULE_PREVIEW_INSTANTS` bounds what a caller may ask for, because
+    // `count` is a `usize` and the allocation below is eager: a caller that
+    // passed `usize::MAX` would otherwise reserve for it before the first
+    // instant was computed. Nothing in the tree asks for more than three, so
+    // the bound costs nothing and removes the question.
+    //
+    // The second clamp is the interval rule from the doc above: an interval's
+    // second instant is anchored on the first run's completion, so one is all
+    // that is knowable and one is all that is offered. Both are `min` rather
+    // than a branch, so `count == 0` still means nothing at all.
+    let asked = count.min(MAX_SCHEDULE_PREVIEW_INSTANTS);
+    let horizon = match schedule {
+        TaskSchedule::Every { .. } => asked.min(1),
+        TaskSchedule::Cron(_) => asked,
+    };
+    let mut fires = Vec::with_capacity(horizon);
     let mut from = now_ms;
-    for _ in 0..count {
+    for _ in 0..horizon {
         let Some(next) = schedule.next_due_after(from, utc_offset_minutes) else {
             break;
         };
         // Strictly increasing or the walk stops. `next_due_after` promises
-        // *strictly after*, and the one thing that can break the promise is
-        // `Every`'s `saturating_add` pinned at `i64::MAX` — at which point every
-        // further answer is the same instant, and a list that repeated it would
-        // read as a schedule that fires three times at once.
+        // *strictly after* and both variants keep the promise — `Cron` walks
+        // with checked arithmetic and answers `None` rather than wrapping, and
+        // `Every`'s `saturating_add` could pin at `i64::MAX` but never walks
+        // twice now that an interval previews one instant. So this is an
+        // invariant check rather than a live branch, kept because the list is
+        // rendered to a person: a repeated or backwards instant would read as a
+        // schedule that fires twice at once, and the next variant added to
+        // `TaskSchedule` is the one that would introduce it.
         if next <= from {
             break;
         }
@@ -1895,15 +1948,27 @@ mod tests {
             "three successive 03:00s, not one of them three times"
         );
 
-        // The interval half, whose `next_due_after` is a bare addition — so
-        // chaining is the only thing that separates a real cadence from a
-        // repeated first answer.
+        // The interval half, and it answers ONE instant however many were asked
+        // for. `Every` fires `interval_ms` after the end of the previous run, so
+        // `Engine::next_task_window` re-derives it from `finished_ms` — which
+        // means the second instant depends on how long the first run takes and
+        // nothing can know it yet. Three chained additions would have been
+        // arithmetic dressed as knowledge, and this function exists precisely so
+        // that a preview cannot claim more than the engine will honour.
         let SchedulePreview::Fires(interval) = preview_schedule("every 90m", now, 0, 3) else {
             panic!("`every 90m` is in the accepted dialect");
         };
+        assert_eq!(interval, vec![now + 90 * 60_000]);
+        // Asserted as an absence too, so a later "improvement" that chains the
+        // interval forward goes red rather than shipping a plausible fiction.
         assert_eq!(
-            interval,
-            vec![now + 90 * 60_000, now + 180 * 60_000, now + 270 * 60_000]
+            preview_schedule("every 6h", now, 0, 3),
+            SchedulePreview::Fires(vec![now + 6 * HOUR_MS])
+        );
+        // And nought still means nought, for the interval as for the pattern.
+        assert_eq!(
+            preview_schedule("every 90m", now, 0, 0),
+            SchedulePreview::Fires(Vec::new())
         );
 
         // The offset is honoured, and it is the same argument the tick passes.
@@ -1929,6 +1994,45 @@ mod tests {
             preview_schedule("@hourly", now, 0, 0),
             SchedulePreview::Fires(Vec::new())
         );
+
+        // A hostile `count` is bounded rather than trusted. `Vec::with_capacity`
+        // reserves for what it was asked, so without the clamp `usize::MAX`
+        // would allocate for `usize::MAX` before the first instant existed — and
+        // the only caller in the tree asks for three, so the bound costs nothing
+        // it will ever meet.
+        let SchedulePreview::Fires(bounded) = preview_schedule("@hourly", now, 0, usize::MAX)
+        else {
+            panic!("`@hourly` is in the accepted dialect");
+        };
+        assert_eq!(bounded.len(), MAX_SCHEDULE_PREVIEW_INSTANTS);
+        // Strictly increasing over the whole bounded walk, which is the property
+        // the list is rendered on: a repeated instant would read as a schedule
+        // firing twice at once.
+        assert!(bounded.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // The end of representable time, which is where the monotonicity guard
+        // stops being theoretical. `Every`'s `saturating_add` pins at
+        // `i64::MAX`, so the answer is not *strictly after* the instant it was
+        // given and the walk refuses to offer it; `Cron` overflows its checked
+        // arithmetic and answers `None`. Both come back as an empty list from a
+        // valid expression — which the preview's caller renders as nothing,
+        // rather than as a date eight hundred million years hence.
+        assert_eq!(
+            preview_schedule("every 1m", i64::MAX, 0, 3),
+            SchedulePreview::Fires(Vec::new())
+        );
+        assert_eq!(
+            preview_schedule("@hourly", i64::MAX, 0, 3),
+            SchedulePreview::Fires(Vec::new())
+        );
+        // And the other end: a pre-epoch clock is arithmetic like any other, and
+        // `CronSpec::next_due_after`'s `div_euclid` exists so it floors to the
+        // day that contains it rather than truncating toward the epoch.
+        let SchedulePreview::Fires(before_epoch) = preview_schedule("0 3 * * *", -DAY_MS, 0, 2)
+        else {
+            panic!("`0 3 * * *` is in the accepted dialect");
+        };
+        assert_eq!(before_epoch, vec![-DAY_MS + 3 * HOUR_MS, 3 * HOUR_MS]);
     }
 
     /// A refusal previews as a refusal, in the save door's own words

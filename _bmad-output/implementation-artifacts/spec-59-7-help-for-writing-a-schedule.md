@@ -4,7 +4,7 @@ type: 'feature'
 created: '2026-09-01'
 status: 'done'
 baseline_revision: 'c7ae611'
-final_revision: ''
+final_revision: 'e7e5314'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:
@@ -85,6 +85,17 @@ rather than a failed command.
   guards: the effect's cleanup abandons a superseded read, and the echo comparison on
   `TaskSchedulePreviewVm.expression` blanks an already-landed answer the moment the box changes. The
   second is not redundant — a keystroke cannot un-answer a read that already completed.
+- **An interval previews exactly one instant.** `TaskSchedule::Every` fires `interval_ms` after the
+  **end of the previous run** (`tasks.rs:534-541`), and `Engine::next_task_window` re-derives it from
+  `finished_ms`, so the second instant depends on how long the first run takes and nothing can know it
+  before the task has ever run. A cron pattern names wall-clock instants and has no such dependency,
+  so it previews the full count. `docs/sync.md:1995-1999` states the same rule from the other end, and
+  it was written before this story: *"`every <n>` measures from the end of the previous run, not from a
+  fixed origin"*. A chained interval preview would have advertised the fixed origin the engine
+  explicitly does not have.
+- **A hostile `count` is bounded, not trusted.** `preview_schedule` is `pub` and reserves for what it
+  is asked, so `MAX_SCHEDULE_PREVIEW_INSTANTS` caps it inside `keeper-sync` rather than relying on the
+  shell's `TASK_SCHEDULE_PREVIEW_COUNT`, which lives in a crate this one cannot see.
 - **The preview is computed on the platform the tick uses.** The verb takes `tauri::State` and reaches
   the supervisor's platform instance, because `ShellSyncPlatform` *overrides* `utc_offset_minutes`
   (`keeper/src/sync.rs:114-131`) precisely to avoid the port default's `gix` fallback to UTC
@@ -112,7 +123,7 @@ edit `keeper-core/src/tasks.rs` between the paced-work block's bounds; touch
 | Whitespace only | `" "` | asked about, and comes back refused quoting `""` — not treated as empty | `Refused`, rendered as help |
 | A valid cron | `0 3 * * *` | the next instants Rust chained, each stamped absolutely | No error expected |
 | An alias | `@weekly` | desugared by Rust to `0 0 * * 0`; instants are Sundays | No error expected |
-| An interval | `every 90m` | instants 90 minutes apart, each from the previous | No error expected |
+| An interval | `every 90m` | **one** instant, 90 minutes from now — the second depends on how long the first run takes, so nothing claims it | No error expected |
 | Malformed | `eee`, `@daily 03:00` | `Refused` with the 5-field/alias/interval sentence, quoting what was typed | `Refused`, rendered as help |
 | Below the floor | `every 30s` | `Refused` naming the one-minute floor — not an unknown unit | `Refused`, rendered as help |
 | Above the ceiling | `every 400d` | `Refused` naming the one-year ceiling and pointing at cron | `Refused`, rendered as help |
@@ -125,14 +136,20 @@ edit `keeper-core/src/tasks.rs` between the paced-work block's bounds; touch
 | Choosing an offer | any menu option | typed into the box; menu returns to its placeholder | No error expected |
 | Offer then edit | `@daily`, then edited to `0 3 * * 1 ` | the edited text is what is sent, trailing space included | No error expected |
 | `count == 0` asked of Rust | `preview_schedule(expr, …, 0)` | parses first, then `Fires(vec![])` — not a refusal | No error expected |
-| Saturated interval | `Every` at `i64::MAX` | the walk stops rather than repeating one instant | strictly-increasing guard |
+| Saturated interval | `every 1m` at `now_ms = i64::MAX` | `Fires(vec![])` — the saturated instant is not *strictly after*, so it is not offered | monotonicity guard |
+| Cron at the end of time | `@hourly` at `now_ms = i64::MAX` | `Fires(vec![])` — `checked_add` overflows and answers `None` | No error expected |
+| Pre-epoch clock | `0 3 * * *` at `now_ms = -DAY_MS` | the two 03:00s either side of the epoch, in order | No error expected |
+| Hostile `count` | `preview_schedule(expr, …, usize::MAX)` | capped at `MAX_SCHEDULE_PREVIEW_INSTANTS`, and the reservation with it | No error expected |
+| A malformed answer from the wire | `refusal` set **and** `instants` non-empty | the refusal wins and the instants are not shown — pinned, not incidental | shell's match is total; cannot arise |
+| Save in flight | `saving` true | the offers menu is disabled with every other control | No error expected |
 
 </intent-contract>
 
 ## Code Map
 
 - `src-tauri/crates/keeper-sync/src/tasks.rs` -- **gains** `SchedulePreview` (infallible two-variant
-  enum) and `preview_schedule(expression, now_ms, utc_offset_minutes, count)`, placed between
+  enum), `MAX_SCHEDULE_PREVIEW_INSTANTS` and
+  `preview_schedule(expression, now_ms, utc_offset_minutes, count)`, placed between
   `impl TaskSchedule` and `impl CronSpec`; plus three tests at the end of `mod tests`:
   `every_schedule_the_form_offers_is_one_this_dialect_accepts`,
   `preview_schedule_walks_the_dialects_own_cadence` and
@@ -154,7 +171,7 @@ edit `keeper-core/src/tasks.rs` between the paced-work block's bounds; touch
   `form.schedule`, the `shownPreview` echo gate; and three new renders under the schedule row. The
   existing schedule note, placeholder, `submit` and every other control are untouched.
 - `src/components/sync/task-form.test.tsx` -- `syncTaskSchedulePreview` in the module mock and an
-  echoing default in `beforeEach`; `previewVm` factory; the seven-test
+  echoing default in `beforeEach`; `previewVm` factory; the nine-test
   `TaskForm, help for writing a schedule` describe; and a new four-test describe
   `the schedule bounds note states the numbers Rust refuses at`, beside 58.9's guard rather than
   inside it.
@@ -176,9 +193,11 @@ edit `keeper-core/src/tasks.rs` between the paced-work block's bounds; touch
   sentence.
 - [x] `src/components/sync/task-form.tsx` -- the offers menu, the bounds note, the preview and its two
   staleness guards.
-- [x] `src/components/sync/task-form.test.tsx` -- eleven new tests over provenance, staleness,
-  silence and the composed sentence.
+- [x] `src/components/sync/task-form.test.tsx` -- thirteen new tests over provenance, staleness,
+  silence, precedence and the composed sentence.
 - [x] Mutation proof, restored and verified by reading the diff.
+- [x] Two parallel read-only review lenses, and the eight findings they returned resolved or accepted
+  with reasons — see the Review Triage Log.
 
 **Acceptance Criteria:**
 - Given somebody who does not know cron, when they open the form, then every shape of the dialect is
@@ -224,9 +243,40 @@ answers with real instants. A description that drifted from its expression is co
 by the engine rather than believed. The one fact worth stating explicitly, and stated, is that this
 dialect counts weekdays from Sunday.
 
-**Why the count of previewed instants is never named.** `Fires` may be shorter than asked, because the
-search window is finite. A sentence saying *the next three* over a list of two is a small lie of
-exactly the family this story exists to remove, so the sentence is `Next: ` and however many arrived.
+**Why an interval previews one instant and a cron pattern three.** This is the story's own defect,
+found by reading the parser's doc rather than by a test — and worth recording as such, because the
+first version of the cadence test *asserted the wrong answer as correct* and therefore defended the
+bug against exactly the adversarial and mutation passes that should have caught it. `TaskSchedule::Every`
+measures from the **end of the previous run**; `Engine::next_task_window` re-derives it from
+`finished_ms`; `docs/sync.md:1995-1999` says so in prose written months earlier. So chaining an
+interval forward produced instants two and three that depend on how long each run takes — no
+TypeScript involved, no arithmetic error, and still a promise the engine had no intention of keeping.
+A cron pattern is immune because it names wall-clock instants: only a run that overran a slot moves
+one. The fix asserts the single instant **and** asserts the absence of the chain, so a later
+"improvement" that reinstates it goes red rather than shipping a plausible fiction.
+
+**Why the count of previewed instants is never named.** `Fires` is very often shorter than asked — one
+for every interval, and fewer than asked for a cron near its search horizon. A sentence saying *the
+next three* over a list of one is a small lie of exactly the family this story exists to remove, so
+the sentence is `Next: ` and however many arrived.
+
+**Why the wire type can represent a state the enum cannot, and what pins it.** `SchedulePreview` is an
+enum, so *refused* and *fires* are exclusive by construction; `TaskSchedulePreviewVm` is a struct with
+an `Option<String>` beside a `Vec<i64>`, so on the wire they are not. A tagged union was considered and
+declined: it buys no behaviour, because the surface has to decide what a malformed answer looks like
+either way, and it would diverge from `RecordingPathPreviewVm`, the precedent this read is modelled
+on. So the exclusion is stated on the type as the shell's to keep, and the renderer's precedence — **a
+refusal wins, and instants arriving beside one are not shown** — is pinned by a test rather than left
+to whichever branch happened to be written first. Rendering a next-fire time under a sentence saying
+the expression never fires is the one outcome worse than either half alone.
+
+**What the preview means on an edit form, since the wording does not say.** It answers *if you saved
+this expression now, when would it next fire* — not *when will the stored row next run*. For a cron
+pattern those are the same instant. They differ for an interval (finish-anchored) and for a row whose
+window was postponed or declined, and the row's own armed `nextDueMs` is shown by the Tasks pane
+rather than here. Left as it is deliberately: labelling it *"if saved now"* would dilute the common
+case, which is somebody writing a schedule on an add form, and the pane already owns the other
+question.
 
 **Why a parsed expression with no instants renders nothing.** Unreachable in practice —
 `matches_any_date` has already refused the patterns that name no date, and `SEARCH_DAYS` covers eight
@@ -266,15 +316,22 @@ place for it is the caller and the guard for it already exists.
   Three agents shared this worktree; the coordinator runs the project-wide gates once, and the
   `keeper` shell crate cannot link on Linux (`gobject-sys`).
 
-**Measured, 2026-09-01, on `c7ae611` plus this story:**
+**Measured, 2026-09-01, on `c7ae611` plus this story (`e7e5314` and its review revision):**
 
-- `cargo test -p keeper-sync --lib tasks::` -- 30 passed / 0 failed (27 before).
-- `cargo test -p keeper-core` -- 2359 passed / 0 failed / 1 ignored; binding regenerated.
-- `bun run vitest run src/components/sync/task-form.test.tsx` -- 43 passed / 0 failed (32 before).
-- `bun run typecheck` -- clean.
-- `bun run lint` -- this story's three files clean; the tree's remaining findings belong to a sibling's
+- `cargo test -p keeper-sync --lib tasks::` -- 30 passed / 0 failed (27 before this story).
+- `cargo test -p keeper-core --lib tasks::` -- 65 passed / 0 failed; binding regenerated twice, once
+  per doc change on the wire type.
+- `cargo clippy -p keeper-core -p keeper-sync --all-targets -- -D warnings` -- clean. The
+  `proc-macro-error2` future-incompat note is a pre-existing dependency warning, not a lint failure.
+- `bun run vitest run src/components/sync/task-form.test.tsx` -- 45 passed / 0 failed (32 before).
+- `bun run typecheck` -- clean, once the sibling-owned `client.ts` wrapper landed.
+- `bun run lint` -- this story's three files clean. The tree's remaining findings are a sibling's
   in-flight files plus one pre-existing committed `lint/style/useTemplate` error in
-  `src/components/viewers/markdown-preview.ts:424`, which this story has not modified.
+  `src/components/viewers/markdown-preview.ts:424`, which this story has not modified and which was
+  reported to the coordinator rather than fixed blind.
+- `bun run test` in full, once, mid-story: 301 files / 5109 tests, 4 failed — all four in
+  `src/components/layout/tasks-pane.test.tsx`, a sibling's in-flight 59.1 restructure. Nothing this
+  story owns was red.
 - **Shell-crate symbols this story's contract touches, for the macOS gate:**
   `keeper::sync_ipc::sync_task_schedule_preview`, `TASK_SCHEDULE_PREVIEW_COUNT`, and its
   `generate_handler!` registration in `keeper::lib`. Written by `StoryPaced`; unlinkable on this host.
@@ -288,8 +345,61 @@ The echo gate (`shownPreview`) reduced to `const shownPreview = schedulePreview;
 instant at all. That is the exact defect the gate exists to stop, and it is the half the effect's
 cleanup cannot cover, because a keystroke cannot un-answer a read that already completed. Restored;
 verified by reading `git diff -- src/components/sync/task-form.tsx` (the gate's four lines present as
-additions, no deletions anywhere in the file) and 43/43 green again.
+additions, no deletions anywhere in the file) and the suite green again — 43/43 at the time, 45/45
+after the review revision added two more.
 
 ## Review Triage Log
 
-Not yet reviewed.
+Two parallel read-only lenses over `e7e5314`: an adversarial pass and an exhaustive edge-case walk.
+Both independently found the interval-cadence defect, which this story had also found by reading
+minutes earlier — three arrivals at one finding, and the reason it needed three is recorded above: the
+committed test asserted the wrong answer as correct, so no mutation of the implementation could
+surface it. **That is the lesson of this story.** A mutation sweep proves a test notices a change; it
+cannot prove the test wants the right thing. Only reading the contract the code is supposed to honour
+does that.
+
+**Fixed now:**
+
+| # | Sev | Finding | Resolution |
+|---|-----|---------|------------|
+| 1 | high | An interval previewed a chained cadence the engine never keeps | `preview_schedule` answers one instant for `Every`, the full count for `Cron`; asserted, plus an absence assertion so reinstating the chain goes red |
+| 2 | medium | The cadence test canonised finding 1 as expected behaviour | Assertion rewritten; the absence is now part of the claim |
+| 3 | low | `Vec::with_capacity(count)` trusted a `pub` fn's caller for an eager reservation | `MAX_SCHEDULE_PREVIEW_INSTANTS` bounds it inside `keeper-sync`, which owns the allocation; asserted at `usize::MAX` |
+| 4 | low | The saturated-`Every` monotonicity guard had no test | Asserted at `now_ms = i64::MAX` for both variants, plus a strictly-increasing assertion over a bounded walk, plus a pre-epoch clock |
+| 5 | low | `Fires`' doc claimed "never empty" absolutely, which the two clock extremes falsify | Doc qualified to *"at any clock a machine can actually hold"*, with the exception named and asserted |
+| 6 | low | The wire type can represent `refusal` **and** `instants` together, a state the enum cannot | Exclusion stated on the type as the shell's to keep; the renderer's precedence (a refusal wins) pinned by a test; tagged union considered and declined with the reason |
+| 7 | low | `disabled={saving}` on the offers menu was a stated behaviour with no guard | Asserted, including that it re-enables when the save settles |
+| 8 | info | `taskSchedulePeriodPhrase` assumes a positive whole number its signature permits violating | Assumption documented, with why the mirror guard is the right place to catch a Rust constant that stops dividing |
+
+**Accepted as-is, with reasons:**
+
+- **The offer descriptions are prose no test can prove.** Both lenses independently checked all nine
+  against `CronSpec::parse`, `parse_field` and `weekday_from_days` and found all nine true, including
+  Sunday-as-0 and vixie's step semantics. The residual risk is mitigated by the preview: a description
+  that drifted from its expression is contradicted on screen by the engine.
+- **The bounds note says "366 days" where Rust's ceiling refusal says "a year".** Both are computed
+  from the same constant and 366 days is the exact bound (`every 366d` is accepted, `every 367d` is
+  not), so the note is more precise than the refusal rather than inconsistent with it. Making them
+  agree would mean rewording the parser's message, which is outside this story.
+- **The preview on an edit form answers *if saved now*, not *when the stored row next runs*.** Design
+  note above; the reviewer's own recommendation was to leave it, because the pane already owns the
+  other question and re-labelling would dilute the add-form case.
+
+**Out of scope, reported not fixed:** the pre-existing `lint/style/useTemplate` error in
+`src/components/viewers/markdown-preview.ts:424`, and the sibling-owned files this story's contract
+depends on. One of those did break during the wave and is worth recording because it is a lesson about
+guards that read source text: the shipped
+`every_schedule_the_dev_harness_shows_is_one_this_dialect_accepts` went red on `"…"` — the ellipsis —
+because a newly written comment in `dev/mock-shell.ts` contained the literal token `schedule: "…"`
+while explaining the guard, and the blunt extractor read the prose as a fixture. Its owner reworded
+the comment. The extractor was deliberately **not** taught to skip comments, and the new offers guard
+copies it unchanged: it is cheap, its failure mode is a loud false positive rather than a silent pass,
+and the alternative is a regex nobody can reason about standing guard over a claim that matters.
+
+**Docs:** `docs/sync.md` §14 does not describe the preview, and deliberately does not yet. The chapter
+belongs to Story 59.10 and to the agent who holds that file; agreed with them explicitly rather than
+left to chance, on the grounds that two stories writing one chapter is how a chapter grows two
+descriptions, and that prose must not go in front of an IPC verb that is not committed yet — Story
+56.13's exact failure. A draft paragraph and the two claims in it that need re-checking against
+committed code (the number of offered forms, and *up to* three instants for a cron pattern) were handed
+over for 59.10.
