@@ -47,10 +47,20 @@ export const LIST_FOLD_LESS_LABEL = "Show fewer";
  * `unfolded` would drop rows silently — with no control left to reveal them and
  * nothing on screen saying they exist. A list that claims to be a complete
  * inventory must not be able to do that.
+ *
+ * `foldedTo` is the other end of the same list, and it is for a list whose rows
+ * are not one line tall. The global `folded` is 10, which is right for ten
+ * one-line run rows and wrong for ten projected paced rows — each of those is a
+ * badge line, a two-cell `dl` and a whole sentence from Rust, and in a 320px
+ * column eight of them measured 1609px with no control on screen at all, because
+ * a list shorter than its own resting size folds nothing and `FoldToggle`
+ * renders nothing (Story 59.13). Overriding the RESTING count is what a fold is
+ * for; overriding the unfolded one is what `unfoldToAll` refuses above, and the
+ * difference is that a resting count leaves a live control naming what it hides.
  */
 export function useFold<T>(
   rows: readonly T[] | null,
-  options?: { unfoldToAll?: boolean },
+  options?: { unfoldToAll?: boolean; foldedTo?: number },
 ): {
   visible: readonly T[];
   hidden: number;
@@ -65,7 +75,7 @@ export function useFold<T>(
   // size otherwise. Returned as well as used, so the control's label promises
   // the same number this hook will actually show.
   const unfoldedLimit = options?.unfoldToAll ? (rows?.length ?? 0) : unfolded;
-  const limit = expanded ? unfoldedLimit : folded;
+  const limit = expanded ? unfoldedLimit : (options?.foldedTo ?? folded);
   // An unread list folds to nothing rather than to `null`: every caller already
   // branches on its own `rows === null` before reaching the rows, and a nullable
   // `visible` only moves that check somewhere it has to be repeated.

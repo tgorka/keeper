@@ -129,6 +129,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { columnMinWidth } from "@/lib/column-widths";
 import { type CountNoun, countLabel, RUNS } from "@/lib/count-label";
 import type {
   PacedWorkVm,
@@ -391,6 +392,87 @@ export const TASKS_PANEL_EMPTY_SENTENCE =
   "Nothing is open here yet. Double-click a task to open it beside the list.";
 
 /**
+ * Where the open-beside gesture is advertised (Story 59.13).
+ *
+ * {@link TASKS_PANEL_EMPTY_SENTENCE} was the only place the gesture was named,
+ * and it was named inside a panel that only exists once the gesture has already
+ * been performed — while an empty strip claiming 60% of the window said it. This
+ * is the same fact stated where a reader can act on it: under the one task the
+ * region is drawing, which is exactly where somebody might want two.
+ *
+ * Rendered by the pane's detail REGION rather than by {@link TaskDetail}, so a
+ * task panel cannot advertise opening a task panel. That is structural — the
+ * panel host renders the component and not the region — rather than a flag a
+ * later change could pass the wrong way.
+ */
+export const TASKS_OPEN_BESIDE_HINT =
+  "Double-click a task in the list to keep it open beside this one.";
+
+/**
+ * What the column says when the task list is empty (Story 59.13).
+ *
+ * The full empty state — three paragraphs and a shell command — is drawn in the
+ * wide region for a reason that still holds (see the region's own comment), and
+ * this is deliberately not a second copy of it. It exists because with no tasks
+ * the column held nothing but Story 58.7's projected paced rows, so the only
+ * thing on screen under the heading *Task list* was work that is explicitly not
+ * a task. Context may not pose as the subject: five words above it say the
+ * subject is empty.
+ */
+export const TASKS_LIST_EMPTY_TEXT = "No tasks yet.";
+
+/**
+ * The narrowest the detail region may be, in px (Story 59.13).
+ *
+ * The region had no floor at all, so it was the one box in the surface that
+ * could be squeezed to nothing — measured at **28px** in a 1024px window with an
+ * empty panel strip beside it, with the add form inside it at 0px and that
+ * form's controls at 22px.
+ *
+ * The hard floor is the add form, because the form is the one thing here that
+ * has to be *operated* rather than read: its widest control is `w-56` (224px),
+ * inside a `size="sm"` card (16px of padding each side) inside this region's
+ * `m-6` (24px each side) — 304px before anything is fillable. 360 is that plus a
+ * line of its own for a label the row can no longer squeeze, and it is what
+ * gives {@link TaskDetail}'s `grid-cols-2` `dl` a cell wide enough to hold a
+ * value rather than one word per line.
+ *
+ * It is a number and not a class because {@link TASKS_PANE_MIN_WIDTH_PX} is
+ * derived from it and `src/lib/window-minimum.test.ts` adds it to three other
+ * floors: a class would make both of those parse a string to do arithmetic.
+ */
+export const TASKS_DETAIL_MIN_WIDTH_PX = 360;
+
+/**
+ * The narrowest the whole pane may be, in px — its two columns' floors (59.13).
+ *
+ * The pane root carried `min-w-0`, which is `min-width: 0` on the flex item that
+ * *holds* the floor: it tells flexbox to ignore what the columns inside need and
+ * squeeze them instead of taking a share of the deficit. That is the same
+ * mistake `columnStyle`'s doc describes from the other side, and it is why the
+ * list kept its 320px while the detail beside it went to 28.
+ *
+ * Derived rather than written down, so the sum can never drift from its two
+ * addends. The arithmetic that makes three columns fit at all is asserted in
+ * `src/lib/window-minimum.test.ts`: at the app's own minimum window (960) the
+ * sidebar is collapsed, and 48 + 240 + 360 + 280 = 928.
+ */
+export const TASKS_PANE_MIN_WIDTH_PX = columnMinWidth("tasks-list") + TASKS_DETAIL_MIN_WIDTH_PX;
+
+/**
+ * How many projected paced rows rest on screen (Story 59.13).
+ *
+ * Not the global `folded` (10): a projected row is a badge line, a two-cell `dl`
+ * and a whole sentence from Rust, and eight of them in a 320px column measured
+ * **1609px** — two screens of context under half a screen of tasks, with no
+ * control on screen, because a list shorter than its own resting size folds
+ * nothing and `FoldToggle` renders nothing at all. Three rows show that the
+ * class exists and what one looks like; the control above says *Show all N* and
+ * hides nothing silently, which is the distinction `useFold`'s doc draws.
+ */
+export const PACED_RESTING_ROWS = 3;
+
+/**
  * What the master list is called to a screen reader.
  *
  * The column region around it is already named *Task list* by its own fold-row
@@ -509,13 +591,26 @@ export const TASKS_BULK_NO_REASON_TEXT = "keeper refused this one and did not sa
 /**
  * The master column's own box.
  *
- * `shrink-0` and `min-w-0` together, `FILES_COLUMN_CLASS`'s pairing: the width
- * is a remembered number that arrives as an inline `flex-basis` from
- * `useSurfaceColumn`, so the column must not be squeezed below it by a long
- * task name — and must still be allowed to clip that name rather than push the
- * detail region off screen.
+ * `min-w-0` so a long task name is clipped rather than pushing the detail
+ * region off screen — `FILES_COLUMN_CLASS`'s half of the pairing that matters
+ * here.
+ *
+ * The other half, `shrink-0`, is deliberately **absent** since Story 59.13, and
+ * this is the one place the Tasks surface has to differ from the Files one. The
+ * Files tree has one neighbour; this column has two, and a column that cannot
+ * give makes the pane's real floor its REMEMBERED width — which a drag can put
+ * at 640 — rather than the 240 `SURFACE_COLUMNS` promises. Measured with a task
+ * open beside: pane 600, list 320, detail 360, so 80px of the detail region was
+ * laid out past the pane's own right edge.
+ *
+ * Shrinking is safe because the floor is not this class's to keep: `columnStyle`
+ * hands the column an inline `min-width` of exactly its `SURFACE_COLUMNS` floor,
+ * which flexbox will not go below, and the basis is restored exactly when the
+ * window widens — so nothing has to remember, recompute or write back the width
+ * somebody dragged. That is the arrangement `columnStyle`'s own doc describes,
+ * and `shrink-0` was quietly opting this column out of it.
  */
-const TASKS_COLUMN_CLASS = "flex min-w-0 shrink-0 flex-col border-border border-r bg-background";
+const TASKS_COLUMN_CLASS = "flex min-w-0 flex-col border-border border-r bg-background";
 
 /**
  * The disclosure over one task's recorded runs, and the section it reveals.
@@ -1694,7 +1789,14 @@ function PacedWorkList({
   // whole projection rather than a page of it, so a cap on the expanded view
   // would drop rows with no control left to reveal them — in the one section
   // whose claim is that it lists everything this host paces.
-  const fold = useFold(rows, { unfoldToAll: true });
+  //
+  // And rests at {@link PACED_RESTING_ROWS} rather than at the global 10, which
+  // is the same argument read from the other end (Story 59.13): a resting count
+  // with a live control naming what it hides is what a fold is, and the global
+  // count was chosen for one-line run rows. At 10 this section folded nothing on
+  // any real machine, so the control that would have revealed the length never
+  // appeared and the length was simply spent.
+  const fold = useFold(rows, { unfoldToAll: true, foldedTo: PACED_RESTING_ROWS });
   return (
     <div className="flex flex-col gap-2 border-border border-t px-6 py-4">
       {/* The project's group-label treatment (`sync-pane.tsx`'s Activity
@@ -1752,7 +1854,16 @@ function PacedWorkList({
                   {PACED_KIND_LABELS[row.kind] ?? row.kind}
                 </span>
               </span>
-              <dl className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              {/* One cell per line, and no `sm:` variant (Story 59.13). It was
+                  `grid-cols-2 sm:grid-cols-4`, and `sm:` is the WINDOW's
+                  breakpoint while this box is a 320px COLUMN — so on every
+                  desktop window the four-track rule won and each of this row's
+                  two values got ~70px. They are prose, not numbers: *about every
+                  15 seconds* rendered over three lines and *committed after 2
+                  seconds of quiet, pushed within 30 seconds* over seven. This
+                  column is 240–640px by construction (`SURFACE_COLUMNS`), which
+                  is one prose column wide at every one of those widths. */}
+              <dl className="grid grid-cols-1 gap-3">
                 <Field label={PACED_FOLDER_LABEL}>{row.profile}</Field>
                 {/* The cadence is drawn ONLY for a row something is actually
                     pacing, and the standing is what decides — not the presence
@@ -2751,7 +2862,27 @@ export function TasksPane() {
   return (
     <section
       aria-label={TASKS_PANE_TITLE}
-      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0"
+      // `min-w-0 flex-1` was here, and it is exactly the defect Story 59.13
+      // measured: `min-width: 0` on the flex item that HOLDS the floor tells
+      // flexbox to squeeze this pane's two columns rather than take a share of
+      // the deficit, so the panel strip beside it — a claimant with a basis AND
+      // a floor of its own since Story 55.1 — was served first and the detail
+      // region went to 28px in a 1024px window.
+      //
+      // Three explicit properties, `panel-strip.tsx`'s own arrangement and for
+      // its stated reason: a basis in a class and a basis inline are one
+      // property twice over, and which one wins should not depend on the order
+      // Tailwind emits them in. `grow shrink` here and the basis below.
+      //
+      // The basis is the FLOOR and not 0, which is what makes the surplus split
+      // evenly above the two floors rather than being handed to whichever box
+      // started at 280. With a task open beside, at 1550: pane 857 / strip 537,
+      // where a basis of 0 gave the pane exactly its floor and the strip 794.
+      // Inline because both numbers are arithmetic over two constants (see
+      // {@link TASKS_PANE_MIN_WIDTH_PX}) and a class would make the guard test
+      // parse a string to add two numbers.
+      style={{ flexBasis: TASKS_PANE_MIN_WIDTH_PX, minWidth: TASKS_PANE_MIN_WIDTH_PX }}
+      className="flex shrink grow flex-col border-border border-r bg-background last:border-r-0"
     >
       <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
         <div className="min-w-0">
@@ -3009,6 +3140,18 @@ export function TasksPane() {
                     </ul>
                   </>
                 )}
+                {/* The subject of this column, when it is empty (Story 59.13).
+                    Five words, and deliberately not a second copy of the wide
+                    region's empty state below — that state is three paragraphs
+                    and a shell command and belongs where a command can be
+                    copied. This exists because with no tasks the only thing
+                    under the heading *Task list* was the projected paced
+                    section, so a reader met work that is explicitly not a task
+                    where the tasks should be. Above the projection, because
+                    which of the two is the subject is the whole point. */}
+                {listing !== null && tasks.length === 0 && listing.unknown.length === 0 && (
+                  <p className="px-3 pt-4 text-muted-foreground text-sm">{TASKS_LIST_EMPTY_TEXT}</p>
+                )}
                 {/* Last in the column and inside the same `ScrollArea`, because
                     it is a second class in ONE view and not a second view: the
                     question it answers — "is that everything keeper does on a
@@ -3034,7 +3177,14 @@ export function TasksPane() {
             never double-clicks anything. */}
         <section
           aria-label={TASKS_DETAIL_LABEL}
-          className="flex min-w-0 flex-1 flex-col bg-background"
+          // The floor Story 59.13 added, and the reason it is inline rather than
+          // a class is {@link TASKS_DETAIL_MIN_WIDTH_PX}'s: the pane's own floor
+          // is derived from it and a guard test adds it to three other numbers.
+          // Before this the region had no `min-width` at all, which made it the
+          // one box in the surface that could be squeezed to nothing — and the
+          // add form lives in it.
+          style={{ minWidth: TASKS_DETAIL_MIN_WIDTH_PX }}
+          className="flex flex-1 flex-col bg-background"
         >
           <ScrollArea fitWidth className="min-h-0 flex-1">
             {/* The add form, revealed by the header or by the folded rail and
@@ -3045,7 +3195,18 @@ export function TasksPane() {
                 detail are two different answers to "what am I looking at", and
                 720px of form does not fit in a 320px column. Closing unmounts
                 it, so the next open starts from a fresh form rather than an
-                abandoned draft — and `task-form.tsx`'s own reads key off mount. */}
+                abandoned draft — and `task-form.tsx`'s own reads key off mount.
+
+                Amended by Story 59.13, and only in what it assumed rather than
+                in what it decided: taking the region is still right, but the
+                argument was "720px does not fit in a 320px column" and it never
+                asked how wide this region actually was. It was 28px in a 1024px
+                window, so the form that could not fit the column did not fit
+                here either — 0px wide, its controls at 22px, its notes at one
+                word per line. The region now has a floor chosen from this form's
+                own widest control ({@link TASKS_DETAIL_MIN_WIDTH_PX}), and the
+                form's rows wrap rather than letting a field give, so the host is
+                wide enough by construction instead of by assumption. */}
             {adding ? (
               <Card size="sm" className="m-6 w-full max-w-[720px]">
                 <CardContent>
@@ -3098,51 +3259,63 @@ export function TasksPane() {
               </p>
             ) : (
               selectedTask !== null && (
-                <TaskDetail
-                  // Keyed by id so choosing another task remounts the region
-                  // rather than reconciling one task's DOM into another's: the
-                  // edit-form focus-return effect and `useId` both belong to the
-                  // task they were mounted for.
-                  key={selectedTask.id}
-                  task={selectedTask}
-                  now={now}
-                  refusal={refusals[selectedTask.id] ?? null}
-                  // The pane is the writing host, so it passes all nine — see
-                  // {@link TaskDetailVerbs} for why the panel beside it passes
-                  // `null` instead of nine inert copies of them.
-                  verbs={{
-                    running: running[selectedTask.id] === true,
-                    deleting: deleting[selectedTask.id] === true,
-                    editing: editingId === selectedTask.id,
-                    writing: formSaving,
-                    onRunNow: (id) => void runNow(id),
-                    // Opening an edit form closes this task's runs, the mirror of
-                    // `toggleHistory` closing the form: one of the two, never both.
-                    onEditToggle: (id) => {
-                      setEditingId((open) => (open === id ? null : id));
-                      if (historyRef.current?.id === id) {
-                        historyToken.current += 1;
-                        openHistory(null);
-                      }
-                    },
-                    onSaved: () => {
-                      setEditingId(null);
-                      void refresh();
-                    },
-                    onSavingChange: setFormSaving,
-                    onForget: (id) => {
-                      setForgetSubject({ kind: "one", id });
-                      setForgetAsking(true);
-                    },
-                  }}
-                  // All three read the ONE slot, so the region can never be
-                  // handed another task's runs: the id and the runs it belongs
-                  // to move together or not at all.
-                  historyOpen={history?.id === selectedTask.id}
-                  historyRuns={history?.id === selectedTask.id ? history.runs : null}
-                  historyError={history?.id === selectedTask.id ? history.error : null}
-                  onHistoryToggle={toggleHistory}
-                />
+                <>
+                  <TaskDetail
+                    // Keyed by id so choosing another task remounts the region
+                    // rather than reconciling one task's DOM into another's: the
+                    // edit-form focus-return effect and `useId` both belong to the
+                    // task they were mounted for.
+                    key={selectedTask.id}
+                    task={selectedTask}
+                    now={now}
+                    refusal={refusals[selectedTask.id] ?? null}
+                    // The pane is the writing host, so it passes all nine — see
+                    // {@link TaskDetailVerbs} for why the panel beside it passes
+                    // `null` instead of nine inert copies of them.
+                    verbs={{
+                      running: running[selectedTask.id] === true,
+                      deleting: deleting[selectedTask.id] === true,
+                      editing: editingId === selectedTask.id,
+                      writing: formSaving,
+                      onRunNow: (id) => void runNow(id),
+                      // Opening an edit form closes this task's runs, the mirror of
+                      // `toggleHistory` closing the form: one of the two, never both.
+                      onEditToggle: (id) => {
+                        setEditingId((open) => (open === id ? null : id));
+                        if (historyRef.current?.id === id) {
+                          historyToken.current += 1;
+                          openHistory(null);
+                        }
+                      },
+                      onSaved: () => {
+                        setEditingId(null);
+                        void refresh();
+                      },
+                      onSavingChange: setFormSaving,
+                      onForget: (id) => {
+                        setForgetSubject({ kind: "one", id });
+                        setForgetAsking(true);
+                      },
+                    }}
+                    // All three read the ONE slot, so the region can never be
+                    // handed another task's runs: the id and the runs it belongs
+                    // to move together or not at all.
+                    historyOpen={history?.id === selectedTask.id}
+                    historyRuns={history?.id === selectedTask.id ? history.runs : null}
+                    historyError={history?.id === selectedTask.id ? history.error : null}
+                    onHistoryToggle={toggleHistory}
+                  />
+                  {/* Where the open-beside gesture is advertised now (Story
+                      59.13). The REGION says it, not `TaskDetail`, so a task
+                      panel — which renders the component and not this — cannot
+                      offer to open a task panel. And only under a drawn task:
+                      never over the form, the empty state or a multi-selection,
+                      because in none of those is there a task to double-click at
+                      the place the sentence points. */}
+                  <p className="px-6 pb-4 text-muted-foreground text-xs">
+                    {TASKS_OPEN_BESIDE_HINT}
+                  </p>
+                </>
               )
             )}
           </ScrollArea>

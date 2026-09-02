@@ -417,6 +417,27 @@ export const TASK_FORM_CANCEL_LABEL = "Cancel";
 /** Where a refusal is rendered — the Tasks pane's idiom for one. */
 export const TASK_FORM_ERROR_TESTID = "task-form-error";
 
+/**
+ * One row of this form: a label and the control it names (Story 59.13).
+ *
+ * `flex-wrap` and the control's own `shrink-0` are the whole of it, and together
+ * they decide WHAT gives when the row is too narrow. It used to be the control,
+ * because a flex item's default `flex-shrink: 1` makes the sized box the elastic
+ * one: measured in a 1024px window, this form's `w-56` controls were **22px**
+ * wide and the form was unfillable. Now the row wraps — the label takes a line
+ * of its own and the control keeps the 224px it was designed at — which is the
+ * only arrangement in which a narrow form is merely taller rather than broken.
+ *
+ * A constant rather than ten copies of the string, so the ten rows cannot
+ * disagree about it and one guard test can name the shape.
+ */
+export const TASK_FORM_ROW_CLASS = "flex flex-wrap items-center justify-between gap-2";
+
+/** The width every control in this form is designed at, as a class so the row
+ *  above and `TASKS_DETAIL_MIN_WIDTH_PX` are talking about the same number:
+ *  `w-56` is 224px, and 224 is what the region's floor is built from. */
+export const TASK_FORM_CONTROL_CLASS = "w-56 shrink-0";
+
 /** Matches the two native `<select>`s in `session-space-editor.tsx`. */
 const SELECT_CLASS =
   "h-9 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50";
@@ -799,11 +820,11 @@ export function TaskForm({
         void submit(event);
       }}
     >
-      <div className="flex items-center justify-between gap-2">
+      <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-id`}>{TASK_FORM_ID_LABEL}</Label>
         <Input
           id={`${fieldId}-id`}
-          className="w-56"
+          className={TASK_FORM_CONTROL_CLASS}
           value={form.id}
           readOnly={editing}
           disabled={saving}
@@ -821,11 +842,11 @@ export function TaskForm({
           this is a name rather than a note, the row that will draw it has one
           line for it, and a box that invites paragraphs would be promising a
           surface that does not exist. */}
-      <div className="flex items-center justify-between gap-2">
+      <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-description`}>{TASK_FORM_DESCRIPTION_LABEL}</Label>
         <Input
           id={`${fieldId}-description`}
-          className="w-56"
+          className={TASK_FORM_CONTROL_CLASS}
           value={form.description}
           disabled={saving}
           placeholder="nightly backup of the photos"
@@ -837,11 +858,11 @@ export function TaskForm({
       {/* The option text is the stored spelling itself: the row's badge already
           shows `task.kind` verbatim, and two words for one stored value is
           exactly the drift AD-C7 forbids. */}
-      <div className="flex items-center justify-between gap-2">
+      <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-kind`}>{TASK_FORM_KIND_LABEL}</Label>
         <select
           id={`${fieldId}-kind`}
-          className={cn(SELECT_CLASS, "w-56")}
+          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
           value={form.kind}
           disabled={saving}
           onChange={(event) => setForm((live) => ({ ...live, kind: event.target.value }))}
@@ -855,11 +876,11 @@ export function TaskForm({
       </div>
       <p className="text-muted-foreground text-xs">{TASK_FORM_KIND_NOTE}</p>
 
-      <div className="flex items-center justify-between gap-2">
+      <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-mode`}>{TASK_FORM_MODE_LABEL}</Label>
         <select
           id={`${fieldId}-mode`}
-          className={cn(SELECT_CLASS, "w-56")}
+          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
           value={form.mode}
           disabled={saving}
           onChange={(event) => setForm((live) => ({ ...live, mode: event.target.value }))}
@@ -873,10 +894,15 @@ export function TaskForm({
       </div>
       <p className="text-muted-foreground text-xs">{TASK_FORM_MODE_NOTE}</p>
 
-      <div className="flex items-center justify-between gap-2">
+      <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-enabled`}>{TASK_FORM_ENABLED_LABEL}</Label>
         <Switch
           id={`${fieldId}-enabled`}
+          // `shrink-0` and not {@link TASK_FORM_CONTROL_CLASS}: a switch is not
+          // a 224px box and never was, but it is a flex item in a wrapping row
+          // and its default `flex-shrink: 1` would squash a 32px toggle the same
+          // way the row used to squash the 224px fields.
+          className="shrink-0"
           checked={form.enabled}
           disabled={saving}
           onCheckedChange={(checked) => setForm((live) => ({ ...live, enabled: checked }))}
@@ -890,11 +916,11 @@ export function TaskForm({
           for `profileId: null`. A `"__wide__"` sentinel translated back to `null`
           on the way out would be the same thing wearing a disguise. All three
           menus here are native so the form is one idiom rather than two. */}
-      <div className="flex items-center justify-between gap-2">
+      <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-profile`}>{TASK_FORM_PROFILE_LABEL}</Label>
         <select
           id={`${fieldId}-profile`}
-          className={cn(SELECT_CLASS, "w-56")}
+          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
           value={form.profileId}
           disabled={saving}
           onChange={(event) => setForm((live) => ({ ...live, profileId: event.target.value }))}
@@ -921,11 +947,11 @@ export function TaskForm({
         </p>
       )}
 
-      <div className="flex items-center justify-between gap-2">
+      <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-schedule`}>{TASK_FORM_SCHEDULE_LABEL}</Label>
         <Input
           id={`${fieldId}-schedule`}
-          className="w-56"
+          className={TASK_FORM_CONTROL_CLASS}
           value={form.schedule}
           disabled={saving}
           placeholder="0 3 * * *"
@@ -971,11 +997,11 @@ export function TaskForm({
           `value` is pinned to `""` so the control always reads as its own
           placeholder rather than pretending to mirror the box, and native for the
           reason the other four menus are. */}
-      <div className="flex items-center justify-between gap-2">
+      <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-schedule-offer`}>{TASK_FORM_SCHEDULE_OFFER_LABEL}</Label>
         <select
           id={`${fieldId}-schedule-offer`}
-          className={cn(SELECT_CLASS, "w-56")}
+          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
           value=""
           disabled={saving}
           onChange={(event) => {
@@ -1001,11 +1027,11 @@ export function TaskForm({
           the stored spelling itself — the same rule the kind menu states: two
           words for one stored value is the drift AD-C7 forbids, and this is the
           vocabulary `tasks list --json` prints. */}
-      <div className="flex items-center justify-between gap-2">
+      <div className={TASK_FORM_ROW_CLASS}>
         <Label htmlFor={`${fieldId}-on-missed`}>{TASK_FORM_ON_MISSED_LABEL}</Label>
         <select
           id={`${fieldId}-on-missed`}
-          className={cn(SELECT_CLASS, "w-56")}
+          className={cn(SELECT_CLASS, TASK_FORM_CONTROL_CLASS)}
           value={form.onMissed}
           disabled={saving}
           onChange={(event) => setForm((live) => ({ ...live, onMissed: event.target.value }))}
@@ -1027,11 +1053,11 @@ export function TaskForm({
 
       {showMissedDelay && (
         <>
-          <div className="flex items-center justify-between gap-2">
+          <div className={TASK_FORM_ROW_CLASS}>
             <Label htmlFor={`${fieldId}-missed-delay`}>{TASK_FORM_MISSED_DELAY_LABEL}</Label>
             <Input
               id={`${fieldId}-missed-delay`}
-              className="w-56"
+              className={TASK_FORM_CONTROL_CLASS}
               value={form.missedDelayMinutes}
               disabled={saving}
               inputMode="numeric"

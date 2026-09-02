@@ -43,6 +43,7 @@ import {
 import {
   TASK_FORM_ADD_SUBMIT_LABEL,
   TASK_FORM_ADD_TITLE,
+  TASK_FORM_CONTROL_CLASS,
   TASK_FORM_DESCRIPTION_LABEL,
   TASK_FORM_DESCRIPTION_NOTE,
   TASK_FORM_EDIT_SUBMIT_LABEL,
@@ -63,6 +64,7 @@ import {
   TASK_FORM_PROFILE_LABEL,
   TASK_FORM_PROFILE_READ_FAILED_PREFIX,
   TASK_FORM_PROFILE_READING_NOTE,
+  TASK_FORM_ROW_CLASS,
   TASK_FORM_SCHEDULE_LABEL,
   TASK_FORM_SCHEDULE_OFFER_LABEL,
   TASK_FORM_SCHEDULE_OFFER_NOTE,
@@ -1612,5 +1614,49 @@ wording needs rewriting rather than this regex widening`,
     // than assumed: "once a minute" at one, "once every N minutes" above one.
     expect(taskSchedulePeriodPhrase(1, "minute")).toBe("once a minute");
     expect(taskSchedulePeriodPhrase(366, "day")).toBe("once every 366 days");
+  });
+});
+
+/**
+ * What decides which half of a row gives when the row is too narrow (59.13).
+ *
+ * A structural guard and not a width: jsdom lays nothing out, so this asserts the
+ * two classes the measured behaviour rests on. Measured before them, in a 1024px
+ * window, this form's controls were **22px** wide and its notes rendered at one
+ * word per line — because a flex item's default `flex-shrink: 1` makes the sized
+ * box the elastic one, so the field gave and the label did not.
+ */
+describe("the form's rows wrap rather than squeezing their controls", () => {
+  it("wraps every row and refuses to shrink every control", async () => {
+    render(<TaskForm />);
+    const form = await screen.findByRole("form", { name: TASK_FORM_ADD_TITLE });
+
+    // Every label's row: the label's parent IS the row, in all ten of them.
+    const rows = Array.from(form.querySelectorAll("label")).map((label) => label.parentElement);
+    expect(rows.length).toBeGreaterThanOrEqual(8);
+    for (const row of rows) {
+      expect(row).toHaveClass("flex-wrap");
+    }
+
+    // And the controls those rows hold. `aria-hidden` skipped: Radix's `Switch`
+    // puts a form-bubbling checkbox behind the toggle, and it is not a control
+    // anybody's pointer reaches.
+    const controls = Array.from(form.querySelectorAll("input,select")).filter(
+      (control) => control.getAttribute("aria-hidden") !== "true",
+    );
+    expect(controls.length).toBeGreaterThanOrEqual(8);
+    for (const control of controls) {
+      expect(control).toHaveClass("shrink-0");
+    }
+  });
+
+  it("keeps the row and the control classes in one place each", () => {
+    // Ten copies of a class string are ten chances for one row to stop wrapping,
+    // and the defect would be invisible until somebody narrowed a window.
+    expect(TASK_FORM_ROW_CLASS).toContain("flex-wrap");
+    expect(TASK_FORM_CONTROL_CLASS).toContain("shrink-0");
+    // 224px is the number `TASKS_DETAIL_MIN_WIDTH_PX` is built from, so the two
+    // files have to be talking about the same control width.
+    expect(TASK_FORM_CONTROL_CLASS).toContain("w-56");
   });
 });
