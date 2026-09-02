@@ -20,9 +20,27 @@
  * A models read that fails does not blank the bot choice: the bot stays
  * selected and the failure is one sentence beside the control, because a person
  * whose Ollama is restarting still has the right bot chosen.
+ *
+ * # Two selects, one row, and the row does not grow (Story 61.14)
+ *
+ * The first cut drew every bot and every model as a chip in a wrapping row, so
+ * the picker's height was a function of how many models an endpoint listed:
+ * the owner's Ollama lists nine, which wrapped to two rows, and every row it
+ * grew by came out of the transcript below it. The header's own sentence —
+ * "two choices in one row, because they are one decision" — is now literal:
+ * one 32px row holds both controls, and a roster of ninety costs the same
+ * height as a roster of one. The capability caption a chip carried in its
+ * `title` is drawn beside the control instead, where it is readable without a
+ * pointer.
  */
 import { useEffect, useState } from "react";
-import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import type { BotModelVm, BotProviderVm, BotVm } from "@/lib/ipc/client";
 import { botsModelsList } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
@@ -134,56 +152,73 @@ export function BotPicker({
     }
   }, [models, selectedModel, onSelectModel]);
 
+  const picked = (models ?? []).find((model) => model.id === selectedModel) ?? null;
+  // What the model control says while it cannot offer a choice: reading, or
+  // an endpoint that answered with nothing. Both disable the control rather
+  // than hide it, so the row does not change shape under the person.
+  const modelPlaceholder =
+    models === null
+      ? BOT_PICKER_MODELS_LOADING
+      : models.length === 0 && error === null
+        ? BOT_PICKER_NO_MODELS
+        : BOT_PICKER_MODEL_LABEL;
+
   return (
-    <div className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-3">
-      <div className="flex flex-wrap items-center gap-1">
-        <span className="text-muted-foreground text-xs">{BOT_PICKER_BOT_LABEL}</span>
-        {bots.map((bot) => {
-          const provider = providers.find((row) => row.id === bot.providerId) ?? null;
-          return (
-            <Button
-              key={bot.id}
-              type="button"
+    <div className="flex shrink-0 flex-col gap-1 border-border border-b px-6 py-2">
+      {/* Wraps only when the pane is narrower than both controls — never
+          because a roster is long: each control is one bounded trigger. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Select value={selectedBotId ?? undefined} onValueChange={onSelectBot}>
+          <SelectTrigger
+            size="sm"
+            className="min-w-0 max-w-[280px]"
+            aria-label={BOT_PICKER_BOT_LABEL}
+          >
+            <SelectValue placeholder={BOT_PICKER_BOT_LABEL} />
+          </SelectTrigger>
+          <SelectContent>
+            {bots.map((bot) => {
+              const provider = providers.find((row) => row.id === bot.providerId) ?? null;
+              return (
+                <SelectItem key={bot.id} value={bot.id}>
+                  {/* The provider's name qualifies the bot, because two tenants
+                      legitimately hold a bot of the same name — a work Hermes
+                      and a home one — and a picker that showed only the bot
+                      name would make them indistinguishable. */}
+                  {provider === null ? bot.name : `${bot.name} · ${provider.name}`}
+                </SelectItem>
+              );
+            })}
+          </SelectContent>
+        </Select>
+        {selected !== null && (
+          <Select
+            value={picked?.id}
+            onValueChange={onSelectModel}
+            disabled={models === null || models.length === 0}
+          >
+            <SelectTrigger
               size="sm"
-              variant={bot.id === selectedBotId ? "secondary" : "ghost"}
-              aria-pressed={bot.id === selectedBotId}
-              onClick={() => onSelectBot(bot.id)}
+              className="min-w-0 max-w-[360px]"
+              aria-label={BOT_PICKER_MODEL_LABEL}
             >
-              {/* The provider's name qualifies the bot, because two tenants
-                  legitimately hold a bot of the same name — a work Hermes and a
-                  home one — and a picker that showed only the bot name would
-                  make them indistinguishable. */}
-              {provider === null ? bot.name : `${bot.name} · ${provider.name}`}
-            </Button>
-          );
-        })}
+              <SelectValue placeholder={modelPlaceholder} />
+            </SelectTrigger>
+            <SelectContent>
+              {(models ?? []).map((model) => (
+                <SelectItem key={model.id} value={model.id} title={botModelCaption(model)}>
+                  {model.id}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+        {picked !== null && (
+          <span className="min-w-0 flex-1 truncate text-muted-foreground text-xs">
+            {botModelCaption(picked)}
+          </span>
+        )}
       </div>
-      {selected !== null && (
-        <div className="flex flex-wrap items-center gap-1">
-          <span className="text-muted-foreground text-xs">{BOT_PICKER_MODEL_LABEL}</span>
-          {models === null && (
-            <span role="status" className="text-muted-foreground text-xs">
-              {BOT_PICKER_MODELS_LOADING}
-            </span>
-          )}
-          {models !== null && models.length === 0 && error === null && (
-            <span className="text-muted-foreground text-xs">{BOT_PICKER_NO_MODELS}</span>
-          )}
-          {(models ?? []).map((model) => (
-            <Button
-              key={model.id}
-              type="button"
-              size="sm"
-              variant={model.id === selectedModel ? "secondary" : "ghost"}
-              aria-pressed={model.id === selectedModel}
-              title={botModelCaption(model)}
-              onClick={() => onSelectModel(model.id)}
-            >
-              {model.id}
-            </Button>
-          ))}
-        </div>
-      )}
       {error !== null && (
         <p role="alert" className="text-destructive text-xs">
           {error}

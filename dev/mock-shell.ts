@@ -2184,6 +2184,28 @@ const BOT_ROWS: BotVm[] = [
   },
 ];
 
+/**
+ * One Ollama model with only the fields the roster varies. The nine names below
+ * are the owner's real `ollama list` (Story 61.14), and what they exercise is
+ * WIDTH: as chips they wrapped to two rows and every row came out of the
+ * transcript, so a harness with two models could not show the defect at all.
+ */
+function ollamaModel(id: string, family: string, parameterSize: string): BotModelVm {
+  return {
+    id,
+    family,
+    parameterSize,
+    quantization: "Q4_K_M",
+    sizeBytes: null,
+    contextWindow: null,
+    maxOutputTokens: null,
+    vision: false,
+    tools: true,
+    reasoning: false,
+    capabilities: ["completion", "tools"],
+  };
+}
+
 /** Per-bot model rosters, with the tri-state exercised on purpose: the Hermes
  *  alias reports nothing about vision, which is what an `unknown` capability
  *  looks like on screen. */
@@ -2215,6 +2237,15 @@ const BOT_MODELS: Record<string, BotModelVm[]> = {
       reasoning: true,
       capabilities: ["completion", "tools", "vision", "thinking"],
     },
+    ollamaModel("embeddinggemma:latest", "gemma", "300M"),
+    ollamaModel("hf.co/unsloth/Qwen3.8-27B-GGUF:Q4_K_M", "qwen3", "27B"),
+    ollamaModel("mythomax:13b", "llama", "13B"),
+    ollamaModel("gemma3:4b", "gemma3", "4.3B"),
+    ollamaModel("qwen3:4b", "qwen3", "4.0B"),
+    ollamaModel("gemma4:e4b", "gemma4", "4.5B"),
+    ollamaModel("qwen3.5:0.8b", "qwen3", "0.8B"),
+    ollamaModel("qwen3.5:2b", "qwen3", "2.0B"),
+    ollamaModel("qwen3.5:4b", "qwen3", "4.0B"),
   ],
   research: [
     {

@@ -406,32 +406,35 @@ export function BotComposer({
         </p>
       )}
 
-      <textarea
-        aria-label={BOT_COMPOSER_LABEL}
-        placeholder={BOT_COMPOSER_PLACEHOLDER}
-        value={draft}
-        rows={3}
-        className="min-h-0 w-full resize-none rounded-md border border-border bg-background px-3 py-2 text-sm"
-        onChange={(event) => {
-          setDraft(event.target.value);
-          // A refusal is about a draft, so editing the draft retires it.
-          setRefusal(null);
-        }}
-        onKeyDown={onKeyDown}
-        onPaste={(event) => {
-          // Ask rather than assume: `passthrough` means the browser's own
-          // behaviour is left in place, which is the honest answer where keeper
-          // has no model to ask about an image.
-          const decision = botPasteDecision(event.clipboardData, pasteContext);
-          if (decision.kind !== "passthrough") {
-            event.preventDefault();
-            onPaste?.(decision);
-          }
-        }}
-      />
-      <div className="flex items-center gap-2">
-        {disabled && <p className="text-muted-foreground text-xs">{BOT_COMPOSER_NO_BOT}</p>}
-        <span className="min-w-0 flex-1" />
+      {disabled && <p className="text-muted-foreground text-xs">{BOT_COMPOSER_NO_BOT}</p>}
+
+      {/* The field and its verb share one row (Story 61.14): stacked, the
+          verb's row was a 40px band of its own under a three-line field, and
+          every band here is height the transcript above does not get. */}
+      <div className="flex items-end gap-2">
+        <textarea
+          aria-label={BOT_COMPOSER_LABEL}
+          placeholder={BOT_COMPOSER_PLACEHOLDER}
+          value={draft}
+          rows={3}
+          className="min-h-0 min-w-0 flex-1 resize-none rounded-md border border-border bg-background px-3 py-2 text-sm"
+          onChange={(event) => {
+            setDraft(event.target.value);
+            // A refusal is about a draft, so editing the draft retires it.
+            setRefusal(null);
+          }}
+          onKeyDown={onKeyDown}
+          onPaste={(event) => {
+            // Ask rather than assume: `passthrough` means the browser's own
+            // behaviour is left in place, which is the honest answer where keeper
+            // has no model to ask about an image.
+            const decision = botPasteDecision(event.clipboardData, pasteContext);
+            if (decision.kind !== "passthrough") {
+              event.preventDefault();
+              onPaste?.(decision);
+            }
+          }}
+        />
         {streaming ? (
           <Button type="button" variant="outline" size="sm" onClick={onStop}>
             {BOT_COMPOSER_STOP_LABEL}

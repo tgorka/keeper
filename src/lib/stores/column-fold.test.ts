@@ -33,6 +33,7 @@ describe("column fold cookie", () => {
       "files-tree": true,
       "chat-list": false,
       "tasks-list": true,
+      "bots-list": false,
     };
     expect(readColumnFold(columnFoldCookie(fold))).toEqual(fold);
   });
@@ -72,6 +73,7 @@ describe("column fold cookie", () => {
       "files-tree": false,
       "chat-list": false,
       "tasks-list": false,
+      "bots-list": false,
     });
   });
 });

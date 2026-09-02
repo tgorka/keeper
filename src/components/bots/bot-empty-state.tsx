@@ -57,11 +57,15 @@ export const BOTS_EMPTY_COPY: Record<
   },
 };
 
-/** Render one empty state. */
+/**
+ * Render one empty state. It stands where the transcript would, so it takes
+ * the transcript's box — `min-h-0 flex-1` — rather than a height of its own:
+ * a band that could not shrink would push the composer under the window edge.
+ */
 export function BotEmptyState({ kind, onAction }: { kind: BotsEmptyKind; onAction: () => void }) {
   const { message, detail, action } = BOTS_EMPTY_COPY[kind];
   return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6">
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 overflow-y-auto p-6">
       <p className="max-w-[36ch] text-center text-muted-foreground text-sm">{message}</p>
       {detail !== null && (
         <p className="max-w-[36ch] text-center text-muted-foreground text-xs">{detail}</p>

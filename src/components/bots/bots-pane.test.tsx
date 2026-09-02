@@ -18,8 +18,12 @@
  * 4. **A dead stream leaves a partial row with a caption** — the terminal
  *    `closed` event carries `partial: true` and a reason, and what arrived is
  *    still on screen with a sentence saying it stopped.
+ * 5. **The transcript is the pane's flexible box** (Story 61.14) — structurally:
+ *    jsdom performs no layout, so the pixels were measured on Chrome through
+ *    `dev/mock-shell.ts` and the block at the end guards the decisions those
+ *    pixels were measured over.
  */
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { APPROVAL_DENY_LABEL, APPROVAL_ONCE_LABEL } from "@/components/bots/bot-approval-dialog";
 import {
@@ -30,9 +34,20 @@ import {
 import { BOT_CONTEXT_TITLE } from "@/components/bots/bot-context-note";
 import { BOTS_EMPTY_COPY } from "@/components/bots/bot-empty-state";
 import { BOT_PARTIAL_CAPTION, BOT_RETRY_LABEL } from "@/components/bots/bot-message";
-import { BOTS_PANE_TITLE, BotsPane } from "@/components/bots/bots-pane";
+import { BOT_SESSION_NEW_LABEL } from "@/components/bots/bot-session-list";
+import {
+  BOTS_PANE_TITLE,
+  BOTS_RAIL_LIST_LABEL,
+  BOTS_TRANSCRIPT_LEVEL_SLOT,
+  BotsPane,
+} from "@/components/bots/bots-pane";
 import { AppShell } from "@/components/layout/app-shell";
 import { SidebarPane } from "@/components/layout/sidebar-pane";
+import {
+  COLUMN_COLLAPSE_PREFIX,
+  COLUMN_RAIL_CONTROL_SLOT,
+} from "@/components/layout/surface-column";
+import { columnMinWidth, SURFACE_COLUMNS } from "@/lib/column-widths";
 import type {
   BotMessageVm,
   BotModelVm,
@@ -43,6 +58,7 @@ import type {
 } from "@/lib/ipc/client";
 import { botsStore } from "@/lib/stores/bots";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { resetColumnFoldForTest } from "@/lib/stores/column-fold";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 
 const botsChatStop = vi.fn();
@@ -185,6 +201,7 @@ afterEach(() => {
   primaryViewStore.getState().setView("inbox");
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   botsStore.getState().reset();
+  resetColumnFoldForTest();
 });
 
 describe("the Bots surface's capability gate", () => {
@@ -482,5 +499,82 @@ describe("BotsPane", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: APPROVAL_DENY_LABEL }));
     await waitFor(() => expect(botsApprovalAnswer).toHaveBeenCalledWith("ask-2", false));
+  });
+});
+
+/**
+ * What the layout depends on, as facts a test can hold (Story 61.14).
+ *
+ * Measured on Chrome at 1440×1050 before this story: the chrome above and
+ * below the transcript was 670px of a 1022px pane and the transcript 353px,
+ * with nothing in the pane a scroller. jsdom performs no layout, so nothing
+ * here is a height and nothing pretends to be: `dev/mock-shell.ts` under a
+ * real engine measured the pixels, and this block guards the structure those
+ * pixels were measured over. Each of these fails if the corresponding decision
+ * is reverted, and none of them can tell you the transcript is readable.
+ */
+describe("the Bots pane's layout contract", () => {
+  it("makes the transcript the one flexible box and bounds every band around it", async () => {
+    render(<BotsPane />);
+    await waitFor(() => expect(botsStore.getState().selectedModel).toBe(MODEL.id));
+
+    // The level that holds the transcript is the flexible half of the row, and
+    // it may shrink: without `min-h-0` a flex column's content is its floor
+    // and the composer is laid out under the window edge.
+    const level = document.querySelector(`[data-slot="${BOTS_TRANSCRIPT_LEVEL_SLOT}"]`);
+    expect(level).not.toBeNull();
+    expect(level).toHaveClass("flex", "flex-col", "flex-1", "min-h-0");
+
+    // Inside it, exactly one child is flexible — the transcript's box, which
+    // here is the empty state standing where the transcript would — and every
+    // other band is `shrink-0`: bounded chrome, not a claimant.
+    const children = [...(level as HTMLElement).children];
+    const flexible = children.filter((child) => child.classList.contains("flex-1"));
+    expect(flexible).toHaveLength(1);
+    expect(flexible[0]).toHaveClass("min-h-0");
+    expect(flexible[0]).toHaveTextContent(BOTS_EMPTY_COPY["no-conversation"].message);
+    for (const child of children) {
+      if (child !== flexible[0]) {
+        expect(child).toHaveClass("shrink-0");
+      }
+    }
+  });
+
+  it("draws the conversation list as a column beside the transcript, not a band above it", async () => {
+    render(<BotsPane />);
+    await waitFor(() => expect(botsStore.getState().sessions).not.toBeNull());
+
+    // A surface column: named from its own title band, floored at the
+    // registry's number, and able to give width rather than `shrink-0`.
+    const column = screen.getByRole("region", { name: SURFACE_COLUMNS["bots-list"].title });
+    expect(column.id).toBe("column-bots-list");
+    expect(column).not.toHaveClass("shrink-0");
+    expect(column.style.minWidth).toBe(`${columnMinWidth("bots-list")}px`);
+    // The list lives INSIDE the column, and the column and the transcript
+    // level are siblings in one row — the shape a list above the transcript
+    // cannot have.
+    const level = document.querySelector(`[data-slot="${BOTS_TRANSCRIPT_LEVEL_SLOT}"]`);
+    expect(column.parentElement).toBe(level?.parentElement);
+    expect(column.parentElement).toHaveClass("flex", "min-h-0", "flex-1");
+    expect(within(column).getByRole("button", { name: BOT_SESSION_NEW_LABEL })).toBeInTheDocument();
+  });
+
+  it("keeps the count and New reachable from the folded rail", async () => {
+    render(<BotsPane />);
+    await waitFor(() => expect(botsStore.getState().sessions).not.toBeNull());
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `${COLUMN_COLLAPSE_PREFIX} ${SURFACE_COLUMNS["bots-list"].label}`,
+      }),
+    );
+    // Folded, the body is gone — that is the height and the subscriptions the
+    // fold reclaims — and the rail says what it holds and gives it back.
+    expect(screen.queryByLabelText("Search conversations")).toBeNull();
+    const rail = [...document.querySelectorAll(`[data-slot="${COLUMN_RAIL_CONTROL_SLOT}"]`)].map(
+      (control) => control.getAttribute("aria-label"),
+    );
+    expect(rail[0]).toMatch(new RegExp(`^${BOTS_RAIL_LIST_LABEL}, .*conversations`));
+    expect(rail).toContain(BOT_SESSION_NEW_LABEL);
   });
 });
