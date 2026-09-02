@@ -4172,6 +4172,7 @@ dependencies = [
 name = "keeper-core"
 version = "0.8.24"
 dependencies = [
+ "base64 0.22.1",
  "flate2",
  "futures-util",
  "globset",

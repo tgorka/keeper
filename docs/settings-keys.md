@@ -48,6 +48,8 @@ file-controlled instead, and says which file.
 | | | | | Whether a remote redaction also removes the archived copy locally. |
 | `favorites_collapsed` | user-global | boolean (`true`/`false`) | `false` | `"favorites_collapsed" = true` |
 | | | | | Whether the Favorites section of the room list starts collapsed. |
+| `bots.message_details` | user-global | boolean (`1`/`0`) | `0` | `"bots.message_details" = true` |
+| | | | | Whether an answer shows its metadata caption — model, tokens, timings, finish reason, request id. |
 | `debug.mode` | user-global | boolean (`1`/`0`) | `0` | `"debug.mode" = true` |
 | | | | | On-disk event and error logging. Read before anything else at boot, so a file can turn it on for the boot that goes wrong. |
 | `incognito.global` | user-global | boolean (`1`/`0`) | `0` | `"incognito.global" = true` |

@@ -105,7 +105,15 @@ pub fn build_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     // Read through the shell's own capability probe rather than a `cfg!`, because
     // notes needs a usable `git` and that is a runtime fact (AD-41).
     let notes = notes_capability(app);
-    for section in registry_sections(crate::macos_version::recording_supported(), notes) {
+    // The bots gate is NOT that probe (Epic 61, FR-384): the pane needs no `git`
+    // and no `sync.db`, only a desktop shell, so it is `cfg!(desktop)` — the same
+    // words `capabilities` uses. This function only ever runs on desktop, which
+    // is exactly why the literal is honest rather than a shortcut.
+    for section in registry_sections(
+        crate::macos_version::recording_supported(),
+        notes,
+        cfg!(desktop),
+    ) {
         // Each generated item's id IS its canonical registry dispatch id; no
         // accelerator is bound (the JS hooks own every binding).
         let mut items: Vec<MenuItem<R>> = Vec::with_capacity(section.items.len());

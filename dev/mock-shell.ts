@@ -1044,6 +1044,10 @@ const ANSWERS: Record<string, unknown> = {
     sync: true,
     notes: true,
     sessions: true,
+    // The bots surface is desktop-only and needs neither git nor sync.db, so the
+    // harness advertises it: without this line the ⌘9 pane is unreachable in
+    // `bun run dev` (story 61.4).
+    bots: true,
     overlayTitleBar: true,
   } satisfies CapabilitiesVm,
   // ---------------------------------------------------------------------------

@@ -37,6 +37,7 @@
 
 pub mod anomaly;
 pub mod backoff;
+pub mod bots_fs;
 pub mod browse;
 pub mod copy;
 pub mod credential;

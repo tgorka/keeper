@@ -79,6 +79,32 @@ notes: boolean,
  */
 sessions: boolean, 
 /**
+ * The Bots surface (Epic 61, FR-378) can run here: **desktop, and nothing
+ * else** — computed in the shell like every other flag in this struct.
+ *
+ * **This is not a synonym for `sessions`, and the difference is the whole
+ * reason it is a separate flag.** `notes` and `sessions` are both
+ * `sync && desktop` because a vault and a sessions root are *folders
+ * keeper syncs*, so neither can exist without a usable `git`. Talking to a
+ * model needs neither `git` nor `sync.db`: a provider is a URL and a
+ * credential, a conversation is two tables in `keeper.db`, and a machine
+ * with no `git` at all can hold both. So a build gated on `sessions` here
+ * would hide a working surface on every desktop whose `git` is too old,
+ * which is a lie in the opposite direction from the one AD-27 usually
+ * guards.
+ *
+ * The half that genuinely needs `sync` is the drive-tool grant (Story
+ * 61.10, 61.11) — a tool call resolves a path inside a synced profile —
+ * and that affordance is gated on `sync` where it is offered. Two facts,
+ * two flags, and the split stated where both are declared.
+ *
+ * Desktop-only rather than everywhere because iOS has no place to put the
+ * surface: the pane is a three-column desktop layout and the phone tier
+ * replaces the whole shell row. When it is `false` every bots affordance
+ * is **absent** from the DOM rather than disabled.
+ */
+bots: boolean, 
+/**
  * The window's title bar is a transparent overlay over the webview, so the
  * native window controls float over page content (Story 34.2, AD-34-2):
  * `true` only on desktop macOS, the only platform where `tauri.conf.json`'s

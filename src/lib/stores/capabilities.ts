@@ -33,6 +33,7 @@ export const DEFAULT_CAPABILITIES: CapabilitiesVm = Object.freeze({
   sync: false,
   notes: false,
   sessions: false,
+  bots: false,
   overlayTitleBar: false,
 });
 

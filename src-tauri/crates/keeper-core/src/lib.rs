@@ -14,6 +14,7 @@ pub mod archive;
 pub mod auth;
 pub mod backup;
 pub mod badge;
+pub mod bots;
 pub mod bridge;
 pub mod bridges;
 pub mod capture;

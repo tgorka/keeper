@@ -1,11 +1,12 @@
 //! Egress honesty — the live set of network destinations keeper contacts (Story
-//! 11.2, NFR-11, UX-DR17; Story 23.7).
+//! 11.2, NFR-11, UX-DR17; Story 23.7; Story 61.1, FR-371).
 //!
 //! keeper makes a *verifiable* egress claim: [`compute_egress`] derives, from live
 //! app state, the exact set of hosts the app talks to — each account's Matrix
 //! homeserver, plus Beeper's `api.beeper.com` when (and only when) a Beeper account
-//! exists, plus the host of every folder-sync profile's git remote, plus the one
-//! signed auto-update endpoint. The Settings → About surface renders this set
+//! exists, plus the host of every folder-sync profile's git remote, plus the host
+//! of every configured AI provider, plus the one signed auto-update endpoint. The
+//! Settings → About surface renders this set
 //! directly (never a hardcoded doc), so the claim can never drift from reality.
 //!
 //! Bridges are Matrix appservices reached *through* the homeserver (server-side),
@@ -18,11 +19,21 @@
 //! would be a fabricated network claim. Only a remote with a real host is disclosed,
 //! and only its host: see [`remote_host`] for why the rest of the URL is dropped.
 //!
+//! AI providers (Story 61.1) go through the *same* [`remote_host`], not a second
+//! reduction of their own. A provider's base URL is usually loopback or a LAN
+//! address — both supported back ends bind `127.0.0.1` by default — so its row
+//! most often discloses that the bytes did not leave the machine, which is a
+//! claim worth making rather than leaving to inference. The credential is
+//! nowhere near this list: the base-URL grammar refuses userinfo and the token
+//! lives behind the secret port, and reducing to a host is the third
+//! independent reason a screen the user shares cannot show one.
+//!
 //! The function is kept pure over `[(homeserver_url, Provider)]` plus `[remote_url]`
+//! plus `[base_url]`
 //! (no `Platform`, no Tauri runtime, and no `keeper-sync` dependency — AD-40 keeps
 //! this crate free of it) so the whole I/O matrix is unit-testable; the `egress_list`
-//! IPC command reads the registry rows and the engine's profile rows and feeds both
-//! in as data.
+//! IPC command reads the registry rows, the engine's profile rows and the provider
+//! rows, and feeds them all in as data.
 
 use crate::auth::{is_beeper_homeserver, BEEPER_API_BASE};
 use crate::vm::{EgressEndpointVm, EgressKind, Provider};
@@ -124,18 +135,25 @@ fn remote_host(remote_url: &str) -> Option<String> {
 }
 
 /// Compute the live egress destination set from the accounts, the folder-sync
-/// profiles' remotes and the update endpoint (Story 11.2, NFR-11; Story 23.7).
+/// profiles' remotes, the configured AI providers and the update endpoint
+/// (Story 11.2, NFR-11; Story 23.7; Story 61.1, FR-371).
 ///
 /// `accounts` is `[(homeserver_url, provider)]` read from the same registry the
 /// session-restore path uses. `sync_remotes` is the `remote_url` of every profile
 /// in the live folder-sync profile set, passed as plain strings because AD-40 bars
 /// this crate from depending on `keeper-sync` — so adding a profile adds its host
 /// here on the next read, and removing the profile removes it, with no cache to go
-/// stale. The returned order is deterministic: each distinct homeserver (in
+/// stale. `provider_base_urls` is the base URL of every configured AI provider
+/// (`bots::store::provider_base_urls`), read the same way and for the same
+/// reason: a provider the user added is a destination on the next open, and one
+/// they removed is gone from it.
+///
+/// The returned order is deterministic: each distinct homeserver (in
 /// first-seen order, deduplicated), then `api.beeper.com` once when any account is
 /// Beeper, then each distinct sync remote *host* (first-seen, deduplicated — two
-/// profiles on one host are one entry, because they are one destination), then the
-/// update endpoint last. Never panics and never uses `.unwrap()` — a malformed
+/// profiles on one host are one entry, because they are one destination), then
+/// each distinct AI provider *host* on the same rule, then the update endpoint
+/// last. Never panics and never uses `.unwrap()` — a malformed
 /// homeserver URL is surfaced verbatim as a homeserver entry and is *not* treated
 /// as Beeper (host detection needs a parseable URL), and a sync remote with no
 /// network host (a local path, a pendrive) contributes nothing. Beeper presence
@@ -144,6 +162,7 @@ fn remote_host(remote_url: &str) -> Option<String> {
 pub fn compute_egress(
     accounts: &[(String, Provider)],
     sync_remotes: &[String],
+    provider_base_urls: &[String],
     update_endpoint: &str,
 ) -> Vec<EgressEndpointVm> {
     let mut endpoints: Vec<EgressEndpointVm> = Vec::new();
@@ -200,6 +219,36 @@ pub fn compute_egress(
         });
     }
 
+    // One entry per distinct AI-provider host (Story 61.1, FR-371). Host-only,
+    // and derived through the SAME `remote_host` a git remote goes through —
+    // not a second reduction that would have to be kept in step with it. A
+    // provider's base URL cannot legally carry userinfo (the grammar in
+    // `bots::url` refuses it), so this is belt and braces; belt and braces is
+    // exactly what an honesty surface should wear, because the row that leaks a
+    // token is the one written by a build where the grammar was looser than
+    // this function assumed.
+    //
+    // Deduplicated by host for the sync remotes' reason: a work Hermes and a
+    // home Hermes behind one gateway are one destination, and two identical
+    // rows would overstate the surface as surely as omitting one understates
+    // it. A base URL with no network host contributes nothing, the same answer
+    // AD-48 gives a pendrive remote.
+    let mut seen_provider_hosts: Vec<String> = Vec::new();
+    for base_url in provider_base_urls {
+        let Some(host) = remote_host(base_url) else {
+            continue;
+        };
+        if seen_provider_hosts.contains(&host) {
+            continue;
+        }
+        seen_provider_hosts.push(host.clone());
+        endpoints.push(EgressEndpointVm {
+            url: host,
+            kind: EgressKind::BotProvider,
+            label: "AI provider".to_owned(),
+        });
+    }
+
     // The signed-update endpoint is always present — keeper checks it regardless of
     // whether any account is signed in.
     endpoints.push(EgressEndpointVm {
@@ -225,6 +274,12 @@ mod tests {
     /// to leave empty (Story 23.7).
     const NO_REMOTES: &[String] = &[];
 
+    /// The same statement for the AI providers (Story 61.1): every row that
+    /// predates this feature pins "no provider configured" as an input, so a
+    /// provider row appearing where nobody added one would fail an existing
+    /// test rather than pass unnoticed.
+    const NO_PROVIDERS: &[String] = &[];
+
     /// Convenience: the (kind, url) shape of the result, for terse assertions.
     fn shape(endpoints: &[EgressEndpointVm]) -> Vec<(EgressKind, &str)> {
         endpoints.iter().map(|e| (e.kind, e.url.as_str())).collect()
@@ -233,7 +288,7 @@ mod tests {
     /// Matrix row 1 — No accounts: exactly one entry, the update endpoint.
     #[test]
     fn no_accounts_yields_only_the_update_endpoint() {
-        let out = compute_egress(&[], NO_REMOTES, UPDATE);
+        let out = compute_egress(&[], NO_REMOTES, NO_PROVIDERS, UPDATE);
         assert_eq!(shape(&out), vec![(EgressKind::Update, UPDATE)]);
     }
 
@@ -241,7 +296,7 @@ mod tests {
     #[test]
     fn one_non_beeper_account_has_homeserver_and_update_only() {
         let accounts = vec![("https://matrix.example.org".to_owned(), Provider::Password)];
-        let out = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -259,7 +314,7 @@ mod tests {
     #[test]
     fn one_beeper_account_by_provider_adds_beeper_api() {
         let accounts = vec![("https://matrix.beeper.com".to_owned(), Provider::Beeper)];
-        let out = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -279,7 +334,7 @@ mod tests {
             // Deliberately not the Beeper provider tag — host detection must win.
             Provider::Password,
         )];
-        let out = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -297,7 +352,7 @@ mod tests {
             ("https://matrix.example.org".to_owned(), Provider::Password),
             ("https://matrix.example.org".to_owned(), Provider::Oidc),
         ];
-        let out = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -321,7 +376,7 @@ mod tests {
             ("https://matrix.beeper.com".to_owned(), Provider::Beeper),
             ("https://matrix.beeper.com".to_owned(), Provider::Beeper),
         ];
-        let out = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
         assert_eq!(
             out.iter().filter(|e| e.kind == EgressKind::Beeper).count(),
             1,
@@ -343,7 +398,7 @@ mod tests {
     #[test]
     fn malformed_homeserver_url_is_shown_verbatim_and_not_beeper() {
         let accounts = vec![("not a url".to_owned(), Provider::Password)];
-        let out = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -363,7 +418,7 @@ mod tests {
     #[test]
     fn malformed_url_with_beeper_provider_still_adds_beeper_api() {
         let accounts = vec![("::::garbage".to_owned(), Provider::Beeper)];
-        let out = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -383,7 +438,7 @@ mod tests {
             ("https://matrix.example.org".to_owned(), Provider::Password),
             ("https://matrix.beeper.com".to_owned(), Provider::Beeper),
         ];
-        let out = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let out = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
         assert_eq!(
             shape(&out),
             vec![
@@ -406,9 +461,9 @@ mod tests {
     #[test]
     fn adding_a_sync_profile_discloses_exactly_one_entry_for_its_remote_host() {
         let accounts = one_account();
-        let before = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let before = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
         let remotes = vec!["https://github.com/tgorka/notes.git".to_owned()];
-        let after = compute_egress(&accounts, &remotes, UPDATE);
+        let after = compute_egress(&accounts, &remotes, NO_PROVIDERS, UPDATE);
 
         assert_eq!(
             shape(&after),
@@ -432,8 +487,8 @@ mod tests {
     fn removing_the_sync_profile_removes_its_entry_again() {
         let accounts = one_account();
         let remotes = vec!["https://github.com/tgorka/notes.git".to_owned()];
-        let with_profile = compute_egress(&accounts, &remotes, UPDATE);
-        let without_profile = compute_egress(&accounts, NO_REMOTES, UPDATE);
+        let with_profile = compute_egress(&accounts, &remotes, NO_PROVIDERS, UPDATE);
+        let without_profile = compute_egress(&accounts, NO_REMOTES, NO_PROVIDERS, UPDATE);
 
         assert!(
             with_profile
@@ -462,7 +517,7 @@ mod tests {
             // same host to DNS and must be the same host here.
             "https://GitHub.com/tgorka/archive.git".to_owned(),
         ];
-        let out = compute_egress(&one_account(), &remotes, UPDATE);
+        let out = compute_egress(&one_account(), &remotes, NO_PROVIDERS, UPDATE);
 
         assert_eq!(
             out.iter()
@@ -498,7 +553,7 @@ mod tests {
             "/srv/repos/a:b".to_owned(),
             "".to_owned(),
         ];
-        let out = compute_egress(&one_account(), &remotes, UPDATE);
+        let out = compute_egress(&one_account(), &remotes, NO_PROVIDERS, UPDATE);
 
         assert_eq!(
             shape(&out),
@@ -524,7 +579,7 @@ mod tests {
             // ssh with an explicit user and port.
             "ssh://deploy@ssh.example.com:2222/srv/git/vault.git".to_owned(),
         ];
-        let out = compute_egress(&one_account(), &remotes, UPDATE);
+        let out = compute_egress(&one_account(), &remotes, NO_PROVIDERS, UPDATE);
 
         assert_eq!(
             shape(&out),
@@ -571,7 +626,7 @@ mod tests {
             "/Volumes/pendrive/vault.git".to_owned(),
             "git@gitlab.example.org:team/archive.git".to_owned(),
         ];
-        let out = compute_egress(&accounts, &remotes, UPDATE);
+        let out = compute_egress(&accounts, &remotes, NO_PROVIDERS, UPDATE);
 
         assert_eq!(
             shape(&out),
@@ -583,6 +638,109 @@ mod tests {
                 (EgressKind::GitRemote, "gitlab.example.org"),
                 (EgressKind::Update, UPDATE),
             ]
+        );
+    }
+
+    /// Story 61.1, FR-371: a provider is disclosed as a HOST, and a credential
+    /// pasted into its URL cannot reach the screen.
+    ///
+    /// The base-URL grammar (`bots::url`) already refuses userinfo, so a row
+    /// shaped like this should not exist — which is exactly why the disclosure
+    /// is reduced by `remote_host` anyway. The row that leaks a token is the one
+    /// written by a build whose grammar was looser than this function assumed,
+    /// and Settings → About is a screen people share.
+    #[test]
+    fn a_provider_is_disclosed_as_a_host_and_never_as_a_url() {
+        let providers = vec!["https://oauth2:ghp_live@gw.example.org/v1".to_owned()];
+        let out = compute_egress(&one_account(), NO_REMOTES, &providers, UPDATE);
+
+        assert_eq!(
+            shape(&out),
+            vec![
+                (EgressKind::Homeserver, "https://matrix.example.org"),
+                (EgressKind::BotProvider, "gw.example.org"),
+                (EgressKind::Update, UPDATE),
+            ]
+        );
+        for endpoint in &out {
+            assert!(
+                !endpoint.url.contains("ghp_live")
+                    && !endpoint.url.contains("oauth2")
+                    && !endpoint.url.contains('@'),
+                "no disclosed destination may carry a credential: {}",
+                endpoint.url
+            );
+        }
+        assert!(
+            !out.iter()
+                .any(|e| e.kind == EgressKind::BotProvider && e.url.contains("/v1")),
+            "a provider row is the host and nothing else — not its path"
+        );
+    }
+
+    /// The dedup rule matches the git remotes' rule verbatim, because the reason
+    /// is the same one: two providers behind one gateway are one destination,
+    /// and a loopback provider is a destination worth naming rather than hiding.
+    #[test]
+    fn two_providers_on_one_host_are_one_row_and_a_pathless_url_is_none() {
+        let providers = vec![
+            "https://gw.example.org/hermes".to_owned(),
+            "https://gw.example.org/ollama".to_owned(),
+            "http://localhost:11434".to_owned(),
+            // Not a URL keeper would have stored (the grammar refuses it), so it
+            // names no host and must contribute no row — the same answer AD-48
+            // gives a pendrive remote.
+            "/srv/models".to_owned(),
+            "   ".to_owned(),
+        ];
+        let out = compute_egress(&one_account(), NO_REMOTES, &providers, UPDATE);
+
+        assert_eq!(
+            out.iter()
+                .filter(|e| e.kind == EgressKind::BotProvider)
+                .map(|e| e.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gw.example.org", "localhost"],
+            "one row per distinct host, first-seen, and nothing for a URL with no host"
+        );
+    }
+
+    /// The disclosure is derived, never hand-listed (AD-53): adding a provider
+    /// adds its host on the next read and removing it removes the entry — with
+    /// nothing else moving, and the update endpoint still last.
+    #[test]
+    fn adding_a_provider_adds_its_host_and_removing_it_removes_the_entry() {
+        let accounts = one_account();
+        let remotes = vec!["https://github.com/tgorka/notes.git".to_owned()];
+        let providers = vec!["http://127.0.0.1:8642".to_owned()];
+
+        let with_provider = compute_egress(&accounts, &remotes, &providers, UPDATE);
+        assert_eq!(
+            shape(&with_provider),
+            vec![
+                (EgressKind::Homeserver, "https://matrix.example.org"),
+                (EgressKind::GitRemote, "github.com"),
+                (EgressKind::BotProvider, "127.0.0.1"),
+                (EgressKind::Update, UPDATE),
+            ],
+            "providers disclose after the sync remotes, and the update endpoint stays last"
+        );
+
+        let without_provider = compute_egress(&accounts, &remotes, NO_PROVIDERS, UPDATE);
+        assert!(
+            !without_provider
+                .iter()
+                .any(|e| e.kind == EgressKind::BotProvider),
+            "removing every provider must remove the kind from the disclosure entirely"
+        );
+        assert_eq!(
+            shape(&without_provider),
+            vec![
+                (EgressKind::Homeserver, "https://matrix.example.org"),
+                (EgressKind::GitRemote, "github.com"),
+                (EgressKind::Update, UPDATE),
+            ],
+            "removing the provider must remove its entry and nothing else"
         );
     }
 
@@ -605,6 +763,7 @@ mod tests {
             EgressKind::Homeserver,
             EgressKind::Beeper,
             EgressKind::GitRemote,
+            EgressKind::BotProvider,
             EgressKind::Update,
         ];
 
@@ -615,14 +774,17 @@ mod tests {
                 EgressKind::Homeserver => {}
                 EgressKind::Beeper => {}
                 EgressKind::GitRemote => {}
+                EgressKind::BotProvider => {}
                 EgressKind::Update => {}
             }
         }
 
-        // Everything switched on at once: a Beeper account and a networked profile.
+        // Everything switched on at once: a Beeper account, a networked profile
+        // and a configured AI provider.
         let accounts = vec![("https://matrix.beeper.com".to_owned(), Provider::Beeper)];
         let remotes = vec!["https://github.com/tgorka/notes.git".to_owned()];
-        let out = compute_egress(&accounts, &remotes, UPDATE);
+        let providers = vec!["https://gw.example.org/v1".to_owned()];
+        let out = compute_egress(&accounts, &remotes, &providers, UPDATE);
 
         for kind in ALL_KINDS {
             assert!(

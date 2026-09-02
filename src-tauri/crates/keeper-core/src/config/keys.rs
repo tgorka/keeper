@@ -381,6 +381,17 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Whether the Favorites section of the room list starts collapsed.",
         example: "true",
     },
+    // ---- bots ------------------------------------------------------------
+    KeySpec {
+        key: "bots.message_details",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether an answer shows its metadata caption — model, tokens, timings, finish reason, request id.",
+        example: "true",
+    },
     // ---- debug -----------------------------------------------------------
     KeySpec {
         key: "debug.mode",

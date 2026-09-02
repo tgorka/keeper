@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::bots::{BotHealthState, ProviderKind};
 use crate::notes::export::NoteExportPlan;
 use crate::signals::IncognitoScope;
 
@@ -135,6 +136,30 @@ pub struct CapabilitiesVm {
     /// every sessions affordance is **absent** from the DOM rather than
     /// disabled, which is the whole of FR-223.
     pub sessions: bool,
+    /// The Bots surface (Epic 61, FR-378) can run here: **desktop, and nothing
+    /// else** — computed in the shell like every other flag in this struct.
+    ///
+    /// **This is not a synonym for `sessions`, and the difference is the whole
+    /// reason it is a separate flag.** `notes` and `sessions` are both
+    /// `sync && desktop` because a vault and a sessions root are *folders
+    /// keeper syncs*, so neither can exist without a usable `git`. Talking to a
+    /// model needs neither `git` nor `sync.db`: a provider is a URL and a
+    /// credential, a conversation is two tables in `keeper.db`, and a machine
+    /// with no `git` at all can hold both. So a build gated on `sessions` here
+    /// would hide a working surface on every desktop whose `git` is too old,
+    /// which is a lie in the opposite direction from the one AD-27 usually
+    /// guards.
+    ///
+    /// The half that genuinely needs `sync` is the drive-tool grant (Story
+    /// 61.10, 61.11) — a tool call resolves a path inside a synced profile —
+    /// and that affordance is gated on `sync` where it is offered. Two facts,
+    /// two flags, and the split stated where both are declared.
+    ///
+    /// Desktop-only rather than everywhere because iOS has no place to put the
+    /// surface: the pane is a three-column desktop layout and the phone tier
+    /// replaces the whole shell row. When it is `false` every bots affordance
+    /// is **absent** from the DOM rather than disabled.
+    pub bots: bool,
     /// The window's title bar is a transparent overlay over the webview, so the
     /// native window controls float over page content (Story 34.2, AD-34-2):
     /// `true` only on desktop macOS, the only platform where `tauri.conf.json`'s
@@ -1412,15 +1437,17 @@ impl Provider {
     }
 }
 
-/// The kind of a network egress destination (Story 11.2, NFR-11; Story 23.7).
+/// The kind of a network egress destination (Story 11.2, NFR-11; Story 23.7;
+/// Story 61.1).
 ///
 /// Classifies each entry in the [`EgressEndpointVm`] list the Settings → About
 /// surface renders so the frontend can label it honestly without re-deriving the
 /// classification. `Homeserver` is an account's Matrix homeserver; `Beeper` is the
 /// `api.beeper.com` login/service endpoint present exactly when a Beeper account
 /// exists; `GitRemote` is the host of one folder-sync profile's remote repository;
-/// `Update` is the signed-update endpoint the app checks. Serializes to
-/// `"homeserver" | "beeper" | "gitRemote" | "update"`.
+/// `BotProvider` is the host of one configured AI provider; `Update` is the
+/// signed-update endpoint the app checks. Serializes to
+/// `"homeserver" | "beeper" | "gitRemote" | "botProvider" | "update"`.
 ///
 /// The container rename is `camelCase` rather than `lowercase` (Story 23.7) so a
 /// multi-word variant reads as `gitRemote` on the wire, matching every other
@@ -1443,6 +1470,15 @@ pub enum EgressKind {
     /// do bytes go", and the host is the whole of that answer; the rest is only
     /// material to leak onto a screen the user may be sharing.
     GitRemote,
+    /// The *host* of one configured AI provider — a Hermes gateway or an Ollama
+    /// server (Story 61.1, FR-371).
+    ///
+    /// The host alone, for [`EgressKind::GitRemote`]'s reason and derived by the
+    /// same function. Usually a private one: both supported back ends bind
+    /// loopback by default, so this row most often discloses that the bytes did
+    /// not leave the machine — which is a claim worth making explicitly rather
+    /// than by omission.
+    BotProvider,
     /// The signed auto-update endpoint (`plugins.updater.endpoints`).
     Update,
 }
@@ -5169,6 +5205,1654 @@ fn layers_summary(overrides: usize, faults: usize) -> String {
         )),
     }
     summary
+}
+
+/// One model an AI provider will accept as the `model` field of a chat request
+/// (Story 61.3, FR-377).
+///
+/// Read from the endpoint, never assumed. The three capability flags are a
+/// **tri-state**: `Some(true)` the endpoint said yes, `Some(false)` the
+/// endpoint said no, `None` the endpoint did not say. `None` is *unknown* and
+/// is never flattened to `false` anywhere — an Ollama build older than the
+/// `capabilities` array, or a Hermes deployment whose `/api/model/options` is
+/// unreachable, tells keeper nothing about vision, and "nothing" is not "no"
+/// (AD-27). The surface offers an unknown capability with a warning; it hides
+/// only a capability the endpoint refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotModelVm {
+    /// What to send as `model` — an Ollama tag (`"llama4:8b"`) or a Hermes
+    /// alias (`"hermes-agent"`, or a `model_routes` alias).
+    pub id: String,
+    /// The model family where the endpoint reports one (`"qwen2"`), else `None`.
+    pub family: Option<String>,
+    /// The parameter size verbatim as the endpoint spells it (`"7.6B"`).
+    ///
+    /// A string and not a number on purpose: it is a label the endpoint chose,
+    /// and parsing it into a float would invent precision keeper did not read.
+    pub parameter_size: Option<String>,
+    /// The quantization level verbatim (`"Q4_K_M"`), else `None`.
+    pub quantization: Option<String>,
+    /// On-disk size in bytes where the endpoint reports it (Ollama does).
+    #[ts(type = "number | null")]
+    pub size_bytes: Option<i64>,
+    /// The context window in tokens where the endpoint states it.
+    ///
+    /// Absent for Ollama over discovery: the trained maximum, the window the
+    /// server will allocate and the window a loaded instance is running with
+    /// are three different numbers, and printing one of them as *the* window
+    /// would be a number keeper did not measure.
+    #[ts(type = "number | null")]
+    pub context_window: Option<i64>,
+    /// The output cap in tokens where the endpoint states it (Hermes does).
+    #[ts(type = "number | null")]
+    pub max_output_tokens: Option<i64>,
+    /// Whether the model can see an image. `None` = the endpoint did not say.
+    pub vision: Option<bool>,
+    /// Whether the model can be given tools. `None` = the endpoint did not say.
+    pub tools: Option<bool>,
+    /// Whether the model reasons/thinks. `None` = the endpoint did not say.
+    pub reasoning: Option<bool>,
+    /// Every capability string the endpoint served, verbatim and unfiltered.
+    ///
+    /// Ollama's vocabulary is open-ended (`completion`, `tools`, `insert`,
+    /// `vision`, `embedding`, `thinking`, `image`, `audio` today), so keeper
+    /// keeps the words it was given instead of narrowing them to the three it
+    /// currently understands. Empty means the endpoint served no list at all,
+    /// which is exactly the case the three flags report as `None`.
+    pub capabilities: Vec<String>,
+}
+
+/// Whether an endpoint answered, in the two words the app already uses for a
+/// remote it cannot reach.
+///
+/// Deliberately [`ConnectionStatus`]'s vocabulary rather than a third spelling
+/// of the same fact: `keeper-sync` calls an unreachable folder's state
+/// `offline` (`profile/mod.rs`, `progress.rs`'s status line) and the Matrix
+/// connection pill calls a dead homeserver `offline` too. A chat endpoint that
+/// does not answer is the same event, so it gets the same word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BotReach {
+    /// The endpoint answered — with any HTTP status, including 401 and 404.
+    /// An answer keeper did not like is still an answer.
+    Online,
+    /// Nothing answered: DNS, connect, TLS or a socket that went quiet.
+    Offline,
+}
+
+/// Whether a named bot exists at an endpoint — the honest third arm included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BotPresence {
+    /// The endpoint served this bot's own model list, so the bot is there.
+    Exists,
+    /// The endpoint answered, and said it has no such bot.
+    Absent,
+    /// keeper could not tell: a rejected credential, an unexpected status, or
+    /// nothing on the wire. Never collapsed into `Absent` — "I could not ask"
+    /// and "it is not there" are different sentences to a user who is about to
+    /// retype a name that was right all along.
+    Unknown,
+}
+
+/// What keeper learned by asking an endpoint one question (Story 61.3, FR-375,
+/// FR-376).
+///
+/// Serves both probes: a provider probe (`bot` is `None`) and a bot probe
+/// (`bot` names the profile or model tag that was asked about). Never an error
+/// type — an endpoint that refused, or never answered, is a *fact about the
+/// endpoint* that the surface must be able to print.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotProbeVm {
+    /// Whether anything answered at all.
+    pub reach: BotReach,
+    /// The HTTP status of the answer, where one arrived.
+    pub status: Option<u16>,
+    /// The server's own version string where the endpoint reports one —
+    /// Ollama's `/api/version`, Hermes' `/health`. `None` is not a fault: an
+    /// endpoint is allowed to be silent about what it is.
+    pub version: Option<String>,
+    /// Wall-clock milliseconds from request to the status line, where one
+    /// arrived. Measured, not estimated.
+    #[ts(type = "number | null")]
+    pub round_trip_ms: Option<i64>,
+    /// The bot that was asked about, echoed back; `None` for a provider probe.
+    pub bot: Option<String>,
+    /// The verdict on that bot; `None` for a provider probe.
+    pub presence: Option<BotPresence>,
+    /// keeper's own sentence for whatever went wrong, ready to print. Carries
+    /// no credential and no full URL — a token never reaches a screen or a log.
+    pub reason: Option<String>,
+}
+
+/// One configured AI provider, as the Settings and picker surfaces render it
+/// (Story 61.1, FR-369, FR-370).
+///
+/// **What is deliberately absent is the point.** There is no token field and no
+/// field a token could hide in: the credential lives behind the secret port
+/// (`bots::provider_token_key`) and the base-URL grammar refuses userinfo, so
+/// the strongest statement this VM can make about it is [`has_token`] — a
+/// boolean the surface needs in order to say "no credential stored" *before*
+/// the user sends a message, rather than at send time (FR-370).
+///
+/// [`has_token`]: BotProviderVm::has_token
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotProviderVm {
+    /// The provider's opaque id — every command's handle on it.
+    pub id: String,
+    /// Which back end this is.
+    pub kind: ProviderKind,
+    /// The user's display name for this tenant.
+    pub name: String,
+    /// The normalized base URL, safe to render: the grammar admits no userinfo,
+    /// no query and no fragment, so there is nothing in it to redact.
+    pub base_url: String,
+    /// The host alone — what the egress disclosure shows, repeated here so the
+    /// provider card and Settings → About name the same destination without the
+    /// frontend parsing a URL.
+    pub host: String,
+    /// Whether the endpoint is loopback / private / LAN-only, so the card can
+    /// disclose which side of the network the bytes stay on.
+    ///
+    /// `None` when the stored URL no longer parses — a hand-edited row. Not
+    /// `false`: "keeper could not tell" and "this reaches the open internet"
+    /// are different claims, and the epic's rule is that the unreadable one is
+    /// `unknown`.
+    pub is_private: Option<bool>,
+    /// When the provider was added, ms since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub created_ms: i64,
+    /// The last verdict keeper reached by talking to it — `unknown` until
+    /// something has.
+    pub health: BotHealthState,
+    /// When that verdict was reached, or `null` when no probe has ever run.
+    /// Absent rather than zero: this app does not print a number it did not
+    /// measure.
+    #[ts(type = "number | null")]
+    pub health_checked_ms: Option<i64>,
+    /// The endpoint's own words about that verdict, ready to print.
+    pub health_detail: Option<String>,
+    /// The per-provider silence bound in ms, or `null` when the policy default
+    /// is in force.
+    #[ts(type = "number | null")]
+    pub read_timeout_ms: Option<i64>,
+    /// Whether the secret port holds a credential for this provider.
+    ///
+    /// The *presence* of a secret, never the secret. An Ollama on loopback
+    /// legitimately has none (research §3.5), so `false` is not a fault by
+    /// itself — it is a fault only when the endpoint answered `401`, which is
+    /// what [`BotProviderVm::health`] says.
+    pub has_token: bool,
+}
+
+impl BotProviderVm {
+    /// Project a stored provider row for the UI (Story 61.1).
+    ///
+    /// `has_token` is a parameter because it is a keychain fact, and this crate
+    /// reaches the OS only through `Platform` (AD-24) — the shell reads it once
+    /// per list rather than making this projection do I/O. The host and the
+    /// private-network flag are re-derived from the stored URL by the same
+    /// grammar that accepted it (`bots::parse_base_url`), so the disclosure on
+    /// the card and the refusal in the form can never disagree.
+    pub fn compose(row: &crate::bots::store::ProviderRow, has_token: bool) -> Self {
+        let parsed = crate::bots::parse_base_url(&row.provider.base_url).ok();
+        BotProviderVm {
+            id: row.provider.id.clone(),
+            kind: row.provider.kind,
+            name: row.provider.name.clone(),
+            base_url: row.provider.base_url.clone(),
+            host: parsed
+                .as_ref()
+                .map_or_else(|| row.provider.base_url.clone(), |url| url.host.clone()),
+            is_private: parsed.as_ref().map(|url| url.is_private),
+            created_ms: row.provider.created_ms,
+            health: row.health.state,
+            health_checked_ms: row.health.checked_ms,
+            health_detail: row.health.detail.clone(),
+            read_timeout_ms: row.read_timeout_ms,
+            has_token,
+        }
+    }
+}
+
+/// One pinned bot, as the pinned strip and the conversation header render it
+/// (Story 61.1, FR-383).
+///
+/// A bot is (provider, target, identity), and all three are here: `providerId`
+/// says which endpoint, `target` says what it is on the far side, and the three
+/// identity fields say how it looks. The identity fields are `null` until Story
+/// 61.7 gives them a picker and a bounded, contrast-checked palette — an
+/// assigned colour would have to be un-assigned later, and `DESIGN.md:172`
+/// requires a colour to be paired with a shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotVm {
+    /// The bot's opaque id — every command's handle on it.
+    pub id: String,
+    /// The owning provider's id.
+    pub provider_id: String,
+    /// The Hermes profile name or the Ollama model tag this bot **is**.
+    pub target: String,
+    /// The user's display name.
+    pub name: String,
+    /// Position in the hand-set order, ascending.
+    #[ts(type = "number")]
+    pub pin_order: i64,
+    /// The chosen shape, from Story 61.7's closed set; `null` until chosen.
+    pub shape: Option<String>,
+    /// The chosen colour **token**, from Story 61.7's bounded palette — never a
+    /// hex value, so `scripts/check-design.mjs` stays the single authority on
+    /// what passes AA in both themes. `null` until chosen.
+    pub colour: Option<String>,
+    /// The chosen mark: a short grapheme or an existing icon name. `null` until
+    /// chosen.
+    pub mark: Option<String>,
+    /// When the bot was pinned, ms since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub created_ms: i64,
+}
+
+impl BotVm {
+    /// Project a stored bot row for the UI (Story 61.1).
+    pub fn compose(bot: &crate::bots::Bot) -> Self {
+        BotVm {
+            id: bot.id.clone(),
+            provider_id: bot.provider_id.clone(),
+            target: bot.target.clone(),
+            name: bot.name.clone(),
+            pin_order: bot.pin_order,
+            shape: bot.identity.shape.clone(),
+            colour: bot.identity.colour.clone(),
+            mark: bot.identity.mark.clone(),
+            created_ms: bot.created_ms,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 61.4 — the conversation surface's view models
+// ---------------------------------------------------------------------------
+
+/// One conversation with one bot, as the session list and the pane header
+/// render it (Story 61.4, FR-381).
+///
+/// keeper's own record and not the remote's: `remoteSessionId` is a
+/// *reference* the Hermes detail may show, and the epic's second decision says
+/// why it can never be the truth — compression mints a successor session with a
+/// renamed title, the stored-response cache is 100 rows LRU, and Ollama has no
+/// session concept at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotSessionVm {
+    /// The session's opaque id — every command's handle on it.
+    pub id: String,
+    /// The bot this conversation is with.
+    pub bot_id: String,
+    /// That bot's provider.
+    pub provider_id: String,
+    /// The title, minted locally from the first user message.
+    pub title: String,
+    /// When the conversation started, ms since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub created_ms: i64,
+    /// When it last changed, ms since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub updated_ms: i64,
+    /// Whether it has been archived. Reversible (Story 61.6).
+    pub archived: bool,
+    /// The remote's own session id where the far side has one, else `null`.
+    pub remote_session_id: Option<String>,
+}
+
+impl BotSessionVm {
+    /// Project a stored conversation for the UI (Story 61.4).
+    pub fn compose(session: &crate::bots::session::BotSession) -> Self {
+        BotSessionVm {
+            id: session.id.clone(),
+            bot_id: session.bot_id.clone(),
+            provider_id: session.provider_id.clone(),
+            title: session.title.clone(),
+            created_ms: session.created_ms,
+            updated_ms: session.updated_ms,
+            archived: session.archived,
+            remote_session_id: session.remote_session_id.clone(),
+        }
+    }
+}
+
+/// One message of a conversation, with everything Story 61.8 will show
+/// (Story 61.4, FR-384).
+///
+/// **Every number is nullable and none of them is ever zero-filled.** An
+/// endpoint that omits `usage` is a fact about the endpoint, so an unreported
+/// token count arrives as `null` and renders as absent — this is the app that
+/// refuses to print a number it did not measure.
+///
+/// `role` and `finishReason` are strings rather than enums for `TaskVm.kind`'s
+/// reason: a row a newer keeper wrote must reach the view as the spelling it
+/// has, so the pane can show it instead of hiding it (NFR-43). `finishReason`
+/// also carries the provider's own invented word verbatim, which is more use in
+/// a caption than keeper's guess at which of its own arms it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotMessageVm {
+    /// The message's opaque id — the handle Retry needs.
+    pub id: String,
+    /// The conversation it belongs to.
+    pub session_id: String,
+    /// Its position in that conversation, ascending from 0.
+    #[ts(type = "number")]
+    pub seq: i64,
+    /// `user` | `assistant` | `system` | `tool`, verbatim.
+    pub role: String,
+    /// The text. For a streaming assistant row this is what has arrived.
+    pub content: String,
+    /// The model the server says answered, which may differ from the model
+    /// requested. `null` where it did not say.
+    pub model: Option<String>,
+    /// The provider that answered, where one did.
+    pub provider_id: Option<String>,
+    /// Prompt tokens where the endpoint reported them, else `null`.
+    #[ts(type = "number | null")]
+    pub prompt_tokens: Option<i64>,
+    /// Completion tokens where the endpoint reported them, else `null`.
+    #[ts(type = "number | null")]
+    pub completion_tokens: Option<i64>,
+    /// Total tokens where the endpoint reported them, else `null`.
+    #[ts(type = "number | null")]
+    pub total_tokens: Option<i64>,
+    /// Milliseconds to the first delta of any kind — measured, not estimated.
+    #[ts(type = "number | null")]
+    pub ttft_ms: Option<i64>,
+    /// Milliseconds from request to the end of the stream.
+    #[ts(type = "number | null")]
+    pub duration_ms: Option<i64>,
+    /// Why the model stopped, in the provider's own word.
+    pub finish_reason: Option<String>,
+    /// The provider's completion id, for a support conversation about one
+    /// answer.
+    pub request_id: Option<String>,
+    /// How many tool calls this turn made.
+    #[ts(type = "number")]
+    pub tool_call_count: i64,
+    /// Whether this row never finished — a stopped stream, a dead socket, or a
+    /// process that died mid-answer. The pane captions it rather than hiding
+    /// it: a truncated answer the person can see is a record, and a discarded
+    /// one is a surprise.
+    pub partial: bool,
+    /// When the row was written, ms since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub created_ms: i64,
+}
+
+impl BotMessageVm {
+    /// Project a stored message for the UI (Story 61.4).
+    pub fn compose(message: &crate::bots::session::BotMessage) -> Self {
+        BotMessageVm {
+            id: message.id.clone(),
+            session_id: message.session_id.clone(),
+            seq: message.seq,
+            role: message.role.clone(),
+            content: message.content.clone(),
+            model: message.model.clone(),
+            provider_id: message.provider_id.clone(),
+            prompt_tokens: message.prompt_tokens,
+            completion_tokens: message.completion_tokens,
+            total_tokens: message.total_tokens,
+            ttft_ms: message.ttft_ms,
+            duration_ms: message.duration_ms,
+            finish_reason: message.finish_reason.clone(),
+            request_id: message.request_id.clone(),
+            tool_call_count: message.tool_call_count,
+            partial: message.partial,
+            created_ms: message.created_ms,
+        }
+    }
+}
+
+/// A conversation and its messages in one read (Story 61.4, FR-382).
+///
+/// One command rather than two, because a session header rendered beside a
+/// message list read a moment later is a surface that can show one
+/// conversation's title over another's rows for a frame. Resume replays from
+/// keeper's own store, so there is nothing to fetch from the remote here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotConversationVm {
+    /// The conversation.
+    pub session: BotSessionVm,
+    /// Its messages, in order.
+    pub messages: Vec<BotMessageVm>,
+}
+
+/// What the webview is told while an answer is arriving (Story 61.4, FR-372,
+/// FR-373).
+///
+/// Internally tagged on `kind`, the `NoteBodyBatch` shape, so the frontend
+/// switches on one discriminant. The events mirror
+/// [`crate::bots::chat::ChatEvent`] rather than re-deriving it, with two
+/// deliberate differences:
+///
+/// * [`BotStreamEvent::Opened`] carries the ids the pane needs *before* the
+///   first byte — the row is already persisted and already marked partial, so
+///   the surface can render it and Stop can name it;
+/// * [`BotStreamEvent::Closed`] carries the whole finished
+///   [`BotMessageVm`] instead of a finish reason alone, because the metadata
+///   the row now holds was measured by the shell and re-reading it would be a
+///   second round trip for facts the producer already had.
+///
+/// A failure is `Closed` with a `reason` and a `partial` row, never a separate
+/// terminal arm: the epic's rule is that a stream which dies leaves a record,
+/// and one terminal event means a consumer cannot forget to handle the sad
+/// path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum BotStreamEvent {
+    /// The request is out and the assistant row exists, partial and empty.
+    ///
+    /// The three view models are `Box`ed for one mechanical reason:
+    /// `BotMessageVm` carries seventeen fields, and an enum whose largest arm
+    /// is 776 bytes makes every `Delta` — one per token — that size too.
+    /// `Box<T>` is transparent to both serde and ts-rs, so the wire shape and
+    /// the generated binding are unchanged.
+    Opened {
+        /// The id `bots_chat_stop` cancels.
+        subscription_id: String,
+        /// The conversation, which the command may have created.
+        session: Box<BotSessionVm>,
+        /// The user's message as stored.
+        user: Box<BotMessageVm>,
+        /// The assistant row, empty and partial.
+        assistant: Box<BotMessageVm>,
+    },
+    /// The first delta of any kind arrived, this many ms after the request
+    /// started. Emitted at most once per answer.
+    FirstToken {
+        /// Milliseconds from request start — measured.
+        #[ts(type = "number")]
+        after_ms: u64,
+    },
+    /// A slice of the answer, to append.
+    Delta {
+        /// The text.
+        text: String,
+    },
+    /// A slice of the model's reasoning, kept as its own kind so the surface
+    /// can show or hide it without parsing the answer.
+    Reasoning {
+        /// The text.
+        text: String,
+    },
+    /// The model asked for a tool. Story 61.11 executes them; this story
+    /// reports that one was requested, so a turn that spent itself on tool
+    /// calls does not look like an empty answer.
+    ToolCall {
+        /// The function name the model named.
+        name: String,
+    },
+    /// The answer is final. `reason` is `null` on a clean finish and carries
+    /// keeper's own credential-free sentence when the stream broke or was
+    /// stopped.
+    Closed {
+        /// The assistant row as it now stands, metadata included. Boxed for
+        /// [`BotStreamEvent::Opened`]'s reason.
+        message: Box<BotMessageVm>,
+        /// Why it ended badly, where it did.
+        reason: Option<String>,
+    },
+    /// What the model was told about the drive before this turn's request
+    /// went out (Story 61.11, FR-391). Emitted once per turn, before the
+    /// first round, and only when the turn built a bundle — a bot with no
+    /// read grant is told nothing and this event is absent, which the pane
+    /// renders as "keeper does not know" rather than as "none".
+    Context {
+        /// The bundle, preamble and skips included. Boxed for
+        /// [`BotStreamEvent::Opened`]'s reason.
+        bundle: Box<BotContextBundleVm>,
+    },
+    /// One tool call finished, and this is the row (Story 61.11, FR-388).
+    /// Emitted as each call completes, so a turn that dies mid-loop has
+    /// already shown every call that ran.
+    ToolResult {
+        /// The row, `result` being the same bytes the model read.
+        call: Box<BotToolCallVm>,
+    },
+    /// A grant said a person must approve this one call (Story 61.10,
+    /// FR-387). The turn is blocked until `bots_approval_answer` names this
+    /// `requestId`; a subscription that is stopped answers it with a refusal.
+    ApprovalAsked {
+        /// What is being asked, in the dialog's own vocabulary.
+        request: Box<BotApprovalRequestVm>,
+    },
+}
+
+/// What the pane sends to start (or continue) a conversation (Story 61.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotChatSendReq {
+    /// The conversation to append to, or `null` to start one. A create rather
+    /// than a separate command because the first message is what mints the
+    /// title, and a two-call flow could leave a titled conversation with no
+    /// message in it.
+    pub session_id: Option<String>,
+    /// Which bot to ask.
+    pub bot_id: String,
+    /// Which model to send as the request's `model`. Chosen by the picker from
+    /// `bots_models_list`, never invented here.
+    pub model: String,
+    /// What the person typed.
+    pub text: String,
+    /// The staged pasted images this message carries, in paste order (Story
+    /// 61.12, FR-392).
+    ///
+    /// Ids, never bytes: the images reached Rust over a raw binary IPC body
+    /// and are on disk, and this request is JSON. `#[serde(default)]` so a
+    /// caller that sends no images sends no field, and every existing caller
+    /// keeps working unchanged.
+    #[serde(default)]
+    pub attachment_ids: Vec<String>,
+}
+
+/// What the pane sends to re-ask a question whose answer failed (Story 61.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotRetryReq {
+    /// The conversation.
+    pub session_id: String,
+    /// The assistant row to replace. Named explicitly rather than inferred as
+    /// "the last one", so a retry pressed on a stale render cannot delete a row
+    /// that arrived after it was drawn.
+    pub message_id: String,
+    /// Which model to send this time — the same one by default, and a change
+    /// away from being the answer to "would a bigger model get this right".
+    pub model: String,
+}
+
+/// What Settings sends to add or edit a provider (Story 61.4, FR-379).
+///
+/// One request type for both, which is AD-C7 on the wire: `id` absent is an
+/// add, `id` present is an edit of that row. Two shapes would be two chances
+/// to validate the same base URL differently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotProviderSaveReq {
+    /// The row to rewrite, or `null` to add one.
+    pub id: Option<String>,
+    /// Which back end this is.
+    pub kind: ProviderKind,
+    /// The display name for this tenant.
+    pub name: String,
+    /// The base URL, as typed. Validated by `keeper_core::bots::parse_base_url`
+    /// and never by the frontend, so there is one grammar.
+    pub base_url: String,
+    /// The credential to store behind the secret port, or `null` to leave
+    /// whatever is there alone.
+    ///
+    /// `null` is "unchanged" and not "clear": an edit form cannot render the
+    /// stored token — there is no field on [`BotProviderVm`] that could carry
+    /// it — so a save that treated an empty field as a deletion would silently
+    /// unauthenticate a working provider every time somebody renamed it. Use
+    /// [`Self::clear_token`] to mean deletion.
+    pub token: Option<String>,
+    /// Whether to delete the stored credential. Explicit, for the reason
+    /// [`Self::token`] gives.
+    pub clear_token: bool,
+}
+
+/// What Settings sends to add or edit a bot (Story 61.4, FR-376).
+///
+/// AD-C7 again: `id` absent adds, `id` present edits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotSaveReq {
+    /// The row to rewrite, or `null` to add one.
+    pub id: Option<String>,
+    /// The owning provider.
+    pub provider_id: String,
+    /// The Hermes profile name or Ollama model tag this bot **is**. Validated
+    /// by `keeper_core::bots::parse_bot_target`.
+    pub target: String,
+    /// The display name.
+    pub name: String,
+    /// This bot's own credential, where the far side needs one — a Hermes
+    /// profile served under its own `API_SERVER_KEY` does. `null` leaves
+    /// whatever is stored alone, for [`BotProviderSaveReq::token`]'s reason.
+    pub token: Option<String>,
+    /// Whether to delete this bot's own credential, so the provider's default
+    /// key is used again.
+    pub clear_token: bool,
+}
+
+/// One grant, as Settings and the conversation header render it (Story 61.10,
+/// FR-386).
+///
+/// **The whole permission model is visible in one list, and this is that
+/// list's row.** It carries the scope as structure *and* as a label, because
+/// the surface renders the label verbatim and the audit log stores the same
+/// words — `layout/panel-strip.tsx:20-25`'s rule, that two surfaces wording one
+/// fact differently is how a person concludes they are two problems.
+///
+/// A revoked grant is still a row here. "What can it change?" is answered by a
+/// list of grants and their state, never by a history of clicks, so a
+/// revocation is a state on the thing it revoked and not its disappearance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotGrantVm {
+    /// The grant's opaque id — the handle revoke and save use.
+    pub id: String,
+    /// Which provider it is about.
+    pub provider_id: String,
+    /// Which bot, or `null` for every bot of that provider.
+    pub bot_id: Option<String>,
+    /// Which bytes, as structure — the shape a picker round-trips.
+    pub scope: crate::bots::grant::GrantScope,
+    /// Which bytes, as one short label: `the whole drive`, a profile name, or
+    /// `profile/subpath`. Composed in Rust so the pane, Settings and the audit
+    /// log name a scope identically.
+    pub scope_label: String,
+    /// What is permitted.
+    pub mode: crate::bots::grant::GrantMode,
+    /// When it was created, ms since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub created_ms: i64,
+    /// When it was revoked, or `null` while it is in force. A revoked grant
+    /// permits nothing — `revokedMs` is the only field the UI needs to consult
+    /// to know that.
+    #[ts(type = "number | null")]
+    pub revoked_ms: Option<i64>,
+}
+
+impl BotGrantVm {
+    /// Project a stored grant row for the UI (Story 61.10).
+    pub fn compose(row: &crate::bots::store::GrantRow) -> Self {
+        BotGrantVm {
+            id: row.grant.id.clone(),
+            provider_id: row.grant.provider_id.clone(),
+            bot_id: row.grant.bot_id.clone(),
+            scope: row.grant.scope.clone(),
+            scope_label: row.grant.scope.label(),
+            mode: row.grant.mode,
+            created_ms: row.grant.created_ms,
+            revoked_ms: row.revoked_ms,
+        }
+    }
+}
+
+/// A grant row this build cannot act on, as Settings renders it (Story 61.10).
+///
+/// Shown rather than skipped, for [`UnknownTaskVm`]'s reason with a sharper
+/// edge: a permission row the user can see and keeper silently ignores is a
+/// permission they believe they have. The surface's one action is to revoke it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct UnknownBotGrantVm {
+    /// The row's id, so it can be revoked.
+    pub id: String,
+    /// The provider it names.
+    pub provider_id: String,
+    /// The stored scope kind, verbatim — a string this build has no meaning
+    /// for.
+    pub scope_kind: String,
+    /// The stored mode, verbatim.
+    pub mode: String,
+}
+
+impl UnknownBotGrantVm {
+    /// Project an unreadable grant row for the UI (Story 61.10).
+    pub fn compose(row: &crate::bots::store::UnknownGrantRow) -> Self {
+        UnknownBotGrantVm {
+            id: row.id.clone(),
+            provider_id: row.provider_id.clone(),
+            scope_kind: row.scope_kind.clone(),
+            mode: row.mode.clone(),
+        }
+    }
+}
+
+/// Every grant, partitioned by whether this build can act on it (Story 61.10,
+/// FR-386).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotGrantListVm {
+    /// The grants, oldest first — `created_ms, id`, the order the store reads
+    /// in, so a list that is re-read does not shuffle.
+    pub grants: Vec<BotGrantVm>,
+    /// The rows keeper cannot act on.
+    pub unknown: Vec<UnknownBotGrantVm>,
+}
+
+impl BotGrantListVm {
+    /// Project the whole grant table for the UI (Story 61.10).
+    pub fn compose(listing: &crate::bots::store::GrantListing) -> Self {
+        BotGrantListVm {
+            grants: listing.rows.iter().map(BotGrantVm::compose).collect(),
+            unknown: listing
+                .unknown
+                .iter()
+                .map(UnknownBotGrantVm::compose)
+                .collect(),
+        }
+    }
+}
+
+/// One line of the tool-call audit log (Story 61.10, FR-388, NFR-47).
+///
+/// **Its reader is a human**, so `path` is the path — `profile/sub/path`, ready
+/// to print — and the profile and subpath are here as well for a filter, not
+/// for the reader to join. Claude Code's default telemetry redacts the file
+/// path entirely (R6 §8.1); a log that cannot say which file was touched is not
+/// an audit trail.
+///
+/// A row whose `outcome` is `pending` and whose `finishedMs` is `null` is a
+/// call that was recorded and never closed — which, after a restart, is a call
+/// that was in flight when the process stopped. That pair is the crash evidence
+/// NFR-47 asks for, and the surface says so rather than rendering it as
+/// success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotAuditRowVm {
+    /// The row's id.
+    #[ts(type = "number")]
+    pub id: i64,
+    /// When the call was about to start, ms since the Unix epoch (UTC).
+    #[ts(type = "number")]
+    pub started_ms: i64,
+    /// When it finished, or `null` while it is pending.
+    #[ts(type = "number | null")]
+    pub finished_ms: Option<i64>,
+    /// Which provider.
+    pub provider_id: String,
+    /// Which bot, where one was named.
+    pub bot_id: Option<String>,
+    /// Which conversation.
+    pub session_id: String,
+    /// Which assistant message asked for it, where one was known.
+    pub message_id: Option<String>,
+    /// The tool's name, as the model called it.
+    pub tool: String,
+    /// The path a person reads — `profile/sub/path`.
+    pub path: String,
+    /// The profile, for a filter.
+    pub profile_id: String,
+    /// The profile-relative path, for a filter.
+    pub subpath: String,
+    /// Read or write. `null` for a stored value this build cannot read — never
+    /// defaulted to `read`, which would understate what happened.
+    pub effect: Option<crate::bots::grant::Effect>,
+    /// What the grant check concluded. `null` for a stored value this build
+    /// cannot read.
+    pub verdict: Option<crate::bots::audit::AuditVerdict>,
+    /// The sentence the user was shown, quoted verbatim from
+    /// `bots::grant`'s consts, so the log and the pane say the same words.
+    pub reason: Option<String>,
+    /// The grant it ran under, where one permitted it.
+    pub grant_id: Option<String>,
+    /// What became of it.
+    pub outcome: crate::bots::audit::AuditOutcome,
+    /// Bytes read or written, or `null` where nothing was counted. Absent
+    /// rather than zero: this app does not print a number it did not measure.
+    #[ts(type = "number | null")]
+    pub bytes: Option<i64>,
+    /// Whether the result was cut short at a cap.
+    pub truncated: bool,
+}
+
+impl BotAuditRowVm {
+    /// Project one audit row for the UI (Story 61.10).
+    pub fn compose(row: &crate::bots::audit::AuditRow) -> Self {
+        BotAuditRowVm {
+            id: row.id,
+            started_ms: row.started_ms,
+            finished_ms: row.finished_ms,
+            provider_id: row.provider_id.clone(),
+            bot_id: row.bot_id.clone(),
+            session_id: row.session_id.clone(),
+            message_id: row.message_id.clone(),
+            tool: row.tool.clone(),
+            path: row.display_path.clone(),
+            profile_id: row.profile_id.clone(),
+            subpath: row.subpath.clone(),
+            effect: row.effect,
+            verdict: row.verdict,
+            reason: row.reason.clone(),
+            grant_id: row.grant_id.clone(),
+            outcome: row.outcome,
+            bytes: row.bytes,
+            truncated: row.truncated,
+        }
+    }
+}
+
+/// What the grant editor sends to create or change one grant (Story 61.10,
+/// FR-386, AD-C7 on the wire).
+///
+/// `id` absent creates, present rewrites — the same one-request shape
+/// [`BotProviderSaveReq`] uses, because add and edit are one component in two
+/// modes and two commands would let them diverge.
+///
+/// **Nothing but this request can create a grant** (NFR-48): no tool result, no
+/// file content and no model message reaches the writer, so a file that
+/// instructs a model to widen its own access has no route to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotGrantSaveReq {
+    /// The grant to rewrite, or `null` to create one.
+    pub id: Option<String>,
+    /// Which provider this grant is about.
+    pub provider_id: String,
+    /// Which bot, or `null` for every bot of that provider.
+    pub bot_id: Option<String>,
+    /// Which bytes.
+    pub scope: crate::bots::grant::GrantScope,
+    /// What is permitted.
+    pub mode: crate::bots::grant::GrantMode,
+}
+
+/// One filesystem tool call, as the conversation renders it (Story 61.11,
+/// FR-388, FR-389).
+///
+/// **A path and never an id** (FR-388): the reader of this row is a person
+/// asking "what did it touch", and a ULID is not an answer to that question.
+/// `displayPath` is [`crate::bots::grant::ToolTarget::display_path`]'s own
+/// spelling, so the audit list and this row cannot describe the same call
+/// differently.
+///
+/// `refusal` is the refusing layer's sentence carried verbatim —
+/// `keeper-sync`'s containment wording, the write router's, or one of
+/// `keeper_core::bots::grant`'s `DENY_*` constants — because a paraphrase of a
+/// security refusal is a second, unproved wording of the rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotToolCallVm {
+    /// The provider's `tool_call_id` — this row's handle, and the id the
+    /// `role: "tool"` message in the transcript answers.
+    pub id: String,
+    /// What the model asked for, verbatim, whether or not it exists. Kept
+    /// beside `name` so a model that invented a verb shows what it invented
+    /// rather than showing nothing.
+    pub requested_name: String,
+    /// Which verb, or `null` when the model named one that does not exist.
+    pub name: Option<crate::bots::tools::ToolName>,
+    /// What it named, in the frame a person reads. `null` when the call was
+    /// refused before a target could be built from it.
+    pub display_path: Option<String>,
+    /// Why it did not happen, or `null` when it did.
+    pub refusal: Option<String>,
+    /// Whether the refusal was a grant's rather than the drive's — the one
+    /// distinction that changes what a person can do about it, because a grant
+    /// is theirs to widen and a containment refusal is not.
+    pub grant_denied: bool,
+    /// The arguments the model sent, verbatim JSON — what the expanded row
+    /// shows. Verbatim because a re-serialization would be keeper's account of
+    /// the call rather than the call.
+    pub arguments: String,
+    /// The `role: "tool"` message this call produced — **the same bytes the
+    /// model read**, disclosure sentences included. Empty when the call never
+    /// ran.
+    pub result: String,
+    /// What the call turned out to be, or `null` when it never ran.
+    pub outcome: Option<BotToolOutcomeKind>,
+    /// How many bytes the result carries: a read's body, a write's new size.
+    /// `null` for an outcome that is not measured in bytes.
+    ///
+    /// `number` on the wire rather than ts-rs's `bigint` for `u64`, the reading
+    /// [`crate::vm::TextFileVm::size_bytes`]'s doc states: Tauri delivers JSON,
+    /// `JSON.parse` produces no `bigint`, and every one of these numbers is
+    /// compared against a bound far below 2^53. Every byte and entry count
+    /// below takes it.
+    #[ts(type = "number | null")]
+    pub bytes: Option<u64>,
+    /// Where a read stopped, when it stopped early (NFR-49).
+    #[ts(type = "number | null")]
+    pub truncated_at_bytes: Option<u64>,
+    /// The file's real size, where the bound makes it worth saying.
+    #[ts(type = "number | null")]
+    pub of_bytes: Option<u64>,
+    /// How many entries a listing returned.
+    #[ts(type = "number | null")]
+    pub entries: Option<u64>,
+    /// How many entries it stopped at, when it stopped early.
+    #[ts(type = "number | null")]
+    pub truncated_at_entries: Option<u64>,
+    /// How many the directory actually holds.
+    #[ts(type = "number | null")]
+    pub of_entries: Option<u64>,
+    /// The note's OKF provenance, where the read carried any (FR-391).
+    pub okf: Option<BotOkfFactsVm>,
+}
+
+impl BotToolCallVm {
+    /// Project one call the tool loop ran (Story 61.11).
+    ///
+    /// `arguments` is the wire call's own JSON and `outcome` is what the
+    /// [`ToolHost`](crate::bots::tools::ToolHost) returned — the two things the
+    /// loop holds at the moment it records a call. `result` is derived here
+    /// with [`render_result`](crate::bots::tools::render_result) rather than
+    /// passed in, so the row cannot show a body that differs from the one the
+    /// model was handed.
+    pub fn compose(
+        record: &crate::bots::tools::ToolCallRecord,
+        arguments: &str,
+        outcome: Option<&crate::bots::tools::ToolOutcome>,
+    ) -> Self {
+        use crate::bots::tools::ToolOutcome;
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        let mut vm = BotToolCallVm {
+            id: record.id.clone(),
+            requested_name: record.requested_name.clone(),
+            name: record.name,
+            display_path: record.display_path.clone(),
+            refusal: record.refusal.clone(),
+            grant_denied: record.grant_denied,
+            arguments: arguments.to_owned(),
+            result: outcome.map_or_else(String::new, crate::bots::tools::render_result),
+            outcome: outcome.map(BotToolOutcomeKind::of),
+            bytes: None,
+            truncated_at_bytes: None,
+            of_bytes: None,
+            entries: None,
+            truncated_at_entries: None,
+            of_entries: None,
+            okf: None,
+        };
+        match outcome {
+            Some(ToolOutcome::Text {
+                body,
+                truncated_at,
+                of_bytes,
+                okf,
+            }) => {
+                vm.bytes = Some(count(body.len()));
+                vm.truncated_at_bytes = *truncated_at;
+                vm.of_bytes = *of_bytes;
+                vm.okf = okf.as_ref().map(BotOkfFactsVm::compose);
+            }
+            Some(ToolOutcome::Entries {
+                entries,
+                truncated_at,
+                of_entries,
+                ..
+            }) => {
+                vm.entries = Some(count(entries.len()));
+                vm.truncated_at_entries = truncated_at.map(count);
+                vm.of_entries = Some(count(*of_entries));
+            }
+            Some(ToolOutcome::NotMaterialized { of_bytes, .. }) => {
+                vm.of_bytes = Some(*of_bytes);
+            }
+            Some(ToolOutcome::Wrote { bytes, .. }) => {
+                vm.bytes = Some(*bytes);
+            }
+            // The refusing layer's own sentence, and only when the record did
+            // not already carry one: a paraphrase of a refusal is a second
+            // wording of the rule.
+            Some(ToolOutcome::Refused { reason }) if vm.refusal.is_none() => {
+                vm.refusal = Some(reason.clone());
+            }
+            Some(ToolOutcome::Refused { .. }) => {}
+            None => {}
+        }
+        vm
+    }
+}
+
+/// What one tool call turned out to be, as the row renders it (Story 61.11).
+///
+/// A kind rather than a pre-worded phrase: the sentence a row shows is built
+/// from this plus the byte counts beside it, in the frontend's own
+/// `formatFileSize` — the mirror of `keeper_core::size::format_file_size` — so
+/// one file size is spelled one way everywhere in the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BotToolOutcomeKind {
+    /// Text was read.
+    Text,
+    /// A directory was listed.
+    Entries,
+    /// The path holds a committed pointer and reading did not fetch the
+    /// content (epic 56).
+    NotMaterialized,
+    /// Bytes were written.
+    Wrote,
+    /// It did not happen.
+    Refused,
+}
+
+impl BotToolOutcomeKind {
+    /// Which kind one outcome is.
+    pub fn of(outcome: &crate::bots::tools::ToolOutcome) -> Self {
+        use crate::bots::tools::ToolOutcome;
+        match outcome {
+            ToolOutcome::Text { .. } => Self::Text,
+            ToolOutcome::Entries { .. } => Self::Entries,
+            ToolOutcome::NotMaterialized { .. } => Self::NotMaterialized,
+            ToolOutcome::Wrote { .. } => Self::Wrote,
+            ToolOutcome::Refused { .. } => Self::Refused,
+        }
+    }
+}
+
+/// A note's OKF provenance, as the tool row shows it (Story 61.11, FR-391).
+///
+/// **The one thing this row can say that a generic filesystem tool cannot**:
+/// whether a *person* ever looked at the note the model just read.
+/// `humanReviewed` is that bit, carried on its own rather than left to a
+/// surface to infer from `verifiedActor` — an inference is a second place the
+/// answer can be got wrong, and getting it wrong manufactures a human-review
+/// claim nobody made.
+///
+/// The actor words are [`crate::bots::tools::actor_word`]'s, and `sentence` is
+/// the provenance line the model itself was shown, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotOkfFactsVm {
+    /// `type:` — OKF's one hard requirement, still `null` where a note omits
+    /// it, because refusing to describe such a note is a strictness the
+    /// format's conformance section forbids.
+    pub doc_type: Option<String>,
+    /// Who produced the content.
+    pub generated_by: Option<String>,
+    /// What kind of actor that was, in words.
+    pub generated_actor: Option<String>,
+    /// The most recent reviewer, where there is one.
+    pub verified_by: Option<String>,
+    /// What kind of actor reviewed it, in words.
+    pub verified_actor: Option<String>,
+    /// Whether any review was by a person.
+    pub human_reviewed: bool,
+    /// The provenance line the model was shown, verbatim.
+    pub sentence: String,
+}
+
+impl BotOkfFactsVm {
+    /// Project the facts a note read carried.
+    pub fn compose(facts: &crate::bots::tools::OkfFacts) -> Self {
+        use crate::bots::tools::actor_word;
+        BotOkfFactsVm {
+            doc_type: facts.doc_type.clone(),
+            generated_by: facts.generated_by.clone(),
+            generated_actor: facts
+                .generated_actor
+                .map(|kind| actor_word(kind).to_owned()),
+            verified_by: facts.verified_by.clone(),
+            verified_actor: facts.verified_actor.map(|kind| actor_word(kind).to_owned()),
+            human_reviewed: facts.human_reviewed,
+            sentence: facts.sentence(),
+        }
+    }
+}
+
+/// One context file, as it entered the request (Story 61.11, FR-391).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotContextFileVm {
+    /// Profile-relative, the spelling the walk found it under.
+    pub subpath: String,
+    /// How many bytes of it the model was given.
+    #[ts(type = "number")]
+    pub bytes: u64,
+    /// The file's real size.
+    #[ts(type = "number")]
+    pub of_bytes: u64,
+    /// Whether what the model was given is a prefix.
+    pub truncated: bool,
+}
+
+/// A context file that was found and left out, and why (Story 61.11, FR-391).
+///
+/// `overBudget` is separate from `sentence` because the two skips are not the
+/// same news: an empty file changes nothing, while **an instruction file the
+/// budget dropped is worse than none** — the model was told the rules and then
+/// not told these ones. A surface that rendered both alike would bury the one
+/// a person needs to act on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotContextSkipVm {
+    /// Profile-relative.
+    pub subpath: String,
+    /// How large it is, where that is the reason it was dropped.
+    #[ts(type = "number | null")]
+    pub of_bytes: Option<u64>,
+    /// Whether the budget dropped it, rather than it being empty.
+    pub over_budget: bool,
+    /// `keeper_core::bots::context_files::ContextSkip::sentence`, verbatim.
+    pub sentence: String,
+}
+
+/// Everything the model was told about the drive, and everything it was not
+/// (Story 61.11, FR-391).
+///
+/// Projected from the same [`ContextBundle`](crate::bots::context_files::ContextBundle)
+/// the system prompt is built from, `preamble` included verbatim, so the
+/// disclosure a person reads and the block the model got cannot disagree.
+/// `files` keeps **render order** — root first, nearest last — which is the
+/// order the model met them in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotContextBundleVm {
+    /// The sentence separating instruction from data, verbatim.
+    pub preamble: String,
+    /// The files that made it, in the order the prompt renders them.
+    pub files: Vec<BotContextFileVm>,
+    /// The ones that did not, nearest first.
+    pub skipped: Vec<BotContextSkipVm>,
+    /// How many bytes of file content the prompt carries.
+    #[ts(type = "number")]
+    pub total_bytes: u64,
+}
+
+impl BotContextBundleVm {
+    /// Project what the model was told.
+    pub fn compose(bundle: &crate::bots::context_files::ContextBundle) -> Self {
+        use crate::bots::context_files::{ContextSkip, UNTRUSTED_PREAMBLE};
+        BotContextBundleVm {
+            preamble: UNTRUSTED_PREAMBLE.to_owned(),
+            files: bundle
+                .files
+                .iter()
+                .map(|file| BotContextFileVm {
+                    subpath: file.subpath.clone(),
+                    bytes: file.bytes,
+                    of_bytes: file.of_bytes,
+                    truncated: file.truncated,
+                })
+                .collect(),
+            skipped: bundle
+                .skipped
+                .iter()
+                .map(|skip| BotContextSkipVm {
+                    subpath: skip.subpath().to_owned(),
+                    of_bytes: match skip {
+                        ContextSkip::OverBudget { of_bytes, .. } => Some(*of_bytes),
+                        ContextSkip::Empty { .. } => None,
+                    },
+                    over_budget: matches!(skip, ContextSkip::OverBudget { .. }),
+                    sentence: skip.sentence(),
+                })
+                .collect(),
+            total_bytes: u64::try_from(bundle.total_bytes).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// One tool call waiting on a person (Story 61.10, FR-387).
+///
+/// The same fields `bot-approval-dialog.tsx`'s `BotApprovalRequest` already
+/// declares, in the same names, so the event carries straight into the store's
+/// `pendingApproval` with nothing renamed between. Every field is what the
+/// grant check knew before the effect — the facts the audit row was born with —
+/// so the dialog and the log describe one call in one vocabulary. `reason` is
+/// the verdict's own sentence, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotApprovalRequestVm {
+    /// The ask's handle — what `bots_approval_answer` names.
+    pub request_id: String,
+    /// The provider whose bot asked.
+    pub provider_id: String,
+    /// The bot that asked, or `null` where none was named.
+    pub bot_id: Option<String>,
+    /// The tool's wire name, as the model called it.
+    pub tool: String,
+    /// The path a person reads — `profile/sub/path`.
+    pub path: String,
+    /// The profile the path is in.
+    pub profile_id: String,
+    /// The profile-relative path.
+    pub subpath: String,
+    /// Read or write.
+    pub effect: crate::bots::grant::Effect,
+    /// The verdict's sentence, verbatim.
+    pub reason: String,
+}
+
+impl BotApprovalRequestVm {
+    /// Project one ask from the call the host is holding and the verdict's
+    /// sentence.
+    pub fn compose(
+        request_id: &str,
+        provider_id: &str,
+        bot_id: Option<&str>,
+        call: &crate::bots::tools::ToolCall,
+        reason: &str,
+    ) -> Self {
+        BotApprovalRequestVm {
+            request_id: request_id.to_owned(),
+            provider_id: provider_id.to_owned(),
+            bot_id: bot_id.map(str::to_owned),
+            tool: call.name.as_wire().to_owned(),
+            path: call.target.display_path(),
+            profile_id: call.target.profile_id.clone(),
+            subpath: call.target.subpath.clone(),
+            effect: call.name.effect(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 61.6 — the conversation list, the archive, and continue
+// ---------------------------------------------------------------------------
+
+/// Which conversations a list is asking for (Story 61.6, FR-381).
+///
+/// Three positions and not a boolean, matching the sessions board's own
+/// `All | Active | Archived` chips: a person who archives conversations wants
+/// to read the archive alone sometimes, and a widening flag cannot say that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BotSessionScope {
+    /// Everything not archived — what the pane opens onto.
+    #[default]
+    Live,
+    /// Live and archived together.
+    All,
+    /// The archive alone.
+    Archived,
+}
+
+impl BotSessionScope {
+    /// The store's own scope for this one.
+    pub fn to_scope(self) -> crate::bots::session::SessionScope {
+        use crate::bots::session::SessionScope;
+        match self {
+            BotSessionScope::Live => SessionScope::Live,
+            BotSessionScope::All => SessionScope::All,
+            BotSessionScope::Archived => SessionScope::Archived,
+        }
+    }
+}
+
+/// What the conversation list asks for (Story 61.6, FR-381).
+///
+/// One request struct rather than three positionals, for `BotChatSendReq`'s
+/// reason: a text, a scope and a limit in a row is a call site that reorders
+/// silently.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotSessionQueryReq {
+    /// Free text, matched case-insensitively against the title **and** every
+    /// message body. Empty is no text predicate at all.
+    pub text: String,
+    /// Which conversations to consider.
+    pub scope: BotSessionScope,
+    /// How many rows to return; `0` takes the store's default and anything
+    /// above its ceiling is clamped to it.
+    pub limit: u32,
+}
+
+impl BotSessionQueryReq {
+    /// The store query this request means.
+    pub fn to_query(&self) -> crate::bots::session::SessionQuery {
+        crate::bots::session::SessionQuery {
+            text: self.text.clone(),
+            scope: self.scope.to_scope(),
+            limit: usize::try_from(self.limit).unwrap_or(0),
+        }
+    }
+}
+
+/// One row of the conversation list (Story 61.6, FR-381).
+///
+/// The session plus the two facts a row renders that are not columns of it.
+/// `latestActivityMs` is composed in Rust rather than derived on the frontend
+/// because it is a `MAX` over another table, and a row that guessed it from
+/// `updatedMs` alone would sort a conversation nobody has renamed below one
+/// somebody just renamed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotSessionRowVm {
+    /// The conversation.
+    pub session: BotSessionVm,
+    /// When anything last happened to it — the newest message or the session's
+    /// own last change, whichever is later. Never null and never zero: a
+    /// conversation with no messages was still created.
+    #[ts(type = "number")]
+    pub latest_activity_ms: i64,
+    /// How many messages it holds.
+    #[ts(type = "number")]
+    pub message_count: i64,
+}
+
+/// One page of the conversation list, and the size of the set it came from
+/// (Story 61.6, FR-381).
+///
+/// `total` is separate from `rows.length` on purpose: the page is bounded, and
+/// a count that means "how many are mounted" while looking like a total is the
+/// defect `count-label.ts:4-18` exists to make unreachable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotSessionListVm {
+    /// The rows, newest activity first.
+    pub rows: Vec<BotSessionRowVm>,
+    /// How many conversations matched, whether or not they fitted on the page.
+    #[ts(type = "number")]
+    pub total: i64,
+}
+
+impl BotSessionListVm {
+    /// Project one page for the UI (Story 61.6).
+    pub fn compose(page: &crate::bots::session::SessionPage) -> Self {
+        BotSessionListVm {
+            rows: page
+                .rows
+                .iter()
+                .map(|row| BotSessionRowVm {
+                    session: BotSessionVm::compose(&row.session),
+                    latest_activity_ms: row.latest_activity_ms,
+                    message_count: row.message_count,
+                })
+                .collect(),
+            total: page.total,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 61.9 — the slash-command surface's view models
+//
+// One round trip answers the composer's whole question: what is this draft,
+// and what should the menu show? The frontend filters nothing and ranks
+// nothing, which is the palette's own contract (AD-20) applied to a second
+// picker — because a TypeScript matcher beside the Rust registry would be two
+// opinions about what `/mod` means.
+// ---------------------------------------------------------------------------
+
+/// What the composer knows when it asks (Story 61.9, FR-385).
+///
+/// Four facts the pane already holds. `modelTools` is a tri-state and stays
+/// one: `null` is *the endpoint did not say*, never *no* (AD-27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotCommandContextReq {
+    /// The chosen bot's provider kind, or `null` when no bot is chosen.
+    pub provider_kind: Option<crate::bots::ProviderKind>,
+    /// Whether any provider is configured.
+    pub has_provider: bool,
+    /// Whether a bot is chosen.
+    pub has_bot: bool,
+    /// Whether the open conversation has started.
+    pub has_session: bool,
+    /// Whether the chosen model takes tools, as the endpoint stated it.
+    pub model_tools: Option<bool>,
+}
+
+impl BotCommandContextReq {
+    /// The `keeper_core::bots::commands` context this request describes.
+    pub fn context(&self) -> crate::bots::commands::Context {
+        crate::bots::commands::Context {
+            kind: self.provider_kind,
+            has_provider: self.has_provider,
+            has_bot: self.has_bot,
+            has_session: self.has_session,
+            model_tools: self.model_tools,
+        }
+    }
+}
+
+/// One row of the slash-command menu (Story 61.9, FR-385).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotCommandRowVm {
+    /// The registry name, without the slash.
+    pub name: String,
+    /// Every other spelling that reaches it, for the row's own disclosure —
+    /// `/h` is discoverable only if `/help` says so.
+    pub aliases: Vec<String>,
+    /// The one sentence the registry holds.
+    pub description: String,
+    /// What may follow the name.
+    pub args: crate::bots::commands::ArgMode,
+    /// What the argument is, in the hint's own words. `null` exactly when
+    /// nothing may follow.
+    pub arg_hint: Option<String>,
+    /// Whether Enter may run it right now.
+    pub available: bool,
+    /// Why not, where it may not. `null` exactly when `available`.
+    pub reason: Option<String>,
+    /// The caveat a runnable command still owes the person — today, that keeper
+    /// could not read whether the chosen model takes tools. `null` when there
+    /// is nothing to say, and never a reason not to run: a row can be both
+    /// `available` and warned, which is the whole point of the field.
+    pub warning: Option<String>,
+}
+
+impl BotCommandRowVm {
+    /// Project one registry entry against a context (Story 61.9).
+    pub fn compose(
+        spec: &crate::bots::commands::CommandSpec,
+        ctx: &crate::bots::commands::Context,
+    ) -> Self {
+        let availability = crate::bots::commands::availability(spec, ctx);
+        BotCommandRowVm {
+            name: spec.name.to_string(),
+            aliases: spec
+                .aliases
+                .iter()
+                .map(|alias| (*alias).to_string())
+                .collect(),
+            description: spec.description.to_string(),
+            args: spec.args,
+            arg_hint: spec.arg_hint.map(|hint| hint.to_string()),
+            available: availability.is_available(),
+            reason: availability.reason().map(|reason| reason.to_string()),
+            warning: availability.warning().map(|warning| warning.to_string()),
+        }
+    }
+}
+
+/// What one draft is (Story 61.9, FR-385).
+///
+/// Three arms and no fourth: text for the model, a command for keeper, or a
+/// refusal that sends nothing. The composer's whole job is to obey whichever
+/// one arrives, which is why an unknown command cannot leak out as prose — the
+/// arm that would carry it does not exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum BotCommandVerdictVm {
+    /// Send this to the model, verbatim. The escaped leading slash arrives
+    /// here with one slash already removed.
+    Prose {
+        /// What to send.
+        text: String,
+    },
+    /// Run this command.
+    Command {
+        /// The registry name, never the alias that was typed.
+        name: String,
+        /// What followed it, trimmed. `null` when nothing did.
+        args: Option<String>,
+    },
+    /// Send nothing, and say this.
+    Refusal {
+        /// keeper's whole sentence, quoted verbatim by the composer.
+        message: String,
+    },
+}
+
+/// Everything the composer needs about one draft (Story 61.9, FR-385).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotCommandPreviewVm {
+    /// The draft this answers, echoed verbatim.
+    ///
+    /// **The caller must check it.** Replies can land out of order, so a slow
+    /// answer for a half-typed draft can arrive after a fast answer for the
+    /// finished one, and rendering it would show a refusal for text the field
+    /// no longer holds — `TaskSchedulePreviewVm`'s rule, restated because the
+    /// call site is the same shape.
+    pub draft: String,
+    /// What the draft is.
+    pub verdict: BotCommandVerdictVm,
+    /// The menu rows for the token as typed, in registry order. Empty when the
+    /// draft is not a command line, so an empty list means "draw no menu".
+    pub rows: Vec<BotCommandRowVm>,
+    /// The one sentence this context owes about commands keeper does not
+    /// serve — Hermes' own, which are enumerable only over a channel keeper
+    /// does not speak. `null` where there is nothing to disclose.
+    pub note: Option<String>,
+    /// How to send a message that really does start with a slash.
+    ///
+    /// Carried on every preview rather than fetched separately: the empty
+    /// state, the menu footer and the unknown-command refusal all teach the
+    /// same escape, and one source is what stops them wording it three ways.
+    pub escape_hint: String,
+}
+
+impl BotCommandPreviewVm {
+    /// Resolve one draft and project the menu beside it (Story 61.9).
+    pub fn compose(draft: &str, ctx: &crate::bots::commands::Context) -> Self {
+        use crate::bots::commands::{self, Resolution};
+        let verdict = match commands::resolve(draft, ctx) {
+            Resolution::Prose(text) => BotCommandVerdictVm::Prose { text },
+            Resolution::Command { name, args } => BotCommandVerdictVm::Command {
+                name: name.to_string(),
+                args,
+            },
+            Resolution::Refusal(message) => BotCommandVerdictVm::Refusal { message },
+        };
+        BotCommandPreviewVm {
+            draft: draft.to_string(),
+            verdict,
+            rows: commands::menu(draft, ctx)
+                .into_iter()
+                .map(|spec| BotCommandRowVm::compose(spec, ctx))
+                .collect(),
+            note: commands::note(ctx).map(|note| note.to_string()),
+            escape_hint: commands::ESCAPE_HINT.to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Story 61.12 — an image you can paste, a path you can open (FR-392, FR-393)
+// ---------------------------------------------------------------------------
+
+/// One pasted image, staged on disk and waiting to be sent (Story 61.12,
+/// FR-392, AD-58).
+///
+/// **There is no `bytes` field and there must never be one.** The image
+/// arrived over a raw binary IPC body and lives in the staging folder; the
+/// webview holds a `blob:` object URL it made from the same clipboard `File`
+/// it already had, so the thumbnail costs no second copy and no base64. The
+/// only `data:` URI in this feature is minted inside the outbound HTTP body,
+/// by [`crate::bots::deliverable::image_data_uri`], and is never seen here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotAttachmentVm {
+    /// The staging id — the handle send and discard use.
+    pub id: String,
+    /// What the attachment is called, for the tray and the alt text.
+    pub filename: String,
+    /// The MIME the clipboard reported, already checked against
+    /// [`crate::bots::deliverable::IMAGE_MIMES`].
+    pub mime: String,
+    /// How many bytes landed on disk.
+    #[ts(type = "number")]
+    pub byte_len: i64,
+}
+
+/// One path an assistant reply named, and what keeper offers on it (Story
+/// 61.12, FR-393, AD-160).
+///
+/// `start`/`end` are byte offsets into the reply **as it was received**. keeper
+/// never strips a path out of a reply the way the Hermes gateway does — here
+/// the reply is the record — so these are the coordinates of a decoration and
+/// never of an edit.
+///
+/// `reason` is `None` exactly when the control is offered. A path with a
+/// reason renders as the text it is, with that one sentence beside it, which
+/// is AD-27's shape: the affordance that could not work is absent and the
+/// reason is on screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotDeliverableVm {
+    /// Exactly the characters the reply used, punctuation already trimmed.
+    pub raw: String,
+    /// The same path with `~` expanded, for display.
+    pub absolute: String,
+    /// Byte offset of `raw` in the reply.
+    #[ts(type = "number")]
+    pub start: i64,
+    /// Byte offset one past the end of `raw` in the reply.
+    #[ts(type = "number")]
+    pub end: i64,
+    /// The sync profile the file is in, where a control is offered.
+    pub profile_id: Option<String>,
+    /// Where in that profile, profile-relative, where a control is offered.
+    pub subpath: Option<String>,
+    /// Why there is no control, or `None` when there is one.
+    pub reason: Option<String>,
+}
+
+impl BotDeliverableVm {
+    /// Project one resolved mention for the UI (Story 61.12).
+    pub fn compose(item: &crate::bots::deliverable::Deliverable) -> Self {
+        use crate::bots::deliverable::DeliverableControl;
+        let (profile_id, subpath, reason) = match &item.control {
+            DeliverableControl::Reveal {
+                profile_id,
+                subpath,
+            } => (Some(profile_id.clone()), Some(subpath.clone()), None),
+            DeliverableControl::None { reason } => (None, None, Some(reason.clone())),
+        };
+        BotDeliverableVm {
+            raw: item.mention.raw.clone(),
+            absolute: item.absolute.clone(),
+            start: item.mention.start as i64,
+            end: item.mention.end as i64,
+            profile_id,
+            subpath,
+            reason,
+        }
+    }
 }
 
 #[cfg(test)]
