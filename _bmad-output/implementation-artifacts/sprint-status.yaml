@@ -1,5 +1,5 @@
 # generated: 2026-07-03
-# last_updated: 2026-08-08
+# last_updated: 2026-09-02
 # project: keeper
 # project_key: NOKEY
 # tracking_system: file-system
@@ -41,7 +41,7 @@
 # - Retrospective appends its action items to action_items; sprint-status surfaces open ones
 
 generated: 2026-07-03
-last_updated: 2026-08-08
+last_updated: 2026-09-02
 project: keeper
 project_key: NOKEY
 tracking_system: file-system
@@ -1177,6 +1177,33 @@ development_status:
   58-9-the-chapter-grows-a-policy: done
   epic-58-retrospective: optional
 
+  # -- EPIC 61, 2026-09-02: a model you can talk to ---------------------------
+  #
+  # The owner's fourteen-line capability request after v0.8.24: talk to Hermes
+  # and Ollama over the OpenAI API standard, with bot mode, discovery, pins,
+  # sessions, slash commands, grants over the drive, and images. Epic doc:
+  # epic-61-a-model-you-can-talk-to-in-the-app-that-holds-your-drive.md, over
+  # main @ 9e06c2b. Thirteen stories. Epic 60 stays RESERVED for the general
+  # exec kind epic 59 deferred (D-3), and voice/wake word is deliberately Epic
+  # 62: every credible permissive voice stack needs native dependencies the
+  # dev host cannot compile, and the keyword-spotting/ASR model weights carry
+  # dataset licence terms their code's Apache-2.0 does not imply.
+  epic-61: review
+  61-1-a-provider-is-something-keeper-remembers: review
+  61-2-one-wire-and-the-divergences-are-data: review
+  61-3-what-can-this-endpoint-actually-do: review
+  61-4-a-conversation-you-can-have: review
+  61-5-the-answer-is-readable: review
+  61-6-a-list-an-archive-and-continue: review
+  61-7-pinned-bots-with-an-identity: review
+  61-8-metadata-you-can-switch-on: review
+  61-9-slash-commands-that-refuse-honestly: review
+  61-10-a-grant-you-can-see-and-revoke: review
+  61-11-the-drive-as-tools: review
+  61-12-an-image-you-can-paste-a-path-you-can-open: review
+  61-13-the-gates-the-docs-and-the-honest-row: review
+  epic-61-retrospective: optional
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
@@ -1430,3 +1457,16 @@ development_status:
 # 23-7, 27-2, 29-6 and 31-2 have no spec file on disk: they were implemented from
 # their epic paragraph and its AC, which was the contract for them. Their
 # `final_revision` therefore lives only here and in the commit messages.
+
+# ── 2026-09-02: epic 61 registered ─────────────────────────────────────────────
+#
+# Epic 61 — a model you can talk to, in the app that already holds your drive —
+# is registered with its thirteen stories (61.1..61.13, see the epic block above).
+# 61.1..61.3 are in-progress with the first implementation wave; the rest are
+# backlog in the epic's stack order. Epic 60 stays RESERVED for the general exec
+# kind that epic 59 deferred to it (docs/decisions.md D-3) — this epic does not
+# build it and does not take its number. Voice/wake word is deliberately Epic 62,
+# not a story of 61: every credible permissive voice stack needs native
+# dependencies that cannot be compiled or exercised on the development host, and
+# the keyword-spotting and ASR model weights carry dataset licence terms their
+# code's Apache-2.0 licence does not imply.

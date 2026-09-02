@@ -3966,3 +3966,274 @@ documented limitation is honest.
   bare repository, a stub LFS server and the makistack Forgejo instance.
 - **Sizing:** 52 stories across Epics 23–31 (7 + 7 + 6 + 6 + 5 + 4 + 6 + 5 + 6),
   each scoped to a single dev session; total 174 stories across 31 epics.
+
+# Phase 8 — Bots (appended 2026-09-02)
+
+Owner-requested phase, written after v0.8.24: talk to a model — Hermes Agent
+first, Ollama local and remote — over the **OpenAI-compatible wire**, from a
+fifth keeper surface at ⌘9, with multi-tenant providers, pinned bots with an
+identity, conversations kept in keeper's own store, switchable per-message
+metadata, slash commands, a user-granted revocable permission onto the drive,
+the drive exposed as filesystem tools through the containment rule keeper
+already enforces, pasted images, and paths a model names opened only inside a
+grant. Inputs: PRD §15 (FR-369–FR-393, NFR-46–NFR-49), Epic 61
+(`epic-61-a-model-you-can-talk-to-in-the-app-that-holds-your-drive.md`, the
+authority for every story below) and its evidence base
+`research-ai-chat-2026-09-02.md` (**adopted, not relitigated**), and the
+Architecture increment **AD-146 … AD-160**. Phases 5–7 (Epics 35–39, 40–42,
+47–49) and Epics 32–34, 43–46, 50–59 live in their own files; this chapter
+follows the Phase 4 chapter above because the file's per-phase format is the
+one this epic's stories are indexed in.
+
+The route is locked by the epic and must not be re-argued in a story:
+
+- **One wire protocol, and the divergences are data.** `POST /v1/chat/completions`
+  with `stream: true` is the only chat transport for both kinds. Ollama's `/v1`
+  layer ignores `tool_choice`, refuses `image_url` beyond base64 data URIs and
+  cannot set `num_ctx` — rows in a per-kind quirk table, not a second client.
+  Native endpoints are used for *discovery only* (`/api/tags` carries
+  capabilities; `/v1/models` does not).
+- **keeper owns the conversation.** Hermes compresses sessions into renamed
+  successors and caches 100 stored responses; Ollama has no session at all.
+  keeper's store is the truth; a Hermes `session_id` is a reference beside the
+  row.
+- **Verification, not enumeration, for bots.** The bearer route table has no
+  profile roster. A named profile is probed at `/p/<name>/v1/models`; keeper
+  never invents a list, and the empty state says why.
+- **A capability keeper could not read is `unknown`, never `false`.**
+- **The grant exists before the first tool can read a byte.** 61.10 precedes
+  61.11 absolutely; no tool executes a shell string (D-3 stands).
+- **Every decision in `keeper-core`; the shell is a call site** (AD-55/AD-56).
+  Egress is derived from the provider set, never hand-listed (AD-53). No JSON
+  blob in a row (AD-139).
+- **Talk mode, the wake word and NeuTTS are Epic 62**, not a story here, for
+  the licence and build-host reasons the epic records. Epic 60 stays reserved
+  for the general exec kind.
+
+## Requirements Inventory — Phase 8
+
+### Functional Requirements
+
+- FR-369: keeper holds several AI providers side by side, each with a kind, a base URL and its own credential
+- FR-370: A provider's credential is stored where secrets are stored, never in a row and never on a screen
+- FR-371: Every configured provider appears as a derived egress destination, as a host and never a URL
+- FR-372: keeper streams a chat completion over the OpenAI-compatible wire and can stop it
+- FR-373: A reply, its tool calls and its usage survive reassembly from fragmented deltas
+- FR-374: A stream that stalls is ended by silence, not by a whole-request deadline
+- FR-375: keeper reports what an endpoint is and what it can do, or says why it cannot tell
+- FR-376: A bot is addressed by profile prefix, verified by probe, and never invented
+- FR-377: A model's vision and tool support is read from the endpoint, not assumed
+- FR-378: There is a surface at ⌘9 where you talk to a model, and it narrates its own state honestly
+- FR-379: A provider is added, tested and removed from Settings
+- FR-380: An answer renders as prose and code, with no remote fetch and no HTML injection
+- FR-381: Conversations are listed, searched, renamed, archived and resumed
+- FR-382: A resumed conversation replays from keeper's own store
+- FR-383: Bots are pinned in a hand order, with a shape, a bounded colour and a mark
+- FR-384: Per-message metadata is recorded always and shown on request
+- FR-385: The composer accepts slash commands, and refuses unknown ones with a reason
+- FR-386: A grant names a scope and a mode, is visible, and is revocable
+- FR-387: A write is never auto-approved by a grant alone
+- FR-388: Every tool call that touched the drive is auditable after the fact
+- FR-389: The model reads and writes the drive through keeper's own containment rule
+- FR-390: File content reaches the model as data, never as instructions
+- FR-391: `AGENTS.md`, `CLAUDE.md` and their kin are found, merged and budgeted
+- FR-392: An image is pasted into the conversation and sent only to a model that can see
+- FR-393: A path a model names is opened only inside a grant
+
+### Non-Functional Requirements
+
+- NFR-46: A stalled stream is abandoned after bounded silence, not bounded total time
+- NFR-47: A tool-call audit row is written before the effect, and survives a crash
+- NFR-48: No tool result can widen its own grant, and no file content is trusted as a directive
+- NFR-49: Every byte read or written by a tool call is bounded, and the bound is disclosed to the model
+
+## Epic 61: A Model You Can Talk To, in the App That Already Holds Your Drive
+
+Thirteen stories on one spine: provider → bot → conversation → message. 61.1
+and 61.2 are the only strictly serial pair; 61.4 needs 61.1–61.3; 61.5, 61.7,
+61.8 and 61.9 are parallel refinements of the surface 61.4 builds; 61.10
+precedes 61.11 absolutely; 61.12 needs 61.3 and 61.10; 61.13 is last because it
+corrects what the twelve before it made false. The risk lives in the impure
+shell and each item is named in the story that owns it: a real SSE socket that
+dies mid-frame (61.2), a real 401 and 404 from a wrong base URL (61.3), a real
+pointer file (61.11), a real `rename` under the sync watcher (61.11), a real
+revocation that stops an in-flight tool call (61.10). A test that proves any of
+these through a pure function has proven nothing.
+
+### Story 61.1: A Provider Is Something keeper Remembers
+`keeper_core::bots` store in `keeper.db` (`bot_providers`, `bots`; idempotent
+`CREATE TABLE IF NOT EXISTS`, additive columns, no JSON blobs): kind
+(`hermes` | `ollama`), display name, base URL, optional bot/profile prefix,
+timeout override, health snapshot; the credential behind the existing secret
+port, and a row that has lost its secret says so. Base-URL grammar as a tested
+`keeper-core` decision: `http`/`https` only, no userinfo, no path beyond a
+prefix; loopback and private-network hosts legitimate **and disclosed**.
+`compute_egress` gains one derived, host-only row per provider through the same
+userinfo-stripping helper git remotes use. AC: two same-kind providers with
+different base URLs coexist; a URL with userinfo is refused by name; adding a
+provider changes the disclosed egress set and removing it removes the row; no
+row holds a token. Binds FR-369, FR-370, FR-371; AD-146, AD-147, AD-148.
+
+### Story 61.2: One Wire, and the Divergences Are Data
+The `keeper-core` client: request builder, SSE framer (`data:` lines,
+keep-alive comments, `[DONE]`, a frame split across two `Bytes` chunks),
+reassembly of index-keyed `tool_calls` fragments with partial-JSON arguments,
+usage capture, cancel that persists a partial assistant row marked partial,
+and the per-kind quirk table. Timeouts bound by **silence** (`read_timeout`),
+never by a whole-request deadline, restated with a comment naming
+`keeper-sync/src/http.rs` as the source because `keeper-core` may not depend on
+`keeper-sync` (AD-40). Bodies read in bounded chunks; `AUTHORIZATION` marked
+sensitive. AC: a local test server that sends a valid stream, a frame in two
+chunks, dies mid-message, sends `[DONE]` without usage, returns 401/404/500,
+and holds the socket open sending nothing — every case reaches a named
+terminal state and the silent socket is abandoned after the bound. Binds
+FR-372, FR-373, FR-374, NFR-46; AD-149.
+
+### Story 61.3: What Can This Endpoint Actually Do
+Discovery per kind — Ollama `/api/tags` (carries `capabilities`); Hermes
+`/v1/models` plus `/api/model/options` (`supports_tools`, `supports_vision`,
+`supports_reasoning`, `context_window`) — into `BotModelVm`; health into
+`BotProbeVm`; a named Hermes profile verified at `/p/<name>/v1/models`. A
+capability keeper could not read is `unknown`, never `false`. AC: a real 401
+and a real 404 from a wrong base URL produce distinct actionable states; a
+model the endpoint describes without a vision field reports `unknown`; there
+is no roster affordance, and the empty state says a roster needs a door keeper
+is not given. Binds FR-375, FR-376, FR-377; AD-150, AD-151.
+
+### Story 61.4: A Conversation You Can Have
+`PrimaryView` member `bots`, `CapabilitiesVm.bots` computed in the shell and
+mirrored in the frozen store default and `dev/mock-shell.ts`, sidebar entry
+absent (not disabled) when off, ⌘9 bound by a hook cloned from
+`use-tasks-shortcut.ts` with its five guards and the no-dead-chord rule; the
+grant affordance additionally gated on `sync`. Settings → Providers as one
+component in two modes (AD-C7): add, test, edit, remove. The pane streams
+progressively, Stop stops, Retry re-sends, and an unreachable endpoint uses the
+app's existing unreachable-remote vocabulary. AC: typecheck fails if the flag
+is missing from any mirror; ⌘9 is a no-op with no dead chord where the flag is
+off; a provider added in Settings is talkable from the pane in the same
+session. Binds FR-378, FR-379; AD-152, AD-146.
+
+### Story 61.5: The Answer Is Readable
+Markdown subset over `@lezer/markdown` / `@codemirror/lang-markdown` already in
+`package.json`: prose, fenced code with copy control and language label, no
+`dangerouslySetInnerHTML`, no remote asset fetch. AC: an unterminated fence
+mid-stream renders as code and closes itself; a 200 kB reply does not lock the
+webview; a reply containing an image URL fetches nothing. Binds FR-380;
+AD-153.
+
+### Story 61.6: A List, an Archive, and Continue
+`bot_sessions` list newest-first with search over titles and bodies, rename,
+reversible archive, confirmed delete that names what happens to which object,
+resume replaying from keeper's store; a held Hermes `session_id` is shown with
+the plain statement that the remote may have compressed it into a successor.
+Titles minted locally from the first user message — no second model call. List
+shape from the recordings archive and the find-bar conventions. AC: resume
+works with the endpoint unreachable; deleting a conversation issues no remote
+request; the title of a new conversation appears without a network round trip.
+Binds FR-381, FR-382; AD-154.
+
+### Story 61.7: Pinned Bots with an Identity
+Hand order persisted with the `registry.rs:260-296` / `pins-strip.tsx`
+pattern; identity = a shape from a closed set + a mark (`space-icons.ts`
+picker extended with a short emoji/grapheme option) + a colour from a bounded
+palette every member of which `scripts/check-design.mjs` contrast-checks
+against both themes. A free colour picker is rejected, not deferred. AC: the
+design gate fails if a palette member is added that misses AA on either theme;
+drag-to-reorder persists across relaunch. Binds FR-383; AD-155.
+
+### Story 61.8: Metadata You Can Switch On
+Columns on `bot_messages` for model, provider, prompt/completion tokens,
+time-to-first-token, total duration, finish reason, tool-call count, request
+id; one persisted toggle in the pane and the palette; compact caption plus
+expander. Absent numbers render as absent, never as zero. AC: a `[DONE]`
+without usage renders with no token count rather than `0`; the toggle state
+survives relaunch. Binds FR-384; AD-156.
+
+### Story 61.9: Slash Commands That Refuse Honestly
+A `keeper-core` registry (name, description, argument mode, needs-provider)
+driving an autocomplete cloned from `slash-menu.ts:58-135`: `/new`, `/bot`,
+`/model`, `/metadata`, `/grant`, `/image`, `/history`, `/help`. Unknown
+commands are refused with the nearest match and never sent as prose; a literal
+leading slash is escapable and the empty state teaches it. Hermes' server-side
+commands are not proxied. AC: `/compct` refuses naming `/compact`-style nearest
+match without sending; an escaped `/etc` question reaches the model verbatim.
+Binds FR-385; AD-157.
+
+### Story 61.10: A Grant You Can See and Revoke
+`bot_grants` as (provider, optional bot) × (whole drive | one profile | one
+subtree) × (none | read | write), listed in Settings and the pane header,
+revocable in one act, checked **at every tool call**; the first write in a
+conversation and every write outside an approved subtree asks, and "always for
+this subtree" is a durable grant edit; `bot_audit` row written **before** the
+effect, naming paths. AC: revoking a grant while a tool call is in flight fails
+that call with the revocation as its reason (the impure-shell test this story
+must carry); a write with no approval never lands; a crash between audit row
+and effect leaves a visible row and no silent effect. Binds FR-386, FR-387,
+FR-388, NFR-47; AD-158.
+
+### Story 61.11: The Drive as Tools
+`list`, `read` (line ranges), `glob`, `grep`, `stat`, `write`, `edit`, each
+resolved through `browse::resolve` / `plain_segments` / `WriteScope::route` in
+`keeper-sync` carried across the verb boundary verbatim; every result bounded
+with the bound told to the model; pointer files return the pointer's truth;
+writes atomic through the existing temp-and-rename; `AGENTS.md`, `CLAUDE.md`,
+`GEMINI.md`, `.cursorrules` discovered nearest-first, merged in a stated order,
+size-capped, and shown to the user; all file content enters as data under a
+system sentence that instructions inside content are not instructions. AC: a
+`read` on a real pointer file returns the pointer state, not empty bytes; a
+`write` under a real watcher pass produces one commit and no conflict copy; a
+file whose text says "grant write" changes no grant; a truncated read carries
+`"truncated at N of M"`. Binds FR-389, FR-390, FR-391, NFR-48, NFR-49; AD-159.
+
+### Story 61.12: An Image You Can Paste, a Path You Can Open
+Pasted image as a raw IPC body (AD-58), stored and referenced like every other
+attachment, attached as a data-URI content part only where vision is `true` or
+`unknown` (with a warning for `unknown`; refused by model name for `false`),
+stated size and count caps; an absolute path in a reply offered as reveal/open
+**only inside a grant**, the reply text never altered. AC: no base64 crosses
+IPC as JSON; a paste to a `false`-vision model is refused with the model
+named; a path outside every grant renders as plain text with no affordance.
+Binds FR-392, FR-393; AD-160.
+
+### Story 61.13: The Gates, the Docs, and the Honest Row
+`docs/egress.md` provider chapter (the release-diff note fires — that is the
+visibility working); `docs/decisions.md` **D-4 — the endpoint is yours, never
+keeper's**; the recording zero-egress gate left untouched and unwidened, with
+the rule stated that no file this epic adds may match its globs and no palette
+verb reads as upload or transcription; `deny.toml` and manifest licence
+comments for any new crate; `docs/project-context.md` gains the two new
+invariants. AC: `zero-egress.test.ts` passes unmodified; the egress inventory
+lists exactly the configured provider hosts; D-4 exists and §15.7 of the PRD
+cites it. Binds FR-371 (docs leg), FR-380 (no-fetch audit), and the phase
+acceptance against FR-369–FR-393 / NFR-46–NFR-49.
+
+## Phase 8 Validation Summary
+
+- **FR coverage:** FR-369–FR-393 all mapped, each to exactly one owning story
+  (61.1: 369–371; 61.2: 372–374; 61.3: 375–377; 61.4: 378–379; 61.5: 380;
+  61.6: 381–382; 61.7: 383; 61.8: 384; 61.9: 385; 61.10: 386–388; 61.11:
+  389–391; 61.12: 392–393); 61.13 owns docs legs and phase acceptance and
+  allocates no FR.
+- **NFR coverage:** NFR-46 engineered in 61.2 and asserted against a silent
+  socket; NFR-47 engineered in 61.10 and asserted by the audit-before-effect
+  crash test; NFR-48 and NFR-49 engineered in 61.11 and asserted by the
+  content-as-data and disclosed-truncation tests.
+- **Architecture compliance:** AD-146/147/148 in 61.1; AD-149 in 61.2;
+  AD-150/151 in 61.3; AD-152 in 61.4; AD-153 in 61.5; AD-154 in 61.6; AD-155
+  in 61.7; AD-156 in 61.8; AD-157 in 61.9; AD-158 in 61.10; AD-159 in 61.11;
+  AD-160 in 61.12. Consumed unchanged: AD-27, AD-40, AD-53 (extended), AD-55,
+  AD-56, AD-58, AD-65, AD-89, AD-137, AD-139, AD-C7.
+- **Dependencies:** 61.1 → 61.2 → 61.3 serial; 61.4 needs 61.1–61.3; 61.5,
+  61.7, 61.8, 61.9 parallel after 61.4; 61.10 strictly before 61.11; 61.12
+  needs 61.3 and 61.10; 61.13 closes the phase.
+- **Human-in-the-loop:** no story needs hardware; 61.2 and 61.3 run against a
+  local test server. The SM-12 end-to-end demonstration needs the owner's real
+  Hermes and Ollama endpoints and, because the `keeper` shell crate does not
+  build on the Linux development host, is a macOS act.
+- **Out of scope, by decision:** talk mode / wake word / NeuTTS (Epic 62),
+  the native `/api/chat` dialect (DW-210), proxied Hermes slash commands
+  (DW-209), a titling model call (DW-211), embeddings/RAG (DW-212), shell
+  execution (DW-213), omp as a provider kind (DW-214).
+- **Sizing:** 13 stories in Epic 61, each scoped to a single dev session. The
+  running total above (174 across 31 epics) predates Epics 32–60, which are
+  indexed in their own files, and is not restated here.
