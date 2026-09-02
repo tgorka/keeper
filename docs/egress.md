@@ -22,6 +22,7 @@ keeper contacts, and it is enforced in two ways:
 | Each account's **Matrix homeserver** (e.g. `https://matrix.example.org`) | One entry per distinct homeserver you are signed into (duplicates collapse to one) | All Matrix protocol traffic — sync, sending, media, key backup, verification. |
 | **`api.beeper.com`** | Only when at least one account is a Beeper account (by provider tag **or** by homeserver host `matrix.beeper.com`) | Beeper's unofficial email-code login and account service. Appears exactly once. |
 | Each sync profile's **git remote host** (e.g. `github.com`, `forgejo.example.org`) | One entry per distinct remote *host* across your folder-sync profiles (duplicates collapse to one); absent entirely for a profile whose remote is a local path or a pendrive, which reaches no network | Fetch, push and LFS transfer for that folder. Only the **host** is shown — never the repository path, the username, or a credential that a badly-stored profile put in the URL. See `egress::remote_host`. |
+| Each configured **AI provider's host** (e.g. `localhost`, `127.0.0.1`, `gw.example.org`) | One entry per distinct provider *host* across your Bots providers (duplicates collapse to one); absent entirely when no provider is configured, which is how keeper ships | Chat completions, model and capability discovery, and a bot probe against the Hermes or Ollama endpoint you typed. Only the **host** is shown — never the `/v1` path, a profile prefix, or a credential. See the provider chapter below, and `egress::remote_host`. |
 | **`github.com/tgorka/keeper/releases/...`** (the signed-update `latest.json` endpoint) | Always (an update check) | Signed auto-updates (NFR-12). Downloads are cryptographically verified against keeper's minisign public key before installing. |
 | **`*.githubusercontent.com`** (GitHub's release-asset CDN) | Only while downloading an update the user chose to install | GitHub serves release files (the update binary) from its content-delivery network, which the `github.com` release URL redirects to. Disclosed so the egress list is exhaustive, not just the check endpoint. |
 
@@ -80,6 +81,50 @@ The derivation lives in `keeper-core::egress::remote_host` and is unit-tested ag
 remote form git accepts — `https`, `ssh`, `git`, the scp-like `git@host:path` shorthand,
 `file:`, and bare paths — including the cases that must yield no entry and the cases that
 must not leak a username or token.
+
+## An AI provider is a destination you typed, disclosed as a host
+
+The Bots surface (⌘9, Epic 61) talks to a model over the OpenAI-compatible wire, and a model
+lives at an endpoint. That endpoint is the one destination in this document that **exists only
+because you typed it**: keeper ships no default endpoint, no hosted model and no proxy of its own,
+so a fresh install has no provider row here at all, and adding one in Settings → Bots is the act
+that creates the destination. Removing the provider removes the row on the next open, with no
+cache to go stale. This is the same posture the no-telemetry section below states for everything
+else — *"keeper never sends your data, usage, or diagnostics anywhere except the servers listed
+above"* — and the provider row is how a model endpoint becomes one of the servers listed above
+rather than an exception to it. The reasoning is recorded as `docs/decisions.md` D-4.
+
+The row is **derived, never hand-written**. `EgressKind::BotProvider` is computed by
+`egress::compute_egress` from `bots::store::provider_base_urls`, read from the same store the
+chat itself reads, exactly as the git-remote rows are read from the sync profiles the engine
+drives (AD-53). And it is reduced by the **same** `egress::remote_host` a git remote goes
+through — not a second reduction that would have to be kept in step with it — so the list shows
+`gw.example.org`, not `https://gw.example.org/v1` and not `/p/<profile>/v1`. The base-URL grammar
+in `bots::url` already refuses userinfo and a query string, so a credential cannot legally reach
+this function from a provider row; it is stripped anyway, because Settings → About is a screen
+people share and the row that leaks a token is the one written by a build whose grammar was
+looser than this one. Two providers on one host are one entry, for the reason the sync-remote
+chapter gives: they are one destination.
+
+**A loopback or private-network host is the normal case here, and it is disclosed, not hidden.**
+Ollama's documentation points every user at `http://localhost:11434`; Hermes' api-server binds
+`127.0.0.1:8642` by default. A blocklist over private ranges — the standard SSRF advice for a
+server accepting arbitrary URLs — would reject the two endpoints the feature exists to reach, so
+keeper answers the SSRF question the way it answers every other reach-outside question: by
+disclosure plus an explicit user act. `bots::url::parse_base_url` accepts a loopback, private or
+link-local host and marks it `is_private` so the surface can say which side of your network the
+bytes stay on; the About list then shows `localhost` or `127.0.0.1` as a row like any other. A
+row that reads `127.0.0.1` is the list telling you the bytes did not leave the machine, which is
+a fact worth stating rather than a destination to suppress. What the grammar refuses is the set
+of shapes that cannot be part of an honest disclosure at all: a non-HTTP scheme, userinfo, a
+query string, a path beyond a profile prefix.
+
+Because this file is diffed on every release, the release workflow's egress diff note fires on
+this chapter's arrival, and that is the mechanism working as designed: a new *kind* of
+destination is exactly the change the note exists to make visible. The derivation and its
+reductions are unit-tested beside the git-remote cases in `keeper-core::egress` — host-only,
+de-duplicated, ordered after the sync remotes and before the update endpoint, and gone entirely
+when the last provider is removed.
 
 ## Screen recording adds no egress
 
