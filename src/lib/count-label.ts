@@ -71,6 +71,17 @@ export const ITEMS: CountNoun = { one: "item", many: "items" };
  */
 export const RUNS: CountNoun = { one: "run", many: "runs" };
 
+/**
+ * A bot answer's token noun (Story 61.8, FR-384).
+ *
+ * Only ever worded from a number an endpoint actually reported: a `usage` block
+ * an endpoint omitted arrives as `null` and the caption drops the phrase
+ * entirely rather than counting zero of them, which is the same refusal the
+ * `of`/`atLeast` shapes above make about a number that is not what it looks
+ * like.
+ */
+export const TOKENS: CountNoun = { one: "token", many: "tokens" };
+
 export interface CountOptions {
   /**
    * How many the query MATCHED, when a cap declined some of them. Rendered as

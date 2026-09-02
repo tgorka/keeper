@@ -11,6 +11,8 @@ import {
   SDK_STORE_UNENCRYPTED_STATUS,
   STORAGE_HONESTY_SENTENCE,
 } from "@/components/settings/at-rest-encryption-choice";
+import { BotGrantsSection } from "@/components/settings/bot-grants-section";
+import { BotsSection } from "@/components/settings/bots-section";
 import { ConfigSourceSection, FileControlled } from "@/components/settings/config-source-section";
 import {
   BADGE_NOT_LIVE_SENTENCE,
@@ -143,6 +145,10 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
   // Folder sync needs a usable `git` binary (Epic 29, AD-41); render the Sync
   // section only where the capability reports one — never a dead affordance.
   const sync = useCapabilitiesStore((s) => s.capabilities.sync);
+  // The Bots section (Epic 61, FR-379), on its own flag rather than `sync`: an
+  // endpoint is a URL and a credential behind the keychain, so it can exist on
+  // a machine with no folder sync at all.
+  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   // Whether this is the capability-reduced (phone) tier — drives the Archive
   // backup-exclusion line below, the "On this iPhone" list in About, and hides the
   // desktop "Background & dock" section (Story 14.2).
@@ -220,6 +226,15 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
           The section removes itself when no folder is flagged as a zone, the
           way Quick capture removes itself without a vault (Story 49.3, FR-276). */}
       <SessionsSettingsSection open={open} />
+      {/* Endpoints and bots (Epic 61, FR-379). Gated on `bots`, which is NOT
+          the sync gate the three sections below it ride: an endpoint is a URL
+          and a credential, so it needs no `git`. */}
+      {bots && <BotsSection open={open} />}
+      {/* Story 61.10's grants: the list that answers "what can a bot change?".
+          Gated on `sync` as well as `bots`, because a grant names a folder
+          inside a synced profile and on a machine with none there is nothing
+          it could name — the honest split the epic states. */}
+      {bots && sync && <BotGrantsSection open={open} />}
       {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
               that has none, never a section whose every button would reject. */}
       {sync && <SyncSection open={open} />}

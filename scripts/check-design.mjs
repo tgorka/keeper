@@ -484,30 +484,244 @@ function checkNonWebColour(file) {
   });
 }
 
-const sources = walk(join(ROOT, "src")).filter(
-  (f) =>
-    !f.endsWith(TOKENS.replace("src/", "src/")) &&
-    !/\.test\.[tj]sx?$/.test(f) &&
-    !f.includes("/test/"),
-);
-for (const f of sources) checkSource(f);
+// ---------------------------------------------------------------------------
+// The bot identity palette (Story 61.7).
+// ---------------------------------------------------------------------------
 
-const nonWeb = [
-  ...walk(join(ROOT, "src-tauri"), [], [".rs"]),
-  ...walk(join(ROOT, "scripts"), [], [".ts", ".mjs"]),
-].filter(
-  (f) => !/\.test\.[tj]s$/.test(f) && !f.includes("/tests/") && !f.endsWith("check-design.mjs"),
-);
-for (const f of nonWeb) checkNonWebColour(f);
+/**
+ * Where the closed sets live, and why the gate reads three files to check one
+ * decision.
+ *
+ * A bot's identity is a shape, a colour and a mark, and the colour is the only
+ * one of the three that can be *wrong* rather than merely unfamiliar: an
+ * unreadable ink is unreadable, and `DESIGN.md` records the arithmetic that
+ * makes an unconstrained pick indefensible — AA needs L* <= 46.8 on warm paper
+ * and L* >= 51.9 on near-black, so no colour of any hue passes in both themes.
+ * A free colour picker is therefore not deferred, it is refused, and what
+ * replaces it is a bounded palette whose every member is measured HERE.
+ *
+ * Three files, because the palette is named in three places and a drift
+ * between any two of them ships a colour somebody can choose and nothing can
+ * draw, or one Rust refuses after the picker has offered it:
+ *
+ *   - the ink hexes, twice each, in `src/index.css`;
+ *   - the closed set of names the picker offers, in `bot-identity.tsx`;
+ *   - the closed set `keeper-core` will accept, in `bots/identity.rs`.
+ */
+const IDENTITY_PALETTE_SOURCE = "src/components/bots/bot-identity.tsx";
+const IDENTITY_PALETTE_RUST = "src-tauri/crates/keeper-core/src/bots/identity.rs";
+/** The `--bot-ink-*` prefix every palette token carries. */
+export const IDENTITY_INK_PREFIX = "bot-ink-";
+/**
+ * 4.5:1, not the 3:1 that SC 1.4.11 would allow a non-text indicator.
+ *
+ * An identity is drawn as a cell with a MARK inside it, and a mark may be a
+ * single letter the user typed — which is text, and text has a text floor. The
+ * same ink also sets the bot's name in the picker. Holding the whole palette to
+ * the text floor is the only way the ink can be used for both without the gate
+ * having to know which call site it is looking at.
+ */
+export const IDENTITY_PALETTE_FLOOR = 4.5;
+/** The surfaces an identity can be drawn on: pane, card, and the raised row. */
+export const IDENTITY_SURFACES = ["background", "card", "secondary"];
+/**
+ * The bound on the palette's size, from the story: fewer than six and two bots
+ * collide constantly, more than ten and the names stop being memorable — and an
+ * unbounded list is the free picker under another name.
+ */
+export const IDENTITY_PALETTE_BOUNDS = [6, 10];
 
-checkTokens();
-
-if (violations.length === 0) {
-  console.log(
-    `check:design — clean (${sources.length} web + ${nonWeb.length} native files, ${TOKENS} arithmetic verified)`,
-  );
-  process.exit(0);
+/** The `#hex` custom properties of one CSS block, keyed by name. */
+export function themeBlock(css, selector) {
+  const start = css.indexOf(selector);
+  if (start === -1) return {};
+  const body = css.slice(start, css.indexOf("\n}", start));
+  const out = {};
+  for (const m of body.matchAll(/--([\w-]+):\s*(#[0-9a-fA-F]{3,8})\s*;/g)) out[m[1]] = m[2];
+  return out;
 }
-for (const v of violations) console.error(`${v.file}:${v.line}  [${v.rule}] ${v.message}`);
-console.error(`\ncheck:design — ${violations.length} violation(s)`);
-process.exit(1);
+
+/** The quoted members of `export const NAME = [...]` in a TS source. */
+export function readNameList(source, name) {
+  const m = new RegExp(`export const ${name}\\s*=\\s*\\[([^\\]]*)\\]`).exec(source);
+  if (m === null) return null;
+  return [...m[1].matchAll(/"([^"]+)"/g)].map((q) => q[1]);
+}
+
+/** The quoted members of `pub const NAME: [&str; N] = [...]` in a Rust source. */
+export function readRustNameList(source, name) {
+  const m = new RegExp(`pub const ${name}:[^=]*=\\s*\\[([^\\]]*)\\]`).exec(source);
+  if (m === null) return null;
+  return [...m[1].matchAll(/"([^"]+)"/g)].map((q) => q[1]);
+}
+
+/**
+ * The arithmetic itself, pure and exported so it is testable without a repo:
+ * every palette member, against every surface of its own theme, in both.
+ *
+ * Returns one finding per failure — `{ kind, name, theme, surface, ratio }` —
+ * rather than reporting directly, so the same function answers the gate and its
+ * own test.
+ */
+export function identityPaletteFindings(names, themes) {
+  const findings = [];
+  if (names.length < IDENTITY_PALETTE_BOUNDS[0] || names.length > IDENTITY_PALETTE_BOUNDS[1]) {
+    findings.push({ kind: "bounds", name: `${names.length} entries` });
+  }
+  for (const [theme, tokens] of Object.entries(themes)) {
+    for (const name of names) {
+      const hex = tokens[`${IDENTITY_INK_PREFIX}${name}`];
+      if (hex === undefined) {
+        findings.push({ kind: "missing", name, theme });
+        continue;
+      }
+      for (const surfaceName of IDENTITY_SURFACES) {
+        const surface = tokens[surfaceName];
+        if (surface === undefined) continue;
+        const ratio = contrast(hex, surface);
+        if (ratio !== null && ratio < IDENTITY_PALETTE_FLOOR) {
+          findings.push({ kind: "contrast", name, theme, surface: surfaceName, ratio });
+        }
+      }
+    }
+    // The other direction: an ink nothing can choose. Unreachable colour is how
+    // a palette grows back past its bound without anybody deciding to.
+    for (const token of Object.keys(tokens)) {
+      if (!token.startsWith(IDENTITY_INK_PREFIX)) continue;
+      const member = token.slice(IDENTITY_INK_PREFIX.length);
+      if (!names.includes(member)) {
+        findings.push({ kind: "orphan", name: member, theme });
+      }
+    }
+  }
+  return findings;
+}
+
+/** The gate's half: read the three files, run the arithmetic, report. */
+function checkIdentityPalette() {
+  const cssFile = join(ROOT, TOKENS);
+  const css = readFileSync(cssFile, "utf8");
+  const lineOf = (needle) => {
+    const at = css.indexOf(needle);
+    return at === -1 ? 1 : css.slice(0, at).split("\n").length;
+  };
+  const themes = { light: themeBlock(css, ":root {"), dark: themeBlock(css, ".dark {") };
+
+  const source = readFileSync(join(ROOT, IDENTITY_PALETTE_SOURCE), "utf8");
+  const names = readNameList(source, "BOT_IDENTITY_COLOURS");
+  if (names === null) {
+    report(
+      join(ROOT, IDENTITY_PALETTE_SOURCE),
+      1,
+      "identity-palette",
+      "BOT_IDENTITY_COLOURS is not declared here — the gate cannot check a palette it cannot read",
+    );
+    return;
+  }
+  const shapes = readNameList(source, "BOT_IDENTITY_SHAPES") ?? [];
+
+  for (const finding of identityPaletteFindings(names, themes)) {
+    if (finding.kind === "contrast") {
+      report(
+        cssFile,
+        lineOf(`--${IDENTITY_INK_PREFIX}${finding.name}:`),
+        "identity-palette",
+        `--${IDENTITY_INK_PREFIX}${finding.name} on --${finding.surface} (${finding.theme}) is ${finding.ratio.toFixed(2)}:1, needs ${IDENTITY_PALETTE_FLOOR} — a bot's ink is read at text size`,
+      );
+      continue;
+    }
+    if (finding.kind === "missing") {
+      report(
+        cssFile,
+        1,
+        "identity-palette",
+        `--${IDENTITY_INK_PREFIX}${finding.name} is offered by the picker but has no ${finding.theme} value — one hex cannot serve both themes`,
+      );
+      continue;
+    }
+    if (finding.kind === "orphan") {
+      report(
+        cssFile,
+        lineOf(`--${IDENTITY_INK_PREFIX}${finding.name}:`),
+        "identity-palette",
+        `--${IDENTITY_INK_PREFIX}${finding.name} (${finding.theme}) is an ink nothing can choose — remove it or add it to BOT_IDENTITY_COLOURS`,
+      );
+      continue;
+    }
+    report(
+      join(ROOT, IDENTITY_PALETTE_SOURCE),
+      1,
+      "identity-palette",
+      `the bot palette is ${finding.name} — it is bounded at ${IDENTITY_PALETTE_BOUNDS.join("-")}, because an unbounded list is the free picker under another name`,
+    );
+  }
+
+  // The two closed sets, once each side. A name the picker offers and Rust
+  // refuses is a save that fails after the person chose; the reverse is a
+  // colour stored that nothing draws.
+  const rust = readFileSync(join(ROOT, IDENTITY_PALETTE_RUST), "utf8");
+  for (const [label, web, native] of [
+    ["colour", names, readRustNameList(rust, "BOT_COLOURS")],
+    ["shape", shapes, readRustNameList(rust, "BOT_SHAPES")],
+  ]) {
+    if (native === null) {
+      report(
+        join(ROOT, IDENTITY_PALETTE_RUST),
+        1,
+        "identity-palette",
+        `the ${label} set is not declared here — the picker and the validator must name the same closed set`,
+      );
+      continue;
+    }
+    if (web.join(",") !== native.join(",")) {
+      report(
+        join(ROOT, IDENTITY_PALETTE_RUST),
+        1,
+        "identity-palette",
+        `the ${label} set differs between the picker (${web.join(", ")}) and the validator (${native.join(", ")})`,
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The run. Guarded, because the rules above are pure functions and a rule that
+// cannot be imported cannot be tested — `check-design.test.ts` exercises the
+// palette arithmetic against fixture themes, which is the only way to prove
+// that the gate FAILS on a member that does not pass rather than merely
+// passing today. `check-js-licenses.ts` guards its own main the same way.
+// ---------------------------------------------------------------------------
+
+if (import.meta.main) {
+  const sources = walk(join(ROOT, "src")).filter(
+    (f) =>
+      !f.endsWith(TOKENS.replace("src/", "src/")) &&
+      !/\.test\.[tj]sx?$/.test(f) &&
+      !f.includes("/test/"),
+  );
+  for (const f of sources) checkSource(f);
+
+  const nonWeb = [
+    ...walk(join(ROOT, "src-tauri"), [], [".rs"]),
+    ...walk(join(ROOT, "scripts"), [], [".ts", ".mjs"]),
+  ].filter(
+    (f) =>
+      !/\.test\.(?:[tj]s|mjs)$/.test(f) &&
+      !f.includes("/tests/") &&
+      !f.endsWith("check-design.mjs"),
+  );
+  for (const f of nonWeb) checkNonWebColour(f);
+
+  checkTokens();
+  checkIdentityPalette();
+
+  if (violations.length === 0) {
+    console.log(
+      `check:design — clean (${sources.length} web + ${nonWeb.length} native files, ${TOKENS} arithmetic verified, bot palette measured in both themes)`,
+    );
+    process.exit(0);
+  }
+  for (const v of violations) console.error(`${v.file}:${v.line}  [${v.rule}] ${v.message}`);
+  console.error(`\ncheck:design — ${violations.length} violation(s)`);
+  process.exit(1);
+}

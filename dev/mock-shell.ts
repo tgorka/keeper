@@ -47,12 +47,28 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type {
   AccountVm,
+  BotAttachmentVm,
+  BotAuditRowVm,
+  BotCommandPreviewVm,
+  BotCommandRowVm,
+  BotConversationVm,
+  BotDeliverableVm,
+  BotGrantSaveReq,
+  BotGrantVm,
+  BotMessageVm,
+  BotModelVm,
+  BotProbeVm,
+  BotProviderVm,
+  BotSessionVm,
+  BotStreamEvent,
+  BotVm,
   CapabilitiesVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
   FilesListingVm,
   FilesReleaseVm,
+  GrantScope,
   PacedWorkVm,
   SessionSpaceFilesVm,
   SessionSpaceFileVm,
@@ -1044,9 +1060,9 @@ const ANSWERS: Record<string, unknown> = {
     sync: true,
     notes: true,
     sessions: true,
-    // The bots surface is desktop-only and needs neither git nor sync.db, so the
-    // harness advertises it: without this line the ⌘9 pane is unreachable in
-    // `bun run dev` (story 61.4).
+    // Epic 61: `true`, and this is the trap the comment above names. As `false`
+    // every bots fixture below would be unreachable in `bun run dev` — the
+    // pane, the picker, the composer and the fake stream all sit behind it.
     bots: true,
     overlayTitleBar: true,
   } satisfies CapabilitiesVm,
@@ -2099,7 +2115,799 @@ export function mockSchedulePreview(expression: string): TaskSchedulePreviewVm {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Bots (Epic 61, Story 61.4)
+//
+// Two tenants of different kinds, because the divergences between them are the
+// whole design and a harness with one would hide half of it: the Ollama one is
+// loopback with no credential (legitimate — its `/v1` layer accepts and
+// discards any key) and the Hermes one is a LAN host that has a key stored.
+// The Hermes bot's pane is what shows the no-grant sentence, and the Ollama
+// one's is what shows the grant bar, so both are reachable in `bun run dev`.
+// ---------------------------------------------------------------------------
+
+const BOT_PROVIDERS: BotProviderVm[] = [
+  {
+    id: "01J8BOTPROVOLLAMAAAAAAAAAA",
+    kind: "ollama",
+    name: "Ollama on this machine",
+    baseUrl: "http://localhost:11434",
+    host: "localhost",
+    isPrivate: true,
+    createdMs: NOW - 86_400_000 * 12,
+    health: "reachable",
+    healthCheckedMs: NOW - 120_000,
+    healthDetail: null,
+    readTimeoutMs: null,
+    hasToken: false,
+  },
+  {
+    id: "01J8BOTPROVHERMESAAAAAAAAA",
+    kind: "hermes",
+    name: "Hermes on hesperia",
+    baseUrl: "http://hesperia.local:8642",
+    host: "hesperia.local",
+    isPrivate: true,
+    createdMs: NOW - 86_400_000 * 3,
+    health: "reachable",
+    healthCheckedMs: NOW - 600_000,
+    healthDetail: null,
+    readTimeoutMs: null,
+    hasToken: true,
+  },
+];
+
+const BOT_ROWS: BotVm[] = [
+  {
+    id: "01J8BOTAAAAAAAAAAAAAAAAAAA",
+    providerId: "01J8BOTPROVOLLAMAAAAAAAAAA",
+    target: "llama4:8b",
+    name: "Llama",
+    pinOrder: 0,
+    // Story 61.7: one bot wears an identity and the other does not, so the
+    // harness shows both the chosen cell and the honest unchosen state.
+    shape: "hollow",
+    colour: "lapis",
+    mark: "flask-conical",
+    createdMs: NOW - 86_400_000 * 12,
+  },
+  {
+    id: "01J8BOTBBBBBBBBBBBBBBBBBBB",
+    providerId: "01J8BOTPROVHERMESAAAAAAAAA",
+    target: "research",
+    name: "Research",
+    pinOrder: 1,
+    shape: null,
+    colour: null,
+    mark: null,
+    createdMs: NOW - 86_400_000 * 3,
+  },
+];
+
+/** Per-bot model rosters, with the tri-state exercised on purpose: the Hermes
+ *  alias reports nothing about vision, which is what an `unknown` capability
+ *  looks like on screen. */
+const BOT_MODELS: Record<string, BotModelVm[]> = {
+  "llama4:8b": [
+    {
+      id: "llama4:8b",
+      family: "llama4",
+      parameterSize: "8.0B",
+      quantization: "Q4_K_M",
+      sizeBytes: 4_920_000_000,
+      contextWindow: null,
+      maxOutputTokens: null,
+      vision: false,
+      tools: true,
+      reasoning: false,
+      capabilities: ["completion", "tools"],
+    },
+    {
+      id: "qwen3-vl:8b",
+      family: "qwen3",
+      parameterSize: "8.2B",
+      quantization: "Q4_K_M",
+      sizeBytes: 5_310_000_000,
+      contextWindow: null,
+      maxOutputTokens: null,
+      vision: true,
+      tools: true,
+      reasoning: true,
+      capabilities: ["completion", "tools", "vision", "thinking"],
+    },
+  ],
+  research: [
+    {
+      id: "hermes-agent",
+      family: null,
+      parameterSize: null,
+      quantization: null,
+      sizeBytes: null,
+      contextWindow: 128_000,
+      maxOutputTokens: 8_192,
+      vision: null,
+      tools: true,
+      reasoning: null,
+      capabilities: [],
+    },
+  ],
+};
+
+/** The conversations, newest activity first — the order Rust returns. */
+const BOT_SESSIONS: BotSessionVm[] = [
+  {
+    id: "01J8BOTSESSIONAAAAAAAAAAAA",
+    botId: "01J8BOTAAAAAAAAAAAAAAAAAAA",
+    providerId: "01J8BOTPROVOLLAMAAAAAAAAAA",
+    title: "What changed in the drive this week",
+    createdMs: NOW - 7_200_000,
+    updatedMs: NOW - 3_600_000,
+    archived: false,
+    remoteSessionId: null,
+  },
+  {
+    id: "01J8BOTSESSIONBBBBBBBBBBBB",
+    botId: "01J8BOTBBBBBBBBBBBBBBBBBBB",
+    providerId: "01J8BOTPROVHERMESAAAAAAAAA",
+    title: "Draft the release note",
+    createdMs: NOW - 86_400_000,
+    updatedMs: NOW - 80_000_000,
+    archived: false,
+    remoteSessionId: "hermes-9f21",
+  },
+  // Archived, so the list's Archived filter and its Unarchive verb have
+  // something to act on (Story 61.6). A harness whose archive is always empty
+  // only ever shows the no-matches sentence.
+  {
+    id: "01J8BOTSESSIONCCCCCCCCCCCC",
+    botId: "01J8BOTAAAAAAAAAAAAAAAAAAA",
+    providerId: "01J8BOTPROVOLLAMAAAAAAAAAA",
+    title: "Certificate renewal, last month",
+    createdMs: NOW - 30 * 86_400_000,
+    updatedMs: NOW - 29 * 86_400_000,
+    archived: true,
+    remoteSessionId: null,
+  },
+];
+
+/** One message row, so every fixture below spells the seventeen columns once. */
+function botMessage(fields: {
+  id: string;
+  sessionId: string;
+  seq: number;
+  role: string;
+  content: string;
+  partial?: boolean;
+  toolCallCount?: number;
+  finishReason?: string | null;
+}): BotMessageVm {
+  return {
+    id: fields.id,
+    sessionId: fields.sessionId,
+    seq: fields.seq,
+    role: fields.role,
+    content: fields.content,
+    model: fields.role === "assistant" ? "llama4:8b" : null,
+    providerId: fields.role === "assistant" ? "01J8BOTPROVOLLAMAAAAAAAAAA" : null,
+    promptTokens: fields.role === "assistant" ? 412 : null,
+    // Absent on purpose, so the harness shows what an endpoint that omits half
+    // of `usage` looks like — the case Story 61.8 must render as absent and
+    // never as zero.
+    completionTokens: null,
+    totalTokens: null,
+    ttftMs: fields.role === "assistant" ? 240 : null,
+    durationMs: fields.role === "assistant" ? 2_180 : null,
+    finishReason: fields.finishReason ?? (fields.role === "assistant" ? "stop" : null),
+    requestId: fields.role === "assistant" ? "chatcmpl-mock-1" : null,
+    toolCallCount: fields.toolCallCount ?? 0,
+    partial: fields.partial ?? false,
+    createdMs: NOW - 3_600_000,
+  };
+}
+
+/** The two stored conversations. The second carries a PARTIAL answer, because
+ *  a stream that died is a state the pane must render and a table of happy
+ *  answers would never show it. */
+const BOT_CONVERSATIONS: Record<string, BotConversationVm> = {
+  "01J8BOTSESSIONAAAAAAAAAAAA": {
+    session: BOT_SESSIONS[0] as BotSessionVm,
+    messages: [
+      botMessage({
+        id: "01J8BOTMSG1",
+        sessionId: "01J8BOTSESSIONAAAAAAAAAAAA",
+        seq: 0,
+        role: "user",
+        content: "What changed in the drive this week?",
+      }),
+      botMessage({
+        id: "01J8BOTMSG2",
+        sessionId: "01J8BOTSESSIONAAAAAAAAAAAA",
+        seq: 1,
+        role: "assistant",
+        content:
+          "I cannot read your folders yet — no grant is held for this bot, so nothing on the drive was looked at.",
+      }),
+    ],
+  },
+  "01J8BOTSESSIONBBBBBBBBBBBB": {
+    session: BOT_SESSIONS[1] as BotSessionVm,
+    messages: [
+      botMessage({
+        id: "01J8BOTMSG3",
+        sessionId: "01J8BOTSESSIONBBBBBBBBBBBB",
+        seq: 0,
+        role: "user",
+        content: "Draft the release note for 0.8.25.",
+      }),
+      botMessage({
+        id: "01J8BOTMSG4",
+        sessionId: "01J8BOTSESSIONBBBBBBBBBBBB",
+        seq: 1,
+        role: "assistant",
+        content: "keeper 0.8.25 adds the Bots surface, and",
+        partial: true,
+        finishReason: "failed",
+      }),
+    ],
+  },
+};
+
+/** What the fake stream says, one delta per element. */
+const BOT_FAKE_ANSWER = [
+  "Nothing on your drive was read: ",
+  "no grant is held for this bot. ",
+  "This answer came from the dev harness, ",
+  "not from a model — `dev/mock-shell.ts` ",
+  "is a viewing aid and never evidence.",
+];
+
+/** Milliseconds between fake deltas. Slow enough that the progressive render
+ *  is visible to a human, fast enough that Stop is reachable before the end. */
+const BOT_FAKE_DELTA_MS = 220;
+
+/**
+ * A channel the mock can push into.
+ *
+ * `mockIPC` hands the handler the payload with the real `Channel` instance in
+ * it — unserialized, because nothing crosses a process here — so its
+ * `onmessage` is callable directly. That bypasses the ordering index the real
+ * `Channel` maintains, which is fine for a viewing aid and is exactly what
+ * makes a fake stream possible with no Rust.
+ */
+interface MockChannel<T> {
+  onmessage?: (message: T) => void;
+}
+
+/** Which fake streams are running, so `bots_chat_stop` can stop one. */
+const BOT_LIVE_STREAMS = new Map<string, () => void>();
+
+/**
+ * The dev shell's answer to `bots_command_preview` (Story 61.9).
+ *
+ * **A fake, and a crude one on purpose.** The registry, the resolution order
+ * and every sentence live in `keeper_core::bots::commands`; this exists only so
+ * the `/` menu draws in a browser with no Rust behind it. It mirrors the names
+ * and the descriptions — a menu of the wrong words would teach a reviewer the
+ * wrong surface — and it does **not** reimplement nearest-match, availability
+ * or the escape beyond what it takes to see each shape once. Read the Rust
+ * tests for the rules; read this for the pixels.
+ */
+function mockCommandPreview(draft: string): BotCommandPreviewVm {
+  const registry: readonly BotCommandRowVm[] = [
+    ["new", "Start a new conversation with the bot you have chosen.", null],
+    ["bot", "Switch to another bot by name.", null],
+    ["model", "Send the rest of this conversation to another model.", null],
+    ["metadata", "Show or hide the model, tokens and timing under each answer.", null],
+    [
+      "grant",
+      "Choose what this bot may reach on your drive.",
+      // The harness' Ollama bot reports no tool capability, which is `unknown`
+      // and never `false` — so the row is runnable AND carries the caveat.
+      // Hard-coded here because a fake cannot read a capability; the rule lives
+      // in `keeper_core::bots::commands::availability`.
+      "keeper could not read whether this model takes tools, so a grant here may reach nothing. Probe the model in Settings → Bots.",
+    ],
+    ["history", "List your conversations, or search them by a word.", null],
+    ["help", "List every command keeper knows.", null],
+  ].map(([name, description, warning]) => ({
+    name: String(name),
+    aliases: [],
+    description: String(description),
+    args: "none",
+    argHint: null,
+    available: true,
+    reason: null,
+    warning: warning === null ? null : String(warning),
+  }));
+  const escapeHint =
+    "To send a message that starts with a slash, double it: //etc sends /etc as text.";
+  const line = draft.startsWith("/") && !draft.startsWith("//") && !draft.includes("\n");
+  if (!line) {
+    const text = draft.startsWith("//") ? draft.slice(1) : draft;
+    return { draft, verdict: { kind: "prose", text }, rows: [], note: null, escapeHint };
+  }
+  const token = draft.slice(1).split(/\s/, 1)[0]?.toLowerCase() ?? "";
+  const rows = registry.filter((row) => row.name.startsWith(token));
+  const exact = rows.find((row) => row.name === token);
+  if (exact !== undefined) {
+    return {
+      draft,
+      verdict: { kind: "command", name: exact.name, args: null },
+      rows: [exact],
+      note: null,
+      escapeHint,
+    };
+  }
+  if (token !== "" && rows.length === 0) {
+    return {
+      draft,
+      verdict: {
+        kind: "refusal",
+        message: `keeper has no /${token} command. Nothing was sent. Type /help for the list. ${escapeHint}`,
+      },
+      rows: [],
+      note: null,
+      escapeHint,
+    };
+  }
+  return { draft, verdict: { kind: "prose", text: draft }, rows, note: null, escapeHint };
+}
+
+/**
+ * Drive one fake answer into `channel`, and return its subscription id.
+ *
+ * It emits the same event sequence the shell does, in the same order — an
+ * `opened` carrying three already-persisted rows, a `firstToken`, N `delta`s,
+ * then exactly one terminal `closed`. A Stop closes with a reason and a partial
+ * row, which is the state the real driver writes.
+ */
+function botFakeStream(
+  channel: MockChannel<BotStreamEvent>,
+  session: BotSessionVm,
+  question: string,
+  carried: BotMessageVm[],
+): string {
+  const subscriptionId = `bot-stream-${Date.now()}`;
+  const base = carried.length;
+  const user = botMessage({
+    id: `${subscriptionId}-user`,
+    sessionId: session.id,
+    seq: base,
+    role: "user",
+    content: question,
+  });
+  const assistant = botMessage({
+    id: `${subscriptionId}-assistant`,
+    sessionId: session.id,
+    seq: base + 1,
+    role: "assistant",
+    content: "",
+    partial: true,
+    finishReason: null,
+  });
+  const send = (event: BotStreamEvent) => channel.onmessage?.(event);
+  send({
+    kind: "opened",
+    subscriptionId,
+    session,
+    user,
+    assistant,
+  });
+
+  let index = 0;
+  let text = "";
+  const timer = window.setInterval(() => {
+    const slice = BOT_FAKE_ANSWER[index];
+    if (slice === undefined) {
+      window.clearInterval(timer);
+      BOT_LIVE_STREAMS.delete(subscriptionId);
+      send({
+        kind: "closed",
+        message: { ...assistant, content: text, partial: false, finishReason: "stop" },
+        reason: null,
+      });
+      return;
+    }
+    if (index === 0) {
+      send({ kind: "firstToken", afterMs: BOT_FAKE_DELTA_MS });
+    }
+    text += slice;
+    index += 1;
+    send({ kind: "delta", text: slice });
+  }, BOT_FAKE_DELTA_MS);
+
+  BOT_LIVE_STREAMS.set(subscriptionId, () => {
+    window.clearInterval(timer);
+    BOT_LIVE_STREAMS.delete(subscriptionId);
+    send({
+      kind: "closed",
+      message: { ...assistant, content: text, partial: true, finishReason: "cancelled" },
+      reason: "Stopped. What had arrived is kept.",
+    });
+  });
+  return subscriptionId;
+}
+
+// --- Story 61.10's grants and audit log ------------------------------------
+//
+// A live subtree grant and a revoked one, so the two states Settings must tell
+// apart are both on screen at once. Ids, providers and profiles are this
+// harness's own, so the grouped list reads as the rows above it do.
+const BOT_GRANTS: BotGrantVm[] = [
+  {
+    id: "01J8BOTGRANTAAAAAAAAAAAAAA",
+    providerId: "01J8BOTPROVOLLAMAAAAAAAAAA",
+    botId: "01J8BOTAAAAAAAAAAAAAAAAAAA",
+    scope: { kind: "subtree", profileId: "p1", subpath: "journal/2026" },
+    scopeLabel: "p1/journal/2026",
+    mode: "write",
+    createdMs: NOW - 86_400_000 * 2,
+    revokedMs: null,
+  },
+  {
+    id: "01J8BOTGRANTBBBBBBBBBBBBBB",
+    providerId: "01J8BOTPROVOLLAMAAAAAAAAAA",
+    botId: null,
+    scope: { kind: "drive" },
+    scopeLabel: "the whole drive",
+    mode: "read",
+    createdMs: NOW - 86_400_000 * 9,
+    revokedMs: NOW - 86_400_000 * 4,
+  },
+];
+
+// Newest first, as Rust returns them. The pending row is the one worth looking
+// at: it is written before the effect, so a row still pending is a call that
+// was in flight when the process stopped (NFR-47).
+const BOT_AUDIT: BotAuditRowVm[] = [
+  {
+    id: 3,
+    startedMs: NOW - 240_000,
+    finishedMs: null,
+    providerId: "01J8BOTPROVOLLAMAAAAAAAAAA",
+    botId: "01J8BOTAAAAAAAAAAAAAAAAAAA",
+    sessionId: "01J8BOTSESSIONAAAAAAAAAAAA",
+    messageId: null,
+    tool: "write",
+    path: "p1/journal/2026/monday.md",
+    profileId: "p1",
+    subpath: "journal/2026/monday.md",
+    effect: "write",
+    verdict: "allow",
+    reason: null,
+    grantId: "01J8BOTGRANTAAAAAAAAAAAAAA",
+    outcome: "pending",
+    bytes: null,
+    truncated: false,
+  },
+  {
+    id: 2,
+    startedMs: NOW - 300_000,
+    finishedMs: NOW - 299_880,
+    providerId: "01J8BOTPROVOLLAMAAAAAAAAAA",
+    botId: "01J8BOTAAAAAAAAAAAAAAAAAAA",
+    sessionId: "01J8BOTSESSIONAAAAAAAAAAAA",
+    messageId: null,
+    tool: "read",
+    path: "p1/journal/2026/sunday.md",
+    profileId: "p1",
+    subpath: "journal/2026/sunday.md",
+    effect: "read",
+    verdict: "allow",
+    reason: null,
+    grantId: "01J8BOTGRANTAAAAAAAAAAAAAA",
+    outcome: "ok",
+    bytes: 2048,
+    truncated: false,
+  },
+  {
+    id: 1,
+    startedMs: NOW - 360_000,
+    finishedMs: NOW - 359_910,
+    providerId: "01J8BOTPROVOLLAMAAAAAAAAAA",
+    botId: "01J8BOTAAAAAAAAAAAAAAAAAAA",
+    sessionId: "01J8BOTSESSIONAAAAAAAAAAAA",
+    messageId: null,
+    tool: "read",
+    path: "p2/2026/raw",
+    profileId: "p2",
+    subpath: "2026/raw",
+    effect: "read",
+    verdict: "deny",
+    // Rust's sentence verbatim, because that is what the real command returns.
+    reason:
+      "No grant covers this folder, so nothing was read or written. Add a grant for it in Settings \u2192 Bots and this bot can try again.",
+    grantId: null,
+    outcome: "refused",
+    bytes: null,
+    truncated: false,
+  },
+];
+
+/** Story 61.8's persisted metadata toggle, off as it ships. */
+let botMessageDetails = false;
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
+  // --- Bots (Epic 61, Story 61.4) ----------------------------------------
+  //
+  // Handlers rather than `ANSWERS` entries for all of them, because the two
+  // things worth looking at here both depend on the payload: which bot's model
+  // roster is asked for, and a chat that actually streams. A table cannot
+  // stream, and a `*_subscribe`-shaped fallback would hand back an id and never
+  // emit — leaving the pane on its empty state forever, which is the failure
+  // §5's own note about `"sub-mock"` describes.
+  bots_providers_list: () => BOT_PROVIDERS,
+  bots_bots_list: () => BOT_ROWS,
+  bots_sessions_list: (payload) =>
+    payload.includeArchived === true
+      ? BOT_SESSIONS
+      : BOT_SESSIONS.filter((session) => !session.archived),
+  bots_session_open: (payload) => BOT_CONVERSATIONS[String(payload.sessionId)] ?? null,
+  // Story 61.6's four. The search really searches — titles and bodies, the two
+  // things Rust matches — because a harness whose filter does nothing teaches
+  // the reviewer that the filter does nothing. The three writes answer with a
+  // plausible row rather than mutating the table, this file's stated rule: the
+  // list re-reads after every write, and a half-mutated fixture would show a
+  // list the next read contradicts.
+  bots_sessions_search: (payload) => {
+    const req = (payload.req ?? {}) as { text?: string; scope?: string; limit?: number };
+    const needle = (req.text ?? "").toLowerCase();
+    const scope = req.scope ?? "live";
+    const inScope = BOT_SESSIONS.filter((session) =>
+      scope === "all" ? true : scope === "archived" ? session.archived : !session.archived,
+    );
+    const matched = inScope.filter((session) => {
+      if (needle === "") {
+        return true;
+      }
+      if (session.title.toLowerCase().includes(needle)) {
+        return true;
+      }
+      const held = BOT_CONVERSATIONS[session.id];
+      return (held?.messages ?? []).some((message) =>
+        message.content.toLowerCase().includes(needle),
+      );
+    });
+    const rows = matched
+      .map((session) => {
+        const messages = BOT_CONVERSATIONS[session.id]?.messages ?? [];
+        // The activity a row shows: the newest message, or the session's own
+        // last change when it holds none. Never zero — that is the whole point
+        // of the fallback in `session.rs`.
+        const newest = messages.reduce((max, message) => Math.max(max, message.createdMs), 0);
+        return {
+          session,
+          latestActivityMs: Math.max(session.updatedMs, newest),
+          messageCount: messages.length,
+        };
+      })
+      .sort((a, b) =>
+        b.latestActivityMs === a.latestActivityMs
+          ? b.session.id.localeCompare(a.session.id)
+          : b.latestActivityMs - a.latestActivityMs,
+      );
+    const limit = req.limit === undefined || req.limit === 0 ? 50 : req.limit;
+    // `total` is the matched set and `rows` is the page: the two numbers the
+    // count line must not confuse.
+    return { rows: rows.slice(0, limit), total: rows.length };
+  },
+  bots_session_rename: (payload) => {
+    const found = BOT_SESSIONS.find((session) => session.id === String(payload.sessionId));
+    return { ...(found ?? BOT_SESSIONS[0]), title: String(payload.title ?? "") };
+  },
+  bots_session_archive: (payload) => {
+    const found = BOT_SESSIONS.find((session) => session.id === String(payload.sessionId));
+    return { ...(found ?? BOT_SESSIONS[0]), archived: payload.archived === true };
+  },
+  bots_session_delete: () => null,
+  // --- Story 61.12's pasted image and deliverable paths -------------------
+  //
+  // The paste answers with a staged row and no bytes, because the real command
+  // takes its bytes over a raw binary IPC body that never appears in a JSON
+  // payload (AD-58) — a harness that echoed base64 back would teach the
+  // frontend a shape the shell will never send.
+  bots_image_paste: () =>
+    ({
+      id: "01J8BOTIMAGEAAAAAAAAAAAAAA",
+      filename: "pasted-image.png",
+      mime: "image/png",
+      byteLen: 184_320,
+    }) satisfies BotAttachmentVm,
+  bots_image_discard: () => null,
+  // Two mentions, one of each verdict, so both halves of FR-393 are on screen
+  // in `bun run dev`: a granted path with a control, and an ungranted one that
+  // renders as text with its reason. The offsets are into the reply itself,
+  // because keeper never strips a path out of an answer.
+  bots_deliverable_paths: (payload) => {
+    const body = String(payload.body ?? "");
+    const rows: BotDeliverableVm[] = [];
+    const granted = body.indexOf("/Users/tgorka/Drive/journal/2026/notes.md");
+    if (granted >= 0) {
+      rows.push({
+        raw: "/Users/tgorka/Drive/journal/2026/notes.md",
+        absolute: "/Users/tgorka/Drive/journal/2026/notes.md",
+        start: granted,
+        end: granted + "/Users/tgorka/Drive/journal/2026/notes.md".length,
+        profileId: "p1",
+        subpath: "journal/2026/notes.md",
+        reason: null,
+      });
+    }
+    const ungranted = body.indexOf("/etc/hosts");
+    if (ungranted >= 0) {
+      rows.push({
+        raw: "/etc/hosts",
+        absolute: "/etc/hosts",
+        start: ungranted,
+        end: ungranted + "/etc/hosts".length,
+        profileId: null,
+        subpath: null,
+        reason:
+          "That path is outside every folder keeper syncs, so keeper is not offering to open it. keeper never opens a location a model named on its own.",
+      });
+    }
+    return rows;
+  },
+  bots_models_list: (payload) => {
+    // Keyed by the bot target rather than the provider, because that is what
+    // differs: a Hermes profile prefix serves its own roster.
+    const bot = payload.bot === null || payload.bot === undefined ? "" : String(payload.bot);
+    return BOT_MODELS[bot] ?? [];
+  },
+  // Both probes answer `online`, because a harness that could not reach its own
+  // fixtures would only ever show the failure state. The failure states are
+  // reachable by pointing a real provider row at a port nothing listens on.
+  bots_provider_probe: () =>
+    ({
+      reach: "online",
+      status: 200,
+      version: "0.33.2",
+      roundTripMs: 4,
+      bot: null,
+      presence: null,
+      reason: null,
+    }) satisfies BotProbeVm,
+  bots_bot_probe: (payload) =>
+    ({
+      reach: "online",
+      status: 200,
+      version: null,
+      roundTripMs: 6,
+      bot: String(payload.target ?? ""),
+      presence: "exists",
+      reason: null,
+    }) satisfies BotProbeVm,
+  // The write verbs answer with a plausible row rather than mutating the table:
+  // Settings re-reads after a save, and a harness that half-mutated would show
+  // a list the next read contradicts.
+  bots_provider_save: () => BOT_PROVIDERS[0],
+  bots_provider_remove: () => null,
+  bots_bot_save: () => BOT_ROWS[0],
+  bots_bot_remove: () => null,
+  // Story 61.7's two writes, and they mutate the fixture rather than answering
+  // a canned row: the whole point of a hand order is that it is the order you
+  // last put it in, and a harness that answered the original order would show
+  // a reorder springing back and teach the surface's most important behaviour
+  // wrongly. Same for an identity — the strip must redraw in the ink chosen.
+  bots_bot_identity_save: (payload) => {
+    const row = BOT_ROWS.find((bot) => bot.id === String(payload.botId));
+    if (row === undefined) {
+      return null;
+    }
+    row.shape = payload.shape === undefined ? null : (payload.shape as string | null);
+    row.colour = payload.colour === undefined ? null : (payload.colour as string | null);
+    row.mark = payload.mark === undefined ? null : (payload.mark as string | null);
+    return row;
+  },
+  bots_bots_reorder: (payload) => {
+    const order = (payload.order ?? []) as string[];
+    const reordered = order
+      .map((id) => BOT_ROWS.find((bot) => bot.id === id))
+      .filter((bot): bot is BotVm => bot !== undefined);
+    if (reordered.length !== BOT_ROWS.length) {
+      // The real command refuses a partial order; the harness refuses it the
+      // same way, so a caller that submits a filtered subset sees the failure
+      // here rather than in production.
+      return BOT_ROWS;
+    }
+    reordered.forEach((bot, index) => {
+      bot.pinOrder = index;
+    });
+    BOT_ROWS.splice(0, BOT_ROWS.length, ...reordered);
+    return BOT_ROWS;
+  },
+  bots_chat_send: (payload) => {
+    const channel = payload.channel as MockChannel<BotStreamEvent>;
+    const req = (payload.req ?? {}) as { sessionId?: string | null; text?: string };
+    const held =
+      req.sessionId === undefined || req.sessionId === null
+        ? null
+        : (BOT_CONVERSATIONS[req.sessionId] ?? null);
+    const session = held?.session ?? (BOT_SESSIONS[0] as BotSessionVm);
+    return botFakeStream(channel, session, String(req.text ?? ""), held?.messages ?? []);
+  },
+  bots_message_retry: (payload) => {
+    const channel = payload.channel as MockChannel<BotStreamEvent>;
+    const req = (payload.req ?? {}) as { sessionId?: string };
+    const held = req.sessionId === undefined ? null : (BOT_CONVERSATIONS[req.sessionId] ?? null);
+    const session = held?.session ?? (BOT_SESSIONS[0] as BotSessionVm);
+    // The question is unchanged on a retry, so the replay drops the failed
+    // answer and keeps everything before it — what the real command does.
+    const carried = (held?.messages ?? []).filter((message) => message.role !== "assistant");
+    return botFakeStream(
+      channel,
+      session,
+      carried[carried.length - 1]?.content ?? "",
+      carried.slice(0, -1),
+    );
+  },
+  bots_chat_stop: (payload) => {
+    BOT_LIVE_STREAMS.get(String(payload.subscriptionId))?.();
+    return null;
+  },
+  // The answer to an `approvalAsked` event. The fake stream never asks — no
+  // tool runs in this harness — so this exists only so the sheet's buttons
+  // resolve rather than reject when the dialog is exercised by hand.
+  bots_approval_answer: () => null,
+  // Story 61.10's four. These four DO mutate the fixture table, which is the
+  // one deliberate exception to the rule two screens up ("the write verbs
+  // answer with a plausible row rather than mutating"): a grant's whole point
+  // is that revoking it changes the answer to "what can this bot reach", so a
+  // harness that re-served the same list would make the single interaction
+  // this story exists for unobservable. The audit log is read-only here —
+  // nothing in the harness runs a tool call.
+  bots_grants_list: () => ({ grants: BOT_GRANTS, unknown: [] }),
+  bots_grant_save: (payload) => {
+    const req = (payload.req ?? {}) as Partial<BotGrantSaveReq>;
+    const scope: GrantScope = req.scope ?? { kind: "drive" };
+    const label =
+      scope.kind === "drive"
+        ? "the whole drive"
+        : scope.kind === "profile"
+          ? scope.profileId
+          : `${scope.profileId}/${scope.subpath}`;
+    const held = BOT_GRANTS.findIndex((grant) => grant.id === req.id);
+    const saved: BotGrantVm = {
+      id: req.id ?? `01J8BOTGRANT${BOT_GRANTS.length}`,
+      providerId: req.providerId ?? "01J8BOTPROVOLLAMAAAAAAAAAA",
+      botId: req.botId ?? null,
+      scope,
+      scopeLabel: label,
+      mode: req.mode ?? "read",
+      createdMs: held === -1 ? NOW : (BOT_GRANTS[held]?.createdMs ?? NOW),
+      // A rewrite un-revokes, as the real command does.
+      revokedMs: null,
+    };
+    if (held === -1) {
+      BOT_GRANTS.push(saved);
+    } else {
+      BOT_GRANTS[held] = saved;
+    }
+    return saved;
+  },
+  bots_grant_revoke: (payload) => {
+    const held = BOT_GRANTS.findIndex((grant) => grant.id === String(payload.grantId));
+    const row = BOT_GRANTS[held];
+    if (row !== undefined) {
+      // The row survives with `revokedMs` set, so every audit line naming it
+      // still resolves — never a row that vanished.
+      BOT_GRANTS[held] = { ...row, revokedMs: NOW };
+    }
+    return null;
+  },
+  bots_audit_list: () => BOT_AUDIT,
+  // Story 61.8's toggle. A module-level `let` rather than an `ANSWERS` entry
+  // because the whole point is that it round-trips: a harness that always
+  // answered `false` would show the caption never appearing and teach the
+  // reviewer that the toggle is broken. It starts off, which is the shipped
+  // default.
+  bots_message_details_get: () => botMessageDetails,
+  bots_message_details_set: (payload) => {
+    botMessageDetails = payload.shown === true;
+    return null;
+  },
+  // Story 61.9's registry, faked. See `mockCommandPreview` for why it is crude.
+  bots_command_preview: (payload) => mockCommandPreview(String(payload.draft ?? "")),
   // --- Tasks (Epic 57, Story 57.6) ---------------------------------------
   //
   // Handlers rather than `ANSWERS` entries, because four of the five depend on

@@ -14,6 +14,7 @@
  * actions when a chat is open). Ranking/filtering is never done here; the Rust
  * `palette_query` is authoritative per query.
  */
+import { toggleBotMessageDetails } from "@/components/bots/bot-message-meta";
 import { createNote, openJournalToday, showCapture } from "@/hooks/use-notes-actions";
 import { logTodayInCurrentSession } from "@/hooks/use-sessions-shortcut";
 import {
@@ -159,6 +160,14 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
   "tasks-view": () => {
     primaryViewStore.getState().setView("tasks");
   },
+
+  // --- Bots (Epic 61, FR-384) --- registry-gated on the `bots` capability in
+  // Rust, which is its own flag rather than the one Notes, Sessions and Tasks
+  // share (see `BOTS_CATEGORY`). One verb, and it is the metadata toggle rather
+  // than the view: ⌘9 and the sidebar row already open the pane, and what had
+  // no second surface was the switch. Routed through the SAME function the
+  // pane's own chip calls, so the two provably do one thing (UX-DR42).
+  "bots-toggle-metadata": () => toggleBotMessageDetails(),
 
   // --- Global actions (dialogs / commands) ---
   "new-chat": () => newChatStore.getState().open(),

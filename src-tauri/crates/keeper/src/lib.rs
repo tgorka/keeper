@@ -5,6 +5,19 @@
 // default type-layout recursion depth; raise it as matrix-sdk recommends.
 #![recursion_limit = "256"]
 
+// The Bots surface's commands (Epic 61, Story 61.4). Deliberately NOT
+// `#[cfg(desktop)]`: unlike every other feature module here it links no
+// `keeper-sync`, because a provider is a URL plus a credential and a
+// conversation is two tables in the `keeper.db` every platform already opens.
+// The surface is kept off a phone by `CapabilitiesVm.bots`, not by a refusing
+// twin — see the module docs.
+mod bots_ipc;
+// The drive-as-tools host (Story 61.11). Desktop-only: it composes
+// `keeper_sync::bots_fs`, and `keeper-sync` is not a dependency on iOS or
+// Android. Every decision it sequences lives in `keeper-core` or
+// `keeper-sync` — this module is a call site by rule (AD-55/AD-56).
+#[cfg(desktop)]
+mod bots_tools;
 mod build_identity;
 // Desktop only: the copy engine drives `keeper_sync`, which is not a
 // dependency on iOS or Android (see this crate's Cargo.toml), and
@@ -717,6 +730,91 @@ pub fn run() {
                 // config_layers not found" would force the Settings surface to
                 // special-case a call it can always make.
                 ipc::config_layers,
+                // The Bots surface (Epic 61, Story 61.4), in the shared body
+                // for `config_layers`' reason: `keeper_core::bots` has no
+                // desktop gate — a provider is a URL and a credential, a
+                // conversation is two tables in `keeper.db` — so none of these
+                // has a `#[cfg(not(desktop))]` twin to name. What keeps the
+                // surface off a phone is `CapabilitiesVm.bots`, which is
+                // `cfg!(desktop)`: the pane, the sidebar row and ⌘9 are all
+                // absent there, so nothing calls them (AD-27's absence rather
+                // than a refusing twin).
+                bots_ipc::bots_providers_list,
+                bots_ipc::bots_provider_save,
+                bots_ipc::bots_provider_remove,
+                bots_ipc::bots_provider_probe,
+                bots_ipc::bots_models_list,
+                bots_ipc::bots_bot_probe,
+                bots_ipc::bots_bots_list,
+                bots_ipc::bots_bot_save,
+                bots_ipc::bots_bot_remove,
+                // The pinned-bot identity half (Story 61.7, FR-383).
+                // `bots_bot_identity_save` validates through
+                // `keeper_core::bots::identity` — the closed shape set and the
+                // bounded, contrast-checked palette — and
+                // `bots_bots_reorder` rewrites the whole hand order in one
+                // transaction, refusing anything that is not a permutation of
+                // the bots that exist.
+                bots_ipc::bots_bot_identity_save,
+                bots_ipc::bots_bots_reorder,
+                bots_ipc::bots_sessions_list,
+                bots_ipc::bots_session_open,
+                // The list, the archive and the continue verb (Story 61.6,
+                // FR-381, FR-382). `bots_sessions_search` is the queried,
+                // scoped, bounded read the list uses; the three writes each
+                // answer with the row as stored, and the delete makes no
+                // remote request because keeper's store is the record
+                // (AD-154).
+                bots_ipc::bots_sessions_search,
+                bots_ipc::bots_session_rename,
+                bots_ipc::bots_session_archive,
+                bots_ipc::bots_session_delete,
+                // The streaming pair, and its cancel. `bots_chat_send` and
+                // `bots_message_retry` each open a `Channel<BotStreamEvent>`
+                // and return a string subscription id;
+                // `bots_chat_stop` fires that answer's cancel handle and is
+                // idempotent, so a racing unmount is not an error.
+                bots_ipc::bots_chat_send,
+                bots_ipc::bots_message_retry,
+                bots_ipc::bots_chat_stop,
+                // The answer to a `BotStreamEvent::ApprovalAsked` (Story
+                // 61.10, FR-387): the one direction the channel cannot carry.
+                // Idempotent like `bots_chat_stop`, for the same reason.
+                bots_ipc::bots_approval_answer,
+                // The grant and audit half (Story 61.10, FR-386, NFR-47),
+                // handed over by its owner and registered here for the same
+                // reason: a grant decision is `keeper_core::bots::grant` and
+                // the audit rows are `keeper.db`, so neither needs
+                // `keeper-sync` and neither has a twin to name. The affordance
+                // that reaches these is itself gated on `CapabilitiesVm.sync`
+                // — a tool call resolves a path inside a synced profile — which
+                // is the honest split the epic states.
+                bots_ipc::bots_grants_list,
+                bots_ipc::bots_grant_save,
+                bots_ipc::bots_grant_revoke,
+                bots_ipc::bots_audit_list,
+                // The metadata toggle (Story 61.8, FR-384). An ordinary
+                // `settings` row rather than a bots table: it is a preference
+                // about the person, so a `keeper.toml` may set it like any
+                // other, and it is registered here beside the surface it
+                // belongs to rather than in the settings block.
+                bots_ipc::bots_message_details_get,
+                bots_ipc::bots_message_details_set,
+                // The slash-command registry (Story 61.9, FR-385). Stateless
+                // and pure — one `keeper_core::bots::commands` call — and in
+                // the shared literal for the same reason as the rest: the
+                // composer may always ask what a draft is.
+                bots_ipc::bots_command_preview,
+                // An image you can paste, a path you can open (Story 61.12,
+                // FR-392, FR-393). `bots_image_paste` takes its bytes as an
+                // `InvokeBody::Raw` body and never as base64 in a JSON payload
+                // (AD-58), which is why it is a `tauri::ipc::Request` command
+                // and not an argument list; `bots_deliverable_paths` re-reads
+                // the grants on every call, so a reveal control cannot outlive
+                // the permission that justified it.
+                bots_ipc::bots_image_paste,
+                bots_ipc::bots_image_discard,
+                bots_ipc::bots_deliverable_paths,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,

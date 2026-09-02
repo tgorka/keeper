@@ -1,0 +1,406 @@
+/**
+ * The Bots primary view — where you talk to a model in the app that already
+ * holds your drive (Epic 61, Story 61.4, FR-378).
+ *
+ * The fifth keeper surface, built the way the other four were: one vocabulary
+ * (provider → bot → session → message), every decision in `keeper-core`, and no
+ * affordance that lies.
+ *
+ * # Capability gating is absence, and the flag is its own
+ *
+ * This pane renders only where `CapabilitiesVm.bots` is on, gated at the nav
+ * entry and the shell's render chain like every gated surface. The flag is
+ * **not** `sessions`: chat needs neither a `git` binary nor `sync.db`, so
+ * gating on the sync capability would hide a working surface on a desktop whose
+ * `git` is too old. The half that does need `sync` is the drive grant, and
+ * {@link BotGrantBar} reads `capabilities.sync` for exactly that.
+ *
+ * # What it reads, and what it does on a refusal
+ *
+ * Three one-shot reads on mount — providers, bots, conversations — through
+ * `Promise.allSettled`, the Tasks pane's rule: a refused read must not blank
+ * the other two. Rows already read stay on a refusal, and the error explains
+ * why nothing newer is known.
+ *
+ * # Streaming, and the one thing the store is not allowed to decide
+ *
+ * `botsChatSend` resolves with a subscription id after Rust has already
+ * persisted the question and an empty, partial answer row. Deltas append to the
+ * row Rust named; the terminal `closed` event **replaces** the row with what
+ * Rust stored. The pane never decides an answer is finished and never computes
+ * its own metadata, so what is on screen after a stream is byte-for-byte what a
+ * reload would show.
+ *
+ * Stop fires the driver's cancel handle rather than dropping the subscription,
+ * so what had arrived is written as a partial row. A partial row renders with
+ * its honest caption and a Retry — never hidden, never silently re-sent.
+ *
+ * # No panel strip beside it
+ *
+ * Stated in the shell where the branch lives: this surface already has its own
+ * document area — the conversation — and an empty strip is a claimant that
+ * would take a third of the window to advertise a gesture for opening files
+ * this pane does not list. Story 59.13 measured that cost on the Tasks pane.
+ */
+import { useCallback, useEffect, useRef, useState } from "react";
+import { BotApprovalHost } from "@/components/bots/bot-approval-dialog";
+import { BotAttachmentStrip, useBotImagePaste } from "@/components/bots/bot-attachment";
+import { BotComposer } from "@/components/bots/bot-composer";
+import { BotConversation } from "@/components/bots/bot-conversation";
+import { BotEmptyState, type BotsEmptyKind } from "@/components/bots/bot-empty-state";
+import { BotGrantBar } from "@/components/bots/bot-grant-bar";
+import { BotMetaToggle } from "@/components/bots/bot-message-meta";
+import { BotPicker } from "@/components/bots/bot-picker";
+import { BotPinsStrip } from "@/components/bots/bot-pins-strip";
+import { BotSessionList } from "@/components/bots/bot-session-list";
+import { botCommandContext, botCommandHost } from "@/components/bots/bot-slash-menu";
+import type { BotModelVm, BotStreamEvent } from "@/lib/ipc/client";
+import {
+  botsApprovalAnswer,
+  botsBotsList,
+  botsChatSend,
+  botsChatStop,
+  botsMessageRetry,
+  botsProvidersList,
+  botsSessionOpen,
+  botsSessionsList,
+} from "@/lib/ipc/client";
+import { botsStore, lastAnswer, useBotsStore } from "@/lib/stores/bots";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { primaryViewStore } from "@/lib/stores/primary-view";
+import { syncErrorMessage } from "@/lib/stores/sync";
+
+/** The pane's heading, and the accessible name of the surface itself. */
+export const BOTS_PANE_TITLE = "Bots";
+
+/**
+ * The one honest sentence under the heading.
+ *
+ * It says what the surface is over and what it will tell you, in one sentence,
+ * lower case after the dash — the `SESSIONS_PANE_SUBTITLE` shape. And it states
+ * the egress fact in four words at the end, the way "Recorded locally. Nothing
+ * uploads." does, because "where does my question go" is the first thing anyone
+ * asks of a surface like this.
+ */
+export const BOTS_PANE_SUBTITLE =
+  "Models you have configured, and the conversations you have had with them — keeper talks to nothing you have not added.";
+
+/** What a failed read says when Rust gave no sentence of its own. */
+export const BOTS_READ_FAILED = "keeper couldn't read what models you have configured.";
+
+/**
+ * Where every stream event lands (Stories 61.4, 61.10, 61.11).
+ *
+ * One event needs more than the store: `approvalAsked` is a blocked tool call
+ * in Rust waiting on `botsApprovalAnswer`, so the continuation the store holds
+ * is that IPC call, made exactly once with whatever the sheet answered.
+ * "always" has already saved its grant by the time it answers
+ * (`BotApprovalDialog`), so it approves this call the same way "once" does.
+ * A failed answer is logged and the turn is left to Stop or the pane going
+ * away, both of which Rust reads as a refusal — never as consent.
+ */
+export function onStreamEvent(event: BotStreamEvent): void {
+  if (event.kind === "approvalAsked") {
+    const { requestId } = event.request;
+    botsStore.getState().askApproval({
+      request: event.request,
+      answer: (answer) => {
+        void botsApprovalAnswer(requestId, answer !== "deny").catch((raw: unknown) => {
+          botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
+        });
+      },
+    });
+    return;
+  }
+  botsStore.getState().applyStreamEvent(event);
+}
+
+export function BotsPane() {
+  const providers = useBotsStore((s) => s.providers);
+  const bots = useBotsStore((s) => s.bots);
+  const sessions = useBotsStore((s) => s.sessions);
+  const selectedBotId = useBotsStore((s) => s.selectedBotId);
+  const selectedModel = useBotsStore((s) => s.selectedModel);
+  const conversation = useBotsStore((s) => s.conversation);
+  const streamingId = useBotsStore((s) => s.streamingId);
+  const streamingMessageId = useBotsStore((s) => s.streamingMessageId);
+  const error = useBotsStore((s) => s.error);
+  // The grant's own gate, and the only place this pane reads `sync`.
+  const sync = useCapabilitiesStore((s) => s.capabilities.sync);
+  // The model row the picker last resolved, held here only so the grant bar can
+  // read its tool capability. Not in the store: it is a fact about an endpoint
+  // read a moment ago, not part of the conversation record.
+  const [pickedModel, setPickedModel] = useState<BotModelVm | null>(null);
+  // Story 61.12: the images this message will carry, and the tray that shows
+  // them. The hook owns the bytes path, the caps and the object-URL lifetime.
+  const imagePaste = useBotImagePaste(selectedBotId, selectedModel, pickedModel?.vision ?? null);
+  // A stale-read token, the Tasks pane's idiom: a second refresh landing after
+  // a first must not restore the older answer.
+  const readToken = useRef(0);
+
+  const refresh = useCallback(async () => {
+    readToken.current += 1;
+    const mine = readToken.current;
+    const [providerRead, botRead, sessionRead] = await Promise.allSettled([
+      botsProvidersList(),
+      botsBotsList(),
+      botsSessionsList(false),
+    ]);
+    if (mine !== readToken.current) {
+      return;
+    }
+    const store = botsStore.getState();
+    // `allSettled`, not `all`, and each answer applied on its own: a refused
+    // conversation list must not blank the provider list somebody is about to
+    // fix in Settings.
+    if (providerRead.status === "fulfilled") {
+      store.applyProviders(providerRead.value);
+    }
+    if (botRead.status === "fulfilled") {
+      store.applyBots(botRead.value);
+      // Choose the first bot only when nothing is chosen, so a refresh cannot
+      // move somebody off the bot they are talking to.
+      const first = botRead.value[0];
+      if (first !== undefined && botsStore.getState().selectedBotId === null) {
+        store.selectBot(first.id);
+      }
+    }
+    if (sessionRead.status === "fulfilled") {
+      store.applySessions(sessionRead.value);
+    }
+    const failure = [providerRead, botRead, sessionRead].find((read) => read.status === "rejected");
+    store.setError(
+      failure === undefined || failure.status !== "rejected"
+        ? null
+        : syncErrorMessage(failure.reason, BOTS_READ_FAILED),
+    );
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const openConversation = (sessionId: string) => {
+    void botsSessionOpen(sessionId)
+      .then((read) => botsStore.getState().openConversation(read))
+      .catch((raw: unknown) => {
+        botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
+      });
+  };
+
+  const send = (text: string) => {
+    if (selectedBotId === null || selectedModel === null) {
+      return;
+    }
+    botsStore.getState().setError(null);
+    void botsChatSend(
+      {
+        sessionId: conversation?.session.id ?? null,
+        botId: selectedBotId,
+        model: selectedModel,
+        text,
+        attachmentIds: imagePaste.take(),
+      },
+      onStreamEvent,
+    )
+      // The id is already on the `opened` event, which arrives before this
+      // resolves; nothing here needs it. What this catch is for is the failure
+      // BEFORE any event: an unknown bot, a refused credential, an endpoint
+      // that never answered.
+      .catch((raw: unknown) => {
+        botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
+      })
+      // The list order is `updated_ms`, which the send just changed.
+      .finally(() => void refresh());
+  };
+
+  const retry = (messageId: string) => {
+    if (conversation === null || selectedModel === null) {
+      return;
+    }
+    botsStore.getState().setError(null);
+    void botsMessageRetry(
+      { sessionId: conversation.session.id, messageId, model: selectedModel },
+      onStreamEvent,
+    ).catch((raw: unknown) => {
+      botsStore.getState().setError(syncErrorMessage(raw, BOTS_READ_FAILED));
+    });
+  };
+
+  const stop = () => {
+    if (streamingId !== null) {
+      void botsChatStop(streamingId);
+    }
+  };
+
+  const providerList = providers ?? [];
+  const botList = bots ?? [];
+  const selectedBot = botList.find((bot) => bot.id === selectedBotId) ?? null;
+  const selectedProvider =
+    selectedBot === null
+      ? null
+      : (providerList.find((row) => row.id === selectedBot.providerId) ?? null);
+  // Retry belongs on the LAST answer only: an earlier one is a turn the
+  // conversation has already built on, and re-sampling it would rewrite
+  // everything after it.
+  const answer = lastAnswer(conversation);
+  const retryable =
+    answer !== null && streamingId === null && answer.id !== streamingMessageId ? answer.id : null;
+
+  const empty = emptyKind({
+    providerCount: providerList.length,
+    botCount: botList.length,
+    secretMissing: selectedProvider !== null && selectedProvider.health === "secretMissing",
+    hasConversation: conversation !== null,
+  });
+
+  return (
+    <section
+      aria-label={BOTS_PANE_TITLE}
+      className="flex min-w-0 flex-1 flex-col border-border border-r bg-background last:border-r-0"
+    >
+      <header className="flex shrink-0 items-start justify-between gap-4 border-border border-b px-6 py-4">
+        <div className="min-w-0">
+          <h1 className="font-heading text-title">{BOTS_PANE_TITLE}</h1>
+          <p className="text-muted-foreground text-sm">{BOTS_PANE_SUBTITLE}</p>
+        </div>
+        {/* Story 61.8's metadata toggle. It hydrates itself. */}
+        <BotMetaToggle />
+      </header>
+
+      <BotPinsStrip
+        bots={botList}
+        selectedBotId={selectedBotId}
+        onSelect={(botId) => botsStore.getState().selectBot(botId)}
+      />
+
+      {botList.length > 0 && (
+        <BotPicker
+          bots={botList}
+          providers={providerList}
+          selectedBotId={selectedBotId}
+          selectedModel={selectedModel}
+          onSelectBot={(botId) => {
+            botsStore.getState().selectBot(botId);
+            setPickedModel(null);
+          }}
+          onSelectModel={(model) => botsStore.getState().selectModel(model)}
+        />
+      )}
+
+      <BotGrantBar
+        sync={sync}
+        provider={selectedProvider}
+        botId={selectedBotId}
+        model={pickedModel}
+      />
+
+      {sessions !== null && (
+        <BotSessionList
+          sessions={sessions}
+          openId={conversation?.session.id ?? null}
+          onOpen={openConversation}
+          onNew={() => botsStore.getState().openConversation(null)}
+          onChanged={() => void refresh()}
+          onClosed={() => botsStore.getState().openConversation(null)}
+        />
+      )}
+
+      {error !== null && (
+        <div
+          role="alert"
+          className="mx-6 mt-2 shrink-0 rounded-md bg-destructive/10 p-3 text-destructive text-sm"
+        >
+          {error}
+        </div>
+      )}
+
+      {empty === null ? (
+        <BotConversation
+          messages={conversation?.messages ?? []}
+          streamingMessageId={streamingMessageId}
+          retryableId={retryable}
+          onRetry={retry}
+        />
+      ) : (
+        <BotEmptyState
+          kind={empty}
+          onAction={() => {
+            if (empty === "no-conversation") {
+              botsStore.getState().openConversation(null);
+              return;
+            }
+            primaryViewStore.getState().setView("settings");
+          }}
+        />
+      )}
+
+      <BotAttachmentStrip
+        images={imagePaste.images}
+        notice={imagePaste.notice}
+        onRemove={imagePaste.remove}
+      />
+      <BotComposer
+        onSend={send}
+        pasteContext={imagePaste.context}
+        onPaste={imagePaste.handle}
+        onStop={stop}
+        streaming={streamingId !== null}
+        disabled={selectedBotId === null || selectedModel === null}
+        commandContext={botCommandContext({
+          providerKind: selectedProvider?.kind ?? null,
+          providerCount: providerList.length,
+          botId: selectedBotId,
+          hasSession: conversation !== null,
+          modelTools: pickedModel?.tools ?? null,
+        })}
+        onCommand={botCommandHost({
+          bots: botList,
+          newConversation: () => botsStore.getState().openConversation(null),
+          selectBot: (botId) => {
+            botsStore.getState().selectBot(botId);
+            setPickedModel(null);
+          },
+          selectModel: (model) => botsStore.getState().selectModel(model),
+        })}
+      />
+      <BotApprovalHost />
+    </section>
+  );
+}
+
+/**
+ * Which empty state the surface owes, or `null` when the conversation should
+ * render instead.
+ *
+ * A pure function and exported, so the pane and its test agree about which of
+ * the four sentences is owed — the four are deliberately different facts, and
+ * the order below is the order of what a person must fix first.
+ */
+export function emptyKind({
+  providerCount,
+  botCount,
+  secretMissing,
+  hasConversation,
+}: {
+  providerCount: number;
+  botCount: number;
+  secretMissing: boolean;
+  hasConversation: boolean;
+}): BotsEmptyKind | null {
+  if (providerCount === 0) {
+    return "no-provider";
+  }
+  if (botCount === 0) {
+    return "no-bot";
+  }
+  // Before the no-conversation state: a missing credential is worth saying
+  // before somebody types a question that cannot be sent (FR-370).
+  if (secretMissing) {
+    return "secret-missing";
+  }
+  if (!hasConversation) {
+    return "no-conversation";
+  }
+  return null;
+}

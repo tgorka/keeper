@@ -1,5 +1,6 @@
 import { type MouseEvent, useCallback, useEffect, useRef } from "react";
 import { ApprovalPane } from "@/components/approval/approval-pane";
+import { BotsPane } from "@/components/bots/bots-pane";
 import { NewChatDialog } from "@/components/chat/new-chat-dialog";
 import { CheatSheetOverlay } from "@/components/cheat-sheet/cheat-sheet-overlay";
 import { CommandPalette } from "@/components/command-palette/command-palette";
@@ -27,6 +28,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sh
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAccountStatuses } from "@/hooks/use-account-statuses";
 import { useApprovalShortcut } from "@/hooks/use-approval-shortcut";
+import { useBotsShortcut } from "@/hooks/use-bots-shortcut";
 import { useBridgeHealthSubscription } from "@/hooks/use-bridge-health";
 import { useBridgesShortcut } from "@/hooks/use-bridges-shortcut";
 import { useCheatSheetShortcut } from "@/hooks/use-cheat-sheet-shortcut";
@@ -98,6 +100,9 @@ export function AppShell() {
   // Wire ⌘8 to the Tasks view (Epic 57, FR-351, FR-352), self-gated on the same
   // capability — the third surface over the one `sync.db` (AD-137).
   useTasksShortcut();
+  // Wire ⌘9 to the Bots view (Epic 61, FR-378), self-gated on its OWN `bots`
+  // capability — the first surface here that needs neither `git` nor `sync.db`.
+  useBotsShortcut();
   // Wire ⌘3 to the Approval Pane (Story 7.3).
   useApprovalShortcut();
   // Wire ⌘K to toggle the command palette (Story 9.1).
@@ -205,6 +210,12 @@ export function AppShell() {
   const notes = useCapabilitiesStore((s) => s.capabilities.notes);
   // A sessions root is the same construction (AD-107, FR-223): same rule again.
   const sessions = useCapabilitiesStore((s) => s.capabilities.sessions);
+  // Bots is the one gated view whose flag is not the sync gate (Epic 61,
+  // FR-378): same rule, different fact, so a stale "bots" primary-view can
+  // never show the pane on a build that has no bots surface — and the pane is
+  // NOT hidden on a desktop whose `git` is too old, because a conversation
+  // does not need one.
+  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   // Where the platform floats the window controls over the webview (desktop macOS,
   // via the macOS-only `titleBarStyle`/`hiddenTitle` keys) the app owes the window
   // its own drag region; under a real title bar the same band would be empty space
@@ -408,6 +419,18 @@ export function AppShell() {
                   <TasksPane />
                   {anyPanelHolds && <PanelStrip emptySentence={TASKS_PANEL_EMPTY_SENTENCE} />}
                 </>
+              ) : bots && primaryView === "bots" ? (
+                // Epic 61: the conversation surface. No `PanelStrip` beside it,
+                // and this is a refusal with a reason rather than scope: the
+                // pane already has its own document area — the conversation —
+                // and an empty strip is a claimant (`grow shrink basis-[280px]
+                // min-w-[280px]`) that would take a third of the window to
+                // advertise a gesture for opening files this surface does not
+                // list. Story 59.13 measured exactly that cost on the Tasks
+                // pane, where it left the add form 0px wide at 1024. If a
+                // later story gives a reply a file to open beside it, this is
+                // the line that changes.
+                <BotsPane />
               ) : primaryView === "bridges" ? (
                 <BridgesPane />
               ) : primaryView === "approval" ? (

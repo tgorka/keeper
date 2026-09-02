@@ -1,5 +1,6 @@
 import {
   Archive,
+  Bot,
   Cable,
   CalendarClock,
   Film,
@@ -125,6 +126,22 @@ const SESSIONS_VIEW: SidebarView = { label: "Sessions", icon: FlaskConical, view
  * not see schedules anywhere in the app, and this row plus the palette
  * registry's `Tasks` category are the two places that answer him. */
 const TASKS_VIEW: SidebarView = { label: "Tasks", icon: CalendarClock, view: "tasks" };
+
+/** The capability-gated Bots nav entry (Epic 61, FR-378).
+ *
+ * `Bot`, not `Sparkles` or `Brain`. The lucide sparkle is the industry's
+ * "magic AI" decoration and this app does not decorate a surface with a claim
+ * about it; a brain names the thing on the other side of the wire rather than
+ * what this row opens, which is a conversation. `Bot` is also the word the
+ * whole feature is spelled with — the sidebar, the command names and the
+ * tables all say `bots` — so nobody has to translate between them.
+ *
+ * Last before Settings, and gated on `bots` rather than on `sessions`: chat
+ * needs neither `git` nor `sync.db`, so this is the first entry on this rail
+ * that can be present on a machine with no folder sync at all. Absent — not
+ * disabled — where the capability is off, the rule every entry above it
+ * follows. */
+const BOTS_VIEW: SidebarView = { label: "Bots", icon: Bot, view: "bots" };
 
 /** Settings sits last, after every primary-view entry. */
 const SETTINGS_VIEW: SidebarView = { label: "Settings", icon: Settings, view: "settings" };
@@ -252,6 +269,11 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
   const notes = useCapabilitiesStore((s) => s.capabilities.notes);
   // A sessions root is the same construction (AD-107, FR-223) — same gate.
   const sessions = useCapabilitiesStore((s) => s.capabilities.sessions);
+  // Bots is the one entry here that does NOT ride the sync gate (Epic 61,
+  // FR-378): a conversation needs no `git` and no `sync.db`, so this row can be
+  // present on a machine where Sync, Files, Notes, Sessions and Tasks are all
+  // absent.
+  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   // Splice the gated entries in before Settings, each only when supported.
   const views: SidebarView[] = [
     ...BASE_VIEWS,
@@ -269,6 +291,8 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
     // same gate — and it is last before Settings, which is where a person who
     // cannot find their schedules goes looking.
     ...(sessions ? [TASKS_VIEW] : []),
+    // Its own flag, for the reason stated where it is read.
+    ...(bots ? [BOTS_VIEW] : []),
     SETTINGS_VIEW,
   ];
 
