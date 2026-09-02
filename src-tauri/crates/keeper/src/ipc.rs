@@ -1142,7 +1142,7 @@ impl keeper_core::bridges::bbctl::BbctlRunner for DesktopBbctlRunner {
 
 /// The single `CoreError -> IpcError` mapping (AD-21). Every fallible command
 /// funnels its errors through here exactly once.
-fn to_ipc_error(err: CoreError) -> IpcError {
+pub(crate) fn to_ipc_error(err: CoreError) -> IpcError {
     let (code, retriable) = match &err {
         CoreError::Platform(PlatformError::Unsupported(_)) | CoreError::Unsupported(_) => {
             (IpcErrorCode::Unsupported, false)
@@ -1456,6 +1456,24 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // root IS a synced folder plus a flag, so the capability is exactly the
         // notes capability's condition, computed once and shared.
         sessions: notes_available(&state),
+        // Bots (Epic 61, FR-378): `cfg!(desktop)` and **deliberately not**
+        // `notes_available`. Every other surface in this struct that rides the
+        // sync gate does so because its record IS a synced folder; a
+        // conversation is not. A provider is a URL and a credential behind the
+        // secret port, and a conversation is two tables in `keeper.db` — the
+        // same database the account registry lives in — so nothing here needs
+        // `git` and nothing here reads `sync.db`. Gating on `sessions` would
+        // hide a working surface on every desktop whose `git` is older than the
+        // engine's floor, which is a dishonest absence rather than an honest
+        // one.
+        //
+        // A bare `cfg!` rather than a probe because there is nothing to probe:
+        // the surface needs no binary, no OS version and no database that might
+        // not open. The half that DOES need `sync` is the drive-tool grant
+        // (Stories 61.10, 61.11), and that affordance reads
+        // `CapabilitiesVm.sync` where it is offered rather than narrowing this
+        // flag — two facts, two flags.
+        bots: cfg!(desktop),
     })
 }
 
@@ -4051,12 +4069,16 @@ pub async fn palette_query(
 ) -> Result<PaletteResultsVm, IpcError> {
     // The recording capability gates the `open-recording` action out of the palette
     // (and thus the cheat sheet + native menu) when unavailable (Story 16.3); the
-    // notes capability does the same for the whole Notes section (FR-122, AD-27).
+    // notes capability does the same for the whole Notes section (FR-122, AD-27),
+    // and `bots` for the Bots section (Epic 61, FR-384). The bots flag is spelled
+    // here exactly as `capabilities` spells it — `cfg!(desktop)` — rather than
+    // borrowed from `notes`, because a desktop build with folder sync off still
+    // has a Bots pane.
     let recording = crate::macos_version::recording_supported();
     let notes = notes_available(&state);
     Ok(state
         .accounts
-        .palette_query(&query, mode, open_chat, recording, notes)
+        .palette_query(&query, mode, open_chat, recording, notes, cfg!(desktop))
         .await)
 }
 
@@ -4074,10 +4096,12 @@ pub fn cheat_sheet_sections(state: State<'_, AppState>) -> Result<Vec<MenuSectio
     // (Story 16.3), keeping it in lockstep with the palette and native menu. The
     // notes gate rides the same mechanism (Story 36.2): six actions declared once
     // reach the palette, the ⌘? sheet, the native menu bar and the tray, so the
-    // four cannot drift (UX-DR42).
+    // four cannot drift (UX-DR42). The bots gate is its own (Epic 61, FR-384) and
+    // is spelled the way `capabilities` spells it.
     Ok(keeper_core::palette::registry_sections(
         crate::macos_version::recording_supported(),
         notes_available(&state),
+        cfg!(desktop),
     ))
 }
 
@@ -10935,17 +10959,22 @@ fn sync_remote_urls(state: &AppState) -> Result<Vec<String>, IpcError> {
 }
 
 /// Report the live set of network destinations keeper contacts (Story 11.2,
-/// NFR-11, UX-DR17; Story 23.7). Reads the accounts registry from the same path
+/// NFR-11, UX-DR17; Story 23.7; Story 61.1, FR-371). Reads the accounts registry
+/// from the same path
 /// [`session_restore`] uses — `registry::list_accounts` — projects each row to its
 /// `(homeserver_url, Provider)`, reads every folder-sync profile's remote via
-/// [`sync_remote_urls`], and feeds both plus the shared [`EGRESS_UPDATE_ENDPOINT`]
+/// [`sync_remote_urls`], reads every configured AI provider's base URL via
+/// `bots::store::provider_base_urls`, and feeds all three plus the shared
+/// [`EGRESS_UPDATE_ENDPOINT`]
 /// into the pure `compute_egress`. The result is rendered as UI under Settings →
 /// About so keeper's egress claim is verifiable, never asserted: each homeserver
 /// (deduped), `api.beeper.com` exactly when a Beeper account exists, each distinct
-/// sync remote *host* (never the full remote URL — see `egress::remote_host`), and
+/// sync remote *host* (never the full remote URL — see `egress::remote_host`), each
+/// distinct provider *host* (reduced by that same function), and
 /// the update endpoint. A legacy row with no/unknown `provider` tag maps to
-/// [`Provider::Password`] — Beeper detection still catches it by host. Both inputs
-/// are read on every call, so adding or removing an account or a profile changes
+/// [`Provider::Password`] — Beeper detection still catches it by host. Every input
+/// is read on every call, so adding or removing an account, a profile or a
+/// provider changes
 /// the disclosed set. Failures funnel through [`to_ipc_error`].
 #[tauri::command]
 pub async fn egress_list(state: State<'_, AppState>) -> Result<Vec<EgressEndpointVm>, IpcError> {
@@ -10955,7 +10984,7 @@ pub async fn egress_list(state: State<'_, AppState>) -> Result<Vec<EgressEndpoin
         .into_iter()
         .map(|row| {
             // A row created after Story 2.5 carries a durable provider tag; a legacy
-            // NULL / unrecognized tag falls back to Password. Beeper-by-host detection
+            // NULL / unrecognized tag falls back to Password. Beeper detection
             // inside `compute_egress` still surfaces `api.beeper.com` for a legacy
             // Beeper row, so the fallback never omits a real destination.
             let provider = row
@@ -10967,9 +10996,16 @@ pub async fn egress_list(state: State<'_, AppState>) -> Result<Vec<EgressEndpoin
         })
         .collect();
     let sync_remotes = sync_remote_urls(&state)?;
+    // Read from the same table the Providers surface writes, so a provider added
+    // there is disclosed here on the next open with no cache in between. A row
+    // whose `kind` this build cannot read contributes nothing: `provider_base_urls`
+    // drops it, because keeper cannot say what it would contact.
+    let provider_base_urls =
+        keeper_core::bots::store::provider_base_urls(&data_dir).map_err(to_ipc_error)?;
     Ok(compute_egress(
         &accounts,
         &sync_remotes,
+        &provider_base_urls,
         EGRESS_UPDATE_ENDPOINT,
     ))
 }

@@ -701,9 +701,10 @@ impl AccountManager {
         open_chat: bool,
         recording: bool,
         notes: bool,
+        bots: bool,
     ) -> PaletteResultsVm {
         let index = self.palette.lock().await;
-        index.query(query, mode, open_chat, recording, notes)
+        index.query(query, mode, open_chat, recording, notes, bots)
     }
 
     /// Kick every live account's sync loop (Story 13.6: pull-to-refresh and the
@@ -3778,6 +3779,31 @@ impl AccountManager {
     ) -> Result<(), CoreError> {
         let data_dir = platform.data_dir()?;
         registry::set_sessions_spaces_folded(&data_dir, folded)
+    }
+
+    /// Read whether a bot answer shows its metadata caption (Story 61.8, FR-384).
+    /// Reads the persisted `bots.message_details` setting (default off). The
+    /// numbers themselves are recorded regardless — this is the showing, not the
+    /// measuring.
+    pub fn bots_message_details_get(
+        &self,
+        platform: &Arc<dyn Platform>,
+    ) -> Result<bool, CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::get_bots_message_details(&data_dir)
+    }
+
+    /// Set whether a bot answer shows its metadata caption (Story 61.8, FR-384).
+    /// Persists the new value to the `settings` k/v table under
+    /// `bots.message_details`, so the pane toggle and the palette entry write one
+    /// fact and a reopened pane reads back what the person chose.
+    pub fn bots_message_details_set(
+        &self,
+        platform: &Arc<dyn Platform>,
+        shown: bool,
+    ) -> Result<(), CoreError> {
+        let data_dir = platform.data_dir()?;
+        registry::set_bots_message_details(&data_dir, shown)
     }
 
     /// Gracefully shut down **every** active account (Story 10.3, FR-53 — honest quit).

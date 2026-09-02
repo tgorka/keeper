@@ -46,6 +46,7 @@ const DESKTOP_CAPABILITIES = {
   sync: false,
   notes: false,
   sessions: false,
+  bots: false,
   overlayTitleBar: false,
 };
 

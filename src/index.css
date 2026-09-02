@@ -56,6 +56,17 @@
     --color-bridge-healthy: var(--bridge-healthy);
     --color-bridge-degraded: var(--bridge-degraded);
     --color-bridge-disconnected: var(--bridge-disconnected);
+    /* The bot identity inks (Story 61.7). Named utilities rather than an
+       inline `style`, so `scripts/check-design.mjs` sees a token and not a
+       colour: an identity is drawn as `text-bot-ink-*` on an SVG that paints
+       from `currentColor`, exactly as the lamp does. */
+    --color-bot-ink-clay: var(--bot-ink-clay);
+    --color-bot-ink-ochre: var(--bot-ink-ochre);
+    --color-bot-ink-olive: var(--bot-ink-olive);
+    --color-bot-ink-verdigris: var(--bot-ink-verdigris);
+    --color-bot-ink-steel: var(--bot-ink-steel);
+    --color-bot-ink-lapis: var(--bot-ink-lapis);
+    --color-bot-ink-madder: var(--bot-ink-madder);
     --color-search-highlight: var(--search-highlight);
     --color-search-highlight-foreground: var(--search-highlight-foreground);
     --color-mark: var(--mark);
@@ -206,6 +217,26 @@
   --account-hue-5: oklch(0.55 0.15 245);
   --account-hue-6: oklch(0.6 0.16 200);
   --account-hue-7: oklch(0.62 0.19 355);
+  /* The bot identity palette (Story 61.7, FR-383). Seven inks, and unlike the
+     account-hue wheel above these are hexes rather than `oklch()` for one
+     reason: `scripts/check-design.mjs` recomputes the contrast of every one of
+     them against `--background`, `--card` and `--secondary` in BOTH themes and
+     fails the build on a member that drops below 4.5:1. The account wheel has
+     never been checked — the gate's arithmetic reads hex — and a colour a
+     person picks for a bot they talk to every day is not a colour to leave
+     unmeasured.
+
+     The wheel deliberately skips the lichen band (OKLCH hue 110–160): the
+     accent is singular, so no bot may wear it. Purple is absent because it is
+     banned outright. Every ink is paired with a shape at the point it is
+     drawn — colour is never the only carrier of an identity. */
+  --bot-ink-clay: #ac2f3b;
+  --bot-ink-ochre: #994d00;
+  --bot-ink-olive: #795f05;
+  --bot-ink-verdigris: #026e65;
+  --bot-ink-steel: #066c7e;
+  --bot-ink-lapis: #0466a1;
+  --bot-ink-madder: #9e3378;
 }
 
 .dark {
@@ -274,6 +305,19 @@
   --account-hue-5: oklch(0.66 0.15 245);
   --account-hue-6: oklch(0.7 0.16 200);
   --account-hue-7: oklch(0.7 0.19 355);
+  /* The bot identity palette, dark theme (Story 61.7). Two hexes per ink and
+     that is arithmetic, not taste: `DESIGN.md` records that AA needs
+     L* <= 46.8 on warm paper and L* >= 51.9 on near-black, so the intersection
+     is empty and no single hex can serve both themes. Same hues, lifted to
+     OKLCH L ~0.645 so each one still clears 4.5:1 on the darkest surface it
+     can land on. */
+  --bot-ink-clay: #df5f65;
+  --bot-ink-ochre: #d66e01;
+  --bot-ink-olive: #ac8909;
+  --bot-ink-verdigris: #09a397;
+  --bot-ink-steel: #0a9eb8;
+  --bot-ink-lapis: #0b94e7;
+  --bot-ink-madder: #d162a5;
 }
 
 /* Long-press / swipe targets (Story 13.6): suppress the native iOS callout and

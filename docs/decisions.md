@@ -112,3 +112,54 @@ is safe.
   app is already a real background host. Until then the asymmetry is visible in the product, not
   hidden.
 - **Status / owner:** decided. Owner is the architect; Epic 57 implements it.
+
+## D-4 — The endpoint is yours, never keeper's
+
+keeper will talk to a model — a Hermes Agent profile or an Ollama model, over the OpenAI-compatible
+wire, from a surface of its own at ⌘9 — and it will **not** decide where that model lives. There is
+no default endpoint, no hosted model, no keeper-operated proxy, no telemetry about what you asked,
+and no opt-in scaffolding for any of them, because there is nothing to opt into (`docs/egress.md`,
+*The no-telemetry invariant*). Recorded here because a chat feature is where every one of those is
+first proposed as a convenience, and the refusal has to be findable before the proposal is made.
+
+- **What is built:** a provider is a record you create — a kind (`hermes` | `ollama`), a base URL,
+  a credential behind the keychain port — and a bot is (provider, model-or-profile, identity).
+  Because keeper ships no endpoint, the base URL is **required, not defaulted**: a fresh install has
+  no provider row, no egress row and no pane content beyond the sentence that says so, and typing
+  the URL is the explicit act that creates the destination. Every configured provider then appears
+  in Settings → About as a derived, host-only egress entry through the same reduction git remotes
+  use, and a loopback or private-network host is accepted and disclosed rather than blocked, since
+  that is where both supported back ends live by default. (AD-146…AD-148, extending AD-53; Epic 61,
+  stories 61.1, 61.4, 61.13)
+- **Why no default, no hosted model, no proxy:** each would make keeper a party to the
+  conversation. A default endpoint is a destination the user did not choose; a hosted model or a
+  keeper-operated relay is project infrastructure on the traffic path, which is the invariant D-1
+  already refuses to break for push and this decision refuses to break for chat. The client-only
+  posture (NFR-11) is not a posture about Matrix; it is a posture about keeper. (AD-148; PRD §13.5)
+- **Why a Hermes bot gets no drive grant:** Hermes executes its own tools on its own host under
+  its own permission model — `/v1/capabilities` declares `tool_execution: "server"`, no route lets
+  a client register a tool, and an api-server session defaults to `unattended_mode: deny`. A grant
+  keeper offered there could never be exercised, and an affordance that cannot act is the lie AD-27
+  forbids, so the Hermes pane offers none and says why in one sentence. The drive tools are offered
+  only where keeper is the thing that would run them: an Ollama bot whose model advertises `tools`.
+  (AD-151, AD-158, AD-159; Epic 61, coordinator correction to 61.10; research §2.6, §2.13)
+- **The honest route to that capability, deferred and not rejected:** keeper *serving* MCP. Hermes
+  loads `mcp_servers:` from its own configuration over stdio or HTTP, so keeper could serve the same
+  seven verbs, behind the same grant, to a bot running on another host. That inverts the direction
+  of the connection — a listening socket is not an outbound request — so it needs its own threat
+  model and must not be designed from the client side by analogy. (DW-215; research §2.14)
+- **Why voice and the wake word are Epic 62, not a story here:** every credible permissive stack
+  needs native dependencies that cannot be compiled or exercised on the development host, and the
+  largest open licence question in the research is the one that would ship in the bundle — the
+  pretrained keyword-spotting and ASR model weights carry dataset terms the code's Apache-2.0
+  licence does not imply. The recording feature's promise that it transcribes nothing is stated in
+  six places and enforced by a source scan, and a voice surface that borrowed the recording
+  pipeline would make that promise false. The direction is recorded so 62 does not re-research it.
+  (Epic 61, *What stays out*; research §10)
+- **Revisit triggers:** a third provider kind with a real endpoint to read against (the enum stays
+  closed at two until then, DW-214); the MCP threat model being written (DW-215); the model-weight
+  licences resolving and the native voice stack becoming buildable on the development host (Epic
+  62). None of them reopens the first paragraph: a default endpoint is not a revisit, it is a
+  different product.
+- **Status / owner:** decided. Owner is the architect; Epic 61 implements the provider, the surface
+  and the grant; Epic 62 owns talk mode.

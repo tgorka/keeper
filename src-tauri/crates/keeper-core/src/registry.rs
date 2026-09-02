@@ -745,6 +745,37 @@ pub fn set_sessions_spaces_folded(data_dir: &Path, folded: bool) -> Result<(), C
     )
 }
 
+/// The `settings` key holding whether a bot answer shows its metadata caption
+/// (Story 61.8, FR-384). Stored as `"1"`/`"0"`; absent = off.
+const BOTS_MESSAGE_DETAILS_KEY: &str = "bots.message_details";
+
+/// Read whether an answer's metadata caption is shown (Story 61.8, FR-384).
+/// Absent / anything-but-`"1"` ⇒ `false`.
+///
+/// **Off is the default, and that is a decision rather than an accident.** The
+/// numbers are recorded on every row whatever this says — an endpoint's token
+/// counts and the measured time to the first token are written by the stream
+/// driver, not by the view — so switching the caption on later still explains
+/// answers that arrived before anybody asked. What defaults off is the
+/// *showing*: a conversation is read for what the model said, and a row that
+/// leads with a request id is a debugger, not a reply.
+pub fn get_bots_message_details(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, BOTS_MESSAGE_DETAILS_KEY)?.as_deref() == Some("1"))
+}
+
+/// Write whether an answer's metadata caption is shown (Story 61.8, FR-384).
+/// Persists `"1"`/`"0"` into the `settings` k/v table under
+/// `bots.message_details` — the same literal the key is registered with
+/// (`Shape::Flag01` in [`crate::config::keys`]), so a `keeper.toml` that sets
+/// the key and a toggle in the pane cannot mean opposite things.
+pub fn set_bots_message_details(data_dir: &Path, shown: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        BOTS_MESSAGE_DETAILS_KEY,
+        if shown { "1" } else { "0" },
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -3835,6 +3866,32 @@ mod tests {
         set_sessions_spaces_folded(&dir, false).expect("unfold by default again");
         assert_eq!(
             get_setting(&dir, "sessions.spaces_folded").expect("read raw"),
+            Some("0".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bots_message_details_defaults_off_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ off: a conversation is read for what the model said.
+        assert!(!get_bots_message_details(&dir).expect("read default"));
+        set_bots_message_details(&dir, true).expect("switch details on");
+        assert!(get_bots_message_details(&dir).expect("read back on"));
+        set_bots_message_details(&dir, false).expect("switch details off");
+        assert!(!get_bots_message_details(&dir).expect("read back off"));
+        // The stored text, not just the round trip: the getter compares against
+        // `"1"`, and the key is registered `Shape::Flag01`, so a writer that put
+        // `"true"` here would round-trip through itself and still invert every
+        // `keeper.toml` that sets the key (config/mod.rs:394-399).
+        set_bots_message_details(&dir, true).expect("switch on again");
+        assert_eq!(
+            get_setting(&dir, "bots.message_details").expect("read raw"),
+            Some("1".to_owned())
+        );
+        set_bots_message_details(&dir, false).expect("switch off again");
+        assert_eq!(
+            get_setting(&dir, "bots.message_details").expect("read raw"),
             Some("0".to_owned())
         );
         let _ = std::fs::remove_dir_all(&dir);

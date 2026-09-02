@@ -2,14 +2,14 @@
 title: "PRD: keeper"
 status: final
 created: 2026-07-03
-updated: 2026-07-16
+updated: 2026-09-02
 ---
 
 # PRD: keeper
 
 ## 0. Document Purpose
 
-This PRD defines the macOS text-first MVP of keeper, an open-source (Apache-2.0), client-only universal messenger built on Matrix. It is written for the downstream BMAD chain — UX design, architecture, and epic/story creation — and for contributors who need a single authoritative statement of what MVP includes, excludes, and must prove. It builds on, and does not duplicate, four upstream inputs: the product brief and its addendum (`_bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/`), the stakeholder requirements (`_bmad-output/planning-artifacts/product-inputs.md`), and the technical and market research reports (`_bmad-output/planning-artifacts/research-technical-2026-07-03.md`, `research-market-2026-07-03.md`). Vocabulary is anchored in §3 Glossary; functional requirements are numbered FR-1 through FR-54 for the macOS MVP with testable consequences; cross-cutting NFRs are numbered NFR-1 through NFR-14. **Phase 2 increment (2026-07-09):** with the macOS MVP implemented in full, §13 extends this PRD with the iOS/iPhone client phase — FR-55 through FR-65 and NFR-15 through NFR-18 — built on the authoritative iOS technical research (`_bmad-output/planning-artifacts/research-ios-2026-07-09.md`); MVP sections §1–§12 are unchanged and remain the authority for all shared behavior. **Phase 3 increment (2026-07-16):** §14 adds the macOS Screen Recording phase — FR-66 through FR-76 and NFR-19 through NFR-22 — built on the authoritative recording research (`_bmad-output/planning-artifacts/research-recording-2026-07-16.md`), whose recommendations and risk register it adopts rather than relitigates. Inline `[ASSUMPTION]` tags mark inferences made without stakeholder confirmation and are indexed in §12. Technical constraints already locked by the owner (stack, SDK versions, IPC patterns, licensing firewall) live in the brief addendum and this PRD's `addendum.md`; this document states *what* keeper does, not *how*.
+This PRD defines the macOS text-first MVP of keeper, an open-source (Apache-2.0), client-only universal messenger built on Matrix. It is written for the downstream BMAD chain — UX design, architecture, and epic/story creation — and for contributors who need a single authoritative statement of what MVP includes, excludes, and must prove. It builds on, and does not duplicate, four upstream inputs: the product brief and its addendum (`_bmad-output/planning-artifacts/briefs/brief-keeper-2026-07-03/`), the stakeholder requirements (`_bmad-output/planning-artifacts/product-inputs.md`), and the technical and market research reports (`_bmad-output/planning-artifacts/research-technical-2026-07-03.md`, `research-market-2026-07-03.md`). Vocabulary is anchored in §3 Glossary; functional requirements are numbered FR-1 through FR-54 for the macOS MVP with testable consequences; cross-cutting NFRs are numbered NFR-1 through NFR-14. **Phase 2 increment (2026-07-09):** with the macOS MVP implemented in full, §13 extends this PRD with the iOS/iPhone client phase — FR-55 through FR-65 and NFR-15 through NFR-18 — built on the authoritative iOS technical research (`_bmad-output/planning-artifacts/research-ios-2026-07-09.md`); MVP sections §1–§12 are unchanged and remain the authority for all shared behavior. **Phase 3 increment (2026-07-16):** §14 adds the macOS Screen Recording phase — FR-66 through FR-76 and NFR-19 through NFR-22 — built on the authoritative recording research (`_bmad-output/planning-artifacts/research-recording-2026-07-16.md`), whose recommendations and risk register it adopts rather than relitigates. **Phase 8 increment (2026-09-02):** §15 adds the Bots phase — FR-369 through FR-393 and NFR-46 through NFR-49 — bound by Epic 61 (`_bmad-output/planning-artifacts/epic-61-a-model-you-can-talk-to-in-the-app-that-holds-your-drive.md`) and its evidence base (`research-ai-chat-2026-09-02.md`), whose verdicts it adopts rather than relitigates; Phases 4–7 (FR-77 through FR-368, NFR-23 through NFR-45) were specified in `epics.md` and the per-epic files and are not restated here. Inline `[ASSUMPTION]` tags mark inferences made without stakeholder confirmation and are indexed in §12. Technical constraints already locked by the owner (stack, SDK versions, IPC patterns, licensing firewall) live in the brief addendum and this PRD's `addendum.md`; this document states *what* keeper does, not *how*.
 
 ## 1. Vision
 
@@ -96,7 +96,7 @@ The MVP must prove one thing: that a user-owned Matrix + Bridges stack, wrapped 
 
 ## 4. Features
 
-*FRs are numbered globally (FR-1 … FR-54 in this section; the iOS phase continues the sequence with FR-55 … FR-65 in §13, and the Screen Recording phase with FR-66 … FR-76 in §14). Every FR uses Glossary terms verbatim and carries testable consequences. "User" means the single macOS operator of the app.*
+*FRs are numbered globally (FR-1 … FR-54 in this section; the iOS phase continues the sequence with FR-55 … FR-65 in §13, the Screen Recording phase with FR-66 … FR-76 in §14, and the Bots phase with FR-369 … FR-393 in §15 — FR-77 … FR-368 belong to Phases 4–7, specified in `epics.md` and the per-epic files rather than here). Every FR uses Glossary terms verbatim and carries testable consequences. "User" means the single macOS operator of the app.*
 
 ### 4.1 Accounts & Authentication
 
@@ -480,6 +480,7 @@ User can click a notification to land in the exact Chat (correct Account) with t
 - **No agent/AI send path in MVP.** The Approval Pane ships; the propose-only agent API/MCP is a post-MVP experiment behind a flag, gated on design-partner validation. Nothing in MVP may send without explicit user approval (FR-41).
 - **No iMessage in MVP.** v1.x at earliest, only via the user's own Mac, labeled "advanced, may break on macOS updates."
 - **No video editing, and no recording upload — ever.** The Screen Recording phase (§14) writes local files to a user-chosen folder, full stop: no editor, no share-link or cloud-processing service, zero new network destinations (FR-76).
+- **No tool that sends, executes or fetches — ever.** The Bots phase (§15) gives a model the drive through seven filesystem verbs inside a user-granted, revocable scope, full stop: no shell, no network fetch, no Matrix send (FR-389); FR-41 stands untouched, and keeper ships no endpoint, no hosted model and no default Provider — the endpoint is always the user's (D-4).
 - **No monetization surface.** No accounts-with-us, no license keys, no telemetry-driven upsell. keeper is free OSS; sustainability questions live outside this PRD.
 - **Not a Matrix admin tool.** keeper manages Bridges from a user's perspective; homeserver administration (user management, federation config) is out.
 - **Not chasing Beeper feature-for-feature.** Reminders/snooze, scheduled send, message-request filtering, labels, note-to-self are deliberate v1.x fast-follows (§6.2), not silent MVP creep.
@@ -517,6 +518,7 @@ User can click a notification to land in the exact Chat (correct Account) with t
 - Beeper Desktop API companion mode (reach On-Device Connection chats when Beeper Desktop is installed) — pragmatic add-on, never a foundation.
 - Email network, AI-bot client, terminal client (owner's long-term network list).
 - Screen recording — **now active as Phase 3, specified in §14** (macOS desktop only; recording on Windows/Linux follows those platforms if and when they exist).
+- AI chat — **now active as Phase 8, specified in §15** (the "AI-bot client" of the list above, built as a fifth keeper surface over the OpenAI-compatible wire to the user's own Hermes Agent or Ollama endpoints, not as a Network; talk mode and the wake word are Epic 62).
 
 ### 6.3 Why Now
 
@@ -553,7 +555,7 @@ Three clocks aligned in 2025–2026, and none of them stays open forever: (1) **
 
 - **NFR-14 Baseline accessibility:** all MVP flows operable via keyboard alone (a superset of FR-48–50); interactive controls carry accessibility labels for VoiceOver; contrast meets WCAG 2.1 AA for text in both light and dark themes. [ASSUMPTION] Full VoiceOver timeline-navigation polish is v1.x; the MVP bar is "operable and labeled."
 
-*Phase 2 (iOS) adds NFR-15 – NFR-18 in §13.3, measured on-device. Phase 3 (Screen Recording) adds NFR-19 – NFR-22 in §14.3.*
+*Phase 2 (iOS) adds NFR-15 – NFR-18 in §13.3, measured on-device. Phase 3 (Screen Recording) adds NFR-19 – NFR-22 in §14.3. Phase 8 (Bots) adds NFR-46 – NFR-49 in §15.3; NFR-23 – NFR-45 belong to Phases 4–7, specified in `epics.md` and the per-epic files.*
 
 ## 8. Constraints & Guardrails
 
@@ -638,6 +640,13 @@ Three clocks aligned in 2025–2026, and none of them stays open forever: (1) **
 - §14 NFR-19 — The 4 h continuous-soak bar is an authored number ("e.g. 4 h" in the owner ask) pending confirmation before release-gating.
 - §14 NFR-20 — Disk-guard thresholds (warn below 10 GB free, stop below 2 GB) are authored defaults.
 - §14 NFR-21 — CPU/memory envelope numbers are authored pending measurement on reference hardware.
+
+**Phase 8 (§15):**
+
+- §15.1 FR-378 — The phase is specified and accepted on macOS desktop; whether the `bots` capability flag is ever true on iOS is left to the capability handshake.
+- §15 FR-379 — Removing a Provider keeps its conversations readable from keeper's store as orphaned rows; nothing is deleted with the Provider.
+- §15 FR-392 — Image size and count caps are authored at story time and disclosed in the UI; no number is fixed in the PRD.
+- §15 NFR-46 — The silence bound's value is a `keeper-core` constant authored at story time, restated from `keeper-sync`'s policy, and named in the stopped-stream message.
 
 ## 13. Phase 2: iOS/iPhone Client
 
@@ -931,3 +940,254 @@ Adopted from the research risk register (research §8):
 
 1. Authored bars need owner confirmation before they become release gates: NFR-19 soak duration, NFR-20 thresholds, NFR-21 CPU/memory envelope, the FR-70/NFR-22 one-frame alignment bound. Owner: product owner, at phase release.
 2. In-app recordings browsing (a list of past sessions inside keeper) is deliberately unspecified — MVP is folder-and-Finder plus the tray's Open Recordings Folder. Revisit on dogfooding evidence. Owner: PM.
+
+## 15. Phase 8: Bots — A Model You Can Talk To
+
+*Added 2026-09-02, after v0.8.24. This section is the Phase 8 increment: it specifies only what talking to a model adds, continues the global numbering (FR-369–FR-393, NFR-46–NFR-49), and adopts — not relitigates — the verdicts of the AI-chat research (`_bmad-output/planning-artifacts/research-ai-chat-2026-09-02.md`) as bound by Epic 61 (`_bmad-output/planning-artifacts/epic-61-a-model-you-can-talk-to-in-the-app-that-holds-your-drive.md`), which is the authority for the stories. Phases 4–7 (folder sync, notes, recording × sync, sessions — FR-77–FR-368, NFR-23–NFR-45) were specified in `epics.md` and the per-epic files rather than here, which is why this section's numbers do not continue §14's; the sequence is global and unbroken. Sections §1–§14 remain authoritative for all existing behavior.*
+
+### 15.1 Phase Goal
+
+keeper already holds the drive, the notes, the sessions and the tasks; what it does not have is a way to *ask something about them*. This phase adds a fifth keeper surface — Bots, at ⌘9 — where the user talks to a model of their own: a Hermes Agent bot or an Ollama model, local or remote, over the OpenAI-compatible wire both already speak. The user configures any number of Providers side by side, each with its own credential, pins the bots they talk to with a shape, a colour and a mark, keeps every conversation in keeper's own store where it can be listed, searched, renamed, archived and resumed, switches per-message metadata on when they want it, and types slash commands the composer refuses honestly when it does not know them. A model may be given the drive — read or write, the whole drive, one profile or one subtree — through a grant the user can see and revoke in one act, and every byte it touches goes through the containment rule keeper already enforces for itself, is bounded, and is audited before it happens. An image pasted into the conversation reaches a model that can see; a path a model names is opened only inside a grant.
+
+Like every keeper surface, this one is built the way the other four were: one vocabulary (Provider → bot → conversation → message), every decision in `keeper-core` with the shell as a call site, an egress row that is derived from the configured Providers and never hand-written, and no affordance that lies — a capability keeper could not read is `unknown`, never `false`. The surface is gated by a `bots` capability flag computed per platform in the shell (FR-57's `CapabilitiesVm`); chat needs neither `git` nor `sync.db`, so the flag is a genuinely new condition, while the drive-tool half needs the `sync` capability exactly and is gated on it. [ASSUMPTION] The phase is specified and accepted on macOS desktop; whether the `bots` flag is ever true on iOS is left to the capability handshake, not decided here.
+
+**This phase requires no new server-side component, because keeper is a client only (§5, §8).** keeper ships no default endpoint, no hosted model, no relay and no telemetry: a base URL is required, never defaulted, and the endpoint is the user's — recorded as decision D-4 in `docs/decisions.md` by this phase. Two decisions are made before any story starts and are not re-argued in one: **one wire protocol** — `POST /v1/chat/completions` with `stream: true` is the only chat transport, and the per-kind divergences are rows in a quirk table, not a second client; and **keeper owns the conversation** — a Hermes `session_id` is a reference persisted beside the row, never the truth, because Hermes compresses sessions into renamed successors, caches only 100 stored responses, and Ollama has no session concept at all. The stack opens with the two strictly serial stories (a Provider record, then the streaming client) and places the grant **before** the first tool can read a byte; a story order that inverts that ships an unguarded filesystem for one PR's duration.
+
+### 15.2 Features & Requirements
+
+#### 15.2.1 Providers & Egress
+
+##### FR-369: Providers side by side
+User can configure any number of AI Providers side by side, each a record with a kind (`hermes` | `ollama`), a display name, a base URL, an optional bot/profile prefix, a timeout override and a health snapshot — the `SyncProfile` multi-tenant precedent applied to model endpoints. Story 61.1; AD-146.
+**Consequences (testable):**
+- Two Providers of the same kind with different base URLs coexist and are addressed independently; removing one leaves the other untouched.
+- The base-URL grammar is a `keeper-core` decision with its own tests: scheme `http` or `https`, no userinfo, no path beyond a profile prefix; a loopback host and a private-network host are both legitimate **and both are disclosed** at save time — the SSRF question is answered by disclosure and an explicit user act, not by a blocklist.
+- A Provider row holds no JSON blob (AD-139); a base URL is required and never defaulted, because keeper ships no endpoint of its own (§15.7, D-4).
+
+##### FR-370: Credentials live behind the secret port
+System stores a Provider's credential behind the existing secret port only — never in a `keeper.db` row, a log line, an error string or on a screen. Story 61.1; AD-147.
+**Consequences (testable):**
+- A Provider row that has lost its secret says so in the Providers list and in the pane, instead of failing at send time.
+- The `Authorization` header is marked sensitive so it is redacted from error text; no log line and no error carries a token or a URL with userinfo.
+- A credential is required for the `hermes` kind (bearer `API_SERVER_KEY`) and optional for `ollama`, which accepts and discards one; the Settings form says which.
+
+##### FR-371: Derived egress
+System lists every configured Provider in the egress inventory (Settings → About, `docs/egress.md`) as a derived row — host only, never a full URL — computed by `compute_egress` from the live Provider set, reusing the same host extraction that strips userinfo from git remotes. Story 61.1; AD-148.
+**Consequences (testable):**
+- Adding a Provider changes the disclosed egress set; removing it removes the row; no hand-maintained list exists anywhere (AD-53 extended to Providers).
+- The NFR-11 per-release egress diff for this phase is **non-empty by design** and names exactly the Provider chapter of `docs/egress.md` (Story 61.13); the release note firing is the visibility working, not a regression.
+- A loopback or private-network Provider appears in the inventory like any other host.
+
+#### 15.2.2 The Wire
+
+##### FR-372: Streaming chat over the OpenAI-compatible wire, with Stop
+System sends every chat as `POST /v1/chat/completions` with `stream: true` — the only chat transport keeper implements, for both kinds — renders the reply progressively, and stops it on the user's act. Story 61.2; AD-149.
+**Consequences (testable):**
+- Stop aborts the request and leaves a partial assistant row persisted and marked partial — never a silently discarded reply.
+- Per-kind divergences are rows in a quirk table, not code paths: Ollama's `/v1` layer ignores `tool_choice`, accepts images as base64 data URIs only, and cannot set the context window (`num_ctx` needs the native dialect, §15.4) — each recorded as data and disclosed where it bites.
+- Acceptance is a local test server, not a mock of the client: a valid stream; a frame split across two chunks; a socket that dies mid-message; `[DONE]` with no usage; 401, 404 and 500; a socket held open sending nothing.
+
+##### FR-373: Reassembly from fragmented deltas
+System reassembles one message from fragmented server-sent events — `data:` lines, keep-alive comments, `[DONE]`, a frame split across two byte chunks — including index-keyed `tool_calls` fragments whose `arguments` arrive as partial JSON, and the `usage` block where the endpoint sends one. Story 61.2; AD-149.
+**Consequences (testable):**
+- Content, tool calls (by index) and usage survive any chunk boundary; the framer and the state machine are tested against a socket that misbehaves, not a pre-assembled fixture.
+- A `[DONE]` with no `usage` yields a message whose token counts are absent, not zero (FR-384).
+- No response body is read unbounded into memory; bytes are consumed in bounded chunks.
+
+##### FR-374: A stream ends by silence, not by a deadline
+System bounds a stream by silence — a read timeout between bytes — and never by a whole-request deadline: a long answer is not a fault; a silent socket is. Story 61.2; NFR-46.
+**Consequences (testable):**
+- A socket held open sending nothing is abandoned after the silence bound with a stated reason; a slow but flowing stream of any total length completes.
+- The policy is restated in `keeper-core` with a comment naming `keeper-sync/src/http.rs` as its source — restated, because `keeper-core` may not depend on `keeper-sync` (AD-40), and not copied by accident.
+
+#### 15.2.3 Discovery
+
+##### FR-375: What an endpoint is and what it can do
+System probes a Provider and reports what it is (kind, reachable, authenticated) and what it can do (models, per-model capabilities, health) — or says, in the house voice, why it cannot tell. Story 61.3; AD-150.
+**Consequences (testable):**
+- Hermes is read from `/v1/models` plus `/api/model/options` (providers, curated model lists, `supports_tools` / `supports_vision` / `supports_reasoning` / `context_window`); Ollama from `/api/tags`, because it carries `capabilities` for every local model in one round trip. Discovery is the only place the native endpoints are used.
+- A capability keeper could not read is `unknown`, never `false`: an `unknown` vision flag offers the paste affordance with a warning; a `false` one hides it (AD-27).
+- A real 401 and a real 404 from a wrong base URL each produce a distinct, actionable state, in the same vocabulary the app already uses for an unreachable remote.
+
+##### FR-376: A bot is verified, never invented
+User names a Hermes bot (a profile) and keeper verifies it exists by probing `/p/<name>/v1/models`; keeper never enumerates bots it cannot see, and the empty state says why. Story 61.3; AD-150.
+**Consequences (testable):**
+- The bearer-authenticated route table has no profile roster (the two doors that list profiles need a dashboard session token or a websocket RPC keeper does not speak), so no "discover bots" affordance exists — a named profile either probes true or false.
+- A bot is (Provider, model-or-profile, identity): a Hermes bot is a profile addressed by the `/p/{profile}` URL prefix; an Ollama bot is a model tag and needs no probe beyond `/api/tags`.
+- The empty state states, in the house voice, that a roster needs a door keeper is not given.
+
+##### FR-377: Capabilities are read, not assumed
+System reads each model's vision, tool and context-window support from the endpoint and stores it per model; nothing about a model is assumed from its name. Story 61.3; AD-151.
+**Consequences (testable):**
+- Ollama's `capabilities` array and Hermes' `supports_*` fields populate the flags; a field the endpoint omits is `unknown`.
+- The paste affordance (FR-392) and the tool surface (FR-389) read these flags; a model whose tool flag is `false` is never sent tool definitions.
+
+#### 15.2.4 The Surface
+
+##### FR-378: A pane at ⌘9 that narrates its own state
+User opens a Bots pane at ⌘9 — `PrimaryView` member `bots`, sidebar label Bots — gated by a `bots` capability flag, and the pane narrates its own state honestly: which Provider, which bot, streaming, stopped, unreachable, secret missing. Story 61.4; AD-152.
+**Consequences (testable):**
+- The flag is computed in the shell and mirrored in the frozen store default and the dev mock shell, or typecheck fails; where the flag is off the sidebar entry is absent, not disabled.
+- The flag is a new condition, not a synonym for `sessions`: chat needs neither `git` nor `sync.db`; the grant affordance (FR-386) is additionally gated on `sync`, which is the honest split.
+- ⌘9 — the only free digit — is bound by a hook cloned from the tasks shortcut with its five guards in order and its no-dead-chord rule; Stop stops; Retry re-sends; an unreachable endpoint uses the same words as an unreachable remote.
+
+##### FR-379: Providers are added, tested and removed from Settings
+User adds, tests, edits and removes a Provider from a Settings → Providers section built as one component in two modes (AD-C7). Story 61.4; AD-146.
+**Consequences (testable):**
+- Test runs the FR-375 probe and shows the result inline; controls are disabled until hydrated; a rejected write reverts to the last confirmed value.
+- Removing a Provider deletes its secret through the same port and its egress row disappears (FR-371). [ASSUMPTION] Conversations that belonged to a removed Provider are kept and remain readable from keeper's store as orphaned rows; nothing is deleted with the Provider.
+
+##### FR-380: An answer is prose and code, and nothing else is executed
+System renders an answer as a markdown subset over the lezer stack already in the tree — prose and fenced code — with no remote asset fetch and no HTML injection. Story 61.5; AD-153.
+**Consequences (testable):**
+- No new dependency, no `dangerouslySetInnerHTML`, no URL fetched by rendering — the position the note protocol already takes: a note that auto-fetches a URL an agent wrote is a tracking pixel.
+- Fenced code blocks carry a copy control and a language label; an unterminated fence mid-stream renders as code and closes itself; a 200 kB reply does not lock the webview.
+
+#### 15.2.5 Conversations, Pins, Metadata & Slash Commands
+
+##### FR-381: Conversations are listed, searched, renamed, archived and resumed
+User sees conversations newest-first, searches over titles and bodies, renames, archives (reversibly), deletes (confirmed, and the confirmation names what happens to which object) and resumes any of them. Story 61.6; AD-154.
+**Consequences (testable):**
+- Titles are minted locally from the first user message — no second model call, ever, because a silent request to a paid endpoint is a surprise this app does not ship.
+- The list reuses the recordings-archive list/filter/sort/paginate shape and the find-bar conventions; there is no second list component.
+
+##### FR-382: Resume replays from keeper's store
+System replays a resumed conversation from keeper's own store; where a Hermes `session_id` exists it is persisted beside the row as a reference, never as the truth. Story 61.6; AD-154.
+**Consequences (testable):**
+- Ollama has no session concept and resumes identically; where a Hermes `session_id` is held, the detail shows it and says plainly that the remote may have compressed it into a renamed successor.
+- Hermes' compression into a continuation session and its 100-row stored-response cache can lose nothing of keeper's, because neither is the store.
+
+##### FR-383: Pinned bots with an identity
+User pins bots in a hand order and gives each an identity: a shape from a closed set, a mark (the existing icon picker, extended with a short emoji/grapheme option) and a colour from a bounded palette. Story 61.7; AD-155.
+**Consequences (testable):**
+- Order is persisted with the existing pins pattern, drag-to-reorder included.
+- Every palette member is contrast-checked against both themes by `scripts/check-design.mjs`; a free colour picker is rejected, not deferred, because no colour of any hue passes AA on both themes for an unconstrained pick, and every state colour must be paired with a shape (DESIGN.md).
+
+##### FR-384: Metadata is always recorded and shown on request
+System records on every assistant message its model, Provider, prompt and completion tokens where reported, time-to-first-token, total duration, finish reason, tool-call count and the Provider's request id; one persisted toggle — in the pane and in the Command Palette — shows a compact caption per message, with an expander for the rest. Story 61.8; AD-156.
+**Consequences (testable):**
+- Absent numbers render as absent, never as zero: an endpoint that omits `usage` is a fact about the endpoint, and keeper does not print a number it did not measure.
+- Metadata is columns on the message row, not a JSON blob (AD-139).
+
+##### FR-385: Slash commands that refuse honestly
+User types slash commands from a client-side `keeper-core` registry — `/new`, `/bot`, `/model`, `/metadata`, `/grant`, `/image`, `/history`, `/help` — with autocomplete cloned from the note editor's slash menu; an unknown command is refused with the nearest match named and is not sent to the model as prose. Story 61.9; AD-157.
+**Consequences (testable):**
+- The registry carries name, description, argument mode and whether the command needs a Provider; filtering and the keyboard model are the note editor's.
+- A literal leading slash is escapable, and the empty state teaches it, because a model may legitimately be asked about `/etc`.
+- Hermes' server-side commands are not proxied: they are enumerable only over a websocket RPC keeper does not speak, and a picker that silently dropped `/compact` on Ollama would be an affordance that lies (§15.4).
+
+#### 15.2.6 Grants & Audit
+
+##### FR-386: A grant names a scope and a mode, is visible, and is revocable
+User grants a bot access to the drive as (Provider, optional bot) × (scope: the whole drive | one profile | one subtree) × (mode: none | read | write); grants are listed in Settings and in the pane's header and are revocable in one act. Story 61.10; AD-158.
+**Consequences (testable):**
+- Revocation is checked at every tool call, not at conversation start: an in-flight tool call whose grant vanished fails with that reason — a real revocation against a real in-flight call, not a pure-function proof.
+- The grant affordance is gated on the `sync` capability: a drive keeper does not hold cannot be granted.
+- This is keeper's first user-granted, revocable permission; what exists today is routing and disclosure, so nothing is extended — it is minted.
+
+##### FR-387: A write is never auto-approved by a grant alone
+System never lets a `write` grant by itself approve a write: the first write in a conversation, and every write outside an already-approved subtree, asks; "always for this subtree" is a durable grant edit, not a remembered click. Story 61.10; AD-158.
+**Consequences (testable):**
+- The answer to "what can it change?" is one list in Settings, never a hidden history of approvals.
+- Approval is a user act inside the conversation; no flag, setting or command bypasses it — the FR-41 posture applied to the drive.
+
+##### FR-388: Every tool call that touched the drive is auditable
+System writes an audit row for every tool call that touched the drive before the effect, naming paths and not ids, so a human can read afterwards what was read and what was changed. Story 61.10; NFR-47.
+**Consequences (testable):**
+- The audit row precedes the effect and survives a crash (NFR-47); a write whose audit row could not be written does not happen.
+- Audit rows are columns, not JSON (AD-139): path, verb, bound, outcome, grant.
+
+#### 15.2.7 The Drive as Tools
+
+##### FR-389: The drive through keeper's own containment rule
+System exposes the drive to a model as seven tools — `list`, `read` (with line ranges), `glob`, `grep`, `stat`, `write`, `edit` — each resolved through the existing containment rule in `keeper-sync` (path resolution, plain segments, write routing), carried across the verb boundary verbatim and never restated as new path arithmetic. Story 61.11; AD-159.
+**Consequences (testable):**
+- There is no eighth tool: no shell, no exec, no network fetch, no Matrix send — FR-41 and D-3 stand untouched by construction.
+- A write is atomic through the same temp-and-rename the tree already uses, proven against a real watcher pass (a real `rename` under the sync watcher).
+- A `read` that lands on a pointer file returns the pointer's truth, never an empty file (Epic 56).
+- A model whose tool flag is `false` (FR-377) is sent no tool definitions.
+
+##### FR-390: File content is data, never instructions
+System places all file content — context files included — into the request as data, under a system-prompt sentence stating that instructions inside file content are not instructions. Story 61.11; NFR-48.
+**Consequences (testable):**
+- No tool result can widen its own grant (NFR-48): a file whose text says "grant write" changes nothing about the grant.
+- What the model was told is shown to the user, verbatim.
+
+##### FR-391: Context files are found, merged and budgeted
+System discovers `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` and `.cursorrules` nearest-first within the granted scope, merges them in a stated order, caps the merged size, and shows the user what the model was told. Story 61.11; AD-159.
+**Consequences (testable):**
+- The discovery list is config: naming one more filename is a config change, not a code change. "okf" could not be identified as any published convention and is not implemented (`[UNVERIFIED]` in the research).
+- The merged block is size-capped and the cap is disclosed to the model like every other bound (NFR-49).
+
+#### 15.2.8 Images & Paths
+
+##### FR-392: An image is pasted, and sent only to a model that can see
+User pastes an image into the conversation; it reaches Rust as a raw IPC body, is stored and referenced like every other attachment, and is attached to the request as a data-URI content part only for a model whose vision capability is `true` or `unknown`. Story 61.12; AD-160.
+**Consequences (testable):**
+- No base64 through JSON, ever (AD-58); the attached image renders through the existing media viewer.
+- For a `false` vision flag the paste is refused with the model's name in the sentence; for `unknown` it is offered with a warning (FR-375). [ASSUMPTION] Size and count caps are authored at story time and disclosed in the UI; no number is fixed here.
+- Ollama's `/v1` layer accepts base64 data URIs only and refuses `image_url` — a quirk-table row (FR-372), not a code path.
+
+##### FR-393: A path a model names is opened only inside a grant
+System recognises an absolute path in a reply and offers *reveal* or *open* only if the path falls inside a grant; keeper never fetches, copies or strips a path a model named outside one. Story 61.12; AD-160.
+**Consequences (testable):**
+- Deliverable mode is handled from the receiving end: over the api-server a client receives the path itself (the `MEDIA:` stripping is a Hermes gateway feature), and the reply text is never altered, because here the reply is the record.
+- A path outside every grant renders as text with no affordance — no dead button, no error-on-click (AD-27).
+
+### 15.3 Phase NFRs
+
+*Continues §7's numbering. Each bar is proved against the impure shell the story names — a real socket, a real file, a real revocation — not against a pure function.*
+
+- **NFR-46 Bounded silence, unbounded length:** a stalled stream is abandoned after a bounded silence between bytes, never after a bounded total time; a flowing stream of any duration completes. [ASSUMPTION] The bound's value is a `keeper-core` constant authored at story time, restated from `keeper-sync`'s existing policy, and named in the stopped-stream message.
+- **NFR-47 Audit before effect:** a tool-call audit row is written before the effect and survives a crash — an effect without a row is impossible, and a row without a confirmed effect is visible as such.
+- **NFR-48 No self-widening:** no tool result can widen its own grant, and no file content is trusted as a directive; every byte a tool returns enters the next request as data.
+- **NFR-49 Every byte bounded, and the bound disclosed:** every read and every write performed by a tool call is bounded, and the bound is told to the model (`"truncated at 64 kB of 1.2 MB"`), because a silent truncation makes a model confidently wrong.
+
+### 15.4 Out of Scope (this phase)
+
+- **Talk mode, the wake word and NeuTTS — Epic 62, not a story here.** Every credible permissive voice stack needs new native dependencies that cannot be compiled or exercised on the development host, and the pretrained keyword-spotting and ASR model weights carry dataset terms the code's Apache-2.0 licence does not imply; the direction is already recorded so 62 does not re-research it, and 62 also owns keeping the recording feature's "transcribes nothing" promise (enforced by a source scan) true.
+- **The native `/api/chat` dialect** — and with it `num_ctx` and `think` levels on Ollama — because one wire protocol is the phase's first decision and a second client is the cost it refuses (DW-210).
+- **Embeddings, RAG, or any index over the drive** — not asked for, and it would make a second source of truth about the user's files (DW-212).
+- **Running commands** — no tool executes a shell string; `docs/decisions.md` D-3 stands and the general exec kind remains Epic 60's, unbuilt, stated because a filesystem tool surface is exactly where someone will propose `bash` (DW-213).
+- **omp as a Provider kind** — the enum stays closed at two; designing an abstraction today for an endpoint with nothing to read is the mistake this phase refuses (DW-214).
+- **Proxying Hermes' server-side slash commands** — enumerable only over a websocket RPC keeper does not speak, so a hand-copied list would rot on the next release (DW-209).
+- **A second model call to title a conversation** — titles are minted locally (FR-381) (DW-211).
+
+### 15.5 Phase Success Metrics
+
+- **SM-11 Impure-shell gate:** the five risks the epic names are each proved against the real thing, not a pure function — a real SSE socket that dies mid-frame (61.2), a real 401 and a real 404 from a wrong base URL (61.3), a real file that is a pointer and not content (61.11), a real `rename` under the sync watcher (61.11), and a real revocation that stops an in-flight tool call (61.10) — and the five stay green as release gates. Validates FR-372–FR-377, FR-386, FR-389.
+- **SM-12 End-to-end on the owner's endpoints:** from ⌘9, the owner talks to a Hermes bot and to an Ollama model (one local, one remote), grants one subtree, watches the model read and write inside it with every touch in the audit, sees exactly the configured hosts in the egress inventory and nothing else, and the recording zero-egress gate is untouched and green. Binary, demo-able, release-gating. Validates FR-369–FR-393.
+
+### 15.6 Phase Risks (Register)
+
+Adopted from the epic's evidence table and its *What stays out*:
+
+- **The bearer door cannot list bots** — no profile roster on the api-server route table. Medium (product). Mitigation: verification instead of enumeration (FR-376), an honest empty state; revisit only if upstream opens a bearer-authenticated roster (§15.7).
+- **Ollama's `/v1` layer diverges silently** — `tool_choice` ignored, `image_url` refused, no `num_ctx`. Medium (correctness). Mitigation: the quirk table is data with a test per row (FR-372); the native dialect is out (§15.4).
+- **Hermes sessions are not stable** — compression mints a renamed successor; the stored-response cache is 100 rows LRU. Medium (data). Mitigation: keeper's store is the truth; the remote id is a reference (FR-382).
+- **Prompt injection through the drive** — file content, context files and tool results are the lethal-trifecta surface. High (security). Mitigation: content as data under a stated system sentence (FR-390), no self-widening (NFR-48), a grant checked at every call (FR-386), writes never auto-approved (FR-387), an audit before every effect (NFR-47).
+- **A base URL is a request keeper makes on the user's behalf** — SSRF by configuration. Medium (security). Mitigation: grammar in `keeper-core` (FR-369), disclosure of loopback and private hosts, derived egress (FR-371); a blocklist is rejected because it would lie about a legitimate local Ollama.
+- **A story order that inverts grant-before-tools** ships an unguarded filesystem for one PR. High (process). Mitigation: 61.10 precedes 61.11 absolutely; the epic states it as the one ordering rule.
+- **The gates that would now cry wolf** — the NFR-11 egress diff fires (correctly), the recording zero-egress source scan reads verbs. Low (process). Mitigation: 61.13 writes the egress chapter and D-4, and the phase adds no file the recording scan globs match and no palette verb it would read as upload or transcription.
+- **New crates** — every added dependency needs a licence justification and passes `cargo-deny`. Low. Mitigation: the phase prefers zero new dependencies (`reqwest`, `serde_json`, `tokio`, `futures`, `bytes`, `rusqlite`, `ts-rs` are already in the tree); the markdown renderer reuses the lezer stack (FR-380).
+
+### 15.7 Phase Decisions & Open Questions
+
+**Pre-answered (adopted from the epic; revisit only on evidence):**
+
+- **No server-side component.** keeper is a client only (§5, §8); every endpoint is the user's. Recorded as **D-4 — the endpoint is yours, never keeper's**: no default endpoint, no hosted model, no telemetry and no opt-in scaffolding for any of them, which is why a base URL is required rather than defaulted.
+- **One wire protocol, divergences as data.** `POST /v1/chat/completions` with `stream: true` for both kinds; native endpoints only for discovery, where they are strictly better.
+- **keeper owns the conversation.** The store is `keeper.db` (`bot_providers`, `bots`, `bot_sessions`, `bot_messages`, later `bot_grants`, `bot_audit`), no JSON blobs in rows; a Hermes `session_id` is a reference.
+- **Verification, not enumeration, for bots.** A named profile is probed; keeper never invents a roster.
+- **A bounded palette, not a colour picker.** Colour is paired with a shape and contrast-checked by the design gate.
+- **Client-side slash registry.** Hermes' server-side commands are not proxied.
+- **The grant exists before the first tool can read a byte.** 61.10 before 61.11, absolutely.
+- **No message-bubble reuse.** The Matrix timeline's bubble is typed down to send-state and read receipts; widening it to a second domain couples two surfaces for a rounded rectangle.
+- **Epic 60 stays reserved** for the general exec kind Epic 59 deferred; this phase neither builds it nor takes its number.
+
+**Open:**
+
+1. Authored values need owner confirmation before they become gates: the NFR-46 silence bound, the FR-392 image size and count caps, and the FR-379 orphaned-conversation behaviour on Provider removal. Owner: product owner, at phase release.
+2. Whether the `bots` flag is ever true on iOS (FR-378 [ASSUMPTION]). Owner: architecture, when the phone is next touched.
+3. A bearer-authenticated profile roster on the Hermes api-server would turn FR-376's verification into enumeration; nothing in keeper should be designed for it until it exists upstream. Owner: PM, on Hermes release evidence.
+4. "okf" in the owner's ask could not be identified as any published convention; if it names one, it is a config line under FR-391, not a story. Owner: owner.

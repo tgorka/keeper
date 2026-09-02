@@ -260,6 +260,31 @@ fill, not by hue alone: filled (live), hollow (idle), dashed ring (working), fil
 taken out (fault). It appears in the sidebar, on sync rows, on bridge cards, on the recording
 button, and — at 1:1 with the mark's mouth — inside the icon itself.
 
+**A bot wears the cell, in one of four fills and one of seven inks.** A pinned bot's identity is
+a shape from a closed set — filled, hollow, dashed, notched — drawn on the mark's own flat-topped
+hexagon, plus a mark inside it and, only ever beside a shape, a colour. It is the lamp's fill
+language on the cell rather than on the disc, and the separation is the point: a status in this
+app is round and 6px, a bot is a cell, so an identity can never be misread as a state. Nothing
+here grows a face — the eyes are the mark's and only the mark's.
+
+**A free colour picker is rejected, not deferred, and the reason is two paragraphs up.** No
+colour of any hue passes AA on both themes, so a picker offering the wheel would offer a person
+several hundred inks of which a large share are unreadable in one of the two themes this product
+ships — and the app would have handed them the swatch. What replaces it is a **bounded palette of
+seven**, each with a light and a dark value, each one recomputed against `background`, `card` and
+`secondary` in both themes by `bun run check:design` and held to the text floor of 4.5:1 because
+a mark may be a letter somebody typed. The names are materials rather than hues — clay, ochre,
+olive, verdigris, steel, lapis, madder — and the wheel deliberately has a hole in it where lichen
+would be: the accent is singular, so no bot may wear it. Purple is absent for the reason purple
+is absent everywhere.
+
+**And the colour is the second channel here too.** A colour with no shape beside it is refused —
+by the picker before it is sent, and by `keeper-core` if it arrives anyway — because a bare
+coloured dot per bot is exactly the colour-only encoding the status triad had to be rescued from.
+Every control that draws a cell says the shape, the ink and the mark in its own accessible name,
+so two bots differing only in their ink are two different bots to a screen reader and to anybody
+who cannot tell those two inks apart.
+
 ## Components
 
 **The mark: the hex-bot.** A honeycomb cell with a face. keeper → beekeeper → the hive: a hive is
@@ -355,6 +380,9 @@ lives in 4% of the pixels and a style guide nobody re-reads cannot defend that.
   is banned by name.
 - **No colour-only status.** Every state carries a shape. This is a WCAG requirement the app
   currently fails, not a preference.
+- **No free colour picker anywhere in the product.** A per-entity colour is chosen from a closed
+  palette whose every member the gate has measured against both themes; an unconstrained pick is
+  an offer of colours this product knows to be unreadable. See *Shapes*.
 - **No face anywhere but the mark, no emoji in chrome, no sparkles.** The hex-bot's face is the
   brand and it is singular: nothing else in the product grows eyes, and the mark itself smiles
   only on the coloured app icon — in the menu bar its mouth is a state display and stays empty at
@@ -366,3 +394,5 @@ lives in 4% of the pixels and a style guide nobody re-reads cannot defend that.
 - A hairline where two columns meet.
 - The lamp vocabulary for every state indicator.
 - Both themes checked, because one hex provably cannot serve both.
+- A colour a person picks comes out of a **bounded, measured palette** — never a wheel, never a
+  hex field — and never arrives without a shape beside it.

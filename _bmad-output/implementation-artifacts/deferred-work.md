@@ -3369,6 +3369,44 @@ reason: `drop_foreign_lfs_driver` removes a non-repository `filter "lfs"` sectio
   only `Some`). (c) is the honest fix and is not ours to schedule.
 status: open
 
+### DW-216: A bot's per-profile token is chosen by reading, not by a test.
+
+origin: story 61.1, 2026-09-02
+location: `keeper-core/src/bots/mod.rs` — `resolve_token` (`:410-421`), `bot_token_key` (`:393`),
+  `provider_token_key` (`:379`)
+reason: Hermes rejects a `/p/<profile>/` request that carries the gateway's default key, so the
+  resolver prefers the per-bot secret and falls back to the provider's. That order is the whole
+  behaviour and nothing exercises it: the `FakePlatform` the auth tests use lives in another
+  module's test scope, and this module's tests stop at the key SPELLINGS. A wrong order would look
+  like a working provider whose every named bot returns 401 — the symptom the order exists to
+  prevent. Owed: a fake secret port in this module's scope, asserting both directions and the
+  absent-secret case.
+status: open
+
+### DW-217: The account-hue wheel is `oklch()` and the design gate cannot measure it.
+
+origin: story 61.7, 2026-09-02
+location: `src/index.css` `--account-hue-*`, against `scripts/check-design.mjs`
+  `checkIdentityPalette` (`:601-683`)
+reason: 61.7's seven `--bot-ink-*` tokens are hex, so the new `identity-palette` rule recomputes
+  their contrast against three surfaces of both themes and fails the build on a member that does
+  not pass. The eight pre-existing account hues are `oklch()`, which that arithmetic does not
+  parse, so they are skipped — they have never been contrast-checked by anything. Same defect
+  family as the one 61.7 closed, one layer older, and deliberately out of that story: converting
+  them is a palette decision about identity colours the app already assigns, not about the ones
+  this epic lets a person choose.
+status: open
+
+### DW-218: The `Bots` palette category holds a preference and no way to open Bots.
+
+origin: story 61.8, 2026-09-02
+location: `keeper-core/src/palette.rs` — `BOTS_CATEGORY` and `bots-toggle-metadata`
+reason: 61.8 minted the category for its metadata toggle; 61.4 never registered a palette or menu
+  entry for the pane itself, because ⌘9 and the sidebar row were the surface it owed. The result
+  reads oddly on the native menu bar: a `Bots` submenu whose only item is `Toggle Answer Details`,
+  with no `Open Bots` above it. One action and one chip, in the story that owns the registry.
+status: open
+
 - source_spec: none
   summary: Restyle the note editor's Find/Replace bar so it matches the app's UI instead of rendering as unstyled inputs and buttons.
   evidence: Split from a four-goal intent (note pane truncation, find bar, toolbar additions, file embedding). Independently shippable: pure presentation inside the editor chrome, no shared contract.

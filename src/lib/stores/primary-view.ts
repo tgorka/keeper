@@ -40,6 +40,14 @@ import { createStore } from "zustand/vanilla";
  * *which host will actually run this, and when*. It is its own view rather than
  * a tab inside Sync because the schedule is host-wide — a task can belong to the
  * machine and to no folder at all — so a per-folder pane has nowhere to put it.
+ *
+ * "bots" is the fifth surface, and the first that is NOT over the `sync`
+ * capability (Epic 61, FR-378). Talking to a model needs neither `git` nor
+ * `sync.db`: a provider is a URL and a credential, a conversation is two
+ * tables in `keeper.db`. It is its own view rather than a tab inside anything
+ * because it answers a question no other surface does — *ask something about
+ * all of this* — and because a conversation you return to over days is a place
+ * you go, not a panel you open.
  */
 export type PrimaryView =
   | "inbox"
@@ -53,6 +61,7 @@ export type PrimaryView =
   | "notes"
   | "sessions"
   | "tasks"
+  | "bots"
   | "settings";
 
 export interface PrimaryViewState {

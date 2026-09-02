@@ -610,7 +610,8 @@ export const TASKS_BULK_NO_REASON_TEXT = "keeper refused this one and did not sa
  * somebody dragged. That is the arrangement `columnStyle`'s own doc describes,
  * and `shrink-0` was quietly opting this column out of it.
  */
-const TASKS_COLUMN_CLASS = "flex min-w-0 flex-col border-border border-r bg-background";
+const TASKS_COLUMN_CLASS =
+  "flex min-w-0 flex-col border-border border-r bg-background last:border-r-0";
 
 /**
  * The disclosure over one task's recorded runs, and the section it reveals.
