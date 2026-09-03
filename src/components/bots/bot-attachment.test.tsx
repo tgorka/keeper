@@ -32,6 +32,7 @@ import {
   botAttachmentCaption,
 } from "@/components/bots/bot-attachment";
 import type { BotDeliverableVm } from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
 const botsDeliverablePaths = vi.fn<(sessionId: string, body: string) => Promise<unknown>>();
 const syncOpenEntry = vi.fn<(id: string, subpath: string) => Promise<void>>();
@@ -190,9 +191,26 @@ describe("BotDeliverablePaths", () => {
 });
 
 describe("BotReplyPaths", () => {
+  beforeEach(() => {
+    // The reveal control is a drive affordance (Epic 62): on unless a case
+    // says otherwise, so the cases below are about the answer and not the tier.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, botTools: true });
+  });
+
   it("asks nothing while the answer is still arriving", () => {
     render(<BotReplyPaths sessionId="s1" body="Saved to /Users/ada/Drive/a.md" streaming />);
     expect(botsDeliverablePaths).not.toHaveBeenCalled();
+  });
+
+  it("asks nothing, and renders nothing, where this build cannot reach the drive", () => {
+    // A phone has no `bots_deliverable_paths` to call: the command lives in the
+    // desktop-only half of the shell. Absent, not a call that would be refused.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, botTools: false });
+    const { container } = render(
+      <BotReplyPaths sessionId="s1" body="Saved to /Users/ada/Drive/a.md" streaming={false} />,
+    );
+    expect(botsDeliverablePaths).not.toHaveBeenCalled();
+    expect(container).toBeEmptyDOMElement();
   });
 
   it("resolves a finished answer against the live grants and renders the control", async () => {

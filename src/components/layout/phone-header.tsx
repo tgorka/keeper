@@ -16,7 +16,7 @@
  * identity and incognito are the exact components the desktop header renders.
  */
 import { ChevronLeft, Download, Ellipsis, Search } from "lucide-react";
-import type { Ref } from "react";
+import type { ReactNode, Ref } from "react";
 import {
   ConversationHeaderIdentity,
   ConversationIncognitoChip,
@@ -33,6 +33,55 @@ import { detailStore } from "@/lib/stores/detail-ui";
 import { exportStore } from "@/lib/stores/export";
 import { useRoomsStore } from "@/lib/stores/rooms";
 import { searchSurfaceStore } from "@/lib/stores/search-surface";
+
+/** The Inbox as the previous level's title, and the back button's name for it. */
+export const PHONE_INBOX_TITLE = "Inbox";
+export const PHONE_BACK_TO_INBOX = `Back to ${PHONE_INBOX_TITLE}`;
+
+/**
+ * The bar itself: the 52px row with the previous level's title on a ≥44pt
+ * back button (UX-DR21), and whatever the level puts beside it. `PhoneHeader`
+ * is this bar plus the Room's identity block; the view levels Story 62.2 adds
+ * (Bots, Settings) wear the bar alone, so it is one definition rather than
+ * three copies of the same classes.
+ */
+export function PhoneBackBar({
+  backLabel,
+  backTitle,
+  onBack,
+  backRef,
+  children,
+}: {
+  /** The accessible name — `Back to {title}` or a generic "Back". */
+  backLabel: string;
+  /** The visible title on the button. */
+  backTitle: string;
+  /** Pop exactly one level (the chevron's action). */
+  onBack: () => void;
+  /** Forwarded to the back button so the shell can focus it on push (UX-DR28). */
+  backRef?: Ref<HTMLButtonElement>;
+  children?: ReactNode;
+}) {
+  return (
+    // Safe-area top inset (Story 13.5, FR-59): the notch/status-bar band pads
+    // *above* the 52px content row (total = safe-top + 52px), so the bar never
+    // slides under the notch in either orientation; --safe-top resolves to 0
+    // off-phone/jsdom, leaving the desktop layout untouched.
+    <header className="flex h-[calc(var(--safe-top)+var(--phone-header))] shrink-0 items-center gap-1 border-border border-b pt-[var(--safe-top)] pr-1">
+      <button
+        ref={backRef}
+        type="button"
+        aria-label={backLabel}
+        onClick={onBack}
+        className="flex h-11 min-w-11 shrink-0 items-center gap-0.5 pr-2 pl-1 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <ChevronLeft className="size-5" aria-hidden="true" />
+        <span className="max-w-44 truncate text-sm">{backTitle}</span>
+      </button>
+      {children}
+    </header>
+  );
+}
 
 interface PhoneHeaderProps {
   /** The stack level this header sits on: 1 = Room, 2 = Detail. */
@@ -52,25 +101,16 @@ export function PhoneHeader({ level, onBack, backRef }: PhoneHeaderProps) {
 
   // The back button carries the previous level's title. At the Detail level the
   // previous level is the Room; an unknown room VM degrades to a generic "Back".
-  const backTitle = level === 1 ? "Inbox" : (room?.displayName ?? null);
+  const backTitle = level === 1 ? PHONE_INBOX_TITLE : (room?.displayName ?? null);
   const backLabel = backTitle === null ? "Back" : `Back to ${backTitle}`;
 
   return (
-    // Safe-area top inset (Story 13.5, FR-59): the notch/status-bar band pads
-    // *above* the 52px content row (total = safe-top + 52px), so the bar never
-    // slides under the notch in either orientation; --safe-top resolves to 0
-    // off-phone/jsdom, leaving the desktop layout untouched.
-    <header className="flex h-[calc(var(--safe-top)+var(--phone-header))] shrink-0 items-center gap-1 border-border border-b pt-[var(--safe-top)] pr-1">
-      <button
-        ref={backRef}
-        type="button"
-        aria-label={backLabel}
-        onClick={onBack}
-        className="flex h-11 min-w-11 shrink-0 items-center gap-0.5 pr-2 pl-1 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        <ChevronLeft className="size-5" aria-hidden="true" />
-        <span className="max-w-44 truncate text-sm">{backTitle ?? "Back"}</span>
-      </button>
+    <PhoneBackBar
+      backLabel={backLabel}
+      backTitle={backTitle ?? "Back"}
+      onBack={onBack}
+      backRef={backRef}
+    >
       {level === 1 && (
         <>
           <button
@@ -133,6 +173,6 @@ export function PhoneHeader({ level, onBack, backRef }: PhoneHeaderProps) {
           </DropdownMenu>
         </>
       )}
-    </header>
+    </PhoneBackBar>
   );
 }

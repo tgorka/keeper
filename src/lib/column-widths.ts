@@ -110,6 +110,7 @@ export const SURFACE_COLUMN_IDS = [
   "files-tree",
   "chat-list",
   "tasks-list",
+  "bots-list",
 ] as const;
 
 export type SurfaceColumnId = (typeof SURFACE_COLUMN_IDS)[number];
@@ -150,6 +151,17 @@ export const SURFACE_COLUMNS: Record<SurfaceColumnId, SurfaceColumnSpec> = {
   // `nightly backup` and the owner's ask was literally "the list of the saved
   // names".
   "tasks-list": { label: "task list", title: "Task list", defaultWidth: 320, minWidth: 240 },
+  // 320, the task list's number and for the same reason: a conversation row is
+  // a title, a relative time and a message count on one line, and the title is
+  // what the column exists to make scannable. Story 61.14 made this a column
+  // at all: as a band above the transcript it was a permanent 241px, and the
+  // transcript — the point of the surface — got what was left.
+  "bots-list": {
+    label: "conversation list",
+    title: "Conversation list",
+    defaultWidth: 320,
+    minWidth: 240,
+  },
 };
 
 /**

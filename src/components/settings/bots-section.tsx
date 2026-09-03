@@ -1,6 +1,7 @@
 /**
  * Settings → Bots: where an endpoint and a bot are added, tested, edited and
- * removed (Epic 61, Story 61.4, FR-379).
+ * removed (Epic 61, Story 61.4, FR-379; on the phone too, Epic 62, Story 62.3,
+ * FR-399).
  *
  * # One component, two modes (AD-C7)
  *
@@ -40,6 +41,19 @@
  * the host, because that is the same shape the egress disclosure uses for a git
  * remote and two surfaces naming one destination differently is how somebody
  * concludes they are two destinations.
+ *
+ * # One component, two widths
+ *
+ * The phone renders this same section (Epic 62): a Hermes endpoint needs its
+ * base URL, its key and optionally a profile, and every one of those is
+ * already a field here. There is no phone edition of the form, for AD-C7's
+ * reason. What the phone changes is only the row: a name, a host and three
+ * verbs do not fit one line at 390 px, so the row and the header are
+ * `flex-wrap` with a floor under the name (`min-w-40`), and the verbs drop to
+ * their own line rather than squeezing the name to a letter a word. Nothing
+ * here reads the platform; the section is the same on both tiers, and the
+ * grants live in their own section, gated on `botTools`, so no drive control
+ * is rendered here to disable.
  */
 import { useCallback, useEffect, useState } from "react";
 import {
@@ -237,7 +251,7 @@ export function BotsSection({ open }: { open: boolean }) {
 
   return (
     <div className="mt-2 flex flex-col gap-2 border-border border-t pt-3 text-sm">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="font-medium">{BOTS_SECTION_TITLE}</p>
         <div className="flex shrink-0 gap-2">
           <Button
@@ -284,8 +298,8 @@ export function BotsSection({ open }: { open: boolean }) {
         <ul aria-label="Endpoints" className="flex flex-col gap-2">
           {providerList.map((provider) => (
             <li key={provider.id} className="flex flex-col gap-1">
-              <div className="flex items-center gap-2">
-                <span className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="min-w-40 flex-1">
                   {/* The host, never the full URL — the egress disclosure's own
                       shape, so one destination is named one way. */}
                   {provider.name} — {provider.kind} at {provider.host}
@@ -362,8 +376,8 @@ export function BotsSection({ open }: { open: boolean }) {
         <ul aria-label="Bots" className="flex flex-col gap-2">
           {botList.map((bot) => (
             <li key={bot.id} className="flex flex-col gap-1">
-              <div className="flex items-center gap-2">
-                <span className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="min-w-40 flex-1">
                   {bot.name} — {bot.target}
                 </span>
                 <Button type="button" variant="outline" size="sm" onClick={() => probeBot(bot)}>

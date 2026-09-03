@@ -46,15 +46,23 @@ export const DEBUG_MODE_SENTENCE =
   "Writes app logs to ~/Library/Logs/keeper/keeper.log and a per-recording events.log beside each session's manifest. Local files only — nothing is uploaded.";
 
 /**
- * The four honesty lines of the reduced-platform (phone tier) "On this iPhone"
- * disclosure (Story 13.7). Project voice: sentence case, no exclamation marks,
- * honest consequence-naming. Each names a desktop-only affordance the phone lacks.
+ * The five honesty lines of the reduced-platform (phone tier) "On this iPhone"
+ * disclosure (Story 13.7; the fifth from Epic 62, Story 62.3, FR-400). Project
+ * voice: sentence case, no exclamation marks, honest consequence-naming. Each
+ * names a desktop-only affordance the phone lacks.
+ *
+ * Mirrored one-to-one into the Limitations list of `docs/ios.md`, which the
+ * disclosure links to; `about-section.test.tsx` reads that file from disk and
+ * fails when the two lists differ. Edit both together or neither.
  */
-const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
+export const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
   "keeper syncs and notifies only while it's open; background notifications await a future decision.",
   "No self-hosted bridge runner — manage your own bridges from your Mac.",
   "No global summon hotkey.",
   "Updates arrive by reinstalling keeper; its signature renews every 7 days.",
+  "Bots talks to a model but cannot reach the folders you sync — the drive tools live on your Mac.",
+  "Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.",
+  "Listening stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit; while it listens the microphone indicator stays lit and it uses battery.",
 ];
 
 /**

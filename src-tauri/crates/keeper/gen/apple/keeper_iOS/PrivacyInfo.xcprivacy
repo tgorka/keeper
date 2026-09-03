@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  keeper's iOS privacy manifest (Epic 62, Story 62.6). Lives under keeper_iOS/, which
+  project.yml lists as a source folder, so XcodeGen adds it to the app target's resources
+  and it ships in the bundle root as Apple requires.
+
+  What voice adds, and why each entry is what it is:
+
+  - NSPrivacyTracking is false and NSPrivacyTrackingDomains is empty: keeper has no
+    tracking and no analytics, on any platform (docs/egress.md is the complete list of
+    destinations, and none is a tracker).
+  - NSPrivacyCollectedDataTypes is empty even though the app hears audio: Apple defines
+    "collected" as data transmitted off the device. Speech is recognised on the device
+    (`requiresOnDeviceRecognition = true`, no server fallback, NFR-50) and what is sent to
+    the model endpoint the person configured is the TEXT they chose to send, to a server
+    they chose — not data keeper collects. The audio itself is never stored or sent.
+  - NSPrivacyAccessedAPITypes: the microphone and the Speech framework are governed by
+    their usage-description strings and the permission dialogs (FR-408), and are NOT in
+    Apple's "required reason" API list, so voice adds no entry here. The list is empty
+    because this manifest records what voice requires; an audit of the whole binary for
+    file-timestamp / UserDefaults / disk-space reasons is a release task (Story 62.7).
+-->
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array/>
+</dict>
+</plist>

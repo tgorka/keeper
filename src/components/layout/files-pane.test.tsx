@@ -3288,6 +3288,16 @@ describe("FilesPane — the tree stays where you left it", () => {
     remembered([nodeKey("01VAULT", ""), nodeKey("01GONE", "")]);
     render(<FilesPane />);
     await screen.findByText(FILES_NO_PROFILES_SENTENCE);
+    // The arrangement, asserted rather than assumed. Everything below is about
+    // what the drop does to the *store*, and the store only holds these keys if
+    // `hydrateFilesTree` believed the cookie — which it silently declines to do
+    // when it has already run in this document. Read it here and a hydration
+    // that did not happen fails on its own line, instead of surfacing later as
+    // an empty expansion that looks like the drop forgetting everything.
+    expect(
+      [...filesTreeStore.getState().expanded].sort(),
+      `hydration; cookie=${document.cookie}`,
+    ).toEqual([nodeKey("01GONE", ""), nodeKey("01VAULT", "")].sort());
 
     // Nothing learned, so nothing forgotten — not even the profile that really
     // has gone. A failed call is not evidence.
@@ -3295,8 +3305,14 @@ describe("FilesPane — the tree stays where you left it", () => {
 
     await click(screen.getByRole("button", { name: FILES_REFRESH_LABEL }));
 
+    // Named in the message because the cookie is a projection of the store: a
+    // failure here is either "the drop took the wrong key" or "the store was
+    // never holding them", and only the store tells those two apart.
     await waitFor(() =>
-      expect(readFilesTree(document.cookie)).toEqual(new Set([nodeKey("01VAULT", "")])),
+      expect(
+        readFilesTree(document.cookie),
+        `store=[${[...filesTreeStore.getState().expanded]}]`,
+      ).toEqual(new Set([nodeKey("01VAULT", "")])),
     );
   });
 

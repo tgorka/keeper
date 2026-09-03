@@ -129,8 +129,8 @@ function movePin(bots: BotVm[], from: number, to: number): BotVm[] {
 /**
  * The press a reorder begins with: the bot's index in the authoritative order.
  *
- * Desktop only, so there is no `viaLift` here — the bots pane does not exist on
- * the phone tier (`capabilities.bots` is `cfg!(desktop)`), and a long-press
+ * Desktop only, so there is no `viaLift` here — the phone composition
+ * (`bots-phone-pane.tsx`, Epic 62) does not mount this strip, so a long-press
  * branch nothing can reach would be an affordance that lies.
  */
 interface BotPinPress {

@@ -19,6 +19,7 @@ const desktopCapabilities: CapabilitiesVm = {
   notes: true,
   sessions: true,
   bots: true,
+  botTools: true,
   overlayTitleBar: true,
 };
 
@@ -43,6 +44,7 @@ describe("capabilitiesStore", () => {
       notes: false,
       sessions: false,
       bots: false,
+      botTools: false,
       overlayTitleBar: false,
     });
   });
@@ -80,13 +82,31 @@ describe("isReducedCapabilityPlatform", () => {
     expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(false);
   });
 
-  it("a single present flag (hydrated) is NOT reduced — every flag must be absent", () => {
+  it("a single tier-telling flag (hydrated) is NOT reduced — every flag must be absent", () => {
     // Derived from the VM's own keys so a capability added later is exercised
     // automatically: the hand-written list had already drifted past `sync`.
-    const flags = Object.keys(DEFAULT_CAPABILITIES) as Array<keyof CapabilitiesVm>;
+    // `bots` is the one flag true on every tier (Epic 62, FR-396), so it is the
+    // one flag that must NOT flip the verdict; the case below owns it.
+    const flags = (Object.keys(DEFAULT_CAPABILITIES) as Array<keyof CapabilitiesVm>).filter(
+      (flag) => flag !== "bots",
+    );
     for (const flag of flags) {
       capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, [flag]: true });
       expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(false);
     }
+  });
+
+  it("a phone that can hold a conversation (`bots` alone true) IS still reduced", () => {
+    // Epic 62 puts the Bots pane on the phone, so `bots` is true there. If the
+    // predicate folded it in, hydrating on iOS would read as desktop and the
+    // "On this iPhone" disclosure, the backup-exclusion line and the offline
+    // pill would all vanish the moment the pane existed.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
+  });
+
+  it("the drive half (`botTools`) is tier-telling: alone true is NOT reduced", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, botTools: true });
+    expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(false);
   });
 });

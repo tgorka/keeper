@@ -79,8 +79,9 @@ notes: boolean,
  */
 sessions: boolean, 
 /**
- * The Bots surface (Epic 61, FR-378) can run here: **desktop, and nothing
- * else** — computed in the shell like every other flag in this struct.
+ * The Bots surface (Epic 61, FR-378; Epic 62, FR-396) can run here:
+ * **true wherever the pane exists** — desktop and phone alike — computed
+ * in the shell like every other flag in this struct.
  *
  * **This is not a synonym for `sessions`, and the difference is the whole
  * reason it is a separate flag.** `notes` and `sessions` are both
@@ -88,22 +89,34 @@ sessions: boolean,
  * keeper syncs*, so neither can exist without a usable `git`. Talking to a
  * model needs neither `git` nor `sync.db`: a provider is a URL and a
  * credential, a conversation is two tables in `keeper.db`, and a machine
- * with no `git` at all can hold both. So a build gated on `sessions` here
- * would hide a working surface on every desktop whose `git` is too old,
- * which is a lie in the opposite direction from the one AD-27 usually
- * guards.
+ * with no `git` at all — or a phone with no folder sync at all — can hold
+ * both. So a build gated on `sessions` here would hide a working surface
+ * on every desktop whose `git` is too old and on every phone, which is a
+ * lie in the opposite direction from the one AD-27 usually guards.
  *
- * The half that genuinely needs `sync` is the drive-tool grant (Story
- * 61.10, 61.11) — a tool call resolves a path inside a synced profile —
- * and that affordance is gated on `sync` where it is offered. Two facts,
- * two flags, and the split stated where both are declared.
- *
- * Desktop-only rather than everywhere because iOS has no place to put the
- * surface: the pane is a three-column desktop layout and the phone tier
- * replaces the whole shell row. When it is `false` every bots affordance
- * is **absent** from the DOM rather than disabled.
+ * The half that genuinely needs the drive is [`Self::bot_tools`]. Two
+ * facts, two flags, and the split stated where both are declared. When
+ * this is `false` every bots affordance is **absent** from the DOM rather
+ * than disabled.
  */
 bots: boolean, 
+/**
+ * This build can reach the drive on a bot's behalf (Epic 62, FR-396,
+ * AD-162): **desktop and `sync`**, computed in the shell like every other
+ * flag in this struct.
+ *
+ * Strictly narrower than `bots`, for a reason that is a fact about
+ * linking rather than a design choice: a tool call resolves a path inside
+ * a synced profile through `keeper-sync`, and `keeper-sync` is not a
+ * dependency of the shell on iOS or Android. A grant is therefore a
+ * promise about files keeper cannot reach from a phone, so on a phone
+ * there is no grant, no audit, no tool row and no deliverable path —
+ * **absent** rather than disabled (AD-27), with one sentence saying the
+ * drive tools live on the Mac. On a desktop it is `sync` for
+ * `notes`' reason: the drive IS the synced folders, so a machine whose
+ * `git` the engine refuses has no drive to grant.
+ */
+botTools: boolean, 
 /**
  * The window's title bar is a transparent overlay over the webview, so the
  * native window controls float over page content (Story 34.2, AD-34-2):

@@ -336,6 +336,9 @@ export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
+export type { VoiceStateVm } from "./gen/VoiceStateVm";
+export type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
+export type { VoiceWakeVm } from "./gen/VoiceWakeVm";
 export type { WidgetKind } from "./gen/WidgetKind";
 export type { WidgetRow } from "./gen/WidgetRow";
 export type { WordBlockStyle } from "./gen/WordBlockStyle";
@@ -499,6 +502,9 @@ import type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
+import type { VoiceStateVm } from "./gen/VoiceStateVm";
+import type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
+import type { VoiceWakeVm } from "./gen/VoiceWakeVm";
 import type { WidgetKind } from "./gen/WidgetKind";
 import type { WidgetRow } from "./gen/WidgetRow";
 
@@ -7129,4 +7135,122 @@ export async function botsDeliverablePaths(
   body: string,
 ): Promise<BotDeliverableVm[]> {
   return await invoke<BotDeliverableVm[]>("bots_deliverable_paths", { sessionId, body });
+}
+
+// ---------------------------------------------------------------------------
+// Voice (Epic 62, Story 62.5) — the wake phrase and the stream that shows it
+// listening. The turn machine, the phrase grammar and the limits sentence are
+// `keeper_core::voice`; nothing here validates or decides.
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether voice can work right now (FR-402): `null` when it can, otherwise
+ * why — in the sentence the surface shows, composed in `keeper_core::voice`.
+ * `unsupported` is every build without a port (the desktop today), and the
+ * affordance is absent for it; `notAuthorized` is a prompt, not absence.
+ *
+ * Rejects with: `internal`.
+ */
+export async function voiceAvailability(): Promise<VoiceUnavailableVm | null> {
+  return await invoke<VoiceUnavailableVm | null>("voice_availability");
+}
+
+/**
+ * Watch the voice turn without starting one (FR-405): the current
+ * {@link VoiceStateVm} arrives at once and again after every transition, so
+ * the surface can say "listening" whenever the microphone is open — for the
+ * phrase or for a turn. Resolves the watch id for {@link voiceUnwatch}.
+ *
+ * One watcher at a time: a second call replaces the first rather than doubling
+ * every snapshot, which is what a remount wants.
+ *
+ * Rejects with: `internal`.
+ */
+export async function voiceWatch(onState: (state: VoiceStateVm) => void): Promise<number> {
+  const channel = new Channel<VoiceStateVm>();
+  // Armed before invoking: the ordering is load-bearing, exactly as in
+  // `subscribe()` -- the first snapshot is pushed inside the command.
+  channel.onmessage = onState;
+  return await invoke<number>("voice_watch", { channel });
+}
+
+/**
+ * Stop watching. A stale id — the pane remounted before this unmount resolved
+ * — is a no-op, and the turn is untouched: a surface going away does not
+ * disarm the phrase.
+ */
+export async function voiceUnwatch(id: number): Promise<void> {
+  await invoke<void>("voice_unwatch", { id });
+}
+
+/**
+ * The wake switch and phrase as persisted (`bots.wake_enabled`,
+ * `bots.wake_phrase`), plus the sentence about what listening costs on this
+ * phone — decided once in `keeper_core::voice::LISTENING_LIMITS` and rendered
+ * beside the switch (FR-406). Off on a fresh install.
+ *
+ * Rejects with: `internal`.
+ */
+export async function voiceWakeGet(): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_wake_get");
+}
+
+/**
+ * Set the wake switch and phrase (FR-404, FR-405). The phrase is validated by
+ * `WakePhrase::parse` in Rust — never here — and a refusal rejects with the
+ * sentence saying what to type instead, with nothing persisted. On success
+ * both are persisted and the turn is armed (or disarmed).
+ *
+ * Rejects with: `internal` (the refusal, with its sentence).
+ */
+export async function voiceWakeSet(enabled: boolean, phrase: string): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_wake_set", { enabled, phrase });
+}
+
+/**
+ * Ask for the recogniser and the microphone, by name, once (FR-408, Story
+ * 62.6). Called from the first deliberate voice act — the mic control, the
+ * wake switch — and never at launch. Resolves `null` when both are granted,
+ * otherwise the {@link VoiceUnavailableVm} with its remedy (`notAuthorized`
+ * names Settings). The OS shows each dialog once; a recorded answer is never
+ * asked for again, so this is safe to call before every start.
+ *
+ * Rejects with: `internal` (the dialog task did not finish).
+ */
+export async function voiceAuthorize(): Promise<VoiceUnavailableVm | null> {
+  return await invoke<VoiceUnavailableVm | null>("voice_authorize");
+}
+
+/**
+ * Start a voice turn by hand (FR-401, FR-407): the microphone opens and
+ * recognition begins. Snapshots arrive over the one {@link voiceWatch}
+ * channel, not here — the surface keeps exactly one stream.
+ *
+ * Rejects with: `internal`.
+ */
+export async function voiceStart(): Promise<void> {
+  await invoke<void>("voice_start");
+}
+
+/**
+ * Abandon the turn, whatever state it is in (NFR-51): the microphone is
+ * released and nothing heard is sent.
+ */
+export async function voiceStop(): Promise<void> {
+  await invoke<void>("voice_stop");
+}
+
+/**
+ * Read `text` aloud (FR-403). From a turn that heard something this is the
+ * answer to what was heard; from idle it is the answer to something typed.
+ * Speech detected while it plays stops it first (barge-in), decided in
+ * `keeper_core::voice`.
+ */
+export async function voiceSpeak(text: string): Promise<void> {
+  await invoke<void>("voice_speak", { text });
+}
+
+/** Stop reading aloud; the turn ends as if the utterance had finished. */
+export async function voiceStopSpeaking(): Promise<void> {
+  await invoke<void>("voice_stop_speaking");
 }

@@ -75,3 +75,10 @@ toml = { workspace = true }
 # neither tauri nor gix, so `check:core-tauri-free` and `check:core-sync-free`
 # stay green.
 base64 = { workspace = true }
+# Wake-phrase normalisation (Epic 62, Story 62.4, FR-404): NFD decomposition
+# plus combining-mark removal is how `voice::phrase` makes "Hej Kééper" and
+# "hej keeper" the same phrase. Already resolved in Cargo.lock as matrix-sdk's
+# own transitive dependency (`idna`), so this adds no package to the tree, and
+# it drags in neither tauri nor gix, so `check:core-tauri-free` and
+# `check:core-sync-free` stay green. MIT OR Apache-2.0.
+unicode-normalization = { workspace = true }

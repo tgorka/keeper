@@ -163,3 +163,67 @@ first proposed as a convenience, and the refusal has to be findable before the p
   different product.
 - **Status / owner:** decided. Owner is the architect; Epic 61 implements the provider, the surface
   and the grant; Epic 62 owns talk mode.
+
+## D-5 — Voice is the system's, on the device, armed by a person
+
+keeper will listen for a phrase and talk to a model on the phone — speech becomes text on the
+device, the text is sent to the bot as an ordinary message, and the answer is spoken — and it will
+**not** ship a model of its own, send a voice anywhere, or start its own microphone. Recorded here
+because each of those three is the first thing proposed when voice is "almost working", and the
+epic that built this got one of them wrong in its first draft; the corrected reasoning has to be
+findable before it is re-argued.
+
+- **What is built:** a turn is a state machine in `keeper_core::voice` — `Idle → Listening →
+  Heard → Sending → Speaking → Idle`, abandonable from every state so the microphone is released,
+  with a bounded silence timeout — tested on the dev host against a fake port. The iOS half of the
+  shell crate is one port implementation over `SFSpeechRecognizer`, `AVAudioEngine`,
+  `AVAudioSession` and `AVSpeechSynthesizer`, and it decides nothing. The wake phrase is validated
+  by `keeper-core` (one word is allowed, the default is `nixie`, a letter floor refuses something
+  too short to be safe), off until a person switches it on, and shown as a live chip whenever it
+  listens. (AD-165…AD-171; Epic 62, stories 62.4–62.6)
+- **Why no bundled model weights, ever:** Apple's recogniser and synthesiser are system frameworks,
+  so keeper ships no weights at all — and that is the whole reason voice exists on iOS while it
+  stays deferred on the Mac. Epic 61 deferred voice because every permissive desktop stack needs
+  pretrained keyword-spotting and ASR weights whose dataset terms the code's Apache-2.0 licence
+  does not imply, and that is still true there: nothing with clear weight provenance exists for
+  desktop wake-word spotting, and macOS's own `SFSpeechRecognizer` is a separate port with its own
+  entitlement story. The desktop half stays deferred as DW-219. (`objc2-speech` and
+  `objc2-avf-audio`, both `Zlib OR Apache-2.0 OR MIT`; D-4, *Why voice and the wake word are Epic
+  62*; Epic 62, *Why this is possible now*)
+- **Why on-device recognition only, with no server fallback:** `docs/egress.md` claims to be the
+  record of every network destination keeper contacts, and NFR-11 rests on that claim. Apple's
+  recogniser will fall back to Apple's servers unless told not to, and that fallback would be a
+  destination the file does not name. So every request sets `requiresOnDeviceRecognition = true`,
+  the recogniser's `supportsOnDeviceRecognition` is checked first, and a locale whose model is not
+  on the phone gets a sentence naming the language to download — never a quiet round trip. This is
+  enforced, not asserted: a source scan over the voice modules of both crates fails the build if a
+  request is ever built without the flag, if the flag is ever `false`, or if a network API appears.
+  (AD-166; FR-402, NFR-50; `voice_on_device` in `keeper-core`'s tests)
+- **Why armed in the foreground, and why keeper never arms itself:** what iOS forbids is
+  *starting* the microphone from the background — "apps will not in general be allowed to start
+  recording while in the background" is Apple's sentence, not a limitation of this implementation.
+  What iOS supports is the other half: a session armed while keeper is in front keeps running with
+  another app in front and with the screen locked, under `UIBackgroundModes: audio` and the
+  `.playAndRecord` category. So listening is one deliberate act and then hands-free, and four
+  things stop it: the person turning it off, iOS ending the audio session (a call, Siri, another
+  app taking the microphone — the port re-arms when the interruption ends, and says it stopped when
+  it cannot), keeper being force-quit, and a reboot. Waking on the phrase after a force-quit or a
+  reboot, or without keeper ever having been opened, is **refused by iOS**, not unbuilt by keeper —
+  and the system microphone indicator stays lit for the whole of an armed session, which no app can
+  hide. All of that is one `const` in `keeper-core`, rendered beside the switch and nowhere else.
+  (AD-168, AD-169; FR-404…FR-406; Apple DTS, `developer.apple.com/forums/thread/120038`; Epic 62,
+  *What the phone cannot have*, corrected 2026-09-03)
+- **What App Review has to say about any of this: nothing.** The epic's first draft weighed App
+  Store Guideline 2.5.4 against background listening and rejected the feature partly on that
+  ground. That was wrong: keeper on iPhone is a free-Personal-Team sideload (D-1, `docs/ios.md`),
+  never TestFlight or the App Store, so no review guideline governs this build. What governs it is
+  what iOS itself permits and refuses, and that is the list above. (Epic 62, *What the phone cannot
+  have*)
+- **Revisit triggers:** a permissive desktop wake-word stack with weight provenance somebody can
+  actually establish (DW-219 — a macOS port is a second port implementation, not a change to the
+  state machine); a Live Activity for the listening state, which needs a widget extension and its
+  own signing story on a free Personal Team (DW-222). None of them reopens the second paragraph: a
+  server fallback is not a revisit, it is a new row in `docs/egress.md` that this decision refuses
+  to write.
+- **Status / owner:** decided. Owner is the architect; Epic 62 implements the turn machine, the iOS
+  port, the phrase and the surface; the Mac half stays deferred under DW-219.

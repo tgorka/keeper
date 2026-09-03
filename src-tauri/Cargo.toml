@@ -123,6 +123,15 @@ objc2-foundation = { version = "0.3", features = [
     "NSString",
     "NSValue",
     "NSFileManager",
+    # The iOS voice port (Story 62.6) watches `AVAudioSessionInterruptionNotification`
+    # and friends through `NSNotificationCenter` block observers: NSNotification for the
+    # centre and the notification, NSOperation for the (nil) queue parameter, NSDictionary
+    # for `userInfo`, NSObject for the observer token's protocol, block2 for the block.
+    "NSNotification",
+    "NSOperation",
+    "NSDictionary",
+    "NSObject",
+    "block2",
 ] }
 # iOS app-icon badge (Story 14.3 fix, FR-62): safe `UNUserNotificationCenter::setBadgeCount`
 # binding (block2 feature for the optional completion handler). Already resolved in the lock
@@ -309,4 +318,44 @@ quick-xml = "0.39"
 # reqwest already pulls into `keeper-core`, so the direct edge adds no package
 # to Cargo.lock. MIT OR Apache-2.0 — passes `cargo deny check`.
 flate2 = "1"
+# Wake-phrase normalisation (Epic 62, Story 62.4, FR-404): a phrase a person
+# types is matched against what the recogniser heard case- and
+# diacritic-insensitively, and the diacritic half is NFD decomposition plus
+# dropping the combining marks — a table nobody should hand-write. Already
+# resolved in Cargo.lock as matrix-sdk's own dependency (via `idna`), so the
+# direct edge on `keeper-core` adds no package to the tree and drags in neither
+# tauri nor gix. MIT OR Apache-2.0 — passes `cargo deny check`.
+unicode-normalization = "0.1"
+# The iPhone's speech recogniser and synthesiser (Epic 62, Story 62.4, AD-166,
+# AD-167). System frameworks: keeper ships no model weights, and the on-device
+# recogniser is the only one asked for (`requiresOnDeviceRecognition`), so
+# voice adds no network destination (NFR-50). Consumed by the `keeper` crate
+# under its iOS-only target table — never on desktop, never on Linux. The
+# feature lists name exactly the surfaces `voice_ios.rs` touches. Both are
+# `Zlib OR Apache-2.0 OR MIT` — pass the cargo-deny license firewall.
+objc2-speech = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "SFSpeechRecognizer",
+    "SFSpeechRecognitionRequest",
+    "SFSpeechRecognitionResult",
+    "SFSpeechRecognitionTask",
+    "SFTranscription",
+    "block2",
+    "objc2-avf-audio",
+] }
+objc2-avf-audio = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "AVAudioBuffer",
+    "AVAudioEngine",
+    "AVAudioFormat",
+    "AVAudioIONode",
+    "AVAudioNode",
+    "AVAudioSession",
+    "AVAudioSessionTypes",
+    "AVAudioTime",
+    "AVAudioTypes",
+    "AVSpeechSynthesis",
+    "bitflags",
+    "block2",
+] }
 

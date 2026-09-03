@@ -90,3 +90,33 @@ safe binding. Current inventory:
   objc2-foundation, behind `Platform::exclude_from_backup` — the single function-level
   `#[allow(unsafe_code)]` in `IosPlatform::exclude_from_backup`,
   `crates/keeper/src/ipc.rs` — story 14.7 (FR-65).
+- macOS PDF export (`WKWebView createPDFWithConfiguration:completionHandler:`) via
+  objc2-web-kit, behind `pdf_export::capture`, `crates/keeper/src/pdf_export.rs` — the
+  second entry, which called itself that in its own doc comment before this list said so.
+- iOS voice port (Epic 62, Stories 62.4 and 62.6, FR-401–FR-403, FR-408, NFR-50/NFR-51):
+  `SFSpeechRecognizer` (`authorizationStatus`, `requestAuthorization:`, `initWithLocale:`,
+  `supportsOnDeviceRecognition`, `recognitionTaskWithRequest:resultHandler:`),
+  `SFSpeechAudioBufferRecognitionRequest` (`setRequiresOnDeviceRecognition:` — always
+  `true`, `appendAudioPCMBuffer:`, `endAudio`), `SFSpeechRecognitionTask cancel`,
+  `AVAudioSession` (`sharedInstance`, `isInputAvailable`, `recordPermission`,
+  `requestRecordPermission:`, `setCategory:mode:options:error:`, `setActive:…`),
+  `AVAudioEngine` (`inputNode`, `setVoiceProcessingEnabled:error:`, `installTapOnBus:…`,
+  `removeTapOnBus:`, `prepare`, `startAndReturnError:`, `stop`, `isRunning`),
+  `AVSpeechSynthesizer` (`speakUtterance:`, `stopSpeakingAtBoundary:`, `isSpeaking`) and
+  `NSNotificationCenter` (`addObserverForName:object:queue:usingBlock:` for
+  `AVAudioSessionInterruptionNotification`, `AVAudioSessionMediaServicesWereResetNotification`
+  and `AVAudioEngineConfigurationChangeNotification`, `removeObserver:`) via objc2-speech,
+  objc2-avf-audio and objc2-foundation, behind `keeper_core::voice::VoicePort` and
+  `keeper_core::voice::ConsentPort` — twenty-two function-level `#[allow(unsafe_code)]`
+  fns in `crates/keeper/src/voice_ios.rs`, one per concern (`speech_authorization`,
+  `microphone`, `microphone_consent`, `ask_speech`, `ask_microphone`,
+  `on_device_recognizer`, `configure_session`, `set_session_options`, `release_session`,
+  `start_capture`, `stop_capture`, `engine_running`, `start_request`, `end_request`,
+  `read_result`, `observe_session`, `interruption_notice`, `forget_observer`,
+  `new_synthesizer`, `speak_text`, `stop_speech`, `is_speaking`), each with a
+  `// SAFETY:` comment citing the Apple contract it relies on. `start_capture` also
+  carries `#[allow(clippy::arc_with_non_send_sync)]`: the request slot the audio tap
+  reads is shared with the audio thread inside a block, which Rust cannot see — the
+  SAFETY comment is the argument. No server recognition path exists in the file, and the
+  port never prompts on its own: the two permission dialogs are reached only through
+  `ConsentPort`, whose timing is decided in `keeper_core::voice::authorization`.

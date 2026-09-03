@@ -32,6 +32,14 @@
  * a reversible act trains people to dismiss dialogs. Delete gets one, and it
  * names the conversation and what goes with it — the chain-of-custody rule the
  * sessions board's own copy follows (`session-actions.tsx:52-66`).
+ *
+ * **It is a column, not a band (Story 61.14).** The first cut stacked this
+ * above the transcript, where the label, New, the search field, its sentence,
+ * the three scope chips and the rows were a permanent 241px, and the transcript
+ * took what was left. It is now the body of a surface column beside the
+ * transcript — the Tasks pane's Level 1 — so it folds to a rail that says how
+ * many conversations it holds, and inside it the head stays put while the rows
+ * scroll. The column's own title band names it; the `<ul>` keeps the noun.
  */
 import { Archive, ArchiveRestore, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -55,6 +63,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupInput } from "@/components/ui/input-group";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { type CountNoun, countLabel } from "@/lib/count-label";
 import { formatDraftAge } from "@/lib/format-time";
 import type { BotSessionRowVm, BotSessionScope, BotSessionVm } from "@/lib/ipc/client";
@@ -285,176 +294,183 @@ export function BotSessionList({
   const shown = rows ?? [];
 
   return (
-    <div className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-3">
-      <div className="flex items-center gap-2">
-        <span className="min-w-0 flex-1 text-muted-foreground text-xs">
-          {BOT_SESSION_LIST_LABEL}
-        </span>
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 flex-col gap-2 px-3 py-3">
         <Button type="button" variant="outline" size="sm" onClick={onNew}>
           {BOT_SESSION_NEW_LABEL}
         </Button>
+
+        {/* Search above the fold, the browse-surface rule. */}
+        <InputGroup>
+          <InputGroupInput
+            placeholder={BOT_SESSION_SEARCH_LABEL}
+            aria-label={BOT_SESSION_SEARCH_LABEL}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+          />
+        </InputGroup>
+        <p className="text-muted-foreground text-xs">{BOT_SESSION_SEARCH_POSTURE}</p>
+
+        {/* Wraps rather than clips: the column's width is the user's business. */}
+        <div className="flex flex-wrap items-center gap-1">
+          {BOT_SESSION_SCOPE_CHOICES.map((choice) => (
+            <Button
+              key={choice.value}
+              type="button"
+              size="sm"
+              variant={scope === choice.value ? "secondary" : "ghost"}
+              aria-pressed={scope === choice.value}
+              onClick={() => setScope(choice.value)}
+            >
+              {choice.label}
+            </Button>
+          ))}
+          <span className="min-w-0 flex-1" />
+          {/* The backend's total, never `shown.length` — the page is bounded and
+              the two numbers differ by the cap. */}
+          <span className="figures text-muted-foreground text-xs">
+            {countLabel(shown.length, CONVERSATIONS, { of: total })}
+          </span>
+        </div>
+
+        {error !== null && (
+          <p role="alert" className="text-destructive text-xs">
+            {error}
+          </p>
+        )}
       </div>
 
-      {/* Search above the fold, the browse-surface rule. */}
-      <InputGroup>
-        <InputGroupInput
-          placeholder={BOT_SESSION_SEARCH_LABEL}
-          aria-label={BOT_SESSION_SEARCH_LABEL}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-        />
-      </InputGroup>
-      <p className="text-muted-foreground text-xs">{BOT_SESSION_SEARCH_POSTURE}</p>
-
-      {/* Wraps rather than clips: the pane's width is the user's business. */}
-      <div className="flex flex-wrap items-center gap-1">
-        {BOT_SESSION_SCOPE_CHOICES.map((choice) => (
-          <Button
-            key={choice.value}
-            type="button"
-            size="sm"
-            variant={scope === choice.value ? "secondary" : "ghost"}
-            aria-pressed={scope === choice.value}
-            onClick={() => setScope(choice.value)}
-          >
-            {choice.label}
-          </Button>
-        ))}
-        <span className="min-w-0 flex-1" />
-        {/* The backend's total, never `shown.length` — the page is bounded and
-            the two numbers differ by the cap. */}
-        <span className="figures text-muted-foreground text-xs">
-          {countLabel(shown.length, CONVERSATIONS, { of: total })}
-        </span>
-      </div>
-
-      {error !== null && (
-        <p role="alert" className="text-destructive text-xs">
-          {error}
-        </p>
-      )}
-
-      {rows !== null && shown.length === 0 ? (
-        <p className="text-muted-foreground text-xs">
-          {filtered ? BOT_SESSION_NO_MATCH : BOT_SESSION_LIST_EMPTY}
-        </p>
-      ) : (
-        <ul aria-label={BOT_SESSION_LIST_LABEL} className="flex flex-col gap-1">
-          {shown.map((row) => (
-            <li key={row.session.id} className="flex flex-col gap-1">
-              {renaming !== null && renaming.id === row.session.id ? (
-                <div className="flex items-center gap-1">
-                  <Input
-                    className="h-8"
-                    aria-label={BOT_SESSION_RENAME_FIELD_LABEL}
-                    value={renaming.draft}
-                    // Autofocus because the row became a field: the gesture
-                    // that asked for the rename is the one that must land the
-                    // next keystroke. `space-row-menu.tsx:469` and the
-                    // templates room's rename field both do this.
-                    autoFocus
-                    onChange={(e) => setRenaming({ id: row.session.id, draft: e.target.value })}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        rename(row.session.id, renaming.draft);
-                        return;
-                      }
-                      if (e.key === "Escape") {
-                        e.preventDefault();
-                        setRenaming(null);
-                      }
-                    }}
-                  />
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    onClick={() => rename(row.session.id, renaming.draft)}
-                  >
-                    {BOT_SESSION_RENAME_CONFIRM}
-                  </Button>
-                  <Button type="button" size="sm" variant="ghost" onClick={() => setRenaming(null)}>
-                    {BOT_SESSION_RENAME_CANCEL}
-                  </Button>
-                </div>
-              ) : (
-                <div className="flex items-center gap-1">
-                  {/* The open button and the menu are siblings: a menu button
-                      nested in a button is not HTML (`session-row.tsx:46-48`). */}
-                  <Button
-                    type="button"
-                    size="sm"
-                    className="min-w-0 flex-1 justify-start"
-                    variant={row.session.id === openId ? "secondary" : "ghost"}
-                    aria-current={row.session.id === openId ? "true" : undefined}
-                    onClick={() => onOpen(row.session.id)}
-                  >
-                    <span className="min-w-0 flex-1 truncate text-left">{row.session.title}</span>
-                    {row.session.archived && (
-                      <span className="shrink-0 text-muted-foreground text-xs">
-                        {BOT_SESSION_ARCHIVED_MARK}
-                      </span>
-                    )}
-                    <span className="figures shrink-0 text-muted-foreground text-xs">
-                      {formatDraftAge(row.latestActivityMs)}
-                    </span>
-                    <span className="figures shrink-0 text-muted-foreground text-xs">
-                      {countLabel(row.messageCount, MESSAGES)}
-                    </span>
-                  </Button>
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        aria-label={`${BOT_SESSION_ACTIONS_LABEL} ${row.session.title}`}
-                      >
-                        <MoreHorizontal aria-hidden="true" className="size-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem
-                        onSelect={() =>
-                          setRenaming({ id: row.session.id, draft: row.session.title })
+      {/* The rows scroll under a head that does not: the search field and the
+          scope chips are the way to any row, so they may not scroll away with
+          the rows they filter. */}
+      <ScrollArea fitWidth className="min-h-0 flex-1">
+        {rows !== null && shown.length === 0 ? (
+          <p className="px-3 pb-3 text-muted-foreground text-xs">
+            {filtered ? BOT_SESSION_NO_MATCH : BOT_SESSION_LIST_EMPTY}
+          </p>
+        ) : (
+          <ul aria-label={BOT_SESSION_LIST_LABEL} className="flex flex-col gap-1 px-3 pb-3">
+            {shown.map((row) => (
+              <li key={row.session.id} className="flex flex-col gap-1">
+                {renaming !== null && renaming.id === row.session.id ? (
+                  <div className="flex items-center gap-1">
+                    <Input
+                      className="h-8"
+                      aria-label={BOT_SESSION_RENAME_FIELD_LABEL}
+                      value={renaming.draft}
+                      // Autofocus because the row became a field: the gesture
+                      // that asked for the rename is the one that must land the
+                      // next keystroke. `space-row-menu.tsx:469` and the
+                      // templates room's rename field both do this.
+                      autoFocus
+                      onChange={(e) => setRenaming({ id: row.session.id, draft: e.target.value })}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          rename(row.session.id, renaming.draft);
+                          return;
                         }
-                      >
-                        <Pencil aria-hidden="true" className="size-4" />
-                        {BOT_SESSION_RENAME_LABEL}
-                      </DropdownMenuItem>
-                      {row.session.archived ? (
-                        <DropdownMenuItem onSelect={() => archive(row.session.id, false)}>
-                          <ArchiveRestore aria-hidden="true" className="size-4" />
-                          {BOT_SESSION_UNARCHIVE_LABEL}
-                        </DropdownMenuItem>
-                      ) : (
-                        <DropdownMenuItem onSelect={() => archive(row.session.id, true)}>
-                          <Archive aria-hidden="true" className="size-4" />
-                          {BOT_SESSION_ARCHIVE_LABEL}
-                        </DropdownMenuItem>
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          setRenaming(null);
+                        }
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => rename(row.session.id, renaming.draft)}
+                    >
+                      {BOT_SESSION_RENAME_CONFIRM}
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setRenaming(null)}
+                    >
+                      {BOT_SESSION_RENAME_CANCEL}
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1">
+                    {/* The open button and the menu are siblings: a menu button
+                      nested in a button is not HTML (`session-row.tsx:46-48`). */}
+                    <Button
+                      type="button"
+                      size="sm"
+                      className="min-w-0 flex-1 justify-start"
+                      variant={row.session.id === openId ? "secondary" : "ghost"}
+                      aria-current={row.session.id === openId ? "true" : undefined}
+                      onClick={() => onOpen(row.session.id)}
+                    >
+                      <span className="min-w-0 flex-1 truncate text-left">{row.session.title}</span>
+                      {row.session.archived && (
+                        <span className="shrink-0 text-muted-foreground text-xs">
+                          {BOT_SESSION_ARCHIVED_MARK}
+                        </span>
                       )}
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(row)}>
-                        <Trash2 aria-hidden="true" className="size-4" />
-                        {BOT_SESSION_DELETE_LABEL}
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </div>
-              )}
-              {/* Only on the conversation being read, and only when one is
+                      <span className="figures shrink-0 text-muted-foreground text-xs">
+                        {formatDraftAge(row.latestActivityMs)}
+                      </span>
+                      <span className="figures shrink-0 text-muted-foreground text-xs">
+                        {countLabel(row.messageCount, MESSAGES)}
+                      </span>
+                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          aria-label={`${BOT_SESSION_ACTIONS_LABEL} ${row.session.title}`}
+                        >
+                          <MoreHorizontal aria-hidden="true" className="size-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          onSelect={() =>
+                            setRenaming({ id: row.session.id, draft: row.session.title })
+                          }
+                        >
+                          <Pencil aria-hidden="true" className="size-4" />
+                          {BOT_SESSION_RENAME_LABEL}
+                        </DropdownMenuItem>
+                        {row.session.archived ? (
+                          <DropdownMenuItem onSelect={() => archive(row.session.id, false)}>
+                            <ArchiveRestore aria-hidden="true" className="size-4" />
+                            {BOT_SESSION_UNARCHIVE_LABEL}
+                          </DropdownMenuItem>
+                        ) : (
+                          <DropdownMenuItem onSelect={() => archive(row.session.id, true)}>
+                            <Archive aria-hidden="true" className="size-4" />
+                            {BOT_SESSION_ARCHIVE_LABEL}
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem variant="destructive" onSelect={() => setDeleting(row)}>
+                          <Trash2 aria-hidden="true" className="size-4" />
+                          {BOT_SESSION_DELETE_LABEL}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </div>
+                )}
+                {/* Only on the conversation being read, and only when one is
                   held: a list of ids nobody asked about is noise, and a row
                   with no id has nothing honest to say here. */}
-              {row.session.id === openId && row.session.remoteSessionId !== null && (
-                <p className="text-muted-foreground text-xs">
-                  {BOT_SESSION_REMOTE_NOTE(row.session.remoteSessionId)}
-                </p>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
+                {row.session.id === openId && row.session.remoteSessionId !== null && (
+                  <p className="text-muted-foreground text-xs">
+                    {BOT_SESSION_REMOTE_NOTE(row.session.remoteSessionId)}
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </ScrollArea>
 
       <AlertDialog open={deleting !== null} onOpenChange={(open) => !open && setDeleting(null)}>
         <AlertDialogContent>

@@ -1,0 +1,787 @@
+//! Story 62.4: the voice turn is a state machine in `keeper-core`, the
+//! microphone is a port, and every rule is pinned here against a fake port
+//! — the only host this code is ever tested on.
+
+use std::sync::{Arc, Mutex};
+
+use keeper_core::vm::{VoiceStateVm, VoiceUnavailableVm};
+use keeper_core::voice::{
+    advance, perform, silence_budget, Effect, PhraseRefused, Turn, TurnEvent, TurnState, VoicePort,
+    VoiceUnavailable, WakePhrase, DEFAULT_WAKE_PHRASE, END_OF_UTTERANCE_PAUSE, LISTENING_LIMITS,
+    NOTHING_HEARD_TIMEOUT,
+};
+
+// ---------------------------------------------------------------------------
+// The fake port: records every call, refuses on demand.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Call {
+    Start(Option<String>),
+    Stop,
+    Speak(String),
+    StopSpeaking,
+}
+
+#[derive(Default)]
+struct FakePort {
+    calls: Mutex<Vec<Call>>,
+    refuse_start: Option<VoiceUnavailable>,
+    refuse_speak: Option<VoiceUnavailable>,
+}
+
+impl FakePort {
+    fn calls(&self) -> Vec<Call> {
+        self.calls.lock().expect("fake port lock").clone()
+    }
+    fn record(&self, call: Call) {
+        self.calls.lock().expect("fake port lock").push(call);
+    }
+}
+
+impl VoicePort for FakePort {
+    fn availability(&self) -> Result<(), VoiceUnavailable> {
+        Ok(())
+    }
+    fn start_listening(&self, wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
+        self.record(Call::Start(wake.map(|w| w.as_str().to_owned())));
+        self.refuse_start.clone().map_or(Ok(()), Err)
+    }
+    fn stop_listening(&self) {
+        self.record(Call::Stop);
+    }
+    fn speak(&self, text: &str) -> Result<(), VoiceUnavailable> {
+        self.record(Call::Speak(text.to_owned()));
+        self.refuse_speak.clone().map_or(Ok(()), Err)
+    }
+    fn stop_speaking(&self) {
+        self.record(Call::StopSpeaking);
+    }
+}
+
+fn listening(heard: &str) -> TurnState {
+    TurnState::Listening {
+        heard: heard.to_owned(),
+    }
+}
+
+fn heard(text: &str) -> TurnState {
+    TurnState::Heard {
+        text: text.to_owned(),
+    }
+}
+
+fn failed(reason: &str) -> TurnState {
+    TurnState::Failed {
+        reason: reason.to_owned(),
+    }
+}
+
+/// Every state the machine has, one of each.
+fn every_state() -> Vec<TurnState> {
+    vec![
+        TurnState::Idle,
+        listening(""),
+        listening("hej"),
+        heard("hello"),
+        TurnState::Sending,
+        TurnState::Speaking,
+        failed("boom"),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// The happy path, then the rules by name.
+// ---------------------------------------------------------------------------
+
+/// `Idle → Listening → Heard → Sending → Speaking → Idle`, with the device
+/// opened once at the start and released once at the end.
+#[test]
+fn voice_turn_walks_the_whole_path() {
+    let (s, e) = advance(TurnState::Idle, TurnEvent::WakeMatched);
+    assert_eq!(s, listening(""));
+    assert_eq!(e, vec![Effect::OpenMicrophone]);
+
+    let (s, e) = advance(s, TurnEvent::PartialHeard("what ti".to_owned()));
+    assert_eq!(s, listening("what ti"));
+    assert!(e.is_empty());
+
+    let (s, e) = advance(s, TurnEvent::FinalHeard("what time is it".to_owned()));
+    assert_eq!(s, heard("what time is it"));
+    assert_eq!(e, vec![Effect::SendText("what time is it".to_owned())]);
+
+    let (s, e) = advance(s, TurnEvent::Sent);
+    assert_eq!(s, TurnState::Sending);
+    assert!(e.is_empty());
+
+    let (s, e) = advance(s, TurnEvent::AnswerChunk);
+    assert_eq!(s, TurnState::Sending);
+    assert!(e.is_empty());
+
+    let (s, e) = advance(s, TurnEvent::AnswerDone("It is noon.".to_owned()));
+    assert_eq!(s, TurnState::Speaking);
+    assert_eq!(e, vec![Effect::Speak("It is noon.".to_owned())]);
+
+    let (s, e) = advance(s, TurnEvent::Silence);
+    assert_eq!(s, TurnState::Idle);
+    assert_eq!(e, vec![Effect::ReleaseMicrophone]);
+}
+
+/// NFR-51: an abandon edge from EVERY state releases the microphone and lands
+/// in `Idle`.
+#[test]
+fn voice_abandon_from_every_state_releases_the_microphone() {
+    for state in every_state() {
+        let label = format!("{state:?}");
+        let (next, effects) = advance(state, TurnEvent::Abandoned);
+        assert_eq!(next, TurnState::Idle, "abandon from {label}");
+        assert!(
+            effects.contains(&Effect::ReleaseMicrophone),
+            "abandon from {label} must release the microphone, got {effects:?}"
+        );
+        assert!(
+            !effects.contains(&Effect::OpenMicrophone),
+            "abandon from {label} must not reopen the microphone"
+        );
+    }
+}
+
+/// A `Failed` turn releases the device too, from every state.
+#[test]
+fn voice_failure_from_every_state_releases_the_microphone() {
+    for state in every_state() {
+        let label = format!("{state:?}");
+        let (next, effects) = advance(state, TurnEvent::Failed("mic gone".to_owned()));
+        assert_eq!(next, failed("mic gone"), "failure from {label}");
+        assert!(
+            effects.contains(&Effect::ReleaseMicrophone),
+            "failure from {label} must release the microphone, got {effects:?}"
+        );
+    }
+}
+
+/// A bounded silence timeout ends a `Listening` turn instead of recording
+/// forever: with nothing heard the turn ends and the device is released.
+#[test]
+fn voice_silence_with_nothing_heard_ends_the_turn() {
+    let (next, effects) = advance(listening(""), TurnEvent::Silence);
+    assert_eq!(next, TurnState::Idle);
+    assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
+}
+
+/// The same timeout after words were heard is the end of the utterance: what
+/// was heard becomes the message.
+#[test]
+fn voice_silence_after_words_sends_what_was_heard() {
+    let (next, effects) = advance(listening("open the pod bay doors"), TurnEvent::Silence);
+    assert_eq!(next, heard("open the pod bay doors"));
+    assert_eq!(
+        effects,
+        vec![Effect::SendText("open the pod bay doors".to_owned())]
+    );
+}
+
+/// The silence budget is bounded in both `Listening` shapes and absent
+/// everywhere else — `Speaking` ends when the synthesiser says so, not when a
+/// clock does.
+#[test]
+fn voice_silence_budget_is_bounded_and_only_while_listening() {
+    assert_eq!(silence_budget(&listening("")), Some(NOTHING_HEARD_TIMEOUT));
+    assert_eq!(
+        silence_budget(&listening("   ")),
+        Some(NOTHING_HEARD_TIMEOUT)
+    );
+    assert_eq!(
+        silence_budget(&listening("hej")),
+        Some(END_OF_UTTERANCE_PAUSE)
+    );
+    assert!(END_OF_UTTERANCE_PAUSE < NOTHING_HEARD_TIMEOUT);
+    for state in [
+        TurnState::Idle,
+        heard("x"),
+        TurnState::Sending,
+        TurnState::Speaking,
+        failed("x"),
+    ] {
+        assert_eq!(silence_budget(&state), None, "{state:?}");
+    }
+}
+
+/// Barge-in: `SpeechDetected` while `Speaking` emits `StopSpeaking` before
+/// anything else, and the turn is listening again.
+#[test]
+fn voice_barge_in_stops_speaking_before_anything_else() {
+    let (next, effects) = advance(TurnState::Speaking, TurnEvent::SpeechDetected);
+    assert_eq!(next, listening(""));
+    assert_eq!(effects.first(), Some(&Effect::StopSpeaking));
+    assert!(
+        !effects.contains(&Effect::ReleaseMicrophone),
+        "barge-in keeps the microphone: {effects:?}"
+    );
+}
+
+/// `SpeechDetected` anywhere but `Speaking` is nothing — there is nothing to
+/// interrupt.
+#[test]
+fn voice_speech_detected_outside_speaking_is_ignored() {
+    for state in [
+        TurnState::Idle,
+        listening("a"),
+        heard("a"),
+        TurnState::Sending,
+    ] {
+        let before = state.clone();
+        let (next, effects) = advance(state, TurnEvent::SpeechDetected);
+        assert_eq!(next, before);
+        assert!(effects.is_empty());
+    }
+}
+
+/// A `FinalHeard("")` does not send an empty message: the turn ends and the
+/// device is released. Whitespace is empty too.
+#[test]
+fn voice_empty_final_transcript_does_not_send() {
+    for blank in ["", "   ", "\n\t"] {
+        let (next, effects) = advance(listening("x"), TurnEvent::FinalHeard(blank.to_owned()));
+        assert_eq!(next, TurnState::Idle, "final {blank:?}");
+        assert_eq!(effects, vec![Effect::ReleaseMicrophone], "final {blank:?}");
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::SendText(_))),
+            "final {blank:?} must not send"
+        );
+    }
+}
+
+/// A `PartialHeard` never sends — it only updates what the surface shows.
+#[test]
+fn voice_partial_transcript_never_sends() {
+    let (next, effects) = advance(
+        listening(""),
+        TurnEvent::PartialHeard("hello there".to_owned()),
+    );
+    assert_eq!(next, listening("hello there"));
+    assert!(effects.is_empty(), "a partial sent something: {effects:?}");
+}
+
+/// A final transcript is trimmed before it is sent, so a recogniser's
+/// trailing space does not become part of the message.
+#[test]
+fn voice_final_transcript_is_trimmed_before_sending() {
+    let (next, effects) = advance(
+        listening(""),
+        TurnEvent::FinalHeard("  hello \n".to_owned()),
+    );
+    assert_eq!(next, heard("hello"));
+    assert_eq!(effects, vec![Effect::SendText("hello".to_owned())]);
+}
+
+/// An empty answer is not spoken: the turn ends instead of reading silence.
+#[test]
+fn voice_empty_answer_is_not_spoken() {
+    for state in [heard("q"), TurnState::Sending, TurnState::Idle] {
+        let (next, effects) = advance(state, TurnEvent::AnswerDone("  ".to_owned()));
+        assert_eq!(next, TurnState::Idle);
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Speak(_))));
+    }
+}
+
+/// An answer may be read aloud without a listening turn (the person typed):
+/// the device opens for barge-in before the speech starts.
+#[test]
+fn voice_answer_from_idle_opens_the_microphone_then_speaks() {
+    let (next, effects) = advance(TurnState::Idle, TurnEvent::AnswerDone("hi".to_owned()));
+    assert_eq!(next, TurnState::Speaking);
+    assert_eq!(
+        effects,
+        vec![Effect::OpenMicrophone, Effect::Speak("hi".to_owned())]
+    );
+}
+
+/// `Speaking` ends on the synthesiser's `Silence`, releasing the device.
+#[test]
+fn voice_speaking_ends_on_silence() {
+    let (next, effects) = advance(TurnState::Speaking, TurnEvent::Silence);
+    assert_eq!(next, TurnState::Idle);
+    assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
+}
+
+/// Abandon while speaking stops the speech and releases the device, in that
+/// order.
+#[test]
+fn voice_abandon_while_speaking_stops_speech_then_releases() {
+    let (_, effects) = advance(TurnState::Speaking, TurnEvent::Abandoned);
+    assert_eq!(
+        effects,
+        vec![Effect::StopSpeaking, Effect::ReleaseMicrophone]
+    );
+}
+
+/// A failed turn can be started again by the trigger.
+#[test]
+fn voice_failed_turn_restarts_on_trigger() {
+    let (next, effects) = advance(failed("x"), TurnEvent::WakeMatched);
+    assert_eq!(next, listening(""));
+    assert_eq!(effects, vec![Effect::OpenMicrophone]);
+}
+
+// ---------------------------------------------------------------------------
+// The driver: phrase matching while idle, re-arming, and the port.
+// ---------------------------------------------------------------------------
+
+fn phrase(raw: &str) -> WakePhrase {
+    WakePhrase::parse(raw).expect("test phrase parses")
+}
+
+/// A transcript that contains the phrase while idle starts a turn; the
+/// microphone is (re)opened on a fresh request with the phrase as the hint.
+#[test]
+fn voice_driver_matches_the_phrase_while_idle() {
+    let port = FakePort::default();
+    let mut turn = Turn::new();
+    let armed = turn.set_wake(Some(phrase("hej keeper")));
+    assert_eq!(armed, vec![Effect::OpenMicrophone]);
+    perform(&armed, &port, turn.wake()).expect("arming succeeds");
+
+    let effects = turn.drive(TurnEvent::PartialHeard("no keeper here".to_owned()), &port);
+    assert!(effects.is_empty(), "noise while idle: {effects:?}");
+    assert_eq!(turn.state(), &TurnState::Idle);
+
+    let effects = turn.drive(TurnEvent::PartialHeard("Hej, Keeper!".to_owned()), &port);
+    assert_eq!(effects, vec![Effect::OpenMicrophone]);
+    assert_eq!(turn.state(), &listening(""));
+    assert_eq!(
+        port.calls(),
+        vec![
+            Call::Start(Some("hej keeper".to_owned())),
+            Call::Start(Some("hej keeper".to_owned())),
+        ]
+    );
+}
+
+/// With no phrase set, a transcript while idle is noise.
+#[test]
+fn voice_driver_ignores_transcripts_while_idle_without_a_phrase() {
+    let port = FakePort::default();
+    let mut turn = Turn::new();
+    let effects = turn.drive(TurnEvent::FinalHeard("hej keeper".to_owned()), &port);
+    assert!(effects.is_empty());
+    assert_eq!(turn.state(), &TurnState::Idle);
+    assert!(port.calls().is_empty());
+}
+
+/// When a turn ends on its own and a phrase is set, the microphone is
+/// released and opened again for the phrase; the surface sees it listening.
+#[test]
+fn voice_driver_rearms_the_phrase_after_a_turn_ends_on_its_own() {
+    let port = FakePort::default();
+    let mut turn = Turn::new();
+    turn.set_wake(Some(phrase("hej keeper")));
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::Silence, &port);
+    assert_eq!(turn.state(), &TurnState::Idle);
+    assert!(turn.microphone_open());
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Idle {
+            wake: Some("hej keeper".to_owned()),
+            listening_for_wake: true,
+        }
+    );
+    assert_eq!(
+        port.calls().last(),
+        Some(&Call::Start(Some("hej keeper".to_owned())))
+    );
+}
+
+/// NFR-51 at the driver, with a standing switch (Story 62.5): a turn the
+/// person stopped releases the turn's microphone — the port sees `Stop` —
+/// and then, because the phrase is still set, opens it again for the phrase.
+/// A stop ends this turn; the switch is what ends listening.
+#[test]
+fn voice_driver_rearms_the_phrase_after_abandon() {
+    let port = FakePort::default();
+    let mut turn = Turn::new();
+    turn.set_wake(Some(phrase("hej keeper")));
+    turn.drive(TurnEvent::WakeMatched, &port);
+    let effects = turn.drive(TurnEvent::Abandoned, &port);
+    assert_eq!(
+        effects,
+        vec![Effect::ReleaseMicrophone, Effect::OpenMicrophone]
+    );
+    assert!(turn.microphone_open());
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Idle {
+            wake: Some("hej keeper".to_owned()),
+            listening_for_wake: true,
+        }
+    );
+    let calls = port.calls();
+    assert_eq!(
+        &calls[calls.len() - 2..],
+        &[Call::Stop, Call::Start(Some("hej keeper".to_owned()))]
+    );
+}
+
+/// A stop with no phrase set stays stopped: nothing to re-arm for.
+#[test]
+fn voice_driver_abandon_without_a_phrase_stays_released() {
+    let port = FakePort::default();
+    let mut turn = Turn::new();
+    turn.drive(TurnEvent::WakeMatched, &port);
+    let effects = turn.drive(TurnEvent::Abandoned, &port);
+    assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
+    assert!(!turn.microphone_open());
+    assert_eq!(port.calls().last(), Some(&Call::Stop));
+}
+
+/// A failed turn does not re-arm even with a phrase set: the port that
+/// refused would refuse again, and the surface says the phrase is set but
+/// not listened for.
+#[test]
+fn voice_driver_does_not_rearm_after_failure_because_the_port_would_refuse_again() {
+    let port = FakePort::default();
+    let mut turn = Turn::new();
+    turn.set_wake(Some(phrase("hej keeper")));
+    turn.drive(TurnEvent::WakeMatched, &port);
+    let effects = turn.drive(TurnEvent::Failed("the device refused".to_owned()), &port);
+    assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
+    assert!(!turn.microphone_open());
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Failed {
+            reason: "the device refused".to_owned()
+        }
+    );
+    assert_eq!(port.calls().last(), Some(&Call::Stop));
+}
+
+/// Clearing the phrase while idle releases the device.
+#[test]
+fn voice_driver_clearing_the_phrase_releases_the_microphone() {
+    let port = FakePort::default();
+    let mut turn = Turn::new();
+    turn.set_wake(Some(phrase("hej keeper")));
+    let effects = turn.set_wake(None);
+    assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
+    perform(&effects, &port, turn.wake()).expect("release is infallible");
+    assert!(!turn.microphone_open());
+    assert_eq!(turn.wake(), None);
+}
+
+/// Setting the phrase mid-turn changes nothing about the device now.
+#[test]
+fn voice_driver_setting_the_phrase_mid_turn_touches_nothing() {
+    let mut turn = Turn::new();
+    turn.apply(TurnEvent::WakeMatched);
+    assert!(turn.set_wake(Some(phrase("hej keeper"))).is_empty());
+    assert_eq!(turn.state(), &listening(""));
+}
+
+/// A port that refuses to open fails the turn, and the failure releases what
+/// the port may have half-opened — the device is never left in doubt.
+#[test]
+fn voice_driver_fails_the_turn_when_the_port_refuses_to_listen() {
+    let port = FakePort {
+        refuse_start: Some(VoiceUnavailable::NoOnDeviceModel {
+            locale: "pl_PL".to_owned(),
+        }),
+        ..FakePort::default()
+    };
+    let mut turn = Turn::new();
+    let effects = turn.drive(TurnEvent::WakeMatched, &port);
+    assert_eq!(
+        effects,
+        vec![Effect::OpenMicrophone, Effect::ReleaseMicrophone]
+    );
+    match turn.state() {
+        TurnState::Failed { reason } => {
+            assert!(reason.contains("pl_PL"), "names the locale: {reason}");
+            assert!(
+                reason.contains("never sends your voice to a server"),
+                "says why there is no fallback: {reason}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(port.calls(), vec![Call::Start(None), Call::Stop]);
+    assert!(!turn.microphone_open());
+}
+
+/// A port that refuses to speak fails the turn the same way, and the failure
+/// stops the speech it may have started.
+#[test]
+fn voice_driver_fails_the_turn_when_the_port_refuses_to_speak() {
+    let port = FakePort {
+        refuse_speak: Some(VoiceUnavailable::Unsupported),
+        ..FakePort::default()
+    };
+    let mut turn = Turn::new();
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
+    turn.drive(TurnEvent::AnswerDone("hello".to_owned()), &port);
+    assert!(matches!(turn.state(), TurnState::Failed { .. }));
+    assert_eq!(
+        port.calls(),
+        vec![
+            Call::Start(None),
+            Call::Speak("hello".to_owned()),
+            Call::StopSpeaking,
+            Call::Stop,
+        ]
+    );
+}
+
+/// The driver's port calls for a whole turn, in order: barge-in stops the
+/// synthesiser before restarting recognition.
+#[test]
+fn voice_driver_orders_port_calls_for_barge_in() {
+    let port = FakePort::default();
+    let mut turn = Turn::new();
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
+    turn.drive(TurnEvent::AnswerDone("a long answer".to_owned()), &port);
+    turn.drive(TurnEvent::SpeechDetected, &port);
+    assert_eq!(
+        port.calls(),
+        vec![
+            Call::Start(None),
+            Call::Speak("a long answer".to_owned()),
+            Call::StopSpeaking,
+            Call::Start(None),
+        ]
+    );
+    assert_eq!(turn.state(), &listening(""));
+}
+
+/// Every machine state has a projection, and `Idle` carries what the surface
+/// must say about the phrase.
+#[test]
+fn voice_state_projects_to_its_view_model() {
+    let mut turn = Turn::new();
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Idle {
+            wake: None,
+            listening_for_wake: false
+        }
+    );
+    turn.apply(TurnEvent::WakeMatched);
+    turn.apply(TurnEvent::PartialHeard("he".to_owned()));
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Listening {
+            heard: "he".to_owned()
+        }
+    );
+    turn.apply(TurnEvent::FinalHeard("hello".to_owned()));
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Heard {
+            text: "hello".to_owned()
+        }
+    );
+    turn.apply(TurnEvent::Sent);
+    assert_eq!(turn.vm(), VoiceStateVm::Sending);
+    turn.apply(TurnEvent::AnswerDone("x".to_owned()));
+    assert_eq!(turn.vm(), VoiceStateVm::Speaking);
+    turn.apply(TurnEvent::Failed("boom".to_owned()));
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Failed {
+            reason: "boom".to_owned()
+        }
+    );
+}
+
+/// The refusal reasons cross the wire with their sentence and, for the
+/// missing model, the locale.
+#[test]
+fn voice_unavailable_projects_its_sentence_and_locale() {
+    let vm = VoiceUnavailableVm::from(&VoiceUnavailable::NoOnDeviceModel {
+        locale: "pl_PL".to_owned(),
+    });
+    match vm {
+        VoiceUnavailableVm::NoOnDeviceModel { locale, message } => {
+            assert_eq!(locale, "pl_PL");
+            assert!(message.contains("pl_PL"));
+            assert!(message.contains("download"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        VoiceUnavailableVm::from(&VoiceUnavailable::NotAuthorized),
+        VoiceUnavailableVm::NotAuthorized { .. }
+    ));
+    let sink: keeper_core::voice::EventSink = Arc::new(|_| {});
+    sink(TurnEvent::Silence);
+}
+
+/// A build linked without `Speech.framework` is its own kind of refusal,
+/// worded as a defect of the build. It is neither `unsupported` (the
+/// desktop's honest "no port here", which the surface hides) nor a missing
+/// model (a language download), because a voice feature that is inert for a
+/// build reason once reported exactly the desktop's sentence and nobody
+/// could see the difference.
+#[test]
+fn voice_missing_recognizer_is_named_as_a_build_defect() {
+    let why = VoiceUnavailable::NoRecognizer;
+    let message = why.to_string();
+    assert!(message.contains("Speech"), "{message}");
+    assert!(message.contains("build"), "{message}");
+    assert!(!message.contains("Settings"), "{message}");
+    assert!(!message.contains("download that language"), "{message}");
+    assert_ne!(message, VoiceUnavailable::Unsupported.to_string());
+    match VoiceUnavailableVm::from(&why) {
+        VoiceUnavailableVm::NoRecognizer { message: carried } => assert_eq!(carried, message),
+        other => panic!("{other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The phrase.
+// ---------------------------------------------------------------------------
+
+/// Case and diacritics do not matter: "hej keeper" and "Hej Kééper" are the
+/// same phrase, and "Hej, Kééper!" heard mid-sentence matches it.
+#[test]
+fn voice_phrase_is_case_and_diacritic_insensitive() {
+    let a = phrase("hej keeper");
+    let b = phrase("Hej Kééper");
+    assert_eq!(a, b);
+    assert_eq!(a.as_str(), "hej keeper");
+    assert!(a.matches("Hej Kééper"));
+    assert!(a.matches("HEJ KEEPER"));
+    assert!(b.matches("hej keeper"));
+}
+
+/// Polish letters fold to what a person without the key would type — "ł" has
+/// no NFD decomposition and is the one the table must carry by hand.
+#[test]
+fn voice_phrase_folds_polish_letters() {
+    let p = phrase("słuchaj keeper");
+    assert_eq!(p.as_str(), "sluchaj keeper");
+    assert!(p.matches("Słuchaj, Keeper"));
+    assert!(p.matches("sluchaj keeper"));
+    assert_eq!(phrase("Zażółć gęślą").as_str(), "zazolc gesla");
+}
+
+/// A phrase occurring mid-sentence still matches.
+#[test]
+fn voice_phrase_matches_mid_sentence() {
+    let p = phrase("hej keeper");
+    assert!(p.matches("okay so, hej keeper, what time is it"));
+    assert!(p.matches("hej keeper"));
+    assert!(p.matches("…hej keeper"));
+}
+
+/// A substring of a longer word does not match: whole words only.
+#[test]
+fn voice_phrase_does_not_match_inside_a_longer_word() {
+    let p = phrase("hej keeper");
+    assert!(!p.matches("hej keepers"));
+    assert!(!p.matches("ahej keeper"));
+    assert!(!p.matches("hejkeeper"));
+    assert!(!p.matches("hej keep"));
+    assert!(!p.matches(""));
+}
+
+/// Whitespace and punctuation collapse: the typed phrase and the heard
+/// transcript agree however either was spaced.
+#[test]
+fn voice_phrase_collapses_whitespace_and_punctuation() {
+    let p = phrase("  hej \t\n keeper  ");
+    assert_eq!(p.as_str(), "hej keeper");
+    assert!(p.matches("hej—keeper"));
+    assert!(p.matches("hej.  keeper?"));
+    assert_eq!(p.words().collect::<Vec<_>>(), vec!["hej", "keeper"]);
+}
+
+/// Refusals, by name, each with a reason a person can act on.
+#[test]
+fn voice_phrase_refuses_an_empty_phrase() {
+    for raw in ["", "   ", "…!?", "\n"] {
+        assert_eq!(WakePhrase::parse(raw), Err(PhraseRefused::Empty), "{raw:?}");
+    }
+    let reason = PhraseRefused::Empty.to_string();
+    assert!(reason.contains("type a phrase"), "{reason}");
+}
+
+/// One word is allowed on purpose: the default phrase is one word.
+#[test]
+fn voice_phrase_accepts_a_single_word() {
+    let p = phrase("Nixie");
+    assert_eq!(p.as_str(), "nixie");
+    assert!(p.matches("nixie, what time is it"));
+    assert!(!p.matches("nixies"));
+    assert_eq!(phrase(DEFAULT_WAKE_PHRASE).as_str(), DEFAULT_WAKE_PHRASE);
+}
+
+#[test]
+fn voice_phrase_refuses_too_few_letters() {
+    let refused = WakePhrase::parse("ok go").expect_err("four letters is refused");
+    assert_eq!(
+        refused,
+        PhraseRefused::TooShort {
+            letters: 4,
+            normalised: "ok go".to_owned()
+        }
+    );
+    let reason = refused.to_string();
+    assert!(reason.contains("at least 5 letters"), "{reason}");
+    assert!(reason.contains("\"ok go\""), "names what it saw: {reason}");
+    // The everyday words a phrase must not be.
+    for raw in ["go", "ok", "hey", "okay"] {
+        assert!(WakePhrase::parse(raw).is_err(), "{raw:?} is everyday talk");
+    }
+    // Exactly the minimum is accepted.
+    assert!(WakePhrase::parse("ok gog").is_ok());
+}
+
+#[test]
+fn voice_phrase_refuses_too_many_words() {
+    let refused =
+        WakePhrase::parse("hey there my dear old keeper").expect_err("six words is refused");
+    assert_eq!(refused, PhraseRefused::TooManyWords { words: 6 });
+    assert!(refused.to_string().contains("5 words or fewer"));
+    assert!(WakePhrase::parse("hey there my dear keeper").is_ok());
+}
+
+/// Letters are what count: "a b" says "use more letters", not "one word".
+#[test]
+fn voice_phrase_counts_letters_not_words() {
+    assert_eq!(
+        WakePhrase::parse("a b"),
+        Err(PhraseRefused::TooShort {
+            letters: 2,
+            normalised: "a b".to_owned()
+        })
+    );
+}
+
+/// The sentence beside the switch (FR-406) states every fact the epic
+/// established, and none of them as "not yet".
+#[test]
+fn voice_limits_sentence_states_every_fact_and_no_to_do() {
+    let s = LISTENING_LIMITS;
+    assert!(s.contains("in front"), "armed with keeper in front: {s}");
+    assert!(
+        s.contains("another app is in front") && s.contains("screen is locked"),
+        "continues in the background and locked: {s}"
+    );
+    assert!(
+        s.contains("turn it off") && s.contains("audio session") && s.contains("force-quit"),
+        "names every way it stops: {s}"
+    );
+    assert!(
+        s.contains("microphone indicator") && s.contains("cannot be hidden"),
+        "{s}"
+    );
+    assert!(s.contains("battery"), "{s}");
+    for weasel in ["not yet", "for now", "coming", "later"] {
+        assert!(
+            !s.contains(weasel),
+            "a refusal, not a to-do: {weasel:?} in {s}"
+        );
+    }
+}

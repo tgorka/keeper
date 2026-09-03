@@ -56,6 +56,29 @@ Tauri and is committed **except** ephemeral output (`build/`, `Externals/`, `Pod
 persistent changes only in `project.yml`, `keeper_iOS/Info.plist`, and the
 `Sources/`/`keeper_iOS/` files, then regenerate.
 
+Two things about that project are easy to get wrong, and both were, once:
+
+- **System frameworks are linked by `project.yml`'s `dependencies` list and nothing
+  else.** `libapp.a` is a static library linked by the generated project, not by
+  rustc, so a Rust crate's `#[link(kind = "framework")]` never reaches the link line —
+  and the objc2 crates put theirs on empty extern blocks anyway. A framework that is
+  missing from the list still builds and still ships every command, because objc2 finds
+  classes by name at run time; the class is simply never registered. That is how a
+  bundle once shipped with `SFSpeechRecognizer` strings inside and no
+  `Speech.framework` in `otool -L`. Check a fresh bundle, not the project:
+  `otool -L keeper.app/keeper | grep -i speech`. The voice port reports that state as
+  its own refusal (`NoRecognizer`, "this build was made without Apple's Speech
+  framework") so it can never again read like a permission or a missing language.
+- **`keeper_iOS/Info.plist` is rewritten on every `tauri ios build` / `dev`** as the
+  merge of, later winning: the XcodeGen output, the CLI's own keys,
+  `crates/keeper/Info.plist` (the **macOS** bundle's — "saved locally on this Mac"),
+  then `crates/keeper/Info.ios.plist`. Any key the macOS file also carries must be
+  restated in `Info.ios.plist` or the phone shows the Mac's sentence; today that is
+  `NSMicrophoneUsageDescription`, and the two copies (`project.yml` for the generated
+  project, `Info.ios.plist` for the merge) must stay equal. Check the bundle:
+  `/usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" keeper.app/Info.plist`.
+  Editing `keeper_iOS/Info.plist` by hand achieves nothing lasting either way.
+
 Initial generation (run from the repo root, using the shared config the other
 scripts use) is a **one-time** bootstrap — the `gen/apple/` tree is already committed,
 so you do **not** re-run `init` in normal work (re-running it overwrites committed
@@ -97,6 +120,21 @@ Developer Program membership are real but livable for a personal build:
 - There is **no TestFlight and no App Store** distribution. Sharing a build means
   handing someone an IPA they re-sign themselves (see
   [Sharing a build without Xcode](#sharing-a-build-without-xcode)).
+- The **Data Protection entitlement cannot be granted**. keeper's iOS target pins
+  `com.apple.developer.default-data-protection` to
+  `NSFileProtectionCompleteUntilFirstUserAuthentication` (source of truth:
+  `gen/apple/project.yml`, FR-65, guarded by `crates/keeper/tests/entitlements_protection.rs`),
+  and a Personal Team's automatic profile does not carry that capability, so the build
+  fails at signing with `Provisioning profile "iOS Team Provisioning Profile:
+  dev.tgorka.keeper" doesn't match the entitlements file's value for the
+  com.apple.developer.default-data-protection entitlement` (measured 2026-09-03,
+  Xcode 26.6, iOS 26.6.1). To sideload on a free team, delete the `entitlements:`
+  block from `gen/apple/project.yml` and re-run `xcodegen generate` in that directory —
+  a local edit to a generated file; the committed value stays as it is and its test
+  keeps passing. Nothing is lost in practice: iOS already defaults a third-party app's
+  container files to that same protection class, and the entitlement exists to pin it
+  so it cannot drift. A paid team keeps it. Note that an `XCODE_XCCONFIG_FILE` override
+  does **not** work here — target-level build settings beat a project-level xcconfig.
 
 ### Set your team, without committing any secret
 
@@ -170,6 +208,58 @@ installed. Follow the steps in this order and the chicken-and-egg resolves itsel
 
 After this first run, subsequent launches are just tapping the icon — until the 7-day
 profile expires (see [The 7-day re-arm ritual](#the-7-day-re-arm-ritual)).
+
+### Installing from a machine you only reach over ssh
+
+If the Mac holding the cable is remote (a Linux workstation driving it, as
+`scripts/install-macos.sh` does for the desktop build), three things in the sequence
+above change. Measured end-to-end on 2026-09-03 against kalypso (iPhone 14 Pro Max,
+iOS 26.6.1, Xcode 26.6):
+
+1. **`codesign` cannot reach the login keychain over ssh** — it fails with
+   `errSecInternalComponent`, because an ssh session is a different security session.
+   Run the whole build inside the Mac's GUI login session by dispatching it through
+   Terminal.app (`osascript -e 'tell application "Terminal" to do script "bash
+   /tmp/build.sh; exit"'`), exactly as `scripts/install-macos.sh` does. Note that
+   `security find-identity -v -p codesigning` **does** list the identity over ssh:
+   listing is not using, so it is not evidence the keychain is reachable.
+
+2. **A headless `tauri ios build` never registers the device**, and without a
+   registration there is no profile to sign against: it fails with `Xcode couldn't find
+   any iOS App Development provisioning profiles matching 'dev.tgorka.keeper'`. Register
+   once, directly:
+
+   ```sh
+   cd src-tauri/crates/keeper/gen/apple
+   xcodebuild -project keeper.xcodeproj -scheme keeper_iOS -configuration debug \
+     -destination id=<device-udid> -allowProvisioningUpdates \
+     -allowProvisioningDeviceRegistration DEVELOPMENT_TEAM=$APPLE_DEVELOPMENT_TEAM build
+   ```
+
+   That mints `iOS Team Provisioning Profile: dev.tgorka.keeper`, after which the normal
+   `bun run tauri ios build` signs. Do not try to finish the build this way: the
+   `Build Rust Code` phase runs `tauri ios xcode-script`, which connects back to the
+   Tauri CLI over a local socket and aborts with `failed to build WebSocket client`
+   when xcodebuild is driven standalone.
+
+3. **Install and launch with `devicectl`**, since Xcode's Run button is not available:
+
+   ```sh
+   xcrun devicectl device install app --device <udid> \
+     src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
+   xcrun devicectl device process launch --device <udid> dev.tgorka.keeper
+   ```
+
+   Steps 4 and 5 above (Developer Mode, trusting the certificate) still need a human at
+   the phone. Until Developer Mode is on, xcodebuild reports the device as
+   `error: Developer Mode disabled` or `The developer disk image could not be mounted`;
+   until the certificate is trusted, the launch is refused by `SBMainWorkspace` with
+   `its profile has not been explicitly trusted by the user`. Both are the expected
+   messages for those two states, not faults to debug.
+
+   `devicectl` has no screenshot verb, and the legacy `idevicescreenshot` service is
+   gone on iOS 26 (`Could not start screenshotr service`), so pixels from a physical
+   phone need a human or Xcode. Use the simulator for layout measurement.
 
 ## The 7-day re-arm ritual
 
@@ -328,18 +418,22 @@ documented above.
 ## Limitations
 
 On a free Personal Team, keeper on iPhone is deliberately narrower than the desktop
-build. These are the same four points keeper shows in-app under **Settings → About →
+build. These are the same seven points keeper shows in-app under **Settings → About →
 "On this iPhone"**:
 
 - keeper syncs and notifies only while it's open; background notifications await a future decision.
 - No self-hosted bridge runner — manage your own bridges from your Mac.
 - No global summon hotkey.
 - Updates arrive by reinstalling keeper; its signature renews every 7 days.
+- Bots talks to a model but cannot reach the folders you sync — the drive tools live on your Mac.
+- Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.
+- Listening stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit; while it listens the microphone indicator stays lit and it uses battery.
 
 > This list is mirrored from `IOS_DISCLOSURE_LINES` in
 > `src/components/settings/about-section.tsx`, which is the single source of truth —
 > the in-app "On this iPhone" disclosure links here, so the two must stay identical.
-> Edit both together or neither.
+> Edit both together or neither; `about-section.test.tsx` reads this list from disk
+> and fails when they differ.
 
 The fourth item is the [7-day re-arm ritual](#the-7-day-re-arm-ritual) above:
 "reinstalling keeper" is exactly the weekly `bun run tauri ios dev` re-sign (or an
@@ -354,3 +448,30 @@ count while keeper is closed; it reflects what keeper knew when it was last open
 
 The "future decision" the first item names is recorded in [decisions.md](decisions.md) D-1 —
 the deferred paid Apple Developer Program that would unlock APNs push and the NSE.
+
+The fifth item is Epic 62. The Bots surface exists on the phone — endpoints and
+bots are added, tested, edited and removed there through the same `keeper-core`
+grammar the desktop uses, and a conversation streams the same way — but
+`keeper-sync` is not a dependency of the shell crate on iOS, so the drive half
+(grants, the audit, deliverable paths, image staging) is desktop-only by
+construction. On the phone those controls are absent, not disabled: the pane says
+once, in its empty state, that the drive tools live on your Mac. The scope is
+Hermes because that is what was asked for; an Ollama endpoint a phone can reach is
+the same wire and is neither built for nor blocked.
+
+The sixth and seventh items are talk mode, also Epic 62. keeper turns speech into
+text, sends it to the bot as an ordinary message and speaks the answer; a wake phrase
+(`nixie` by default, yours to change) starts a turn hands-free once listening is
+switched on. What iOS forbids is *starting* the microphone from the background, so
+listening is switched on while keeper is in front; what iOS supports is a session that
+keeps running afterwards — with Maps in front, or the screen locked — under
+`UIBackgroundModes: audio`, which the generated project declares. keeper cannot arm
+itself: after a force-quit or a restart, listening is off until you open keeper and
+switch it on again, and a call, Siri or another app taking the microphone can end the
+session, which the port re-arms when it can and reports when it cannot. The orange
+microphone indicator is the system's and stays lit for the whole of an armed session.
+Recognition is on-device only — a locale whose model is not on the phone gets a
+sentence naming the language to download, never a server round trip — because
+`egress.md` names every destination keeper contacts and Apple's speech servers are not
+on it. The full reasoning, including why this is possible on the phone while voice
+stays deferred on the Mac, is [decisions.md](decisions.md) D-5.

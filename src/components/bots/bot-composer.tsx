@@ -45,7 +45,7 @@
  *   component's hands and the pane has nothing to add to them. Every other
  *   command leaves through `onCommand`.
  */
-import { type KeyboardEvent, useCallback, useEffect, useState } from "react";
+import { type KeyboardEvent, type ReactNode, useCallback, useEffect, useState } from "react";
 import {
   type BotPasteContext,
   type BotPasteDecision,
@@ -104,6 +104,8 @@ export function BotComposer({
   pasteContext = null,
   onPaste,
   resolveDraft = botsCommandPreview,
+  heard = null,
+  accessory,
 }: {
   /** Send the trimmed text. The parent owns the IPC call and the errors. */
   onSend: (text: string) => void;
@@ -155,6 +157,20 @@ export function BotComposer({
       modelTools: boolean | null;
     },
   ) => Promise<BotCommandPreviewVm>;
+  /**
+   * What talk mode heard (Story 62.6, FR-407): lands in the field as the
+   * draft, where it can be read and edited before it goes, and is sent only
+   * by the same Enter or Send as typed text. `seq` distinguishes hearing the
+   * same words twice from nothing new: each turn bumps it. A transcriber
+   * that sent what it mis-heard would be worse than one that asks, so this
+   * component never sends on its own account.
+   */
+  heard?: { text: string; seq: number } | null;
+  /**
+   * A control that shares the field's row — the talk-mode microphone on a
+   * phone. Rendered between the field and the verb, absent where undefined.
+   */
+  accessory?: ReactNode;
 }) {
   const [draft, setDraft] = useState("");
   const [preview, setPreview] = useState<BotCommandPreviewVm | null>(null);
@@ -205,6 +221,16 @@ export function BotComposer({
       live = false;
     };
   }, [draft, resolve]);
+
+  // A heard transcript replaces the draft rather than appending: the field
+  // is where it is checked, and a half-typed line under it would be two
+  // messages nobody meant. Editing after that is ordinary typing.
+  useEffect(() => {
+    if (heard !== null) {
+      setDraft(heard.text);
+      setRefusal(null);
+    }
+  }, [heard]);
 
   const token = slashToken(draft);
   const rows = preview === null ? [] : preview.rows;
@@ -406,32 +432,36 @@ export function BotComposer({
         </p>
       )}
 
-      <textarea
-        aria-label={BOT_COMPOSER_LABEL}
-        placeholder={BOT_COMPOSER_PLACEHOLDER}
-        value={draft}
-        rows={3}
-        className="min-h-0 w-full resize-none rounded-md border border-border bg-background px-3 py-2 text-sm"
-        onChange={(event) => {
-          setDraft(event.target.value);
-          // A refusal is about a draft, so editing the draft retires it.
-          setRefusal(null);
-        }}
-        onKeyDown={onKeyDown}
-        onPaste={(event) => {
-          // Ask rather than assume: `passthrough` means the browser's own
-          // behaviour is left in place, which is the honest answer where keeper
-          // has no model to ask about an image.
-          const decision = botPasteDecision(event.clipboardData, pasteContext);
-          if (decision.kind !== "passthrough") {
-            event.preventDefault();
-            onPaste?.(decision);
-          }
-        }}
-      />
-      <div className="flex items-center gap-2">
-        {disabled && <p className="text-muted-foreground text-xs">{BOT_COMPOSER_NO_BOT}</p>}
-        <span className="min-w-0 flex-1" />
+      {disabled && <p className="text-muted-foreground text-xs">{BOT_COMPOSER_NO_BOT}</p>}
+
+      {/* The field and its verb share one row (Story 61.14): stacked, the
+          verb's row was a 40px band of its own under a three-line field, and
+          every band here is height the transcript above does not get. */}
+      <div className="flex items-end gap-2">
+        <textarea
+          aria-label={BOT_COMPOSER_LABEL}
+          placeholder={BOT_COMPOSER_PLACEHOLDER}
+          value={draft}
+          rows={3}
+          className="min-h-0 min-w-0 flex-1 resize-none rounded-md border border-border bg-background px-3 py-2 text-sm"
+          onChange={(event) => {
+            setDraft(event.target.value);
+            // A refusal is about a draft, so editing the draft retires it.
+            setRefusal(null);
+          }}
+          onKeyDown={onKeyDown}
+          onPaste={(event) => {
+            // Ask rather than assume: `passthrough` means the browser's own
+            // behaviour is left in place, which is the honest answer where keeper
+            // has no model to ask about an image.
+            const decision = botPasteDecision(event.clipboardData, pasteContext);
+            if (decision.kind !== "passthrough") {
+              event.preventDefault();
+              onPaste?.(decision);
+            }
+          }}
+        />
+        {accessory}
         {streaming ? (
           <Button type="button" variant="outline" size="sm" onClick={onStop}>
             {BOT_COMPOSER_STOP_LABEL}

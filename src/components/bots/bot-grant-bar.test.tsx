@@ -128,14 +128,14 @@ beforeEach(() => {
 });
 
 describe("botGrantOffer", () => {
-  it("offers nothing at all without folder sync", () => {
-    expect(botGrantOffer({ sync: false, provider: OLLAMA, model: MODEL })).toEqual({
+  it("offers nothing at all where this build cannot reach the drive", () => {
+    expect(botGrantOffer({ botTools: false, provider: OLLAMA, model: MODEL })).toEqual({
       kind: "absent",
     });
   });
 
   it("refuses a Hermes bot with the one sentence", () => {
-    expect(botGrantOffer({ sync: true, provider: HERMES, model: MODEL })).toEqual({
+    expect(botGrantOffer({ botTools: true, provider: HERMES, model: MODEL })).toEqual({
       kind: "refused",
       sentence: GRANT_HERMES_SENTENCE,
     });
@@ -143,7 +143,7 @@ describe("botGrantOffer", () => {
 
   it("refuses a model that stated it cannot take tools", () => {
     expect(
-      botGrantOffer({ sync: true, provider: OLLAMA, model: { ...MODEL, tools: false } }),
+      botGrantOffer({ botTools: true, provider: OLLAMA, model: { ...MODEL, tools: false } }),
     ).toEqual({ kind: "refused", sentence: GRANT_NO_TOOLS_SENTENCE });
   });
 
@@ -152,12 +152,12 @@ describe("botGrantOffer", () => {
     // old to state its capabilities, and every call still goes through
     // `grant::decide` and the approval path.
     expect(
-      botGrantOffer({ sync: true, provider: OLLAMA, model: { ...MODEL, tools: null } }),
+      botGrantOffer({ botTools: true, provider: OLLAMA, model: { ...MODEL, tools: null } }),
     ).toEqual({ kind: "offered", warning: GRANT_TOOLS_UNKNOWN_SENTENCE });
   });
 
   it("offers the grant with no warning for a model that advertises tools", () => {
-    expect(botGrantOffer({ sync: true, provider: OLLAMA, model: MODEL })).toEqual({
+    expect(botGrantOffer({ botTools: true, provider: OLLAMA, model: MODEL })).toEqual({
       kind: "offered",
       warning: null,
     });
@@ -227,15 +227,15 @@ describe("liveGrantsFor", () => {
 });
 
 describe("BotGrantBar", () => {
-  it("is absent entirely on a machine with no folder sync", () => {
+  it("is absent entirely where this build cannot reach the drive", () => {
     const { container } = render(
-      <BotGrantBar sync={false} provider={OLLAMA} botId="bot-1" model={MODEL} />,
+      <BotGrantBar botTools={false} provider={OLLAMA} botId="bot-1" model={MODEL} />,
     );
     expect(container).toBeEmptyDOMElement();
   });
 
   it("shows the Hermes sentence and offers no control", async () => {
-    render(<BotGrantBar sync provider={HERMES} botId="bot-1" model={MODEL} />);
+    render(<BotGrantBar botTools provider={HERMES} botId="bot-1" model={MODEL} />);
     expect(await screen.findByText(GRANT_HERMES_SENTENCE)).toBeInTheDocument();
     expect(screen.queryByRole("button")).toBeNull();
     expect(screen.queryByText(GRANT_NONE_HELD)).toBeNull();
@@ -244,13 +244,17 @@ describe("BotGrantBar", () => {
   });
 
   it("offers no control when the model stated it cannot take tools", async () => {
-    render(<BotGrantBar sync provider={OLLAMA} botId="bot-1" model={{ ...MODEL, tools: false }} />);
+    render(
+      <BotGrantBar botTools provider={OLLAMA} botId="bot-1" model={{ ...MODEL, tools: false }} />,
+    );
     expect(await screen.findByText(GRANT_NO_TOOLS_SENTENCE)).toBeInTheDocument();
     expect(screen.queryByRole("button")).toBeNull();
   });
 
   it("warns, and still offers the control, when the capability is unknown", async () => {
-    render(<BotGrantBar sync provider={OLLAMA} botId="bot-1" model={{ ...MODEL, tools: null }} />);
+    render(
+      <BotGrantBar botTools provider={OLLAMA} botId="bot-1" model={{ ...MODEL, tools: null }} />,
+    );
     const warning = await screen.findByRole("status");
     expect(warning).toHaveTextContent(GRANT_TOOLS_UNKNOWN_SENTENCE);
     // Offered anyway: unknown is not no, and a grant here reaches nothing at
@@ -260,20 +264,20 @@ describe("BotGrantBar", () => {
   });
 
   it("shows no warning where the endpoint stated the capability", async () => {
-    render(<BotGrantBar sync provider={OLLAMA} botId="bot-1" model={MODEL} />);
+    render(<BotGrantBar botTools provider={OLLAMA} botId="bot-1" model={MODEL} />);
     expect(await screen.findByText(GRANT_NONE_HELD)).toBeInTheDocument();
     expect(screen.queryByRole("status")).toBeNull();
   });
 
   it("says no grant is held, and offers the one control that creates one", async () => {
-    render(<BotGrantBar sync provider={OLLAMA} botId="bot-1" model={MODEL} />);
+    render(<BotGrantBar botTools provider={OLLAMA} botId="bot-1" model={MODEL} />);
     expect(await screen.findByText(GRANT_NONE_HELD)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: GRANT_ADD_LABEL })).toBeInTheDocument();
   });
 
   it("names what a held grant reaches, with a control to change it and one to revoke", async () => {
     botsGrantsList.mockResolvedValue(listing([GRANT]));
-    render(<BotGrantBar sync provider={OLLAMA} botId="bot-1" model={MODEL} />);
+    render(<BotGrantBar botTools provider={OLLAMA} botId="bot-1" model={MODEL} />);
     const list = await screen.findByRole("list", { name: GRANT_LIST_LABEL });
     expect(list).toHaveTextContent("This bot can read and write p1/journal/2026.");
     expect(screen.getByRole("button", { name: GRANT_CHANGE_LABEL })).toBeInTheDocument();
@@ -282,7 +286,7 @@ describe("BotGrantBar", () => {
 
   it("revokes by id, and the bar re-reads instead of splicing its own list", async () => {
     botsGrantsList.mockResolvedValueOnce(listing([GRANT])).mockResolvedValue(listing([]));
-    render(<BotGrantBar sync provider={OLLAMA} botId="bot-1" model={MODEL} />);
+    render(<BotGrantBar botTools provider={OLLAMA} botId="bot-1" model={MODEL} />);
     fireEvent.click(await screen.findByRole("button", { name: GRANT_REVOKE_LABEL }));
     expect(botsGrantRevoke).toHaveBeenCalledWith("grant-1");
     await waitFor(() => expect(screen.getByText(GRANT_NONE_HELD)).toBeInTheDocument());
@@ -291,7 +295,7 @@ describe("BotGrantBar", () => {
 
   it("saves a changed grant as a rewrite of the same row, subtree as typed", async () => {
     botsGrantsList.mockResolvedValue(listing([GRANT]));
-    render(<BotGrantBar sync provider={OLLAMA} botId="bot-1" model={MODEL} />);
+    render(<BotGrantBar botTools provider={OLLAMA} botId="bot-1" model={MODEL} />);
     fireEvent.click(await screen.findByRole("button", { name: GRANT_CHANGE_LABEL }));
     fireEvent.change(screen.getByLabelText("Inside that folder"), {
       target: { value: "journal/2026/" },
@@ -312,7 +316,7 @@ describe("BotGrantBar", () => {
   });
 
   it("creates a new grant with no id", async () => {
-    render(<BotGrantBar sync provider={OLLAMA} botId="bot-1" model={MODEL} />);
+    render(<BotGrantBar botTools provider={OLLAMA} botId="bot-1" model={MODEL} />);
     fireEvent.click(await screen.findByRole("button", { name: GRANT_ADD_LABEL }));
     fireEvent.change(screen.getByLabelText("Inside that folder"), {
       target: { value: "journal" },
@@ -333,7 +337,7 @@ describe("BotGrantBar", () => {
     botsGrantSave.mockRejectedValue({
       message: 'a tool path may not contain ".."',
     });
-    render(<BotGrantBar sync provider={OLLAMA} botId="bot-1" model={MODEL} />);
+    render(<BotGrantBar botTools provider={OLLAMA} botId="bot-1" model={MODEL} />);
     fireEvent.click(await screen.findByRole("button", { name: GRANT_ADD_LABEL }));
     fireEvent.change(screen.getByLabelText("Inside that folder"), {
       target: { value: "../etc" },

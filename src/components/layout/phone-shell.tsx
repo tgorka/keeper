@@ -28,6 +28,18 @@
  *   selection changes, so a room (re)selected with Detail open lands on the
  *   Room level — never on Detail. Desktop detail persistence is untouched
  *   (this component mounts only on the phone tier).
+ *
+ * Story 62.2 (FR-397, FR-398, AD-163) gives the stack its first non-chat
+ * surfaces, by the same rule: a level is derived from state that already
+ * exists, here `primaryViewStore.view`. With no room selected, the Bots view
+ * (gated on `capabilities.bots` — absent, not disabled, where false) and the
+ * Settings view each push a level 1 over the Inbox with a "Back to Inbox"
+ * bar, and Bots pushes its conversation as level 2 over its list — one thing
+ * at a time, two views rather than two columns. A selected room outranks a
+ * view level: a notification tap lands on the Room, and popping it returns
+ * to whatever view was under it. Back, edge-swipe and Escape pop these
+ * levels through the same `onBack`; the Bots surface adds no navigation of
+ * its own (`bots-phone-pane.tsx`).
  */
 import { RefreshCw, WifiOff } from "lucide-react";
 import {
@@ -41,13 +53,20 @@ import {
   useRef,
   useState,
 } from "react";
+import { BotsPhoneConversation, BotsPhoneList } from "@/components/bots/bots-phone-pane";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
 import { LeadingDrawer } from "@/components/layout/leading-drawer";
-import { PhoneHeader } from "@/components/layout/phone-header";
+import {
+  PHONE_BACK_TO_INBOX,
+  PHONE_INBOX_TITLE,
+  PhoneBackBar,
+  PhoneHeader,
+} from "@/components/layout/phone-header";
 import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
 import { PhoneSearchSurface } from "@/components/layout/phone-search-surface";
+import { SettingsPane } from "@/components/layout/settings-pane";
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
 import { useKeyboardInset } from "@/hooks/use-keyboard-inset";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
@@ -55,9 +74,10 @@ import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useStaleResumePill } from "@/hooks/use-stale-resume-pill";
 import { syncNow } from "@/lib/ipc/client";
 import { accountStatusStore, useShellOffline } from "@/lib/stores/account-status";
-import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
 import { leadingDrawerStore, useLeadingDrawerStore } from "@/lib/stores/leading-drawer";
+import { primaryViewStore, usePrimaryView } from "@/lib/stores/primary-view";
 import { roomsStore, useRoomsStore } from "@/lib/stores/rooms";
 import { searchSurfaceStore, useSearchSurfaceStore } from "@/lib/stores/search-surface";
 import { cn } from "@/lib/utils";
@@ -241,9 +261,40 @@ export function PhoneShell() {
   const { phone } = useShellLayout();
   useKeyboardInset({ enabled: phone });
 
-  // One visible level, derived purely from existing selection state:
-  //   detailOpen && selected -> 2 (Detail); selected -> 1 (Room); else 0 (Inbox).
-  const level = detailOpen && selected !== null ? 2 : selected !== null ? 1 : 0;
+  // Story 62.2: the view levels. With no room selected, the Bots view (only
+  // where the capability is on — absent, never a dead level) or the Settings
+  // view occupies level 1, and an open Bots conversation level 2. A selected
+  // room outranks both: a notification tap must land on the Room.
+  const view = usePrimaryView();
+  const botsCapability = useCapabilitiesStore((s) => s.capabilities.bots);
+  const surface: "bots" | "settings" | null =
+    view === "bots" && botsCapability ? "bots" : view === "settings" ? "settings" : null;
+  // Whether the Bots conversation is pushed over its list. Shell state rather
+  // than a store field because only this stack has two views to choose from —
+  // the desktop pane shows both at once — and it resets whenever the surface
+  // is no longer Bots, so re-entering always lands on the list. Derived during
+  // render, the sanctioned setState-in-render adjustment `StackLevel` uses.
+  const [botConversationOpen, setBotConversationOpen] = useState(false);
+  if (surface !== "bots" && botConversationOpen) {
+    setBotConversationOpen(false);
+  }
+  const surfaceOpen = selected === null && surface !== null;
+  const botConversationLevelOpen = surfaceOpen && surface === "bots" && botConversationOpen;
+  // What the view level draws, held across its exit: `surface` goes null the
+  // moment the view leaves, but the level stays mounted until its slide ends
+  // (presence), and it must keep drawing the surface that is leaving — not
+  // mount the other one, whose sections would start their reads.
+  const lastSurfaceRef = useRef(surface);
+  if (surface !== null) {
+    lastSurfaceRef.current = surface;
+  }
+  const shownSurface = surface ?? lastSurfaceRef.current;
+
+  // One visible level, derived purely from existing state:
+  //   selected -> Room (1) or, with Detail open, Detail (2);
+  //   else a view surface -> level 1, or the Bots conversation -> 2; else Inbox (0).
+  const level =
+    selected !== null ? (detailOpen ? 2 : 1) : botConversationLevelOpen ? 2 : surfaceOpen ? 1 : 0;
 
   // DW-109 (phone-scoped): a selection change never lands on Detail — close it
   // whenever `selected` changes so a room (re)selected with Detail open resolves
@@ -266,19 +317,35 @@ export function PhoneShell() {
   }, [selected]);
 
   // Pop exactly one level: Detail closes back to the Room; the Room clears the
-  // selection back to the Inbox. Read the stores imperatively so the handler
-  // never closes over stale render state.
+  // selection back to the Inbox; the Bots conversation closes back to its list;
+  // a view level returns to the Inbox view. Read the stores imperatively so
+  // the handler never closes over stale render state.
   const onBack = () => {
-    if (detailStore.getState().open) {
-      detailStore.getState().closeDetail();
+    if (roomsStore.getState().selected !== null) {
+      if (detailStore.getState().open) {
+        detailStore.getState().closeDetail();
+        return;
+      }
+      roomsStore.getState().selectRoom(null);
       return;
     }
-    roomsStore.getState().selectRoom(null);
+    if (botConversationLevelOpen) {
+      setBotConversationOpen(false);
+      return;
+    }
+    primaryViewStore.getState().setView("inbox");
   };
 
   // ---- Focus management (UX-DR28 / DW-110) -------------------------------
   const back1Ref = useRef<HTMLButtonElement>(null);
   const back2Ref = useRef<HTMLButtonElement>(null);
+  // The view levels' own back buttons: a room level popping while a view level
+  // opens beneath it would have two headers claiming one ref for the length of
+  // the exit transition, and the unmount would null it out from under the
+  // header that stayed.
+  const surfaceBack1Ref = useRef<HTMLButtonElement>(null);
+  const surfaceBack2Ref = useRef<HTMLButtonElement>(null);
+  const roomLevels = selected !== null;
   // The most recently focused element per level, tracked via focus-capture on
   // each level's wrapper — captured *before* a push makes the level inert (an
   // inert subtree blurs its focus, so reading `document.activeElement` in the
@@ -296,9 +363,17 @@ export function PhoneShell() {
     }
     if (level > prev) {
       // Push: remember the pusher (the element focused on the level we left)
-      // and move focus to the new level's back button.
+      // and move focus to the new level's back button — the room levels' or
+      // the view levels', whichever occupies it this render.
       pushersRef.current.set(level, lastFocusedRef.current.get(prev) ?? null);
-      const backRef = level === 2 ? back2Ref : back1Ref;
+      const backRef =
+        level === 2
+          ? roomLevels
+            ? back2Ref
+            : surfaceBack2Ref
+          : roomLevels
+            ? back1Ref
+            : surfaceBack1Ref;
       backRef.current?.focus();
       return;
     }
@@ -311,9 +386,11 @@ export function PhoneShell() {
     if (pusher?.isConnected) {
       pusher.focus();
     } else if (level === 1) {
-      back1Ref.current?.focus();
+      (roomLevels ? back1Ref : surfaceBack1Ref).current?.focus();
     }
-  }, [level]);
+    // `roomLevels` is a fact about the same render as `level`; a selection
+    // change at an unchanged level returns at the guard above.
+  }, [level, roomLevels]);
 
   const captureFocusFor =
     (l: number): FocusEventHandler<HTMLDivElement> =>
@@ -809,6 +886,56 @@ export function PhoneShell() {
         <div className="flex min-h-0 min-w-0 flex-1">
           <DetailPanel />
         </div>
+      </StackLevel>
+      {/* Story 62.2 — the view levels, occupying levels 1 and 2 only while no
+          room is selected (the room levels above are closed then, so the two
+          families never share a level). Bots is the list, then the
+          conversation; Settings is the same pane the desktop renders. */}
+      <StackLevel
+        levelIndex={1}
+        open={surfaceOpen}
+        covered={level > 1}
+        inert={level !== 1}
+        reducedMotion={reducedMotion}
+        dragX={dragXFor(1)}
+        coveredProgress={coveredProgressFor(1)}
+        onFocusCapture={captureFocusFor(1)}
+        className="absolute inset-0 z-10"
+      >
+        {level === 1 && edgeSwipeZone}
+        {shownSurface === "bots" ? (
+          <BotsPhoneList
+            onBack={onBack}
+            backRef={surfaceBack1Ref}
+            onOpen={() => setBotConversationOpen(true)}
+          />
+        ) : shownSurface === "settings" ? (
+          <>
+            <PhoneBackBar
+              backLabel={PHONE_BACK_TO_INBOX}
+              backTitle={PHONE_INBOX_TITLE}
+              onBack={onBack}
+              backRef={surfaceBack1Ref}
+            />
+            <div className="flex min-h-0 min-w-0 flex-1">
+              <SettingsPane />
+            </div>
+          </>
+        ) : null}
+      </StackLevel>
+      <StackLevel
+        levelIndex={2}
+        open={botConversationLevelOpen}
+        covered={false}
+        inert={level !== 2}
+        reducedMotion={reducedMotion}
+        dragX={dragXFor(2)}
+        coveredProgress={null}
+        onFocusCapture={captureFocusFor(2)}
+        className="absolute inset-0 z-20"
+      >
+        {level === 2 && edgeSwipeZone}
+        <BotsPhoneConversation onBack={onBack} backRef={surfaceBack2Ref} />
       </StackLevel>
       {/* The always-mounted leading nav drawer (Story 13.3); a portalled Sheet,
           so it renders outside the stack's transform layers. */}
