@@ -85,6 +85,8 @@ import type {
   TaskSaveReq,
   TaskSchedulePreviewVm,
   TaskVm,
+  VoiceStateVm,
+  VoiceWakeVm,
 } from "@/lib/ipc/client";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
@@ -1064,6 +1066,10 @@ const ANSWERS: Record<string, unknown> = {
     // every bots fixture below would be unreachable in `bun run dev` — the
     // pane, the picker, the composer and the fake stream all sit behind it.
     bots: true,
+    // Epic 62: the drive half, `desktop && sync` in Rust. `true` here so the
+    // grant bar, the tool rows and the reveal control are reachable in `bun
+    // run dev`; flip to `false` to see the phone's shape of the same pane.
+    botTools: true,
     overlayTitleBar: true,
   } satisfies CapabilitiesVm,
   // ---------------------------------------------------------------------------
@@ -2658,6 +2664,32 @@ const BOT_AUDIT: BotAuditRowVm[] = [
 /** Story 61.8's persisted metadata toggle, off as it ships. */
 let botMessageDetails = false;
 
+/**
+ * Story 62.5's wake phrase, faked. The switch starts off and the phrase is the
+ * shipped default, and both round-trip, because the flow worth looking at is
+ * turning listening on and watching the chip appear. `voice_availability`
+ * answers "available" here so the affordance is visible in `bun run dev`;
+ * the real desktop answers `unsupported`, which hides it.
+ */
+let voiceWake: VoiceWakeVm = {
+  enabled: false,
+  phrase: "nixie",
+  limits:
+    "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. It stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit. The microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
+};
+/** The one watcher, so `voice_wake_set` can push the new idle snapshot. */
+let voiceWatcher: MockChannel<VoiceStateVm> | null = null;
+let voiceWatchSerial = 0;
+
+/** What an idle turn looks like given the switch. */
+function voiceIdle(): VoiceStateVm {
+  return {
+    kind: "idle",
+    wake: voiceWake.enabled ? voiceWake.phrase.toLowerCase() : null,
+    listeningForWake: voiceWake.enabled,
+  };
+}
+
 const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = {
   // --- Bots (Epic 61, Story 61.4) ----------------------------------------
   //
@@ -2935,6 +2967,65 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   bots_message_details_get: () => botMessageDetails,
   bots_message_details_set: (payload) => {
     botMessageDetails = payload.shown === true;
+    return null;
+  },
+  // --- Voice (Epic 62, Story 62.5) ----------------------------------------
+  voice_availability: () => null,
+  voice_watch: (payload) => {
+    voiceWatcher = payload.channel as MockChannel<VoiceStateVm>;
+    voiceWatchSerial += 1;
+    voiceWatcher.onmessage?.(voiceIdle());
+    return voiceWatchSerial;
+  },
+  voice_unwatch: (payload) => {
+    if (payload.id === voiceWatchSerial) {
+      voiceWatcher = null;
+    }
+    return null;
+  },
+  voice_wake_get: () => voiceWake,
+  voice_wake_set: (payload) => {
+    const phrase = String(payload.phrase ?? "").trim();
+    // A crude stand-in for `WakePhrase::parse`: the real refusal sentence is
+    // Rust's; this only shows the surface rendering one.
+    if (phrase.replace(/\s+/g, "").length < 5) {
+      throw {
+        code: "internal",
+        message: `use at least 5 letters in total — "${phrase}" is too short for the recogniser to tell from noise`,
+        accountId: null,
+        retriable: false,
+      };
+    }
+    voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase };
+    voiceWatcher?.onmessage?.(voiceIdle());
+    return voiceWake;
+  },
+  // --- Voice, the talk mode (Epic 62, Story 62.6) --------------------------
+  //
+  // A scripted turn so the mic control's three states can be looked at in
+  // `bun run dev`: listening with an interim transcript, then heard. What is
+  // heard lands in the composer; nothing here sends. `voice_authorize`
+  // answers "granted" — the dialogs are the phone's.
+  voice_authorize: () => null,
+  voice_start: () => {
+    const push = (state: VoiceStateVm) => voiceWatcher?.onmessage?.(state);
+    push({ kind: "listening", heard: "" });
+    setTimeout(() => push({ kind: "listening", heard: "what did I" }), 400);
+    setTimeout(() => push({ kind: "listening", heard: "what did I save yesterday" }), 900);
+    setTimeout(() => push({ kind: "heard", text: "what did I save yesterday" }), 1600);
+    return null;
+  },
+  voice_stop: () => {
+    voiceWatcher?.onmessage?.(voiceIdle());
+    return null;
+  },
+  voice_speak: () => {
+    voiceWatcher?.onmessage?.({ kind: "speaking" });
+    setTimeout(() => voiceWatcher?.onmessage?.(voiceIdle()), 2500);
+    return null;
+  },
+  voice_stop_speaking: () => {
+    voiceWatcher?.onmessage?.(voiceIdle());
     return null;
   },
   // Story 61.9's registry, faked. See `mockCommandPreview` for why it is crude.

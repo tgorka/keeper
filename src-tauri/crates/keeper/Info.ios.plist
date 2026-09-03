@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The iOS half of the Tauri Info.plist merge (Epic 62, Story 62.6, FR-408).
+
+  On every `tauri ios build` / `tauri ios dev` the CLI rewrites
+  gen/apple/keeper_iOS/Info.plist as the merge of, in this order, later
+  winning: the XcodeGen-generated file, the CLI's own keys, `Info.plist`
+  beside this file (the macOS bundle's, written for a Mac), then THIS file
+  (tauri-cli `mobile/ios/build.rs`, `merge_plist`). Without this file the
+  iPhone's microphone dialog said "Everything is saved locally on this Mac",
+  because the macOS string overwrote the one `project.yml` declares.
+
+  Only keys the macOS file also carries belong here — every other iOS key
+  lives in `gen/apple/project.yml` (AD-32), which is what `xcodegen
+  generate` and a plain Xcode run see. The sentence below MUST equal the one
+  in `project.yml`: that copy is the project's truth, this copy is the
+  override that reaches the bundle.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>keeper listens through the microphone only while you talk to a model you configured — after you tap Talk or say your wake phrase — and turns your words into text on this phone. Nothing is recorded or uploaded.</string>
+</dict>
+</plist>

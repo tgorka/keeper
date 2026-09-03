@@ -50,6 +50,10 @@ file-controlled instead, and says which file.
 | | | | | Whether the Favorites section of the room list starts collapsed. |
 | `bots.message_details` | user-global | boolean (`1`/`0`) | `0` | `"bots.message_details" = true` |
 | | | | | Whether an answer shows its metadata caption — model, tokens, timings, finish reason, request id. |
+| `bots.wake_enabled` | user-global | boolean (`1`/`0`) | `0` | `"bots.wake_enabled" = true` |
+| | | | | Whether the wake phrase is armed on the phone. Off until chosen: an open microphone is a deliberate act. |
+| `bots.wake_phrase` | user-global | text | `nixie` | `"bots.wake_phrase" = "hej keeper"` |
+| | | | | The phrase that starts a voice turn, as typed; matched case- and diacritic-insensitively. At least 5 letters, at most 5 words. |
 | `debug.mode` | user-global | boolean (`1`/`0`) | `0` | `"debug.mode" = true` |
 | | | | | On-disk event and error logging. Read before anything else at boot, so a file can turn it on for the boot that goes wrong. |
 | `incognito.global` | user-global | boolean (`1`/`0`) | `0` | `"incognito.global" = true` |

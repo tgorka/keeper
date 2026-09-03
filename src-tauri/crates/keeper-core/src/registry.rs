@@ -776,6 +776,54 @@ pub fn set_bots_message_details(data_dir: &Path, shown: bool) -> Result<(), Core
     )
 }
 
+/// The `settings` key holding whether the wake phrase is armed (Story 62.5,
+/// FR-405). Stored as `"1"`/`"0"`; absent = off — listening is chosen, never
+/// found on.
+const BOTS_WAKE_ENABLED_KEY: &str = "bots.wake_enabled";
+
+/// The `settings` key holding the wake phrase as typed (Story 62.5, FR-404).
+/// Absent or blank = [`crate::voice::DEFAULT_WAKE_PHRASE`]. Stored raw, not
+/// normalised: the text box shows back what the person typed, and
+/// `WakePhrase::parse` decides matching form every time it is armed.
+const BOTS_WAKE_PHRASE_KEY: &str = "bots.wake_phrase";
+
+/// Read whether the wake phrase is armed (Story 62.5, FR-405). Absent /
+/// anything-but-`"1"` ⇒ `false`.
+///
+/// Off is the whole point: an open microphone is a deliberate act, and a
+/// fresh install that listened would be the silent always-on listener the
+/// epic refuses. The switch, not the phrase, is what a person chooses.
+pub fn get_bots_wake_enabled(data_dir: &Path) -> Result<bool, CoreError> {
+    Ok(get_setting(data_dir, BOTS_WAKE_ENABLED_KEY)?.as_deref() == Some("1"))
+}
+
+/// Write whether the wake phrase is armed (Story 62.5, FR-405). Persists
+/// `"1"`/`"0"` under `bots.wake_enabled` — the literal the key is registered
+/// with (`Shape::Flag01` in [`crate::config::keys`]).
+pub fn set_bots_wake_enabled(data_dir: &Path, enabled: bool) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        BOTS_WAKE_ENABLED_KEY,
+        if enabled { "1" } else { "0" },
+    )
+}
+
+/// Read the wake phrase as typed (Story 62.5, FR-404). Absent or blank ⇒
+/// [`crate::voice::DEFAULT_WAKE_PHRASE`], so the box is never empty and the
+/// switch has something to arm on a fresh install.
+pub fn get_bots_wake_phrase(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, BOTS_WAKE_PHRASE_KEY)?
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::voice::DEFAULT_WAKE_PHRASE.to_owned()))
+}
+
+/// Write the wake phrase as typed (Story 62.5, FR-404). Stored verbatim under
+/// `bots.wake_phrase`; validation is `WakePhrase::parse`'s, run by the caller
+/// before this is reached, so the table never holds a phrase that was refused.
+pub fn set_bots_wake_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, BOTS_WAKE_PHRASE_KEY, phrase)
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -3893,6 +3941,46 @@ mod tests {
         assert_eq!(
             get_setting(&dir, "bots.message_details").expect("read raw"),
             Some("0".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bots_wake_enabled_defaults_off_and_round_trips() {
+        let dir = temp_dir();
+        // Absent ⇒ off: an open microphone is chosen, never found on.
+        assert!(!get_bots_wake_enabled(&dir).expect("read default"));
+        set_bots_wake_enabled(&dir, true).expect("arm");
+        assert!(get_bots_wake_enabled(&dir).expect("read back on"));
+        assert_eq!(
+            get_setting(&dir, "bots.wake_enabled").expect("read raw"),
+            Some("1".to_owned())
+        );
+        set_bots_wake_enabled(&dir, false).expect("disarm");
+        assert!(!get_bots_wake_enabled(&dir).expect("read back off"));
+        assert_eq!(
+            get_setting(&dir, "bots.wake_enabled").expect("read raw"),
+            Some("0".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bots_wake_phrase_defaults_to_nixie_and_round_trips_verbatim() {
+        let dir = temp_dir();
+        assert_eq!(
+            get_bots_wake_phrase(&dir).expect("read default"),
+            crate::voice::DEFAULT_WAKE_PHRASE
+        );
+        set_bots_wake_phrase(&dir, "Hej Keeper").expect("write");
+        // Verbatim: the box shows back what was typed; matching form is
+        // `WakePhrase::parse`'s business at arm time.
+        assert_eq!(get_bots_wake_phrase(&dir).expect("read back"), "Hej Keeper");
+        // Blank falls back to the default rather than arming nothing.
+        set_bots_wake_phrase(&dir, "   ").expect("write blank");
+        assert_eq!(
+            get_bots_wake_phrase(&dir).expect("read blank"),
+            crate::voice::DEFAULT_WAKE_PHRASE
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

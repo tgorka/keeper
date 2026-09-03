@@ -60,6 +60,27 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
+        # Voice (Epic 62, Story 62.6, FR-408). Both strings are the sentence iOS shows in
+        # its permission dialog, so each says what THIS app does with the audio. Declared
+        # here, not in keeper_iOS/Info.plist, because `xcodegen generate` rewrites that file
+        # from these properties (AD-32) and a key placed only there is silently reverted.
+        # Apple: "If this key is not present, your app will crash when you call
+        # requestAuthorization" (SFSpeechRecognizer.requestAuthorization(_:)).
+        # The microphone string is ALSO in crates/keeper/Info.ios.plist, and must stay
+        # equal to it: `tauri ios build` merges crates/keeper/Info.plist (the macOS
+        # bundle's, "on this Mac") over this file's output, and Info.ios.plist is the
+        # only later step in that merge.
+        NSMicrophoneUsageDescription: keeper listens through the microphone only while you talk to a model you configured — after you tap Talk or say your wake phrase — and turns your words into text on this phone. Nothing is recorded or uploaded.
+        NSSpeechRecognitionUsageDescription: keeper turns what you say into text on this phone, using on-device recognition only, so it can send your words to the model you chose. Your voice never leaves the device; keeper refuses server recognition.
+        # Story 62.6 (the driving brief): a listening session ARMED in the foreground keeps
+        # running when another app comes in front or the screen locks, because the audio
+        # session is play-and-record and this mode is declared. What it does NOT buy: an app
+        # cannot START recording from the background (Apple, "Configuring your app for
+        # background audio"; DTS on forums thread 120038), so the phrase is armed by a tap
+        # with keeper in front (FR-405), and iOS shows the microphone indicator the whole
+        # time it is armed. This build is a Personal-Team sideload, never App Store, so
+        # Guideline 2.5.4 is not a gate here — docs/ios.md.
+        UIBackgroundModes: [audio]
     entitlements:
       path: keeper_iOS/keeper_iOS.entitlements
       # Source of truth for the entitlements (Story 14.7, FR-65): XcodeGen REGENERATES
@@ -94,6 +115,17 @@ targets:
       - sdk: Security.framework
       - sdk: UIKit.framework
       - sdk: WebKit.framework
+      # Voice (Story 62.4/62.6): this list is the ONLY thing that links Speech.
+      # objc2-speech and objc2-avf-audio carry `#[link(kind = "framework")]` on EMPTY
+      # extern blocks, and libapp.a is linked by this project, not by rustc, so those
+      # attributes never reach the link line. AVFAudio still arrived on its own (the port
+      # reads `AVAudioSessionCategoryPlayAndRecord`, a symbol ld resolves through the
+      # AVFoundation Tauri already links); Speech is reached only by class name at run
+      # time, so a project without it builds, ships every voice command, and has no
+      # `SFSpeechRecognizer` (the port answers `NoRecognizer`). Run `xcodegen generate`
+      # after editing — project.pbxproj must list them too, and once did not.
+      - sdk: Speech.framework
+      - sdk: AVFAudio.framework
     preBuildScripts:
       - script: bun tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
         name: Build Rust Code

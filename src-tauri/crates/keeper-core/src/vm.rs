@@ -136,8 +136,9 @@ pub struct CapabilitiesVm {
     /// every sessions affordance is **absent** from the DOM rather than
     /// disabled, which is the whole of FR-223.
     pub sessions: bool,
-    /// The Bots surface (Epic 61, FR-378) can run here: **desktop, and nothing
-    /// else** — computed in the shell like every other flag in this struct.
+    /// The Bots surface (Epic 61, FR-378; Epic 62, FR-396) can run here:
+    /// **true wherever the pane exists** — desktop and phone alike — computed
+    /// in the shell like every other flag in this struct.
     ///
     /// **This is not a synonym for `sessions`, and the difference is the whole
     /// reason it is a separate flag.** `notes` and `sessions` are both
@@ -145,21 +146,31 @@ pub struct CapabilitiesVm {
     /// keeper syncs*, so neither can exist without a usable `git`. Talking to a
     /// model needs neither `git` nor `sync.db`: a provider is a URL and a
     /// credential, a conversation is two tables in `keeper.db`, and a machine
-    /// with no `git` at all can hold both. So a build gated on `sessions` here
-    /// would hide a working surface on every desktop whose `git` is too old,
-    /// which is a lie in the opposite direction from the one AD-27 usually
-    /// guards.
+    /// with no `git` at all — or a phone with no folder sync at all — can hold
+    /// both. So a build gated on `sessions` here would hide a working surface
+    /// on every desktop whose `git` is too old and on every phone, which is a
+    /// lie in the opposite direction from the one AD-27 usually guards.
     ///
-    /// The half that genuinely needs `sync` is the drive-tool grant (Story
-    /// 61.10, 61.11) — a tool call resolves a path inside a synced profile —
-    /// and that affordance is gated on `sync` where it is offered. Two facts,
-    /// two flags, and the split stated where both are declared.
-    ///
-    /// Desktop-only rather than everywhere because iOS has no place to put the
-    /// surface: the pane is a three-column desktop layout and the phone tier
-    /// replaces the whole shell row. When it is `false` every bots affordance
-    /// is **absent** from the DOM rather than disabled.
+    /// The half that genuinely needs the drive is [`Self::bot_tools`]. Two
+    /// facts, two flags, and the split stated where both are declared. When
+    /// this is `false` every bots affordance is **absent** from the DOM rather
+    /// than disabled.
     pub bots: bool,
+    /// This build can reach the drive on a bot's behalf (Epic 62, FR-396,
+    /// AD-162): **desktop and `sync`**, computed in the shell like every other
+    /// flag in this struct.
+    ///
+    /// Strictly narrower than `bots`, for a reason that is a fact about
+    /// linking rather than a design choice: a tool call resolves a path inside
+    /// a synced profile through `keeper-sync`, and `keeper-sync` is not a
+    /// dependency of the shell on iOS or Android. A grant is therefore a
+    /// promise about files keeper cannot reach from a phone, so on a phone
+    /// there is no grant, no audit, no tool row and no deliverable path —
+    /// **absent** rather than disabled (AD-27), with one sentence saying the
+    /// drive tools live on the Mac. On a desktop it is `sync` for
+    /// `notes`' reason: the drive IS the synced folders, so a machine whose
+    /// `git` the engine refuses has no drive to grant.
+    pub bot_tools: bool,
     /// The window's title bar is a transparent overlay over the webview, so the
     /// native window controls float over page content (Story 34.2, AD-34-2):
     /// `true` only on desktop macOS, the only platform where `tauri.conf.json`'s
@@ -6853,6 +6864,115 @@ impl BotDeliverableVm {
             reason,
         }
     }
+}
+
+/// Where a voice turn is (Epic 62, Story 62.4, FR-401), streamed over the
+/// `voice_start` channel as a snapshot after every transition.
+///
+/// A projection of `keeper_core::voice::Turn`, composed there: the state names
+/// are the machine's, and `idle` adds what the surface must say about the
+/// microphone while no turn runs — which phrase is set, and whether the
+/// device is open for it (FR-405: visible whenever it listens).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum VoiceStateVm {
+    /// No turn.
+    Idle {
+        /// The wake phrase in matching form, or `None` when none is set.
+        wake: Option<String>,
+        /// Whether the microphone is open, waiting for the phrase.
+        listening_for_wake: bool,
+    },
+    /// The microphone is open and the recogniser is transcribing.
+    Listening {
+        /// The interim transcript as it forms (Story 62.6 shows it).
+        heard: String,
+    },
+    /// The final transcript, handed to the conversation.
+    Heard {
+        /// What was said.
+        text: String,
+    },
+    /// The message is with the model.
+    Sending,
+    /// The answer is being read aloud.
+    Speaking,
+    /// The turn ended on an error.
+    Failed {
+        /// Why, in a sentence.
+        reason: String,
+    },
+}
+
+/// Why voice is not available on this device right now (Epic 62, Story 62.4,
+/// FR-402), from `voice_availability`.
+///
+/// Every variant carries the sentence the surface shows, composed in
+/// `keeper_core::voice`, so the kind is for the affordance the surface offers
+/// beside it — Open Settings for `notAuthorized`, nothing for `unsupported` —
+/// and the words are decided once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export)]
+pub enum VoiceUnavailableVm {
+    /// The person has not allowed the microphone or speech recognition.
+    NotAuthorized {
+        /// What to do about it.
+        message: String,
+    },
+    /// The phone has no on-device model for the locale, and keeper refuses
+    /// the server fallback (NFR-50).
+    NoOnDeviceModel {
+        /// The locale identifier the recogniser was asked for.
+        locale: String,
+        /// Which language to download, and where.
+        message: String,
+    },
+    /// The device has no audio input.
+    NoMicrophone {
+        /// The sentence.
+        message: String,
+    },
+    /// The build was linked without `Speech.framework`, so the recogniser
+    /// class does not exist in this process. A defect of the build — nothing
+    /// the person can change on the phone — kept apart from `unsupported`
+    /// so an inert voice feature never reads as an absent one.
+    NoRecognizer {
+        /// The sentence, naming the build problem.
+        message: String,
+    },
+    /// This build has no voice port (every platform but iOS today).
+    Unsupported {
+        /// The sentence.
+        message: String,
+    },
+}
+
+/// The wake phrase's switch and words (Epic 62, Story 62.5, FR-404–FR-406),
+/// from `voice_wake_get` and back from `voice_wake_set`.
+///
+/// `limits` is `keeper_core::voice::LISTENING_LIMITS` carried to the surface
+/// rather than retyped there: the sentence beside the switch is decided once,
+/// in core, and the webview only renders it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VoiceWakeVm {
+    /// Whether listening for the phrase is switched on. Off on a fresh install.
+    pub enabled: bool,
+    /// The phrase as the person typed it (the box's contents), never blank.
+    pub phrase: String,
+    /// What armed listening does and does not do on this phone.
+    pub limits: String,
 }
 
 #[cfg(test)]

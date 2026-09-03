@@ -1456,24 +1456,45 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // root IS a synced folder plus a flag, so the capability is exactly the
         // notes capability's condition, computed once and shared.
         sessions: notes_available(&state),
-        // Bots (Epic 61, FR-378): `cfg!(desktop)` and **deliberately not**
-        // `notes_available`. Every other surface in this struct that rides the
-        // sync gate does so because its record IS a synced folder; a
-        // conversation is not. A provider is a URL and a credential behind the
-        // secret port, and a conversation is two tables in `keeper.db` — the
-        // same database the account registry lives in — so nothing here needs
-        // `git` and nothing here reads `sync.db`. Gating on `sessions` would
-        // hide a working surface on every desktop whose `git` is older than the
-        // engine's floor, which is a dishonest absence rather than an honest
-        // one.
+        // Bots (Epic 61, FR-378; Epic 62, FR-396): `cfg!(desktop) ||
+        // cfg!(mobile)`, i.e. true on every target that has a pane to put it
+        // in, and **deliberately not** `notes_available`. Every other surface
+        // in this struct that rides the sync gate does so because its record
+        // IS a synced folder; a conversation is not. A provider is a URL and a
+        // credential behind the secret port, and a conversation is two tables
+        // in `keeper.db` — the same database the account registry lives in —
+        // so nothing here needs `git` and nothing here reads `sync.db`.
+        // Gating on `sessions` would hide a working surface on every desktop
+        // whose `git` is older than the engine's floor and on every phone,
+        // which is a dishonest absence rather than an honest one.
+        //
+        // **`|| cfg!(mobile)` is not a slip for `true`.** Tauri injects
+        // `desktop` and `mobile` as a partition of the targets it builds for,
+        // so today the two are exhaustive — but writing `true` would make the
+        // flag stop being a claim about this build, and `AppState::new`
+        // already `compile_error!`s on a mobile target that is not iOS. A
+        // later target earns the pane by joining the partition, not by
+        // inheriting a literal.
         //
         // A bare `cfg!` rather than a probe because there is nothing to probe:
-        // the surface needs no binary, no OS version and no database that might
-        // not open. The half that DOES need `sync` is the drive-tool grant
-        // (Stories 61.10, 61.11), and that affordance reads
-        // `CapabilitiesVm.sync` where it is offered rather than narrowing this
-        // flag — two facts, two flags.
-        bots: cfg!(desktop),
+        // the surface needs no binary, no OS version and no database that
+        // might not open. The half that DOES need the drive is `bot_tools`,
+        // next — two facts, two flags.
+        bots: cfg!(desktop) || cfg!(mobile),
+        // Bot tools (Epic 62, FR-396, AD-162): desktop AND `sync`, and the
+        // `desktop` half is a linking fact rather than a design choice. A
+        // tool call resolves a path inside a synced profile through
+        // `keeper-sync`, and `keeper-sync` is not a dependency of this crate
+        // on iOS or Android (see Cargo.toml's target table) — so
+        // `bots_drive_ipc`, which holds every grant, audit, approval and
+        // deliverable command, is `#[cfg(desktop)]` and a phone has nothing to
+        // call. The `sync` half is `notes`' reason: the drive IS the synced
+        // folders, so a desktop whose `git` the engine refuses has no folder to
+        // grant into. Where this is `false` the grant bar, the audit list,
+        // the tool rows and the reveal control are absent, not disabled
+        // (AD-27). Computed as `notes_available` because it is the same
+        // condition, and stated separately because it is not the same fact.
+        bot_tools: notes_available(&state),
     })
 }
 

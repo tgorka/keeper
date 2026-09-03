@@ -34,6 +34,7 @@ export const DEFAULT_CAPABILITIES: CapabilitiesVm = Object.freeze({
   notes: false,
   sessions: false,
   bots: false,
+  botTools: false,
   overlayTitleBar: false,
 });
 
@@ -65,23 +66,47 @@ export function useCapabilitiesStore<T>(selector: (state: CapabilitiesState) => 
 }
 
 /**
+ * Flags that do not tell the tiers apart, and so are left out of the fold in
+ * {@link isReducedCapabilityPlatform}.
+ *
+ * **`bots` is true on every tier (Epic 62, FR-396)** — a conversation is two
+ * tables in `keeper.db`, which every platform opens — so its value says
+ * nothing about which build this is. Folding it in would make the phone read
+ * as a desktop the moment the pane existed, which would silently drop the
+ * "On this iPhone" disclosure, the backup-exclusion line and the offline pill.
+ * The drive half of the same surface, `botTools`, is `desktop && sync` and
+ * stays in the fold. A flag belongs here only when the Rust side computes it
+ * as true on both tiers; that is the whole membership rule.
+ */
+const TIER_NEUTRAL_FLAGS: Partial<Record<keyof CapabilitiesVm, true>> = {
+  bots: true,
+};
+
+/**
  * Pure predicate: is this a capability-reduced platform (i.e. the phone tier)?
  *
  * True only when the mirror has hydrated (`hydrated === true`) AND every one of
- * the optional surfaces is absent. All the flags are `cfg!(desktop)` in the Rust
- * `capabilities` command, so "every flag `false`" equals "iOS" today while staying
- * a pure capability read — never a platform sniff. The `hydrated` term is
- * load-bearing: without it the all-`false` {@link DEFAULT_CAPABILITIES} safe
+ * the tier-telling surfaces is absent. Every flag outside
+ * {@link TIER_NEUTRAL_FLAGS} is `cfg!(desktop)`-shaped in the Rust
+ * `capabilities` command, so "every such flag `false`" equals "iOS" today while
+ * staying a pure capability read — never a platform sniff. The `hydrated` term
+ * is load-bearing: without it the all-`false` {@link DEFAULT_CAPABILITIES} safe
  * default would advertise the iOS-only disclosures on desktop for the one frame
  * before hydration resolves.
  *
- * The absence check derives from `Object.values` over the (all-boolean) VM rather
- * than a hand-written flag list, so a capability added to `CapabilitiesVm` is
- * folded in automatically and can never silently desync the predicate.
+ * The absence check derives from `Object.entries` over the (all-boolean) VM
+ * rather than a hand-written flag list, so a capability added to
+ * `CapabilitiesVm` is folded in automatically and can never silently desync the
+ * predicate; only a flag that is true on both tiers has to opt out, by name.
  */
 export function isReducedCapabilityPlatform(state: CapabilitiesState): boolean {
   const { hydrated, capabilities } = state;
-  return hydrated && Object.values(capabilities).every((present) => !present);
+  return (
+    hydrated &&
+    Object.entries(capabilities).every(
+      ([flag, present]) => TIER_NEUTRAL_FLAGS[flag as keyof CapabilitiesVm] === true || !present,
+    )
+  );
 }
 
 /**

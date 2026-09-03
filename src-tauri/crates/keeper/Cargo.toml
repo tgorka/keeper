@@ -140,3 +140,18 @@ objc2-foundation = { workspace = true }
 # aarch64-apple-ios compile (found by Story 15.4). The objc2 0.3 binding is a SAFE API —
 # no unsafe block needed. Crate already in the tree transitively; only the edge changes.
 objc2-user-notifications = { workspace = true }
+# The voice port (Epic 62, Story 62.4, AD-165–AD-167): `SFSpeechRecognizer` +
+# `SFSpeechAudioBufferRecognitionRequest` (objc2-speech) and `AVAudioSession`,
+# `AVAudioEngine`, `AVSpeechSynthesizer` (objc2-avf-audio), reached only from
+# `voice_ios.rs` — the audited function-level `#[allow(unsafe_code)]` entries
+# listed in docs/constraints-and-limitations.md. System frameworks, so keeper
+# ships no model weights; every request sets `requiresOnDeviceRecognition`, so
+# voice adds no network destination (NFR-50). iOS-only by this target table:
+# desktop and Linux never see either crate, and `verify:ios-ipa`'s tree stays
+# free of anything it forbids. Both `Zlib OR Apache-2.0 OR MIT` (0.3.2) — pass
+# the cargo-deny license firewall. Feature lists on the workspace entries name
+# exactly the classes the port touches. `block2` carries the recogniser's
+# result handler and the audio tap; 0.6.2 is already in the tree for macOS.
+objc2-speech = { workspace = true }
+objc2-avf-audio = { workspace = true }
+block2 = { workspace = true }

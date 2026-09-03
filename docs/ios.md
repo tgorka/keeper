@@ -328,18 +328,22 @@ documented above.
 ## Limitations
 
 On a free Personal Team, keeper on iPhone is deliberately narrower than the desktop
-build. These are the same four points keeper shows in-app under **Settings → About →
+build. These are the same seven points keeper shows in-app under **Settings → About →
 "On this iPhone"**:
 
 - keeper syncs and notifies only while it's open; background notifications await a future decision.
 - No self-hosted bridge runner — manage your own bridges from your Mac.
 - No global summon hotkey.
 - Updates arrive by reinstalling keeper; its signature renews every 7 days.
+- Bots talks to a model but cannot reach the folders you sync — the drive tools live on your Mac.
+- Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.
+- Listening stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit; while it listens the microphone indicator stays lit and it uses battery.
 
 > This list is mirrored from `IOS_DISCLOSURE_LINES` in
 > `src/components/settings/about-section.tsx`, which is the single source of truth —
 > the in-app "On this iPhone" disclosure links here, so the two must stay identical.
-> Edit both together or neither.
+> Edit both together or neither; `about-section.test.tsx` reads this list from disk
+> and fails when they differ.
 
 The fourth item is the [7-day re-arm ritual](#the-7-day-re-arm-ritual) above:
 "reinstalling keeper" is exactly the weekly `bun run tauri ios dev` re-sign (or an
@@ -354,3 +358,30 @@ count while keeper is closed; it reflects what keeper knew when it was last open
 
 The "future decision" the first item names is recorded in [decisions.md](decisions.md) D-1 —
 the deferred paid Apple Developer Program that would unlock APNs push and the NSE.
+
+The fifth item is Epic 62. The Bots surface exists on the phone — endpoints and
+bots are added, tested, edited and removed there through the same `keeper-core`
+grammar the desktop uses, and a conversation streams the same way — but
+`keeper-sync` is not a dependency of the shell crate on iOS, so the drive half
+(grants, the audit, deliverable paths, image staging) is desktop-only by
+construction. On the phone those controls are absent, not disabled: the pane says
+once, in its empty state, that the drive tools live on your Mac. The scope is
+Hermes because that is what was asked for; an Ollama endpoint a phone can reach is
+the same wire and is neither built for nor blocked.
+
+The sixth and seventh items are talk mode, also Epic 62. keeper turns speech into
+text, sends it to the bot as an ordinary message and speaks the answer; a wake phrase
+(`nixie` by default, yours to change) starts a turn hands-free once listening is
+switched on. What iOS forbids is *starting* the microphone from the background, so
+listening is switched on while keeper is in front; what iOS supports is a session that
+keeps running afterwards — with Maps in front, or the screen locked — under
+`UIBackgroundModes: audio`, which the generated project declares. keeper cannot arm
+itself: after a force-quit or a restart, listening is off until you open keeper and
+switch it on again, and a call, Siri or another app taking the microphone can end the
+session, which the port re-arms when it can and reports when it cannot. The orange
+microphone indicator is the system's and stays lit for the whole of an armed session.
+Recognition is on-device only — a locale whose model is not on the phone gets a
+sentence naming the language to download, never a server round trip — because
+`egress.md` names every destination keeper contacts and Apple's speech servers are not
+on it. The full reasoning, including why this is possible on the phone while voice
+stays deferred on the Mac, is [decisions.md](decisions.md) D-5.

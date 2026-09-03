@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -23,7 +25,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
-import { AboutSection } from "@/components/settings/about-section";
+import { AboutSection, IOS_DISCLOSURE_LINES } from "@/components/settings/about-section";
 import { type EgressEndpointVm, egressList } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
@@ -47,6 +49,7 @@ const DESKTOP_CAPABILITIES = {
   notes: false,
   sessions: false,
   bots: false,
+  botTools: false,
   overlayTitleBar: false,
 };
 
@@ -351,12 +354,16 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     // …but the software-update block is gone (no dead "Check for updates" button).
     expect(screen.queryByText("Software updates")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Check for updates" })).not.toBeInTheDocument();
-    // The "On this iPhone" list renders all four honesty lines.
+    // The "On this iPhone" list renders every honesty line.
     expect(screen.getByText("On this iPhone")).toBeInTheDocument();
     expect(screen.getByText(/syncs and notifies only while it's open/)).toBeInTheDocument();
     expect(screen.getByText(/No self-hosted bridge runner/)).toBeInTheDocument();
     expect(screen.getByText("No global summon hotkey.")).toBeInTheDocument();
     expect(screen.getByText(/signature renews every 7 days/)).toBeInTheDocument();
+    expect(screen.getByText(/the drive tools live on your Mac/)).toBeInTheDocument();
+    for (const line of IOS_DISCLOSURE_LINES) {
+      expect(screen.getByText(line)).toBeInTheDocument();
+    }
   });
 
   it("iOS: the docs link opens docs/ios.md externally via openUrl (best-effort)", async () => {
@@ -394,5 +401,43 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(vi.mocked(debugModeSet)).toHaveBeenCalledWith(true));
     expect(toggle).toBeChecked();
+  });
+});
+
+/**
+ * `docs/ios.md` says of its Limitations list: "mirrored from `IOS_DISCLOSURE_LINES`
+ * … the two must stay identical. Edit both together or neither." A sentence in a
+ * doc is a request; this is the guard. The list is read from disk, never
+ * restated here, so a third copy cannot drift either.
+ */
+describe("IOS_DISCLOSURE_LINES mirrors docs/ios.md (Story 62.3, FR-400)", () => {
+  it("is identical to the Limitations bullet list, in order", () => {
+    const doc = readFileSync(resolve(process.cwd(), "docs/ios.md"), "utf8");
+    const section = /^## Limitations\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(doc);
+    if (section === null) {
+      throw new Error("docs/ios.md has no '## Limitations' section");
+    }
+    // The first bullet run of the section: the list stops at the first line that
+    // is not a bullet after the list has begun, so the prose below it is not
+    // mistaken for a sixth item.
+    const lines = section[1]?.split("\n") ?? [];
+    const first = lines.findIndex((line) => line.startsWith("- "));
+    expect(first).toBeGreaterThanOrEqual(0);
+    const bullets: string[] = [];
+    for (const line of lines.slice(first)) {
+      if (!line.startsWith("- ")) {
+        break;
+      }
+      bullets.push(line.slice(2));
+    }
+    expect(bullets).toEqual([...IOS_DISCLOSURE_LINES]);
+  });
+
+  it("names, in the phone's own disclosure, what Bots does not do there", () => {
+    // FR-400: the drive tools are on the Mac, and the phone says so where the
+    // person reads what this build lacks — not only in a doc.
+    expect(IOS_DISCLOSURE_LINES.some((line) => /drive tools live on your Mac/.test(line))).toBe(
+      true,
+    );
   });
 });

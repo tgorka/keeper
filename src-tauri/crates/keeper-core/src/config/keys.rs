@@ -392,6 +392,26 @@ pub const KEYS: &[KeySpec] = &[
         summary: "Whether an answer shows its metadata caption — model, tokens, timings, finish reason, request id.",
         example: "true",
     },
+    KeySpec {
+        key: "bots.wake_enabled",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Flag01,
+        default: "0",
+        summary: "Whether the wake phrase is armed on the phone. Off until chosen: an open microphone is a deliberate act.",
+        example: "true",
+    },
+    KeySpec {
+        key: "bots.wake_phrase",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "nixie",
+        summary: "The phrase that starts a voice turn, as typed; matched case- and diacritic-insensitively. At least 5 letters, at most 5 words.",
+        example: "\"hej keeper\"",
+    },
     // ---- debug -----------------------------------------------------------
     KeySpec {
         key: "debug.mode",

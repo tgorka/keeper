@@ -32,6 +32,7 @@ const DESKTOP_CAPABILITIES = {
   notes: false,
   sessions: false,
   bots: false,
+  botTools: false,
   overlayTitleBar: false,
 };
 
