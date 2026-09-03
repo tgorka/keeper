@@ -2281,6 +2281,9 @@ const BOT_SESSIONS: BotSessionVm[] = [
     updatedMs: NOW - 3_600_000,
     archived: false,
     remoteSessionId: null,
+    // Epic 63: the gateway's word on the session, absent on a local-only row.
+    remoteLastActiveMs: null,
+    remoteSource: null,
   },
   {
     id: "01J8BOTSESSIONBBBBBBBBBBBB",
@@ -2291,6 +2294,10 @@ const BOT_SESSIONS: BotSessionVm[] = [
     updatedMs: NOW - 80_000_000,
     archived: false,
     remoteSessionId: "hermes-9f21",
+    // Epic 63: a session the gateway listed — written through its API door,
+    // last seen moving a while ago, so the list's Remote label has a row.
+    remoteLastActiveMs: NOW - 79_000_000,
+    remoteSource: "api",
   },
   // Archived, so the list's Archived filter and its Unarchive verb have
   // something to act on (Story 61.6). A harness whose archive is always empty
@@ -2304,6 +2311,8 @@ const BOT_SESSIONS: BotSessionVm[] = [
     updatedMs: NOW - 29 * 86_400_000,
     archived: true,
     remoteSessionId: null,
+    remoteLastActiveMs: null,
+    remoteSource: null,
   },
 ];
 
@@ -2365,6 +2374,7 @@ const BOT_CONVERSATIONS: Record<string, BotConversationVm> = {
           "I cannot read your folders yet — no grant is held for this bot, so nothing on the drive was looked at.",
       }),
     ],
+    transcript: "local",
   },
   "01J8BOTSESSIONBBBBBBBBBBBB": {
     session: BOT_SESSIONS[1] as BotSessionVm,
@@ -2386,8 +2396,13 @@ const BOT_CONVERSATIONS: Record<string, BotConversationVm> = {
         finishReason: "failed",
       }),
     ],
+    // Epic 63 (AD-181): this one is read from the gateway, and says so.
+    transcript: "remote",
   },
 };
+
+/** How many follow reads the harness has answered (Story 63.7). */
+let botFollowReads = 0;
 
 /** What the fake stream says, one delta per element. */
 const BOT_FAKE_ANSWER = [
@@ -2706,6 +2721,36 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       ? BOT_SESSIONS
       : BOT_SESSIONS.filter((session) => !session.archived),
   bots_session_open: (payload) => BOT_CONVERSATIONS[String(payload.sessionId)] ?? null,
+  // Story 63.7: the remote conversation is followed. The first read shows the
+  // other device's question landing with the caption up; the second lands
+  // its answer and stops, so the harness shows both states and never polls
+  // forever.
+  bots_session_follow: (payload) => {
+    const open = BOT_CONVERSATIONS[String(payload.sessionId)];
+    if (open === undefined || open.transcript !== "remote") {
+      return { messages: null, live: false, nextPollMs: null };
+    }
+    botFollowReads += 1;
+    const theirs = botMessage({
+      id: "01J8BOTMSG5",
+      sessionId: open.session.id,
+      seq: open.messages.length,
+      role: "user",
+      content: "And the changelog line for the phone?",
+    });
+    if (botFollowReads % 2 === 1) {
+      return { messages: [...open.messages, theirs], live: true, nextPollMs: 2000 };
+    }
+    const answer = botMessage({
+      id: "01J8BOTMSG6",
+      sessionId: open.session.id,
+      seq: open.messages.length + 1,
+      role: "assistant",
+      content: "Bots on the phone, reachable without an account.",
+      finishReason: "stop",
+    });
+    return { messages: [...open.messages, theirs, answer], live: false, nextPollMs: null };
+  },
   // Story 61.6's four. The search really searches — titles and bodies, the two
   // things Rust matches — because a harness whose filter does nothing teaches
   // the reviewer that the filter does nothing. The three writes answer with a
@@ -2742,6 +2787,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
           session,
           latestActivityMs: Math.max(session.updatedMs, newest),
           messageCount: messages.length,
+          // Epic 63 (AD-181): `bots::remote::transcript_source`'s rule — the
+          // conversation's own answer where the mock holds one, else local.
+          transcript: BOT_CONVERSATIONS[session.id]?.transcript ?? "local",
         };
       })
       .sort((a, b) =>

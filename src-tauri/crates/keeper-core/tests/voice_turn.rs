@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use keeper_core::vm::{VoiceStateVm, VoiceUnavailableVm};
 use keeper_core::voice::{
-    advance, perform, silence_budget, Effect, PhraseRefused, Turn, TurnEvent, TurnState, VoicePort,
-    VoiceUnavailable, WakePhrase, DEFAULT_WAKE_PHRASE, END_OF_UTTERANCE_PAUSE, LISTENING_LIMITS,
-    NOTHING_HEARD_TIMEOUT,
+    advance, perform, silence_budget, Effect, PhraseRefused, Turn, TurnEvent, TurnState,
+    VoicePlatform, VoicePort, VoiceUnavailable, WakePhrase, DEFAULT_WAKE_PHRASE,
+    END_OF_UTTERANCE_PAUSE, LISTENING_LIMITS, NOTHING_HEARD_TIMEOUT,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,6 +28,8 @@ struct FakePort {
     calls: Mutex<Vec<Call>>,
     refuse_start: Option<VoiceUnavailable>,
     refuse_speak: Option<VoiceUnavailable>,
+    /// Half-duplex when set, so the same fake stands in for either platform.
+    half_duplex: bool,
 }
 
 impl FakePort {
@@ -40,6 +42,13 @@ impl FakePort {
 }
 
 impl VoicePort for FakePort {
+    fn platform(&self) -> VoicePlatform {
+        if self.half_duplex {
+            VoicePlatform::MACOS
+        } else {
+            VoicePlatform::IOS
+        }
+    }
     fn availability(&self) -> Result<(), VoiceUnavailable> {
         Ok(())
     }
@@ -337,7 +346,7 @@ fn phrase(raw: &str) -> WakePhrase {
 #[test]
 fn voice_driver_matches_the_phrase_while_idle() {
     let port = FakePort::default();
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     let armed = turn.set_wake(Some(phrase("hej keeper")));
     assert_eq!(armed, vec![Effect::OpenMicrophone]);
     perform(&armed, &port, turn.wake()).expect("arming succeeds");
@@ -362,7 +371,7 @@ fn voice_driver_matches_the_phrase_while_idle() {
 #[test]
 fn voice_driver_ignores_transcripts_while_idle_without_a_phrase() {
     let port = FakePort::default();
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     let effects = turn.drive(TurnEvent::FinalHeard("hej keeper".to_owned()), &port);
     assert!(effects.is_empty());
     assert_eq!(turn.state(), &TurnState::Idle);
@@ -374,7 +383,7 @@ fn voice_driver_ignores_transcripts_while_idle_without_a_phrase() {
 #[test]
 fn voice_driver_rearms_the_phrase_after_a_turn_ends_on_its_own() {
     let port = FakePort::default();
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     turn.set_wake(Some(phrase("hej keeper")));
     turn.drive(TurnEvent::WakeMatched, &port);
     turn.drive(TurnEvent::Silence, &port);
@@ -400,7 +409,7 @@ fn voice_driver_rearms_the_phrase_after_a_turn_ends_on_its_own() {
 #[test]
 fn voice_driver_rearms_the_phrase_after_abandon() {
     let port = FakePort::default();
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     turn.set_wake(Some(phrase("hej keeper")));
     turn.drive(TurnEvent::WakeMatched, &port);
     let effects = turn.drive(TurnEvent::Abandoned, &port);
@@ -427,7 +436,7 @@ fn voice_driver_rearms_the_phrase_after_abandon() {
 #[test]
 fn voice_driver_abandon_without_a_phrase_stays_released() {
     let port = FakePort::default();
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     turn.drive(TurnEvent::WakeMatched, &port);
     let effects = turn.drive(TurnEvent::Abandoned, &port);
     assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
@@ -441,7 +450,7 @@ fn voice_driver_abandon_without_a_phrase_stays_released() {
 #[test]
 fn voice_driver_does_not_rearm_after_failure_because_the_port_would_refuse_again() {
     let port = FakePort::default();
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     turn.set_wake(Some(phrase("hej keeper")));
     turn.drive(TurnEvent::WakeMatched, &port);
     let effects = turn.drive(TurnEvent::Failed("the device refused".to_owned()), &port);
@@ -460,7 +469,7 @@ fn voice_driver_does_not_rearm_after_failure_because_the_port_would_refuse_again
 #[test]
 fn voice_driver_clearing_the_phrase_releases_the_microphone() {
     let port = FakePort::default();
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     turn.set_wake(Some(phrase("hej keeper")));
     let effects = turn.set_wake(None);
     assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
@@ -472,7 +481,7 @@ fn voice_driver_clearing_the_phrase_releases_the_microphone() {
 /// Setting the phrase mid-turn changes nothing about the device now.
 #[test]
 fn voice_driver_setting_the_phrase_mid_turn_touches_nothing() {
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     turn.apply(TurnEvent::WakeMatched);
     assert!(turn.set_wake(Some(phrase("hej keeper"))).is_empty());
     assert_eq!(turn.state(), &listening(""));
@@ -488,7 +497,7 @@ fn voice_driver_fails_the_turn_when_the_port_refuses_to_listen() {
         }),
         ..FakePort::default()
     };
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     let effects = turn.drive(TurnEvent::WakeMatched, &port);
     assert_eq!(
         effects,
@@ -516,7 +525,7 @@ fn voice_driver_fails_the_turn_when_the_port_refuses_to_speak() {
         refuse_speak: Some(VoiceUnavailable::Unsupported),
         ..FakePort::default()
     };
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     turn.drive(TurnEvent::WakeMatched, &port);
     turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
     turn.drive(TurnEvent::AnswerDone("hello".to_owned()), &port);
@@ -537,7 +546,7 @@ fn voice_driver_fails_the_turn_when_the_port_refuses_to_speak() {
 #[test]
 fn voice_driver_orders_port_calls_for_barge_in() {
     let port = FakePort::default();
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     turn.drive(TurnEvent::WakeMatched, &port);
     turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
     turn.drive(TurnEvent::AnswerDone("a long answer".to_owned()), &port);
@@ -558,7 +567,7 @@ fn voice_driver_orders_port_calls_for_barge_in() {
 /// must say about the phrase.
 #[test]
 fn voice_state_projects_to_its_view_model() {
-    let mut turn = Turn::new();
+    let mut turn = Turn::new(VoicePlatform::IOS);
     assert_eq!(
         turn.vm(),
         VoiceStateVm::Idle {
@@ -598,9 +607,10 @@ fn voice_state_projects_to_its_view_model() {
 /// missing model, the locale.
 #[test]
 fn voice_unavailable_projects_its_sentence_and_locale() {
-    let vm = VoiceUnavailableVm::from(&VoiceUnavailable::NoOnDeviceModel {
+    let vm = VoiceUnavailable::NoOnDeviceModel {
         locale: "pl_PL".to_owned(),
-    });
+    }
+    .vm(&VoicePlatform::IOS);
     match vm {
         VoiceUnavailableVm::NoOnDeviceModel { locale, message } => {
             assert_eq!(locale, "pl_PL");
@@ -610,7 +620,7 @@ fn voice_unavailable_projects_its_sentence_and_locale() {
         other => panic!("{other:?}"),
     }
     assert!(matches!(
-        VoiceUnavailableVm::from(&VoiceUnavailable::NotAuthorized),
+        VoiceUnavailable::NotAuthorized.vm(&VoicePlatform::IOS),
         VoiceUnavailableVm::NotAuthorized { .. }
     ));
     let sink: keeper_core::voice::EventSink = Arc::new(|_| {});
@@ -626,13 +636,16 @@ fn voice_unavailable_projects_its_sentence_and_locale() {
 #[test]
 fn voice_missing_recognizer_is_named_as_a_build_defect() {
     let why = VoiceUnavailable::NoRecognizer;
-    let message = why.to_string();
+    let message = why.message(&VoicePlatform::IOS);
     assert!(message.contains("Speech"), "{message}");
     assert!(message.contains("build"), "{message}");
     assert!(!message.contains("Settings"), "{message}");
     assert!(!message.contains("download that language"), "{message}");
-    assert_ne!(message, VoiceUnavailable::Unsupported.to_string());
-    match VoiceUnavailableVm::from(&why) {
+    assert_ne!(
+        message,
+        VoiceUnavailable::Unsupported.message(&VoicePlatform::IOS)
+    );
+    match why.vm(&VoicePlatform::IOS) {
         VoiceUnavailableVm::NoRecognizer { message: carried } => assert_eq!(carried, message),
         other => panic!("{other:?}"),
     }

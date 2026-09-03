@@ -19,13 +19,14 @@
  * one list, which is how a row moves between two reads for no reason a reader
  * can see.
  *
- * **Continue is not a verb of its own.** Opening a conversation replays it from
- * keeper's store, which is the whole of FR-382: the same click on a live row and
- * on an archived one, with the endpoint up or down, because nothing is fetched
- * from the far side to read what was already said. Where a conversation holds a
- * remote session id, the open row says so in one sentence — the remote may have
- * compressed its own copy into a renamed successor, and keeper's record is
- * unaffected by that because keeper's record is the record (AD-154).
+ * **Continue is not a verb of its own.** Opening a conversation reads it —
+ * the same click on a live row and on an archived one. Where the conversation
+ * names a gateway session and the gateway has a session API, what is read is
+ * the gateway's own transcript, the one every device writes to (Epic 63,
+ * AD-176); otherwise it is keeper's store, with the endpoint up or down. The
+ * row says which (`transcript`, AD-181): a `Remote` mark and the gateway's
+ * last-active age in place of a local message count, and on the open row one
+ * sentence naming the session, which door wrote it and when it last moved.
  *
  * **Archive is a column and delete is a transaction.** Archiving needs no
  * confirmation: it is reversible with the same control, and a dialog in front of
@@ -73,6 +74,7 @@ import {
   botsSessionRename,
   botsSessionsSearch,
 } from "@/lib/ipc/client";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
 
 /** The list's accessible name. */
@@ -134,26 +136,58 @@ export const BOT_SESSION_ARCHIVED_MARK = "Archived";
  * Named rather than counted-and-anonymous, because the reader is about to lose
  * one specific thing and "this conversation" is what a dialog says when it has
  * not checked which one it is aimed at.
+ *
+ * `device` is which machine's store this is (Story 63.1, FR-411): one
+ * sentence, and the phone tier says "this phone" where the Mac says "this
+ * Mac" — a phone told its conversation leaves "this Mac" is being lied to.
  */
 export const BOT_SESSION_DELETE_TITLE = (title: string) => `Delete "${title}"?`;
-export const BOT_SESSION_DELETE_BODY = (messageCount: number) =>
-  `The conversation and its ${countLabel(messageCount, MESSAGES)} are removed from keeper's own store on this Mac, in one step, and cannot be brought back. Nothing on your drive changes, and the model is not told.`;
+export const BOT_SESSION_DELETE_BODY = (messageCount: number, device: string) =>
+  `The conversation and its ${countLabel(messageCount, MESSAGES)} are removed from keeper's own store on ${device}, in one step, and cannot be brought back. Nothing on your drive changes, and the model is not told.`;
 export const BOT_SESSION_DELETE_CONFIRM = "Delete conversation";
 export const BOT_SESSION_DELETE_CANCEL = "Keep it";
 
+/** The device words the delete body is read with, per tier. */
+export const BOT_SESSION_DEVICE_MAC = "this Mac";
+export const BOT_SESSION_DEVICE_PHONE = "this phone";
+
 /**
- * The remote-session sentence, shown on an open conversation that holds one
- * (Story 61.6, §2.10).
+ * The remote-transcript sentences, shown on an open conversation that names a
+ * gateway session (Story 61.6 §2.10; Epic 63, AD-176, AD-181).
  *
- * The id is worth showing because it is the handle a person needs to ask the
- * far side about their own data. The second half is worth saying because the
- * far side may have replaced it: a gateway that compresses a session mints a
- * renamed successor, so the id keeper holds can name something that no longer
- * exists — and keeper's replay is unaffected either way, because keeper's store
- * is the record.
+ * Two sentences for two facts, chosen by `transcript` and never by whether the
+ * id is non-null. On a `remote` row the transcript on screen **is** the
+ * gateway's: every device that talks to this bot writes into it, so the note
+ * says which door wrote it and when the gateway last saw it move — the label
+ * AD-181 requires so two devices writing one conversation reads as the normal
+ * state it is. On a `local` row that still holds an id, the endpoint keeps no
+ * session API keeper can reach (an older Hermes, an edited provider), so the
+ * older sentence stands: keeper replays its own copy, and the far side may
+ * have compressed its copy into a renamed successor.
  */
 export const BOT_SESSION_REMOTE_NOTE = (remoteSessionId: string) =>
   `The other side calls this session ${remoteSessionId}. keeper replays from its own store, and the other side may have compressed its copy into a renamed successor.`;
+export const BOT_SESSION_REMOTE_TRANSCRIPT_NOTE = (
+  remoteSessionId: string,
+  source: string | null,
+  lastActive: string,
+) =>
+  `Read from the gateway's session ${remoteSessionId}${source !== null ? `, written via ${source}` : ""}${lastActive !== "" ? `, last active ${lastActive}` : ""}. Every device you use with this bot writes here; keeper shows the shared copy.`;
+
+/**
+ * The marker a row whose transcript lives on the gateway carries, in place of
+ * the local message count: keeper's own copy may hold none of the turns
+ * another device wrote, so counting it would be a number about the wrong
+ * thing.
+ */
+export const BOT_SESSION_REMOTE_MARK = "Remote";
+
+/** The age a row shows: the gateway's `last_active` on a remote row. */
+export function botSessionActivityMs(row: BotSessionRowVm): number {
+  return row.transcript === "remote" && row.session.remoteLastActiveMs !== null
+    ? row.session.remoteLastActiveMs
+    : row.latestActivityMs;
+}
 
 /** The list's counting noun. Local, because no other surface counts these. */
 const CONVERSATIONS: CountNoun = { one: "conversation", many: "conversations" };
@@ -183,7 +217,11 @@ export function BotSessionList({
    * Read as a **revision signal** and not as the rows: this component queries
    * its own bounded, searched page, and the pane re-reads the store's list
    * after every send. A new array identity therefore means "something happened
-   * to the conversations" and is exactly the moment this page is stale.
+   * to the conversations" and is exactly the moment this page is stale. The
+   * pane's list read is also where the gateway's sessions are folded in
+   * (Epic 63), so a conversation another device started reaches this page on
+   * the same signal — and only then: what another device does between two
+   * reads is Story 63.7's polling, not this component's.
    */
   sessions: BotSessionVm[];
   /** The conversation on screen, or `null` for a fresh one. */
@@ -204,6 +242,9 @@ export function BotSessionList({
   const [deleting, setDeleting] = useState<BotSessionRowVm | null>(null);
   /** Bumped by every write here, so the query re-runs on our own changes too. */
   const [revision, setRevision] = useState(0);
+  // Which machine the delete dialog names (Story 63.1): the tier's own word.
+  const phone = useIsReducedCapabilityPlatform();
+  const device = phone ? BOT_SESSION_DEVICE_PHONE : BOT_SESSION_DEVICE_MAC;
   /**
    * A monotonic read token, the recordings archive's stale guard (`:148`):
    * a slow first query landing after a fast second one must not restore the
@@ -412,11 +453,17 @@ export function BotSessionList({
                         </span>
                       )}
                       <span className="figures shrink-0 text-muted-foreground text-xs">
-                        {formatDraftAge(row.latestActivityMs)}
+                        {formatDraftAge(botSessionActivityMs(row))}
                       </span>
-                      <span className="figures shrink-0 text-muted-foreground text-xs">
-                        {countLabel(row.messageCount, MESSAGES)}
-                      </span>
+                      {row.transcript === "remote" ? (
+                        <span className="shrink-0 text-muted-foreground text-xs">
+                          {BOT_SESSION_REMOTE_MARK}
+                        </span>
+                      ) : (
+                        <span className="figures shrink-0 text-muted-foreground text-xs">
+                          {countLabel(row.messageCount, MESSAGES)}
+                        </span>
+                      )}
                     </Button>
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
@@ -460,10 +507,19 @@ export function BotSessionList({
                 )}
                 {/* Only on the conversation being read, and only when one is
                   held: a list of ids nobody asked about is noise, and a row
-                  with no id has nothing honest to say here. */}
+                  with no id has nothing honest to say here. Which sentence is
+                  `transcript`'s call (AD-181). */}
                 {row.session.id === openId && row.session.remoteSessionId !== null && (
                   <p className="text-muted-foreground text-xs">
-                    {BOT_SESSION_REMOTE_NOTE(row.session.remoteSessionId)}
+                    {row.transcript === "remote"
+                      ? BOT_SESSION_REMOTE_TRANSCRIPT_NOTE(
+                          row.session.remoteSessionId,
+                          row.session.remoteSource,
+                          row.session.remoteLastActiveMs !== null
+                            ? formatDraftAge(row.session.remoteLastActiveMs)
+                            : "",
+                        )
+                      : BOT_SESSION_REMOTE_NOTE(row.session.remoteSessionId)}
                   </p>
                 )}
               </li>
@@ -479,7 +535,7 @@ export function BotSessionList({
               {BOT_SESSION_DELETE_TITLE(deleting?.session.title ?? "")}
             </AlertDialogTitle>
             <AlertDialogDescription>
-              {BOT_SESSION_DELETE_BODY(deleting?.messageCount ?? 0)}
+              {BOT_SESSION_DELETE_BODY(deleting?.messageCount ?? 0, device)}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

@@ -160,6 +160,9 @@ const SESSION: BotSessionVm = {
   updatedMs: 1,
   archived: false,
   remoteSessionId: null,
+  // Epic 63's two gateway facts: absent on a row no gateway described.
+  remoteLastActiveMs: null,
+  remoteSource: null,
 };
 
 function message(overrides: Partial<BotMessageVm> & { id: string; role: string }): BotMessageVm {

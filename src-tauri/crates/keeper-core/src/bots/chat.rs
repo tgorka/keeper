@@ -29,6 +29,7 @@
 
 use std::time::{Duration, Instant};
 
+use reqwest::header::HeaderValue;
 use serde_json::{json, Map, Value};
 
 use crate::bots::error::BotsError;
@@ -162,6 +163,15 @@ pub struct ChatRequest {
     pub temperature: Option<f64>,
     /// Completion-length ceiling, if the caller set one.
     pub max_tokens: Option<u32>,
+    /// The server-side session this turn continues, where the endpoint keeps
+    /// one (Epic 63, AD-176). Sent as the
+    /// [`crate::bots::remote::SESSION_HEADER`] request header and never in the
+    /// body — the header is the continuity mechanism the OpenAI-compatible
+    /// path documents. `None` sends no header, which is today's behaviour on
+    /// Ollama and on a Hermes that advertised no `session_continuity_header`;
+    /// the decision of whether to fill it is
+    /// [`crate::bots::remote::continuity_id`]'s, never this module's.
+    pub session_id: Option<String>,
 }
 
 /// Turn a [`ChatRequest`] into the JSON body for one provider kind.
@@ -967,6 +977,7 @@ pub async fn stream_chat(
             endpoint,
             &url,
             &body,
+            request.session_id.as_deref(),
             options,
             cancel.clone(),
             sink,
@@ -1028,18 +1039,38 @@ fn backoff(base: Duration, attempt: u32) -> Duration {
     base.saturating_mul(factor)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn attempt_stream(
     client: &reqwest::Client,
     endpoint: &Endpoint,
     url: &str,
     body: &Value,
+    session_id: Option<&str>,
     options: &ChatOptions,
     mut cancel: CancelSignal,
     sink: ChatSink<'_>,
 ) -> Result<ChatOutcome, Box<AttemptFailure>> {
     let started = Instant::now();
 
-    let request = client.post(url).json(body);
+    let mut request = client.post(url).json(body);
+    // The continuity header (AD-176). Sent on every attempt of a turn, so a
+    // retried request continues the same server-side session as the one that
+    // produced no bytes; a value the header grammar refuses is the same named
+    // refusal a bad credential is, because a turn that silently dropped its
+    // identity would mint a second session on the far side.
+    if let Some(session_id) = session_id {
+        let value = HeaderValue::from_str(session_id).map_err(|_| {
+            Box::new(AttemptFailure {
+                error: BotsError::Protocol {
+                    detail: "the session id cannot be sent as a header".to_owned(),
+                },
+                saw_stream_bytes: false,
+                partial: None,
+                retry_after: None,
+            })
+        })?;
+        request = request.header(crate::bots::remote::SESSION_HEADER, value);
+    }
     let request = authorize(request, endpoint.token.as_deref()).map_err(|error| {
         Box::new(AttemptFailure {
             error,

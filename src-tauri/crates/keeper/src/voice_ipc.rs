@@ -27,7 +27,8 @@
 //!
 //! # Every target
 //!
-//! Only iOS has a port ([`crate::voice_ios`]); every other target holds
+//! iOS has a port ([`crate::voice_ios`]) and so does macOS
+//! ([`crate::voice_macos`], Story 63.4); every other target holds
 //! [`AbsentPort`], whose every answer is [`VoiceUnavailable::Unsupported`],
 //! so the command list is identical everywhere and a desktop that asks gets
 //! a sentence rather than "command not found" (AD-27, the `sessions_ipc`
@@ -37,13 +38,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use keeper_core::registry;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm};
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 use keeper_core::voice::EventSink;
-#[cfg(not(target_os = "ios"))]
-use keeper_core::voice::VoiceUnavailable;
 use keeper_core::voice::{
     silence_budget, ConsentPort, Turn, TurnEvent, VoicePort, WakePhrase, LISTENING_LIMITS,
 };
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
 use tauri::ipc::Channel;
 use tauri::State;
 
@@ -67,9 +68,10 @@ struct Voice {
 /// The single voice state for the process.
 fn voice() -> MutexGuard<'static, Voice> {
     static VOICE: std::sync::LazyLock<Mutex<Voice>> = std::sync::LazyLock::new(|| {
+        let port = platform_port();
         Mutex::new(Voice {
-            turn: Turn::new(),
-            port: platform_port(),
+            turn: Turn::new(port.platform()),
+            port,
             watcher: None,
             watch_serial: 0,
             generation: 0,
@@ -105,24 +107,52 @@ fn platform_consent() -> Arc<dyn ConsentPort> {
     ios_port()
 }
 
+/// The one macOS port (Story 63.4): the same worker answers as [`VoicePort`]
+/// and as [`ConsentPort`], for the same reason as on iOS — a permission
+/// dialog and a capture never race on two threads.
+#[cfg(target_os = "macos")]
+fn macos_port() -> Arc<crate::voice_macos::MacVoicePort> {
+    static PORT: std::sync::LazyLock<Arc<crate::voice_macos::MacVoicePort>> =
+        std::sync::LazyLock::new(|| Arc::new(crate::voice_macos::MacVoicePort::new(sink())));
+    Arc::clone(&PORT)
+}
+
 /// The port for this target.
-#[cfg(not(target_os = "ios"))]
+#[cfg(target_os = "macos")]
+fn platform_port() -> Arc<dyn VoicePort> {
+    macos_port()
+}
+
+/// The consent half for this target (FR-408).
+#[cfg(target_os = "macos")]
+fn platform_consent() -> Arc<dyn ConsentPort> {
+    macos_port()
+}
+
+/// The port for this target.
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 fn platform_port() -> Arc<dyn VoicePort> {
     Arc::new(AbsentPort)
 }
 
 /// The consent half for this target: nothing to ask for.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 fn platform_consent() -> Arc<dyn ConsentPort> {
     Arc::new(AbsentPort)
 }
 
-/// The port every target but iOS holds: honest, non-panicking, unsupported.
-#[cfg(not(target_os = "ios"))]
+/// The port every target without one holds: honest, non-panicking,
+/// unsupported.
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 struct AbsentPort;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 impl VoicePort for AbsentPort {
+    /// No platform to name: this port covers every target without one, and
+    /// its one sentence names no device.
+    fn platform(&self) -> VoicePlatform {
+        VoicePlatform::ABSENT
+    }
     fn availability(&self) -> Result<(), VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
     }
@@ -136,7 +166,7 @@ impl VoicePort for AbsentPort {
     fn stop_speaking(&self) {}
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 impl ConsentPort for AbsentPort {
     fn consent(&self) -> Result<keeper_core::voice::Consent, VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
@@ -148,14 +178,14 @@ impl ConsentPort for AbsentPort {
 
 /// Where the port delivers what it heard: off the framework thread, onto the
 /// runtime, into [`transition`].
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 fn sink() -> EventSink {
     Arc::new(deliver)
 }
 
 /// Hand a port event to the turn without taking the lock on the caller's
 /// thread.
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 fn deliver(event: TurnEvent) {
     tauri::async_runtime::spawn(async move {
         transition(event);
@@ -199,6 +229,13 @@ fn push(voice: &mut Voice) {
     }
 }
 
+/// The turn's current snapshot, for a surface that lives in Rust — the tray
+/// item's tick (Story 63.5) reads it the way `ipc::recording_snapshot` is
+/// read. No decision here; the same projection the watcher streams.
+pub fn voice_snapshot() -> VoiceStateVm {
+    voice().turn.vm()
+}
+
 /// A phrase refusal is the person's input, so it says what to type instead
 /// and is `internal` only in the sense the taxonomy has no better word — the
 /// message is the point.
@@ -223,10 +260,10 @@ pub fn voice_availability() -> Result<Option<VoiceUnavailableVm>, IpcError> {
     let port = Arc::clone(&voice().port);
     let refusal = port.availability().err();
     match &refusal {
-        Some(why) => tracing::info!(%why, "voice: unavailable"),
+        Some(why) => tracing::info!(?why, "voice: unavailable"),
         None => tracing::info!("voice: available"),
     }
-    Ok(refusal.as_ref().map(VoiceUnavailableVm::from))
+    Ok(refusal.as_ref().map(|why| why.vm(&port.platform())))
 }
 
 /// Register `channel` as the watcher and return its id.
@@ -325,10 +362,15 @@ pub fn voice_wake_set(
     if let Err(why) = keeper_core::voice::perform(&effects, port.as_ref(), voice.turn.wake()) {
         // The choice is recorded; the device refused to open for it. Say so
         // through the turn, which releases whatever was half-opened.
-        let recovery = voice
-            .turn
-            .drive(TurnEvent::Failed(why.to_string()), port.as_ref());
-        tracing::warn!(%why, ?recovery, "voice: the port refused to listen for the phrase");
+        let recovery = voice.turn.drive(
+            TurnEvent::Failed(why.message(&port.platform())),
+            port.as_ref(),
+        );
+        tracing::warn!(
+            ?why,
+            ?recovery,
+            "voice: the port refused to listen for the phrase"
+        );
     }
     after_change(&mut voice);
     Ok(VoiceWakeVm {
@@ -361,5 +403,6 @@ pub async fn voice_authorize() -> Result<Option<VoiceUnavailableVm>, IpcError> {
         account_id: None,
         retriable: true,
     })?;
-    Ok(verdict.err().as_ref().map(VoiceUnavailableVm::from))
+    let platform = voice().port.platform();
+    Ok(verdict.err().as_ref().map(|why| why.vm(&platform)))
 }

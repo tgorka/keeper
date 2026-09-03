@@ -35,14 +35,16 @@
 
 pub mod authorization;
 pub mod phrase;
+pub mod platform;
 pub mod turn;
 
 use std::sync::Arc;
 
 pub use authorization::{authorize, next_ask, Ask, Consent, ConsentPort, Permission};
 pub use phrase::{PhraseRefused, WakePhrase};
+pub use platform::VoicePlatform;
 pub use turn::{
-    advance, silence_budget, Effect, TurnEvent, TurnState, END_OF_UTTERANCE_PAUSE,
+    advance, may_record, silence_budget, Effect, TurnEvent, TurnState, END_OF_UTTERANCE_PAUSE,
     NOTHING_HEARD_TIMEOUT,
 };
 
@@ -68,9 +70,19 @@ pub const LISTENING_LIMITS: &str = "Turn listening on while keeper is in front a
 
 /// Why the port cannot listen or speak right now.
 ///
-/// Each `Display` is the sentence the surface shows. `NoOnDeviceModel` is the
-/// one that matters: it names the locale so the person knows which language
-/// to download, and says why keeper will not simply use the network instead.
+/// Each variant is a cause; the sentence the surface shows is
+/// [`VoiceUnavailable::message`], written once per cause with the
+/// platform's nouns filled in from a [`VoicePlatform`] (Story 63.3): the
+/// same cause reads "this phone … Settings > keeper" on iOS and "this Mac …
+/// System Settings > Privacy & Security > Microphone" on macOS, and no
+/// sentence exists twice. `NoOnDeviceModel` is the one that matters: it
+/// names the locale so the person knows which language to download, and
+/// says why keeper will not simply use the network instead.
+///
+/// `NoOnDeviceRecognition` is its neighbour and must stay distinct from it:
+/// a recogniser that reports `supportsOnDeviceRecognition == false` cannot
+/// run on the device whatever is downloaded, so the sentence must not send
+/// the person to a download that changes nothing (AD-175).
 ///
 /// `NoRecognizer` is the one that must not be confused with any other. A
 /// build whose Xcode project does not link `Speech.framework` still compiles
@@ -81,50 +93,83 @@ pub const LISTENING_LIMITS: &str = "Turn listening on while keeper is in front a
 /// looked configured and inert with nothing anyone could act on. So the
 /// port names the missing class as a defect of the build, in words that
 /// cannot be mistaken for a permission or a language download.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceUnavailable {
     /// The person has not allowed the microphone or speech recognition, or
     /// the device restricts them.
-    #[error(
-        "keeper is not allowed to use the microphone or speech recognition on this phone — allow both under Settings > keeper"
-    )]
     NotAuthorized,
     /// The recogniser exists for the locale but has no on-device model, and
     /// keeper refuses the server fallback.
-    #[error(
-        "on-device speech recognition for {locale} is not on this phone — download that language under Settings > General > Keyboard > Dictation Languages; keeper never sends your voice to a server"
-    )]
     NoOnDeviceModel {
         /// The locale identifier the recogniser was asked for (e.g. `pl_PL`).
         locale: String,
     },
+    /// The recogniser for the locale reports that it cannot run on the
+    /// device at all (`supportsOnDeviceRecognition == false`), and keeper
+    /// refuses the server fallback. No download changes this one.
+    NoOnDeviceRecognition {
+        /// The locale identifier the recogniser was asked for (e.g. `pl_PL`).
+        locale: String,
+    },
     /// The device has no audio input route.
-    #[error("no microphone is available on this device")]
     NoMicrophone,
     /// `SFSpeechRecognizer` is not registered in this process: the build
     /// was linked without `Speech.framework`. A defect of the build, not of
-    /// the phone, its settings or its languages.
-    #[error(
-        "this build of keeper was made without Apple's Speech framework, so it cannot recognise speech on any phone — no setting or language download changes that; install a build whose Xcode project links Speech.framework"
-    )]
+    /// the device, its settings or its languages.
     NoRecognizer,
     /// This build has no voice port.
-    #[error("voice is not available in this build")]
     Unsupported,
 }
 
-impl From<&VoiceUnavailable> for VoiceUnavailableVm {
-    fn from(why: &VoiceUnavailable) -> Self {
-        let message = why.to_string();
-        match why {
-            VoiceUnavailable::NotAuthorized => VoiceUnavailableVm::NotAuthorized { message },
-            VoiceUnavailable::NoOnDeviceModel { locale } => VoiceUnavailableVm::NoOnDeviceModel {
+impl VoiceUnavailable {
+    /// The sentence the surface shows, with `platform`'s nouns in it.
+    ///
+    /// Every hole is one of [`VoicePlatform`]'s fields; the words around the
+    /// holes are the same on every platform. `NoRecognizer` names the kind
+    /// of device only to say that no device of that kind is at fault — the
+    /// defect is the build's — and `Unsupported` has nothing to name.
+    pub fn message(&self, platform: &VoicePlatform) -> String {
+        let VoicePlatform {
+            noun,
+            allow,
+            download,
+            ..
+        } = platform;
+        match self {
+            Self::NotAuthorized => format!(
+                "keeper is not allowed to use the microphone or speech recognition on this {noun} — {allow}"
+            ),
+            Self::NoOnDeviceModel { locale } => format!(
+                "on-device speech recognition for {locale} is not on this {noun} — {download}; keeper never sends your voice to a server"
+            ),
+            Self::NoOnDeviceRecognition { locale } => format!(
+                "speech recognition for {locale} cannot run on this {noun} itself, only through a server, and keeper never sends your voice to a server — downloading a language does not change that"
+            ),
+            Self::NoMicrophone => "no microphone is available on this device".to_owned(),
+            Self::NoRecognizer => format!(
+                "this build of keeper was made without Apple's Speech framework, so it cannot recognise speech on any {noun} — no setting or language download changes that; install a build whose Xcode project links Speech.framework"
+            ),
+            Self::Unsupported => "voice is not available in this build".to_owned(),
+        }
+    }
+
+    /// The refusal as the surface receives it: the kind, the locale where
+    /// there is one, and [`VoiceUnavailable::message`].
+    pub fn vm(&self, platform: &VoicePlatform) -> VoiceUnavailableVm {
+        let message = self.message(platform);
+        match self {
+            Self::NotAuthorized => VoiceUnavailableVm::NotAuthorized { message },
+            Self::NoOnDeviceModel { locale } => VoiceUnavailableVm::NoOnDeviceModel {
                 locale: locale.clone(),
                 message,
             },
-            VoiceUnavailable::NoMicrophone => VoiceUnavailableVm::NoMicrophone { message },
-            VoiceUnavailable::NoRecognizer => VoiceUnavailableVm::NoRecognizer { message },
-            VoiceUnavailable::Unsupported => VoiceUnavailableVm::Unsupported { message },
+            Self::NoOnDeviceRecognition { locale } => VoiceUnavailableVm::NoOnDeviceRecognition {
+                locale: locale.clone(),
+                message,
+            },
+            Self::NoMicrophone => VoiceUnavailableVm::NoMicrophone { message },
+            Self::NoRecognizer => VoiceUnavailableVm::NoRecognizer { message },
+            Self::Unsupported => VoiceUnavailableVm::Unsupported { message },
         }
     }
 }
@@ -140,6 +185,11 @@ pub type EventSink = Arc<dyn Fn(TurnEvent) + Send + Sync>;
 /// `AVAudioEngine` and `AVSpeechSynthesizer`; tests implement it over a fake.
 /// `keeper-core` never touches CoreAudio.
 ///
+/// A port names the platform it runs on ([`VoicePort::platform`]), and that
+/// is required rather than defaulted: a default would be a platform nobody
+/// named, and the whole of Story 63.3 is that the differences between the
+/// platforms are named, not discovered (AD-175).
+///
 /// A port reports back through the [`EventSink`] it was constructed with:
 /// [`TurnEvent::PartialHeard`] and [`TurnEvent::FinalHeard`] from
 /// recognition, [`TurnEvent::SpeechDetected`] when a new transcript starts
@@ -148,6 +198,10 @@ pub type EventSink = Arc<dyn Fn(TurnEvent) + Send + Sync>;
 /// `WakeMatched` — matching is [`Turn`]'s — and never runs a silence clock;
 /// that is the shell's, budgeted by [`silence_budget`].
 pub trait VoicePort: Send + Sync {
+    /// The platform this port runs on: the nouns its refusals name and
+    /// whether the OS keeps its own voice out of the transcript.
+    fn platform(&self) -> VoicePlatform;
+
     /// Whether listening and speaking can work right now, and if not, why.
     fn availability(&self) -> Result<(), VoiceUnavailable>;
 
@@ -161,7 +215,9 @@ pub trait VoicePort: Send + Sync {
     /// Idempotent.
     fn stop_listening(&self);
 
-    /// Read `text` aloud. The microphone, if open, stays open for barge-in.
+    /// Read `text` aloud. Whether the microphone is open meanwhile is the
+    /// turn's decision ([`may_record`]): on a full-duplex platform it stays
+    /// open for barge-in; on a half-duplex one the turn released it first.
     fn speak(&self, text: &str) -> Result<(), VoiceUnavailable>;
 
     /// Stop reading aloud immediately. Idempotent.
@@ -169,7 +225,7 @@ pub trait VoicePort: Send + Sync {
 }
 
 /// The turn the shell holds: the machine's state plus the wake phrase, and
-/// the two rules that sit between an event and the table.
+/// the three rules that sit between an event and the table.
 ///
 /// **Matching**: while `Idle` with a phrase set, a transcript that contains
 /// the phrase becomes [`TurnEvent::WakeMatched`]; every other transcript in
@@ -181,9 +237,15 @@ pub trait VoicePort: Send + Sync {
 /// turn*, not the listening (Story 62.5: someone driving cannot come back
 /// to re-arm it). Only a failure leaves the device released: a port that
 /// refused to open would refuse again, and re-arming would be a loop. The
-/// switch, not a stop, is what turns listening off.
-#[derive(Debug, Default)]
+/// switch, not a stop, is what turns listening off. **Half-duplex**
+/// (AD-175): where [`may_record`] says the device may not be open in the
+/// state the table moved to, the turn does not open it and releases it if
+/// it was — before the `Speak`, so the port never records its own answer.
+/// On iOS the rule allows every state the table opens the device in, so
+/// nothing there changes.
+#[derive(Debug)]
 pub struct Turn {
+    platform: VoicePlatform,
     state: TurnState,
     wake: Option<WakePhrase>,
     /// Whether the last effect touching the device opened it. What the
@@ -192,9 +254,20 @@ pub struct Turn {
 }
 
 impl Turn {
-    /// An idle turn with no phrase.
-    pub fn new() -> Self {
-        Self::default()
+    /// An idle turn with no phrase, on `platform` — the port's own answer,
+    /// [`VoicePort::platform`].
+    pub fn new(platform: VoicePlatform) -> Self {
+        Self {
+            platform,
+            state: TurnState::Idle,
+            wake: None,
+            microphone_open: false,
+        }
+    }
+
+    /// The platform this turn's refusals and its half-duplex rule are for.
+    pub fn platform(&self) -> &VoicePlatform {
+        &self.platform
     }
 
     /// Where the turn is.
@@ -258,8 +331,21 @@ impl Turn {
         {
             effects.push(Effect::OpenMicrophone);
         }
+        if !may_record(&self.platform, &next) && device_after(self.microphone_open, &effects) {
+            // AD-175: the table would leave the device open in a state this
+            // platform may not record in. Do not open it, and close it if it
+            // is open — first, so it is closed before the `Speak`.
+            effects.retain(|effect| *effect != Effect::OpenMicrophone);
+            if self.microphone_open {
+                effects.insert(0, Effect::ReleaseMicrophone);
+            }
+        }
         self.state = next;
         self.note_device(&effects);
+        debug_assert!(
+            !self.microphone_open || may_record(&self.platform, &self.state),
+            "the device is open in a state the platform may not record in"
+        );
         effects
     }
 
@@ -269,7 +355,7 @@ impl Turn {
     pub fn drive(&mut self, event: TurnEvent, port: &dyn VoicePort) -> Vec<Effect> {
         let mut effects = self.apply(event);
         if let Err(why) = perform(&effects, port, self.wake.as_ref()) {
-            let recovery = self.apply(TurnEvent::Failed(why.to_string()));
+            let recovery = self.apply(TurnEvent::Failed(why.message(&self.platform)));
             // A failed release cannot fail: `stop_*` are infallible.
             let _ = perform(&recovery, port, self.wake.as_ref());
             effects.extend(recovery);
@@ -297,14 +383,18 @@ impl Turn {
     }
 
     fn note_device(&mut self, effects: &[Effect]) {
-        for effect in effects {
-            match effect {
-                Effect::OpenMicrophone => self.microphone_open = true,
-                Effect::ReleaseMicrophone => self.microphone_open = false,
-                _ => {}
-            }
-        }
+        self.microphone_open = device_after(self.microphone_open, effects);
     }
+}
+
+/// Whether the device is open once `effects` have been carried out, given
+/// that it is `open` now.
+fn device_after(open: bool, effects: &[Effect]) -> bool {
+    effects.iter().fold(open, |open, effect| match effect {
+        Effect::OpenMicrophone => true,
+        Effect::ReleaseMicrophone => false,
+        _ => open,
+    })
 }
 
 /// Carry out `effects` on `port`, in order, stopping at the first refusal.

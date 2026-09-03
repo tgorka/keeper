@@ -120,3 +120,34 @@ safe binding. Current inventory:
   SAFETY comment is the argument. No server recognition path exists in the file, and the
   port never prompts on its own: the two permission dialogs are reached only through
   `ConsentPort`, whose timing is decided in `keeper_core::voice::authorization`.
+- macOS voice port (Epic 63, Story 63.4, FR-417–FR-419, FR-408, NFR-53, AD-175):
+  `SFSpeechRecognizer` (`authorizationStatus`, `requestAuthorization:`, `initWithLocale:`,
+  `supportsOnDeviceRecognition`, `isAvailable`, `recognitionTaskWithRequest:resultHandler:`),
+  `SFSpeechAudioBufferRecognitionRequest` (`setRequiresOnDeviceRecognition:` — always
+  `true`, `appendAudioPCMBuffer:`, `endAudio`), `SFSpeechRecognitionTask cancel`,
+  `AVAudioApplication` (`sharedInstance`, `recordPermission`,
+  `requestRecordPermissionWithCompletionHandler:` — macOS 14+; on 11–13 the class is
+  absent and the port reports the microphone grant as denied, at error level, rather than
+  guess), `AVAudioEngine` (`inputNode`, `inputFormatForBus:` for the no-input-device check,
+  `outputFormatForBus:`, `installTapOnBus:…`, `removeTapOnBus:`, `prepare`,
+  `startAndReturnError:`, `stop`, `isRunning`), `AVSpeechSynthesizer` (`speakUtterance:`,
+  `stopSpeakingAtBoundary:`, `isSpeaking`), `NSNotificationCenter`
+  (`addObserverForName:object:queue:usingBlock:` for
+  `AVAudioEngineConfigurationChangeNotification`, `removeObserver:`) and `NSProcessInfo`
+  (`endActivity:` for the App Nap assertion; `beginActivityWithOptions:reason:` is a safe
+  binding) via objc2-speech, objc2-avf-audio and objc2-foundation, behind
+  `keeper_core::voice::VoicePort` and `keeper_core::voice::ConsentPort` — seventeen
+  function-level `#[allow(unsafe_code)]` fns in `crates/keeper/src/voice_macos.rs`, one per
+  concern (`speech_authorization`, `microphone_consent`, `ask_speech`, `ask_microphone`,
+  `input_present`, `recognizer_for`, `start_capture`, `stop_capture`, `engine_running`,
+  `start_request`, `end_request`, `read_result`, `forget_observer`, `new_synthesizer`,
+  `speak_text`, `stop_speech`, `is_speaking`), each with a `// SAFETY:` comment citing the
+  Apple contract it relies on. `start_capture` also carries
+  `#[allow(clippy::arc_with_non_send_sync)]` for the same request slot as the iOS port. No
+  `AVAudioSession` call exists in the file — the class does not exist on macOS — so there
+  is no category, no ducking and no interruption observer; half-duplex is
+  `keeper_core::voice::may_record`'s, and the port never records while it speaks. No
+  server recognition path exists in the file, and the port never prompts on its own.
+  **Not yet compiled where it was written**: the file was authored on a Linux host and
+  gated by `keeper-core`'s platform-neutral voice tests and the on-device source scan;
+  its first `cargo clippy --target aarch64-apple-darwin` and first run are on the Mac.

@@ -54,6 +54,9 @@ fn session(id: &str, title: &str, updated_ms: i64) -> BotSession {
         updated_ms,
         archived: false,
         remote_session_id: None,
+        // Epic 63's two gateway facts: absent on a row no gateway described.
+        remote_last_active_ms: None,
+        remote_source: None,
     }
 }
 
@@ -452,7 +455,7 @@ fn deleting_a_session_deletes_its_messages_and_only_its_messages() {
     }
     append_message(&dir, &message("m-kept", "s-kept", "also asked", NOW)).expect("append");
 
-    delete_session(&dir, "s-gone").expect("delete");
+    delete_session(&dir, "s-gone", NOW).expect("delete");
 
     assert_eq!(ids(&dir, &SessionQuery::default()), vec!["s-kept"]);
     assert!(
@@ -484,8 +487,8 @@ fn deleting_a_session_is_idempotent_and_reaches_the_archive() {
     let dir = temp_dir();
     insert_session(&dir, &session("s-a", "filed", NOW)).expect("insert");
     assert!(set_session_archived(&dir, "s-a", true, NOW).expect("archive"));
-    delete_session(&dir, "s-a").expect("delete");
-    delete_session(&dir, "s-a").expect("deleting nothing is not an error");
+    delete_session(&dir, "s-a", NOW).expect("delete");
+    delete_session(&dir, "s-a", NOW).expect("deleting nothing is not an error");
     assert_eq!(
         search_sessions(
             &dir,

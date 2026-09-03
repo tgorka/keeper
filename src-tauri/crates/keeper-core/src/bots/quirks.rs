@@ -174,6 +174,21 @@ pub struct Quirks {
     ///   that path exists rather than a switch.
     /// * Ollama — **No**.
     pub named_events: Support,
+
+    /// Whether this kind keeps a server-side conversation keeper can name
+    /// and read back (Epic 63, AD-176).
+    ///
+    /// * Hermes — **Unknown** until asked. A Hermes new enough advertises
+    ///   `session_*` feature flags and `session_continuity_header` on
+    ///   `GET /v1/capabilities`, and then `GET /api/sessions` is a real
+    ///   `last_active`-ordered list and `GET /api/sessions/{id}/messages` a
+    ///   real history read (verified against `NousResearch/hermes-agent`
+    ///   `main`, 2026-09-03). An older one answers nothing there, and
+    ///   [`crate::bots::remote::probe_capabilities`] is what turns this row
+    ///   into a definite answer per endpoint.
+    /// * Ollama — **No**. There is no server-side conversation at all, so no
+    ///   probe is sent and everything stays in `keeper.db`.
+    pub server_sessions: Support,
 }
 
 /// The divergence table, keyed by provider kind.
@@ -192,6 +207,7 @@ pub const fn quirks(kind: ProviderKind) -> Quirks {
             reasoning_fields: &["reasoning_content", "reasoning"],
             keepalive_secs: Some(30),
             named_events: Support::Yes,
+            server_sessions: Support::Unknown,
         },
         ProviderKind::Ollama => Quirks {
             tool_choice: Support::No,
@@ -203,6 +219,7 @@ pub const fn quirks(kind: ProviderKind) -> Quirks {
             reasoning_fields: &["reasoning"],
             keepalive_secs: None,
             named_events: Support::No,
+            server_sessions: Support::No,
         },
     }
 }

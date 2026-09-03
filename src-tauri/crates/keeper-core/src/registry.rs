@@ -1150,6 +1150,30 @@ pub fn set_capture_hotkey(data_dir: &Path, accelerator: &str) -> Result<(), Core
     set_setting(data_dir, HOTKEY_CAPTURE_KEY, accelerator)
 }
 
+/// The `settings` key holding the optional OS-global voice hotkey accelerator
+/// (Epic 63, Story 63.5, FR-420, AD-174). A **fourth, independent** binding
+/// beside summon, recording and capture — it never touches their keys. Stored
+/// as an opaque accelerator string; absent ⇒ the empty string = **unset** (the
+/// shell registers nothing). `keeper-core` never parses it.
+const HOTKEY_VOICE_KEY: &str = "hotkey.voice";
+
+/// Read the OS-global voice hotkey accelerator (Story 63.5). Absent ⇒ the
+/// empty string, meaning **unset by default**, for the capture chord's reason:
+/// a shipped default would be a chord stolen from whatever else the user had
+/// bound to it, and a turn is started by a person, so the chord is theirs to
+/// choose.
+pub fn get_voice_hotkey(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, HOTKEY_VOICE_KEY)?.unwrap_or_default())
+}
+
+/// Write the OS-global voice hotkey accelerator (Story 63.5). Persists the
+/// opaque accelerator string under `hotkey.voice`; the empty string persists
+/// "unset" (the shell's clear path). The shell validates + registers with the
+/// OS *before* calling this; core only stores it.
+pub fn set_voice_hotkey(data_dir: &Path, accelerator: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, HOTKEY_VOICE_KEY, accelerator)
+}
+
 /// The `settings` key holding the id of the vault the notes surface is currently
 /// showing (Phase 5, FR-95). Every notes-flagged profile is resident at once, so
 /// this is a *selection*, not a mount point: switching vaults is a filter change
@@ -2778,6 +2802,30 @@ mod tests {
         assert_eq!(get_capture_hotkey(&dir).expect("get cleared hotkey"), "");
         // Neither of the other two bindings moved — three keys, three chords.
         set_capture_hotkey(&dir, "Control+Alt+K").expect("set hotkey again");
+        assert_eq!(get_recording_hotkey(&dir).expect("recording untouched"), "");
+        assert_eq!(
+            get_global_hotkey(&dir).expect("summon untouched"),
+            DEFAULT_GLOBAL_HOTKEY
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn voice_hotkey_is_a_fourth_independent_binding() {
+        let dir = temp_dir();
+        // Unset by default, like the recording and capture chords.
+        assert_eq!(get_voice_hotkey(&dir).expect("get absent hotkey"), "");
+        set_voice_hotkey(&dir, "Control+Alt+V").expect("set hotkey");
+        assert_eq!(
+            get_voice_hotkey(&dir).expect("get set hotkey"),
+            "Control+Alt+V"
+        );
+        // The empty string clears it back to unset.
+        set_voice_hotkey(&dir, "").expect("clear hotkey");
+        assert_eq!(get_voice_hotkey(&dir).expect("get cleared hotkey"), "");
+        // None of the other three bindings moved — four keys, four chords.
+        set_voice_hotkey(&dir, "Control+Alt+V").expect("set hotkey again");
+        assert_eq!(get_capture_hotkey(&dir).expect("capture untouched"), "");
         assert_eq!(get_recording_hotkey(&dir).expect("recording untouched"), "");
         assert_eq!(
             get_global_hotkey(&dir).expect("summon untouched"),

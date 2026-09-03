@@ -35,6 +35,14 @@
  * two sentences on the desktop, lives in the sheet here for exactly that
  * reason. jsdom lays nothing out, so the test is structural.
  *
+ * The pinned bots (Story 63.1, FR-412) are on the LIST level for the same
+ * reason, not over the transcript where the desktop draws them: a 49px band
+ * (`py-2` round a 32px cell, plus its rule) on the conversation level would
+ * be 49px the transcript does not get on every phone, for a strip that is
+ * only read when choosing whom to talk to. On the list it costs the rows —
+ * which scroll — and tapping a pin starts a conversation with that bot, which
+ * is what "reach a pinned bot" means on a surface with one level in view.
+ *
  * # What is absent
  *
  * No grant bar, no tool rows, no deliverable paths, no image staging: every
@@ -48,6 +56,7 @@ import { BotConversation } from "@/components/bots/bot-conversation";
 import { BOTS_NO_DRIVE_HERE_SENTENCE, BotEmptyState } from "@/components/bots/bot-empty-state";
 import { BotMetaToggle } from "@/components/bots/bot-message-meta";
 import { BotPicker } from "@/components/bots/bot-picker";
+import { BotPinsStrip } from "@/components/bots/bot-pins-strip";
 import { BotSessionList } from "@/components/bots/bot-session-list";
 import { botCommandContext, botCommandHost } from "@/components/bots/bot-slash-menu";
 import { BotVoiceMic, BotVoiceStatus } from "@/components/bots/bot-voice-mic";
@@ -97,6 +106,13 @@ export const BOTS_PHONE_PICKER_LABEL = "Bot and model";
 /** What the sheet says under its title. */
 export const BOTS_PHONE_PICKER_DESCRIPTION =
   "Which bot this conversation asks, and what its endpoint should run.";
+
+/**
+ * Where this tier chooses a bot, as the composer's no-bot caption names it:
+ * the sheet, opened from the header (Story 63.1, FR-411). The desktop says
+ * "above", which on this column points at a back bar.
+ */
+export const BOTS_PHONE_PICKER_PLACE = `in the ${BOTS_PHONE_PICKER_LABEL} sheet`;
 
 /** What the header says while no bot is chosen. */
 export const BOTS_PHONE_NO_BOT = "Choose a bot";
@@ -181,6 +197,8 @@ export function BotsPhoneList({
   onOpen: () => void;
 }) {
   const sessions = useBotsStore((s) => s.sessions);
+  const bots = useBotsStore((s) => s.bots);
+  const selectedBotId = useBotsStore((s) => s.selectedBotId);
   const conversation = useBotsStore((s) => s.conversation);
   const error = useBotsStore((s) => s.error);
   useVoiceStream();
@@ -221,6 +239,20 @@ export function BotsPhoneList({
           {error}
         </div>
       )}
+      <BotPinsStrip
+        bots={bots ?? []}
+        selectedBotId={selectedBotId}
+        onSelect={(botId) => {
+          // A pin on this level is "talk to this bot": choose it and push a
+          // fresh conversation, the same two steps New then the sheet would
+          // take. The desktop only selects, because its picker and transcript
+          // are both in view and the next message goes wherever it is aimed.
+          const store = botsStore.getState();
+          store.selectBot(botId);
+          store.openConversation(null);
+          onOpen();
+        }}
+      />
       {sessions !== null && (
         <BotSessionList
           sessions={sessions}
@@ -439,6 +471,7 @@ export function BotsPhoneConversation({
         }
         streaming={streamingId !== null}
         disabled={selectedBotId === null || selectedModel === null}
+        pickerPlace={BOTS_PHONE_PICKER_PLACE}
         commandContext={botCommandContext({
           providerKind: selectedProvider?.kind ?? null,
           providerCount: providerList.length,

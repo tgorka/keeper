@@ -48,6 +48,7 @@ export type { BotContextFileVm } from "./gen/BotContextFileVm";
 export type { BotContextSkipVm } from "./gen/BotContextSkipVm";
 export type { BotConversationVm } from "./gen/BotConversationVm";
 export type { BotDeliverableVm } from "./gen/BotDeliverableVm";
+export type { BotFollowVm } from "./gen/BotFollowVm";
 export type { BotGrantListVm } from "./gen/BotGrantListVm";
 export type { BotGrantSaveReq } from "./gen/BotGrantSaveReq";
 export type { BotGrantVm } from "./gen/BotGrantVm";
@@ -70,6 +71,7 @@ export type { BotSessionVm } from "./gen/BotSessionVm";
 export type { BotStreamEvent } from "./gen/BotStreamEvent";
 export type { BotToolCallVm } from "./gen/BotToolCallVm";
 export type { BotToolOutcomeKind } from "./gen/BotToolOutcomeKind";
+export type { BotTranscriptSource } from "./gen/BotTranscriptSource";
 export type { BotVm } from "./gen/BotVm";
 export type { BridgeDiscoveryVm } from "./gen/BridgeDiscoveryVm";
 export type { BridgeHealth } from "./gen/BridgeHealth";
@@ -358,6 +360,7 @@ import type { BotCommandContextReq } from "./gen/BotCommandContextReq";
 import type { BotCommandPreviewVm } from "./gen/BotCommandPreviewVm";
 import type { BotConversationVm } from "./gen/BotConversationVm";
 import type { BotDeliverableVm } from "./gen/BotDeliverableVm";
+import type { BotFollowVm } from "./gen/BotFollowVm";
 import type { BotGrantListVm } from "./gen/BotGrantListVm";
 import type { BotGrantSaveReq } from "./gen/BotGrantSaveReq";
 import type { BotGrantVm } from "./gen/BotGrantVm";
@@ -1644,6 +1647,41 @@ export async function recordingHotkeySet(accelerator: string): Promise<HotkeyVm>
  */
 export async function recordingHotkeyClear(): Promise<HotkeyVm> {
   return await invoke<HotkeyVm>("recording_hotkey_clear");
+}
+
+/**
+ * Read the optional OS-global voice hotkey binding (Epic 63, Story 63.5,
+ * FR-420): the persisted accelerator (`""` = unset, the shipped default),
+ * whether it is registered with the OS, and any soft conflict — with a system
+ * shortcut, the summon chord or the recording chord. A press starts a voice
+ * turn from Rust, with keeper in front or not.
+ *
+ * Rejects with: `unsupported` where voice is (`voice_availability` answers
+ * `unsupported`) or off desktop — the row is absent there.
+ */
+export async function voiceHotkeyGet(): Promise<HotkeyVm> {
+  return await invoke<HotkeyVm>("voice_hotkey_get");
+}
+
+/**
+ * Assign the OS-global voice hotkey (Story 63.5): the same validate →
+ * unregister-old → register-new → persist → rollback discipline as
+ * {@link recordingHotkeySet}, for the independent `hotkey.voice` binding. A
+ * malformed accelerator or an OS refusal keeps the previous binding and
+ * rejects with the {@link IpcError} envelope; an empty one is a
+ * {@link voiceHotkeyClear}, never a set.
+ */
+export async function voiceHotkeySet(accelerator: string): Promise<HotkeyVm> {
+  return await invoke<HotkeyVm>("voice_hotkey_set", { accelerator });
+}
+
+/**
+ * Clear the OS-global voice hotkey back to unset (Story 63.5): unregisters
+ * the current binding and persists the empty accelerator. Resolves with the
+ * unset {@link HotkeyVm}.
+ */
+export async function voiceHotkeyClear(): Promise<HotkeyVm> {
+  return await invoke<HotkeyVm>("voice_hotkey_clear");
 }
 
 /**
@@ -6739,6 +6777,23 @@ export async function botsSessionsList(includeArchived: boolean): Promise<BotSes
  */
 export async function botsSessionOpen(sessionId: string): Promise<BotConversationVm> {
   return await invoke<BotConversationVm>("bots_session_open", { sessionId });
+}
+
+/**
+ * Read the conversation another device may be writing, and learn when to
+ * read it again (Epic 63, Story 63.7, FR-425, FR-426, AD-177).
+ *
+ * One history read of the route `botsSessionOpen` uses — never the run's
+ * event stream, which a second reader destroys — merged so this device's own
+ * rows are neither doubled nor overwritten. `nextPollMs` is Rust's decision;
+ * the caller owns the timer and stops the moment it is `null`, or the moment
+ * the conversation leaves the screen. `messages` is `null` where nothing was
+ * read, and then what is on screen stands.
+ *
+ * Rejects with: `internal` (unknown id).
+ */
+export async function botsSessionFollow(sessionId: string): Promise<BotFollowVm> {
+  return await invoke<BotFollowVm>("bots_session_follow", { sessionId });
 }
 
 /**

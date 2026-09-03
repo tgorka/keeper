@@ -5494,13 +5494,16 @@ impl BotVm {
 // ---------------------------------------------------------------------------
 
 /// One conversation with one bot, as the session list and the pane header
-/// render it (Story 61.4, FR-381).
+/// render it (Story 61.4, FR-381; Epic 63, AD-176, AD-181).
 ///
-/// keeper's own record and not the remote's: `remoteSessionId` is a
-/// *reference* the Hermes detail may show, and the epic's second decision says
-/// why it can never be the truth — compression mints a successor session with a
-/// renamed title, the stored-response cache is 100 rows LRU, and Ollama has no
-/// session concept at all.
+/// keeper's own row, carrying the conversation's cross-device identity:
+/// `remoteSessionId` is the Hermes session id keeper mints on the first turn
+/// and sends on every turn, and the id a second device adopts when it lists
+/// the gateway — so both devices continue one session (AD-176). It is `null`
+/// where the endpoint keeps no server-side conversation (Ollama, an older
+/// Hermes), and there the row is the whole record. `remoteLastActiveMs` and
+/// `remoteSource` are what the gateway last said about that session, for the
+/// label AD-181 requires on a transcript read from the endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -5521,8 +5524,17 @@ pub struct BotSessionVm {
     pub updated_ms: i64,
     /// Whether it has been archived. Reversible (Story 61.6).
     pub archived: bool,
-    /// The remote's own session id where the far side has one, else `null`.
+    /// The Hermes session id this conversation is, where the endpoint keeps
+    /// sessions; else `null`. The join key for every cross-device read.
     pub remote_session_id: Option<String>,
+    /// When the gateway last saw activity on that session, ms since the Unix
+    /// epoch, as of keeper's last list read; `null` where keeper never read
+    /// one.
+    #[ts(type = "number | null")]
+    pub remote_last_active_ms: Option<i64>,
+    /// Which door wrote it on the gateway's side (`api`, `cli`, a bridge), as
+    /// the gateway spells it; `null` where it said nothing.
+    pub remote_source: Option<String>,
 }
 
 impl BotSessionVm {
@@ -5537,6 +5549,8 @@ impl BotSessionVm {
             updated_ms: session.updated_ms,
             archived: session.archived,
             remote_session_id: session.remote_session_id.clone(),
+            remote_last_active_ms: session.remote_last_active_ms,
+            remote_source: session.remote_source.clone(),
         }
     }
 }
@@ -5636,8 +5650,14 @@ impl BotMessageVm {
 ///
 /// One command rather than two, because a session header rendered beside a
 /// message list read a moment later is a surface that can show one
-/// conversation's title over another's rows for a frame. Resume replays from
-/// keeper's own store, so there is nothing to fetch from the remote here.
+/// conversation's title over another's rows for a frame.
+///
+/// `transcript` says where the messages came from (AD-181): `remote` when they
+/// were read from the gateway's own history for `session.remoteSessionId` —
+/// which is the transcript both devices share — and `local` when they were
+/// replayed from `keeper.db`, either because the endpoint keeps no sessions or
+/// because it could not be reached just now and the local copy is what there
+/// is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -5646,6 +5666,75 @@ pub struct BotConversationVm {
     pub session: BotSessionVm,
     /// Its messages, in order.
     pub messages: Vec<BotMessageVm>,
+    /// Where `messages` were read from.
+    pub transcript: BotTranscriptSource,
+}
+
+/// Where a conversation's transcript was read from (Epic 63, AD-181).
+///
+/// Two values and not a boolean, because the surface prints the word: a row
+/// labelled `remote` came from the gateway that both devices write to, and a
+/// row labelled `local` is this device's own copy. Serialises to
+/// `"local" | "remote"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum BotTranscriptSource {
+    /// Replayed from `keeper.db`.
+    Local,
+    /// Read from the gateway's session history.
+    Remote,
+}
+
+/// One read of a conversation another device is writing (Epic 63, Story 63.7,
+/// FR-425, FR-426, AD-177).
+///
+/// The answer to `bots_session_follow`: the transcript as it stands now, folded
+/// under [`crate::bots::follow::merge`]'s rule so this device's own rows are
+/// never doubled or overwritten, and what to do next. `nextPollMs` is the
+/// decision of [`crate::bots::follow::decide`] — how long to wait before
+/// asking again — and `null` when the following stops: this device holds the
+/// turn, or the session has gone cold. `live` is whether the newest step is
+/// one a turn is still working on, which is when the surface says that steps
+/// land as they complete rather than as they are typed.
+///
+/// `messages` is `null` where the gateway's transcript could not be read —
+/// the endpoint keeps no sessions, or did not answer — and then what is on
+/// screen stays; a gateway that is down does not blank a conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct BotFollowVm {
+    /// The merged transcript, or `null` when it was not read this time.
+    pub messages: Option<Vec<BotMessageVm>>,
+    /// Whether a turn is open on the other device.
+    pub live: bool,
+    /// Ms to wait before the next read; `null` to stop following.
+    #[ts(type = "number | null")]
+    pub next_poll_ms: Option<i64>,
+}
+
+impl BotFollowVm {
+    /// The answer where nothing was read: what is on screen stands, and the
+    /// following stops.
+    pub const UNREAD: Self = Self {
+        messages: None,
+        live: false,
+        next_poll_ms: None,
+    };
+
+    /// Project one read and its decision for the UI.
+    pub fn compose(
+        messages: &[crate::bots::session::BotMessage],
+        live: bool,
+        next: crate::bots::follow::Follow,
+    ) -> Self {
+        BotFollowVm {
+            messages: Some(messages.iter().map(BotMessageVm::compose).collect()),
+            live,
+            next_poll_ms: next.after_ms(),
+        }
+    }
 }
 
 /// What the webview is told while an answer is arriving (Story 61.4, FR-372,
@@ -6538,13 +6627,15 @@ impl BotSessionQueryReq {
     }
 }
 
-/// One row of the conversation list (Story 61.6, FR-381).
+/// One row of the conversation list (Story 61.6, FR-381; Epic 63, AD-181).
 ///
-/// The session plus the two facts a row renders that are not columns of it.
+/// The session plus the facts a row renders that are not columns of it.
 /// `latestActivityMs` is composed in Rust rather than derived on the frontend
 /// because it is a `MAX` over another table, and a row that guessed it from
 /// `updatedMs` alone would sort a conversation nobody has renamed below one
-/// somebody just renamed.
+/// somebody just renamed. `transcript` says whether opening this row reads the
+/// gateway's history or keeper's own copy, so the list can say which is which
+/// before a click.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -6556,9 +6647,13 @@ pub struct BotSessionRowVm {
     /// conversation with no messages was still created.
     #[ts(type = "number")]
     pub latest_activity_ms: i64,
-    /// How many messages it holds.
+    /// How many messages **keeper's own copy** holds. On a `remote` row the
+    /// gateway's transcript may hold more — this device may never have written
+    /// a turn of it — so the number is labelled as local, never as the whole.
     #[ts(type = "number")]
     pub message_count: i64,
+    /// Where opening this row reads its transcript from.
+    pub transcript: BotTranscriptSource,
 }
 
 /// One page of the conversation list, and the size of the set it came from
@@ -6579,8 +6674,16 @@ pub struct BotSessionListVm {
 }
 
 impl BotSessionListVm {
-    /// Project one page for the UI (Story 61.6).
-    pub fn compose(page: &crate::bots::session::SessionPage) -> Self {
+    /// Project one page for the UI (Story 61.6, Epic 63).
+    ///
+    /// `caps_of` answers, per provider id, what that endpoint said about
+    /// sessions — the shell's cache, read here so the label on every row is
+    /// `bots::remote::transcript_source`'s decision and not the frontend's
+    /// guess from a non-null id.
+    pub fn compose(
+        page: &crate::bots::session::SessionPage,
+        caps_of: impl Fn(&str) -> crate::bots::remote::SessionCapabilities,
+    ) -> Self {
         BotSessionListVm {
             rows: page
                 .rows
@@ -6589,6 +6692,10 @@ impl BotSessionListVm {
                     session: BotSessionVm::compose(&row.session),
                     latest_activity_ms: row.latest_activity_ms,
                     message_count: row.message_count,
+                    transcript: crate::bots::remote::transcript_source(
+                        caps_of(&row.session.provider_id),
+                        &row.session,
+                    ),
                 })
                 .collect(),
             total: page.total,
@@ -6935,6 +7042,16 @@ pub enum VoiceUnavailableVm {
         /// The locale identifier the recogniser was asked for.
         locale: String,
         /// Which language to download, and where.
+        message: String,
+    },
+    /// The recogniser for the locale cannot run on the device at all
+    /// (`supportsOnDeviceRecognition == false`), and keeper refuses the
+    /// server fallback (NFR-50). Kept apart from `noOnDeviceModel`: no
+    /// download changes this one.
+    NoOnDeviceRecognition {
+        /// The locale identifier the recogniser was asked for.
+        locale: String,
+        /// The sentence, saying why no download helps.
         message: String,
     },
     /// The device has no audio input.

@@ -51,6 +51,7 @@ import { voiceAuthorize, voiceWakeSet } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { isListening, useVoiceStore, voiceStore } from "@/lib/stores/voice";
+import { cn } from "@/lib/utils";
 
 /** The switch's label. */
 export const WAKE_SWITCH_LABEL = "Listen for a phrase";
@@ -65,8 +66,13 @@ export function wakeListeningLabel(phrase: string | null): string {
 /** When a write failed for a reason that was not the phrase. */
 const WAKE_WRITE_FAILED = "Could not save the wake phrase.";
 
-/** The wake phrase band. Absent, or the switch with its chip and sentence. */
-export function BotVoiceWake() {
+/**
+ * The wake phrase band. Absent, or the switch with its chip and sentence.
+ * `className` is the host's frame: the phone's sheet draws the pane band by
+ * default, and Settings → Bots (Story 63.5) hands in its own row spacing,
+ * because the control is one and the frames are two.
+ */
+export function BotVoiceWake({ className }: { className?: string } = {}) {
   const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   const unavailable = useVoiceStore((s) => s.unavailable);
   const wake = useVoiceStore((s) => s.wake);
@@ -125,7 +131,10 @@ export function BotVoiceWake() {
   return (
     <section
       aria-label={WAKE_PHRASE_LABEL}
-      className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-2"
+      className={cn(
+        "flex shrink-0 flex-col gap-2",
+        className ?? "border-border border-b px-6 py-2",
+      )}
     >
       <div className="flex items-center gap-2">
         <Label htmlFor={switchId} className="min-w-0 flex-1">

@@ -454,6 +454,16 @@ pub const KEYS: &[KeySpec] = &[
         summary: "The OS-global Quick Capture accelerator; empty means unset.",
         example: "\"Control+Alt+N\"",
     },
+    KeySpec {
+        key: "hotkey.voice",
+        family: false,
+        scope: Scope::MachineLocal,
+        settable: Settable::MachineFileOnly(HOTKEY_WHY),
+        shape: Shape::Accelerator,
+        default: "",
+        summary: "The OS-global voice accelerator that starts a turn; empty means unset.",
+        example: "\"Control+Alt+V\"",
+    },
     // ---- incognito -------------------------------------------------------
     KeySpec {
         key: "incognito.global",
@@ -1358,6 +1368,7 @@ mod tests {
             "hotkey.global",
             "hotkey.recording",
             "hotkey.capture",
+            "hotkey.voice",
             "recording.destination_dir",
             "recording.destination_profile_id",
             "sync.git_path",

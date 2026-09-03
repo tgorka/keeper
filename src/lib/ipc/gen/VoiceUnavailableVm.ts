@@ -21,6 +21,14 @@ locale: string,
 /**
  * Which language to download, and where.
  */
+message: string, } | { "kind": "noOnDeviceRecognition", 
+/**
+ * The locale identifier the recogniser was asked for.
+ */
+locale: string, 
+/**
+ * The sentence, saying why no download helps.
+ */
 message: string, } | { "kind": "noMicrophone", 
 /**
  * The sentence.

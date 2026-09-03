@@ -101,6 +101,8 @@ These are facts about one computer. A shared file that sets one of them is a nam
 | | | | | The OS-global Start/Stop Recording accelerator; empty means unset. |
 | `hotkey.capture` | machine-local | accelerator | *(absent)* | `"hotkey.capture" = "Control+Alt+N"` |
 | | | | | The OS-global Quick Capture accelerator; empty means unset. |
+| `hotkey.voice` | machine-local | accelerator | *(absent)* | `"hotkey.voice" = "Control+Alt+V"` |
+| | | | | The OS-global voice accelerator that starts a turn; empty means unset. |
 | `notes.active_vault` | machine-local | text | *(absent)* | `"notes.active_vault" = "01J8Z5R0Q9WQ4C3S0PNK7T2A1B"` |
 | | | | | Which notes vault the notes surface is showing, as a sync-profile id. |
 | `recording.destination_dir` | machine-local | absolute path | *(absent)* | `"recording.destination_dir" = "/Users/tgorka/Movies/keeper"` |
@@ -115,6 +117,7 @@ Why each one is refused from a shared file:
 - `hotkey.global` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
 - `hotkey.recording` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
 - `hotkey.capture` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
+- `hotkey.voice` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
 - `notes.active_vault` — it names a row in this machine's sync.db, and the same folder is a different profile id on the other machine
 - `recording.destination_dir` — it is an absolute path, and /Volumes/merope/… does not exist on the other machine
 - `recording.destination_profile_id` — it names a row in this machine's sync.db, and the same folder is a different profile id on the other machine

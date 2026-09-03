@@ -5,7 +5,7 @@
 use std::sync::Mutex;
 
 use keeper_core::voice::{
-    authorize, next_ask, Ask, Consent, ConsentPort, Permission, VoiceUnavailable,
+    authorize, next_ask, Ask, Consent, ConsentPort, Permission, VoicePlatform, VoiceUnavailable,
 };
 
 /// A port whose recorded state is a script: `answers` is what each dialog
@@ -154,10 +154,14 @@ fn voice_authorize_passes_an_absent_port_through() {
     assert!(port.asked().is_empty());
 }
 
+/// On either platform the refusal names Settings, the microphone and speech
+/// recognition; which Settings is the platform's word.
 #[test]
 fn voice_refusal_names_its_remedy() {
-    let message = VoiceUnavailable::NotAuthorized.to_string();
-    assert!(message.contains("Settings"), "{message}");
-    assert!(message.contains("microphone"), "{message}");
-    assert!(message.contains("speech recognition"), "{message}");
+    for platform in [VoicePlatform::IOS, VoicePlatform::MACOS] {
+        let message = VoiceUnavailable::NotAuthorized.message(&platform);
+        assert!(message.contains("Settings"), "{message}");
+        assert!(message.contains("microphone"), "{message}");
+        assert!(message.contains("speech recognition"), "{message}");
+    }
 }

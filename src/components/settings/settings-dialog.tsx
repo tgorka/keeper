@@ -21,6 +21,7 @@ import {
 import { RecordingSettingsControls } from "@/components/settings/recording-settings-controls";
 import { SyncGitRow } from "@/components/settings/sync-git-row";
 import { DeviceSection, SyncSection } from "@/components/settings/sync-section";
+import { UnsetShortcutRow } from "@/components/settings/unset-shortcut-row";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -34,6 +35,7 @@ import { Kbd } from "@/components/ui/kbd";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Switch } from "@/components/ui/switch";
+import { useVoiceFacts } from "@/hooks/use-voice-facts";
 import { acceleratorFromEvent, DEFAULT_GLOBAL_HOTKEY, formatAccelerator } from "@/lib/hotkey";
 import {
   type DockBadgeMode,
@@ -61,6 +63,9 @@ import {
   setHonorRemoteDeletions,
   setUndoSendWindow,
   undoSendWindow,
+  voiceHotkeyClear,
+  voiceHotkeyGet,
+  voiceHotkeySet,
 } from "@/lib/ipc/client";
 import { useAccountsStore } from "@/lib/stores/accounts";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
@@ -69,6 +74,7 @@ import { incognitoStore } from "@/lib/stores/incognito";
 import { keyBackupStore, useKeyBackupStatus } from "@/lib/stores/key-backup";
 import { ensureRecordingSettingsHydrated } from "@/lib/stores/recording-settings";
 import { verificationStore } from "@/lib/stores/verification";
+import { useVoiceStore } from "@/lib/stores/voice";
 import { wizardStore } from "@/lib/stores/wizard";
 
 interface SettingsDialogProps {
@@ -1090,7 +1096,19 @@ function ShortcutsSection({ open }: { open: boolean }) {
           {error}
         </p>
       )}
-      {recording && <RecordingShortcutRow open={open} />}
+      {recording && (
+        <UnsetShortcutRow
+          open={open}
+          label="Start / stop recording"
+          noun="recording"
+          settingKey="hotkey.recording"
+          read={recordingHotkeyGet}
+          set={recordingHotkeySet}
+          clear={recordingHotkeyClear}
+          notRegistered={RECORDING_HOTKEY_PERMISSION_SENTENCE}
+        />
+      )}
+      <VoiceShortcutRow open={open} />
     </div>
   );
 }
@@ -1101,161 +1119,49 @@ function ShortcutsSection({ open }: { open: boolean }) {
 const RECORDING_HOTKEY_PERMISSION_SENTENCE =
   "The recording hotkey isn't registered with macOS right now. Another app may already own this shortcut, or keeper may need permission — check System Settings → Privacy & Security (Accessibility) and Keyboard shortcuts, then reassign it below.";
 
-/** The unset-state label for the recording hotkey row (Story 20.4): the binding
- * ships unset — no chord is registered until the user assigns one. */
-const RECORDING_HOTKEY_NOT_SET_LABEL = "Not set";
+/** The same honest copy for the voice chord (Story 63.5). */
+const VOICE_HOTKEY_PERMISSION_SENTENCE =
+  "The voice hotkey isn't registered with macOS right now. Another app may already own this shortcut, or keeper may need permission — check System Settings → Privacy & Security (Accessibility) and Keyboard shortcuts, then reassign it below.";
+
+/** The voice row's label. */
+export const VOICE_SHORTCUT_LABEL = "Talk to a bot";
+
+/** What the voice row says a press does, and where else the same reach lives. */
+export const VOICE_SHORTCUT_NOTE =
+  "Starts a voice turn from any app, with keeper hidden or not. The menu bar item and the keeper://voice/talk link — for a Shortcut, which the Touch Bar's Quick Actions can hold — do the same.";
 
 /**
- * The "Start / stop recording" row inside Settings → Shortcuts (Story 20.4,
- * FR-50) — rendered only when the `recording` capability is on (absent, never
- * disabled, elsewhere). A second, independent OS-global binding: unset by
- * default ("Not set"), assigned by capturing the next chord
- * ({@link acceleratorFromEvent} → {@link recordingHotkeySet}, so a bare
- * single key can never bind — UX-DR29), and cleared back to unset via
- * {@link recordingHotkeyClear}. Reuses the summon row's conflict / inactive /
- * error note rendering; the VM (including the cross-summon clash warning) is
- * rendered as-is, never derived in TS.
+ * The "Talk to a bot" row inside Settings → Shortcuts (Epic 63, Story 63.5,
+ * FR-420, AD-174, AD-179): a fourth, independent OS-global binding whose
+ * press starts a voice turn from Rust, with keeper in front or not.
+ *
+ * Present on exactly one condition — `voice_availability`'s answer is not
+ * `unsupported` — read from the voice store, which {@link useVoiceFacts}
+ * fills when the section opens. No capability flag is consulted, because
+ * `CapabilitiesVm` has no voice field and gains none (AD-179): the same one
+ * answer that governs the tray item, the hotkey's own registration and the
+ * wake switch governs this row. `undefined` (not yet answered) and
+ * `unsupported` both render nothing (AD-27).
  */
-function RecordingShortcutRow({ open }: { open: boolean }) {
-  // `undefined` = still loading; otherwise the resolved binding VM.
-  const [hotkey, setHotkey] = useState<HotkeyVm | undefined>(undefined);
-  // Whether the capture control is armed and listening for the next chord.
-  const [capturing, setCapturing] = useState(false);
-  // The last reassignment/clear error (OS refused / persist failed), or `null`.
-  const [error, setError] = useState<string | null>(null);
-  const writeId = useRef(0);
-
-  useEffect(() => {
-    if (!open) {
-      return;
-    }
-    setHotkey(undefined);
-    setCapturing(false);
-    setError(null);
-    let cancelled = false;
-    void recordingHotkeyGet()
-      .then((vm) => {
-        if (!cancelled) {
-          setHotkey(vm);
-        }
-      })
-      .catch(() => {
-        // On a read failure leave the row in its loading state rather than
-        // asserting a (possibly wrong) binding.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
-
-  // Adopt the VM a write resolved with, or surface the error without losing the
-  // previous binding (the Rust command restored it — mirroring the summon row).
-  const applyWrite = (write: Promise<HotkeyVm>) => {
-    writeId.current += 1;
-    const id = writeId.current;
-    setError(null);
-    void write
-      .then((vm) => {
-        if (id === writeId.current) {
-          setHotkey(vm);
-        }
-      })
-      .catch((raw: unknown) => {
-        if (id !== writeId.current) {
-          return;
-        }
-        const message =
-          typeof raw === "object" && raw !== null && "message" in raw
-            ? String((raw as { message: unknown }).message)
-            : "Could not set that shortcut.";
-        setError(message);
-      });
-  };
-
-  // While capturing, translate the next complete chord into an accelerator and
-  // assign it. A bare modifier or modifier-less key yields `null` and keeps
-  // capturing (no single-key verb can ever bind); Escape cancels.
-  const onCaptureKeyDown = (event: React.KeyboardEvent) => {
-    event.preventDefault();
-    event.stopPropagation();
-    if (event.key === "Escape") {
-      setCapturing(false);
-      return;
-    }
-    const accelerator = acceleratorFromEvent(event.nativeEvent);
-    if (accelerator === null) {
-      return;
-    }
-    setCapturing(false);
-    applyWrite(recordingHotkeySet(accelerator));
-  };
-
-  const unset = hotkey !== undefined && hotkey.accelerator === "";
-
+function VoiceShortcutRow({ open }: { open: boolean }) {
+  useVoiceFacts(open);
+  const unavailable = useVoiceStore((s) => s.unavailable);
+  if (unavailable === undefined || unavailable?.kind === "unsupported") {
+    return null;
+  }
   return (
     <>
-      <div className="flex items-center justify-between gap-2">
-        <Label>Start / stop recording</Label>
-        <div className="flex items-center gap-2">
-          <FileControlled settingKey="hotkey.recording" />
-          {capturing ? (
-            <button
-              type="button"
-              // biome-ignore lint/a11y/noAutofocus: capture is an explicit user action; the field must receive the next keystroke immediately.
-              autoFocus
-              aria-label="Press a shortcut for Start / stop recording (Esc to cancel)"
-              onKeyDown={onCaptureKeyDown}
-              onBlur={() => setCapturing(false)}
-              className="rounded-sm border border-ring px-2 py-0.5 text-muted-foreground text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              Press a shortcut… (Esc to cancel)
-            </button>
-          ) : unset ? (
-            <span className="text-muted-foreground text-xs">{RECORDING_HOTKEY_NOT_SET_LABEL}</span>
-          ) : (
-            <Kbd aria-label={hotkey === undefined ? "Loading shortcut" : hotkey.accelerator}>
-              {hotkey === undefined ? "…" : formatAccelerator(hotkey.accelerator)}
-            </Kbd>
-          )}
-          <Button
-            type="button"
-            variant="outline"
-            size="xs"
-            aria-label="Change recording shortcut"
-            disabled={hotkey === undefined || capturing}
-            onClick={() => {
-              setError(null);
-              setCapturing(true);
-            }}
-          >
-            Change…
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="xs"
-            disabled={hotkey === undefined || unset || capturing}
-            onClick={() => applyWrite(recordingHotkeyClear())}
-          >
-            Clear
-          </Button>
-        </div>
-      </div>
-      {hotkey?.conflict != null && (
-        <p className="text-held text-xs" role="status">
-          {hotkey.conflict}
-        </p>
-      )}
-      {hotkey !== undefined && !unset && !hotkey.active && (
-        <p className="text-held text-xs" role="status">
-          {RECORDING_HOTKEY_PERMISSION_SENTENCE}
-        </p>
-      )}
-      {error !== null && (
-        <p className="text-held text-xs" role="alert">
-          {error}
-        </p>
-      )}
+      <UnsetShortcutRow
+        open={open}
+        label={VOICE_SHORTCUT_LABEL}
+        noun="voice"
+        settingKey="hotkey.voice"
+        read={voiceHotkeyGet}
+        set={voiceHotkeySet}
+        clear={voiceHotkeyClear}
+        notRegistered={VOICE_HOTKEY_PERMISSION_SENTENCE}
+      />
+      <p className="text-muted-foreground text-xs">{VOICE_SHORTCUT_NOTE}</p>
     </>
   );
 }

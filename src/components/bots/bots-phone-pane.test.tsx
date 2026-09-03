@@ -20,11 +20,16 @@
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { BOT_COMPOSER_LABEL, BOT_COMPOSER_SEND_LABEL } from "@/components/bots/bot-composer";
+import {
+  BOT_COMPOSER_LABEL,
+  BOT_COMPOSER_SEND_LABEL,
+  botComposerNoBot,
+} from "@/components/bots/bot-composer";
 import { BOT_CONVERSATION_LABEL } from "@/components/bots/bot-conversation";
 import { BOTS_EMPTY_COPY } from "@/components/bots/bot-empty-state";
 import { GRANT_ADD_LABEL, GRANT_NONE_HELD } from "@/components/bots/bot-grant-bar";
 import { BOT_PICKER_BOT_LABEL } from "@/components/bots/bot-picker";
+import { BOT_PINS_LABEL } from "@/components/bots/bot-pins-strip";
 import { BOT_SESSION_NEW_LABEL } from "@/components/bots/bot-session-list";
 import { BOTS_PANE_TITLE } from "@/components/bots/bots-pane";
 import {
@@ -32,6 +37,7 @@ import {
   BOTS_PHONE_BACK_TO_LIST,
   BOTS_PHONE_CONVERSATION_SLOT,
   BOTS_PHONE_PICKER_LABEL,
+  BOTS_PHONE_PICKER_PLACE,
 } from "@/components/bots/bots-phone-pane";
 import { SETTINGS_PANE_TITLE } from "@/components/layout/settings-pane";
 import type {
@@ -88,14 +94,18 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     botsSessionsList: () => Promise.resolve([SESSION]),
     botsSessionsSearch: () =>
       Promise.resolve({
-        rows: [{ session: SESSION, messageCount: 2, latestActivityMs: 1 }],
+        rows: [{ session: SESSION, messageCount: 2, latestActivityMs: 1, transcript: "local" }],
         total: 1,
       }),
     botsModelsList: () => Promise.resolve([MODEL]),
     botsMessageDetailsGet: () => Promise.resolve(false),
     botsSessionOpen: (id: string) => {
       botsSessionOpen(id);
-      return Promise.resolve({ session: SESSION, messages: [QUESTION, ANSWER_DONE] });
+      return Promise.resolve({
+        session: SESSION,
+        messages: [QUESTION, ANSWER_DONE],
+        transcript: "local",
+      });
     },
     botsChatSend: (_req: unknown, onEvent: (event: BotStreamEvent) => void) => {
       sink = onEvent;
@@ -189,6 +199,8 @@ const SESSION: BotSessionVm = {
   updatedMs: 1,
   archived: false,
   remoteSessionId: null,
+  remoteLastActiveMs: null,
+  remoteSource: null,
 };
 
 function message(overrides: Partial<BotMessageVm> & { id: string; role: string }): BotMessageVm {
@@ -389,6 +401,51 @@ describe("the Bots view on the phone stack", () => {
     const sheet = await screen.findByRole("dialog", { name: BOTS_PHONE_PICKER_LABEL });
     expect(within(sheet).getByRole("combobox", { name: BOT_PICKER_BOT_LABEL })).toBeInTheDocument();
   });
+
+  /**
+   * Story 63.1, FR-412: the pinned bots are reachable at level 1. They sit on
+   * the list level, above the rows, and a tap is "talk to this bot": the bot
+   * is chosen and a fresh conversation is pushed. Not on the conversation
+   * level, where the band would be transcript height (see the height contract
+   * below, which still counts three bands there).
+   */
+  it("reaches the pinned bots at level 1, and a pin starts a conversation with that bot", async () => {
+    render(<PhoneShell />);
+    await openBots();
+    const list = screen.getByRole("region", { name: BOTS_PANE_TITLE });
+    const pins = within(list).getByRole("navigation", { name: BOT_PINS_LABEL });
+    expect(stackLevel(1)).toContainElement(pins);
+    expect(stackLevel(2)).toBeNull();
+    // The strip is a bounded band on the list level; the rows keep the height.
+    expect(pins.parentElement).toHaveClass("shrink-0");
+
+    act(() => {
+      botsStore.getState().selectBot(null);
+    });
+    fireEvent.click(within(pins).getByRole("button", { name: new RegExp(`^${BOT.name}`) }));
+    await screen.findByRole("button", { name: BOTS_PHONE_BACK_TO_LIST });
+    expect(botsStore.getState().selectedBotId).toBe(BOT.id);
+    expect(botsStore.getState().conversation).toBeNull();
+    expect(screen.getByRole("textbox", { name: BOT_COMPOSER_LABEL })).toBeInTheDocument();
+  });
+
+  /**
+   * Story 63.1, FR-411: the composer's no-bot caption names the sheet, because
+   * "above" on this column is a back bar. Asserted with the model unchosen,
+   * which is the disabled state the caption is shown in.
+   */
+  it("names the sheet, not 'above', while the composer has nothing to send to", async () => {
+    render(<PhoneShell />);
+    await openBots();
+    fireEvent.click(screen.getByRole("button", { name: BOT_SESSION_NEW_LABEL }));
+    await screen.findByRole("button", { name: BOTS_PHONE_BACK_TO_LIST });
+    act(() => {
+      botsStore.getState().selectBot(null);
+    });
+    expect(screen.getByText(botComposerNoBot(BOTS_PHONE_PICKER_PLACE))).toBeInTheDocument();
+    expect(screen.getByText(/in the Bot and model sheet/)).toBeInTheDocument();
+    expect(screen.queryByText(/Choose a bot above/)).not.toBeInTheDocument();
+  });
 });
 
 describe("the phone conversation's height contract (Story 61.14)", () => {
@@ -492,7 +549,11 @@ describe("the phone stack with the flag off, for the record", () => {
   it("does not mount the list or the conversation for any store state", () => {
     capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
     botsStore.getState().applySessions([SESSION]);
-    botsStore.getState().openConversation({ session: SESSION, messages: [QUESTION, ANSWER] });
+    botsStore.getState().openConversation({
+      session: SESSION,
+      messages: [QUESTION, ANSWER],
+      transcript: "local",
+    });
     primaryViewStore.getState().setView("bots");
     render(<PhoneShell />);
     expect(screen.queryByRole("list", { name: BOT_CONVERSATION_LABEL })).not.toBeInTheDocument();

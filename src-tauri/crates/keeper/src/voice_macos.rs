@@ -1,86 +1,109 @@
-//! The voice port on iOS (Epic 62, Stories 62.4 and 62.6, AD-165–AD-167,
-//! AD-171): the thinnest thing over `SFSpeechRecognizer`, `AVAudioEngine`,
-//! `AVAudioSession` and `AVSpeechSynthesizer` that can carry out what
-//! `keeper_core::voice` decides.
+//! The voice port on macOS (Epic 63, Story 63.4, AD-175; collects DW-219):
+//! the thinnest thing over `SFSpeechRecognizer`, `AVAudioEngine` and
+//! `AVSpeechSynthesizer` that can carry out what `keeper_core::voice`
+//! decides. The second port behind the trait `voice_ios.rs` was the first
+//! behind; where the two differ, the difference is named here (AD-175), not
+//! discovered by a reader diffing the files.
 //!
-//! # On the device or not at all (FR-402, NFR-50)
+//! # On the device or not at all (FR-417, NFR-53)
 //!
 //! Every recognition request sets `requiresOnDeviceRecognition = true`, and
-//! [`availability`] refuses with [`VoiceUnavailable::NoOnDeviceModel`] when
-//! the locale's recogniser reports `supportsOnDeviceRecognition == false`.
-//! There is no server path in this file: no request without the flag, no
-//! retry without it, no fallback. `docs/egress.md` names every destination
-//! keeper contacts, and Apple's speech servers are not on it.
+//! [`availability`] refuses before any request is built when the locale's
+//! recogniser cannot work on this Mac. There is no server path in this file:
+//! no request without the flag, no retry without it, no fallback.
+//! `docs/egress.md` names every destination keeper contacts, and Apple's
+//! speech servers are not on it.
+//!
+//! Two absences look alike from the outside and are told apart here, because
+//! the remedies differ (Story 63.3 gave the sentences): a recogniser whose
+//! `supportsOnDeviceRecognition` is `false` cannot run on this Mac whatever
+//! is downloaded ([`VoiceUnavailable::NoOnDeviceRecognition`]), and one that
+//! supports it but reports `isAvailable == false` is waiting on Dictation
+//! being turned on and its language downloaded under System Settings >
+//! Keyboard > Dictation ([`VoiceUnavailable::NoOnDeviceModel`]). A locale
+//! the framework has no recogniser for at all is the first of those: no
+//! download adds a language to `supportedLocales`.
+//!
+//! # No audio session
+//!
+//! `AVAudioSession` does not exist on macOS. Everything the iOS port did
+//! with it has a named replacement or none:
+//!
+//! - **Category, activation, ducking:** none. Capture is the engine's input
+//!   node and nothing else; keeper does not duck other audio on the Mac.
+//! - **Half-duplex** is `keeper_core::voice::may_record`'s (AD-175): the
+//!   turn releases the microphone before every `Speak` on this platform,
+//!   so this port never has a capture up while it speaks and does not
+//!   re-implement the rule. It obeys the effects it is handed, in order.
+//! - **Barge-in by voice** therefore does not exist here. Without voice
+//!   processing on the input there is nothing to keep keeper's own answer
+//!   out of the transcript, so the port never classifies a transcript as
+//!   `SpeechDetected`; an answer is stopped by the button, the hotkey or
+//!   the tray (Story 63.5). A transcript that did arrive while speaking is
+//!   ignored by the turn's table.
+//! - **Interruptions:** none are posted. The capture can still die under
+//!   the port — `AVAudioEngineConfigurationChangeNotification` when
+//!   headphones or a dock change the input, or the engine simply stopping —
+//!   and both take the resume path below.
+//! - **The microphone grant** is read and asked through `AVAudioApplication`
+//!   (`recordPermission`, `requestRecordPermissionWithCompletionHandler:`),
+//!   which is macOS 14 and later. On an older Mac the class is not
+//!   registered; this port then reports the grant as denied and says why at
+//!   error level, because there is no honest way to read it from the crates
+//!   this build carries. The bundle's `minimumSystemVersion` is 11; voice on
+//!   11–13 is a limit named here, not a silent failure.
+//! - **Whether a microphone exists** is the input node's hardware format:
+//!   Apple documents a zero sample rate or channel count on
+//!   `inputFormatForBus:0` as "input is not enabled" on a Mac with no input
+//!   device. That is [`VoiceUnavailable::NoMicrophone`].
 //!
 //! # One thread owns the frameworks
 //!
-//! The objc2 bindings for these classes are not `Send`, and the port must be
-//! (`VoicePort: Send + Sync`, held in an `Arc` by the command layer). So the
+//! As on iOS: the objc2 bindings are not `Send`, the port must be, so the
 //! port is a channel to one worker thread that owns every framework object,
 //! and each trait method is a message. Results come back through the
 //! [`EventSink`] the port was built with; that sink never touches this
-//! thread. The alternative — `unsafe impl Send` on a wrapper — would be a
-//! second kind of `unsafe` with a weaker story than "one thread, no
-//! sharing", so it is not here.
+//! thread.
 //!
-//! # Listening that outlives a request (Story 62.6, the driving brief)
+//! # Listening that outlives a request
 //!
-//! The phrase is armed for as long as a drive, and one `SFSpeechRecognizer`
-//! request is not built for that: a task ends on its own after a final
-//! result, and a request left running for a long time churns errors. So the
-//! **capture** — the audio session, the engine, the tap — is one long-lived
-//! thing, and the **request** is rolled underneath it: the tap appends to
-//! whichever request is in [`RequestSlot`] right now, and the worker swaps
-//! in a fresh one after [`REQUEST_ROLL_AFTER`] at the next quiet moment, at
-//! [`REQUEST_LONGEST`] regardless, and immediately when a task reports a
-//! final result or an error. The microphone never closes for a roll, so
-//! nothing said across the seam is lost to a route change.
+//! The wake phrase is armed for as long as the person leaves it on, and one
+//! `SFSpeechRecognizer` request is not built for that: a task ends on its
+//! own after a final result, and a request left running for a long time
+//! churns errors. So the **capture** — the engine and its tap — is one
+//! long-lived thing, and the **request** is rolled underneath it: the tap
+//! appends to whichever request is in [`RequestSlot`] right now, and the
+//! worker swaps in a fresh one after [`REQUEST_ROLL_AFTER`] at the next
+//! quiet moment, at [`REQUEST_LONGEST`] regardless, and immediately when a
+//! task reports a final result or an error. The microphone never closes for
+//! a roll.
 //!
-//! # Interruptions re-arm, they do not end
+//! # A capture that dies is rebuilt, not reported
 //!
-//! A phone call, Siri, or another app taking the microphone stops the engine
-//! and posts `AVAudioSessionInterruptionNotification`. A port that reported
-//! that as `Failed` would leave the phrase dead after the first call of the
-//! drive — the defect this design exists to prevent. Instead the worker
-//! remembers what the turn asked for (`wanted`), tears the dead capture down,
-//! and rebuilds it when the interruption ends — or, when the end never comes
-//! (Siri is known not to send one), every [`RESUME_RETRY`] while the request
-//! stands. An engine configuration change (headphones, a car connecting)
-//! and a media-services reset take the same path. The turn is told nothing:
-//! its `Idle { listening_for_wake: true }` is the promise the port is keeping,
-//! a few seconds late.
+//! An engine configuration change stops the engine, and so does the system
+//! on occasion with no notification at all. A port that reported either as
+//! `Failed` would leave the phrase dead after the first pair of headphones.
+//! Instead the worker remembers what the turn asked for (`wanted`), tears
+//! the dead capture down and rebuilds it — at once for a change, and every
+//! [`RESUME_RETRY`] while the request stands if the rebuild is refused. The
+//! turn is told nothing: its `Idle { listening_for_wake: true }` is the
+//! promise the port is keeping, a few seconds late.
 //!
-//! # Sharing the speaker with the app in front
+//! # App Nap
 //!
-//! While armed, the session is `.playAndRecord` with `mixWithOthers`: keeper
-//! neither pauses nor quietens Maps or music, because a listener that ducked
-//! the whole drive for a phrase it mostly does not hear would be turned off
-//! and rightly. While keeper **speaks**, the options switch to `duckOthers`
-//! (which implies mixing, per Apple's `AVAudioSession.CategoryOptions`
-//! docs), so the answer sits over a quieter Maps prompt rather than a paused
-//! one, and the volume comes back the moment the utterance ends. Bluetooth
-//! HFP and A2DP are both allowed so a car kit is a route; the speaker is the
-//! default when nothing else is. The mode stays `.default`: `.voiceChat`
-//! would route to the receiver, and `.voicePrompt` is for playback-only
-//! sessions.
+//! A listener that is not in front is a candidate for App Nap, which would
+//! starve the tap. The worker holds an `NSProcessInfo` activity
+//! (`UserInitiatedAllowingIdleSystemSleep`) for exactly as long as a capture
+//! is up: it names the reason, it does not keep the Mac awake — a closed
+//! lid disconnects the microphone physically and no assertion changes that
+//! — and it ends with the capture.
 //!
 //! # Stale results are not failures
 //!
 //! Cancelling a recognition task delivers its handler an error. Every
-//! request gets a serial, the handler captures it, and a result from a serial
-//! that is no longer current is dropped — so a roll, a stop and the restart
-//! inside `speak` never surface as `Failed`.
-//!
-//! # Barge-in (FR-403)
-//!
-//! `speak` rolls to a fresh request before the utterance begins and raises a
-//! `speaking` flag; while it is up, any non-empty transcript is
-//! `SpeechDetected` rather than `PartialHeard`. Echo cancellation
-//! (`setVoiceProcessingEnabled`) is what keeps the app's own voice out of
-//! that transcript. The synthesiser's end is polled from the worker loop
-//! rather than through an `AVSpeechSynthesizerDelegate`, which would need an
-//! Objective-C subclass declared from Rust — more blind code than a 250 ms
-//! poll is worth.
+//! request gets a serial, the handler captures it, and a result from a
+//! serial that is no longer current is dropped — so a roll and a stop never
+//! surface as `Failed`.
 //!
 //! # Asking (FR-408)
 //!
@@ -98,17 +121,16 @@
 //! relies on, and a row in the audit inventory in
 //! `docs/constraints-and-limitations.md`.
 //!
-//! # `SpeechAnalyzer`
+//! # Not compiled where it was written
 //!
-//! Not used. objc2-speech 0.3.2 does not bind the iOS 26 `SpeechAnalyzer` /
-//! `SpeechTranscriber` API, so an availability-gated fast path would be
-//! hand-written `msg_send!` against a Swift-first API on a host that cannot
-//! compile it. `SFSpeechRecognizer` on-device is the floor and, today, the
-//! whole of it.
+//! This file was written on a Linux host and gated by the platform-neutral
+//! tests only (`keeper-core`'s `voice*` suite and the on-device source scan).
+//! Its first compile and first run are on a Mac; the report that shipped it
+//! lists both.
 
-#![cfg(target_os = "ios")]
+#![cfg(target_os = "macos")]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -122,16 +144,13 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, NSObjectProtocol, ProtocolObject};
 use objc2::AnyThread;
 use objc2_avf_audio::{
-    AVAudioEngine, AVAudioEngineConfigurationChangeNotification, AVAudioPCMBuffer, AVAudioSession,
-    AVAudioSessionCategoryOptions, AVAudioSessionCategoryPlayAndRecord,
-    AVAudioSessionInterruptionNotification, AVAudioSessionInterruptionOptionKey,
-    AVAudioSessionInterruptionOptions, AVAudioSessionInterruptionType,
-    AVAudioSessionInterruptionTypeKey, AVAudioSessionMediaServicesWereResetNotification,
-    AVAudioSessionModeDefault, AVAudioSessionRecordPermission, AVAudioSessionSetActiveOptions,
-    AVAudioTime, AVSpeechBoundary, AVSpeechSynthesizer, AVSpeechUtterance,
+    AVAudioApplication, AVAudioApplicationRecordPermission, AVAudioEngine,
+    AVAudioEngineConfigurationChangeNotification, AVAudioPCMBuffer, AVAudioTime, AVSpeechBoundary,
+    AVSpeechSynthesizer, AVSpeechUtterance,
 };
 use objc2_foundation::{
-    NSArray, NSError, NSLocale, NSNotification, NSNotificationCenter, NSNumber, NSString,
+    NSActivityOptions, NSArray, NSError, NSLocale, NSNotification, NSNotificationCenter,
+    NSProcessInfo, NSString,
 };
 use objc2_speech::{
     SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionResult, SFSpeechRecognitionTask,
@@ -147,7 +166,9 @@ const SPEAK_POLL: Duration = Duration::from_millis(250);
 /// queue-to-speaking gap on a cold voice.
 const SPEAK_GRACE: Duration = Duration::from_millis(500);
 
-/// Frames per tap buffer: ~64 ms at 16 kHz, the recogniser's native rate.
+/// Frames per tap buffer: ~21 ms at the 48 kHz most Mac inputs run at,
+/// ~64 ms at 16 kHz. The recogniser takes whatever the input node's format
+/// is; the request resamples.
 const TAP_FRAMES: u32 = 1024;
 
 /// After this long on one request, roll to a fresh one at the next quiet
@@ -163,7 +184,7 @@ const REQUEST_ROLL_QUIET: Duration = Duration::from_millis(1500);
 /// pause for a minute is rarer than a request that should not run that long.
 const REQUEST_LONGEST: Duration = Duration::from_secs(58);
 
-/// How often a listener the system took away is tried again while the turn
+/// How often a capture the system took away is tried again while the turn
 /// still wants it.
 const RESUME_RETRY: Duration = Duration::from_secs(5);
 
@@ -171,6 +192,10 @@ const RESUME_RETRY: Duration = Duration::from_secs(5);
 /// trying and tells the turn — bounded so a broken recogniser is a sentence,
 /// not a loop.
 const ROLL_FAILURES_TOLERATED: u32 = 3;
+
+/// The reason the App Nap assertion names; visible in Activity Monitor's
+/// "Preventing App Nap" column.
+const ACTIVITY_REASON: &str = "keeper is listening for the wake phrase";
 
 /// What the command layer asks the worker to do.
 enum Command {
@@ -190,35 +215,30 @@ enum Command {
         reply: SyncSender<Result<(), VoiceUnavailable>>,
     },
     StopSpeaking,
-    /// Something the system did to the audio, reported by an observer or a
-    /// result handler, to be acted on from the worker's own thread.
+    /// Something that happened to the capture or a request, reported by an
+    /// observer or a result handler, to be acted on from the worker's own
+    /// thread.
     Audio(AudioNotice),
 }
 
-/// What the system did.
+/// What happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioNotice {
-    /// `AVAudioSessionInterruptionTypeBegan`: the engine is stopped.
-    Interrupted,
-    /// `AVAudioSessionInterruptionTypeEnded`, with Apple's resume hint.
-    InterruptionEnded { should_resume: bool },
     /// `AVAudioEngineConfigurationChangeNotification`: the engine stopped
-    /// because its I/O changed (a route, a format).
+    /// because its I/O changed (a device, a format).
     EngineChanged,
-    /// `AVAudioSessionMediaServicesWereResetNotification`: every audio
-    /// object is invalid.
-    MediaReset,
-    /// The recognition task with this serial ended — a final result, or the
-    /// error in `reason`.
+    /// The recognition task with this serial ended — a final result, or an
+    /// error.
     RequestEnded { serial: u64 },
 }
 
-/// The iOS [`VoicePort`] and [`ConsentPort`]: a sender to the worker thread.
-pub struct IosVoicePort {
+/// The macOS [`VoicePort`] and [`ConsentPort`]: a sender to the worker
+/// thread.
+pub struct MacVoicePort {
     commands: Sender<Command>,
 }
 
-impl IosVoicePort {
+impl MacVoicePort {
     /// Start the worker thread and hand it `sink`.
     pub fn new(sink: EventSink) -> Self {
         let (commands, inbox) = mpsc::channel();
@@ -256,9 +276,9 @@ impl IosVoicePort {
     }
 }
 
-impl VoicePort for IosVoicePort {
+impl VoicePort for MacVoicePort {
     fn platform(&self) -> VoicePlatform {
-        VoicePlatform::IOS
+        VoicePlatform::MACOS
     }
 
     fn availability(&self) -> Result<(), VoiceUnavailable> {
@@ -289,7 +309,7 @@ impl VoicePort for IosVoicePort {
     }
 }
 
-impl ConsentPort for IosVoicePort {
+impl ConsentPort for MacVoicePort {
     fn consent(&self) -> Result<Consent, VoiceUnavailable> {
         self.ask(Command::Consent)
             .unwrap_or(Err(VoiceUnavailable::Unsupported))
@@ -298,7 +318,7 @@ impl ConsentPort for IosVoicePort {
     fn ask(&self, ask: Ask) -> Permission {
         // A worker that cannot answer has not asked, and the decision layer
         // treats an answer that is not `Granted` as the refusal it is.
-        IosVoicePort::ask(self, |reply| Command::Ask { ask, reply }).unwrap_or(Permission::Denied)
+        MacVoicePort::ask(self, |reply| Command::Ask { ask, reply }).unwrap_or(Permission::Denied)
     }
 }
 
@@ -316,6 +336,8 @@ struct Capture {
     _tap: RcBlock<dyn Fn(std::ptr::NonNull<AVAudioPCMBuffer>, std::ptr::NonNull<AVAudioTime>)>,
     /// The configuration-change observer for this engine, removed with it.
     change_observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+    /// The App Nap assertion, ended with the capture.
+    activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
 }
 
 /// One recognition request and the task answering it. Rolled by
@@ -347,22 +369,18 @@ struct Worker {
     /// The serial of the current request; handlers from older serials are
     /// stale and dropped.
     current: Arc<AtomicU64>,
-    /// Up while an utterance is being spoken: a transcript then is barge-in.
-    speaking: Arc<AtomicBool>,
-    /// When the current utterance was handed to the synthesiser.
+    /// When the current utterance was handed to the synthesiser; `None`
+    /// while not speaking.
     speaking_since: Option<Instant>,
     /// When the system took the capture away, for the retry clock; `None`
     /// while capturing or not wanted.
     suspended: Option<Instant>,
     /// Fresh requests that failed to start since the last that worked.
     failed_starts: u32,
-    /// The session observers, removed when the worker ends.
-    session_observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
 }
 
 impl Worker {
     fn new(sink: EventSink, commands: Sender<Command>) -> Self {
-        let session_observers = observe_session(&commands);
         Self {
             sink,
             commands,
@@ -372,11 +390,9 @@ impl Worker {
             recognition: None,
             synthesizer: None,
             current: Arc::new(AtomicU64::new(0)),
-            speaking: Arc::new(AtomicBool::new(false)),
             speaking_since: None,
             suspended: None,
             failed_starts: 0,
-            session_observers,
         }
     }
 
@@ -413,7 +429,6 @@ impl Worker {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     self.stop();
-                    self.forget_session_observers();
                     return;
                 }
             }
@@ -424,10 +439,11 @@ impl Worker {
     /// Start (or, while already capturing, restart on a fresh request)
     /// listening for `hints`.
     ///
-    /// A session the system will not give up right now — a call in
-    /// progress — is not a refusal: the request is recorded and the capture
-    /// arrives when the interruption ends. Only what the person must act on
-    /// (authorisation, a missing model, no microphone at all) is refused.
+    /// An engine that will not start right now — the input device is
+    /// changing under it — is not a refusal: the request is recorded and
+    /// the capture arrives on the retry clock. Only what the person must
+    /// act on (authorisation, a missing model, no microphone at all) is
+    /// refused.
     fn start(&mut self, hints: Vec<String>) -> Result<(), VoiceUnavailable> {
         availability()?;
         self.wanted = Some(hints);
@@ -445,7 +461,6 @@ impl Worker {
     /// Bring the capture up if it is down, then roll to a fresh request.
     fn arm(&mut self) -> Result<(), String> {
         if self.capture.is_none() {
-            configure_session(ARMED)?;
             self.capture = Some(start_capture(&self.commands)?);
         }
         self.roll_request()
@@ -458,13 +473,13 @@ impl Worker {
         self.suspended = Some(Instant::now());
     }
 
-    /// End recognition, stop capture, and let the session go.
+    /// End recognition and stop capture. Nothing else to let go of: there
+    /// is no session on this platform.
     fn stop(&mut self) {
         self.wanted = None;
         self.suspended = None;
         self.end_recognition();
         self.end_capture();
-        release_session();
     }
 
     fn end_recognition(&mut self) {
@@ -505,20 +520,16 @@ impl Worker {
         }
     }
 
-    /// Read `text` aloud; recognition rolls to a fresh request so that the
-    /// first transcript to arrive is the person, not the tail of what they
-    /// said before, and other audio ducks for the duration.
+    /// Read `text` aloud. The turn released the microphone before this on
+    /// a half-duplex platform (`may_record`), so there is no request to
+    /// roll and nothing to duck; the port only speaks.
     fn speak(&mut self, text: &str) -> Result<(), VoiceUnavailable> {
         if self.capture.is_some() {
-            if let Err(error) = self.roll_request() {
-                tracing::warn!(%error, "voice: could not roll the request before speaking");
-            }
-            if let Err(error) = set_session_options(DUCKING) {
-                tracing::debug!(%error, "voice: others did not duck");
-            }
+            // Not an error — the turn owns the rule — but worth a line if
+            // it ever happens, because it means the rule was not applied.
+            tracing::debug!("voice: speaking while a capture is up on a half-duplex platform");
         }
         let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
-        self.speaking.store(true, Ordering::SeqCst);
         self.speaking_since = Some(Instant::now());
         speak_text(synthesizer, text);
         Ok(())
@@ -528,19 +539,7 @@ impl Worker {
         if let Some(synthesizer) = &self.synthesizer {
             stop_speech(synthesizer);
         }
-        self.speech_over();
-    }
-
-    /// The utterance is over, one way or another: flag down, others back
-    /// to full volume.
-    fn speech_over(&mut self) {
-        self.speaking.store(false, Ordering::SeqCst);
         self.speaking_since = None;
-        if self.capture.is_some() {
-            if let Err(error) = set_session_options(ARMED) {
-                tracing::debug!(%error, "voice: others did not un-duck");
-            }
-        }
     }
 
     /// Between commands: the retry clock, the roll clock, the synthesiser.
@@ -555,7 +554,7 @@ impl Worker {
                 .as_ref()
                 .is_some_and(|c| !engine_running(&c.engine))
             {
-                // Stopped without a word from the system — Siri does this.
+                // Stopped without a word from the system.
                 tracing::info!("voice: the engine stopped on its own; resuming");
                 self.resume();
             } else if self.roll_due() {
@@ -586,15 +585,15 @@ impl Worker {
         quiet_for >= REQUEST_ROLL_QUIET
     }
 
-    /// Rebuild the capture after the system took it; on refusal, wait for
-    /// the next tick of the retry clock.
+    /// Rebuild the capture after it died; on refusal, wait for the next
+    /// tick of the retry clock.
     fn resume(&mut self) {
         self.end_recognition();
         self.end_capture();
         match self.arm() {
             Ok(()) => {
                 if self.suspended.take().is_some() {
-                    tracing::info!("voice: listening resumed after an interruption");
+                    tracing::info!("voice: listening resumed");
                 }
             }
             Err(error) => {
@@ -618,38 +617,12 @@ impl Worker {
         }
     }
 
-    /// What the system did, acted on here rather than in the observer.
+    /// What happened, acted on here rather than in the observer.
     fn on_audio(&mut self, notice: AudioNotice) {
         tracing::debug!(?notice, "voice: audio notice");
         match notice {
-            AudioNotice::Interrupted => {
-                if self.speaking_since.is_some() {
-                    // The answer is gone with the speaker; the turn ends as
-                    // if it had finished.
-                    self.stop_speaking();
-                    (self.sink)(TurnEvent::Silence);
-                }
-                if self.wanted.is_some() {
-                    self.suspend();
-                }
-            }
-            AudioNotice::InterruptionEnded { should_resume } => {
-                // Apple's hint is about playback etiquette; a microphone the
-                // person armed comes back either way.
-                tracing::info!(should_resume, "voice: interruption ended");
-                if self.wanted.is_some() {
-                    self.resume();
-                }
-            }
             AudioNotice::EngineChanged => {
                 if self.wanted.is_some() && self.suspended.is_none() {
-                    self.resume();
-                }
-            }
-            AudioNotice::MediaReset => {
-                self.synthesizer = None;
-                self.speech_over();
-                if self.wanted.is_some() {
                     self.resume();
                 }
             }
@@ -680,7 +653,7 @@ impl Worker {
             .as_ref()
             .is_some_and(|synthesizer| is_speaking(synthesizer));
         if !still {
-            self.speech_over();
+            self.speaking_since = None;
             (self.sink)(TurnEvent::Silence);
         }
     }
@@ -690,15 +663,18 @@ impl Worker {
     }
 
     /// The block the recogniser calls with each result. Captures the serial
-    /// it belongs to, the current-serial cell, the speaking flag, the sink
-    /// and the worker's inbox — all `Send`, none of them a framework object.
+    /// it belongs to, the current-serial cell, the sink and the worker's
+    /// inbox — all `Send`, none of them a framework object.
+    ///
+    /// No barge-in classification: on this platform the turn has already
+    /// released the microphone before an utterance, so a transcript is
+    /// always the person and never keeper's own answer.
     fn result_handler(
         &self,
         serial: u64,
         last_heard: Arc<AtomicU64>,
     ) -> RcBlock<dyn Fn(*mut SFSpeechRecognitionResult, *mut NSError)> {
         let current = Arc::clone(&self.current);
-        let speaking = Arc::clone(&self.speaking);
         let sink = Arc::clone(&self.sink);
         let commands = self.commands.clone();
         let epoch = self.epoch;
@@ -714,18 +690,12 @@ impl Worker {
                                 u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
                             last_heard.store(now, Ordering::SeqCst);
                         }
-                        if speaking.load(Ordering::SeqCst) {
-                            if !text.trim().is_empty() {
-                                sink(TurnEvent::SpeechDetected);
-                            }
-                        } else if is_final {
-                            sink(TurnEvent::FinalHeard(text));
-                        } else {
-                            sink(TurnEvent::PartialHeard(text));
-                        }
                         if is_final {
+                            sink(TurnEvent::FinalHeard(text));
                             let _ =
                                 commands.send(Command::Audio(AudioNotice::RequestEnded { serial }));
+                        } else {
+                            sink(TurnEvent::PartialHeard(text));
                         }
                     }
                     Ok(None) => {}
@@ -740,89 +710,59 @@ impl Worker {
             },
         )
     }
-
-    fn forget_session_observers(&mut self) {
-        for observer in self.session_observers.drain(..) {
-            forget_observer(&observer);
-        }
-    }
 }
-
-// ---------------------------------------------------------------------------
-// The session's shape.
-// ---------------------------------------------------------------------------
-
-/// The options while armed: mixable, so the app in front keeps its audio;
-/// speaker by default; car kits and headsets as routes.
-///
-/// Apple, `AVAudioSession.CategoryOptions`: `mixWithOthers` "allows other
-/// applications to play in the background while your app has both audio
-/// input and output enabled"; without it, activating `.playAndRecord`
-/// interrupts every other session — which is the "kills Maps" case.
-const ARMED: AVAudioSessionCategoryOptions = AVAudioSessionCategoryOptions::MixWithOthers
-    .union(AVAudioSessionCategoryOptions::DefaultToSpeaker)
-    .union(AVAudioSessionCategoryOptions::AllowBluetoothHFP)
-    .union(AVAudioSessionCategoryOptions::AllowBluetoothA2DP);
-
-/// The options while keeper speaks: the same routes, and others ducked.
-///
-/// Apple, the same page: `duckOthers` "reduces the volume of any music
-/// currently being played" and "setting this option will also make your
-/// session mixable with others". So Maps' prompt is quieter under keeper's
-/// answer, not paused, and comes back to full volume when the utterance
-/// ends and [`ARMED`] is set again.
-const DUCKING: AVAudioSessionCategoryOptions = AVAudioSessionCategoryOptions::DuckOthers
-    .union(AVAudioSessionCategoryOptions::DefaultToSpeaker)
-    .union(AVAudioSessionCategoryOptions::AllowBluetoothHFP)
-    .union(AVAudioSessionCategoryOptions::AllowBluetoothA2DP);
 
 // ---------------------------------------------------------------------------
 // The FFI, one function per concern.
 // ---------------------------------------------------------------------------
 
-/// Whether listening and speaking can work right now (FR-402).
+/// Whether listening and speaking can work right now (FR-417).
 ///
-/// Order: the recogniser class itself, then authorisation (both the
-/// recogniser's and the microphone's), then an input route, then a
-/// recogniser for the current locale that can work on the device.
-/// `NotDetermined` is `NotAuthorized`: this function never prompts — asking
-/// is [`ConsentPort`]'s, decided by `keeper_core::voice::authorization`
-/// (FR-408).
+/// Order: the recogniser class itself, then authorisation (the
+/// recogniser's, then the microphone's), then an input device, then a
+/// recogniser for the current locale that can work on this Mac. The
+/// microphone grant is read before the engine is touched, so a refused
+/// grant never opens the input device. `NotDetermined` is `NotAuthorized`:
+/// this function never prompts — asking is [`ConsentPort`]'s, decided by
+/// `keeper_core::voice::authorization` (FR-408).
 fn availability() -> Result<(), VoiceUnavailable> {
     recognizer_class()?;
     if speech_authorization() != SFSpeechRecognizerAuthorizationStatus::Authorized {
         return Err(VoiceUnavailable::NotAuthorized);
     }
-    match microphone() {
-        Microphone::Absent => return Err(VoiceUnavailable::NoMicrophone),
-        Microphone::NotAuthorized => return Err(VoiceUnavailable::NotAuthorized),
-        Microphone::Ready => {}
+    if microphone_consent() != Permission::Granted {
+        return Err(VoiceUnavailable::NotAuthorized);
+    }
+    if !input_present() {
+        return Err(VoiceUnavailable::NoMicrophone);
     }
     let locale = NSLocale::currentLocale();
     let identifier = locale.localeIdentifier().to_string();
-    match on_device_recognizer(&locale) {
-        Some(_) => Ok(()),
-        None => Err(VoiceUnavailable::NoOnDeviceModel { locale: identifier }),
+    match recognizer_for(&locale) {
+        Recognizer::Ready(_) => Ok(()),
+        Recognizer::Absent | Recognizer::ServerOnly => {
+            Err(VoiceUnavailable::NoOnDeviceRecognition { locale: identifier })
+        }
+        Recognizer::NoModel => Err(VoiceUnavailable::NoOnDeviceModel { locale: identifier }),
     }
 }
 
 /// Whether `SFSpeechRecognizer` is registered in this process at all.
 ///
-/// objc2 reaches the class by name at run time, and `objc2-speech`'s
-/// `#[link(name = "Speech", kind = "framework")]` sits on an empty extern
-/// block that never reaches Xcode's link line (`libapp.a` is linked by the
-/// generated project, not by rustc). So a project that does not list
-/// `Speech.framework` builds, ships every `voice_*` command, and has no
-/// recogniser class — and every call below this one would abort the worker
-/// with "class not found". The check is first on every path that touches
-/// the class, and the refusal is the build's, said once at error level so
-/// the log names it even before a surface asks.
+/// objc2 reaches the class by name at run time, and the Speech framework
+/// reaches the link line only through `objc2-speech`'s `#[link]` attribute
+/// on an empty extern block. rustc links the macOS binary itself, so that
+/// attribute is expected to hold — but a build in which it does not would
+/// still ship every `voice_*` command and abort the worker with "class not
+/// found" on the first call below this one. The check is first on every
+/// path that touches the class, and the refusal is the build's, said once
+/// at error level so the log names it even before a surface asks.
 fn recognizer_class() -> Result<(), VoiceUnavailable> {
     if AnyClass::get(c"SFSpeechRecognizer").is_some() {
         return Ok(());
     }
     tracing::error!(
-        "voice: SFSpeechRecognizer is not registered — this build was linked without Speech.framework (gen/apple/project.yml must list it)"
+        "voice: SFSpeechRecognizer is not registered — this build was linked without Speech.framework"
     );
     Err(VoiceUnavailable::NoRecognizer)
 }
@@ -846,45 +786,43 @@ fn speech_consent() -> Permission {
     }
 }
 
-/// What the audio session says about the microphone.
-enum Microphone {
-    Ready,
-    Absent,
-    NotAuthorized,
-}
-
-/// `AVAudioSession.isInputAvailable` and `.recordPermission`.
+/// Whether `AVAudioApplication` — the class that reads and asks for the
+/// microphone grant on macOS 14 and later — is registered in this process.
 ///
-/// `recordPermission` is deprecated in favour of `AVAudioApplication`, which
-/// is iOS 17; the floor is iOS 16, so the older property is the one every
-/// supported phone has.
-#[allow(unsafe_code)]
-#[allow(deprecated)]
-fn microphone() -> Microphone {
-    // SAFETY: `+[AVAudioSession sharedInstance]` returns the process
-    // singleton, retained here for the call's duration. `isInputAvailable`
-    // and `recordPermission` are read-only properties documented as
-    // thread-safe; neither prompts.
-    let session = unsafe { AVAudioSession::sharedInstance() };
-    if !unsafe { session.isInputAvailable() } {
-        return Microphone::Absent;
+/// On macOS 11–13 it is not, and the crates this build carries have no other
+/// reader of the grant. That is a limit of this port, said at error level
+/// once per ask so a log reader on an older Mac finds the cause, and shown
+/// to the person as `NotAuthorized` because nothing else is true: keeper
+/// cannot know it is allowed, so it does not record.
+fn audio_application_class() -> bool {
+    if AnyClass::get(c"AVAudioApplication").is_some() {
+        return true;
     }
-    if unsafe { session.recordPermission() } != AVAudioSessionRecordPermission::Granted {
-        return Microphone::NotAuthorized;
-    }
-    Microphone::Ready
+    tracing::error!(
+        "voice: AVAudioApplication is not registered — reading the microphone grant needs macOS 14 or later; voice is not available on this Mac"
+    );
+    false
 }
 
 /// The microphone's recorded permission, as the decision layer reads it.
+///
+/// `AVAudioApplication.recordPermission` is the macOS reader; there is no
+/// `AVAudioSession` here. Denied where the class is absent (see
+/// [`audio_application_class`]).
 #[allow(unsafe_code)]
-#[allow(deprecated)]
 fn microphone_consent() -> Permission {
-    // SAFETY: as in `microphone`: the retained singleton and a read-only,
-    // thread-safe property that never prompts.
-    let session = unsafe { AVAudioSession::sharedInstance() };
-    match unsafe { session.recordPermission() } {
-        AVAudioSessionRecordPermission::Undetermined => Permission::NotDetermined,
-        AVAudioSessionRecordPermission::Granted => Permission::Granted,
+    if !audio_application_class() {
+        return Permission::Denied;
+    }
+    // SAFETY: `+[AVAudioApplication sharedInstance]` returns the process
+    // singleton, retained here for the call's duration, and
+    // `recordPermission` is a read-only property Apple documents as
+    // returning the recorded state without prompting. The class was
+    // confirmed registered just above.
+    let application = unsafe { AVAudioApplication::sharedInstance() };
+    match unsafe { application.recordPermission() } {
+        AVAudioApplicationRecordPermission::Undetermined => Permission::NotDetermined,
+        AVAudioApplicationRecordPermission::Granted => Permission::Granted,
         _ => Permission::Denied,
     }
 }
@@ -899,7 +837,7 @@ fn ask_speech() -> Permission {
     // is why this blocks a worker and not the main thread. The block is
     // copied by the call and captures only a `SyncSender`. Apple's stated
     // precondition — `NSSpeechRecognitionUsageDescription` present, or the
-    // app crashes — is met by `gen/apple/project.yml`.
+    // app is terminated — is met by `crates/keeper/Info.plist`.
     let (reply, answer) = mpsc::sync_channel::<SFSpeechRecognizerAuthorizationStatus>(1);
     let handler = RcBlock::new(move |status: SFSpeechRecognizerAuthorizationStatus| {
         let _ = reply.send(status);
@@ -916,24 +854,26 @@ fn ask_speech() -> Permission {
     }
 }
 
-/// `-[AVAudioSession requestRecordPermission:]`: the microphone's dialog,
-/// shown once by the OS, waited for here (FR-408). Deprecated for
-/// `AVAudioApplication` (iOS 17); the floor is 16.
+/// `+[AVAudioApplication requestRecordPermissionWithCompletionHandler:]`:
+/// the microphone's dialog, shown once by the OS, waited for here (FR-408).
+/// Denied without a dialog where the class is absent (macOS 11–13).
 #[allow(unsafe_code)]
-#[allow(deprecated)]
 fn ask_microphone() -> Permission {
-    // SAFETY: the retained singleton and a completion block Apple documents
-    // as "called immediately if permission has already been granted or
-    // denied", otherwise once the dialog is dismissed, "in a different thread
-    // context" — so a blocking wait here is off the main thread by
-    // construction. The block captures only a `SyncSender`.
-    // `NSMicrophoneUsageDescription` is in `gen/apple/project.yml`.
+    if !audio_application_class() {
+        return Permission::Denied;
+    }
+    // SAFETY: a class method taking a completion block Apple documents as
+    // "called immediately if permission has already been granted or
+    // denied", otherwise once the dialog is dismissed, on an unspecified
+    // thread — so a blocking wait here is off the main thread by
+    // construction. The block is copied by the call and captures only a
+    // `SyncSender`. `NSMicrophoneUsageDescription` is in
+    // `crates/keeper/Info.plist`.
     let (reply, answer) = mpsc::sync_channel::<bool>(1);
     let handler = RcBlock::new(move |granted: Bool| {
         let _ = reply.send(granted.as_bool());
     });
-    let session = unsafe { AVAudioSession::sharedInstance() };
-    unsafe { session.requestRecordPermission(&handler) };
+    unsafe { AVAudioApplication::requestRecordPermissionWithCompletionHandler(&handler) };
     match answer.recv() {
         Ok(true) => Permission::Granted,
         Ok(false) => Permission::Denied,
@@ -944,109 +884,100 @@ fn ask_microphone() -> Permission {
     }
 }
 
-/// A recogniser for `locale` that can work without the network, or `None`.
+/// Whether this Mac has an audio input device right now.
+///
+/// Apple's `AVAudioEngine.inputNode` documentation: check the input node's
+/// input (hardware) format for a non-zero sample rate and channel count to
+/// see whether input is enabled — a Mac with no microphone reports zeros.
+/// The engine built here is discarded; nothing is started, and the read is
+/// made only after the grant was confirmed, so it never opens the device.
 #[allow(unsafe_code)]
-fn on_device_recognizer(locale: &NSLocale) -> Option<Retained<SFSpeechRecognizer>> {
+fn input_present() -> bool {
+    // SAFETY: a fresh engine, its input node (created on demand and owned by
+    // the engine) and a read-only format property on bus 0, the only input
+    // bus. Every object is retained for the duration of the call and dropped
+    // with it; nothing is started or installed.
+    let engine = unsafe { AVAudioEngine::new() };
+    let input = unsafe { engine.inputNode() };
+    let format = unsafe { input.inputFormatForBus(0) };
+    let sample_rate = unsafe { format.sampleRate() };
+    let channels = unsafe { format.channelCount() };
+    sample_rate > 0.0 && channels > 0
+}
+
+/// What the framework has for a locale.
+enum Recognizer {
+    /// No recogniser at all: the locale is not in `supportedLocales`. No
+    /// download adds one.
+    Absent,
+    /// A recogniser that cannot run on this Mac
+    /// (`supportsOnDeviceRecognition == false`). No download changes that.
+    ServerOnly,
+    /// A recogniser that can run on this Mac but is not available right
+    /// now (`isAvailable == false`): Dictation is off, or its language is
+    /// not downloaded.
+    NoModel,
+    /// A recogniser that can work now, without the network.
+    Ready(Retained<SFSpeechRecognizer>),
+}
+
+/// The recogniser for `locale`, classified for the four absences Story 63.4
+/// names.
+#[allow(unsafe_code)]
+fn recognizer_for(locale: &NSLocale) -> Recognizer {
     // SAFETY: `-[SFSpeechRecognizer initWithLocale:]` consumes the fresh
     // allocation and returns nil when the locale has no recogniser, which
-    // objc2 surfaces as `None`. `supportsOnDeviceRecognition` is a read-only
-    // property on the retained object. Neither prompts nor touches the
-    // network: Apple documents the property as the precondition a request's
-    // `requiresOnDeviceRecognition` needs to be honoured.
-    let recognizer =
-        unsafe { SFSpeechRecognizer::initWithLocale(SFSpeechRecognizer::alloc(), locale) }?;
-    if unsafe { recognizer.supportsOnDeviceRecognition() } {
-        Some(recognizer)
-    } else {
-        None
+    // objc2 surfaces as `None`. `supportsOnDeviceRecognition` and
+    // `isAvailable` are read-only properties on the retained object. None
+    // prompts or touches the network: Apple documents the first property as
+    // the precondition a request's `requiresOnDeviceRecognition` needs to be
+    // honoured, and the second as whether the recogniser can be used now.
+    let Some(recognizer) =
+        (unsafe { SFSpeechRecognizer::initWithLocale(SFSpeechRecognizer::alloc(), locale) })
+    else {
+        return Recognizer::Absent;
+    };
+    if !unsafe { recognizer.supportsOnDeviceRecognition() } {
+        return Recognizer::ServerOnly;
     }
-}
-
-/// Put the shared session in `.playAndRecord` with `options` and activate
-/// it.
-#[allow(unsafe_code)]
-fn configure_session(options: AVAudioSessionCategoryOptions) -> Result<(), String> {
-    // SAFETY: `AVAudioSessionCategoryPlayAndRecord` and
-    // `AVAudioSessionModeDefault` are Apple's process-lifetime extern
-    // `NSString` constants; reading them carries no other obligation, and a
-    // nil (which no iOS ships) is answered rather than dereferenced.
-    // `setCategory:mode:options:error:` and `setActive:error:` take the
-    // retained singleton and documented enum values; a refusal — including
-    // `AVAudioSessionErrorCodeCannotInterruptOthers` during a call — is
-    // returned as `NSError`, never undefined behaviour.
-    let session = unsafe { AVAudioSession::sharedInstance() };
-    let category = unsafe { AVAudioSessionCategoryPlayAndRecord }
-        .ok_or("AVAudioSessionCategoryPlayAndRecord is nil")?;
-    let mode = unsafe { AVAudioSessionModeDefault }.ok_or("AVAudioSessionModeDefault is nil")?;
-    unsafe { session.setCategory_mode_options_error(category, mode, options) }
-        .map_err(|error| error.localizedDescription().to_string())?;
-    unsafe { session.setActive_error(true) }
-        .map_err(|error| error.localizedDescription().to_string())
-}
-
-/// Change the active session's options without deactivating it: ducking on
-/// for an utterance, off after.
-#[allow(unsafe_code)]
-fn set_session_options(options: AVAudioSessionCategoryOptions) -> Result<(), String> {
-    // SAFETY: as in `configure_session`, minus activation. Apple allows
-    // `setCategory:mode:options:error:` on an active session; the category
-    // and mode are unchanged, so no route changes, and if one did the
-    // engine's configuration-change notification rebuilds the capture.
-    let session = unsafe { AVAudioSession::sharedInstance() };
-    let category = unsafe { AVAudioSessionCategoryPlayAndRecord }
-        .ok_or("AVAudioSessionCategoryPlayAndRecord is nil")?;
-    let mode = unsafe { AVAudioSessionModeDefault }.ok_or("AVAudioSessionModeDefault is nil")?;
-    unsafe { session.setCategory_mode_options_error(category, mode, options) }
-        .map_err(|error| error.localizedDescription().to_string())
-}
-
-/// Deactivate the shared session, un-ducking whatever was ducked.
-#[allow(unsafe_code)]
-fn release_session() {
-    // SAFETY: the retained singleton and a documented option flag;
-    // deactivation while I/O still runs is reported as `NSError`
-    // (`AVAudioSessionErrorCodeIsBusy`) and the session is deactivated
-    // anyway, which is what a release wants.
-    let session = unsafe { AVAudioSession::sharedInstance() };
-    if let Err(error) = unsafe {
-        session.setActive_withOptions_error(
-            false,
-            AVAudioSessionSetActiveOptions::NotifyOthersOnDeactivation,
-        )
-    } {
-        tracing::debug!(%error, "voice: the audio session did not deactivate cleanly");
+    if !unsafe { recognizer.isAvailable() } {
+        return Recognizer::NoModel;
     }
+    Recognizer::Ready(recognizer)
 }
 
-/// Start capturing into whatever request the slot holds.
+/// Start capturing into whatever request the slot holds, and hold the App
+/// Nap assertion for as long as the capture stands.
 ///
-/// The engine is built new per capture rather than kept: voice processing
-/// may only be toggled on a stopped engine, and a fresh one is always
-/// stopped. The tap reads the slot on every buffer, so a request can be
-/// rolled underneath it without touching the engine.
+/// The engine is built new per capture rather than kept: a fresh one is
+/// always stopped and carries no tap from a previous input device. No voice
+/// processing is enabled — this platform is half-duplex by
+/// `keeper_core::voice::may_record`, and the microphone is never open while
+/// keeper speaks, so there is nothing to cancel. The tap reads the slot on
+/// every buffer, so a request can be rolled underneath it without touching
+/// the engine.
 #[allow(unsafe_code)]
 // The slot crosses to the audio thread inside a block, which Rust cannot see
 // and clippy therefore flags; the SAFETY comment below is the argument.
 #[allow(clippy::arc_with_non_send_sync)]
 fn start_capture(commands: &Sender<Command>) -> Result<Capture, String> {
     // SAFETY: every object below is freshly allocated or retained here and
-    // outlives every call made on it. `setVoiceProcessingEnabled:error:` is
-    // called before `startAndReturnError:`, which Apple requires. The tap
-    // block is copied by `installTapOnBus:…` and also kept in `Capture` so
-    // it cannot be freed while installed; on each call it locks the slot and
-    // appends the buffer to the request there, which Apple's SpeakToMe
-    // sample does from the same thread the tap runs on, and the buffer
-    // pointer is non-null for the duration of the tap call by that method's
-    // contract. The slot's mutex is the only thing shared between the audio
-    // thread and the worker, and Objective-C retain/release is thread-safe,
-    // so the swap under the lock is sound. The configuration-change observer
-    // is registered for this engine only and removed in `stop_capture`;
-    // its block captures a `Sender` and reads nothing from the notification.
-    // Failures surface as `NSError`.
+    // outlives every call made on it. The tap block is copied by
+    // `installTapOnBus:…` and also kept in `Capture` so it cannot be freed
+    // while installed; on each call it locks the slot and appends the buffer
+    // to the request there, which Apple's SpeakToMe sample does from the
+    // same thread the tap runs on, and the buffer pointer is non-null for
+    // the duration of the tap call by that method's contract. The slot's
+    // mutex is the only thing shared between the audio thread and the
+    // worker, and Objective-C retain/release is thread-safe, so the swap
+    // under the lock is sound. The configuration-change observer is
+    // registered for this engine only and removed in `stop_capture`; its
+    // block captures a `Sender` and reads nothing from the notification.
+    // Failures surface as `NSError`. `beginActivityWithOptions:reason:` is
+    // a safe binding; its token is retained in `Capture` and handed back to
+    // `endActivity:` in `stop_capture`.
     let engine = unsafe { AVAudioEngine::new() };
     let input = unsafe { engine.inputNode() };
-    unsafe { input.setVoiceProcessingEnabled_error(true) }
-        .map_err(|error| error.localizedDescription().to_string())?;
     let format = unsafe { input.outputFormatForBus(0) };
 
     let slot: Arc<RequestSlot> = Arc::new(Mutex::new(None));
@@ -1086,22 +1017,28 @@ fn start_capture(commands: &Sender<Command>) -> Result<Capture, String> {
             &on_change,
         )
     };
+    let activity = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+        NSActivityOptions::UserInitiatedAllowingIdleSystemSleep,
+        &NSString::from_str(ACTIVITY_REASON),
+    );
     Ok(Capture {
         engine,
         slot,
         _tap: tap,
         change_observer,
+        activity,
     })
 }
 
 /// Tear one capture down: observer off, tap off, engine stopped, slot
-/// emptied.
+/// emptied, App Nap assertion ended.
 #[allow(unsafe_code)]
 fn stop_capture(capture: &Capture) {
     // SAFETY: the objects are the retained ones `start_capture` built;
     // `removeObserver:` takes the token that registration returned,
     // `removeTapOnBus:` and `stop` are documented as safe while the engine
-    // runs and harmless when it does not.
+    // runs and harmless when it does not, and `endActivity:` takes the
+    // token `beginActivityWithOptions:reason:` returned, once.
     forget_observer(&capture.change_observer);
     let input = unsafe { capture.engine.inputNode() };
     unsafe { input.removeTapOnBus(0) };
@@ -1110,6 +1047,7 @@ fn stop_capture(capture: &Capture) {
         .slot
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    unsafe { NSProcessInfo::processInfo().endActivity(&capture.activity) };
 }
 
 /// `AVAudioEngine.isRunning`.
@@ -1138,8 +1076,12 @@ fn start_request(
     // reach it, which Apple permits (audio may be appended before the task
     // starts).
     let locale = NSLocale::currentLocale();
-    let recognizer = on_device_recognizer(&locale)
-        .ok_or_else(|| format!("no on-device recogniser for {}", locale.localeIdentifier()))?;
+    let Recognizer::Ready(recognizer) = recognizer_for(&locale) else {
+        return Err(format!(
+            "no on-device recogniser for {}",
+            locale.localeIdentifier()
+        ));
+    };
     let request = unsafe { SFSpeechAudioBufferRecognitionRequest::new() };
     unsafe { request.setRequiresOnDeviceRecognition(true) };
     unsafe { request.setShouldReportPartialResults(true) };
@@ -1192,81 +1134,6 @@ fn read_result(
     Ok(Some((text, is_final)))
 }
 
-/// Watch the shared session for interruptions and media resets, posting each
-/// to the worker's inbox.
-#[allow(unsafe_code)]
-fn observe_session(
-    commands: &Sender<Command>,
-) -> Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>> {
-    // SAFETY: `addObserverForName:object:queue:usingBlock:` copies the block
-    // and returns an opaque observer token that must be passed to
-    // `removeObserver:` before it is dropped, which `forget_observer` does.
-    // With a nil queue the block runs on the posting thread; it captures only
-    // a `Sender`, reads the notification's `userInfo` (Apple: a dictionary
-    // whose interruption-type value is an `NSNumber`) through null-checked
-    // safe accessors, and never touches a worker-owned object. The
-    // notification names are Apple's process-lifetime constants; a nil one
-    // (which no iOS ships) means no observer rather than a null deref.
-    let mut observers = Vec::with_capacity(2);
-    let center = NSNotificationCenter::defaultCenter();
-    let session = unsafe { AVAudioSession::sharedInstance() };
-
-    if let Some(name) = unsafe { AVAudioSessionInterruptionNotification } {
-        let inbox = commands.clone();
-        let on_interruption = RcBlock::new(move |note: std::ptr::NonNull<NSNotification>| {
-            let notification = unsafe { note.as_ref() };
-            if let Some(notice) = interruption_notice(notification) {
-                let _ = inbox.send(Command::Audio(notice));
-            }
-        });
-        let token = unsafe {
-            center.addObserverForName_object_queue_usingBlock(
-                Some(name),
-                Some(&session),
-                None,
-                &on_interruption,
-            )
-        };
-        observers.push(token);
-    }
-
-    if let Some(name) = unsafe { AVAudioSessionMediaServicesWereResetNotification } {
-        let inbox = commands.clone();
-        let on_reset = RcBlock::new(move |_note: std::ptr::NonNull<NSNotification>| {
-            let _ = inbox.send(Command::Audio(AudioNotice::MediaReset));
-        });
-        let token = unsafe {
-            center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &on_reset)
-        };
-        observers.push(token);
-    }
-    observers
-}
-
-/// Read an interruption notification's `userInfo` into a notice.
-#[allow(unsafe_code)]
-fn interruption_notice(notification: &NSNotification) -> Option<AudioNotice> {
-    // SAFETY: the two keys are Apple's process-lifetime `NSString`
-    // constants, read once; every lookup below is a safe, null-checked
-    // accessor on the retained dictionary, and the number is downcast before
-    // it is read.
-    let info = notification.userInfo()?;
-    let type_key = unsafe { AVAudioSessionInterruptionTypeKey }?;
-    let kind = info
-        .objectForKey(type_key)
-        .and_then(|value| value.downcast::<NSNumber>().ok())
-        .map(|number| AVAudioSessionInterruptionType(number.unsignedIntegerValue()))?;
-    if kind == AVAudioSessionInterruptionType::Began {
-        return Some(AudioNotice::Interrupted);
-    }
-    let should_resume = unsafe { AVAudioSessionInterruptionOptionKey }
-        .and_then(|key| info.objectForKey(key))
-        .and_then(|value| value.downcast::<NSNumber>().ok())
-        .map(|number| AVAudioSessionInterruptionOptions(number.unsignedIntegerValue()))
-        .is_some_and(|options| options.contains(AVAudioSessionInterruptionOptions::ShouldResume));
-    Some(AudioNotice::InterruptionEnded { should_resume })
-}
-
 /// `-[NSNotificationCenter removeObserver:]` for one registration token.
 #[allow(unsafe_code)]
 fn forget_observer(observer: &ProtocolObject<dyn NSObjectProtocol>) {
@@ -1297,7 +1164,7 @@ fn speak_text(synthesizer: &AVSpeechSynthesizer, text: &str) {
 }
 
 /// `stopSpeakingAtBoundary:AVSpeechBoundaryImmediate` — mid-word, which is
-/// what barge-in means.
+/// what a stop means.
 #[allow(unsafe_code)]
 fn stop_speech(synthesizer: &AVSpeechSynthesizer) {
     // SAFETY: a documented enum value on the retained synthesiser; returns

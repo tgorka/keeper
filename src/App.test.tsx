@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AccountVm } from "@/lib/ipc/client";
 
@@ -13,6 +13,11 @@ const mockEncryptionPosture = vi.hoisted(() => vi.fn());
 // unmounted one, which is precisely how `listenNotesOpenNote` came to be
 // declared and called from nowhere for two epics.
 const mockListenNotesOpenNote = vi.hoisted(() => vi.fn(async () => () => {}));
+// The capability handshake (Story 12.2). Pending by default so every test
+// above the no-account path sees the safe default; that path resolves a phone.
+// The executor form, not `Promise.withResolvers`: the project compiles
+// against `lib: ES2020`, where that constructor method does not exist.
+const mockCapabilities = vi.hoisted(() => vi.fn(() => new Promise(() => {})));
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
@@ -30,13 +35,17 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     // the resolved value. Defaults to "chosen off" so unrelated tests see login.
     encryptionPosture: mockEncryptionPosture,
     listenNotesOpenNote: mockListenNotesOpenNote,
+    capabilities: mockCapabilities,
   };
 });
 
 import { CHOICE_TITLE } from "@/components/settings/at-rest-encryption-choice";
 import { accountsStore } from "@/lib/stores/accounts";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
+import { primaryViewStore } from "@/lib/stores/primary-view";
 import { wizardStore } from "@/lib/stores/wizard";
-import App from "./App";
+import App, { NO_ACCOUNT_BOTS_LABEL } from "./App";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -45,6 +54,29 @@ const account: AccountVm = {
   hueIndex: 0,
   provider: "password",
 };
+
+/** A phone: it can talk to a model and nothing else is on. */
+const PHONE = { ...DEFAULT_CAPABILITIES, bots: true };
+
+const originalMatchMedia = window.matchMedia;
+/** The phone-shell suite's viewport stub: 390px wide, reduced motion. */
+function mockPhoneViewport() {
+  window.matchMedia = vi.fn().mockImplementation((query: string) => {
+    const match = query.match(/max-width:\s*(\d+)px/);
+    const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+    const matches = query.includes("prefers-reduced-motion") ? true : 390 <= maxWidth;
+    return {
+      matches,
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    };
+  });
+}
 
 describe("App", () => {
   beforeEach(() => {
@@ -55,12 +87,20 @@ describe("App", () => {
     mockEncryptionPosture.mockReset();
     mockEncryptionPosture.mockResolvedValue(false);
     mockListenNotesOpenNote.mockClear();
+    mockCapabilities.mockReset();
+    mockCapabilities.mockImplementation(() => new Promise(() => {}));
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+    primaryViewStore.getState().setView("inbox");
+    leadingDrawerStore.getState().close();
   });
 
   afterEach(() => {
     accountsStore.getState().clear();
     accountsStore.setState({ hydrated: false });
     wizardStore.setState({ active: false, dismissed: false, step: "welcome", accountId: null });
+    window.matchMedia = originalMatchMedia;
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+    primaryViewStore.getState().setView("inbox");
   });
 
   it("renders a splash while the boot restore is in flight (not hydrated)", () => {
@@ -163,6 +203,54 @@ describe("App", () => {
     expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
     expect(screen.queryByRole("main")).not.toBeInTheDocument();
     expect(wizardStore.getState().active).toBe(false);
+  });
+
+  /**
+   * Story 63.1, AD-180: a phone with no Matrix account can still reach Bots.
+   * The login screen is not replaced — Sign in is still the form — but it is
+   * no longer a wall: one named control under it opens the shell on Bots,
+   * and Add account stays reachable in the drawer after it. The control is
+   * absent where the build has no Bots (AD-27), which the default here is.
+   */
+  it("offers a way into Bots with zero accounts at phone width, and still offers sign-in", async () => {
+    mockPhoneViewport();
+    mockCapabilities.mockResolvedValue(PHONE);
+    // Boot with an account so the first-run decision locks out, then sign it
+    // out: the zero-account login screen, the state a signed-out phone sits in.
+    accountsStore.getState().addAccount(account);
+    accountsStore.getState().markHydrated();
+    const { rerender } = render(<App />);
+    await waitFor(() => expect(capabilitiesStore.getState().hydrated).toBe(true));
+    accountsStore.getState().removeAccount(account.accountId);
+    rerender(<App />);
+
+    // Signing in is still the primary path, and the way past it is beside it.
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: NO_ACCOUNT_BOTS_LABEL }));
+
+    // The shell, on Bots: the phone stack's level 1 with its back bar, and no
+    // login form.
+    expect(await screen.findByRole("region", { name: "Bots" })).toBeInTheDocument();
+    expect(primaryViewStore.getState().view).toBe("bots");
+    expect(screen.queryByRole("button", { name: "Sign in" })).not.toBeInTheDocument();
+    // Add account is still there, in the drawer under the Inbox.
+    act(() => {
+      leadingDrawerStore.getState().open();
+    });
+    expect(await screen.findByRole("button", { name: "Add account" })).toBeInTheDocument();
+  });
+
+  it("has no way past the login screen where the build has no Bots", async () => {
+    // Absent, not disabled: the safe default (every surface off) is the
+    // capability mirror of a build that cannot talk to a model.
+    accountsStore.getState().addAccount(account);
+    accountsStore.getState().markHydrated();
+    const { rerender } = render(<App />);
+    await waitFor(() => expect(screen.getByRole("main")).toBeInTheDocument());
+    accountsStore.getState().removeAccount(account.accountId);
+    rerender(<App />);
+    expect(await screen.findByRole("button", { name: "Sign in" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: NO_ACCOUNT_BOTS_LABEL })).not.toBeInTheDocument();
   });
 
   /**

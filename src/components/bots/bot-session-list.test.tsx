@@ -21,7 +21,7 @@
  * 7. **Two empty states, two sentences**: nothing asked yet, versus nothing
  *    matching a filter.
  */
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BOT_SESSION_ACTIONS_LABEL,
@@ -34,6 +34,7 @@ import {
   BOT_SESSION_LIST_LABEL,
   BOT_SESSION_NO_MATCH,
   BOT_SESSION_READ_FAILED,
+  BOT_SESSION_REMOTE_MARK,
   BOT_SESSION_REMOTE_NOTE,
   BOT_SESSION_RENAME_CONFIRM,
   BOT_SESSION_RENAME_FIELD_LABEL,
@@ -42,7 +43,13 @@ import {
   BOT_SESSION_UNARCHIVE_LABEL,
   BotSessionList,
 } from "@/components/bots/bot-session-list";
-import type { BotSessionListVm, BotSessionRowVm, BotSessionVm } from "@/lib/ipc/client";
+import type {
+  BotSessionListVm,
+  BotSessionRowVm,
+  BotSessionVm,
+  BotTranscriptSource,
+} from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
 const botsSessionsSearch = vi.fn<(req: unknown) => Promise<BotSessionListVm>>();
 const botsSessionRename = vi.fn<(id: string, title: string) => Promise<BotSessionVm>>();
@@ -66,6 +73,9 @@ function session(fields: Partial<BotSessionVm> & { id: string; title: string }):
     updatedMs: NOW - 3_600_000,
     archived: false,
     remoteSessionId: null,
+    // Epic 63's two gateway facts: absent on a row no gateway described.
+    remoteLastActiveMs: null,
+    remoteSource: null,
     ...fields,
   };
 }
@@ -74,8 +84,9 @@ function row(
   fields: Partial<BotSessionVm> & { id: string; title: string },
   latestActivityMs: number = NOW - 3_600_000,
   messageCount = 2,
+  transcript: BotTranscriptSource = "local",
 ): BotSessionRowVm {
-  return { session: session(fields), latestActivityMs, messageCount };
+  return { session: session(fields), latestActivityMs, messageCount, transcript };
 }
 
 const ROW_A = row({ id: "s-a", title: "What changed in the drive" }, NOW - 60_000, 4);
@@ -332,6 +343,36 @@ describe("delete", () => {
     await waitFor(() => expect(botsSessionDelete).toHaveBeenCalledWith("s-a"));
   });
 
+  /**
+   * Story 63.1, FR-412: the body names the machine the store is on, in the
+   * tier's own word. The Mac's sentence is the literal it always was; a phone
+   * — the reduced tier, `bots` on and every desktop flag off — says "this
+   * phone" and never "this Mac".
+   */
+  it("says which device holds the store, per tier", async () => {
+    // The Mac: the desktop tier, which is any hydrated mirror with a desktop
+    // flag on.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    mount();
+    let menu = await openMenu("What changed in the drive");
+    fireEvent.click(within(menu).getByRole("menuitem", { name: BOT_SESSION_DELETE_LABEL }));
+    let dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent(
+      "The conversation and its 4 messages are removed from keeper's own store on this Mac, in one step, and cannot be brought back. Nothing on your drive changes, and the model is not told.",
+    );
+    cleanup();
+
+    // The phone.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    mount();
+    menu = await openMenu("What changed in the drive");
+    fireEvent.click(within(menu).getByRole("menuitem", { name: BOT_SESSION_DELETE_LABEL }));
+    dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent("removed from keeper's own store on this phone,");
+    expect(dialog).not.toHaveTextContent("this Mac");
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  });
+
   it("deletes nothing when the confirmation is declined", async () => {
     mount();
     const menu = await openMenu("What changed in the drive");
@@ -416,7 +457,9 @@ describe("rename", () => {
 });
 
 describe("the remote session id", () => {
-  /** Shown on the conversation being read, when one is held. */
+  /** Shown on the conversation being read, when one is held. A row with an id
+   *  but no session API behind it reads locally, so the sentence is the older
+   *  one about the reference. */
   it("says which session the other side calls it, and that it may be gone", async () => {
     botsSessionsSearch.mockResolvedValue(
       answer([row({ id: "s-a", title: "Draft the release note", remoteSessionId: "hermes-9f21" })]),
@@ -445,5 +488,65 @@ describe("the remote session id", () => {
     await screen.findByText("Draft the release note");
 
     expect(screen.queryByText(/calls this session/)).toBeNull();
+  });
+});
+
+describe("which is which (AD-181)", () => {
+  const REMOTE = row(
+    {
+      id: "s-r",
+      title: "From the phone",
+      remoteSessionId: "hermes-9f21",
+      remoteSource: "api",
+      remoteLastActiveMs: NOW - 5 * 60_000,
+    },
+    NOW - 3 * 3_600_000,
+    0,
+    "remote",
+  );
+
+  /** A remote row is marked, dated by the gateway's clock, and does not count a
+   *  local copy that may hold none of the other device's turns. */
+  it("marks a row whose transcript lives on the gateway and dates it by the gateway", async () => {
+    botsSessionsSearch.mockResolvedValue(answer([REMOTE, ROW_A]));
+    mount();
+
+    const remoteRow = await screen.findByRole("button", { name: /^From the phone/ });
+    expect(remoteRow).toHaveTextContent(BOT_SESSION_REMOTE_MARK);
+    expect(remoteRow).toHaveTextContent(/5 min/);
+    expect(remoteRow).not.toHaveTextContent("0 messages");
+
+    const localRow = screen.getByRole("button", { name: /^What changed in the drive/ });
+    expect(localRow).not.toHaveTextContent(BOT_SESSION_REMOTE_MARK);
+    expect(localRow).toHaveTextContent("4 messages");
+  });
+
+  /** The open remote row says which door wrote it and when it last moved; the
+   *  replay sentence is not shown, because nothing was replayed. */
+  it("names the gateway session, its writer and its last activity on the open row", async () => {
+    botsSessionsSearch.mockResolvedValue(answer([REMOTE]));
+    mount({ openId: "s-r" });
+
+    // The age's punctuation is the runtime locale's (`formatDraftAge`); the
+    // facts asserted are the id, the door and that an age is named.
+    const note = await screen.findByText(/Read from the gateway's session hermes-9f21/);
+    expect(note).toHaveTextContent("written via api");
+    expect(note).toHaveTextContent(/last active .*5 min/);
+    expect(note).toHaveTextContent("Every device you use with this bot writes here");
+    expect(screen.queryByText(/replays from its own store/)).toBeNull();
+  });
+
+  /** The same id on an endpoint that keeps no session API is a local row, and
+   *  says so with the older sentence — the label is `transcript`'s, never the
+   *  id's. */
+  it("keeps the local sentence for an id the gateway can no longer serve", async () => {
+    botsSessionsSearch.mockResolvedValue(
+      answer([row({ id: "s-a", title: "Older gateway", remoteSessionId: "hermes-9f21" })]),
+    );
+    mount({ openId: "s-a" });
+
+    expect(await screen.findByText(BOT_SESSION_REMOTE_NOTE("hermes-9f21"))).toBeInTheDocument();
+    expect(screen.queryByText(/Read from the gateway/)).toBeNull();
+    expect(screen.getByRole("button", { name: /^Older gateway/ })).toHaveTextContent("2 messages");
   });
 });

@@ -16,15 +16,17 @@
  * swallowed (the chip stays off, which is the honest default).
  *
  * The two one-shot reads — availability and the persisted wake settings —
- * ride the same effect: they are what the affordance needs before it can
- * decide whether to exist (`unsupported` ⇒ absent) and what to show.
+ * ride the same effect through {@link readVoiceFacts}: they are what the
+ * affordance needs before it can decide whether to exist (`unsupported` ⇒
+ * absent) and what to show.
  * Re-arming a persisted switch is deliberately **not** done here: arming is
  * the person's act with keeper in front, and the shell holds the turn across
  * pane remounts, so a phrase armed once stays armed until they turn it off.
  */
 import { useEffect } from "react";
+import { readVoiceFacts } from "@/hooks/use-voice-facts";
 import type { VoiceStateVm } from "@/lib/ipc/client";
-import { voiceAvailability, voiceUnwatch, voiceWakeGet, voiceWatch } from "@/lib/ipc/client";
+import { voiceUnwatch, voiceWatch } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
 
@@ -45,27 +47,7 @@ export function useVoiceStream(): void {
       }
     };
 
-    void voiceAvailability()
-      .then((unavailable) => {
-        if (!cancelled) {
-          voiceStore.getState().applyAvailability(unavailable);
-        }
-      })
-      .catch(() => {
-        // Unanswered stays `undefined`: the affordance neither shows nor
-        // claims absence on a question that failed.
-      });
-
-    void voiceWakeGet()
-      .then((wake) => {
-        if (!cancelled) {
-          voiceStore.getState().applyWake(wake);
-        }
-      })
-      .catch(() => {
-        // No settings read means no switch to draw; the chip still follows
-        // the stream.
-      });
+    readVoiceFacts(() => cancelled);
 
     voiceWatch(onState)
       .then((id) => {
