@@ -120,6 +120,21 @@ Developer Program membership are real but livable for a personal build:
 - There is **no TestFlight and no App Store** distribution. Sharing a build means
   handing someone an IPA they re-sign themselves (see
   [Sharing a build without Xcode](#sharing-a-build-without-xcode)).
+- The **Data Protection entitlement cannot be granted**. keeper's iOS target pins
+  `com.apple.developer.default-data-protection` to
+  `NSFileProtectionCompleteUntilFirstUserAuthentication` (source of truth:
+  `gen/apple/project.yml`, FR-65, guarded by `crates/keeper/tests/entitlements_protection.rs`),
+  and a Personal Team's automatic profile does not carry that capability, so the build
+  fails at signing with `Provisioning profile "iOS Team Provisioning Profile:
+  dev.tgorka.keeper" doesn't match the entitlements file's value for the
+  com.apple.developer.default-data-protection entitlement` (measured 2026-09-03,
+  Xcode 26.6, iOS 26.6.1). To sideload on a free team, delete the `entitlements:`
+  block from `gen/apple/project.yml` and re-run `xcodegen generate` in that directory —
+  a local edit to a generated file; the committed value stays as it is and its test
+  keeps passing. Nothing is lost in practice: iOS already defaults a third-party app's
+  container files to that same protection class, and the entitlement exists to pin it
+  so it cannot drift. A paid team keeps it. Note that an `XCODE_XCCONFIG_FILE` override
+  does **not** work here — target-level build settings beat a project-level xcconfig.
 
 ### Set your team, without committing any secret
 
@@ -193,6 +208,58 @@ installed. Follow the steps in this order and the chicken-and-egg resolves itsel
 
 After this first run, subsequent launches are just tapping the icon — until the 7-day
 profile expires (see [The 7-day re-arm ritual](#the-7-day-re-arm-ritual)).
+
+### Installing from a machine you only reach over ssh
+
+If the Mac holding the cable is remote (a Linux workstation driving it, as
+`scripts/install-macos.sh` does for the desktop build), three things in the sequence
+above change. Measured end-to-end on 2026-09-03 against kalypso (iPhone 14 Pro Max,
+iOS 26.6.1, Xcode 26.6):
+
+1. **`codesign` cannot reach the login keychain over ssh** — it fails with
+   `errSecInternalComponent`, because an ssh session is a different security session.
+   Run the whole build inside the Mac's GUI login session by dispatching it through
+   Terminal.app (`osascript -e 'tell application "Terminal" to do script "bash
+   /tmp/build.sh; exit"'`), exactly as `scripts/install-macos.sh` does. Note that
+   `security find-identity -v -p codesigning` **does** list the identity over ssh:
+   listing is not using, so it is not evidence the keychain is reachable.
+
+2. **A headless `tauri ios build` never registers the device**, and without a
+   registration there is no profile to sign against: it fails with `Xcode couldn't find
+   any iOS App Development provisioning profiles matching 'dev.tgorka.keeper'`. Register
+   once, directly:
+
+   ```sh
+   cd src-tauri/crates/keeper/gen/apple
+   xcodebuild -project keeper.xcodeproj -scheme keeper_iOS -configuration debug \
+     -destination id=<device-udid> -allowProvisioningUpdates \
+     -allowProvisioningDeviceRegistration DEVELOPMENT_TEAM=$APPLE_DEVELOPMENT_TEAM build
+   ```
+
+   That mints `iOS Team Provisioning Profile: dev.tgorka.keeper`, after which the normal
+   `bun run tauri ios build` signs. Do not try to finish the build this way: the
+   `Build Rust Code` phase runs `tauri ios xcode-script`, which connects back to the
+   Tauri CLI over a local socket and aborts with `failed to build WebSocket client`
+   when xcodebuild is driven standalone.
+
+3. **Install and launch with `devicectl`**, since Xcode's Run button is not available:
+
+   ```sh
+   xcrun devicectl device install app --device <udid> \
+     src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
+   xcrun devicectl device process launch --device <udid> dev.tgorka.keeper
+   ```
+
+   Steps 4 and 5 above (Developer Mode, trusting the certificate) still need a human at
+   the phone. Until Developer Mode is on, xcodebuild reports the device as
+   `error: Developer Mode disabled` or `The developer disk image could not be mounted`;
+   until the certificate is trusted, the launch is refused by `SBMainWorkspace` with
+   `its profile has not been explicitly trusted by the user`. Both are the expected
+   messages for those two states, not faults to debug.
+
+   `devicectl` has no screenshot verb, and the legacy `idevicescreenshot` service is
+   gone on iOS 26 (`Could not start screenshotr service`), so pixels from a physical
+   phone need a human or Xcode. Use the simulator for layout measurement.
 
 ## The 7-day re-arm ritual
 
