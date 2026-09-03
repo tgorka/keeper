@@ -42,6 +42,7 @@ import {
   botsImagePaste,
   syncOpenEntry,
 } from "@/lib/ipc/client";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { cn } from "@/lib/utils";
 
 /** One pasted image the composer is holding, as the pane models it. */
@@ -371,6 +372,12 @@ function ipcMessage(raw: unknown): string {
  * Nothing renders while an answer is still arriving. A path in a half-written
  * reply is a path that may still gain three more characters, and offering to
  * open it would be offering to open a file name that does not exist yet.
+ *
+ * Nothing is asked, either, where `capabilities.botTools` is off (Epic 62):
+ * the command that resolves a path lives in the drive half of the shell,
+ * which a phone does not carry, and a reveal control is a promise about files
+ * keeper cannot reach from there. Absent rather than a call that would be
+ * refused — AD-27, and the same reason the grant bar is absent.
  */
 export function BotReplyPaths({
   sessionId,
@@ -384,9 +391,10 @@ export function BotReplyPaths({
   /** Whether this row is still arriving. */
   streaming: boolean;
 }) {
+  const botTools = useCapabilitiesStore((s) => s.capabilities.botTools);
   const [paths, setPaths] = useState<BotDeliverableVm[]>([]);
   useEffect(() => {
-    if (streaming || body.length === 0) {
+    if (!botTools || streaming || body.length === 0) {
       setPaths([]);
       return;
     }
@@ -407,7 +415,7 @@ export function BotReplyPaths({
     return () => {
       live = false;
     };
-  }, [sessionId, body, streaming]);
+  }, [botTools, sessionId, body, streaming]);
   return (
     <BotDeliverablePaths
       paths={paths}

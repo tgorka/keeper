@@ -33,6 +33,7 @@ import {
 } from "@/components/bots/bot-composer";
 import { BOT_CONTEXT_TITLE } from "@/components/bots/bot-context-note";
 import { BOTS_EMPTY_COPY } from "@/components/bots/bot-empty-state";
+import { GRANT_ADD_LABEL, GRANT_NONE_HELD } from "@/components/bots/bot-grant-bar";
 import { BOT_PARTIAL_CAPTION, BOT_RETRY_LABEL } from "@/components/bots/bot-message";
 import { BOT_SESSION_NEW_LABEL } from "@/components/bots/bot-session-list";
 import {
@@ -63,6 +64,7 @@ import { primaryViewStore } from "@/lib/stores/primary-view";
 
 const botsChatStop = vi.fn();
 const botsApprovalAnswer = vi.fn();
+const botsGrantsList = vi.fn();
 /** The event sink the pane handed to `botsChatSend`, so the test can drive the
  *  stream exactly as Rust would. */
 let sink: ((event: BotStreamEvent) => void) | null = null;
@@ -95,6 +97,13 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     botsApprovalAnswer: (requestId: string, approved: boolean) => {
       botsApprovalAnswer(requestId, approved);
       return Promise.resolve();
+    },
+    // The grant bar's read (Story 61.10). Mocked so the `botTools` cases below
+    // exercise the real bar over an empty table rather than its read-failed
+    // sentence; the cases without `botTools` must never reach it at all.
+    botsGrantsList: () => {
+      botsGrantsList();
+      return Promise.resolve({ grants: [], unknown: [] });
     },
   };
 });
@@ -177,8 +186,12 @@ function message(overrides: Partial<BotMessageVm> & { id: string; role: string }
 const QUESTION = message({ id: "msg-user", role: "user", seq: 0, content: "What changed?" });
 const ANSWER = message({ id: "msg-answer", role: "assistant", seq: 1, partial: true });
 
-/** A desktop that can hold a conversation and has no folder sync at all. */
+/** A build that can hold a conversation and cannot reach the drive: a desktop
+ *  with no folder sync, or a phone (Epic 62). `botTools` off. */
 const WITH_BOTS = { ...DEFAULT_CAPABILITIES, bots: true };
+
+/** A desktop that can also reach the drive: both halves on. */
+const WITH_BOT_TOOLS = { ...DEFAULT_CAPABILITIES, bots: true, botTools: true, sync: true };
 
 /** Full folder sync, `bots` off — the state a gate on the wrong flag misreads. */
 const SYNC_WITHOUT_BOTS = {
@@ -193,6 +206,7 @@ beforeEach(() => {
   sink = null;
   botsChatStop.mockClear();
   botsApprovalAnswer.mockClear();
+  botsGrantsList.mockClear();
   botsStore.getState().reset();
   capabilitiesStore.getState().applySnapshot(WITH_BOTS);
 });
@@ -245,6 +259,67 @@ describe("the Bots surface's capability gate", () => {
     primaryViewStore.getState().setView("bots");
     render(<AppShell />);
     expect(screen.queryByRole("region", { name: BOTS_PANE_TITLE })).not.toBeInTheDocument();
+  });
+});
+
+describe("the drive half's capability gate (Epic 62, FR-396)", () => {
+  /** Send one question and stream one answer, the way Rust would. */
+  async function askAndAnswer() {
+    await waitFor(() => expect(botsStore.getState().selectedModel).toBe(MODEL.id));
+    fireEvent.change(screen.getByLabelText(BOT_COMPOSER_LABEL), {
+      target: { value: "What changed?" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: BOT_COMPOSER_SEND_LABEL }));
+    await waitFor(() => expect(sink).not.toBeNull());
+    act(() => {
+      sink?.({
+        kind: "opened",
+        subscriptionId: SUBSCRIPTION_ID,
+        session: SESSION,
+        user: QUESTION,
+        assistant: ANSWER,
+      });
+      sink?.({ kind: "delta", text: "Nothing on your drive." });
+      sink?.({
+        kind: "closed",
+        message: message({
+          id: ANSWER.id,
+          role: "assistant",
+          seq: 1,
+          content: "Nothing on your drive.",
+          finishReason: "stop",
+        }),
+        reason: null,
+      });
+    });
+  }
+
+  it("offers the grant affordance where this build can reach the drive", async () => {
+    capabilitiesStore.getState().applySnapshot(WITH_BOT_TOOLS);
+    render(<BotsPane />);
+    await waitFor(() => expect(botsStore.getState().selectedModel).toBe(MODEL.id));
+    expect(await screen.findByText(GRANT_NONE_HELD)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: GRANT_ADD_LABEL })).toBeInTheDocument();
+    expect(botsGrantsList).toHaveBeenCalled();
+  });
+
+  it("has NO grant affordance where it cannot, and the conversation still works", async () => {
+    // The phone's shape (Epic 62): `bots` on, `botTools` off. Absent, not
+    // disabled — no grant sentence, no control, and no read of a grant table
+    // the build could not act on — while a question is still asked and
+    // answered. Flip `botTools` to always-true and this fails while the case
+    // above still passes.
+    capabilitiesStore.getState().applySnapshot(WITH_BOTS);
+    render(<BotsPane />);
+    await askAndAnswer();
+
+    expect(screen.getByText("What changed?")).toBeInTheDocument();
+    expect(screen.getByText("Nothing on your drive.")).toBeInTheDocument();
+    expect(botsStore.getState().streamingId).toBeNull();
+
+    expect(screen.queryByText(GRANT_NONE_HELD)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: GRANT_ADD_LABEL })).not.toBeInTheDocument();
+    expect(botsGrantsList).not.toHaveBeenCalled();
   });
 });
 

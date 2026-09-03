@@ -7,11 +7,14 @@
  * Four conditions, and every failing one is an AD-27 *absence*, never a
  * disabled control:
  *
- * 1. **`capabilities.sync` must be on.** A drive tool resolves a path inside a
- *    synced profile, so on a machine with no folder sync there is nothing a
- *    grant could name. This is the honest split the epic states: the *pane* is
- *    gated on `bots` because a conversation needs no `git`, and the *grant* is
- *    gated on `sync` because a file does.
+ * 1. **`capabilities.botTools` must be on.** A drive tool resolves a path
+ *    inside a synced profile through `keeper-sync`, so on a machine with no
+ *    folder sync — and on a phone, where `keeper-sync` is not linked at all
+ *    (Epic 62) — there is nothing a grant could name. This is the honest split
+ *    the epic states: the *pane* is gated on `bots` because a conversation
+ *    needs no `git`, and the *grant* is gated on `botTools` because a file
+ *    needs the drive. Absent, not disabled: the conversation goes on without
+ *    it.
  * 2. **The provider must be Ollama.** Hermes executes its own tools on its own
  *    host under its own permission model, so the pane says that in one sentence
  *    and offers nothing.
@@ -125,22 +128,22 @@ export type BotGrantOffer =
 
 /**
  * Decide what this bot's pane may offer — `grant::grant_offer`'s arms, plus
- * the `sync` gate the shell owns.
+ * the `botTools` gate the shell owns.
  *
  * `model` is `null` while the model list is still being read, which lands in
  * the warned arm on purpose: keeper has not read the capability, and that is
  * precisely what that sentence says.
  */
 export function botGrantOffer({
-  sync,
+  botTools,
   provider,
   model,
 }: {
-  sync: boolean;
+  botTools: boolean;
   provider: BotProviderVm | null;
   model: BotModelVm | null;
 }): BotGrantOffer {
-  if (!sync || provider === null) {
+  if (!botTools || provider === null) {
     return { kind: "absent" };
   }
   if (provider.kind === "hermes") {
@@ -197,17 +200,17 @@ export function grantSentence(grant: BotGrantVm): string {
 
 /** The grant bar. Absent, or one line per grant with the two controls. */
 export function BotGrantBar({
-  sync,
+  botTools,
   provider,
   botId,
   model,
 }: {
-  sync: boolean;
+  botTools: boolean;
   provider: BotProviderVm | null;
   botId?: string | null;
   model: BotModelVm | null;
 }) {
-  const offer = botGrantOffer({ sync, provider, model });
+  const offer = botGrantOffer({ botTools, provider, model });
   const providerId = provider?.id ?? null;
   const offered = offer.kind === "offered";
   const [grants, setGrants] = useState<BotGrantVm[] | null>(null);

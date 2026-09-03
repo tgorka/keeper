@@ -21,10 +21,15 @@
  *   connection pill already use.
  * - **A lost secret says so** — `secretMissing` renders its own sentence,
  *   which is distinct from "no key stored".
+ * - **The phone runs the same component** (Epic 62, Story 62.3, FR-399) — a
+ *   Hermes endpoint with its key and a profile-addressed bot go through the
+ *   same form and the same probe vocabulary with the capability mirror at the
+ *   phone tier, and nothing in this section is gated on the drive half.
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  BOTS_ADD_BOT_LABEL,
   BOTS_ADD_PROVIDER_LABEL,
   BOTS_BASE_URL_LABEL,
   BOTS_EDIT_LABEL,
@@ -35,13 +40,21 @@ import {
   BOTS_SECRET_MISSING_CAPTION,
   BOTS_SECTION_EMPTY,
   BOTS_SECTION_TITLE,
+  BOTS_TARGET_LABEL,
   BOTS_TEST_LABEL,
   BOTS_TOKEN_LABEL,
   BotsSection,
   botProbeSentence,
   removalSentence,
 } from "@/components/settings/bots-section";
-import type { BotProbeVm, BotProviderSaveReq, BotProviderVm, BotVm } from "@/lib/ipc/client";
+import type {
+  BotProbeVm,
+  BotProviderSaveReq,
+  BotProviderVm,
+  BotSaveReq,
+  BotVm,
+} from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
 const botsProvidersList = vi.fn();
 const botsBotsList = vi.fn();
@@ -260,6 +273,119 @@ describe("BotsSection", () => {
       "Ollama here is removed, along with every bot on it and the key stored for it.",
     );
     expect(dialog).toHaveTextContent("Conversations you have already had are kept.");
+  });
+});
+
+/**
+ * The phone tier (Epic 62): `bots` true because the pane exists there, every
+ * tier-telling flag false, hydrated. The same predicate that shows "On this
+ * iPhone" in Settings → About.
+ */
+const PHONE_CAPABILITIES = { ...DEFAULT_CAPABILITIES, bots: true };
+
+const HERMES: BotProviderVm = {
+  ...PROVIDER,
+  id: "prov-2",
+  kind: "hermes",
+  name: "Hermes on hesperia",
+  baseUrl: "http://hesperia.local:8642",
+  host: "hesperia.local",
+  isPrivate: true,
+  hasToken: true,
+};
+
+describe("BotsSection on the phone (Story 62.3, FR-399)", () => {
+  beforeEach(() => {
+    capabilitiesStore.getState().applySnapshot(PHONE_CAPABILITIES);
+  });
+
+  afterEach(() => {
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  });
+
+  it("adds a Hermes endpoint with its base URL and key through the same form", async () => {
+    botsProvidersList.mockResolvedValue([]);
+    botsBotsList.mockResolvedValue([]);
+    render(<BotsSection open />);
+    fireEvent.click(screen.getByRole("button", { name: BOTS_ADD_PROVIDER_LABEL }));
+    // The kind picker offers both stored spellings — Ollama is neither built
+    // for nor blocked on a phone (the epic's DW-221) — and the pick is the
+    // stored word.
+    expect(screen.getByRole("button", { name: "ollama" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "hermes" }));
+    expect(screen.getByRole("button", { name: "hermes" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.change(screen.getByLabelText(BOTS_NAME_LABEL), {
+      target: { value: "Hermes on hesperia" },
+    });
+    fireEvent.change(screen.getByLabelText(BOTS_BASE_URL_LABEL), {
+      target: { value: "http://hesperia.local:8642" },
+    });
+    fireEvent.change(screen.getByLabelText(BOTS_TOKEN_LABEL), {
+      target: { value: "hermes-key" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: BOTS_SAVE_LABEL }));
+
+    await waitFor(() => expect(botsProviderSave).toHaveBeenCalledTimes(1));
+    expect(botsProviderSave).toHaveBeenCalledWith({
+      id: null,
+      kind: "hermes",
+      name: "Hermes on hesperia",
+      baseUrl: "http://hesperia.local:8642",
+      token: "hermes-key",
+      clearToken: false,
+    } satisfies BotProviderSaveReq);
+  });
+
+  it("probes, edits and removes the Hermes row with the desktop's own controls", async () => {
+    botsProvidersList.mockResolvedValue([HERMES]);
+    botsBotsList.mockResolvedValue([]);
+    botsProviderProbe.mockResolvedValue({
+      reach: "offline",
+      status: null,
+      version: null,
+      roundTripMs: 30,
+      bot: null,
+      presence: null,
+      reason: null,
+    } satisfies BotProbeVm);
+    render(<BotsSection open />);
+    await waitFor(() =>
+      expect(
+        screen.getByText(/Hermes on hesperia — hermes at hesperia\.local \(private\)/),
+      ).toBeInTheDocument(),
+    );
+    // The probe answers in the app's reachability vocabulary, same word as the
+    // desktop and the connection pill.
+    fireEvent.click(screen.getByRole("button", { name: BOTS_TEST_LABEL }));
+    await waitFor(() =>
+      expect(screen.getByText("Offline — nothing answered.")).toBeInTheDocument(),
+    );
+    expect(botsProviderProbe).toHaveBeenCalledWith("prov-2");
+
+    fireEvent.click(screen.getByRole("button", { name: BOTS_EDIT_LABEL }));
+    expect(screen.getByLabelText(BOTS_BASE_URL_LABEL)).toHaveValue("http://hesperia.local:8642");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: BOTS_REMOVE_LABEL }));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Hermes on hesperia is removed");
+  });
+
+  it("pins a Hermes bot by its profile, the same target field as a model tag", async () => {
+    botsProvidersList.mockResolvedValue([HERMES]);
+    botsBotsList.mockResolvedValue([]);
+    render(<BotsSection open />);
+    fireEvent.click(await screen.findByRole("button", { name: BOTS_ADD_BOT_LABEL }));
+    fireEvent.change(screen.getByLabelText(BOTS_TARGET_LABEL), {
+      target: { value: "research" },
+    });
+    fireEvent.change(screen.getByLabelText(BOTS_NAME_LABEL), { target: { value: "Research" } });
+    fireEvent.click(screen.getByRole("button", { name: BOTS_SAVE_LABEL }));
+
+    await waitFor(() => expect(botsBotSave).toHaveBeenCalledTimes(1));
+    const req = botsBotSave.mock.calls[0]?.[0] as BotSaveReq;
+    expect(req.providerId).toBe("prov-2");
+    expect(req.target).toBe("research");
   });
 });
 

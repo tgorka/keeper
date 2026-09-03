@@ -12,8 +12,10 @@
  * entry and the shell's render chain like every gated surface. The flag is
  * **not** `sessions`: chat needs neither a `git` binary nor `sync.db`, so
  * gating on the sync capability would hide a working surface on a desktop whose
- * `git` is too old. The half that does need `sync` is the drive grant, and
- * {@link BotGrantBar} reads `capabilities.sync` for exactly that.
+ * `git` is too old — and on a phone, where `bots` is true and the drive is not
+ * linked at all (Epic 62). The half that does need the drive is the grant, and
+ * {@link BotGrantBar} reads `capabilities.botTools` for exactly that: where it
+ * is false the bar is absent, not disabled, and the conversation still works.
  *
  * # What it reads, and what it does on a refusal
  *
@@ -76,7 +78,10 @@ import { BotPicker } from "@/components/bots/bot-picker";
 import { BotPinsStrip } from "@/components/bots/bot-pins-strip";
 import { BOT_SESSION_NEW_LABEL, BotSessionList } from "@/components/bots/bot-session-list";
 import { botCommandContext, botCommandHost } from "@/components/bots/bot-slash-menu";
+import { BotVoiceMic, BotVoiceStatus, speakIfHeard } from "@/components/bots/bot-voice-mic";
+import { BotVoiceWake } from "@/components/bots/bot-voice-wake";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
+import { useVoiceStream } from "@/hooks/use-voice-stream";
 import { type CountNoun, countLabel } from "@/lib/count-label";
 import type { BotModelVm, BotStreamEvent } from "@/lib/ipc/client";
 import {
@@ -151,6 +156,11 @@ export function onStreamEvent(event: BotStreamEvent): void {
     return;
   }
   botsStore.getState().applyStreamEvent(event);
+  // A voice turn's answer is read aloud (Story 62.6, FR-403); typed ones are
+  // not. `speakIfHeard` reads the turn's state and decides nothing else.
+  if (event.kind === "closed" && event.reason === null) {
+    speakIfHeard(event.message.content);
+  }
 }
 
 export function BotsPane() {
@@ -163,8 +173,11 @@ export function BotsPane() {
   const streamingId = useBotsStore((s) => s.streamingId);
   const streamingMessageId = useBotsStore((s) => s.streamingMessageId);
   const error = useBotsStore((s) => s.error);
-  // The grant's own gate, and the only place this pane reads `sync`.
-  const sync = useCapabilitiesStore((s) => s.capabilities.sync);
+  // The grant's own gate, and the only place this pane reads `botTools`.
+  const botTools = useCapabilitiesStore((s) => s.capabilities.botTools);
+  // The one voice watcher for the surface (Story 62.5): the wake chip and the
+  // talk-mode control both read the store it fills.
+  useVoiceStream();
   // The model row the picker last resolved, held here only so the grant bar can
   // read its tool capability. Not in the store: it is a fact about an endpoint
   // read a moment ago, not part of the conversation record.
@@ -172,6 +185,10 @@ export function BotsPane() {
   // Story 61.12: the images this message will carry, and the tray that shows
   // them. The hook owns the bytes path, the caps and the object-URL lifetime.
   const imagePaste = useBotImagePaste(selectedBotId, selectedModel, pickedModel?.vision ?? null);
+  // Story 62.6: the transcript waiting in the composer, with a sequence so
+  // hearing the same words twice is still two hand-offs.
+  const [heard, setHeard] = useState<{ text: string; seq: number } | null>(null);
+  const heardSeq = useRef(0);
   // A stale-read token, the Tasks pane's idiom: a second refresh landing after
   // a first must not restore the older answer.
   const readToken = useRef(0);
@@ -393,11 +410,13 @@ export function BotsPane() {
           )}
 
           <BotGrantBar
-            sync={sync}
+            botTools={botTools}
             provider={selectedProvider}
             botId={selectedBotId}
             model={pickedModel}
           />
+
+          <BotVoiceWake />
 
           {empty === null ? (
             <BotConversation
@@ -424,10 +443,30 @@ export function BotsPane() {
             notice={imagePaste.notice}
             onRemove={imagePaste.remove}
           />
+          <BotVoiceStatus />
           <BotComposer
             onSend={send}
-            pasteContext={imagePaste.context}
-            onPaste={imagePaste.handle}
+            // Image staging is the drive half of the shell (Epic 62): a phone
+            // has no `bots_image_paste` to call, so a paste there keeps the
+            // browser's own behaviour — the honest answer the composer already
+            // gives for a `null` context — rather than a refusal.
+            pasteContext={botTools ? imagePaste.context : null}
+            onPaste={botTools ? imagePaste.handle : undefined}
+            // Talk mode (Story 62.6): what a button-started turn heard lands
+            // here as the draft; a phrase-started turn goes as said, because
+            // the person is driving with another app in front.
+            heard={heard}
+            accessory={
+              <BotVoiceMic
+                onHeard={(text, origin) => {
+                  if (origin === "phrase") {
+                    send(text);
+                    return;
+                  }
+                  setHeard({ text, seq: heardSeq.current++ });
+                }}
+              />
+            }
             onStop={stop}
             streaming={streamingId !== null}
             disabled={selectedBotId === null || selectedModel === null}

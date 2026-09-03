@@ -147,8 +147,13 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
   const sync = useCapabilitiesStore((s) => s.capabilities.sync);
   // The Bots section (Epic 61, FR-379), on its own flag rather than `sync`: an
   // endpoint is a URL and a credential behind the keychain, so it can exist on
-  // a machine with no folder sync at all.
+  // a machine with no folder sync at all — and on a phone (Epic 62).
   const bots = useCapabilitiesStore((s) => s.capabilities.bots);
+  // The drive half of the same surface (Epic 62, FR-396): `desktop && sync`
+  // in Rust, because a grant names a folder inside a synced profile and a
+  // phone has no `keeper-sync` to resolve one. Where it is false the Grants
+  // section is absent, not disabled (AD-27).
+  const botTools = useCapabilitiesStore((s) => s.capabilities.botTools);
   // Whether this is the capability-reduced (phone) tier — drives the Archive
   // backup-exclusion line below, the "On this iPhone" list in About, and hides the
   // desktop "Background & dock" section (Story 14.2).
@@ -231,10 +236,12 @@ export function SettingsBody({ open, onOpenChange }: SettingsDialogProps) {
           and a credential, so it needs no `git`. */}
       {bots && <BotsSection open={open} />}
       {/* Story 61.10's grants: the list that answers "what can a bot change?".
-          Gated on `sync` as well as `bots`, because a grant names a folder
-          inside a synced profile and on a machine with none there is nothing
-          it could name — the honest split the epic states. */}
-      {bots && sync && <BotGrantsSection open={open} />}
+          Gated on `botTools` rather than `sync`, because a grant names a
+          folder inside a synced profile and a build that cannot reach the
+          drive — a desktop with no usable git, or a phone — has nothing it
+          could name. `botTools` is strictly narrower than `bots` in Rust, so
+          it is the one gate this section needs. */}
+      {botTools && <BotGrantsSection open={open} />}
       {/* Folder sync needs a usable `git` (Epic 29): absent on every machine
               that has none, never a section whose every button would reject. */}
       {sync && <SyncSection open={open} />}

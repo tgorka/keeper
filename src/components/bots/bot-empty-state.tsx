@@ -15,8 +15,16 @@
  *
  * Each state carries exactly one action, so the surface never dead-ends —
  * modelled on {@link NotesEmptyState} and {@link RecordingsEmptyState}.
+ *
+ * On the phone tier every state also carries
+ * {@link BOTS_NO_DRIVE_HERE_SENTENCE} (Epic 62, Story 62.3): the grant bar and
+ * the tool affordances are absent there rather than disabled (AD-27), and the
+ * empty state is where a person looks before the first message — so it is
+ * where the missing control is explained, once, instead of in a Settings page
+ * nobody opens to find out why a button is not there.
  */
 import { Button } from "@/components/ui/button";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 
 /** Which of the four states the surface is in. */
 export type BotsEmptyKind = "no-provider" | "no-bot" | "no-conversation" | "secret-missing";
@@ -58,17 +66,34 @@ export const BOTS_EMPTY_COPY: Record<
 };
 
 /**
+ * What the phone says about the half of the surface it cannot have. `keeper-sync`
+ * is not linkable on iOS, so a grant would be a promise about files keeper
+ * cannot reach from there; the honest sentence names where the tools are.
+ * One const, so the empty state and the `/grant` answer cannot word it twice.
+ */
+export const BOTS_NO_DRIVE_HERE_SENTENCE =
+  "On this iPhone a bot can talk but cannot reach the folders you sync — the drive tools live on your Mac.";
+
+/**
  * Render one empty state. It stands where the transcript would, so it takes
  * the transcript's box — `min-h-0 flex-1` — rather than a height of its own:
  * a band that could not shrink would push the composer under the window edge.
  */
 export function BotEmptyState({ kind, onAction }: { kind: BotsEmptyKind; onAction: () => void }) {
   const { message, detail, action } = BOTS_EMPTY_COPY[kind];
+  // The phone tier, read from the capability mirror rather than the platform:
+  // the same predicate that shows "On this iPhone" in Settings → About.
+  const reducedPlatform = useIsReducedCapabilityPlatform();
   return (
     <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 overflow-y-auto p-6">
       <p className="max-w-[36ch] text-center text-muted-foreground text-sm">{message}</p>
       {detail !== null && (
         <p className="max-w-[36ch] text-center text-muted-foreground text-xs">{detail}</p>
+      )}
+      {reducedPlatform && (
+        <p className="max-w-[36ch] text-center text-muted-foreground text-xs">
+          {BOTS_NO_DRIVE_HERE_SENTENCE}
+        </p>
       )}
       <Button type="button" variant="outline" size="sm" onClick={onAction}>
         {action}
