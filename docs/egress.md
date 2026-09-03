@@ -137,6 +137,30 @@ source-scan audits fail the build if a network API ever appears in the sidecar's
 (`keeper_rec_sidecar_sources_are_network_free` in the `keeper` crate) or an egress affordance
 in the recording frontend (`zero-egress.test.ts`).
 
+## Voice adds no egress
+
+Talk mode on the phone (Epic 62) turns speech into text, sends that text to the bot as an
+ordinary message, and speaks the answer — and none of the three steps contacts a network host
+the table above does not already name. The message goes to the provider row you typed, exactly
+as a typed message would. Recognition is Apple's on-device recogniser: every request the iOS
+port builds sets `requiresOnDeviceRecognition = true`, and the port checks the recogniser's
+`supportsOnDeviceRecognition` before it builds one. Apple's recogniser will otherwise fall back
+to Apple's servers, and that fallback would be a destination this file does not name — so
+there is no server-fallback path in the code, not a disabled one. Synthesis is the system's own
+voice, which needs nothing from the network. The wake phrase is matched in the same on-device
+transcript and never leaves the device; it is stored as a setting, not sent anywhere.
+
+When the phone has no on-device model for its locale, keeper says so — *"on-device speech
+recognition for `pl_PL` is not on this phone — download that language under Settings > General >
+Keyboard > Dictation Languages; keeper never sends your voice to a server"* — and does nothing
+else. That sentence is not a fallback, it is the refusal: the person is told which language to
+download and why keeper will not simply use the network instead. Like the sidecar audit above,
+this is enforced by a source scan rather than asserted: `voice_on_device` in `keeper-core`'s
+tests reads the voice modules of both crates off disk and fails the build if a recognition
+request is ever built without the on-device flag, if the flag is ever set to `false`, or if a
+network API appears in any voice module (NFR-50). The decision is recorded as
+`docs/decisions.md` D-5.
+
 ## The no-telemetry invariant
 
 keeper has **no telemetry, analytics, or crash reporting** — and no opt-in scaffolding for any of

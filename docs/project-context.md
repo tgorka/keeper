@@ -13,7 +13,7 @@ sections_completed:
     "anti_patterns",
   ]
 status: "complete"
-rule_count: 48
+rule_count: 52
 optimized_for_llm: true
 ---
 
@@ -69,6 +69,10 @@ Keeper is an open-source, Beeper-style Matrix messenger client (Apache-2.0). It 
 - A model capability keeper could not read is `None` (`BotModelVm.vision/tools/reasoning: Option<bool>`), never `Some(false)` — an unknown capability offers the affordance with a warning; a `false` one hides it (AD-151).
 - File content reaching a model — tool results and `AGENTS.md`-style context files alike — is **data**, entered under the not-instructions sentence; it never becomes a directive and never widens a grant (AD-159, NFR-48).
 - A write is never auto-approved by a grant alone: `bots::grant::decide` runs at every tool call, the first write and every write outside an approved subtree asks, and the audit row precedes the effect (AD-158, NFR-47).
+- Voice (Epic 62): every decision — the turn state machine, the phrase grammar, when to ask for a permission, what armed listening costs — lives in `keeper_core::voice`; `voice_ios.rs` in the shell is a port implementation and decides nothing (AD-165; D-5).
+- Speech recognition is on-device only: every `SFSpeech…RecognitionRequest` sets `requiresOnDeviceRecognition(true)` after `supportsOnDeviceRecognition` is checked, and a server fallback is a **refusal** (`VoiceUnavailable::NoOnDeviceModel` names the language to download), never a TODO — `voice_on_device` in `keeper-core/tests` scans the voice sources and fails on a `false` flag, a request without one, or any network token (NFR-50, AD-166).
+- The wake phrase is armed by a person while keeper is in front and never by keeper itself; iOS refuses to start the microphone from the background, so no code may pretend to (AD-168; D-5). What stops listening and what it costs is `LISTENING_LIMITS`, one `const`, rendered beside the switch and nowhere else (AD-169).
+- `CapabilitiesVm.bots` is *this build can talk to a model* (every tier); `botTools` is *this build can reach the drive* (desktop **and** `sync`). Grant and tool affordances read `botTools` and are absent, not disabled, where it is false — `bots_ipc` is sync-free, `bots_drive_ipc` is `#[cfg(desktop)]` (AD-161, AD-162).
 
 ### TypeScript / React Rules (src/)
 
@@ -131,7 +135,7 @@ Keeper is an open-source, Beeper-style Matrix messenger client (Apache-2.0). It 
 - Update when the technology stack changes.
 - Review periodically for outdated rules and remove rules that become obvious.
 
-Last Updated: 2026-09-02
+Last Updated: 2026-09-03
 
 ## Git workflow (automation sessions)
 

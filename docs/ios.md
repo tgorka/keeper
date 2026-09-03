@@ -56,6 +56,29 @@ Tauri and is committed **except** ephemeral output (`build/`, `Externals/`, `Pod
 persistent changes only in `project.yml`, `keeper_iOS/Info.plist`, and the
 `Sources/`/`keeper_iOS/` files, then regenerate.
 
+Two things about that project are easy to get wrong, and both were, once:
+
+- **System frameworks are linked by `project.yml`'s `dependencies` list and nothing
+  else.** `libapp.a` is a static library linked by the generated project, not by
+  rustc, so a Rust crate's `#[link(kind = "framework")]` never reaches the link line —
+  and the objc2 crates put theirs on empty extern blocks anyway. A framework that is
+  missing from the list still builds and still ships every command, because objc2 finds
+  classes by name at run time; the class is simply never registered. That is how a
+  bundle once shipped with `SFSpeechRecognizer` strings inside and no
+  `Speech.framework` in `otool -L`. Check a fresh bundle, not the project:
+  `otool -L keeper.app/keeper | grep -i speech`. The voice port reports that state as
+  its own refusal (`NoRecognizer`, "this build was made without Apple's Speech
+  framework") so it can never again read like a permission or a missing language.
+- **`keeper_iOS/Info.plist` is rewritten on every `tauri ios build` / `dev`** as the
+  merge of, later winning: the XcodeGen output, the CLI's own keys,
+  `crates/keeper/Info.plist` (the **macOS** bundle's — "saved locally on this Mac"),
+  then `crates/keeper/Info.ios.plist`. Any key the macOS file also carries must be
+  restated in `Info.ios.plist` or the phone shows the Mac's sentence; today that is
+  `NSMicrophoneUsageDescription`, and the two copies (`project.yml` for the generated
+  project, `Info.ios.plist` for the merge) must stay equal. Check the bundle:
+  `/usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" keeper.app/Info.plist`.
+  Editing `keeper_iOS/Info.plist` by hand achieves nothing lasting either way.
+
 Initial generation (run from the repo root, using the shared config the other
 scripts use) is a **one-time** bootstrap — the `gen/apple/` tree is already committed,
 so you do **not** re-run `init` in normal work (re-running it overwrites committed
