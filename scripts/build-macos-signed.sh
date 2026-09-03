@@ -86,6 +86,14 @@ bunx tauri build \
 # --- Verify the signature is actually stable -------------------------------
 keeper_require_stable_signature "$APP"
 
+# --- Verify the bundle can render at all -----------------------------------
+# A `--debug` build signs and installs exactly like this one and opens to a
+# blank window, because its executable embeds no frontend and points the
+# webview at the Vite dev server. The signature check above cannot see that;
+# this one refuses the bundle before it reaches /Applications (AD-173).
+. "$SCRIPT_DIR/lib/bundle-guard.sh"
+keeper_require_renderable_bundle "$APP"
+
 # --- Optional install ------------------------------------------------------
 if [ "$INSTALL" -eq 1 ]; then
   echo "==> Quitting a running keeper (graceful — a live recording finalizes)"

@@ -3422,7 +3422,16 @@ reason: Epic 62 ships voice on iOS precisely because Apple's recogniser and synt
   implementation behind the same trait, with its own entitlement and TCC story — and it is not the
   same work as the wake phrase, which still needs a spotter. Revisit when either a
   clearly-licensed KWS model exists or the Mac ships only push-to-talk over the system recogniser.
-status: open
+status: done 2026-09-03
+resolution: collected by epic 63, story 63.4. The "honest first move" this row named is what
+  shipped: `crates/keeper/src/voice_macos.rs`, a second `VoicePort`/`ConsentPort` over macOS's own
+  `SFSpeechRecognizer` with `requiresOnDeviceRecognition = true`, `AVAudioEngine` and
+  `AVSpeechSynthesizer`, behind the same trait and the same turn machine, with the platform
+  vocabulary in `keeper-core/src/voice/platform.rs` (story 63.3). The spotter question dissolved
+  rather than being answered: the Mac matches the wake phrase in the same on-device transcript the
+  recogniser already produces, exactly as the phone does, so no keyword-spotting weights are needed
+  and the licence question this row was about does not arise. What remains is not this row's
+  question — the port has never been compiled or run on a Mac, and that is DW-228.
 
 ### DW-220: The drive tools cannot reach a phone, and the honest route inverts the connection.
 
@@ -3479,6 +3488,131 @@ reason: CI's frontend job (macos-latest, whole suite in parallel) failed this te
   line so the next failure says which of the two happened. Left open rather than papered over with
   a longer timeout: the observed value had already been written, so it was never a value still on
   its way.
+status: open
+
+  **Second member of the same class, 2026-09-03 (epic 63).**
+  `src/components/notes/editor/find-panel.test.tsx` — "shows a query that arrived from somewhere
+  other than these fields" — failed once in a whole-suite run at epic 63's tip, in a file this epic
+  never touched (`git log 687d2aa..HEAD -- .../find-panel*` is empty). Alone it passes 3/3, and the
+  very next whole-suite run was 330 files / 5616 tests green. So the class is not specific to the
+  files-pane restore: it is "a test that passes alone and fails under whole-suite contention", and
+  it has now been seen in two unrelated surfaces. Whoever closes this should treat the shared cause
+  as the target — most likely module-level state or a timer surviving between files under the
+  runner's parallelism — rather than hardening one test at a time.
+
+### DW-224: The other device's transcript grows by steps, not by tokens — and the token route is a destination change.
+
+origin: epic 63, story 63.7 / 63.8, 2026-09-03
+location: `keeper-core/src/bots/follow.rs:7-19` (the rule and why), `docs/egress.md` *Why the
+  token-by-token mirror is a destination change* (the arithmetic), `docs/decisions.md` D-7
+reason: The owner asked to watch a conversation held on the other device grow word by word.
+  Hermes cannot serve that: `GET /v1/runs/{id}/events` is one `asyncio.Queue` per run with a
+  destructive read, so a second subscriber steals events from the first and either side
+  disconnecting pops the queue out from under the survivor; keeper never opens an SSE against a
+  run it did not start (AD-177, proven in `keeper-core/tests/bots_remote_session.rs:1074`). The
+  only route that can carry tokens is relaying the live transcript into a Matrix room as one
+  message edited in place with `m.replace` as tokens arrive. That adds no host — the homeserver
+  is already the first egress row — and is still an architecture-level change under NFR-11,
+  because it makes the homeserver (and every device's key backup, and every federated server) a
+  place transcripts persist. On a default Synapse it is also a bad trade: `rc_message` defaults
+  to 0.2 events/s with a burst of 10, so a 1 Hz edit loop spends its burst in 10 ÷ (1 − 0.2) =
+  12.5 s and is then throttled to one edit every five seconds with `M_LIMIT_EXCEEDED` between;
+  an event is capped at 65536 bytes of canonical JSON and an `m.replace` carries the whole new
+  body in `m.new_content`, so bytes sent grow quadratically with the answer and a long answer
+  stops being editable at all; and `m.relates_to` stays in cleartext in an encrypted room, so the
+  homeserver sees the cadence of the model's output. What ships is step-level following of the
+  history read keeper already makes, at 2 s / 5 s / 15 s as the session quietens, stopped after
+  five cold minutes, with a caption that says "following". Revisit if Hermes serves a fan-out or
+  replayable per-run stream, or if the owner decides the Matrix-bot product question (DW-226),
+  which would move transcripts to the homeserver on purpose rather than as a side effect.
+status: open
+
+### DW-225: An `NSTouchBar` item inside keeper's own window.
+
+origin: epic 63, story 63.5, 2026-09-03
+location: `crates/keeper/src/voice_reach.rs` (the three reach surfaces that exist),
+  `keeper-core/src/voice_reach.rs:4-8`, `:31-37`; `docs/decisions.md` D-6
+reason: Supported by Apple: an app may place its own items in the Touch Bar's app region through
+  `NSTouchBar`, and Tauri exposes the `NSWindow` to do it. But an `NSTouchBar` item is visible
+  only while keeper is the frontmost app — which is the one case the global hotkey and the tray
+  item already cover, and the one case the owner did not ask about ("szczególnie w
+  backgroundzie"). The Control Strip and the Siri button are refused, not deferred (D-6): they
+  need private `DFRFoundation` in a non-sandboxed bundle with library validation disabled, and the
+  apps that do it are unmaintained (Pock `0.9.0-22` pre-release 2021-09-28, MTMR `v0.27.0`
+  2020-11-20) with Pock carrying an open "not working on Macos 26.0" report
+  (`github.com/pock/pock/issues/655`). The supported Touch Bar reach — a Shortcut opening
+  `keeper://voice/talk` from the Quick Actions button — ships. A nicety for a 2016–2021 hardware
+  line; take it only if somebody with a Touch Bar Mac asks for it while keeper is in front.
+status: open
+
+### DW-226: Making Hermes the Matrix bot is a product decision, not a story.
+
+origin: epic 63, 2026-09-03
+location: `keeper-core/src/bots/**` (every conversation rides the `/v1` OpenAI-compatible wire and
+  `/api/sessions`); `docs/decisions.md` D-4 (the endpoint is yours), D-7
+reason: Hermes can run as a Matrix bot in a room both devices already sync. That would give both
+  devices the transcript — every token, live, through the homeserver's ordinary timeline — for
+  almost no keeper code, and it is the cheapest possible answer to the cross-device ask. It is also
+  the largest product change on the table: every conversation moves off the `/v1` API onto Matrix,
+  approvals become reactions, the tool grant and audit row (AD-158) have no place to live, and
+  every transcript persists on the homeserver and in key backup — the exact change `docs/egress.md`
+  refuses to make as a side effect (DW-224). Nothing here is a defect in what shipped; it is a
+  fork in what keeper's Bots surface is. Filed so it is decided by the owner rather than drifted
+  into by whichever story next finds it convenient. No code until that decision is written down.
+status: open
+
+### DW-227: Wake listening with the Mac's lid closed.
+
+origin: epic 63, story 63.4, 2026-09-03
+location: `crates/keeper/src/voice_macos.rs:94-98` (the App Nap assertion and its comment),
+  `docs/decisions.md` D-5 *What the Mac does differently*
+reason: The port holds an `NSProcessInfo` activity (`UserInitiatedAllowingIdleSystemSleep`) only
+  while a capture is up, which keeps App Nap from starving the tap while keeper is not in front.
+  It deliberately does not keep the Mac awake, and no assertion could make a closed MacBook hear
+  anything: closing the lid disconnects the built-in microphone physically, and clamshell mode
+  needs external power plus an external display and still has no built-in microphone. An
+  external USB microphone in clamshell mode is the one arrangement that could work and is
+  untested (DW-228 comes first). Not a defect; recorded so nobody files it as one or writes a
+  `PreventUserIdleSystemSleep` assertion that would keep a laptop hot for nothing.
+status: open
+
+### DW-228: The macOS voice port has never been compiled or run.
+
+origin: epic 63, story 63.4 (written), story 63.8 (recorded), 2026-09-03
+location: `crates/keeper/src/voice_macos.rs` (~1180 lines, seventeen `#[allow(unsafe_code)]`
+  fns), `crates/keeper/src/voice_ipc.rs` (`platform_port`/`platform_consent` selection),
+  `crates/keeper/Info.plist:22-33` (the two usage strings), `docs/constraints-and-limitations.md`
+  *macOS voice port* (already says "not yet compiled where it was written")
+reason: The port was authored on the Linux dev host, where the shell crate cannot be built at all
+  (`docs/project-context.md`, *The shell crate cannot be compiled on the Linux dev host*), and the
+  Mac that would have compiled it — hesperia — was unreachable over ssh for the whole of the
+  session that wrote it. What has been verified: `keeper-core`'s platform-neutral voice tests and
+  the on-device source scan (`keeper-core/tests/voice_on_device.rs`, which picks the file up by
+  prefix) pass on Linux, and a later story read `voice_ipc.rs` and fixed the one call the local
+  gate could not see (`voice_authorize` calling a `From` impl story 63.3 had removed). What has
+  not: whether the file compiles against `objc2-speech`/`objc2-avf-audio`/`objc2-foundation` as
+  pinned, whether clippy at `-D warnings` accepts it, whether `voice_availability` on a real Mac
+  answers with a real availability rather than `unsupported` (FR-417, the story's own acceptance
+  criterion), whether the TCC prompts appear with the Info.plist strings, whether the rolling
+  request (45 s / 1.5 s quiet / 58 s hard) actually rolls, and whether the tray reflects idle /
+  listening / speaking with keeper backgrounded (story 63.5's acceptance). Story 63.4 is therefore
+  **implemented, not finished**; sprint status must not read it as done until this row closes.
+  The next session on a Mac closes it with, in order:
+  1. `bun run check:rust:macos` from the Linux box (or on the Mac: `cd src-tauri && cargo clippy
+     --workspace --all-targets -- -D warnings && cargo nextest run --workspace`) — the first
+     compile of the file; expect objc2 signature mismatches and fix them in the port, never by
+     loosening the on-device scan.
+  2. `bun run install:macos` (`scripts/install-macos.sh`, whose dispatched
+     `scripts/build-macos-signed.sh:94-95` now refuses a bundle `lib/bundle-guard.sh` says cannot
+     render), then open Settings → Bots and confirm the wake switch is drawn — that is
+     `voice_availability` answering something other than `unsupported`.
+  3. Grant the two TCC prompts, press Talk, say a sentence, hear the answer; then background
+     keeper and start a turn from the hotkey and from the tray; then `open keeper://voice/talk`
+     twice and confirm one turn.
+  4. Say nothing for 50 s with listening on and confirm in the log that the request rolled at
+     45 s rather than the recogniser ending the session.
+  5. Record the answers in `docs/constraints-and-limitations.md` (replace "not yet compiled where
+     it was written") and close this row.
 status: open
 
 - source_spec: none

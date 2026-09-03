@@ -7,10 +7,15 @@
 # identity in a macOS keychain. None of those cross-compile, so a Linux
 # workstation that wants a running Mac app has to build it on the Mac.
 #
-# Note the reason is the BUNDLE, not the shell crate: `cargo build -p keeper`
-# succeeds on Linux (GTK/glib are present in the dev container), which is what
-# makes `bun run dev` and the Rust suite usable there. Only this last mile —
-# sidecar, bundle, signature — is Mac-bound.
+# The reason is the BUNDLE and more: measured on 2026-09-03 in this dev
+# container, `cargo build -p keeper` does NOT succeed on Linux either — there is
+# no `pkg-config` and no glib development headers, so `gio-sys` fails its build
+# script before the shell crate is reached. What IS usable on Linux is
+# `keeper-core` and `keeper-sync` (`cargo nextest run -p keeper-core -p
+# keeper-sync`) plus the whole frontend. The shell crate's only gates are CI's
+# Rust job (macos-latest) and this script's host. An earlier version of this
+# comment claimed the opposite, and a whole epic's shell code was written
+# against that claim before anyone ran the command.
 #
 # The build runs inside the Mac's GUI login session, because that is the only
 # session that can reach the signing identity's private key. A Terminal.app
@@ -96,7 +101,9 @@ remote "cd \$HOME/$REMOTE_DIR && $REMOTE_ENV && bun install --frozen-lockfile --
 #
 # The payload is `build-macos-signed.sh`, unchanged and shared with the
 # run-it-on-the-Mac path, so there is one build, one identity lookup, one
-# signature check and one install rather than a second implementation here.
+# signature check, one check that the bundle can render (lib/bundle-guard.sh:
+# a `--debug` build signs fine and opens to a blank window) and one install
+# rather than a second implementation here.
 say "building and signing in the GUI session on $HOST (Terminal.app opens there)"
 GUI_ARGS=""
 if [ -z "${KEEPER_MACOS_BUILD_ONLY:-}" ]; then

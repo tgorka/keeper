@@ -242,9 +242,13 @@ iOS 26.6.1, Xcode 26.6):
    Tauri CLI over a local socket and aborts with `failed to build WebSocket client`
    when xcodebuild is driven standalone.
 
-3. **Install and launch with `devicectl`**, since Xcode's Run button is not available:
+3. **Check the IPA, then install and launch with `devicectl`**, since Xcode's Run
+   button is not available. The check is not optional: a `--debug` build passes every
+   step of this sequence and shows nothing on the phone (see
+   [The build that installs and shows nothing](#the-build-that-installs-and-shows-nothing---debug)).
 
    ```sh
+   bash scripts/check-bundle.sh src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
    xcrun devicectl device install app --device <udid> \
      src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
    xcrun devicectl device process launch --device <udid> dev.tgorka.keeper
@@ -321,6 +325,39 @@ src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
 The exact subdirectory and filename are derived from the product name and export, so
 confirm the precise path from your first build's output. Everything under `build/` is
 excluded by `src-tauri/.gitignore`, so an IPA left at that path is never committed.
+
+### The build that installs and shows nothing (`--debug`)
+
+`bun run tauri ios build --debug --target aarch64` produces an IPA that signs, installs
+and launches like the real one and opens to an almost empty screen. Measured on
+2026-09-03 on kalypso, from the installed `keeper.app`:
+
+```sh
+ls keeper.app/assets                                   # empty: no frontend on disk
+grep -rlo "Listen for a phrase" keeper.app             # 0 hits for every UI string tried
+strings -a keeper.app/keeper | grep -c "localhost:1420"   # 1
+```
+
+A debug profile is a *dev* build to Tauri: the executable embeds no frontend, the
+`assets/` folder resource is copied empty, and the webview is pointed at
+`build.devUrl` — the Vite dev server, which does not run on a phone. Note that the
+third line is not evidence on its own: `tauri.conf.json` is compiled into every keeper
+binary, `devUrl` included, so a correct build matches it too. What a correct build has
+and a `--debug` build lacks is the embedded frontend.
+
+The one-line recipe that avoids it is the one above: `bun run tauri ios build
+--export-method debugging`. The check that refuses the bad one is
+
+```sh
+bash scripts/check-bundle.sh src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
+```
+
+which exits 1 with a sentence naming the cause — empty `assets/`, no `index.html`, or an
+executable that embeds no frontend and carries the dev URL — and the recipe to run
+instead. Run it on every IPA before it goes near a phone or a tester; the install steps
+below and in [Installing from a machine you only reach over ssh](#installing-from-a-machine-you-only-reach-over-ssh)
+are not finished until it passes. The macOS install path runs the same check itself
+(`scripts/build-macos-signed.sh`, dispatched by `bun run install:macos`).
 
 ### What "debugging" export means, and why not "unsigned"
 
