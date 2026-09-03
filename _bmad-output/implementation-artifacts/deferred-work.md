@@ -3462,6 +3462,25 @@ reason: Armed listening keeps running with another app in front, which is the wh
   re-sign every seven days.
 status: open
 
+### DW-223: A files-pane restore test that only fails on the CI runner.
+
+origin: epic 62, 2026-09-03
+location: `src/components/layout/files-pane.test.tsx` — "waits for a real list before deciding a
+  profile is gone"; the code it exercises is `files-pane.tsx:1324-1341` and
+  `stores/files-tree.ts:354-363` (`retainProfiles`) plus `379-389` (`hydrateFilesTree`)
+reason: CI's frontend job (macos-latest, whole suite in parallel) failed this test twice with
+  `expected Set{} to deeply equal Set{'01VAULT\0'}` — a written EMPTY expansion — including on a
+  docs-only commit, and passed on the same tree before and after. Not reproducible: alone, whole
+  file 3x, `CI=true`, pinned to one core, and 6 runs on the macOS host the runner matches. What is
+  established: `retainProfiles` is the ONLY writer of that cookie (instrumented `persist`), so an
+  empty cookie means it ran against a store that was not holding the keys, not that the drop chose
+  wrongly; and the store holds them only if `hydrateFilesTree` believed the cookie, which it
+  declines silently once it has run in the document. The arrangement is now asserted on its own
+  line so the next failure says which of the two happened. Left open rather than papered over with
+  a longer timeout: the observed value had already been written, so it was never a value still on
+  its way.
+status: open
+
 - source_spec: none
   summary: Restyle the note editor's Find/Replace bar so it matches the app's UI instead of rendering as unstyled inputs and buttons.
   evidence: Split from a four-goal intent (note pane truncation, find bar, toolbar additions, file embedding). Independently shippable: pure presentation inside the editor chrome, no shared contract.
