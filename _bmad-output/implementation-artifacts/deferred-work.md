@@ -3407,6 +3407,61 @@ reason: 61.8 minted the category for its metadata toggle; 61.4 never registered 
   with no `Open Bots` above it. One action and one chip, in the story that owns the registry.
 status: open
 
+### DW-219: Voice on the Mac waits for weights whose licence somebody can read.
+
+origin: epic 62, 2026-09-03
+location: `keeper-core/src/voice/**` (the port and the turn machine are platform-neutral),
+  against `crates/keeper/src/voice_ios.rs` as the only implementation
+reason: Epic 62 ships voice on iOS precisely because Apple's recogniser and synthesiser are system
+  frameworks, so keeper bundles no model weights (D-5). The desktop has no such route. Every
+  permissive wake-word or ASR stack surveyed for Epic 61 either ships weights under a
+  non-commercial licence (openWakeWord: CC BY-NC-SA), needs a vendor key and phones home
+  (Porcupine), links GPL-3.0 through espeak-ng (Piper, sherpa-onnx with TTS enabled), or publishes
+  weights whose training-data provenance nobody could establish (sherpa-onnx KWS/ASR). macOS does
+  expose `SFSpeechRecognizer` too, which would be the honest first move — a second port
+  implementation behind the same trait, with its own entitlement and TCC story — and it is not the
+  same work as the wake phrase, which still needs a spotter. Revisit when either a
+  clearly-licensed KWS model exists or the Mac ships only push-to-talk over the system recogniser.
+status: open
+
+### DW-220: The drive tools cannot reach a phone, and the honest route inverts the connection.
+
+origin: epic 62, 2026-09-03
+location: `crates/keeper/src/bots_drive_ipc.rs` (`#[cfg(desktop)]`), `keeper-sync/src/bots_fs.rs`
+reason: `keeper-sync` is not a dependency of the shell crate on iOS or Android, so the grant, the
+  audit and the seven filesystem verbs cannot exist there — `CapabilitiesVm.botTools` is false on a
+  phone and the affordances are absent rather than disabled. The route that would work is the one
+  Epic 61 already recorded for Hermes (DW-215): keeper *serving* MCP to something that can reach
+  the files, which inverts the direction of the connection and needs its own threat model. Filed
+  together because they are one decision taken twice.
+status: open
+
+### DW-221: Ollama on the phone is neither built nor blocked.
+
+origin: epic 62, 2026-09-03
+location: `keeper-core/src/bots/{mod,discover,chat}.rs` — `ProviderKind` is closed at two
+reason: The epic's scope is Hermes because that is what was asked for, and the wire is the same
+  for both kinds, so an Ollama endpoint a phone can reach already works. Writing a gate to refuse
+  it would be code whose only effect is to make the app less honest about what it can do. What is
+  genuinely untested is the shape of that reachability from a phone — a loopback Ollama does not
+  exist on iOS, so it means a LAN or tailnet address, which is the `is_private` disclosure path.
+  Revisit if a phone-side provider list needs to rank or explain the two kinds differently.
+status: open
+
+### DW-222: The listening indicator lives inside keeper, not on the lock screen.
+
+origin: epic 62, 2026-09-03
+location: `src/components/bots/bot-voice-wake.tsx` (the chip), against `gen/apple/project.yml`
+reason: Armed listening keeps running with another app in front, which is the whole point of the
+  drive-mode case — but keeper's own chip is then not on screen, and the only thing the person can
+  see is the system's orange microphone indicator. A Live Activity would put a keeper-owned
+  indicator beside Google Maps on the lock screen and in the Dynamic Island, and would give
+  disarming a control that does not require switching apps. Deferred rather than rejected: it
+  needs an ActivityKit widget extension in the generated Apple project, a second bundle id, and
+  its own signing story on a free Personal Team, where every extension is another target to
+  re-sign every seven days.
+status: open
+
 - source_spec: none
   summary: Restyle the note editor's Find/Replace bar so it matches the app's UI instead of rendering as unstyled inputs and buttons.
   evidence: Split from a four-goal intent (note pane truncation, find bar, toolbar additions, file embedding). Independently shippable: pure presentation inside the editor chrome, no shared contract.
