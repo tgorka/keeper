@@ -1204,6 +1204,24 @@ development_status:
   61-13-the-gates-the-docs-and-the-honest-row: review
   epic-61-retrospective: optional
 
+# Epic 62 (`epic-62-a-model-you-can-talk-to-on-the-phone-and-a-phrase-that-starts-it.md`)
+# shipped as PRs #319-#322 and merged to main at 687d2aa without ever being
+# registered here: no 62-* rows were written, so this file's story table has a
+# hole where an entire epic went past. Recorded rather than back-filled -
+# inventing seven rows after the fact would be a worse lie than the gap.
+  epic-62-unregistered: done
+
+# Epic 63 (`epic-63-one-conversation-two-devices-and-a-voice-on-the-mac.md`).
+# The Mac voice half that D-5 deferred under DW-219 is collected here.
+  63-1-the-phone-surface-reachable-and-true: backlog
+  63-2-a-bundle-that-cannot-be-a-dev-build: backlog
+  63-3-the-voice-ports-neutral-half: backlog
+  63-4-the-mac-can-hear-you: backlog
+  63-5-reach-on-the-mac-when-its-not-in-front: backlog
+  63-6-one-conversation-one-identity: backlog
+  63-7-follow-from-the-other-device: backlog
+  63-8-the-docs-the-disclosures-the-guards: backlog
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
