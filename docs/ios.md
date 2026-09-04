@@ -265,6 +265,32 @@ iOS 26.6.1, Xcode 26.6):
    gone on iOS 26 (`Could not start screenshotr service`), so pixels from a physical
    phone need a human or Xcode. Use the simulator for layout measurement.
 
+### The scripted path: `bun run install:ios`
+
+Everything in this section, in that order, is what `scripts/install-ios.sh` does
+(`bun run install:ios [host]`, default host `$KEEPER_MACOS_HOST` or `hesperia`), and it
+is the supported way to put a build on a phone from a Linux workstation. It rsyncs the
+tree, builds inside the Mac's GUI session with `--export-method debugging`, runs
+`scripts/check-bundle.sh`'s check and the designated-requirement check on the IPA
+before the phone sees it, installs and launches with `devicectl`, then prints what it
+read off the bundle — `Speech.framework` in `otool -L`, both usage strings, `UIBackgroundModes`,
+the designated requirement — and, last, the three things only a person at the phone
+can do (permission prompts, dictation language, arming the wake phrase, which is off on
+a fresh install).
+
+It refuses, naming the remedy each time, when: the Mac is unreachable; Xcode, xcodegen,
+cocoapods, bun, the `aarch64-apple-ios` target or an Apple Development identity is
+missing; no iPhone is on the USB bus, or one is but is unpaired, or Developer Mode is
+off; `APPLE_DEVELOPMENT_TEAM` is unset (it prints the team id read off the certificate as
+the line to export); the build hits the Personal Team entitlement wall (the remedy is
+`KEEPER_IOS_FREE_TEAM=1`, which drops the `entitlements:` block from the remote copy of
+`project.yml`, regenerates, and verifies `CODE_SIGN_ENTITLEMENTS` is gone while
+`Speech.framework` is still referenced) or has no provisioning profile
+(`KEEPER_IOS_REGISTER_DEVICE=1` mints one first); the IPA cannot render or is ad-hoc
+signed; or the launch is refused for an untrusted certificate or a lapsed profile.
+`KEEPER_IOS_BUILD_ONLY=1` stops after the gates; `KEEPER_IOS_DEVICE=<udid>` picks the
+phone when several are cabled.
+
 ## The 7-day re-arm ritual
 
 A free Personal Team's provisioning profile is valid for **7 days**. When it expires
