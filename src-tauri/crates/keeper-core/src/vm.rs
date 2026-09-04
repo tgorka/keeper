@@ -7081,7 +7081,7 @@ pub enum VoiceUnavailableVm {
 /// and the recogniser's language (Epic 63), from `voice_wake_get` and back
 /// from `voice_wake_set` and `voice_locale_set`.
 ///
-/// `limits` is `keeper_core::voice::LISTENING_LIMITS` carried to the surface
+/// `limits` is the port's own `VoicePlatform::limits` carried to the surface
 /// rather than retyped there: the sentence beside the switch is decided once,
 /// in core, and the webview only renders it. `locale` is
 /// `keeper_core::voice::locale::in_force`'s answer and `on_device_locales`

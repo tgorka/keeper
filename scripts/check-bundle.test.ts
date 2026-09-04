@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -49,12 +57,18 @@ function app(): string {
   return dir;
 }
 
-/** An iOS bundle exactly as `tauri ios build --export-method debugging` lays it out. */
+/**
+ * An iOS bundle as `tauri ios build --export-method debugging` really lays it
+ * out, measured on hesperia 2026-09-04: `assets/` beside the executable is an
+ * Xcode source directory and is EMPTY, because a release build compiles the
+ * frontend into the binary exactly as it does on macOS. The first version of
+ * these tests asserted the opposite - a populated `assets/` with an
+ * index.html - which is why the guard refused a good IPA and, worse, why its
+ * author believed an empty `assets/` proved a frontend-less build.
+ */
 function goodIos(): string {
   const dir = app();
-  mkdirSync(join(dir, "assets/assets"), { recursive: true });
-  writeFileSync(join(dir, "assets/index.html"), INDEX_HTML);
-  writeFileSync(join(dir, "assets/assets/main-Bx7Qk2Lp.js"), "export {};\n");
+  mkdirSync(join(dir, "assets"));
   // A correct build carries the dev URL too: tauri-codegen compiles the whole
   // config into the binary. The guard must not refuse it for that.
   writeFileSync(join(dir, "keeper"), binary(ENTRY, DEV_URL));
@@ -70,51 +84,39 @@ function run(path: string, env: Record<string, string> = {}) {
 }
 
 describe("check-bundle.sh on an iOS .app", () => {
-  it("passes a bundle whose assets/, index.html and embedded chunk are all present", () => {
-    const r = run(goodIos());
+  let iosRoot: string;
+  beforeAll(() => {
+    iosRoot = join(root, "ios-root");
+    mkdirSync(join(iosRoot, "src-tauri/crates/keeper"), { recursive: true });
+    cpSync(TAURI_CONF, join(iosRoot, "src-tauri/crates/keeper/tauri.conf.json"));
+    mkdirSync(join(iosRoot, "dist"));
+    writeFileSync(join(iosRoot, "dist/index.html"), INDEX_HTML);
+  });
+
+  it("passes a bundle whose executable embeds the chunk, with assets/ empty as a real one is", () => {
+    const dir = goodIos();
+    expect(readdirSync(join(dir, "assets"))).toEqual([]);
+    const r = run(dir, { KEEPER_REPO_ROOT: iosRoot });
     expect(r.err).toBe("");
     expect(r.status).toBe(0);
     expect(r.out).toContain(`embeds ${ENTRY}`);
   });
 
-  it("refuses an empty assets/ with its own sentence and the correct recipe", () => {
+  it("passes a bundle with no assets/ directory at all: it is not evidence either way", () => {
     const dir = app();
-    mkdirSync(join(dir, "assets"));
-    writeFileSync(join(dir, "keeper"), binary(DEV_URL));
-    const r = run(dir);
-    expect(r.status).toBe(1);
-    expect(r.err).toContain("assets is empty");
-    expect(r.err).toContain("bun run tauri ios build --export-method debugging");
-  });
-
-  it("refuses a missing assets/ as empty rather than crashing", () => {
-    const dir = app();
-    writeFileSync(join(dir, "keeper"), binary(DEV_URL));
-    const r = run(dir);
-    expect(r.status).toBe(1);
-    expect(r.err).toContain("assets is empty");
-  });
-
-  it("refuses an assets/ that has files but no index.html, with a different sentence", () => {
-    const dir = app();
-    mkdirSync(join(dir, "assets/assets"), { recursive: true });
-    writeFileSync(join(dir, "assets/assets/main-Bx7Qk2Lp.js"), "export {};\n");
     writeFileSync(join(dir, "keeper"), binary(ENTRY, DEV_URL));
-    const r = run(dir);
-    expect(r.status).toBe(1);
-    expect(r.err).toContain("has no index.html");
-    expect(r.err).not.toContain("is empty");
+    const r = run(dir, { KEEPER_REPO_ROOT: iosRoot });
+    expect(r.status).toBe(0);
   });
 
   it("refuses a binary that carries the dev-server URL and no frontend, naming the URL", () => {
     const dir = goodIos();
     writeFileSync(join(dir, "keeper"), binary(DEV_URL));
-    const r = run(dir);
+    const r = run(dir, { KEEPER_REPO_ROOT: iosRoot });
     expect(r.status).toBe(1);
     expect(r.err).toContain("embeds no frontend");
     expect(r.err).toContain(`pointed at ${DEV_URL}`);
-    expect(r.err).not.toContain("is empty");
-    expect(r.err).not.toContain("has no index.html");
+    expect(r.err).toContain("bun run tauri ios build --export-method debugging");
   });
 
   it("reads the dev URL from tauri.conf.json, not from a copy", () => {
@@ -127,6 +129,8 @@ describe("check-bundle.sh on an iOS .app", () => {
       join(fakeRoot, "src-tauri/crates/keeper/tauri.conf.json"),
       readFileSync(TAURI_CONF, "utf8").replace(DEV_URL, "http://127.0.0.1:9999"),
     );
+    mkdirSync(join(fakeRoot, "dist"));
+    writeFileSync(join(fakeRoot, "dist/index.html"), INDEX_HTML);
     const dir = goodIos();
     writeFileSync(join(dir, "keeper"), binary("http://127.0.0.1:9999/"));
     const r = run(dir, { KEEPER_REPO_ROOT: fakeRoot });
@@ -137,7 +141,7 @@ describe("check-bundle.sh on an iOS .app", () => {
   it("refuses a binary that embeds no frontend even without the dev URL", () => {
     const dir = goodIos();
     writeFileSync(join(dir, "keeper"), binary("nothing of note"));
-    const r = run(dir);
+    const r = run(dir, { KEEPER_REPO_ROOT: iosRoot });
     expect(r.status).toBe(1);
     expect(r.err).toContain("embeds no frontend");
     expect(r.err).not.toContain("pointed at");
@@ -216,6 +220,15 @@ describe("check-bundle.sh on a macOS .app", () => {
 });
 
 describe.skipIf(!python3)("check-bundle.sh on an .ipa", () => {
+  let ipaRoot: string;
+  beforeAll(() => {
+    ipaRoot = join(root, "ipa-root");
+    mkdirSync(join(ipaRoot, "src-tauri/crates/keeper"), { recursive: true });
+    cpSync(TAURI_CONF, join(ipaRoot, "src-tauri/crates/keeper/tauri.conf.json"));
+    mkdirSync(join(ipaRoot, "dist"));
+    writeFileSync(join(ipaRoot, "dist/index.html"), INDEX_HTML);
+  });
+
   function ipa(appDir: string): string {
     // `Payload/keeper.app` is what Xcode's export writes; python3's zipfile is
     // the zip writer this host has.
@@ -232,18 +245,18 @@ describe.skipIf(!python3)("check-bundle.sh on an .ipa", () => {
   }
 
   it("passes a correct IPA", () => {
-    const r = run(ipa(goodIos()));
+    const r = run(ipa(goodIos()), { KEEPER_REPO_ROOT: ipaRoot });
     expect(r.err).toBe("");
     expect(r.status).toBe(0);
   });
 
-  it("refuses an IPA whose bundle has an empty assets/", () => {
+  it("refuses an IPA whose executable embeds no frontend", () => {
     const dir = app();
     mkdirSync(join(dir, "assets"));
     writeFileSync(join(dir, "keeper"), binary(DEV_URL));
-    const r = run(ipa(dir));
+    const r = run(ipa(dir), { KEEPER_REPO_ROOT: ipaRoot });
     expect(r.status).toBe(1);
-    expect(r.err).toContain("assets is empty");
+    expect(r.err).toContain("embeds no frontend");
   });
 
   it("refuses a file that is not a zip", () => {

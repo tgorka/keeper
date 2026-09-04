@@ -33,7 +33,9 @@
 //! comes in front or the screen locks, because the shell declares the audio
 //! background mode and records in the play-and-record category. What that
 //! costs — the microphone indicator, the battery — is said once, in
-//! [`LISTENING_LIMITS`], beside the switch (FR-406).
+//! [`platform::VoicePlatform::limits`], beside the switch (FR-406) - per
+//! platform, because what takes the microphone away has a name and it is not
+//! the same name on a Mac as on a phone.
 
 pub mod authorization;
 pub mod locale;
@@ -56,20 +58,6 @@ use crate::vm::{VoiceStateVm, VoiceUnavailableVm};
 /// The phrase a fresh install listens for once the switch is turned on. One
 /// word, on purpose — see [`phrase::MIN_WORDS`].
 pub const DEFAULT_WAKE_PHRASE: &str = "nixie";
-
-/// What armed listening does and does not do on the phone (FR-406, AD-169).
-///
-/// **The one place these words live.** The surface shows this beside the
-/// switch — not in a tooltip, not only in Settings — and `docs/ios.md` quotes
-/// it, so the sentence a person reads before turning listening on and the
-/// sentence the docs make are the same sentence. Every clause is a fact
-/// about iOS, not a to-do: listening cannot be *started* from the background,
-/// so it is armed here; once armed it continues while another app is in
-/// front or the screen is locked; it ends when the person turns it off, when
-/// iOS ends the audio session, or when keeper is force-quit; the system's
-/// microphone indicator is on the whole time and no app can hide it; and an
-/// open microphone costs battery.
-pub const LISTENING_LIMITS: &str = "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. It stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit. The microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.";
 
 /// Why the port cannot listen or speak right now.
 ///

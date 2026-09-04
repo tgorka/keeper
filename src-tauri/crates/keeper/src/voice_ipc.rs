@@ -41,7 +41,7 @@ use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use keeper_core::voice::EventSink;
 use keeper_core::voice::{
-    locale, silence_budget, ConsentPort, Turn, TurnEvent, VoicePort, WakePhrase, LISTENING_LIMITS,
+    locale, silence_budget, ConsentPort, Turn, TurnEvent, VoicePort, WakePhrase,
 };
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
 use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
@@ -367,7 +367,9 @@ fn wake_vm(
     Ok(VoiceWakeVm {
         enabled,
         phrase,
-        limits: LISTENING_LIMITS.to_owned(),
+        // The port's own platform, not one const for every target: a Mac was
+        // showing iOS's sentence under its switch (screenshot, 2026-09-04).
+        limits: port.platform().limits.to_owned(),
         locale: locale::in_force(locale_chosen.as_deref(), &system, &on_device),
         locale_chosen,
         on_device_locales: on_device,

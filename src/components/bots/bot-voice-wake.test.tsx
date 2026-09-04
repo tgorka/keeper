@@ -59,15 +59,17 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   };
 });
 
-/** `LISTENING_LIMITS` as `keeper-core` holds it, so the fixture is the real sentence. */
+/** iOS's `VoicePlatform::limits` as `keeper-core` holds it, so the fixture is the real sentence. */
 function rustLimits(): string {
   const source = readFileSync(
-    path.resolve(__dirname, "../../../src-tauri/crates/keeper-core/src/voice/mod.rs"),
+    path.resolve(__dirname, "../../../src-tauri/crates/keeper-core/src/voice/platform.rs"),
     "utf8",
   );
-  const match = /pub const LISTENING_LIMITS: &str = "([^"]+)";/.exec(source);
+  // The iOS constant, which is the one this fixture stands for; the Mac has
+  // its own sentence in the same file and must not be picked up here.
+  const match = /noun: "phone",[\s\S]*?limits: "([^"]+)"/.exec(source);
   if (match?.[1] === undefined) {
-    throw new Error("LISTENING_LIMITS not found in voice/mod.rs");
+    throw new Error("VoicePlatform::IOS.limits not found in voice/platform.rs");
   }
   return match[1];
 }

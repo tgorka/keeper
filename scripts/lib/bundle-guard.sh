@@ -107,29 +107,22 @@ _keeper_check_unpacked() {
     html="$KEEPER_REPO_ROOT/dist/index.html"
     recipe="bun run tauri:build:signed"
   elif [ -d "$app" ]; then
-    # iOS: the Xcode project bundles `assets/` (a copy of frontendDist) as a
-    # folder resource beside the executable, so the frontend is on disk too.
+    # iOS. `assets/` beside the executable is an Xcode source directory, and a
+    # release build leaves it EMPTY: the frontend is compiled into the binary
+    # exactly as on macOS. Measured on hesperia 2026-09-04 against the IPA that
+    # `--export-method debugging` produced: `assets/` empty, and 127 embedded
+    # asset paths in the executable including the entry chunk. An earlier
+    # version of this guard required that directory to be populated, refused
+    # the good IPA, and - worse - had told its author that an empty `assets/`
+    # was proof of a frontend-less build. It is not proof of anything.
     name="$(basename "$app" .app)"
     bin="$app/$name"
-    frontend="$app/assets"
-    html="$frontend/index.html"
+    frontend=""
+    html="$KEEPER_REPO_ROOT/dist/index.html"
     recipe="bun run tauri ios build --export-method debugging"
   else
     echo "error: $app is neither a .app bundle nor an executable." >&2
     return 1
-  fi
-
-  if [ -n "$frontend" ]; then
-    if [ ! -d "$frontend" ] || [ -z "$(find "$frontend" -mindepth 1 -print -quit)" ]; then
-      _keeper_bundle_refuse "$recipe" \
-        "$frontend is empty: the bundle carries no frontend, so the app opens to a blank screen."
-      return 1
-    fi
-    if [ ! -f "$html" ]; then
-      _keeper_bundle_refuse "$recipe" \
-        "$frontend has no index.html: the webview has no document to load."
-      return 1
-    fi
   fi
 
   if [ ! -f "$bin" ]; then

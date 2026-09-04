@@ -41,6 +41,13 @@ pub struct VoicePlatform {
     /// it is `false`, [`super::may_record`] answers `false` while speaking
     /// and the turn releases the microphone before it speaks (AD-175).
     pub full_duplex: bool,
+    /// What armed listening costs and what ends it, as the whole sentence
+    /// shown beside the switch (FR-406). Per platform because the thing
+    /// that takes the microphone away has a name, and on a Mac that name is
+    /// not iOS: a screenshot of the real macOS build on 2026-09-04 showed
+    /// the iOS sentence sitting under a Mac's switch, saying "when iOS ends
+    /// the audio session" to somebody holding a MacBook.
+    pub limits: &'static str,
 }
 
 impl VoicePlatform {
@@ -54,6 +61,7 @@ impl VoicePlatform {
         download:
             "download that language under Settings > General > Keyboard > Dictation Languages",
         full_duplex: true,
+        limits: "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. It stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit. The microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
     };
 
     /// macOS: the Mac. The microphone grant lives in System Settings >
@@ -67,6 +75,11 @@ impl VoicePlatform {
         allow: "allow the microphone under System Settings > Privacy & Security > Microphone",
         download: "turn Dictation on and download that language under System Settings > Keyboard > Dictation",
         full_duplex: false,
+        // No screen-lock clause: with no `AVAudioSession` there is no
+        // documented macOS rule about a locked screen that this session
+        // verified, and a sentence beside a switch is the wrong place to
+        // guess. What IS known is stated.
+        limits: "Turn listening on while keeper is in front and it keeps listening when another app is in front. It stops when you turn it off, when the system takes the microphone away, or when keeper quits. The microphone indicator in the menu bar stays on the whole time and cannot be hidden, and listening uses battery.",
     };
 
     /// The platform of a port that has none — the shell's absent port on a
@@ -81,5 +94,8 @@ impl VoicePlatform {
         allow: "allow both in the system's privacy settings",
         download: "download that language in the system's dictation settings",
         full_duplex: false,
+        // Never shown: a port with no platform refuses before a switch is
+        // ever drawn. Present so that every platform answers every question.
+        limits: "Listening is not available on this device.",
     };
 }

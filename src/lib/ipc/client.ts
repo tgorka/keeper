@@ -7241,7 +7241,7 @@ export async function voiceUnwatch(id: number): Promise<void> {
 /**
  * The wake switch and phrase as persisted (`bots.wake_enabled`,
  * `bots.wake_phrase`), plus the sentence about what listening costs on this
- * phone — decided once in `keeper_core::voice::LISTENING_LIMITS` and rendered
+ * phone — decided once per platform in `VoicePlatform::limits` and rendered
  * beside the switch (FR-406). Off on a fresh install.
  *
  * Rejects with: `internal`.

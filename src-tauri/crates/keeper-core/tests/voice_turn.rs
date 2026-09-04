@@ -8,7 +8,7 @@ use keeper_core::vm::{VoiceStateVm, VoiceUnavailableVm};
 use keeper_core::voice::{
     advance, perform, silence_budget, Effect, PhraseRefused, Turn, TurnEvent, TurnState,
     VoicePlatform, VoicePort, VoiceUnavailable, WakePhrase, DEFAULT_WAKE_PHRASE,
-    END_OF_UTTERANCE_PAUSE, LISTENING_LIMITS, NOTHING_HEARD_TIMEOUT,
+    END_OF_UTTERANCE_PAUSE, NOTHING_HEARD_TIMEOUT,
 };
 
 // ---------------------------------------------------------------------------
@@ -780,7 +780,7 @@ fn voice_phrase_counts_letters_not_words() {
 /// established, and none of them as "not yet".
 #[test]
 fn voice_limits_sentence_states_every_fact_and_no_to_do() {
-    let s = LISTENING_LIMITS;
+    let s = VoicePlatform::IOS.limits;
     assert!(s.contains("in front"), "armed with keeper in front: {s}");
     assert!(
         s.contains("another app is in front") && s.contains("screen is locked"),

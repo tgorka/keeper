@@ -40,7 +40,7 @@
  * The phrase is validated by `keeper_core::voice::WakePhrase::parse` and a
  * refusal is rendered letter for letter from the rejection — never
  * re-validated here, so a phrase the box accepted is a phrase Rust accepted.
- * The limits sentence is `keeper_core::voice::LISTENING_LIMITS`, carried in
+ * The limits sentence is the port's own `VoicePlatform::limits`, carried in
  * `VoiceWakeVm.limits`. Whether the microphone is open is the turn's, read
  * from the streamed snapshot; the chip is a projection of it and never of a
  * local "did I turn it on" flag, so a device that refused to open shows no

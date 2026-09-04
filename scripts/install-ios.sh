@@ -130,12 +130,20 @@ i=0
 while plutil -extract "result.devices.$i.identifier" raw -o - "$json" >/dev/null 2>&1; do
   d="result.devices.$i"
   get() { plutil -extract "$d.$1" raw -o - "$json" 2>/dev/null || echo "unknown"; }
-  printf 'device\t%s\t%s\t%s\t%s\t%s\n' \
+  # `transportType` is what says "on this Mac's cable" (wired) as against a
+  # paired device reachable over the network (localNetwork - that is how the
+  # owner's Apple Watch shows up). `tunnelState` is NOT that: measured on
+  # hesperia 2026-09-04 it reads `disconnected` for a phone that is plugged in,
+  # paired and installable, because a tunnel only exists while something is
+  # talking to the device. Reading it as attachment made this script refuse a
+  # perfectly connected iPhone and blame trust.
+  printf 'device\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(get hardwareProperties.udid)" \
-    "$(get connectionProperties.tunnelState)" \
+    "$(get connectionProperties.transportType)" \
     "$(get connectionProperties.pairingState)" \
     "$(get deviceProperties.developerModeStatus)" \
-    "$(get deviceProperties.name)"
+    "$(get deviceProperties.name)" \
+    "$(get hardwareProperties.platform)"
   i=$((i + 1))
 done
 rm -f "$json"
@@ -147,7 +155,7 @@ EOF
   || fail "\`xcrun devicectl list devices\` failed on $HOST. That command ships with Xcode 15 and later; check \`xcode-select -p\` points at a current Xcode."
 
 USB_IPHONES="$(printf '%s\n' "$DEVICES" | awk -F'\t' '$1 == "usb" {print $2}')"
-ATTACHED="$(printf '%s\n' "$DEVICES" | awk -F'\t' '$1 == "device" && $3 == "connected"')"
+ATTACHED="$(printf '%s\n' "$DEVICES" | awk -F'\t' '$1 == "device" && $3 == "wired" && $7 == "iOS"')"
 
 if [ -z "$ATTACHED" ]; then
   if [ "${USB_IPHONES:-0}" -eq 0 ]; then
@@ -251,6 +259,14 @@ set -euo pipefail
 awk 'skip && /^    [^ ]/ { skip = 0 } /^    entitlements:/ { skip = 1 } !skip' project.yml > project.yml.free
 mv project.yml.free project.yml
 grep -q '^    entitlements:' project.yml && { echo "error: the entitlements: block is still in project.yml after the edit" >&2; exit 1; }
+# `Externals/` (the Rust staticlib the Xcode target links) and `assets/` (the
+# frontend copy) are build outputs, gitignored, and therefore absent from the
+# freshly rsynced tree - and XcodeGen refuses a target whose source directory
+# does not exist. They are created empty here so the regeneration can run
+# before the build that fills them. Measured on hesperia 2026-09-04: without
+# this, `xcodegen generate` fails with two "missing source directory" spec
+# validation errors and the install stops before it builds anything.
+mkdir -p Externals assets
 xcodegen generate
 if grep -q CODE_SIGN_ENTITLEMENTS keeper.xcodeproj/project.pbxproj; then
   echo "error: project.pbxproj still carries CODE_SIGN_ENTITLEMENTS after xcodegen generate; the entitlement was not dropped" >&2
@@ -295,7 +311,14 @@ cd \$HOME/$REMOTE_DIR
 $REMOTE_ENV
 export APPLE_DEVELOPMENT_TEAM=$APPLE_DEVELOPMENT_TEAM
 $REGISTER
-bun run tauri ios build --config src-tauri/crates/keeper/tauri.conf.json --export-method debugging
+# No `--config`: naming the base config explicitly stops Tauri merging the
+# sibling `tauri.ios.conf.json`, whose whole content is `bundle.externalBin:
+# []` - the recording sidecar is macOS-only Swift and has no iOS build.
+# Measured on hesperia 2026-09-04: with `--config`, the build dies at
+# `resource path binaries/keeper-rec-aarch64-apple-ios doesn't exist`; without
+# it, the same tree builds. `tauri ios init` DOES take `--config` (docs/ios.md)
+# because it only has to find the project, not merge a platform overlay.
+bun run tauri ios build --export-method debugging
 PAYLOAD" 2>&1 | tee "$BUILD_LOG"; then
   if grep -q 'com.apple.developer.default-data-protection entitlement' "$BUILD_LOG"; then
     fail "signing failed on the data-protection entitlement: team $APPLE_DEVELOPMENT_TEAM is a free Personal Team and Apple does not grant it that capability. Re-run with KEEPER_IOS_FREE_TEAM=1, which drops the entitlement from the remote copy of the generated project (the committed value stays)."

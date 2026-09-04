@@ -7,7 +7,7 @@
  * switch with its phrase and the sentence about what listening costs. Every
  * write goes through an IPC command and comes back as a fresh read — the
  * phrase is validated by `keeper_core::voice::WakePhrase::parse`, never here,
- * and the limits sentence is `keeper_core::voice::LISTENING_LIMITS`, never
+ * and the limits sentence is the port's own `VoicePlatform::limits`, never
  * retyped here.
  *
  * **One store, one stream.** The wake control (this story) and the talk-mode
