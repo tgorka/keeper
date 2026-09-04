@@ -54,6 +54,8 @@ file-controlled instead, and says which file.
 | | | | | Whether the wake phrase is armed on the phone. Off until chosen: an open microphone is a deliberate act. |
 | `bots.wake_phrase` | user-global | text | `nixie` | `"bots.wake_phrase" = "hej keeper"` |
 | | | | | The phrase that starts a voice turn, as typed; matched case- and diacritic-insensitively. At least 5 letters, at most 5 words. |
+| `bots.voice_locale` | user-global | text | *(absent)* | `"bots.voice_locale" = "en-US"` |
+| | | | | The language the voice recogniser runs in, as a locale identifier. Blank means the system locale when it can run on the device, otherwise the first that can; a language that cannot run here is refused, never silently replaced. |
 | `debug.mode` | user-global | boolean (`1`/`0`) | `0` | `"debug.mode" = true` |
 | | | | | On-disk event and error logging. Read before anything else at boot, so a file can turn it on for the boot that goes wrong. |
 | `incognito.global` | user-global | boolean (`1`/`0`) | `0` | `"incognito.global" = true` |

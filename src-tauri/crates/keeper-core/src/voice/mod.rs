@@ -16,10 +16,12 @@
 //!
 //! # What the port never does
 //!
-//! Recognition happens **on the device or not at all** (FR-402, NFR-50). A
+//! Recognition happens **on the device or not at all** (FR-402, NFR-50). The
+//! language it runs in is [`locale::choose`]'s answer — the person's choice
+//! when it can run here, otherwise a refusal that names what can — and a
 //! port whose on-device model is missing answers
-//! [`VoiceUnavailable::NoOnDeviceModel`] with the locale, and the surface
-//! tells the person which language to download; there is no server path to
+//! [`VoiceUnavailable::NoOnDeviceModel`] with the locale, so the surface
+//! tells the person which language to download. There is no server path to
 //! fall back to, here or in the port, because `docs/egress.md` names every
 //! destination keeper contacts and Apple's speech servers are not on it.
 //!
@@ -34,6 +36,7 @@
 //! [`LISTENING_LIMITS`], beside the switch (FR-406).
 
 pub mod authorization;
+pub mod locale;
 pub mod phrase;
 pub mod platform;
 pub mod turn;
@@ -75,14 +78,18 @@ pub const LISTENING_LIMITS: &str = "Turn listening on while keeper is in front a
 /// platform's nouns filled in from a [`VoicePlatform`] (Story 63.3): the
 /// same cause reads "this phone … Settings > keeper" on iOS and "this Mac …
 /// System Settings > Privacy & Security > Microphone" on macOS, and no
-/// sentence exists twice. `NoOnDeviceModel` is the one that matters: it
-/// names the locale so the person knows which language to download, and
-/// says why keeper will not simply use the network instead.
+/// sentence exists twice. `NoOnDeviceModel` names the locale so the person
+/// knows which language to download, and says why keeper will not simply
+/// use the network instead.
 ///
-/// `NoOnDeviceRecognition` is its neighbour and must stay distinct from it:
-/// a recogniser that reports `supportsOnDeviceRecognition == false` cannot
-/// run on the device whatever is downloaded, so the sentence must not send
-/// the person to a download that changes nothing (AD-175).
+/// `NoOnDeviceRecognition` is its neighbour and stays distinct from it: the
+/// recogniser for that locale reports `supportsOnDeviceRecognition == false`,
+/// which is the OS saying it has no on-device asset for the language ("No
+/// Assistant asset for language pl-PL" in its own log). Adding the language
+/// to the system's dictation languages may make one available — the
+/// evidence does not say it always does, so the sentence says "may" — and
+/// the other way out is to choose a language this device can already run,
+/// which the refusal carries and names ([`locale::choose`]).
 ///
 /// `NoRecognizer` is the one that must not be confused with any other. A
 /// build whose Xcode project does not link `Speech.framework` still compiles
@@ -98,18 +105,24 @@ pub enum VoiceUnavailable {
     /// The person has not allowed the microphone or speech recognition, or
     /// the device restricts them.
     NotAuthorized,
-    /// The recogniser exists for the locale but has no on-device model, and
-    /// keeper refuses the server fallback.
+    /// The recogniser exists for the locale and can run on the device, but
+    /// its model is not available right now, and keeper refuses the server
+    /// fallback.
     NoOnDeviceModel {
-        /// The locale identifier the recogniser was asked for (e.g. `pl_PL`).
+        /// The locale identifier the recogniser was asked for (e.g. `pl-PL`).
         locale: String,
     },
-    /// The recogniser for the locale reports that it cannot run on the
-    /// device at all (`supportsOnDeviceRecognition == false`), and keeper
-    /// refuses the server fallback. No download changes this one.
+    /// The recogniser for the locale reports no on-device recognition
+    /// (`supportsOnDeviceRecognition == false`), or the locale is not one
+    /// the framework lists at all, and keeper refuses the server fallback.
+    /// Carries what can run instead.
     NoOnDeviceRecognition {
-        /// The locale identifier the recogniser was asked for (e.g. `pl_PL`).
+        /// The locale identifier that was asked for, in canonical form
+        /// (e.g. `pl-PL`).
         locale: String,
+        /// Every locale this device can run on its own, in the port's
+        /// sorted order; empty when none can.
+        on_device: Vec<String>,
     },
     /// The device has no audio input route.
     NoMicrophone,
@@ -142,8 +155,12 @@ impl VoiceUnavailable {
             Self::NoOnDeviceModel { locale } => format!(
                 "on-device speech recognition for {locale} is not on this {noun} — {download}; keeper never sends your voice to a server"
             ),
-            Self::NoOnDeviceRecognition { locale } => format!(
-                "speech recognition for {locale} cannot run on this {noun} itself, only through a server, and keeper never sends your voice to a server — downloading a language does not change that"
+            Self::NoOnDeviceRecognition { locale, on_device } if on_device.is_empty() => format!(
+                "this {noun} has no on-device speech recognition for {locale} or for any other language, and keeper never sends your voice to a server — {download}, which may add it"
+            ),
+            Self::NoOnDeviceRecognition { locale, on_device } => format!(
+                "this {noun} has no on-device speech recognition for {locale}, and keeper never sends your voice to a server — {download}, which may add it, or choose a language this {noun} can already run on its own: {}",
+                on_device.join(", ")
             ),
             Self::NoMicrophone => "no microphone is available on this device".to_owned(),
             Self::NoRecognizer => format!(
@@ -163,10 +180,12 @@ impl VoiceUnavailable {
                 locale: locale.clone(),
                 message,
             },
-            Self::NoOnDeviceRecognition { locale } => VoiceUnavailableVm::NoOnDeviceRecognition {
-                locale: locale.clone(),
-                message,
-            },
+            Self::NoOnDeviceRecognition { locale, .. } => {
+                VoiceUnavailableVm::NoOnDeviceRecognition {
+                    locale: locale.clone(),
+                    message,
+                }
+            }
             Self::NoMicrophone => VoiceUnavailableVm::NoMicrophone { message },
             Self::NoRecognizer => VoiceUnavailableVm::NoRecognizer { message },
             Self::Unsupported => VoiceUnavailableVm::Unsupported { message },
@@ -188,7 +207,10 @@ pub type EventSink = Arc<dyn Fn(TurnEvent) + Send + Sync>;
 /// A port names the platform it runs on ([`VoicePort::platform`]), and that
 /// is required rather than defaulted: a default would be a platform nobody
 /// named, and the whole of Story 63.3 is that the differences between the
-/// platforms are named, not discovered (AD-175).
+/// platforms are named, not discovered (AD-175). The two locale methods are
+/// required for the same reason: a port that defaulted to "no locale can
+/// run here" or that silently ignored the person's choice would be a port
+/// nobody noticed was wrong.
 ///
 /// A port reports back through the [`EventSink`] it was constructed with:
 /// [`TurnEvent::PartialHeard`] and [`TurnEvent::FinalHeard`] from
@@ -204,6 +226,19 @@ pub trait VoicePort: Send + Sync {
 
     /// Whether listening and speaking can work right now, and if not, why.
     fn availability(&self) -> Result<(), VoiceUnavailable>;
+
+    /// The locales this device can recognise on its own, and the system's,
+    /// as the OS spells them ([`locale::DeviceLocales`]). Enumerating them
+    /// means constructing one recogniser per supported locale — measured
+    /// at 0.41 s for 63 on a Mac — so a port answers from a cache it fills
+    /// once, not per probe.
+    fn locales(&self) -> locale::DeviceLocales;
+
+    /// Record the person's choice of locale (`bots.voice_locale`; `None` is
+    /// "choose for me"). The port hands it to [`locale::choose`] with its
+    /// own enumeration before every availability probe and every request,
+    /// and builds the recogniser for the answer; it decides nothing itself.
+    fn set_locale(&self, requested: Option<String>);
 
     /// Open the microphone and start (or restart) recognition on a fresh
     /// request. `wake` is a vocabulary hint for the recogniser — the phrase's

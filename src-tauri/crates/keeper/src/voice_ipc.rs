@@ -41,7 +41,7 @@ use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use keeper_core::voice::EventSink;
 use keeper_core::voice::{
-    silence_budget, ConsentPort, Turn, TurnEvent, VoicePort, WakePhrase, LISTENING_LIMITS,
+    locale, silence_budget, ConsentPort, Turn, TurnEvent, VoicePort, WakePhrase, LISTENING_LIMITS,
 };
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
 use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
@@ -156,6 +156,12 @@ impl VoicePort for AbsentPort {
     fn availability(&self) -> Result<(), VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
     }
+    /// No recogniser, so no locale runs and no system locale is worth
+    /// naming: the surface this feeds is absent on this target (AD-179).
+    fn locales(&self) -> locale::DeviceLocales {
+        locale::DeviceLocales::default()
+    }
+    fn set_locale(&self, _requested: Option<String>) {}
     fn start_listening(&self, _wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
     }
@@ -329,17 +335,77 @@ pub fn voice_stop_speaking() -> Result<(), IpcError> {
     Ok(())
 }
 
+/// Hand the persisted locale choice to the port (Epic 63), so its next
+/// availability probe and request run `keeper_core::voice::locale::choose`
+/// over it. Called once at boot from `lib.rs` — the port is process-wide
+/// and `voice_availability` takes no state — and again by
+/// [`voice_locale_set`] after a change. No decision here: the port asks
+/// core which locale the answer is.
+pub fn load_locale(data_dir: &std::path::Path) {
+    match registry::get_bots_voice_locale(data_dir) {
+        Ok(requested) => {
+            tracing::info!(?requested, "voice: locale choice loaded");
+            voice().port.set_locale(requested);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "voice: could not read bots.voice_locale; choosing for the person");
+            voice().port.set_locale(None);
+        }
+    }
+}
+
+/// The wake VM as persisted plus what the port knows about locales: the
+/// one in force is core's answer, the list is the port's cache.
+fn wake_vm(
+    data_dir: &std::path::Path,
+    enabled: bool,
+    phrase: String,
+    port: &dyn VoicePort,
+) -> Result<VoiceWakeVm, IpcError> {
+    let locale_chosen = registry::get_bots_voice_locale(data_dir).map_err(to_ipc_error)?;
+    let locale::DeviceLocales { system, on_device } = port.locales();
+    Ok(VoiceWakeVm {
+        enabled,
+        phrase,
+        limits: LISTENING_LIMITS.to_owned(),
+        locale: locale::in_force(locale_chosen.as_deref(), &system, &on_device),
+        locale_chosen,
+        on_device_locales: on_device,
+    })
+}
+
 /// The wake switch and phrase as persisted (FR-404, FR-405), with the
-/// sentence about what listening costs (FR-406). Reads only: whether the
-/// device is open is the turn's, streamed over the watcher.
+/// sentence about what listening costs (FR-406) and the recogniser's
+/// language (Epic 63). Reads only: whether the device is open is the
+/// turn's, streamed over the watcher.
 #[tauri::command]
 pub fn voice_wake_get(state: State<'_, AppState>) -> Result<VoiceWakeVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    Ok(VoiceWakeVm {
-        enabled: registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?,
-        phrase: registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?,
-        limits: LISTENING_LIMITS.to_owned(),
-    })
+    let enabled = registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
+    let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
+    let port = Arc::clone(&voice().port);
+    wake_vm(&data_dir, enabled, phrase, port.as_ref())
+}
+
+/// Arm or disarm the turn for `wake` and carry the effects out on the port.
+/// A port that refuses to open for the phrase is reported through the turn,
+/// which releases whatever was half-opened; the choice itself stays
+/// recorded.
+fn arm(voice: &mut Voice, wake: Option<WakePhrase>) {
+    let effects = voice.turn.set_wake(wake);
+    let port = Arc::clone(&voice.port);
+    if let Err(why) = keeper_core::voice::perform(&effects, port.as_ref(), voice.turn.wake()) {
+        let recovery = voice.turn.drive(
+            TurnEvent::Failed(why.message(&port.platform())),
+            port.as_ref(),
+        );
+        tracing::warn!(
+            ?why,
+            ?recovery,
+            "voice: the port refused to listen for the phrase"
+        );
+    }
+    after_change(voice);
 }
 
 /// Set the wake switch and phrase (FR-404, FR-405): validate the phrase with
@@ -357,27 +423,41 @@ pub fn voice_wake_set(
     registry::set_bots_wake_phrase(&data_dir, phrase.trim()).map_err(to_ipc_error)?;
     registry::set_bots_wake_enabled(&data_dir, enabled).map_err(to_ipc_error)?;
     let mut voice = voice();
-    let effects = voice.turn.set_wake(enabled.then_some(parsed));
+    arm(&mut voice, enabled.then_some(parsed));
     let port = Arc::clone(&voice.port);
-    if let Err(why) = keeper_core::voice::perform(&effects, port.as_ref(), voice.turn.wake()) {
-        // The choice is recorded; the device refused to open for it. Say so
-        // through the turn, which releases whatever was half-opened.
-        let recovery = voice.turn.drive(
-            TurnEvent::Failed(why.message(&port.platform())),
-            port.as_ref(),
-        );
-        tracing::warn!(
-            ?why,
-            ?recovery,
-            "voice: the port refused to listen for the phrase"
-        );
+    wake_vm(&data_dir, enabled, phrase.trim().to_owned(), port.as_ref())
+}
+
+/// Choose the recogniser's language (Epic 63): `None` is "choose for me".
+/// Persisted as given and handed to the port, which asks
+/// `keeper_core::voice::locale::choose` whether it can run here — a
+/// language that cannot is recorded and refused, never silently replaced
+/// by one that can, and the refusal names the ones that can. While the
+/// phrase is armed, listening is re-armed so the new language takes effect
+/// on the next request rather than the next launch. Returns the wake VM,
+/// whose `locale` is the one now in force.
+#[tauri::command]
+pub fn voice_locale_set(
+    state: State<'_, AppState>,
+    locale: Option<String>,
+) -> Result<VoiceWakeVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let requested = locale
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned);
+    registry::set_bots_voice_locale(&data_dir, requested.as_deref()).map_err(to_ipc_error)?;
+    let mut voice = voice();
+    voice.port.set_locale(requested);
+    let armed = voice.turn.wake().cloned();
+    if armed.is_some() {
+        arm(&mut voice, armed);
     }
-    after_change(&mut voice);
-    Ok(VoiceWakeVm {
-        enabled,
-        phrase: phrase.trim().to_owned(),
-        limits: LISTENING_LIMITS.to_owned(),
-    })
+    let enabled = registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
+    let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
+    let port = Arc::clone(&voice.port);
+    wake_vm(&data_dir, enabled, phrase, port.as_ref())
 }
 
 /// Ask for the recogniser and the microphone, by name, once, with the reason

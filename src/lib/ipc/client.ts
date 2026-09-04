@@ -7263,6 +7263,21 @@ export async function voiceWakeSet(enabled: boolean, phrase: string): Promise<Vo
 }
 
 /**
+ * Choose the language the recogniser listens in (Epic 63): one of
+ * `VoiceWakeVm.onDeviceLocales`, or `null` to persist "choose for me" —
+ * the system language when it can run on this device, otherwise a refusal
+ * naming the languages that can. Which locale is in force is decided in
+ * `keeper_core::voice`, never here; the fresh {@link VoiceWakeVm} says what
+ * was chosen. Recognition stays on this device whatever is chosen: nothing
+ * here can reach a server.
+ *
+ * Rejects with: `internal`.
+ */
+export async function voiceLocaleSet(locale: string | null): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_locale_set", { locale });
+}
+
+/**
  * Ask for the recogniser and the microphone, by name, once (FR-408, Story
  * 62.6). Called from the first deliberate voice act — the mic control, the
  * wake switch — and never at launch. Resolves `null` when both are granted,

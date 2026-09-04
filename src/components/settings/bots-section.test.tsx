@@ -28,10 +28,14 @@
  * - **The wake switch lives here on the Mac** (Epic 63, Story 63.5, AD-179):
  *   present on `voice_availability`'s answer alone — absent for `unsupported`,
  *   drawn for a real availability — with no capability flag consulted.
+ * - **The language control is reached through Settings on the phone tier**
+ *   (Epic 63): the same section, the phone's capability mirror, and the list
+ *   the device reported — so a Polish phone with English assets can pick
+ *   English here as well as in the sheet.
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
+import { VOICE_LOCALE_LABEL, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
 import {
   BOTS_ADD_BOT_LABEL,
   BOTS_ADD_PROVIDER_LABEL,
@@ -146,7 +150,14 @@ beforeEach(() => {
     kind: "unsupported",
     message: "voice is not available in this build",
   });
-  voiceWakeGet.mockResolvedValue({ enabled: false, phrase: "hey nixie", limits: "limits" });
+  voiceWakeGet.mockResolvedValue({
+    enabled: false,
+    phrase: "hey nixie",
+    limits: "limits",
+    locale: "en-US",
+    localeChosen: null,
+    onDeviceLocales: ["en-US"],
+  });
   voiceStore.setState({ state: null, unavailable: undefined, wake: null });
   capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
 });
@@ -185,6 +196,16 @@ describe("BotsSection", () => {
     expect(screen.getByDisplayValue("hey nixie")).toBeInTheDocument();
     // Nothing was streamed: Settings reads the facts and opens no watcher.
     expect(voiceStore.getState().state).toBeNull();
+  });
+
+  it("reaches the language control through Settings on the phone tier (Epic 63)", async () => {
+    voiceAvailability.mockResolvedValue(null);
+    // The phone's mirror: it can talk to a model and cannot reach the drive.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    render(<BotsSection open />);
+    const control = await screen.findByRole("combobox", { name: VOICE_LOCALE_LABEL });
+    expect(control).toHaveValue("");
+    expect(screen.getByRole("option", { name: /en-US/ })).toBeInTheDocument();
   });
 
   it("does not draw the wake switch before voice_availability has answered", () => {

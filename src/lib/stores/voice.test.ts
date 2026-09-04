@@ -10,6 +10,9 @@ const WAKE = {
   enabled: false,
   phrase: "nixie",
   limits: "what listening costs",
+  locale: "en-US",
+  localeChosen: null,
+  onDeviceLocales: ["en-US"],
 };
 
 afterEach(() => {

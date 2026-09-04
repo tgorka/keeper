@@ -20,7 +20,20 @@
  * is a prompt: the switch stays and the sentence beside it says what to
  * allow (asking by name is 62.6's, FR-408). `noOnDeviceModel` names the
  * language to download and says why keeper will not use a server instead;
- * `noMicrophone` says so. Each sentence is Rust's, rendered from the payload.
+ * `noOnDeviceRecognition` says the language has no on-device asset here and
+ * names the ones that do; `noMicrophone` says so. Each sentence is Rust's,
+ * rendered from the payload.
+ *
+ * # The language (Epic 63)
+ *
+ * Recognition runs on this device and nowhere else, so the language control
+ * offers exactly `VoiceWakeVm.onDeviceLocales` — what this device can run
+ * itself, probed by the port — plus "Choose for me", which is the setting
+ * unset and the system language in force when it can run here. A phone set
+ * to Polish whose only on-device asset is English is the case this exists
+ * for: the control must not offer Polish, and the refusal Rust sends for the
+ * system language sits beside the control that fixes it. An empty list is an
+ * AD-27 absence — no control — and the availability sentence explains.
  *
  * # Nothing here decides
  *
@@ -47,7 +60,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { voiceAuthorize, voiceWakeSet } from "@/lib/ipc/client";
+import { voiceAuthorize, voiceAvailability, voiceLocaleSet, voiceWakeSet } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { isListening, useVoiceStore, voiceStore } from "@/lib/stores/voice";
@@ -65,6 +78,37 @@ export function wakeListeningLabel(phrase: string | null): string {
 }
 /** When a write failed for a reason that was not the phrase. */
 const WAKE_WRITE_FAILED = "Could not save the wake phrase.";
+/** The language control's label. */
+export const VOICE_LOCALE_LABEL = "Language";
+/** The option for the setting unset: the system language when it runs here. */
+export const VOICE_LOCALE_AUTO_LABEL = "Choose for me";
+/** What the list is, and is not. */
+export const VOICE_LOCALE_NOTE =
+  "Recognition runs on this device only, so these are the languages it can run itself — not every language the model understands.";
+/** When the language could not be written. */
+const VOICE_LOCALE_WRITE_FAILED = "Could not save the language.";
+
+/** English names for the identifiers the port reports; the identifier is
+ *  kept beside the name because it is what the OS's own download list shows. */
+const LOCALE_NAMES = new Intl.DisplayNames(["en"], { type: "language", fallback: "none" });
+
+/** `en-US` → `American English (en-US)`; an identifier no name is known for
+ *  is shown as it is. `_` is the OS's own spelling of the system locale. */
+export function voiceLocaleName(locale: string): string {
+  const tag = locale.replace("_", "-");
+  let name: string | undefined;
+  try {
+    name = LOCALE_NAMES.of(tag);
+  } catch {
+    name = undefined;
+  }
+  return name === undefined || name === tag ? locale : `${name} (${locale})`;
+}
+
+/** The sentence naming the language in force. */
+export function voiceListeningIn(locale: string): string {
+  return `Listens in ${voiceLocaleName(locale)}.`;
+}
 
 /**
  * The wake phrase band. Absent, or the switch with its chip and sentence.
@@ -79,6 +123,7 @@ export function BotVoiceWake({ className }: { className?: string } = {}) {
   const state = useVoiceStore((s) => s.state);
   const switchId = useId();
   const phraseId = useId();
+  const localeId = useId();
   /** The box's contents: what the person is typing, seeded from what Rust
    *  holds. Reseeded whenever Rust's answer changes, so a save that came
    *  back normalised or a read that arrived late lands in the box. */
@@ -124,6 +169,27 @@ export function BotVoiceWake({ className }: { className?: string } = {}) {
       })
       .finally(() => setBusy(false));
   };
+
+  const chooseLocale = (locale: string | null) => {
+    setBusy(true);
+    // The locale in force is Rust's answer, and so is whether it can run
+    // here: availability is asked again after the write, because "choose
+    // for me" on a phone whose system language has no on-device asset is
+    // exactly the refusal this control exists to show beside itself.
+    void voiceLocaleSet(locale)
+      .then((next) => {
+        voiceStore.getState().applyWake(next);
+        setRefusal(null);
+        return voiceAvailability();
+      })
+      .then((unavailable) => voiceStore.getState().applyAvailability(unavailable))
+      .catch((raw: unknown) => {
+        setRefusal(syncErrorMessage(raw, VOICE_LOCALE_WRITE_FAILED));
+      })
+      .finally(() => setBusy(false));
+  };
+
+  const localeRefused = unavailable !== null && "locale" in unavailable;
 
   const listening = isListening(state);
   const listeningFor = state?.kind === "idle" ? state.wake : null;
@@ -179,6 +245,37 @@ export function BotVoiceWake({ className }: { className?: string } = {}) {
           {WAKE_SAVE_LABEL}
         </Button>
       </form>
+      {wake.onDeviceLocales.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-2">
+            <Label htmlFor={localeId} className="min-w-0 flex-1">
+              {VOICE_LOCALE_LABEL}
+            </Label>
+            <select
+              id={localeId}
+              // `""` is the setting unset: a `<select>`'s value is always a
+              // string, and `null` would come back as the word "null".
+              value={wake.localeChosen ?? ""}
+              disabled={busy}
+              onChange={(event) =>
+                chooseLocale(event.target.value === "" ? null : event.target.value)
+              }
+              className="h-9 max-w-64 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <option value="">{VOICE_LOCALE_AUTO_LABEL}</option>
+              {wake.onDeviceLocales.map((locale) => (
+                <option key={locale} value={locale}>
+                  {voiceLocaleName(locale)}
+                </option>
+              ))}
+            </select>
+          </div>
+          {/* Not while Rust refuses the language in force: "listens in
+              Polish" beside "Polish has no on-device asset" is the lie. */}
+          {!localeRefused && <p className="text-xs">{voiceListeningIn(wake.locale)}</p>}
+          <p className="text-muted-foreground text-xs">{VOICE_LOCALE_NOTE}</p>
+        </div>
+      )}
       {refusal !== null && (
         <p role="alert" className="text-destructive text-xs">
           {refusal}

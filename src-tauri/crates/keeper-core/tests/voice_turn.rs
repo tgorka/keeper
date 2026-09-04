@@ -52,6 +52,10 @@ impl VoicePort for FakePort {
     fn availability(&self) -> Result<(), VoiceUnavailable> {
         Ok(())
     }
+    fn locales(&self) -> keeper_core::voice::locale::DeviceLocales {
+        keeper_core::voice::locale::DeviceLocales::default()
+    }
+    fn set_locale(&self, _requested: Option<String>) {}
     fn start_listening(&self, wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
         self.record(Call::Start(wake.map(|w| w.as_str().to_owned())));
         self.refuse_start.clone().map_or(Ok(()), Err)

@@ -7044,14 +7044,17 @@ pub enum VoiceUnavailableVm {
         /// Which language to download, and where.
         message: String,
     },
-    /// The recogniser for the locale cannot run on the device at all
-    /// (`supportsOnDeviceRecognition == false`), and keeper refuses the
-    /// server fallback (NFR-50). Kept apart from `noOnDeviceModel`: no
-    /// download changes this one.
+    /// The recogniser for the locale reports no on-device recognition
+    /// (`supportsOnDeviceRecognition == false`) — the OS has no on-device
+    /// asset for that language — and keeper refuses the server fallback
+    /// (NFR-50). Kept apart from `noOnDeviceModel`: the download may add
+    /// the asset rather than will, and the sentence also names the
+    /// languages this device can already run, which `VoiceWakeVm`'s
+    /// `onDeviceLocales` carries for a picker.
     NoOnDeviceRecognition {
-        /// The locale identifier the recogniser was asked for.
+        /// The locale identifier that was asked for, canonical (`pl-PL`).
         locale: String,
-        /// The sentence, saying why no download helps.
+        /// The sentence: the two ways out, and the languages that can run.
         message: String,
     },
     /// The device has no audio input.
@@ -7074,12 +7077,16 @@ pub enum VoiceUnavailableVm {
     },
 }
 
-/// The wake phrase's switch and words (Epic 62, Story 62.5, FR-404–FR-406),
-/// from `voice_wake_get` and back from `voice_wake_set`.
+/// The wake phrase's switch and words (Epic 62, Story 62.5, FR-404–FR-406)
+/// and the recogniser's language (Epic 63), from `voice_wake_get` and back
+/// from `voice_wake_set` and `voice_locale_set`.
 ///
 /// `limits` is `keeper_core::voice::LISTENING_LIMITS` carried to the surface
 /// rather than retyped there: the sentence beside the switch is decided once,
-/// in core, and the webview only renders it.
+/// in core, and the webview only renders it. `locale` is
+/// `keeper_core::voice::locale::in_force`'s answer and `on_device_locales`
+/// is the port's enumeration, so the picker offers only languages that run
+/// here and shows which one is in force even when the setting is unset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -7090,6 +7097,14 @@ pub struct VoiceWakeVm {
     pub phrase: String,
     /// What armed listening does and does not do on this phone.
     pub limits: String,
+    /// The locale the recogniser runs in, or — when the choice is refused —
+    /// the one that was asked for, canonical (`en-US`).
+    pub locale: String,
+    /// `bots.voice_locale` as stored; `None` means "choose for me".
+    pub locale_chosen: Option<String>,
+    /// Every locale this device can recognise on its own, sorted by
+    /// identifier; empty when none can.
+    pub on_device_locales: Vec<String>,
 }
 
 #[cfg(test)]

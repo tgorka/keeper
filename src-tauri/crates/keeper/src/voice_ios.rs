@@ -6,11 +6,23 @@
 //! # On the device or not at all (FR-402, NFR-50)
 //!
 //! Every recognition request sets `requiresOnDeviceRecognition = true`, and
-//! [`availability`] refuses with [`VoiceUnavailable::NoOnDeviceModel`] when
-//! the locale's recogniser reports `supportsOnDeviceRecognition == false`.
-//! There is no server path in this file: no request without the flag, no
-//! retry without it, no fallback. `docs/egress.md` names every destination
-//! keeper contacts, and Apple's speech servers are not on it.
+//! [`Worker::availability`] refuses before any request is built when the
+//! chosen locale's recogniser cannot work on this phone. There is no server
+//! path in this file: no request without the flag, no retry without it, no
+//! fallback. `docs/egress.md` names every destination keeper contacts, and
+//! Apple's speech servers are not on it.
+//!
+//! # Which language (Epic 63)
+//!
+//! The same shape as `voice_macos.rs`: the port enumerates
+//! `supportedLocales()` once, classifies each by
+//! `supportsOnDeviceRecognition` (cached — it costs a recogniser per
+//! locale — and refreshed when the person changes the choice), and hands
+//! that list, the system locale and `bots.voice_locale` (via
+//! [`VoicePort::set_locale`]) to `keeper_core::voice::locale::choose`, which
+//! answers the locale to build the recogniser for or the refusal to show.
+//! A Polish-language phone whose only on-device models are English is not
+//! dead: the person is told which languages run here and can choose one.
 //!
 //! # One thread owns the frameworks
 //!
@@ -87,8 +99,9 @@
 //! [`ConsentPort`] is the second port this type implements: it reads what
 //! the OS recorded and shows one dialog at a time. *When* to ask is
 //! `keeper_core::voice::authorization`; this file never decides it, and
-//! [`availability`] never prompts. The dialogs need the main thread free, so
-//! the command that triggers them is `async` and this worker blocks instead.
+//! [`Worker::availability`] never prompts. The dialogs need the main thread
+//! free, so the command that triggers them is `async` and this worker blocks
+//! instead.
 //!
 //! # `unsafe`
 //!
@@ -114,6 +127,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
+use keeper_core::voice::locale::{self, DeviceLocales};
 use keeper_core::voice::{
     Ask, Consent, ConsentPort, EventSink, Permission, TurnEvent, VoicePlatform, VoicePort,
     VoiceUnavailable, WakePhrase,
@@ -175,6 +189,9 @@ const ROLL_FAILURES_TOLERATED: u32 = 3;
 /// What the command layer asks the worker to do.
 enum Command {
     Availability(SyncSender<Result<(), VoiceUnavailable>>),
+    Locales(SyncSender<DeviceLocales>),
+    /// The person's choice of locale; `None` is "choose for me".
+    SetLocale(Option<String>),
     Consent(SyncSender<Result<Consent, VoiceUnavailable>>),
     Ask {
         ask: Ask,
@@ -264,6 +281,14 @@ impl VoicePort for IosVoicePort {
     fn availability(&self) -> Result<(), VoiceUnavailable> {
         self.ask(Command::Availability)
             .unwrap_or(Err(VoiceUnavailable::Unsupported))
+    }
+
+    fn locales(&self) -> DeviceLocales {
+        self.ask(Command::Locales).unwrap_or_default()
+    }
+
+    fn set_locale(&self, requested: Option<String>) {
+        self.tell(Command::SetLocale(requested));
     }
 
     fn start_listening(&self, wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
@@ -356,6 +381,14 @@ struct Worker {
     suspended: Option<Instant>,
     /// Fresh requests that failed to start since the last that worked.
     failed_starts: u32,
+    /// The person's choice of locale (`bots.voice_locale`); `None` is
+    /// "choose for me". Handed to `locale::choose` with `locales`.
+    requested: Option<String>,
+    /// The enumeration of `supportedLocales()` by on-device support, filled
+    /// on first need and refreshed on `SetLocale` — a deliberate act, and
+    /// the moment a language the person just added to Dictation would be
+    /// looked for. Never per probe.
+    locales: Option<DeviceLocales>,
     /// The session observers, removed when the worker ends.
     session_observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
 }
@@ -376,6 +409,8 @@ impl Worker {
             speaking_since: None,
             suspended: None,
             failed_starts: 0,
+            requested: None,
+            locales: None,
             session_observers,
         }
     }
@@ -386,7 +421,15 @@ impl Worker {
         loop {
             match inbox.recv_timeout(SPEAK_POLL) {
                 Ok(Command::Availability(reply)) => {
-                    let _ = reply.send(availability());
+                    let _ = reply.send(self.availability());
+                }
+                Ok(Command::Locales(reply)) => {
+                    let _ = reply.send(self.locales().clone());
+                }
+                Ok(Command::SetLocale(requested)) => {
+                    tracing::info!(?requested, "voice: locale choice set; re-enumerating");
+                    self.requested = requested;
+                    self.locales = None;
                 }
                 Ok(Command::Consent(reply)) => {
                     let _ = reply.send(recognizer_class().map(|()| Consent {
@@ -429,7 +472,7 @@ impl Worker {
     /// arrives when the interruption ends. Only what the person must act on
     /// (authorisation, a missing model, no microphone at all) is refused.
     fn start(&mut self, hints: Vec<String>) -> Result<(), VoiceUnavailable> {
-        availability()?;
+        self.availability()?;
         self.wanted = Some(hints);
         self.failed_starts = 0;
         match self.arm() {
@@ -438,6 +481,74 @@ impl Worker {
                 tracing::warn!(%error, "voice: the capture did not start; will retry");
                 self.suspend();
                 Ok(())
+            }
+        }
+    }
+
+    /// What this phone knows about locales, from the cache or by
+    /// enumerating once. A build without the recogniser class enumerates
+    /// nothing and reports the system locale only; `availability` names
+    /// that defect itself.
+    fn locales(&mut self) -> &DeviceLocales {
+        self.locales.get_or_insert_with(|| {
+            let on_device = match recognizer_class() {
+                Ok(()) => on_device_locales(),
+                Err(_) => Vec::new(),
+            };
+            let locales = DeviceLocales {
+                system: system_locale(),
+                on_device,
+            };
+            tracing::info!(
+                system = %locales.system,
+                on_device = ?locales.on_device,
+                "voice: on-device locales enumerated"
+            );
+            locales
+        })
+    }
+
+    /// The locale to build the recogniser for, or the refusal — core's
+    /// answer over the person's choice and this phone's enumeration.
+    fn chosen(&mut self) -> Result<String, VoiceUnavailable> {
+        let requested = self.requested.clone();
+        let locales = self.locales();
+        locale::choose(requested.as_deref(), &locales.system, &locales.on_device)
+    }
+
+    /// Whether listening and speaking can work right now (FR-402).
+    ///
+    /// Order: the recogniser class itself, then authorisation (both the
+    /// recogniser's and the microphone's), then an input route, then the
+    /// chosen locale — `keeper_core::voice::locale::choose` over the cache —
+    /// and a recogniser for it that can work on the device now.
+    /// `NotDetermined` is `NotAuthorized`: this function never prompts —
+    /// asking is [`ConsentPort`]'s, decided by
+    /// `keeper_core::voice::authorization` (FR-408).
+    fn availability(&mut self) -> Result<(), VoiceUnavailable> {
+        recognizer_class()?;
+        if speech_authorization() != SFSpeechRecognizerAuthorizationStatus::Authorized {
+            return Err(VoiceUnavailable::NotAuthorized);
+        }
+        match microphone() {
+            Microphone::Absent => return Err(VoiceUnavailable::NoMicrophone),
+            Microphone::NotAuthorized => return Err(VoiceUnavailable::NotAuthorized),
+            Microphone::Ready => {}
+        }
+        let chosen = self.chosen()?;
+        match recognizer_for(&locale_named(&chosen)) {
+            Recognizer::Ready(_) => Ok(()),
+            Recognizer::NoModel => Err(VoiceUnavailable::NoOnDeviceModel { locale: chosen }),
+            Recognizer::Absent | Recognizer::ServerOnly => {
+                // The cache said this locale could run and the framework
+                // now says otherwise: the enumeration is stale. Refresh it
+                // and refuse with what is true now.
+                self.locales = None;
+                let on_device = self.locales().on_device.clone();
+                Err(VoiceUnavailable::NoOnDeviceRecognition {
+                    locale: chosen,
+                    on_device,
+                })
             }
         }
     }
@@ -485,6 +596,9 @@ impl Worker {
     /// Replace the current request with a fresh one on the same capture.
     fn roll_request(&mut self) -> Result<(), String> {
         self.end_recognition();
+        let chosen = self
+            .chosen()
+            .map_err(|why| why.message(&VoicePlatform::IOS))?;
         let Some(capture) = &self.capture else {
             return Err("no capture to roll on".to_owned());
         };
@@ -492,7 +606,14 @@ impl Worker {
         let serial = self.current.load(Ordering::SeqCst);
         let last_heard = Arc::new(AtomicU64::new(self.millis()));
         let handler = self.result_handler(serial, Arc::clone(&last_heard));
-        match start_request(&hints, &handler, &capture.slot, serial, last_heard) {
+        match start_request(
+            &locale_named(&chosen),
+            &hints,
+            &handler,
+            &capture.slot,
+            serial,
+            last_heard,
+        ) {
             Ok(recognition) => {
                 self.recognition = Some(recognition);
                 self.failed_starts = 0;
@@ -780,32 +901,6 @@ const DUCKING: AVAudioSessionCategoryOptions = AVAudioSessionCategoryOptions::Du
 // The FFI, one function per concern.
 // ---------------------------------------------------------------------------
 
-/// Whether listening and speaking can work right now (FR-402).
-///
-/// Order: the recogniser class itself, then authorisation (both the
-/// recogniser's and the microphone's), then an input route, then a
-/// recogniser for the current locale that can work on the device.
-/// `NotDetermined` is `NotAuthorized`: this function never prompts — asking
-/// is [`ConsentPort`]'s, decided by `keeper_core::voice::authorization`
-/// (FR-408).
-fn availability() -> Result<(), VoiceUnavailable> {
-    recognizer_class()?;
-    if speech_authorization() != SFSpeechRecognizerAuthorizationStatus::Authorized {
-        return Err(VoiceUnavailable::NotAuthorized);
-    }
-    match microphone() {
-        Microphone::Absent => return Err(VoiceUnavailable::NoMicrophone),
-        Microphone::NotAuthorized => return Err(VoiceUnavailable::NotAuthorized),
-        Microphone::Ready => {}
-    }
-    let locale = NSLocale::currentLocale();
-    let identifier = locale.localeIdentifier().to_string();
-    match on_device_recognizer(&locale) {
-        Some(_) => Ok(()),
-        None => Err(VoiceUnavailable::NoOnDeviceModel { locale: identifier }),
-    }
-}
-
 /// Whether `SFSpeechRecognizer` is registered in this process at all.
 ///
 /// objc2 reaches the class by name at run time, and `objc2-speech`'s
@@ -944,22 +1039,91 @@ fn ask_microphone() -> Permission {
     }
 }
 
-/// A recogniser for `locale` that can work without the network, or `None`.
+/// What the framework has for a locale.
+enum Recognizer {
+    /// No recogniser at all: the locale is not in `supportedLocales`.
+    Absent,
+    /// A recogniser that reports `supportsOnDeviceRecognition == false`:
+    /// the OS has no on-device asset for the language. Adding the language
+    /// under Settings > General > Keyboard > Dictation Languages may change
+    /// that; the enumeration is refreshed when the person changes the
+    /// choice.
+    ServerOnly,
+    /// A recogniser that can run on this phone but is not available right
+    /// now (`isAvailable == false`).
+    NoModel,
+    /// A recogniser that can work now, without the network.
+    Ready(Retained<SFSpeechRecognizer>),
+}
+
+/// The system locale as the OS spells it (`en_US`, an underscore — the
+/// framework's own list says `en-US`; `keeper_core::voice::locale`
+/// normalises the two before comparing them).
+fn system_locale() -> String {
+    NSLocale::currentLocale().localeIdentifier().to_string()
+}
+
+/// An `NSLocale` for an identifier from the enumeration or the setting.
+/// `+[NSLocale localeWithLocaleIdentifier:]` accepts both separators.
+fn locale_named(identifier: &str) -> Retained<NSLocale> {
+    NSLocale::localeWithLocaleIdentifier(&NSString::from_str(identifier))
+}
+
+/// Every locale in `supportedLocales()` whose recogniser can run on this
+/// phone, as the framework spells them, sorted by identifier. A locale
+/// whose model is merely not downloaded yet (`isAvailable == false`) is in
+/// the list: it can run here, and `availability` names the download.
+///
+/// Constructs one recogniser per supported locale, so the caller caches
+/// the answer.
 #[allow(unsafe_code)]
-fn on_device_recognizer(locale: &NSLocale) -> Option<Retained<SFSpeechRecognizer>> {
+fn on_device_locales() -> Vec<String> {
+    // SAFETY: `+[SFSpeechRecognizer supportedLocales]` returns a set the
+    // binding retains; `allObjects` copies it into an array the binding
+    // also retains, and `to_vec` retains each element before the array is
+    // released. Neither prompts nor touches the network: Apple documents
+    // the set as static — the locales the keyboard's dictation supports.
+    // Classifying each is `recognizer_for`, whose contract is its own.
+    let supported = unsafe { SFSpeechRecognizer::supportedLocales() };
+    let mut locales: Vec<String> = supported
+        .allObjects()
+        .to_vec()
+        .iter()
+        .filter(|locale| {
+            matches!(
+                recognizer_for(locale),
+                Recognizer::Ready(_) | Recognizer::NoModel
+            )
+        })
+        .map(|locale| locale.localeIdentifier().to_string())
+        .collect();
+    locales.sort_unstable();
+    locales
+}
+
+/// The recogniser for `locale`, classified for the absences the sentences
+/// name.
+#[allow(unsafe_code)]
+fn recognizer_for(locale: &NSLocale) -> Recognizer {
     // SAFETY: `-[SFSpeechRecognizer initWithLocale:]` consumes the fresh
     // allocation and returns nil when the locale has no recogniser, which
-    // objc2 surfaces as `None`. `supportsOnDeviceRecognition` is a read-only
-    // property on the retained object. Neither prompts nor touches the
-    // network: Apple documents the property as the precondition a request's
-    // `requiresOnDeviceRecognition` needs to be honoured.
-    let recognizer =
-        unsafe { SFSpeechRecognizer::initWithLocale(SFSpeechRecognizer::alloc(), locale) }?;
-    if unsafe { recognizer.supportsOnDeviceRecognition() } {
-        Some(recognizer)
-    } else {
-        None
+    // objc2 surfaces as `None`. `supportsOnDeviceRecognition` and
+    // `isAvailable` are read-only properties on the retained object. None
+    // prompts or touches the network: Apple documents the first property as
+    // the precondition a request's `requiresOnDeviceRecognition` needs to be
+    // honoured, and the second as whether the recogniser can be used now.
+    let Some(recognizer) =
+        (unsafe { SFSpeechRecognizer::initWithLocale(SFSpeechRecognizer::alloc(), locale) })
+    else {
+        return Recognizer::Absent;
+    };
+    if !unsafe { recognizer.supportsOnDeviceRecognition() } {
+        return Recognizer::ServerOnly;
     }
+    if !unsafe { recognizer.isAvailable() } {
+        return Recognizer::NoModel;
+    }
+    Recognizer::Ready(recognizer)
 }
 
 /// Put the shared session in `.playAndRecord` with `options` and activate
@@ -1119,10 +1283,12 @@ fn engine_running(engine: &AVAudioEngine) -> bool {
     unsafe { engine.isRunning() }
 }
 
-/// Start a fresh on-device recognition request on `slot`, and the task that
-/// answers it through `handler`.
+/// Start a fresh on-device recognition request on `slot` for `locale` —
+/// the one `keeper_core::voice::locale::choose` answered, never the
+/// system's — and the task that answers it through `handler`.
 #[allow(unsafe_code)]
 fn start_request(
+    locale: &NSLocale,
     hints: &[String],
     handler: &RcBlock<dyn Fn(*mut SFSpeechRecognitionResult, *mut NSError)>,
     slot: &RequestSlot,
@@ -1137,9 +1303,12 @@ fn start_request(
     // request in the slot before the task exists means the first buffers
     // reach it, which Apple permits (audio may be appended before the task
     // starts).
-    let locale = NSLocale::currentLocale();
-    let recognizer = on_device_recognizer(&locale)
-        .ok_or_else(|| format!("no on-device recogniser for {}", locale.localeIdentifier()))?;
+    let Recognizer::Ready(recognizer) = recognizer_for(locale) else {
+        return Err(format!(
+            "no on-device recogniser for {}",
+            locale.localeIdentifier()
+        ));
+    };
     let request = unsafe { SFSpeechAudioBufferRecognitionRequest::new() };
     unsafe { request.setRequiresOnDeviceRecognition(true) };
     unsafe { request.setShouldReportPartialResults(true) };

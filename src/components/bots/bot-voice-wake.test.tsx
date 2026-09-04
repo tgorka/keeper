@@ -17,14 +17,24 @@
  *    sentence saying what to allow.
  * 6. **The section is absent where `capabilities.bots` is off**, and while the
  *    availability question has not been answered.
+ * 7. **The language control (Epic 63)** — offers exactly what the device can
+ *    run on-device plus "Choose for me", sends the choice (or `null`) through
+ *    Rust and re-asks availability; is absent on an empty list with Rust's
+ *    sentence explaining; shows the language in force whether the setting
+ *    is unset or explicit, and withholds it while Rust refuses that language.
  */
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BotVoiceWake,
+  VOICE_LOCALE_AUTO_LABEL,
+  VOICE_LOCALE_LABEL,
+  VOICE_LOCALE_NOTE,
+  voiceListeningIn,
+  voiceLocaleName,
   WAKE_PHRASE_LABEL,
   WAKE_SAVE_LABEL,
   WAKE_SWITCH_LABEL,
@@ -36,12 +46,16 @@ import { voiceStore } from "@/lib/stores/voice";
 
 const voiceWakeSet = vi.fn<(enabled: boolean, phrase: string) => Promise<VoiceWakeVm>>();
 const voiceAuthorize = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
+const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
+const voiceLocaleSet = vi.fn<(locale: string | null) => Promise<VoiceWakeVm>>();
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
     ...actual,
     voiceWakeSet: (enabled: boolean, phrase: string) => voiceWakeSet(enabled, phrase),
     voiceAuthorize: () => voiceAuthorize(),
+    voiceAvailability: () => voiceAvailability(),
+    voiceLocaleSet: (locale: string | null) => voiceLocaleSet(locale),
   };
 });
 
@@ -59,8 +73,17 @@ function rustLimits(): string {
 }
 
 const LIMITS = rustLimits();
-const OFF: VoiceWakeVm = { enabled: false, phrase: "nixie", limits: LIMITS };
-const ON: VoiceWakeVm = { enabled: true, phrase: "nixie", limits: LIMITS };
+/** hesperia's real answer: four English variants and nothing else. */
+const ON_DEVICE = ["en-ID", "en-PH", "en-SA", "en-US"];
+const OFF: VoiceWakeVm = {
+  enabled: false,
+  phrase: "nixie",
+  limits: LIMITS,
+  locale: "en-US",
+  localeChosen: null,
+  onDeviceLocales: ON_DEVICE,
+};
+const ON: VoiceWakeVm = { ...OFF, enabled: true };
 const IDLE_ARMED: VoiceStateVm = { kind: "idle", wake: "nixie", listeningForWake: true };
 const IDLE_RELEASED: VoiceStateVm = { kind: "idle", wake: null, listeningForWake: false };
 const NOT_AUTHORIZED: VoiceUnavailableVm = {
@@ -70,6 +93,13 @@ const NOT_AUTHORIZED: VoiceUnavailableVm = {
 const UNSUPPORTED: VoiceUnavailableVm = {
   kind: "unsupported",
   message: "voice is not available in this build",
+};
+/** The owner's case: a Polish phone whose on-device assets are English. */
+const POLISH_REFUSED: VoiceUnavailableVm = {
+  kind: "noOnDeviceRecognition",
+  locale: "pl-PL",
+  message:
+    "speech recognition for pl-PL has no on-device asset on this phone — downloading it under Settings > General > Keyboard > Dictation Languages may add one, or choose en-ID, en-PH, en-SA or en-US",
 };
 
 function seed(
@@ -95,7 +125,10 @@ function seed(
 beforeEach(() => {
   voiceWakeSet.mockReset();
   voiceAuthorize.mockReset();
+  voiceAvailability.mockReset();
+  voiceLocaleSet.mockReset();
   voiceAuthorize.mockResolvedValue(null);
+  voiceAvailability.mockResolvedValue(null);
   voiceStore.setState({ state: null, unavailable: undefined, wake: null });
   capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
 });
@@ -243,5 +276,127 @@ describe("BotVoiceWake — the chip and the sentence", () => {
       expect(LIMITS).toContain(fact);
     }
     expect(LIMITS).not.toMatch(/not yet|for now|coming|later/);
+  });
+});
+
+describe("BotVoiceWake — the language", () => {
+  const control = () => screen.getByRole("combobox", { name: VOICE_LOCALE_LABEL });
+
+  it("offers exactly the on-device languages plus Choose for me, and sends a choice through Rust", async () => {
+    seed();
+    const chosen: VoiceWakeVm = { ...OFF, locale: "en-PH", localeChosen: "en-PH" };
+    voiceLocaleSet.mockResolvedValue(chosen);
+    render(<BotVoiceWake />);
+    const options = within(control()).getAllByRole("option");
+    expect(options.map((option) => option.textContent)).toEqual([
+      VOICE_LOCALE_AUTO_LABEL,
+      ...ON_DEVICE.map(voiceLocaleName),
+    ]);
+    expect(options.map((option) => (option as HTMLOptionElement).value)).toEqual([
+      "",
+      ...ON_DEVICE,
+    ]);
+    // Polish is not on the list, and no option claims it.
+    expect(screen.queryByRole("option", { name: /Polish|pl-PL/ })).toBeNull();
+    fireEvent.change(control(), { target: { value: "en-PH" } });
+    await waitFor(() => expect(voiceLocaleSet).toHaveBeenCalledWith("en-PH"));
+    await waitFor(() => expect(voiceStore.getState().wake).toEqual(chosen));
+    expect(control()).toHaveValue("en-PH");
+    // Availability is asked again: whether the language in force runs here
+    // is Rust's answer, refreshed after every write.
+    await waitFor(() => expect(voiceAvailability).toHaveBeenCalledTimes(1));
+  });
+
+  it("sends null for Choose for me, and shows the refusal Rust then gives beside the control", async () => {
+    seed({ wake: { ...OFF, locale: "en-US", localeChosen: "en-US" } });
+    voiceLocaleSet.mockResolvedValue({ ...OFF, locale: "pl-PL", localeChosen: null });
+    voiceAvailability.mockResolvedValue(POLISH_REFUSED);
+    render(<BotVoiceWake />);
+    expect(control()).toHaveValue("en-US");
+    fireEvent.change(control(), { target: { value: "" } });
+    await waitFor(() => expect(voiceLocaleSet).toHaveBeenCalledWith(null));
+    expect(await screen.findByRole("status")).toHaveTextContent(POLISH_REFUSED.message);
+    expect(control()).toHaveValue("");
+    // No "listens in Polish" beside a sentence saying Polish cannot run here.
+    expect(screen.queryByText(voiceListeningIn("pl-PL"))).toBeNull();
+  });
+
+  it("is absent — no control, no note — on an empty list, and Rust's sentence explains", () => {
+    const none: VoiceUnavailableVm = {
+      kind: "noOnDeviceRecognition",
+      locale: "pl-PL",
+      message:
+        "speech recognition for pl-PL has no on-device asset on this phone — no language on this phone can run locally right now",
+    };
+    seed({ wake: { ...OFF, locale: "pl-PL", onDeviceLocales: [] }, unavailable: none });
+    render(<BotVoiceWake />);
+    expect(screen.queryByRole("combobox", { name: VOICE_LOCALE_LABEL })).toBeNull();
+    expect(screen.queryByText(VOICE_LOCALE_NOTE)).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(none.message);
+    // The wake switch is still there: the refusal is a state, not absence.
+    expect(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL })).toBeInTheDocument();
+  });
+
+  it("offers a list of one as a control, not as absence", () => {
+    seed({ wake: { ...OFF, onDeviceLocales: ["en-US"] } });
+    render(<BotVoiceWake />);
+    expect(within(control()).getAllByRole("option")).toHaveLength(2);
+  });
+
+  it("shows the language in force as Choose for me while the setting is unset", () => {
+    seed();
+    render(<BotVoiceWake />);
+    expect(control()).toHaveValue("");
+    expect(control()).toHaveDisplayValue(VOICE_LOCALE_AUTO_LABEL);
+    expect(screen.getByText(voiceListeningIn("en-US"))).toBeInTheDocument();
+    expect(voiceListeningIn("en-US")).toBe("Listens in American English (en-US).");
+  });
+
+  it("shows the explicit language when the setting is set", () => {
+    seed({ wake: { ...OFF, locale: "en-SA", localeChosen: "en-SA" } });
+    render(<BotVoiceWake />);
+    expect(control()).toHaveValue("en-SA");
+    expect(control()).toHaveDisplayValue(voiceLocaleName("en-SA"));
+    expect(screen.getByText(voiceListeningIn("en-SA"))).toBeInTheDocument();
+  });
+
+  it("keeps the refusal and its remedy beside the control that fixes it", () => {
+    seed({ wake: { ...OFF, locale: "pl-PL" }, unavailable: POLISH_REFUSED });
+    render(<BotVoiceWake />);
+    const section = screen.getByRole("region", { name: WAKE_PHRASE_LABEL });
+    expect(section).toContainElement(control());
+    expect(within(section).getByRole("status")).toHaveTextContent(POLISH_REFUSED.message);
+    expect(screen.queryByText(voiceListeningIn("pl-PL"))).toBeNull();
+  });
+
+  it("says what the list is: this device's own languages, not the model's", () => {
+    seed();
+    render(<BotVoiceWake />);
+    expect(screen.getByText(VOICE_LOCALE_NOTE)).toBeInTheDocument();
+    expect(VOICE_LOCALE_NOTE).toMatch(/on this device only/);
+    expect(VOICE_LOCALE_NOTE).toMatch(/not every language the model understands/);
+  });
+
+  it("a refused write renders Rust's sentence and leaves the choice where Rust left it", async () => {
+    seed();
+    voiceLocaleSet.mockRejectedValue({
+      code: "internal",
+      message: "pl-PL cannot run on this phone — choose one of the languages listed",
+      accountId: null,
+      retriable: false,
+    });
+    render(<BotVoiceWake />);
+    fireEvent.change(control(), { target: { value: "en-US" } });
+    expect(await screen.findByRole("alert")).toHaveTextContent(/cannot run on this phone/);
+    expect(control()).toHaveValue("");
+    expect(voiceAvailability).not.toHaveBeenCalled();
+  });
+
+  it("names an unfamiliar identifier as it is, and an OS-spelled one by its language", () => {
+    expect(voiceLocaleName("zz-ZZ")).toBe("zz-ZZ");
+    expect(voiceLocaleName("en_US")).toBe("American English (en_US)");
+    // The region stays: en-ID, en-PH and en-SA are four English entries.
+    expect(voiceLocaleName("pl-PL")).toBe("Polish (Poland) (pl-PL)");
+    expect(voiceLocaleName("en-PH")).toBe("English (Philippines) (en-PH)");
   });
 });

@@ -354,6 +354,10 @@ mod tests {
         fn availability(&self) -> Result<(), VoiceUnavailable> {
             Ok(())
         }
+        fn locales(&self) -> crate::voice::locale::DeviceLocales {
+            crate::voice::locale::DeviceLocales::default()
+        }
+        fn set_locale(&self, _requested: Option<String>) {}
         fn start_listening(&self, _wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
             self.opened.fetch_add(1, Ordering::SeqCst);
             Ok(())

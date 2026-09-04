@@ -396,6 +396,11 @@ pub fn run() {
                         tracing::error!(%error, "config.json: import failed; file skipped");
                     }
                 }
+                // The voice recogniser's language (Epic 63): the port is
+                // process-wide and `voice_availability` takes no state, so
+                // the persisted choice reaches it here, once, before any
+                // surface or the tray asks.
+                voice_ipc::load_locale(&data_dir);
             }
 
             // Forward every incoming `keeper://` deep link: `keeper://voice/talk`
@@ -851,6 +856,8 @@ pub fn run() {
                 voice_ipc::voice_watch,
                 voice_ipc::voice_unwatch,
                 voice_ipc::voice_wake_get,
+                // Epic 63: the recogniser's language, chosen from what runs on the device.
+                voice_ipc::voice_locale_set,
                 // Story 62.6: the two permission dialogs, on the first deliberate act.
                 voice_ipc::voice_authorize,
                 // Story 63.5: the voice hotkey's binding, for Settings.

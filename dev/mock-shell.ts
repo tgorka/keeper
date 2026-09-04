@@ -86,6 +86,7 @@ import type {
   TaskSchedulePreviewVm,
   TaskVm,
   VoiceStateVm,
+  VoiceUnavailableVm,
   VoiceWakeVm,
 } from "@/lib/ipc/client";
 
@@ -2680,6 +2681,47 @@ const BOT_AUDIT: BotAuditRowVm[] = [
 let botMessageDetails = false;
 
 /**
+ * Which languages the faked device can recognise on-device (Epic 63): three
+ * states, chosen with `?voice=many|one|none` on the dev URL, because the
+ * surface has to be looked at in each — a list to choose from, a list of one,
+ * and the absence with Rust's refusal explaining it. `many` is the default.
+ * The hesperia probe found exactly four on a stock Mac, none of them Polish.
+ */
+const VOICE_ON_DEVICE_LOCALES: Record<string, string[]> = {
+  many: ["en-ID", "en-PH", "en-SA", "en-US"],
+  one: ["en-US"],
+  none: [],
+};
+const voiceOnDeviceLocales =
+  VOICE_ON_DEVICE_LOCALES[new URLSearchParams(window.location.search).get("voice") ?? "many"] ??
+  VOICE_ON_DEVICE_LOCALES.many;
+/** The faked system language: Polish, the owner's own phone. */
+const VOICE_SYSTEM_LOCALE = "pl-PL";
+
+/** Why the faked device cannot listen, or `null`. The language in force is
+ *  the explicit setting when set, else the system language — in force even
+ *  when refused, which is the owner's case: a Polish phone is never silently
+ *  switched to English; the refusal names the list and the picker beside it
+ *  is how English gets chosen. The sentence is Rust's own shape for the
+ *  iPhone (`keeper_core::voice`; the noun and the download path are the
+ *  platform's). */
+function voiceUnavailable(): VoiceUnavailableVm | null {
+  const locale = voiceWake.locale;
+  if (voiceOnDeviceLocales.includes(locale)) {
+    return null;
+  }
+  const remedy =
+    voiceOnDeviceLocales.length === 0
+      ? `which may add it for ${locale} or for any other language`
+      : `which may add it, or choose a language this iPhone can already run on its own: ${voiceOnDeviceLocales.join(", ")}`;
+  return {
+    kind: "noOnDeviceRecognition",
+    locale,
+    message: `this iPhone has no on-device speech recognition for ${locale}, and keeper never sends your voice to a server — download that language under Settings > General > Keyboard > Dictation Languages, ${remedy}`,
+  };
+}
+
+/**
  * Story 62.5's wake phrase, faked. The switch starts off and the phrase is the
  * shipped default, and both round-trip, because the flow worth looking at is
  * turning listening on and watching the chip appear. `voice_availability`
@@ -2691,6 +2733,9 @@ let voiceWake: VoiceWakeVm = {
   phrase: "nixie",
   limits:
     "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. It stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit. The microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
+  locale: VOICE_SYSTEM_LOCALE,
+  localeChosen: null,
+  onDeviceLocales: voiceOnDeviceLocales,
 };
 /** The one watcher, so `voice_wake_set` can push the new idle snapshot. */
 let voiceWatcher: MockChannel<VoiceStateVm> | null = null;
@@ -3018,7 +3063,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     return null;
   },
   // --- Voice (Epic 62, Story 62.5) ----------------------------------------
-  voice_availability: () => null,
+  voice_availability: () => voiceUnavailable(),
   voice_watch: (payload) => {
     voiceWatcher = payload.channel as MockChannel<VoiceStateVm>;
     voiceWatchSerial += 1;
@@ -3046,6 +3091,19 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     }
     voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase };
     voiceWatcher?.onmessage?.(voiceIdle());
+    return voiceWake;
+  },
+  voice_locale_set: (payload) => {
+    const chosen = typeof payload.locale === "string" ? payload.locale : null;
+    if (chosen !== null && !voiceOnDeviceLocales.includes(chosen)) {
+      throw {
+        code: "internal",
+        message: `${chosen} cannot run on this phone — choose one of the languages listed`,
+        accountId: null,
+        retriable: false,
+      };
+    }
+    voiceWake = { ...voiceWake, localeChosen: chosen, locale: chosen ?? VOICE_SYSTEM_LOCALE };
     return voiceWake;
   },
   // --- Voice, the talk mode (Epic 62, Story 62.6) --------------------------

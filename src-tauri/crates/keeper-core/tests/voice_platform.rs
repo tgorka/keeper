@@ -51,6 +51,10 @@ impl VoicePort for FakePort {
     fn availability(&self) -> Result<(), VoiceUnavailable> {
         Ok(())
     }
+    fn locales(&self) -> keeper_core::voice::locale::DeviceLocales {
+        keeper_core::voice::locale::DeviceLocales::default()
+    }
+    fn set_locale(&self, _requested: Option<String>) {}
     fn start_listening(&self, _wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
         self.record(Call::Start);
         Ok(())
@@ -291,8 +295,13 @@ fn no_model(locale: &str) -> VoiceUnavailable {
 }
 
 fn no_recognition(locale: &str) -> VoiceUnavailable {
+    no_recognition_with(locale, &["en-ID", "en-PH", "en-SA", "en-US"])
+}
+
+fn no_recognition_with(locale: &str, on_device: &[&str]) -> VoiceUnavailable {
     VoiceUnavailable::NoOnDeviceRecognition {
         locale: locale.to_owned(),
+        on_device: on_device.iter().map(|id| (*id).to_owned()).collect(),
     }
 }
 
@@ -339,8 +348,12 @@ fn voice_macos_sentences_name_the_mac_and_its_settings() {
         "on-device speech recognition for pl_PL is not on this Mac — turn Dictation on and download that language under System Settings > Keyboard > Dictation; keeper never sends your voice to a server"
     );
     assert_eq!(
-        no_recognition("pl_PL").message(&mac),
-        "speech recognition for pl_PL cannot run on this Mac itself, only through a server, and keeper never sends your voice to a server — downloading a language does not change that"
+        no_recognition("pl-PL").message(&mac),
+        "this Mac has no on-device speech recognition for pl-PL, and keeper never sends your voice to a server — turn Dictation on and download that language under System Settings > Keyboard > Dictation, which may add it, or choose a language this Mac can already run on its own: en-ID, en-PH, en-SA, en-US"
+    );
+    assert_eq!(
+        no_recognition_with("pl-PL", &[]).message(&mac),
+        "this Mac has no on-device speech recognition for pl-PL or for any other language, and keeper never sends your voice to a server — turn Dictation on and download that language under System Settings > Keyboard > Dictation, which may add it"
     );
     assert_eq!(
         VoiceUnavailable::NoMicrophone.message(&mac),
@@ -371,42 +384,68 @@ fn voice_macos_sentences_name_the_mac_and_its_settings() {
 }
 
 /// The two "no on-device model" causes are distinct absences: one sends the
-/// person to a download, the other says a download changes nothing. Neither
-/// offers a server, on either platform.
+/// person to a download that will add the model, the other says the OS has
+/// no on-device asset for the language — the download *may* add one, and
+/// the languages this device can already run are named so the person can
+/// pick one instead. Neither offers a server, on either platform, and
+/// neither claims a certainty the evidence does not give: the old sentence
+/// said "downloading a language does not change that", which the OS's own
+/// log ("No Assistant asset for language pl-PL") does not support.
 #[test]
 fn voice_no_on_device_recognition_is_distinct_from_no_model() {
     for platform in [VoicePlatform::IOS, VoicePlatform::MACOS] {
-        let download = no_model("pl_PL").message(&platform);
-        let never = no_recognition("pl_PL").message(&platform);
-        assert_ne!(download, never);
+        let download = no_model("pl-PL").message(&platform);
+        let asset = no_recognition("pl-PL").message(&platform);
+        assert_ne!(download, asset);
         assert!(download.contains("download that language"), "{download}");
-        assert!(!never.contains("download that language"), "{never}");
-        assert!(
-            never.contains("downloading a language does not change that"),
-            "{never}"
-        );
-        for message in [&download, &never] {
-            assert!(message.contains("pl_PL"), "{message}");
+        assert!(asset.contains("download that language"), "{asset}");
+        assert!(asset.contains("which may add it"), "{asset}");
+        assert!(!asset.contains("does not change"), "{asset}");
+        assert!(!asset.contains("only through a server"), "{asset}");
+        for message in [&download, &asset] {
+            assert!(message.contains("pl-PL"), "{message}");
             assert!(
                 message.contains("keeper never sends your voice to a server"),
                 "{message}"
             );
         }
     }
-    match no_recognition("pl_PL").vm(&VoicePlatform::MACOS) {
+    match no_recognition("pl-PL").vm(&VoicePlatform::MACOS) {
         VoiceUnavailableVm::NoOnDeviceRecognition { locale, message } => {
-            assert_eq!(locale, "pl_PL");
+            assert_eq!(locale, "pl-PL");
             assert_eq!(
                 message,
-                no_recognition("pl_PL").message(&VoicePlatform::MACOS)
+                no_recognition("pl-PL").message(&VoicePlatform::MACOS)
             );
         }
         other => panic!("{other:?}"),
     }
     assert!(matches!(
-        no_model("pl_PL").vm(&VoicePlatform::MACOS),
+        no_model("pl-PL").vm(&VoicePlatform::MACOS),
         VoiceUnavailableVm::NoOnDeviceModel { .. }
     ));
+}
+
+/// The refusal for a language that cannot run names every language that
+/// can, in the port's order, on every platform — and when none can, says
+/// so instead of offering an empty choice.
+#[test]
+fn voice_no_on_device_recognition_names_the_languages_that_can_run() {
+    for platform in [
+        VoicePlatform::IOS,
+        VoicePlatform::MACOS,
+        VoicePlatform::ABSENT,
+    ] {
+        let message = no_recognition("pl-PL").message(&platform);
+        assert!(
+            message.ends_with("can already run on its own: en-ID, en-PH, en-SA, en-US"),
+            "{message}"
+        );
+        let none = no_recognition_with("pl-PL", &[]).message(&platform);
+        assert!(none.contains("or for any other language"), "{none}");
+        assert!(!none.contains("choose a language"), "{none}");
+        assert!(!none.contains(':'), "{none}");
+    }
 }
 
 /// No sentence exists twice: a platform contributes nouns, and the words
@@ -468,6 +507,10 @@ fn voice_turn_failure_reason_uses_the_turn_platform() {
         fn availability(&self) -> Result<(), VoiceUnavailable> {
             Ok(())
         }
+        fn locales(&self) -> keeper_core::voice::locale::DeviceLocales {
+            keeper_core::voice::locale::DeviceLocales::default()
+        }
+        fn set_locale(&self, _requested: Option<String>) {}
         fn start_listening(&self, _wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
             Err(VoiceUnavailable::NotAuthorized)
         }

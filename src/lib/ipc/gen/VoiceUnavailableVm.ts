@@ -23,11 +23,11 @@ locale: string,
  */
 message: string, } | { "kind": "noOnDeviceRecognition", 
 /**
- * The locale identifier the recogniser was asked for.
+ * The locale identifier that was asked for, canonical (`pl-PL`).
  */
 locale: string, 
 /**
- * The sentence, saying why no download helps.
+ * The sentence: the two ways out, and the languages that can run.
  */
 message: string, } | { "kind": "noMicrophone", 
 /**

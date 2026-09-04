@@ -824,6 +824,35 @@ pub fn set_bots_wake_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreErr
     set_setting(data_dir, BOTS_WAKE_PHRASE_KEY, phrase)
 }
 
+/// The `settings` key holding the recogniser's language (Epic 63). Absent or
+/// blank = "choose for me": `keeper_core::voice::locale::choose` takes the
+/// system locale when it can run on the device and the first that can
+/// otherwise. Stored as typed (`pl-PL` or `pl_PL`); the comparison that
+/// matters normalises, so the table never needs to.
+const BOTS_VOICE_LOCALE_KEY: &str = "bots.voice_locale";
+
+/// Read the chosen recogniser language (Epic 63). Absent or blank ⇒ `None`,
+/// "choose for me".
+pub fn get_bots_voice_locale(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, BOTS_VOICE_LOCALE_KEY)?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Write the chosen recogniser language (Epic 63): `None` clears the choice
+/// back to "choose for me". Stored trimmed under `bots.voice_locale`; whether
+/// the locale can run here is `keeper_core::voice::locale::choose`'s answer,
+/// given to the caller before this is reached, and a locale that cannot is
+/// still stored — the person's choice is recorded and refused, not silently
+/// replaced.
+pub fn set_bots_voice_locale(data_dir: &Path, locale: Option<&str>) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        BOTS_VOICE_LOCALE_KEY,
+        locale.map(str::trim).unwrap_or_default(),
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -4029,6 +4058,27 @@ mod tests {
         assert_eq!(
             get_bots_wake_phrase(&dir).expect("read blank"),
             crate::voice::DEFAULT_WAKE_PHRASE
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bots_voice_locale_defaults_to_unset_and_clears_to_unset() {
+        let dir = temp_dir();
+        // Absent ⇒ "choose for me".
+        assert_eq!(get_bots_voice_locale(&dir).expect("read default"), None);
+        set_bots_voice_locale(&dir, Some(" pl_PL ")).expect("write");
+        // Trimmed, otherwise as typed: the comparison normalises, the table
+        // does not.
+        assert_eq!(
+            get_bots_voice_locale(&dir).expect("read back"),
+            Some("pl_PL".to_owned())
+        );
+        set_bots_voice_locale(&dir, None).expect("clear");
+        assert_eq!(get_bots_voice_locale(&dir).expect("read cleared"), None);
+        assert_eq!(
+            get_setting(&dir, "bots.voice_locale").expect("read raw"),
+            Some(String::new())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
