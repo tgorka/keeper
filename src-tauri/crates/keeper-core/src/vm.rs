@@ -6980,7 +6980,14 @@ impl BotDeliverableVm {
 /// are the machine's, and `idle` adds what the surface must say about the
 /// microphone while no turn runs — which phrase is set, and whether the
 /// device is open for it (FR-405: visible whenever it listens).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+///
+/// Since Epic 64 (Story 64.3, AD-186) the states with the microphone open for
+/// a turn carry `level`: the input level in `0.0..=1.0` as
+/// `keeper_core::voice::level::Meter` smoothed and rate-limited it, or `None`
+/// where the port has not measured one — before the first buffer, and on a
+/// port that has no meter. A snapshot with a level is streamed at most ~25
+/// times a second and only while the level changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
@@ -6999,14 +7006,22 @@ pub enum VoiceStateVm {
     Listening {
         /// The interim transcript as it forms (Story 62.6 shows it).
         heard: String,
+        /// The input level, `0.0..=1.0`, or `None` where unmeasured.
+        level: Option<f32>,
     },
     /// The final transcript, handed to the conversation.
     Heard {
         /// What was said.
         text: String,
+        /// The input level, `0.0..=1.0`, or `None` where unmeasured.
+        level: Option<f32>,
     },
     /// The message is with the model.
-    Sending,
+    Sending {
+        /// Whether the first piece of the answer has arrived: `false` is a
+        /// model thinking, `true` one that has begun to answer (AD-186).
+        answering: bool,
+    },
     /// The answer is being read aloud.
     Speaking,
     /// The turn ended on an error.
@@ -7068,6 +7083,15 @@ pub enum VoiceUnavailableVm {
     /// so an inert voice feature never reads as an absent one.
     NoRecognizer {
         /// The sentence, naming the build problem.
+        message: String,
+    },
+    /// This device has no synthesiser voice for the language the answer is
+    /// in (Epic 64, AD-182); the answer stays on screen and the sentence
+    /// names where a voice is downloaded.
+    NoVoice {
+        /// The language subtag the answer was detected in (e.g. `pl`).
+        language: String,
+        /// The sentence.
         message: String,
     },
     /// This build has no voice port (every platform but iOS today).

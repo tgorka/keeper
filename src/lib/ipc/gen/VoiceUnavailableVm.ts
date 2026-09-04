@@ -37,6 +37,14 @@ message: string, } | { "kind": "noRecognizer",
 /**
  * The sentence, naming the build problem.
  */
+message: string, } | { "kind": "noVoice", 
+/**
+ * The language subtag the answer was detected in (e.g. `pl`).
+ */
+language: string, 
+/**
+ * The sentence.
+ */
 message: string, } | { "kind": "unsupported", 
 /**
  * The sentence.

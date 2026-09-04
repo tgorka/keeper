@@ -76,8 +76,10 @@ pub fn same(a: &str, b: &str) -> bool {
 }
 
 /// The language subtag of `id` — `en` of `en_US` — for the same-language
-/// preference. Lowercased, so `EN-us` and `en-GB` share one.
-fn language(id: &str) -> String {
+/// preference here and for [`super::speech`], whose detected languages and
+/// voice languages meet at the subtag. Lowercased, so `EN-us` and `en-GB`
+/// share one.
+pub fn language(id: &str) -> String {
     id.trim()
         .split(['_', '-'])
         .next()

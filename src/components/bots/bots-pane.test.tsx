@@ -22,6 +22,11 @@
  *    jsdom performs no layout, so the pixels were measured on Chrome through
  *    `dev/mock-shell.ts` and the block at the end guards the decisions those
  *    pixels were measured over.
+ * 6. **The voice block folds to one line by default** (Story 64.1, AD-184) —
+ *    where voice is available the pane shows the line and no control, one
+ *    click unfolds the block, and the fold survives a remount through the
+ *    pane's own cookie — the mount point's `hydrateBotsPaneFold`, which a
+ *    store-level test cannot see (DW-172).
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -36,6 +41,7 @@ import { BOTS_EMPTY_COPY } from "@/components/bots/bot-empty-state";
 import { GRANT_ADD_LABEL, GRANT_NONE_HELD } from "@/components/bots/bot-grant-bar";
 import { BOT_PARTIAL_CAPTION, BOT_RETRY_LABEL } from "@/components/bots/bot-message";
 import { BOT_SESSION_NEW_LABEL } from "@/components/bots/bot-session-list";
+import { voiceFoldedLine, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
 import {
   BOTS_PANE_TITLE,
   BOTS_RAIL_LIST_LABEL,
@@ -56,8 +62,11 @@ import type {
   BotSessionVm,
   BotStreamEvent,
   BotVm,
+  VoiceUnavailableVm,
+  VoiceWakeVm,
 } from "@/lib/ipc/client";
 import { botsStore } from "@/lib/stores/bots";
+import { BOTS_PANE_FOLD_COOKIE, resetBotsPaneFoldForTest } from "@/lib/stores/bots-pane-fold";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { resetColumnFoldForTest } from "@/lib/stores/column-fold";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -65,6 +74,10 @@ import { primaryViewStore } from "@/lib/stores/primary-view";
 const botsChatStop = vi.fn();
 const botsApprovalAnswer = vi.fn();
 const botsGrantsList = vi.fn();
+/** The two voice facts (Story 64.1). Unanswered — rejected — by default, so
+ *  the block is absent in every test that is not about it. */
+const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
+const voiceWakeGet = vi.fn<() => Promise<VoiceWakeVm>>();
 /** The event sink the pane handed to `botsChatSend`, so the test can drive the
  *  stream exactly as Rust would. */
 let sink: ((event: BotStreamEvent) => void) | null = null;
@@ -105,6 +118,10 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
       botsGrantsList();
       return Promise.resolve({ grants: [], unknown: [] });
     },
+    voiceAvailability: () => voiceAvailability(),
+    voiceWakeGet: () => voiceWakeGet(),
+    voiceWatch: () => Promise.reject(new Error("not used")),
+    voiceUnwatch: () => Promise.resolve(),
   };
 });
 
@@ -210,6 +227,10 @@ beforeEach(() => {
   botsChatStop.mockClear();
   botsApprovalAnswer.mockClear();
   botsGrantsList.mockClear();
+  voiceAvailability.mockReset();
+  voiceWakeGet.mockReset();
+  voiceAvailability.mockRejectedValue(new Error("not used"));
+  voiceWakeGet.mockRejectedValue(new Error("not used"));
   botsStore.getState().reset();
   capabilitiesStore.getState().applySnapshot(WITH_BOTS);
 });
@@ -219,6 +240,9 @@ afterEach(() => {
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   botsStore.getState().reset();
   resetColumnFoldForTest();
+  resetBotsPaneFoldForTest();
+  // biome-ignore lint/suspicious/noDocumentCookie: clearing the fold this suite wrote
+  document.cookie = `${BOTS_PANE_FOLD_COOKIE}=; path=/; max-age=0`;
 });
 
 describe("the Bots surface's capability gate", () => {
@@ -654,5 +678,96 @@ describe("the Bots pane's layout contract", () => {
     );
     expect(rail[0]).toMatch(new RegExp(`^${BOTS_RAIL_LIST_LABEL}, .*conversations`));
     expect(rail).toContain(BOT_SESSION_NEW_LABEL);
+  });
+});
+
+/**
+ * The voice block, folded (Story 64.1, FR-427, FR-428, AD-184).
+ *
+ * Measured with `dev/measure-bots.ts` on Chrome at 1440×900 over the dev
+ * shell: before, the transcript was 259px of the 872px pane (29.7%) under a
+ * 223px block; folded by default it is 444px (50.9%) under a 39px line. What
+ * jsdom can hold is the structure: the band is `shrink-0` either way, folded
+ * it is a line and no control, and the mount point restores the fold from
+ * the cookie.
+ */
+describe("the Bots pane's voice block folds (Story 64.1)", () => {
+  const WAKE: VoiceWakeVm = {
+    enabled: false,
+    phrase: "nixie",
+    limits: "Listening uses the microphone.",
+    locale: "en-US",
+    localeChosen: null,
+    onDeviceLocales: ["en-US"],
+  };
+  const NOT_AUTHORIZED: VoiceUnavailableVm = {
+    kind: "notAuthorized",
+    message:
+      "keeper is not allowed to use the microphone or speech recognition on this Mac — allow both under System Settings > Privacy & Security",
+  };
+
+  /** The band the pane draws for the voice block: the disclosure's section. */
+  function band(): HTMLElement {
+    const disclosure = screen.getByRole("button", { name: /^(Expand|Collapse) Listening/ });
+    const section = disclosure.closest("section");
+    if (section === null) {
+      throw new Error("the disclosure is not inside its band");
+    }
+    return section;
+  }
+
+  beforeEach(() => {
+    voiceAvailability.mockResolvedValue(NOT_AUTHORIZED);
+    voiceWakeGet.mockResolvedValue(WAKE);
+  });
+
+  it("is one line by default, saying the setting and the refusal, with no control", async () => {
+    render(<BotsPane />);
+    const disclosure = await screen.findByRole("button", {
+      name: `Expand ${voiceFoldedLine(WAKE, NOT_AUTHORIZED)}`,
+    });
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(disclosure).toHaveTextContent(
+      "Listening off · en-US · keeper is not allowed to use the microphone or speech recognition on this Mac",
+    );
+    expect(screen.queryByRole("switch", { name: WAKE_SWITCH_LABEL })).toBeNull();
+
+    // The 61.14 contract with the band present: it sits in the transcript
+    // level, bounded, and the transcript is still the one flexible box.
+    const level = document.querySelector(`[data-slot="${BOTS_TRANSCRIPT_LEVEL_SLOT}"]`);
+    expect(band().parentElement).toBe(level);
+    expect(band()).toHaveClass("shrink-0");
+    const flexible = [...(level as HTMLElement).children].filter((child) =>
+      child.classList.contains("flex-1"),
+    );
+    expect(flexible).toHaveLength(1);
+    expect(flexible[0]).toHaveTextContent(BOTS_EMPTY_COPY["no-conversation"].message);
+  });
+
+  it("unfolds on one click to the whole block, still bounded", async () => {
+    render(<BotsPane />);
+    fireEvent.click(await screen.findByRole("button", { name: /^Expand Listening/ }));
+    expect(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL })).toBeInTheDocument();
+    // Scoped: the composer's own status line is another `status` in the pane.
+    expect(within(band()).getByRole("status")).toHaveTextContent(NOT_AUTHORIZED.message);
+    expect(band()).toHaveClass("shrink-0");
+  });
+
+  it("remembers the unfold across a remount, through the pane's own cookie", async () => {
+    const first = render(<BotsPane />);
+    fireEvent.click(await screen.findByRole("button", { name: /^Expand Listening/ }));
+    expect(document.cookie).toContain(`${BOTS_PANE_FOLD_COOKIE}=${encodeURIComponent("voice:0")}`);
+    first.unmount();
+
+    // A fresh document's store: unhydrated, at its default. Only the pane's
+    // own `hydrateBotsPaneFold` can bring the cookie back, and a pane that
+    // forgot to call it would start folded here.
+    resetBotsPaneFoldForTest();
+    render(<BotsPane />);
+    expect(await screen.findByRole("switch", { name: WAKE_SWITCH_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Collapse Listening/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
   });
 });

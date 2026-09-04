@@ -109,13 +109,14 @@ safe binding. Current inventory:
   `AVAudioSessionInterruptionNotification`, `AVAudioSessionMediaServicesWereResetNotification`
   and `AVAudioEngineConfigurationChangeNotification`, `removeObserver:`) via objc2-speech,
   objc2-avf-audio and objc2-foundation, behind `keeper_core::voice::VoicePort` and
-  `keeper_core::voice::ConsentPort` — twenty-three function-level `#[allow(unsafe_code)]`
+  `keeper_core::voice::ConsentPort` — twenty-seven function-level `#[allow(unsafe_code)]`
   fns in `crates/keeper/src/voice_ios.rs`, one per concern (`speech_authorization`,
   `microphone`, `microphone_consent`, `ask_speech`, `ask_microphone`,
   `on_device_locales`, `recognizer_for`, `configure_session`, `set_session_options`,
   `release_session`, `start_capture`, `stop_capture`, `engine_running`, `start_request`,
   `end_request`, `read_result`, `observe_session`, `interruption_notice`,
-  `forget_observer`, `new_synthesizer`, `speak_text`, `stop_speech`, `is_speaking`), each
+  `forget_observer`, `new_synthesizer`, `voice_languages`, `voice_for_language`,
+  `voice_name`, `detect_language`, `speak_text`, `stop_speech`, `is_speaking`), each
   with a `// SAFETY:` comment citing the Apple contract it relies on. `start_capture`
   also carries `#[allow(clippy::arc_with_non_send_sync)]`: the request slot the audio tap
   reads is shared with the audio thread inside a block, which Rust cannot see — the
@@ -142,12 +143,13 @@ safe binding. Current inventory:
   `AVAudioEngineConfigurationChangeNotification`, `removeObserver:`) and `NSProcessInfo`
   (`endActivity:` for the App Nap assertion; `beginActivityWithOptions:reason:` is a safe
   binding) via objc2-speech, objc2-avf-audio and objc2-foundation, behind
-  `keeper_core::voice::VoicePort` and `keeper_core::voice::ConsentPort` — eighteen
+  `keeper_core::voice::VoicePort` and `keeper_core::voice::ConsentPort` — twenty-two
   function-level `#[allow(unsafe_code)]` fns in `crates/keeper/src/voice_macos.rs`, one per
   concern (`speech_authorization`, `microphone_consent`, `ask_speech`, `ask_microphone`,
   `input_present`, `on_device_locales`, `recognizer_for`, `start_capture`, `stop_capture`,
   `engine_running`, `start_request`, `end_request`, `read_result`, `forget_observer`,
-  `new_synthesizer`, `speak_text`, `stop_speech`, `is_speaking`), each with a `// SAFETY:`
+  `new_synthesizer`, `voice_languages`, `voice_for_language`, `voice_name`,
+  `detect_language`, `speak_text`, `stop_speech`, `is_speaking`), each with a `// SAFETY:`
   comment citing the Apple contract it relies on. `start_capture` also carries
   `#[allow(clippy::arc_with_non_send_sync)]` for the same request slot as the iOS port. No
   `AVAudioSession` call exists in the file — the class does not exist on macOS — so there
@@ -157,3 +159,24 @@ safe binding. Current inventory:
   **Not yet compiled where it was written**: the file was authored on a Linux host and
   gated by `keeper-core`'s platform-neutral voice tests and the on-device source scan;
   its first `cargo clippy --target aarch64-apple-darwin` and first run are on the Mac.
+- Voice selection and on-device language detection, both ports (Epic 64, Story 64.2,
+  FR-429–FR-432, AD-182, AD-183, AD-188): `AVSpeechSynthesisVoice` (`speechVoices` —
+  enumerated once and cached beside the locales, refreshed when the person changes
+  `bots.voice_locale`; 180 voices on hesperia, one Polish — `language`, `name`, and
+  `voiceWithLanguage:`, whose `nil` is refused as `VoiceUnavailable::NoVoice` naming the
+  language and the platform's voice-download page, never a fall-through to the default
+  voice), `AVSpeechUtterance setVoice:` (set on every utterance; no utterance is spoken
+  without an explicit voice), and `NLLanguageRecognizer` (`new`, `setLanguageConstraints:`
+  — the languages this device has voices for plus the listening one, so the answer is
+  classified only among languages it could be spoken in — `processString:`,
+  `dominantLanguage`) via objc2-avf-audio and objc2-natural-language 0.3.2 (`Zlib OR
+  Apache-2.0 OR MIT`, features `NLLanguage` + `NLLanguageRecognizer`, objc2 ≥ 0.6.2,
+  objc2-foundation ^0.3.2), behind `keeper_core::voice::VoicePort::{voices, listening,
+  detect_language, speak}` — the four fns `voice_languages`, `voice_for_language`,
+  `voice_name`, `detect_language` and the changed `speak_text` in each of
+  `voice_macos.rs` and `voice_ios.rs`, counted in the totals above, each with a
+  `// SAFETY:` comment. `NaturalLanguage` is a system framework with no network path:
+  no answer text leaves the device to be classified, and `docs/egress.md` gains no
+  destination. Which voice is used is `keeper_core::voice::speech::choose_voice`'s
+  decision over (detected, listening, voices) — a pure function with a truth table —
+  and the ports only enumerate, detect and obey (AD-183).

@@ -135,6 +135,10 @@ block2 = { workspace = true }
 # voice adds no network destination here either (NFR-53).
 objc2-speech = { workspace = true }
 objc2-avf-audio = { workspace = true }
+# On-device language detection for the answer about to be read aloud (Epic 64,
+# Story 64.2, AD-182, AD-188): `NLLanguageRecognizer`, reached only from
+# `voice_macos.rs`'s audited `detect_language`. No network path.
+objc2-natural-language = { workspace = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = { workspace = true }
@@ -165,4 +169,8 @@ objc2-user-notifications = { workspace = true }
 # tap; 0.6.2 is already in the tree for macOS.
 objc2-speech = { workspace = true }
 objc2-avf-audio = { workspace = true }
+# On-device language detection for the answer about to be read aloud (Epic 64,
+# Story 64.2, AD-182, AD-188): `NLLanguageRecognizer`, reached only from
+# `voice_ios.rs`'s audited `detect_language`. No network path.
+objc2-natural-language = { workspace = true }
 block2 = { workspace = true }

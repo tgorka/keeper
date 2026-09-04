@@ -22,6 +22,11 @@
  *    Rust and re-asks availability; is absent on an empty list with Rust's
  *    sentence explaining; shows the language in force whether the setting
  *    is unset or explicit, and withholds it while Rust refuses that language.
+ * 8. **Folded to one line (Epic 64, Story 64.1, AD-184)** — with a `fold`,
+ *    the block is a disclosure whose label is the truthful line: the switch,
+ *    the phrase and the language live from `VoiceWakeVm`, and the refusal's
+ *    first clause when the port refuses. Folded, no control is in the tree;
+ *    unfolded, the whole block is. Without a `fold` nothing above changes.
  */
 
 import { readFileSync } from "node:fs";
@@ -30,9 +35,11 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BotVoiceWake,
+  VOICE_FOLDED_OFF,
   VOICE_LOCALE_AUTO_LABEL,
   VOICE_LOCALE_LABEL,
   VOICE_LOCALE_NOTE,
+  voiceFoldedLine,
   voiceListeningIn,
   voiceLocaleName,
   WAKE_PHRASE_LABEL,
@@ -245,7 +252,7 @@ describe("BotVoiceWake — the chip and the sentence", () => {
   });
 
   it("keeps the chip during a turn's listening and drops it once the microphone is released", () => {
-    seed({ wake: ON, state: { kind: "listening", heard: "what time" } });
+    seed({ wake: ON, state: { kind: "listening", heard: "what time", level: null } });
     const { rerender } = render(<BotVoiceWake />);
     expect(screen.getByRole("status")).toHaveTextContent(wakeListeningLabel(null));
     voiceStore.getState().applyState({ kind: "speaking" });
@@ -400,5 +407,82 @@ describe("BotVoiceWake — the language", () => {
     // The region stays: en-ID, en-PH and en-SA are four English entries.
     expect(voiceLocaleName("pl-PL")).toBe("Polish (Poland) (pl-PL)");
     expect(voiceLocaleName("en-PH")).toBe("English (Philippines) (en-PH)");
+  });
+});
+
+describe("BotVoiceWake — folded to one line (Story 64.1)", () => {
+  const NO_MICROPHONE: VoiceUnavailableVm = {
+    kind: "noMicrophone",
+    message: "no microphone is available on this device",
+  };
+
+  it("says whether listening is armed, the phrase and the language, from the setting", () => {
+    expect(voiceFoldedLine(ON, null)).toBe('Listening for "nixie" · en-US');
+    expect(voiceFoldedLine(OFF, null)).toBe(`${VOICE_FOLDED_OFF} · en-US`);
+    expect(voiceFoldedLine({ ...OFF, locale: "pl-PL" }, null)).toBe(`${VOICE_FOLDED_OFF} · pl-PL`);
+  });
+
+  it("appends the refusal's first clause, so 'not allowed' is read without unfolding", () => {
+    // Each of Rust's sentences opens with the fact and follows it with the
+    // remedy after a dash, a comma or a semicolon; the remedy is what
+    // unfolding shows. A sentence with no such break is carried whole.
+    expect(voiceFoldedLine(OFF, NOT_AUTHORIZED)).toBe(
+      `${VOICE_FOLDED_OFF} · en-US · keeper is not allowed to use the microphone`,
+    );
+    expect(voiceFoldedLine({ ...OFF, locale: "pl-PL" }, POLISH_REFUSED)).toBe(
+      `${VOICE_FOLDED_OFF} · pl-PL · speech recognition for pl-PL has no on-device asset on this phone`,
+    );
+    expect(voiceFoldedLine(OFF, NO_MICROPHONE)).toBe(
+      `${VOICE_FOLDED_OFF} · en-US · no microphone is available on this device`,
+    );
+  });
+
+  it("folded, draws the line as a collapsed disclosure and no control", () => {
+    seed({ unavailable: NOT_AUTHORIZED });
+    const onToggle = vi.fn();
+    render(<BotVoiceWake fold={{ folded: true, onToggle }} />);
+    const line = voiceFoldedLine(OFF, NOT_AUTHORIZED);
+    const disclosure = screen.getByRole("button", { name: `Expand ${line}` });
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    expect(disclosure).toHaveTextContent(line);
+    // Hidden, not merely small: nothing of the block is reachable folded.
+    expect(screen.queryByRole("switch")).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+    fireEvent.click(disclosure);
+    expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it("unfolded, is the whole block under an expanded disclosure", () => {
+    seed({ unavailable: NOT_AUTHORIZED });
+    render(<BotVoiceWake fold={{ folded: false, onToggle: vi.fn() }} />);
+    expect(screen.getByRole("button", { name: /^Collapse / })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: VOICE_LOCALE_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(NOT_AUTHORIZED.message);
+    expect(screen.getByText(LIMITS)).toBeInTheDocument();
+  });
+
+  it("follows the switch, the phrase and the language live", () => {
+    seed();
+    const { rerender } = render(<BotVoiceWake fold={{ folded: true, onToggle: vi.fn() }} />);
+    expect(screen.getByRole("button")).toHaveTextContent(`${VOICE_FOLDED_OFF} · en-US`);
+    voiceStore.getState().applyWake({ ...ON, phrase: "hej keeper", locale: "en-PH" });
+    rerender(<BotVoiceWake fold={{ folded: true, onToggle: vi.fn() }} />);
+    expect(screen.getByRole("button")).toHaveTextContent('Listening for "hej keeper" · en-PH');
+    voiceStore.getState().applyAvailability(POLISH_REFUSED);
+    rerender(<BotVoiceWake fold={{ folded: true, onToggle: vi.fn() }} />);
+    expect(screen.getByRole("button")).toHaveTextContent(
+      "· speech recognition for pl-PL has no on-device asset on this phone",
+    );
+  });
+
+  it("is still absent where the block is absent", () => {
+    seed({ unavailable: UNSUPPORTED });
+    const { container } = render(<BotVoiceWake fold={{ folded: true, onToggle: vi.fn() }} />);
+    expect(container).toBeEmptyDOMElement();
   });
 });

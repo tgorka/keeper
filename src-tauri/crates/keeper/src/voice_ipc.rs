@@ -41,7 +41,7 @@ use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, 
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use keeper_core::voice::EventSink;
 use keeper_core::voice::{
-    locale, silence_budget, ConsentPort, Turn, TurnEvent, VoicePort, WakePhrase,
+    locale, silence_budget, ConsentPort, Turn, TurnEvent, TurnState, VoicePort, WakePhrase,
 };
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
 use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
@@ -166,7 +166,17 @@ impl VoicePort for AbsentPort {
         Err(VoiceUnavailable::Unsupported)
     }
     fn stop_listening(&self) {}
-    fn speak(&self, _text: &str) -> Result<(), VoiceUnavailable> {
+    /// No synthesiser, so no voice and no language to speak in.
+    fn voices(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn listening(&self) -> String {
+        String::new()
+    }
+    fn detect_language(&self, _text: &str, _constraints: &[String]) -> Option<String> {
+        None
+    }
+    fn speak(&self, _text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
     }
     fn stop_speaking(&self) {}
@@ -191,11 +201,35 @@ fn sink() -> EventSink {
 
 /// Hand a port event to the turn without taking the lock on the caller's
 /// thread.
+///
+/// A [`TurnEvent::Level`] arrives at most ~25 times a second — the port's
+/// `keeper_core::voice::level::Meter` is the limiter, so one spawned task
+/// per reading is the whole cost here and no coalescing is needed. Every
+/// other event is a transition.
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 fn deliver(event: TurnEvent) {
     tauri::async_runtime::spawn(async move {
-        transition(event);
+        match event {
+            TurnEvent::Level(level) => meter(level),
+            event => transition(event),
+        }
     });
+}
+
+/// Record one level reading and stream the snapshot if it changed.
+///
+/// Not a transition: the generation is not bumped and the silence clock is
+/// not touched. A level that moved would otherwise re-arm the
+/// end-of-utterance pause on every reading, and a room with any noise in it
+/// would never let a sentence end.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn meter(level: f32) {
+    let mut voice = voice();
+    let before = voice.turn.level();
+    voice.turn.apply(TurnEvent::Level(level));
+    if voice.turn.level() != before {
+        push(&mut voice);
+    }
 }
 
 /// Apply one event, stream the snapshot, and arm the silence clock.
@@ -205,6 +239,54 @@ fn transition(event: TurnEvent) {
     let effects = voice.turn.drive(event, port.as_ref());
     tracing::debug!(state = ?voice.turn.state(), ?effects, "voice: transition");
     after_change(&mut voice);
+}
+
+/// The request for what the turn heard has left (Story 64.3, AD-186): the
+/// bots adapter calls this as it spawns a turn's driver, whatever started
+/// that turn. Only a turn in `Heard` moves — to `Sending` — so a typed
+/// message leaving while no voice turn runs is nothing here, and nothing is
+/// streamed or re-armed for it.
+pub fn note_sent() {
+    let awaiting = matches!(voice().turn.state(), TurnState::Heard { .. });
+    if awaiting {
+        transition(TurnEvent::Sent);
+    }
+}
+
+/// The first token of the answer arrived (Story 64.3, AD-186): the bots
+/// adapter calls this on the stream's first delta. Only a turn in `Sending`
+/// that has not yet seen one moves, so a stream that is not the voice
+/// turn's costs a lock and nothing else.
+pub fn note_answer_chunk() {
+    let thinking = matches!(
+        voice().turn.state(),
+        TurnState::Sending { answering: false }
+    );
+    if thinking {
+        transition(TurnEvent::AnswerChunk);
+    }
+}
+
+/// The language a send made right now is asked in, when it belongs to a
+/// voice turn (Epic 64, AD-182): the listening locale in force —
+/// `wake_vm`'s own expression — while `Turn::awaiting_send`, otherwise
+/// `None`. The bots adapter reads it to decide whether the per-turn
+/// instruction goes on the request; the rule is the turn's, read once.
+pub fn spoken_turn(data_dir: &std::path::Path) -> Option<String> {
+    let port = {
+        let voice = voice();
+        if !voice.turn.awaiting_send() {
+            return None;
+        }
+        Arc::clone(&voice.port)
+    };
+    let chosen = registry::get_bots_voice_locale(data_dir)
+        .map_err(|error| {
+            tracing::warn!(%error, "voice: could not read bots.voice_locale for the spoken turn");
+        })
+        .ok()?;
+    let locale::DeviceLocales { system, on_device } = port.locales();
+    Some(locale::in_force(chosen.as_deref(), &system, &on_device))
 }
 
 /// What every change does once the turn has moved: bump the generation,

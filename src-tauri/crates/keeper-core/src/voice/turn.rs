@@ -64,7 +64,11 @@ pub enum TurnState {
         text: String,
     },
     /// The message went to the model and the answer is streaming back.
-    Sending,
+    Sending {
+        /// Whether the first piece of the answer has arrived — the difference
+        /// between a model thinking and one that has started (AD-186).
+        answering: bool,
+    },
     /// The answer is being read aloud. Whether the microphone is open for
     /// barge-in meanwhile is [`may_record`]'s answer for the platform.
     Speaking,
@@ -76,7 +80,7 @@ pub enum TurnState {
 }
 
 /// What happened, as the port, the surface and the conversation report it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
     /// The trigger: the wake phrase was heard, or the person pressed the mic
     /// control that stands in for it (Story 62.6).
@@ -89,6 +93,10 @@ pub enum TurnEvent {
     Sent,
     /// A piece of the answer arrived.
     AnswerChunk,
+    /// The input level in `0.0..=1.0`, smoothed and rate-limited by the
+    /// port's [`super::level::Meter`]. Not a transition: [`super::Turn`]
+    /// records it for the snapshot and the table ignores it everywhere.
+    Level(f32),
     /// The whole answer arrived — the text to read aloud.
     AnswerDone(String),
     /// The person started speaking (barge-in while `Speaking`).
@@ -165,16 +173,18 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
         (state @ TurnState::Listening { .. }, _) => (state, Vec::new()),
 
         // -- Heard ------------------------------------------------------------
-        (TurnState::Heard { .. }, Sent) => (TurnState::Sending, Vec::new()),
+        (TurnState::Heard { .. }, Sent) => (TurnState::Sending { answering: false }, Vec::new()),
         // The answer may arrive without a `Sent` in between: `Sending` is a
         // progress marker for the surface, not a gate on the answer.
         (TurnState::Heard { .. }, AnswerDone(text)) => speak_or_end(text, Vec::new()),
         (state @ TurnState::Heard { .. }, _) => (state, Vec::new()),
 
         // -- Sending ----------------------------------------------------------
-        (TurnState::Sending, AnswerChunk) => (TurnState::Sending, Vec::new()),
-        (TurnState::Sending, AnswerDone(text)) => speak_or_end(text, Vec::new()),
-        (TurnState::Sending, _) => (TurnState::Sending, Vec::new()),
+        (TurnState::Sending { .. }, AnswerChunk) => {
+            (TurnState::Sending { answering: true }, Vec::new())
+        }
+        (TurnState::Sending { .. }, AnswerDone(text)) => speak_or_end(text, Vec::new()),
+        (state @ TurnState::Sending { .. }, _) => (state, Vec::new()),
 
         // -- Speaking ---------------------------------------------------------
         // Barge-in: stop talking before anything else, then listen again. On
@@ -253,6 +263,6 @@ pub fn may_record(platform: &VoicePlatform, state: &TurnState) -> bool {
         TurnState::Idle
         | TurnState::Listening { .. }
         | TurnState::Heard { .. }
-        | TurnState::Sending => true,
+        | TurnState::Sending { .. } => true,
     }
 }

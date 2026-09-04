@@ -3111,14 +3111,19 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
   // A scripted turn so the mic control's three states can be looked at in
   // `bun run dev`: listening with an interim transcript, then heard. What is
   // heard lands in the composer; nothing here sends. `voice_authorize`
-  // answers "granted" — the dialogs are the phone's.
+  // answers "granted" — the dialogs are the phone's. The level (Epic 64,
+  // Story 64.3) rises with the words and falls once they are heard, at the
+  // ~25 Hz Rust bounds it to, so an indicator can be looked at too.
   voice_authorize: () => null,
   voice_start: () => {
     const push = (state: VoiceStateVm) => voiceWatcher?.onmessage?.(state);
-    push({ kind: "listening", heard: "" });
-    setTimeout(() => push({ kind: "listening", heard: "what did I" }), 400);
-    setTimeout(() => push({ kind: "listening", heard: "what did I save yesterday" }), 900);
-    setTimeout(() => push({ kind: "heard", text: "what did I save yesterday" }), 1600);
+    push({ kind: "listening", heard: "", level: null });
+    for (let tick = 1; tick <= 40; tick++) {
+      const heard = tick < 10 ? "" : tick < 22 ? "what did I" : "what did I save yesterday";
+      const level = 0.15 + 0.5 * Math.abs(Math.sin(tick / 3));
+      setTimeout(() => push({ kind: "listening", heard, level }), tick * 40);
+    }
+    setTimeout(() => push({ kind: "heard", text: "what did I save yesterday", level: 0.1 }), 1700);
     return null;
   },
   voice_stop: () => {

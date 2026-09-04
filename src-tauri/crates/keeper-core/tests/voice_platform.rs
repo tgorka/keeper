@@ -62,7 +62,16 @@ impl VoicePort for FakePort {
     fn stop_listening(&self) {
         self.record(Call::Stop);
     }
-    fn speak(&self, text: &str) -> Result<(), VoiceUnavailable> {
+    fn voices(&self) -> Vec<String> {
+        vec!["en-US".to_owned()]
+    }
+    fn listening(&self) -> String {
+        "en-US".to_owned()
+    }
+    fn detect_language(&self, _text: &str, _constraints: &[String]) -> Option<String> {
+        None
+    }
+    fn speak(&self, text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
         self.record(Call::Speak(text.to_owned()));
         Ok(())
     }
@@ -88,7 +97,7 @@ fn every_state() -> Vec<TurnState> {
         TurnState::Heard {
             text: "hello".to_owned(),
         },
-        TurnState::Sending,
+        TurnState::Sending { answering: false },
         TurnState::Speaking,
         TurnState::Failed {
             reason: "boom".to_owned(),
@@ -515,7 +524,16 @@ fn voice_turn_failure_reason_uses_the_turn_platform() {
             Err(VoiceUnavailable::NotAuthorized)
         }
         fn stop_listening(&self) {}
-        fn speak(&self, _text: &str) -> Result<(), VoiceUnavailable> {
+        fn voices(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn listening(&self) -> String {
+            String::new()
+        }
+        fn detect_language(&self, _text: &str, _constraints: &[String]) -> Option<String> {
+            None
+        }
+        fn speak(&self, _text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
             Ok(())
         }
         fn stop_speaking(&self) {}

@@ -38,9 +38,11 @@
 //! the same name on a Mac as on a phone.
 
 pub mod authorization;
+pub mod level;
 pub mod locale;
 pub mod phrase;
 pub mod platform;
+pub mod speech;
 pub mod turn;
 
 use std::sync::Arc;
@@ -118,6 +120,14 @@ pub enum VoiceUnavailable {
     /// was linked without `Speech.framework`. A defect of the build, not of
     /// the device, its settings or its languages.
     NoRecognizer,
+    /// The answer is in a language this device has no synthesiser voice
+    /// for (Epic 64, AD-182), so it stays on the screen: a voice of another
+    /// language reading it is the failure the epic opens with, never a
+    /// fallback. Carries the language as [`speech::choose_voice`] named it.
+    NoVoice {
+        /// The detected language, as the detector spelled it (`pl`).
+        language: String,
+    },
     /// This build has no voice port.
     Unsupported,
 }
@@ -134,6 +144,7 @@ impl VoiceUnavailable {
             noun,
             allow,
             download,
+            voice_download,
             ..
         } = platform;
         match self {
@@ -151,6 +162,10 @@ impl VoiceUnavailable {
                 on_device.join(", ")
             ),
             Self::NoMicrophone => "no microphone is available on this device".to_owned(),
+            Self::NoVoice { language } => format!(
+                "this {noun} has no voice for {}, so the answer stays on the screen instead of being read aloud — {voice_download}",
+                speech::describe(language)
+            ),
             Self::NoRecognizer => format!(
                 "this build of keeper was made without Apple's Speech framework, so it cannot recognise speech on any {noun} — no setting or language download changes that; install a build whose Xcode project links Speech.framework"
             ),
@@ -175,6 +190,10 @@ impl VoiceUnavailable {
                 }
             }
             Self::NoMicrophone => VoiceUnavailableVm::NoMicrophone { message },
+            Self::NoVoice { language } => VoiceUnavailableVm::NoVoice {
+                language: language.clone(),
+                message,
+            },
             Self::NoRecognizer => VoiceUnavailableVm::NoRecognizer { message },
             Self::Unsupported => VoiceUnavailableVm::Unsupported { message },
         }
@@ -238,10 +257,37 @@ pub trait VoicePort: Send + Sync {
     /// Idempotent.
     fn stop_listening(&self);
 
-    /// Read `text` aloud. Whether the microphone is open meanwhile is the
-    /// turn's decision ([`may_record`]): on a full-duplex platform it stays
-    /// open for barge-in; on a half-duplex one the turn released it first.
-    fn speak(&self, text: &str) -> Result<(), VoiceUnavailable>;
+    /// The languages this device has a synthesiser voice for, as the
+    /// framework spells them (`pl-PL`, `en-US`), each once, sorted.
+    /// Enumerating the voices is a framework call the port caches the way
+    /// it caches [`VoicePort::locales`], refreshed on the same deliberate
+    /// act, so a voice downloaded while keeper runs is seen the next time
+    /// the language is chosen.
+    fn voices(&self) -> Vec<String>;
+
+    /// The locale recognition runs in — [`locale::in_force`]'s answer over
+    /// the person's choice and this device's enumeration. The language a
+    /// spoken turn was asked in, and the one its answer is spoken in when
+    /// the text's own language cannot be told ([`speech::choose_voice`]).
+    fn listening(&self) -> String;
+
+    /// The dominant language of `text`, from among `constraints` (language
+    /// subtags, `pl`, `en`), or `None` when the detector cannot tell.
+    /// On-device or not at all (AD-188): the port never sends the text
+    /// anywhere to have it classified. A port with no detector answers
+    /// `None`, which [`speech::choose_voice`] reads as "the listening
+    /// language".
+    fn detect_language(&self, text: &str, constraints: &[String]) -> Option<String>;
+
+    /// Read `text` aloud in the voice for `language` — one of
+    /// [`VoicePort::voices`], chosen by [`speech::choose_voice`]. A port
+    /// whose framework answers no voice for it refuses with
+    /// [`VoiceUnavailable::NoVoice`] rather than reading in the default
+    /// voice (AD-27): a mismatched voice is the exact failure Epic 64 opens
+    /// with. Whether the microphone is open meanwhile is the turn's decision
+    /// ([`may_record`]): on a full-duplex platform it stays open for
+    /// barge-in; on a half-duplex one the turn released it first.
+    fn speak(&self, text: &str, language: &str) -> Result<(), VoiceUnavailable>;
 
     /// Stop reading aloud immediately. Idempotent.
     fn stop_speaking(&self);
@@ -265,7 +311,11 @@ pub trait VoicePort: Send + Sync {
 /// state the table moved to, the turn does not open it and releases it if
 /// it was — before the `Speak`, so the port never records its own answer.
 /// On iOS the rule allows every state the table opens the device in, so
-/// nothing there changes.
+/// nothing there changes. **Level** (Story 64.3, AD-186): a
+/// [`TurnEvent::Level`] is not a transition. It is recorded while the device
+/// is open for a turn — `Listening` and `Heard` — and cleared when the turn
+/// moves anywhere else, so a snapshot never carries a level from a
+/// microphone that is closed.
 #[derive(Debug)]
 pub struct Turn {
     platform: VoicePlatform,
@@ -274,6 +324,9 @@ pub struct Turn {
     /// Whether the last effect touching the device opened it. What the
     /// surface's "listening for the phrase" indicator reads.
     microphone_open: bool,
+    /// The last level the port reported while `Listening` or `Heard`;
+    /// `None` before the first reading and in every other state.
+    level: Option<f32>,
 }
 
 impl Turn {
@@ -285,6 +338,7 @@ impl Turn {
             state: TurnState::Idle,
             wake: None,
             microphone_open: false,
+            level: None,
         }
     }
 
@@ -306,6 +360,24 @@ impl Turn {
     /// Whether the microphone is open right now, per the effects handed out.
     pub fn microphone_open(&self) -> bool {
         self.microphone_open
+    }
+
+    /// The input level the snapshot carries: the port's last reading while
+    /// the device is open for a turn, `None` before the first and elsewhere.
+    pub fn level(&self) -> Option<f32> {
+        self.level
+    }
+
+    /// Whether a send made now belongs to this turn — the turn heard
+    /// something and is waiting for the answer to speak (Epic 64, AD-182).
+    /// The same predicate the surface applies before it reads an answer
+    /// aloud, so the instruction on the request and the voice on the answer
+    /// are decided by one rule.
+    pub fn awaiting_send(&self) -> bool {
+        matches!(
+            self.state,
+            TurnState::Heard { .. } | TurnState::Sending { .. }
+        )
     }
 
     /// Set or clear the wake phrase.
@@ -330,7 +402,17 @@ impl Turn {
     }
 
     /// Apply `event` and return what the shell must do, in order.
+    ///
+    /// A [`TurnEvent::Level`] never reaches the table: it is recorded for
+    /// the snapshot where the device is open for a turn and dropped
+    /// elsewhere, with no effects either way.
     pub fn apply(&mut self, event: TurnEvent) -> Vec<Effect> {
+        if let TurnEvent::Level(level) = event {
+            if self.meters() {
+                self.level = Some(level.clamp(0.0, 1.0));
+            }
+            return Vec::new();
+        }
         let event = match (&self.state, &self.wake, &event) {
             (
                 TurnState::Idle,
@@ -364,6 +446,9 @@ impl Turn {
             }
         }
         self.state = next;
+        if !self.meters() {
+            self.level = None;
+        }
         self.note_device(&effects);
         debug_assert!(
             !self.microphone_open || may_record(&self.platform, &self.state),
@@ -395,14 +480,29 @@ impl Turn {
             },
             TurnState::Listening { heard } => VoiceStateVm::Listening {
                 heard: heard.clone(),
+                level: self.level,
             },
-            TurnState::Heard { text } => VoiceStateVm::Heard { text: text.clone() },
-            TurnState::Sending => VoiceStateVm::Sending,
+            TurnState::Heard { text } => VoiceStateVm::Heard {
+                text: text.clone(),
+                level: self.level,
+            },
+            TurnState::Sending { answering } => VoiceStateVm::Sending {
+                answering: *answering,
+            },
             TurnState::Speaking => VoiceStateVm::Speaking,
             TurnState::Failed { reason } => VoiceStateVm::Failed {
                 reason: reason.clone(),
             },
         }
+    }
+
+    /// Whether the state is one whose snapshot carries a level: the device
+    /// is open for a turn, not merely for the phrase.
+    fn meters(&self) -> bool {
+        matches!(
+            self.state,
+            TurnState::Listening { .. } | TurnState::Heard { .. }
+        )
     }
 
     fn note_device(&mut self, effects: &[Effect]) {
@@ -424,8 +524,12 @@ fn device_after(open: bool, effects: &[Effect]) -> bool {
 ///
 /// [`Effect::SendText`] is not a port call: the text reaches the conversation
 /// through the state the shell streams (`VoiceStateVm::Heard`), so here it is
-/// nothing to do. Releases and stops are infallible by the port's contract,
-/// so the only errors are an `OpenMicrophone` or a `Speak` the device refused.
+/// nothing to do. [`Effect::Speak`] is where the voice is chosen (AD-182,
+/// AD-183): the port supplies its inventory, the listening locale and the
+/// text's detected language, [`speech::choose_voice`] decides, and the port
+/// is told which language to speak in. Releases and stops are infallible by
+/// the port's contract, so the only errors are an `OpenMicrophone` or a
+/// `Speak` the device refused — including a language it has no voice for.
 pub fn perform(
     effects: &[Effect],
     port: &dyn VoicePort,
@@ -436,7 +540,14 @@ pub fn perform(
             Effect::OpenMicrophone => port.start_listening(wake)?,
             Effect::ReleaseMicrophone => port.stop_listening(),
             Effect::SendText(_) => {}
-            Effect::Speak(text) => port.speak(text)?,
+            Effect::Speak(text) => {
+                let voices = port.voices();
+                let listening = port.listening();
+                let detected =
+                    port.detect_language(text, &speech::constraints(&listening, &voices));
+                let language = speech::choose_voice(detected.as_deref(), &listening, &voices)?;
+                port.speak(text, &language)?;
+            }
             Effect::StopSpeaking => port.stop_speaking(),
         }
     }

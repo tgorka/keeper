@@ -36,6 +36,12 @@ pub struct VoicePlatform {
     /// What to do about a language whose on-device model is not installed,
     /// as an imperative clause: where the download lives on this platform.
     pub download: &'static str,
+    /// What to do about a language this device has no synthesiser voice for
+    /// (Epic 64, AD-182), as an imperative clause: where voices are
+    /// downloaded on this platform. A different place from `download`,
+    /// because recognition and synthesis are different inventories — a
+    /// dictation language and a voice are installed on different pages.
+    pub voice_download: &'static str,
     /// Whether the OS keeps the port's own voice out of the transcript, so
     /// the microphone may stay open while an utterance is read aloud. Where
     /// it is `false`, [`super::may_record`] answers `false` while speaking
@@ -60,6 +66,7 @@ impl VoicePlatform {
         allow: "allow both under Settings > keeper",
         download:
             "download that language under Settings > General > Keyboard > Dictation Languages",
+        voice_download: "download a voice for it under Settings > Accessibility > Spoken Content > Voices",
         full_duplex: true,
         limits: "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. It stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit. The microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
     };
@@ -74,6 +81,7 @@ impl VoicePlatform {
         noun: "Mac",
         allow: "allow the microphone under System Settings > Privacy & Security > Microphone",
         download: "turn Dictation on and download that language under System Settings > Keyboard > Dictation",
+        voice_download: "download a voice for it under System Settings > Accessibility > Spoken Content > System Voice",
         full_duplex: false,
         // No screen-lock clause: with no `AVAudioSession` there is no
         // documented macOS rule about a locked screen that this session
@@ -93,6 +101,7 @@ impl VoicePlatform {
         noun: "device",
         allow: "allow both in the system's privacy settings",
         download: "download that language in the system's dictation settings",
+        voice_download: "download a voice for it in the system's spoken-content settings",
         full_duplex: false,
         // Never shown: a port with no platform refuses before a switch is
         // ever drawn. Present so that every platform answers every question.

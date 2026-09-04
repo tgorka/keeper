@@ -64,6 +64,21 @@
  * jsdom lays nothing out, so the test for this is structural — the classes
  * that make the transcript the flexible region and the bands bounded — and the
  * pixels were measured on Chrome through `dev/mock-shell.ts`.
+ *
+ * # The voice block folds to a line (Epic 64, Story 64.1, AD-184)
+ *
+ * Epic 63 gave the Mac a voice and put the whole wake block — switch, phrase,
+ * language, sentence, note, limits — above the transcript. Measured with
+ * `dev/measure-bots.ts` on Chrome at 1440×900 over the dev shell, whose
+ * fixture is the owner's own case (a Polish system language with English-only
+ * on-device assets, so the refusal is on screen): before, the block was 223px
+ * and the transcript **259px of the 872px pane — 29.7%**; folded, the block is
+ * a 39px line and the transcript **444px — 50.9%**, the block's height less
+ * the line that remains. Unfolded by the person, the block is 257px and the
+ * transcript 226px (25.9%) — the disclosure row is what the unfold costs, and
+ * unfolding is their choice. The fold is remembered in the pane's own cookie
+ * (`bots-pane-fold.ts`) and hydrated here; Settings → Bots keeps the block
+ * unfolded, so nothing is one fold further away than it was.
  */
 import { MessagesSquare, Plus } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -95,6 +110,11 @@ import {
   botsSessionsList,
 } from "@/lib/ipc/client";
 import { botsStore, lastAnswer, useBotsStore } from "@/lib/stores/bots";
+import {
+  botsPaneFoldStore,
+  hydrateBotsPaneFold,
+  useBotsPaneFold,
+} from "@/lib/stores/bots-pane-fold";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { columnFoldStore } from "@/lib/stores/column-fold";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -178,6 +198,12 @@ export function BotsPane() {
   // The one voice watcher for the surface (Story 62.5): the wake chip and the
   // talk-mode control both read the store it fills.
   useVoiceStream();
+  // Story 64.1: whether the voice block is folded to its line. Restored here
+  // rather than in `AppShell`, the notes rail's argument (`bots-pane-fold.ts`).
+  const voiceFolded = useBotsPaneFold((s) => s.bands.voice);
+  useEffect(() => {
+    hydrateBotsPaneFold(document.cookie);
+  }, []);
   // The model row the picker last resolved, held here only so the grant bar can
   // read its tool capability. Not in the store: it is a fact about an endpoint
   // read a moment ago, not part of the conversation record.
@@ -416,7 +442,14 @@ export function BotsPane() {
             model={pickedModel}
           />
 
-          <BotVoiceWake />
+          {/* Folded to one line by default (Story 64.1, AD-184); the whole
+              block is one click away, and Settings → Bots always has it. */}
+          <BotVoiceWake
+            fold={{
+              folded: voiceFolded,
+              onToggle: () => botsPaneFoldStore.getState().toggleBand("voice"),
+            }}
+          />
 
           {empty === null ? (
             <BotConversation

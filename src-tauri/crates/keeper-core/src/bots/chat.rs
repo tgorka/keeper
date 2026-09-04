@@ -122,6 +122,33 @@ impl ChatMessage {
             tool_calls: Vec::new(),
         }
     }
+
+    /// The one system message a turn opens with, from every instruction the
+    /// turn carries — the drive's context bundle, the voice turn's "answer
+    /// in this language" (Epic 64, AD-182) — or `None` when it carries
+    /// nothing, so a plain typed turn sends exactly what it sent before.
+    ///
+    /// One message, not one per instruction: Hermes layers *a* request's
+    /// system message over its profile prompt, and two system rows would
+    /// leave it to the server which one that is. Blank parts are dropped.
+    pub fn instructions<I>(parts: I) -> Option<Self>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let mut body = String::new();
+        for part in parts {
+            let part = part.as_ref().trim();
+            if part.is_empty() {
+                continue;
+            }
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str(part);
+        }
+        (!body.is_empty()).then(|| Self::text(Role::System, body))
+    }
 }
 
 /// A tool keeper offers the model.

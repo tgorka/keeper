@@ -62,9 +62,13 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
 });
 
 const IDLE: VoiceStateVm = { kind: "idle", wake: null, listeningForWake: false };
-const LISTENING: VoiceStateVm = { kind: "listening", heard: "" };
-const LISTENING_HALF: VoiceStateVm = { kind: "listening", heard: "what did I save" };
-const HEARD: VoiceStateVm = { kind: "heard", text: "what did I save yesterday" };
+const LISTENING: VoiceStateVm = { kind: "listening", heard: "", level: null };
+const LISTENING_HALF: VoiceStateVm = {
+  kind: "listening",
+  heard: "what did I save",
+  level: 0.3,
+};
+const HEARD: VoiceStateVm = { kind: "heard", text: "what did I save yesterday", level: null };
 const SPEAKING: VoiceStateVm = { kind: "speaking" };
 const NOT_AUTHORIZED: VoiceUnavailableVm = {
   kind: "notAuthorized",
@@ -129,7 +133,8 @@ describe("micState", () => {
     expect(micState(null)).toBe("idle");
     expect(micState(IDLE)).toBe("idle");
     expect(micState(HEARD)).toBe("idle");
-    expect(micState({ kind: "sending" })).toBe("idle");
+    expect(micState({ kind: "sending", answering: false })).toBe("idle");
+    expect(micState({ kind: "sending", answering: true })).toBe("idle");
     expect(micState({ kind: "failed", reason: "x" })).toBe("idle");
     expect(micState(LISTENING)).toBe("listening");
     expect(micState(SPEAKING)).toBe("speaking");

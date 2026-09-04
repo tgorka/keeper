@@ -50,6 +50,7 @@ use keeper_core::bots::session::{
 };
 use keeper_core::bots::{Endpoint, ProviderKind};
 use keeper_core::vm::{BotSessionListVm, BotTranscriptSource};
+use keeper_core::voice::speech;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -58,12 +59,15 @@ use tokio::net::{TcpListener, TcpStream};
 // The fake Hermes
 // ---------------------------------------------------------------------------
 
-/// One recorded request: method, path with query, lower-cased headers.
+/// One recorded request: method, path with query, lower-cased headers, and
+/// the body as JSON where it parsed as any — so a test can assert on the
+/// messages that left keeper, not only on the headers (Epic 64).
 #[derive(Debug, Clone)]
 struct Seen {
     method: String,
     target: String,
     headers: BTreeMap<String, String>,
+    body: Value,
 }
 
 impl Seen {
@@ -71,6 +75,25 @@ impl Seen {
         self.headers
             .get(&SESSION_HEADER.to_ascii_lowercase())
             .map(String::as_str)
+    }
+
+    /// The `role` and text `content` of every message in the body, in
+    /// order.
+    fn messages(&self) -> Vec<(String, String)> {
+        self.body["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|m| {
+                        (
+                            m["role"].as_str().unwrap_or_default().to_owned(),
+                            m["content"].as_str().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -215,6 +238,7 @@ async fn serve(mut stream: TcpStream, state: Arc<Mutex<FakeState>>) {
         method: method.clone(),
         target: target.clone(),
         headers,
+        body: serde_json::from_slice(&body).unwrap_or(Value::Null),
     };
     let response = {
         let mut guard = state.lock().expect("fake state");
@@ -537,6 +561,22 @@ async fn send_turn(
     caps: SessionCapabilities,
     text: &str,
 ) -> String {
+    send_turn_spoken(fake, dir, local_id, caps, text, None).await
+}
+
+/// [`send_turn`] with the turn's origin: `spoken_in` is the listening
+/// locale of a voice turn, whose request opens with the per-turn
+/// instruction the shell's `arm_turn` composes the same way (Epic 64,
+/// AD-182) — `ChatMessage::instructions` over `speech::answer_instruction`
+/// — and `None` is a typed turn, which opens with nothing.
+async fn send_turn_spoken(
+    fake: &FakeHermes,
+    dir: &Path,
+    local_id: &str,
+    caps: SessionCapabilities,
+    text: &str,
+    spoken_in: Option<&str>,
+) -> String {
     let row = get_session(dir, local_id).expect("read").expect("row");
     let continuity = continuity_id(caps, row.remote_session_id.as_deref(), || {
         format!("minted-{local_id}")
@@ -544,9 +584,15 @@ async fn send_turn(
     if continuity.is_some() && continuity != row.remote_session_id {
         session::set_session_remote_id(dir, local_id, continuity.as_deref()).expect("write id");
     }
+    let mut messages = Vec::with_capacity(2);
+    let instruction = spoken_in.map(speech::answer_instruction);
+    if let Some(system) = ChatMessage::instructions(instruction.iter()) {
+        messages.push(system);
+    }
+    messages.push(ChatMessage::text(Role::User, text));
     let request = ChatRequest {
         model: "hermes-agent".to_owned(),
-        messages: vec![ChatMessage::text(Role::User, text)],
+        messages,
         session_id: continuity,
         ..ChatRequest::default()
     };
@@ -571,6 +617,59 @@ fn chat_requests(fake: &FakeHermes) -> Vec<Seen> {
         .into_iter()
         .filter(|seen| seen.method == "POST")
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Epic 64, Story 64.2 — the per-turn instruction on a spoken turn
+// ---------------------------------------------------------------------------
+
+/// AD-182, asserted on the wire: a turn the voice heard opens with one
+/// system message asking for the answer in the listening language, and a
+/// typed turn on the same conversation opens with nothing at all — the
+/// user text is its first and only message, byte for byte as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spoken_turn_carries_the_language_instruction_and_a_typed_one_does_not() {
+    let fake = FakeHermes::start(FakeState::default()).await;
+    let dir = device_dir("spoken");
+    insert_session(&dir, &local_session("local", None)).expect("insert");
+    let caps = SessionCapabilities::NONE;
+
+    send_turn_spoken(
+        &fake,
+        &dir,
+        "local",
+        caps,
+        "what's the weather",
+        Some("en-US"),
+    )
+    .await;
+    send_turn_spoken(&fake, &dir, "local", caps, "and tomorrow?", None).await;
+
+    let posts = chat_requests(&fake);
+    assert_eq!(posts.len(), 2);
+
+    let spoken = posts[0].messages();
+    assert_eq!(spoken.len(), 2, "one instruction, one question: {spoken:?}");
+    assert_eq!(spoken[0].0, "system");
+    assert_eq!(
+        spoken[0].1,
+        "The person asked this aloud and your answer will be read aloud to them. Answer in English (en-US)."
+    );
+    assert_eq!(
+        spoken[1],
+        ("user".to_owned(), "what's the weather".to_owned())
+    );
+
+    let typed = posts[1].messages();
+    assert_eq!(
+        typed,
+        vec![("user".to_owned(), "and tomorrow?".to_owned())],
+        "a typed turn sends exactly what it sent before"
+    );
+    assert!(
+        !posts[1].body.to_string().contains("read aloud"),
+        "no instruction anywhere in a typed turn's body"
+    );
 }
 
 // ---------------------------------------------------------------------------

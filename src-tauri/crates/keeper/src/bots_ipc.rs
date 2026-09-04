@@ -99,6 +99,8 @@ use keeper_core::vm::{
     BotSessionQueryReq, BotSessionVm, BotStreamEvent, BotTranscriptSource, BotVm, IpcError,
     IpcErrorCode,
 };
+// Epic 64's one: the sentence a spoken turn opens with (AD-182).
+use keeper_core::voice::speech;
 // Story 61.9's two, on their own line so the story that owns them is legible.
 use keeper_core::vm::{BotCommandContextReq, BotCommandPreviewVm};
 // Story 61.11's two — the tool row and the context disclosure — likewise.
@@ -973,6 +975,12 @@ pub(crate) struct Turn {
     /// The profile an unqualified tool path is relative to, or empty when no
     /// grant names one — `keeper_core::bots::tools::default_profile_id`.
     pub(crate) default_profile_id: String,
+    /// Whether the voice turn heard the question this answer is to (Epic
+    /// 64, AD-182, AD-186): the request carried the answer-in-this-language
+    /// instruction, and the voice turn is told when the request leaves and
+    /// when the first token arrives, so its indicator has a middle. A typed
+    /// turn never touches the voice turn.
+    pub(crate) spoken: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,6 +1086,7 @@ struct Armed {
     context: Option<ContextBundle>,
     drive: Box<dyn TurnHost>,
     default_profile_id: String,
+    spoken: bool,
 }
 
 /// Everything about one turn that `keeper-core` decides from the live grants,
@@ -1136,13 +1145,26 @@ async fn arm_turn(
     let profile_ids: Vec<&str> = drive.profile_ids.iter().map(String::as_str).collect();
     let default_profile_id = tools::default_profile_id(&grants, &profile_ids).unwrap_or_default();
 
+    // Epic 64, AD-182: a question the voice turn heard is answered aloud,
+    // so the model is asked to answer in the language the person is
+    // speaking — the listening locale in force. Whether this send is that
+    // turn's is the voice turn's own answer (`Turn::awaiting_send`), the
+    // same rule the pane applies before it reads the answer aloud. The
+    // sentence is core's (`speech::answer_instruction`); a typed turn adds
+    // nothing and sends exactly what it sent before.
+    let spoken_in = crate::voice_ipc::spoken_turn(dir);
+    if let Some(listening) = &spoken_in {
+        tracing::info!(%listening, "bots: a spoken turn; asking for the answer in the listening language");
+    }
     let mut prompted = Vec::with_capacity(messages.len() + 1);
-    if let Some(system) = drive
+    let context_prompt = drive
         .context
         .as_ref()
-        .and_then(ContextBundle::system_prompt)
-    {
-        prompted.push(ChatMessage::text(Role::System, system));
+        .and_then(ContextBundle::system_prompt);
+    let instruction = spoken_in.as_deref().map(speech::answer_instruction);
+    let parts = [context_prompt, instruction].into_iter().flatten();
+    if let Some(system) = ChatMessage::instructions(parts) {
+        prompted.push(system);
     }
     prompted.extend(messages);
 
@@ -1157,6 +1179,7 @@ async fn arm_turn(
         context: drive.context,
         drive: drive.host,
         default_profile_id,
+        spoken: spoken_in.is_some(),
     }
 }
 
@@ -1249,6 +1272,7 @@ pub async fn bots_chat_send(
         assistant_id: assistant.id.clone(),
         drive: armed.drive,
         default_profile_id: armed.default_profile_id,
+        spoken: armed.spoken,
     };
 
     let subscription_id = new_id();
@@ -1384,6 +1408,7 @@ pub async fn bots_message_retry(
         assistant_id: assistant.id.clone(),
         drive: armed.drive,
         default_profile_id: armed.default_profile_id,
+        spoken: armed.spoken,
     };
 
     let subscription_id = new_id();
@@ -1563,6 +1588,11 @@ async fn drive(turn: Turn, signal: chat::CancelSignal, channel: Channel<BotStrea
         read_timeout: turn.read_timeout,
         ..ChatOptions::default()
     };
+    // AD-186: the voice turn's "thinking" state begins when its request
+    // leaves and ends at the first token; only a turn it heard is told.
+    if turn.spoken {
+        crate::voice_ipc::note_sent();
+    }
 
     // The host is the port's to build, not this file's: `channel` and
     // `signal` are what an approval needs, and they exist only here.
@@ -1582,6 +1612,9 @@ async fn drive(turn: Turn, signal: chat::CancelSignal, channel: Channel<BotStrea
     let mut unflushed = 0usize;
     let mut sink = |event: ToolLoopEvent| match event {
         ToolLoopEvent::Chat(ChatEvent::FirstToken { after_ms }) => {
+            if turn.spoken {
+                crate::voice_ipc::note_answer_chunk();
+            }
             let _ = channel.send(BotStreamEvent::FirstToken { after_ms });
         }
         ToolLoopEvent::Chat(ChatEvent::ContentDelta(text)) => {

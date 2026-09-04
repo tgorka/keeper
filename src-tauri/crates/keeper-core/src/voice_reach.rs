@@ -67,7 +67,7 @@ impl From<&VoiceStateVm> for VoiceFace {
             VoiceStateVm::Speaking => Self::Speaking,
             VoiceStateVm::Idle { .. }
             | VoiceStateVm::Heard { .. }
-            | VoiceStateVm::Sending
+            | VoiceStateVm::Sending { .. }
             | VoiceStateVm::Failed { .. } => Self::Idle,
         }
     }
@@ -129,10 +129,10 @@ pub fn tray_voice_labels(state: &VoiceStateVm) -> TrayVoiceLabels {
             listening_for_wake: true,
         } => format!("Listening for \"{phrase}\""),
         VoiceStateVm::Idle { .. } => "Not listening".to_owned(),
-        VoiceStateVm::Listening { heard } if heard.trim().is_empty() => "Listening".to_owned(),
-        VoiceStateVm::Listening { heard } => format!("Listening: {}", heard.trim()),
+        VoiceStateVm::Listening { heard, .. } if heard.trim().is_empty() => "Listening".to_owned(),
+        VoiceStateVm::Listening { heard, .. } => format!("Listening: {}", heard.trim()),
         VoiceStateVm::Heard { .. } => "Heard".to_owned(),
-        VoiceStateVm::Sending => "Sending what you said".to_owned(),
+        VoiceStateVm::Sending { .. } => "Sending what you said".to_owned(),
         VoiceStateVm::Speaking => "Speaking the answer".to_owned(),
         VoiceStateVm::Failed { reason } => format!("Could not listen: {reason}"),
     };
@@ -224,7 +224,8 @@ mod tests {
         assert_eq!(VoiceFace::from(&idle), VoiceFace::Idle);
         assert_eq!(
             VoiceFace::from(&VoiceStateVm::Listening {
-                heard: String::new()
+                heard: String::new(),
+                level: None,
             }),
             VoiceFace::Listening
         );
@@ -236,8 +237,9 @@ mod tests {
         for released in [
             VoiceStateVm::Heard {
                 text: "hi".to_owned(),
+                level: Some(0.4),
             },
-            VoiceStateVm::Sending,
+            VoiceStateVm::Sending { answering: true },
             VoiceStateVm::Failed {
                 reason: "nope".to_owned(),
             },
@@ -289,12 +291,14 @@ mod tests {
 
         let listening = tray_voice_labels(&VoiceStateVm::Listening {
             heard: String::new(),
+            level: Some(0.2),
         });
         assert_eq!(listening.status, "Listening");
         assert_eq!(listening.verb, "Cancel this question");
 
         let forming = tray_voice_labels(&VoiceStateVm::Listening {
             heard: " what time ".to_owned(),
+            level: None,
         });
         assert_eq!(forming.status, "Listening: what time");
 
@@ -302,7 +306,7 @@ mod tests {
         assert_eq!(speaking.status, "Speaking the answer");
         assert_eq!(speaking.verb, "Stop this answer");
 
-        let sending = tray_voice_labels(&VoiceStateVm::Sending);
+        let sending = tray_voice_labels(&VoiceStateVm::Sending { answering: false });
         assert_eq!(sending.status, "Sending what you said");
         assert_eq!(sending.verb, "Talk");
 
@@ -363,7 +367,16 @@ mod tests {
             Ok(())
         }
         fn stop_listening(&self) {}
-        fn speak(&self, _text: &str) -> Result<(), VoiceUnavailable> {
+        fn voices(&self) -> Vec<String> {
+            vec!["en-US".to_owned()]
+        }
+        fn listening(&self) -> String {
+            "en-US".to_owned()
+        }
+        fn detect_language(&self, _text: &str, _constraints: &[String]) -> Option<String> {
+            None
+        }
+        fn speak(&self, _text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
             Ok(())
         }
         fn stop_speaking(&self) {}

@@ -94,6 +94,19 @@
 //! Objective-C subclass declared from Rust — more blind code than a 250 ms
 //! poll is worth.
 //!
+//! # Which voice (Epic 64, Story 64.2, AD-182, AD-188)
+//!
+//! The same shape as the macOS port, because the fault is the same: a
+//! synthesiser with no voice set speaks in the system's language whatever
+//! the text's. The port enumerates the installed voices' languages once
+//! (`AVSpeechSynthesisVoice.speechVoices`, cached beside the locales),
+//! detects the answer's dominant language on-device with
+//! `NLLanguageRecognizer` constrained to those languages plus the listening
+//! one, and `keeper_core::voice::speech::choose_voice` decides. The
+//! utterance gets `voiceWithLanguage:` explicitly; `nil` is a refusal that
+//! names the language and where a voice is downloaded, never a fall-through
+//! to the default voice. No text leaves the phone to be classified.
+//!
 //! # Asking (FR-408)
 //!
 //! [`ConsentPort`] is the second port this type implements: it reads what
@@ -127,6 +140,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
+use keeper_core::voice::level::{self, Meter};
 use keeper_core::voice::locale::{self, DeviceLocales};
 use keeper_core::voice::{
     Ask, Consent, ConsentPort, EventSink, Permission, TurnEvent, VoicePlatform, VoicePort,
@@ -142,11 +156,12 @@ use objc2_avf_audio::{
     AVAudioSessionInterruptionOptions, AVAudioSessionInterruptionType,
     AVAudioSessionInterruptionTypeKey, AVAudioSessionMediaServicesWereResetNotification,
     AVAudioSessionModeDefault, AVAudioSessionRecordPermission, AVAudioSessionSetActiveOptions,
-    AVAudioTime, AVSpeechBoundary, AVSpeechSynthesizer, AVSpeechUtterance,
+    AVAudioTime, AVSpeechBoundary, AVSpeechSynthesisVoice, AVSpeechSynthesizer, AVSpeechUtterance,
 };
 use objc2_foundation::{
     NSArray, NSError, NSLocale, NSNotification, NSNotificationCenter, NSNumber, NSString,
 };
+use objc2_natural_language::NLLanguageRecognizer;
 use objc2_speech::{
     SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionResult, SFSpeechRecognitionTask,
     SFSpeechRecognizer, SFSpeechRecognizerAuthorizationStatus,
@@ -202,8 +217,19 @@ enum Command {
         reply: SyncSender<Result<(), VoiceUnavailable>>,
     },
     Stop,
+    /// The languages this phone has synthesiser voices for.
+    Voices(SyncSender<Vec<String>>),
+    /// The locale recognition runs in, for the voice an answer defaults to.
+    Listening(SyncSender<String>),
+    /// The dominant language of a text, from among `constraints`.
+    Detect {
+        text: String,
+        constraints: Vec<String>,
+        reply: SyncSender<Option<String>>,
+    },
     Speak {
         text: String,
+        language: String,
         reply: SyncSender<Result<(), VoiceUnavailable>>,
     },
     StopSpeaking,
@@ -303,10 +329,34 @@ impl VoicePort for IosVoicePort {
         self.tell(Command::Stop);
     }
 
-    fn speak(&self, text: &str) -> Result<(), VoiceUnavailable> {
+    fn voices(&self) -> Vec<String> {
+        self.ask(Command::Voices).unwrap_or_default()
+    }
+
+    fn listening(&self) -> String {
+        self.ask(Command::Listening).unwrap_or_default()
+    }
+
+    fn detect_language(&self, text: &str, constraints: &[String]) -> Option<String> {
         let text = text.to_owned();
-        self.ask(|reply| Command::Speak { text, reply })
-            .unwrap_or(Err(VoiceUnavailable::Unsupported))
+        let constraints = constraints.to_vec();
+        self.ask(|reply| Command::Detect {
+            text,
+            constraints,
+            reply,
+        })
+        .flatten()
+    }
+
+    fn speak(&self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
+        let text = text.to_owned();
+        let language = language.to_owned();
+        self.ask(|reply| Command::Speak {
+            text,
+            language,
+            reply,
+        })
+        .unwrap_or(Err(VoiceUnavailable::Unsupported))
     }
 
     fn stop_speaking(&self) {
@@ -389,6 +439,9 @@ struct Worker {
     /// the moment a language the person just added to Dictation would be
     /// looked for. Never per probe.
     locales: Option<DeviceLocales>,
+    /// The languages of `AVSpeechSynthesisVoice.speechVoices()`, each once,
+    /// sorted; filled on first need and refreshed with `locales` (Epic 64).
+    voices: Option<Vec<String>>,
     /// The session observers, removed when the worker ends.
     session_observers: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
 }
@@ -411,6 +464,7 @@ impl Worker {
             failed_starts: 0,
             requested: None,
             locales: None,
+            voices: None,
             session_observers,
         }
     }
@@ -430,6 +484,20 @@ impl Worker {
                     tracing::info!(?requested, "voice: locale choice set; re-enumerating");
                     self.requested = requested;
                     self.locales = None;
+                    self.voices = None;
+                }
+                Ok(Command::Voices(reply)) => {
+                    let _ = reply.send(self.voices().clone());
+                }
+                Ok(Command::Listening(reply)) => {
+                    let _ = reply.send(self.listening());
+                }
+                Ok(Command::Detect {
+                    text,
+                    constraints,
+                    reply,
+                }) => {
+                    let _ = reply.send(detect_language(&text, &constraints));
                 }
                 Ok(Command::Consent(reply)) => {
                     let _ = reply.send(recognizer_class().map(|()| Consent {
@@ -448,8 +516,12 @@ impl Worker {
                     let _ = reply.send(self.start(hints));
                 }
                 Ok(Command::Stop) => self.stop(),
-                Ok(Command::Speak { text, reply }) => {
-                    let _ = reply.send(self.speak(&text));
+                Ok(Command::Speak {
+                    text,
+                    language,
+                    reply,
+                }) => {
+                    let _ = reply.send(self.speak(&text, &language));
                 }
                 Ok(Command::StopSpeaking) => self.stop_speaking(),
                 Ok(Command::Audio(notice)) => self.on_audio(notice),
@@ -516,6 +588,29 @@ impl Worker {
         locale::choose(requested.as_deref(), &locales.system, &locales.on_device)
     }
 
+    /// The locale recognition runs in, as the surface shows it — core's
+    /// `in_force` over the same inputs as [`Worker::chosen`] (Epic 64: the
+    /// language an answer is spoken in when its own cannot be told).
+    fn listening(&mut self) -> String {
+        let requested = self.requested.clone();
+        let locales = self.locales();
+        locale::in_force(requested.as_deref(), &locales.system, &locales.on_device)
+    }
+
+    /// The languages this phone has voices for, from the cache or by
+    /// enumerating once.
+    fn voices(&mut self) -> &Vec<String> {
+        self.voices.get_or_insert_with(|| {
+            let voices = voice_languages();
+            tracing::info!(
+                count = voices.len(),
+                languages = ?voices,
+                "voice: synthesiser voice languages enumerated"
+            );
+            voices
+        })
+    }
+
     /// Whether listening and speaking can work right now (FR-402).
     ///
     /// Order: the recogniser class itself, then authorisation (both the
@@ -557,7 +652,7 @@ impl Worker {
     fn arm(&mut self) -> Result<(), String> {
         if self.capture.is_none() {
             configure_session(ARMED)?;
-            self.capture = Some(start_capture(&self.commands)?);
+            self.capture = Some(start_capture(&self.commands, Arc::clone(&self.sink))?);
         }
         self.roll_request()
     }
@@ -626,10 +721,28 @@ impl Worker {
         }
     }
 
-    /// Read `text` aloud; recognition rolls to a fresh request so that the
-    /// first transcript to arrive is the person, not the tail of what they
-    /// said before, and other audio ducks for the duration.
-    fn speak(&mut self, text: &str) -> Result<(), VoiceUnavailable> {
+    /// Read `text` aloud in the voice for `language` — core's choice over
+    /// this phone's inventory (Epic 64, AD-182); recognition rolls to a
+    /// fresh request so that the first transcript to arrive is the person,
+    /// not the tail of what they said before, and other audio ducks for
+    /// the duration. A language the framework answers no voice for is
+    /// refused before anything rolls or ducks: the default voice would be
+    /// the wrong language.
+    fn speak(&mut self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
+        let Some(voice) = voice_for_language(language) else {
+            tracing::warn!(
+                language,
+                "voice: no synthesiser voice for the chosen language"
+            );
+            return Err(VoiceUnavailable::NoVoice {
+                language: language.to_owned(),
+            });
+        };
+        tracing::info!(
+            language,
+            voice = %voice_name(&voice),
+            "voice: utterance voice chosen"
+        );
         if self.capture.is_some() {
             if let Err(error) = self.roll_request() {
                 tracing::warn!(%error, "voice: could not roll the request before speaking");
@@ -641,7 +754,7 @@ impl Worker {
         let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
         self.speaking.store(true, Ordering::SeqCst);
         self.speaking_since = Some(Instant::now());
-        speak_text(synthesizer, text);
+        speak_text(synthesizer, text, &voice);
         Ok(())
     }
 
@@ -1188,11 +1301,17 @@ fn release_session() {
 /// may only be toggled on a stopped engine, and a fresh one is always
 /// stopped. The tap reads the slot on every buffer, so a request can be
 /// rolled underneath it without touching the engine.
+///
+/// The tap also meters (Story 64.3, AD-186): the RMS of channel 0 of each
+/// buffer goes to a `keeper_core::voice::level::Meter`, and only the
+/// readings its limiter lets through — at most ~25 a second, only while
+/// the level moves — reach `sink` as [`TurnEvent::Level`]. The recogniser
+/// still receives every buffer, untouched, before the meter looks at it.
 #[allow(unsafe_code)]
 // The slot crosses to the audio thread inside a block, which Rust cannot see
 // and clippy therefore flags; the SAFETY comment below is the argument.
 #[allow(clippy::arc_with_non_send_sync)]
-fn start_capture(commands: &Sender<Command>) -> Result<Capture, String> {
+fn start_capture(commands: &Sender<Command>, sink: EventSink) -> Result<Capture, String> {
     // SAFETY: every object below is freshly allocated or retained here and
     // outlives every call made on it. `setVoiceProcessingEnabled:error:` is
     // called before `startAndReturnError:`, which Apple requires. The tap
@@ -1206,7 +1325,15 @@ fn start_capture(commands: &Sender<Command>) -> Result<Capture, String> {
     // so the swap under the lock is sound. The configuration-change observer
     // is registered for this engine only and removed in `stop_capture`;
     // its block captures a `Sender` and reads nothing from the notification.
-    // Failures surface as `NSError`.
+    // Failures surface as `NSError`. The meter reads the buffer after the
+    // append: `floatChannelData` is null when the format is not float (the
+    // tap is installed with the input node's own format, which is float on
+    // the phone's inputs, but the null is checked rather than assumed); when
+    // non-null it points at `stride`-interleaved samples of which
+    // `frameLength * stride` are valid for the duration of the tap call, so
+    // the slice built over them is read only inside the call and never
+    // stored. The meter's mutex is touched by the audio thread alone; the
+    // sink is `Send + Sync` by its type.
     let engine = unsafe { AVAudioEngine::new() };
     let input = unsafe { engine.inputNode() };
     unsafe { input.setVoiceProcessingEnabled_error(true) }
@@ -1215,12 +1342,32 @@ fn start_capture(commands: &Sender<Command>) -> Result<Capture, String> {
 
     let slot: Arc<RequestSlot> = Arc::new(Mutex::new(None));
     let fed = Arc::clone(&slot);
+    let meter = Mutex::new(Meter::new());
+    let epoch = Instant::now();
     let tap = RcBlock::new(
         move |buffer: std::ptr::NonNull<AVAudioPCMBuffer>,
               _when: std::ptr::NonNull<AVAudioTime>| {
             let request = fed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(request) = request.as_ref() {
                 unsafe { request.appendAudioPCMBuffer(buffer.as_ref()) };
+            }
+            drop(request);
+            let buffer = unsafe { buffer.as_ref() };
+            let channels = unsafe { buffer.floatChannelData() };
+            if channels.is_null() {
+                return;
+            }
+            let frames = unsafe { buffer.frameLength() } as usize;
+            let stride = unsafe { buffer.stride() }.max(1);
+            let samples =
+                unsafe { std::slice::from_raw_parts((*channels).as_ptr(), frames * stride) };
+            let rms = level::rms(samples.iter().copied().step_by(stride));
+            let reading = meter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .feed(rms, epoch.elapsed());
+            if let Some(level) = reading {
+                sink(TurnEvent::Level(level));
             }
         },
     );
@@ -1453,15 +1600,85 @@ fn new_synthesizer() -> Retained<AVSpeechSynthesizer> {
     unsafe { AVSpeechSynthesizer::new() }
 }
 
-/// `speakUtterance:` with the system voice for the current language.
+/// The languages of every installed voice (`+[AVSpeechSynthesisVoice
+/// speechVoices]`), as the framework spells them (`pl-PL`), each once,
+/// sorted; the caller caches the answer.
 #[allow(unsafe_code)]
-fn speak_text(synthesizer: &AVSpeechSynthesizer, text: &str) {
+fn voice_languages() -> Vec<String> {
+    // SAFETY: `speechVoices` returns an array the binding retains, and
+    // `language` is a read-only property on each retained voice. Neither
+    // prompts nor touches the network: the list is the voices installed on
+    // this phone.
+    let voices = unsafe { AVSpeechSynthesisVoice::speechVoices() };
+    let mut languages: Vec<String> = voices
+        .to_vec()
+        .iter()
+        .map(|voice| unsafe { voice.language() }.to_string())
+        .collect();
+    languages.sort_unstable();
+    languages.dedup();
+    languages
+}
+
+/// `+[AVSpeechSynthesisVoice voiceWithLanguage:]` for `language`: the
+/// system's default voice for that language, or `None` when it has none —
+/// which the caller refuses rather than letting the utterance take the
+/// default voice of another language.
+#[allow(unsafe_code)]
+fn voice_for_language(language: &str) -> Option<Retained<AVSpeechSynthesisVoice>> {
+    // SAFETY: a class method taking a BCP-47 string; it answers nil for a
+    // language with no voice, which objc2 surfaces as `None`. It neither
+    // prompts nor touches the network.
+    unsafe { AVSpeechSynthesisVoice::voiceWithLanguage(Some(&NSString::from_str(language))) }
+}
+
+/// The voice's `name`, for the log line that says which voice spoke.
+#[allow(unsafe_code)]
+fn voice_name(voice: &AVSpeechSynthesisVoice) -> String {
+    // SAFETY: a read-only property on the retained voice.
+    unsafe { voice.name() }.to_string()
+}
+
+/// The dominant language of `text` by `NLLanguageRecognizer`, constrained
+/// to `constraints` (language subtags, `pl`, `en`), or `None` when the
+/// recogniser cannot tell. On-device: `NaturalLanguage` has no network
+/// path, and no text leaves this phone to be classified (AD-188).
+#[allow(unsafe_code)]
+fn detect_language(text: &str, constraints: &[String]) -> Option<String> {
+    if constraints.is_empty() {
+        return None;
+    }
+    // SAFETY: a plain allocation; `setLanguageConstraints:` copies the
+    // array of language strings; `processString:` reads the string and
+    // `dominantLanguage` answers a retained string or nil. All are
+    // documented on the object itself, and none prompt or touch the
+    // network.
+    let recognizer = unsafe { NLLanguageRecognizer::new() };
+    let languages: Vec<Retained<NSString>> = constraints
+        .iter()
+        .map(|language| NSString::from_str(language))
+        .collect();
+    unsafe { recognizer.setLanguageConstraints(&NSArray::from_retained_slice(&languages)) };
+    unsafe { recognizer.processString(&NSString::from_str(text)) };
+    let dominant = unsafe { recognizer.dominantLanguage() }?.to_string();
+    // `NLLanguageUndetermined` is spelled `und`; the binding may hand it
+    // over rather than nil, and it means the same thing.
+    (dominant != "und" && !dominant.is_empty()).then_some(dominant)
+}
+
+/// `speakUtterance:` with `voice` set on the utterance explicitly (Epic
+/// 64, AD-182) — never the default voice, which is the language of the
+/// system and not necessarily of the text.
+#[allow(unsafe_code)]
+fn speak_text(synthesizer: &AVSpeechSynthesizer, text: &str, voice: &AVSpeechSynthesisVoice) {
     // SAFETY: the utterance is freshly allocated from a Rust string and
-    // retained across the call; `speakUtterance:` copies what it needs and
-    // queues it. Both are documented as callable from any thread.
+    // retained across the call; `setVoice:` retains the voice on it;
+    // `speakUtterance:` copies what it needs and queues it. All are
+    // documented as callable from any thread.
     let utterance = unsafe {
         AVSpeechUtterance::initWithString(AVSpeechUtterance::alloc(), &NSString::from_str(text))
     };
+    unsafe { utterance.setVoice(Some(voice)) };
     unsafe { synthesizer.speakUtterance(&utterance) };
 }
 

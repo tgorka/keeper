@@ -22,6 +22,11 @@
  * Re-arming a persisted switch is deliberately **not** done here: arming is
  * the person's act with keeper in front, and the shell holds the turn across
  * pane remounts, so a phrase armed once stays armed until they turn it off.
+ *
+ * Since Epic 64 (Story 64.3, AD-186) a `listening`/`heard` snapshot also
+ * arrives whenever the input level moves — Rust bounds that to ~25 a second
+ * and to changes only, so the sink here stays a plain mirror: no throttling,
+ * no coalescing, every snapshot is the truth at the moment it was sent.
  */
 import { useEffect } from "react";
 import { readVoiceFacts } from "@/hooks/use-voice-facts";

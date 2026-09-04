@@ -366,4 +366,20 @@ objc2-avf-audio = { version = "0.3.2", default-features = false, features = [
     "bitflags",
     "block2",
 ] }
+# On-device language detection for the answer a voice turn will read aloud
+# (Epic 64, Story 64.2, AD-182, AD-188): `NLLanguageRecognizer`, constrained to
+# the languages this device has synthesiser voices for, so a Polish answer on
+# an English-listening Mac is spoken by the Polish voice rather than the
+# default English one. A system framework — no model weights shipped, no
+# network path, no new destination in `docs/egress.md`. Consumed by the
+# `keeper` crate under its iOS and macOS target tables only. Chosen over the
+# Rust detectors: `whatlang`'s corpus terms are unverified and `lingua`'s
+# models derive from a CC BY-NC corpus. `Zlib OR Apache-2.0 OR MIT` — passes
+# the cargo-deny license firewall. objc2 ≥ 0.6.2 and objc2-foundation ^0.3.2,
+# both already resolved in the lock.
+objc2-natural-language = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NLLanguage",
+    "NLLanguageRecognizer",
+] }
 
