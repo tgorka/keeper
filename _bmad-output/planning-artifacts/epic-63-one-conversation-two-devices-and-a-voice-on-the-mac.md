@@ -29,21 +29,33 @@ voice turn without the phrase — **all three already ship**, and the repository
 | "mozliwosc pisania rozmowy" | `BotComposer` always mounted; Enter sends; Send enabled once a bot and a model are chosen (the first of each is auto-chosen) | `bots-phone-pane.tsx:423-463`, `:283-303` |
 | "przycisk wymuszający voice (nie czekający na nixie)" | the `Talk` button, whose press dispatches `TurnEvent::WakeMatched` — the *same* event a matched phrase produces, so the wake switch is irrelevant to it | `bots-phone-pane.tsx:429-438`; `voice_ipc.rs:262-266`; `keeper-core/src/voice/mod.rs:242-249` |
 
-The screen he saw was empty because **the coordinator mis-built the bundle**: `tauri ios build
---debug` embedded no frontend, so the webview had nothing to render and fell back to the dev-server
-URL that a phone cannot reach. Verified by inspecting the installed bundle: `assets/` empty, no
-`index.html`, and `grep -rlo "Listen for a phrase" keeper.app` → 0 hits for every UI string tried.
-The documented recipe is `bun run tauri ios build --export-method debugging` (`docs/ios.md`,
-"Building a shareable IPA").
+**The real cause, found on 2026-09-04 from the owner's own screenshot, after two wrong diagnoses
+below that are kept because both were argued from evidence and both were wrong.** His phone was
+showing the **quick-capture window** — `capture.html`, the desktop notes panel, recognisable by its
+pin / lock / close bar — with the sentence `Command notes_capture_draft not found` in red, because
+that command is desktop-only. `tauri.conf.json` declares two windows for every target, `main` and
+`quick-capture` (`visible: false`, a desktop notion); on iOS Tauri creates both and the second
+webview covers the first. The simulator had shown exactly this error on the epic's first day and it
+was dismissed as "pre-existing, from the desktop notes surface". It was the whole report. Fixed by
+`tauri.ios.conf.json` overriding `app.windows` to `main` alone (a platform overlay's array replaces
+the base array); the simulator then boots to the first-run card, and the phone install carries it.
 
-**Corrected while story 63.2 was being built, and worth stating because the first version of this
-paragraph was wrong:** `strings keeper | grep -c localhost:1420` → 1 on a **correct** release build
-too. `tauri-codegen` compiles the whole of `tauri.conf.json` into every binary, `build.devUrl`
-included (`tauri-utils-2.9.3/src/tokens.rs`, `BuildConfig::to_tokens`, emitted unconditionally), so
-the dev URL is not a discriminator and a guard that refused on it would refuse every install. What a
-dev build actually lacks is the **embedded frontend**: dev mode emits `EmbeddedAssets::default()`
-(`tauri-codegen-2.6.3/src/context.rs:178`) instead of the map whose keys are the frontend's own
-asset paths. That is what 63.2's guard tests for.
+*First diagnosis, wrong:* `tauri ios build --debug` "embedded no frontend". The evidence offered
+was an empty `assets/` and `grep -rlo "Listen for a phrase" keeper.app` → 0. Neither is evidence:
+a release IPA leaves `assets/` empty too (it is an Xcode source directory; the frontend is compiled
+into the binary, 127 embedded asset paths measured on the real artefact), and UI strings live inside
+compressed assets, so a grep for them finds nothing in a correct build either.
+
+*Second diagnosis, also wrong, corrected while story 63.2 was being built:*
+`strings keeper | grep -c localhost:1420` → 1 on a **correct** release build too. `tauri-codegen`
+compiles the whole of `tauri.conf.json` into every binary, `build.devUrl` included
+(`tauri-utils-2.9.3/src/tokens.rs`, `BuildConfig::to_tokens`), so the dev URL is not a
+discriminator. What a *dev-mode* build lacks is the embedded frontend (`EmbeddedAssets::default()`,
+`tauri-codegen-2.6.3/src/context.rs:178`); that is what 63.2's guard tests for, and it is a real
+guard — it just was not the cause of this report.
+
+The documented build recipe remains `bun run tauri ios build --export-method debugging`
+(`docs/ios.md`), now driven by `scripts/install-ios.sh`.
 
 So this epic does **not** redesign the phone's Bots surface. It does three smaller, real things the
 map exposed while looking, and then spends its weight where the gaps actually are.

@@ -382,6 +382,7 @@ fi
 rm -f "$INSTALL_LOG"
 
 say "launching $BUNDLE_ID on $DEVICE_NAME"
+LAUNCHED_BY_HAND=""
 LAUNCH_LOG="$(mktemp "${TMPDIR:-/tmp}/keeper-ios-launch.XXXXXX.log")"
 LAUNCH_CMD="xcrun devicectl device process launch --device $UDID $BUNDLE_ID"
 if ! remote "$LAUNCH_CMD" 2>&1 | tee "$LAUNCH_LOG"; then
@@ -391,7 +392,14 @@ if ! remote "$LAUNCH_CMD" 2>&1 | tee "$LAUNCH_LOG"; then
   if grep -qiE 'profile.*(expired|no longer valid|invalid)|expired.*profile' "$LAUNCH_LOG"; then
     fail "iOS refused the launch for a lapsed provisioning profile. A free Personal Team's profile lasts 7 days; re-arm it as docs/ios.md \"The 7-day re-arm ritual\" says (re-running this script re-signs and reinstalls with a fresh profile, and the phone keeps its data)."
   fi
-  fail "devicectl could not launch $BUNDLE_ID on $DEVICE_NAME (output above; kept at $LAUNCH_LOG). It is installed; tap the icon to see what the phone says."
+  if grep -q 'could not be, unlocked' "$LAUNCH_LOG"; then
+    # Measured 2026-09-04: SBMainWorkspace answers "Locked" for a phone with its
+    # screen off. The install is complete; only the launch is refused.
+    say "keeper is installed on $DEVICE_NAME, but iOS will not launch an app while the phone is locked. Unlock it and tap the icon, or from here once it is unlocked: ssh $HOST '$LAUNCH_CMD'."
+    LAUNCHED_BY_HAND=1
+  else
+    fail "devicectl could not launch $BUNDLE_ID on $DEVICE_NAME (output above; kept at $LAUNCH_LOG). It is installed; tap the icon to see what the phone says."
+  fi
 fi
 rm -f "$LAUNCH_LOG"
 
@@ -433,7 +441,11 @@ rm -rf "\$(dirname "\$(dirname "\$app")")"
 EOF
 )" || fail "the proofs could not be read off the bundle (output above)."
 
-say "keeper is running on $DEVICE_NAME"
+if [ -n "${LAUNCHED_BY_HAND:-}" ]; then
+  say "keeper is installed on $DEVICE_NAME and waits for you to unlock the phone and tap it"
+else
+  say "keeper is running on $DEVICE_NAME"
+fi
 cat <<EOF
 
 What is still yours to do, on the phone, in this order — none of it can be
