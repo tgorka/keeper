@@ -150,9 +150,16 @@ _keeper_check_unpacked() {
     return 1
   fi
 
-  if ! strings -a "$bin" | grep -qF -- "$marker"; then
+  # `grep -a` on the file itself, NEVER `strings -a … | grep -q`. Measured on
+  # hesperia 2026-09-04 against the real 136 MB signed binary: `grep -q` exits
+  # at its first hit, `strings` then dies of SIGPIPE, and under `set -o
+  # pipefail` the pipeline returns 141 — which this guard read as "the chunk is
+  # absent" and used to refuse a perfectly good release build. The small
+  # fixtures never caught it because `strings` finished before `grep` quit, so
+  # the bug only appeared on an artefact big enough to matter.
+  if ! grep -a -qF -- "$marker" "$bin"; then
     pointed=""
-    if strings -a "$bin" | grep -qF -- "$dev_url"; then
+    if grep -a -qF -- "$dev_url" "$bin"; then
       pointed=" Its webview is pointed at $dev_url (build.devUrl), a dev server that runs on nobody's phone and in nobody's /Applications."
     fi
     _keeper_bundle_refuse "$recipe" \

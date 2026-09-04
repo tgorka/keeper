@@ -197,6 +197,22 @@ describe("check-bundle.sh on a macOS .app", () => {
     expect(r.err).toContain("embeds no frontend");
     expect(r.err).toContain("bun run tauri:build");
   });
+
+  // The defect this test exists for, measured on hesperia 2026-09-04: the guard
+  // refused a perfectly good 136 MB signed release build. `strings -a … | grep
+  // -qF` quits at the first hit, `strings` dies of SIGPIPE, and under `set -o
+  // pipefail` the pipeline yields 141, which the guard read as "the chunk is
+  // absent". Every fixture above is small enough that `strings` finishes before
+  // `grep` quits, so none of them could ever have caught it. This one carries
+  // the chunk near the FRONT and megabytes of padding behind it, which is the
+  // shape that makes an early-exiting reader race its producer.
+  it("passes a large executable whose chunk sits early, where an early-exiting grep would race", () => {
+    const padding = Buffer.alloc(24 * 1024 * 1024, 0x41);
+    const big = Buffer.concat([binary(ENTRY, DEV_URL), padding]);
+    const r = run(macApp(big), { KEEPER_REPO_ROOT: macRoot });
+    expect(r.err).toBe("");
+    expect(r.status).toBe(0);
+  });
 });
 
 describe.skipIf(!python3)("check-bundle.sh on an .ipa", () => {
