@@ -1222,6 +1222,13 @@ development_status:
   63-7-follow-from-the-other-device: backlog
   63-8-the-docs-the-disclosures-the-guards: backlog
 
+# Epic 64 (`epic-64-a-voice-that-shows-itself-and-speaks-a-language-it-has.md`).
+  64-1-the-transcript-gets-its-space-back: backlog
+  64-2-spoken-in-a-voice-it-has: backlog
+  64-3-a-turn-that-has-a-level-and-a-middle: backlog
+  64-4-a-pill-that-shows-it-hears: backlog
+  64-5-the-record-and-the-gates: backlog
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
