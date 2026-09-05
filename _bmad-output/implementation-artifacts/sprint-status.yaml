@@ -1245,6 +1245,12 @@ development_status:
   66-5-a-push-keeper-does-itself: backlog
   66-6-the-disclosure-the-docs-and-the-gates: backlog
 
+  # Epic 67 — a turn that finishes without the screen (2026-09-05)
+  67-1-the-turn-lives-in-rust: backlog
+  67-2-the-lock-screen-says-what-keeper-heard: backlog
+  67-3-stop-and-an-ear-that-does-not-hear-itself: backlog
+  67-4-the-record-and-the-gates: backlog
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
