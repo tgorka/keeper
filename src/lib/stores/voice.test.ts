@@ -13,6 +13,8 @@ const WAKE = {
   locale: "en-US",
   localeChosen: null,
   onDeviceLocales: ["en-US"],
+  stopPhrase: "stop",
+  voiceTarget: null,
 };
 
 afterEach(() => {

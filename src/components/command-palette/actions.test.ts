@@ -33,7 +33,10 @@ vi.mock("@/lib/recording-control", () => ({
 }));
 
 import { dispatchPaletteAction, paletteActionHandlers } from "@/components/command-palette/actions";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
+import { searchStore } from "@/lib/stores/search";
+import { searchSurfaceStore } from "@/lib/stores/search-surface";
 
 beforeEach(() => {
   recordingRevealFolder.mockReset().mockResolvedValue(undefined);
@@ -141,5 +144,56 @@ describe("the tasks palette verb (Epic 57, FR-351, FR-352)", () => {
   it("opens the Tasks view", () => {
     void dispatchPaletteAction("tasks-view", null);
     expect(primaryViewStore.getState().view).toBe("tasks");
+  });
+});
+
+describe("open-search on the phone tier (Story 66.1, DW-111)", () => {
+  /** A viewport-only phone: matchMedia says narrow, the capabilities say nothing. */
+  function mockViewport(phone: boolean) {
+    window.matchMedia = vi.fn().mockImplementation((query: string) => ({
+      matches: phone && /max-width/.test(query),
+      media: query,
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+  }
+
+  const originalMatchMedia = window.matchMedia;
+  beforeEach(() => {
+    searchStore.setState({ isOpen: false });
+    searchSurfaceStore.setState({ isOpen: false, scope: "chats", chatLock: null });
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  });
+  afterEach(() => {
+    window.matchMedia = originalMatchMedia;
+  });
+
+  it("opens the full-screen phone surface, never the desktop dialog, on a narrow viewport", () => {
+    mockViewport(true);
+    void dispatchPaletteAction("open-search", null);
+    expect(searchSurfaceStore.getState().isOpen).toBe(true);
+    expect(searchStore.getState().isOpen).toBe(false);
+  });
+
+  it("opens the phone surface on a reduced-capability platform at any width", () => {
+    // An iPhone rotated wide is still an iPhone (Epic 65, AD-189): the tier is
+    // the platform's, so the surface follows the capabilities, not the width.
+    mockViewport(false);
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    void dispatchPaletteAction("open-search", null);
+    expect(searchSurfaceStore.getState().isOpen).toBe(true);
+    expect(searchStore.getState().isOpen).toBe(false);
+  });
+
+  it("keeps the desktop dialog on the desktop tier", () => {
+    mockViewport(false);
+    void dispatchPaletteAction("open-search", null);
+    expect(searchStore.getState().isOpen).toBe(true);
+    expect(searchStore.getState().scope).toBe("global");
+    expect(searchSurfaceStore.getState().isOpen).toBe(false);
   });
 });

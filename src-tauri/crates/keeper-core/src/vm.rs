@@ -109,6 +109,20 @@ pub struct CapabilitiesVm {
     /// "Reveal in Finder"-style file-manager reveal (Story 5.5) exists on this
     /// platform.
     pub reveal_in_file_manager: bool,
+    /// Share-out — handing a file to the OS share sheet — exists on this
+    /// platform (Story 66.3, AD-200): `true` only on iOS, where
+    /// `UIActivityViewController` is the phone's reveal. Computed in the shell
+    /// like every other flag here (AD-26).
+    ///
+    /// **Inverted against every other flag in this struct, on purpose.** The
+    /// others are true on the desktop and false on the phone; this one is the
+    /// phone's answer to [`Self::reveal_in_file_manager`], and a surface offers
+    /// exactly one of the two — Reveal where the desktop flag is on, Share
+    /// where this one is — each absent rather than disabled where its flag is
+    /// off (AD-27). The frontend's tier fold (`isReducedCapabilityPlatform`)
+    /// therefore leaves it out by name: a phone-only truth must not read as a
+    /// desktop.
+    pub share_out: bool,
     /// Screen recording (Story 16.3) exists on this platform: `true` only on
     /// desktop macOS ≥ 13.0 (the system-audio floor), `false` on older macOS,
     /// every non-macOS desktop, and iOS. Computed in the shell from a runtime
@@ -7101,9 +7115,10 @@ pub enum VoiceUnavailableVm {
     },
 }
 
-/// The wake phrase's switch and words (Epic 62, Story 62.5, FR-404–FR-406)
-/// and the recogniser's language (Epic 63), from `voice_wake_get` and back
-/// from `voice_wake_set` and `voice_locale_set`.
+/// The wake phrase's switch and words (Epic 62, Story 62.5, FR-404–FR-406),
+/// the recogniser's language (Epic 63), the stop phrase (Epic 67, AD-208)
+/// and the bot a spoken turn goes to (Epic 67, AD-206), from `voice_wake_get`
+/// and back from `voice_wake_set`, `voice_locale_set` and `voice_target_set`.
 ///
 /// `limits` is the port's own `VoicePlatform::limits` carried to the surface
 /// rather than retyped there: the sentence beside the switch is decided once,
@@ -7129,6 +7144,38 @@ pub struct VoiceWakeVm {
     /// Every locale this device can recognise on its own, sorted by
     /// identifier; empty when none can.
     pub on_device_locales: Vec<String>,
+    /// The word that ends a spoken answer, as typed (`bots.stop_phrase`);
+    /// never blank.
+    pub stop_phrase: String,
+    /// `bots.voice_target` as stored — the id of the pinned bot a spoken
+    /// turn goes to; `None` means "the pinned bot most recently talked to".
+    pub voice_target: Option<String>,
+}
+
+/// One thing the voice port did (Epic 65, Story 65.3, AD-192), from
+/// `voice_events`, newest first. A projection of
+/// `keeper_core::voice::events::VoiceEvent`: `kind` is the closed set's
+/// stable string (`armed`, `refused`, `interruption_begun`,
+/// `interruption_ended`, `media_reset`, `route_changed`, `resumed`,
+/// `rolled`, `turn:<state>`, `wake_matched`, `spoken`, `disarmed`,
+/// `island:<what>`) and `detail` the words that go with
+/// it — a refusal's sentence, a transcript — or `null`. A view of memory: the
+/// ring is bounded, on the device, and never written anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VoiceEventVm {
+    /// The event's position in the ring's history: monotonic, never reused,
+    /// so a row can be keyed on it.
+    #[ts(type = "number")]
+    pub seq: u64,
+    /// When, ms since the Unix epoch (UTC), as the shell's clock said.
+    #[ts(type = "number")]
+    pub at_ms: i64,
+    /// What happened, in the stable string form.
+    pub kind: String,
+    /// The words that go with it, or `null`.
+    pub detail: Option<String>,
 }
 
 #[cfg(test)]

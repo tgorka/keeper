@@ -31,6 +31,7 @@ import type { IpcError, SearchHitVm } from "@/lib/ipc/client";
 import { searchArchive } from "@/lib/ipc/client";
 import { buildSearchFilter, type SearchUiFilter } from "@/lib/search-filter";
 import { useAccountsStore } from "@/lib/stores/accounts";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { exportStore } from "@/lib/stores/export";
 import { useNetworksStore } from "@/lib/stores/networks";
 import { primaryViewStore } from "@/lib/stores/primary-view";
@@ -40,6 +41,18 @@ import { cn } from "@/lib/utils";
 
 /** Debounce (ms) before a keystroke fires `searchArchive`. */
 const DEBOUNCE_MS = 200;
+
+/**
+ * The honest-offline line under the header, in two device nouns (DW-112,
+ * Story 66.1). "On this Mac" is the desktop's and stays verbatim there; the
+ * reduced-capability tier — the phone, which is not a Mac — gets the
+ * device-neutral sentence rather than a guessed model name, because this
+ * panel is shared and a wrong noun is worse than none.
+ */
+export const SEARCH_OFFLINE_MAC_SENTENCE =
+  "Search works fully offline against your local archive on this Mac.";
+export const SEARCH_OFFLINE_DEVICE_SENTENCE =
+  "Search works fully offline against your local archive on this device.";
 
 /** Structural guard for the IpcError envelope surfaced on a search rejection. */
 function isIpcError(value: unknown): value is IpcError {
@@ -270,6 +283,8 @@ export function SearchPanel({
     primaryViewStore.getState().setView("approval");
     onClose();
   }, [onClose]);
+  // DW-112: which device noun the offline line names.
+  const reducedCapability = useIsReducedCapabilityPlatform();
 
   const showNoResults = hasSearched && error === null && hits.length === 0 && query.trim() !== "";
 
@@ -285,7 +300,7 @@ export function SearchPanel({
             Searching your local archive
           </h2>
           <p className="text-xs text-muted-foreground">
-            Search works fully offline against your local archive on this Mac.
+            {reducedCapability ? SEARCH_OFFLINE_DEVICE_SENTENCE : SEARCH_OFFLINE_MAC_SENTENCE}
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">

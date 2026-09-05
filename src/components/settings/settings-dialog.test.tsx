@@ -115,6 +115,9 @@ vi.mock("@/lib/ipc/client", () => ({
   egressList: vi.fn(() => Promise.resolve([])),
   debugModeGet: vi.fn(() => Promise.resolve(false)),
   debugModeSet: vi.fn(() => Promise.resolve()),
+  // Story 65.3: where this device's log is, and the voice port's record.
+  debugLogPath: vi.fn(() => Promise.resolve("/Users/alice/Library/Logs/keeper/keeper.log")),
+  voiceEvents: vi.fn(() => Promise.resolve([])),
   verificationCancel: vi.fn(() => Promise.resolve()),
   iosSyncDisclosureShownGet: vi.fn(() => Promise.resolve(true)),
   iosSyncDisclosureShownSet: vi.fn(() => Promise.resolve()),
@@ -136,6 +139,7 @@ vi.mock("@/lib/ipc/client", () => ({
       state: "unsupported",
       summary: null,
       problem: null,
+      engine: "git",
       configuredPath: null,
     }),
   ),
@@ -276,6 +280,8 @@ const DESKTOP_CAPABILITIES = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  // Story 66.3: the phone's reveal; false on every desktop fixture.
+  shareOut: false,
   recording: false,
   sync: false,
   notes: false,
@@ -351,6 +357,7 @@ beforeEach(() => {
     state: "unsupported",
     summary: null,
     problem: null,
+    engine: "git",
     configuredPath: null,
   });
   accountsStore.getState().clear();
@@ -1042,6 +1049,7 @@ describe("SettingsDialog git report placement", () => {
       state: "tooOld",
       summary: null,
       problem: "/usr/local/bin/git is 2.23, below the 2.42 floor",
+      engine: "git",
       configuredPath: null,
     });
   });

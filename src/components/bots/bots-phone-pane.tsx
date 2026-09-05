@@ -28,12 +28,27 @@
  * # The transcript gets the height (Story 61.14, held here too)
  *
  * The conversation level is one column: a 52px header, the transcript as the
- * single `min-h-0 flex-1 overflow-y-auto` region, the talk-mode caption when
- * there is one, and the composer. Every band but the transcript is `shrink-0`
+ * single `min-h-0 flex-1 overflow-y-auto` region, the voice line when there
+ * is one, and the composer. Every band but the transcript is `shrink-0`
  * and bounded, which at phone height means the composer plus at most one
  * caption above the keyboard — the wake-phrase band, a switch, a field and
  * two sentences on the desktop, lives in the sheet here for exactly that
  * reason. jsdom lays nothing out, so the test is structural.
+ *
+ * # What the ear is doing, on the phone's face (Epic 65, Story 65.2, AD-191)
+ *
+ * The desktop folds the wake band to one truthful line above the transcript
+ * (`voiceFoldedLine`, AD-184); the phone had the band in the sheet and the
+ * reason a phrase was not listening with it, so the owner's phone said
+ * nothing about why. {@link BotsPhoneVoiceLine} is the phone's equivalent:
+ * the one caption above the composer, {@link phoneVoiceLine} — the setting
+ * (armed or off, the phrase, the language), the refusal's first clause when
+ * the port refuses, and the turn's live state while one runs. It replaces
+ * the desktop's `BotVoiceStatus` on this tier, so the band count stays at
+ * one; tapping it opens the sheet, where the whole sentence and its remedy
+ * sit beside the switch that fixes it. The Open Settings control a refused
+ * permission needs (FR-408) rides the same line, because the OS will not
+ * ask again and the sheet has no way to Settings > keeper.
  *
  * The pinned bots (Story 63.1, FR-412) are on the LIST level for the same
  * reason, not over the transcript where the desktop draws them: a 49px band
@@ -50,7 +65,7 @@
  * composition simply never mounts the grant bar or the paste hook. A
  * slash-command that would point at the bar answers with a sentence instead.
  */
-import { type Ref, useEffect, useRef, useState } from "react";
+import { type Ref, useEffect, useState } from "react";
 import { BotComposer } from "@/components/bots/bot-composer";
 import { BotConversation } from "@/components/bots/bot-conversation";
 import { BOTS_NO_DRIVE_HERE_SENTENCE, BotEmptyState } from "@/components/bots/bot-empty-state";
@@ -59,8 +74,12 @@ import { BotPicker } from "@/components/bots/bot-picker";
 import { BotPinsStrip } from "@/components/bots/bot-pins-strip";
 import { BotSessionList } from "@/components/bots/bot-session-list";
 import { botCommandContext, botCommandHost } from "@/components/bots/bot-slash-menu";
-import { BotVoiceMic, BotVoiceStatus } from "@/components/bots/bot-voice-mic";
-import { BotVoiceWake } from "@/components/bots/bot-voice-wake";
+import { BotVoiceMic, VOICE_OPEN_SETTINGS_LABEL } from "@/components/bots/bot-voice-mic";
+import {
+  BotVoiceWake,
+  voiceFoldedLine,
+  voiceRefusalClause,
+} from "@/components/bots/bot-voice-wake";
 import {
   BOTS_PANE_TITLE,
   BOTS_READ_FAILED,
@@ -72,6 +91,7 @@ import {
   PHONE_INBOX_TITLE,
   PhoneBackBar,
 } from "@/components/layout/phone-header";
+import { Button } from "@/components/ui/button";
 import {
   Sheet,
   SheetContent,
@@ -79,7 +99,9 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { useSpokenStream } from "@/hooks/use-spoken-stream";
 import { useVoiceStream } from "@/hooks/use-voice-stream";
+import type { VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/client";
 import {
   botsBotsList,
   botsChatSend,
@@ -89,10 +111,14 @@ import {
   botsProvidersList,
   botsSessionOpen,
   botsSessionsList,
+  iosOpenAppSettings,
 } from "@/lib/ipc/client";
 import { botsStore, lastAnswer, useBotsStore } from "@/lib/stores/bots";
+import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { syncErrorMessage } from "@/lib/stores/sync";
+import { useVoiceStore } from "@/lib/stores/voice";
+import { cn } from "@/lib/utils";
 
 /** The list level's back control: the level beneath it is the Inbox. */
 export const BOTS_PHONE_BACK_TO_INBOX = PHONE_BACK_TO_INBOX;
@@ -129,6 +155,105 @@ export const BOTS_PHONE_CONVERSATION_SLOT = "bots-phone-conversation";
 export const BOTS_PHONE_COMMAND_GRANT = BOTS_NO_DRIVE_HERE_SENTENCE;
 export const BOTS_PHONE_COMMAND_HISTORY = "Your conversations are one level back.";
 export const BOTS_PHONE_COMMAND_METADATA = `The per-answer details toggle is in the ${BOTS_PHONE_PICKER_LABEL} sheet.`;
+
+/** The voice line's accessible name: it is a control, and it opens the sheet. */
+export const BOTS_PHONE_VOICE_LINE_LABEL = "Listening state";
+
+/** The live state word the voice line carries while a turn runs (AD-191). */
+export const VOICE_PHONE_STATE_WORDS = {
+  listening: "Listening",
+  heard: "Heard",
+  sending: "Sending",
+  speaking: "Speaking",
+} as const;
+
+/**
+ * The one line the phone says about its ear (AD-191): what the desktop's
+ * folded line says — the setting and the refusal's first clause — plus the
+ * turn's live state. While the turn listens and has heard something, the
+ * words heard so far are the line, as they were on the status line this
+ * replaces: a person mid-sentence needs to see what is being taken down,
+ * not the phrase. A port that refused when the phrase was armed puts the
+ * turn in `failed`; when the availability probe did not carry that reason,
+ * the turn's own is appended, so the line says why either way. Nothing here
+ * decides — every word is Rust's, or the setting's.
+ */
+export function phoneVoiceLine(
+  wake: VoiceWakeVm,
+  unavailable: VoiceUnavailableVm | null,
+  state: VoiceStateVm | null,
+): string {
+  if (state?.kind === "listening" && state.heard.length > 0) {
+    return `${VOICE_PHONE_STATE_WORDS.listening} · ${state.heard}`;
+  }
+  const line = voiceFoldedLine(wake, unavailable);
+  switch (state?.kind) {
+    case "listening":
+    case "heard":
+    case "sending":
+    case "speaking":
+      return `${line} · ${VOICE_PHONE_STATE_WORDS[state.kind]}`;
+    case "failed":
+      return unavailable === null ? `${line} · ${voiceRefusalClause(state.reason)}` : line;
+    default:
+      return line;
+  }
+}
+
+/**
+ * The band above the phone's composer. Absent exactly where the wake band is
+ * absent (AD-27: `capabilities.bots` off, availability unanswered or
+ * `unsupported`, the setting unread), so the resting column keeps its three
+ * bands. A `status` live region, and a button: tapping opens the sheet.
+ */
+export function BotsPhoneVoiceLine({ onOpen }: { onOpen: () => void }) {
+  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
+  const unavailable = useVoiceStore((s) => s.unavailable);
+  const wake = useVoiceStore((s) => s.wake);
+  const state = useVoiceStore((s) => s.state);
+
+  if (!bots || unavailable === undefined || unavailable?.kind === "unsupported" || wake === null) {
+    return null;
+  }
+
+  const line = phoneVoiceLine(wake, unavailable, state);
+  const failed = unavailable === null && state?.kind === "failed";
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-border border-t px-4">
+      <button
+        type="button"
+        aria-label={BOTS_PHONE_VOICE_LINE_LABEL}
+        onClick={onOpen}
+        className="flex h-9 min-w-0 flex-1 items-center text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <span
+          role="status"
+          aria-live="polite"
+          data-voice={state?.kind ?? "unknown"}
+          className={cn(
+            "min-w-0 truncate text-xs",
+            failed ? "text-destructive" : "text-muted-foreground",
+          )}
+        >
+          {line}
+        </span>
+      </button>
+      {unavailable?.kind === "notAuthorized" && (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            // Best-effort deep link through the Rust opener; never re-prompts.
+            void iosOpenAppSettings().catch(() => {});
+          }}
+        >
+          {VOICE_OPEN_SETTINGS_LABEL}
+        </Button>
+      )}
+    </div>
+  );
+}
 
 /**
  * A stale-read token, the desktop pane's idiom: a second refresh landing after
@@ -206,6 +331,17 @@ export function BotsPhoneList({
   useEffect(() => {
     void refresh();
   }, []);
+
+  // Epic 67 (AD-205): a turn the voice heard is sent and spoken by Rust. This
+  // level stays mounted under the conversation, so it is where the spoken
+  // stream is observed: the store applies each event as it applies the
+  // conversation level's own, and the list is re-read when the answer closes.
+  useSpokenStream((event) => {
+    onStreamEvent(event);
+    if (event.kind === "closed") {
+      void refresh();
+    }
+  });
 
   const open = (sessionId: string) => {
     void botsSessionOpen(sessionId)
@@ -292,10 +428,6 @@ export function BotsPhoneConversation({
   const streamingMessageId = useBotsStore((s) => s.streamingMessageId);
   const error = useBotsStore((s) => s.error);
   const [pickerOpen, setPickerOpen] = useState(false);
-  // Story 62.6: the transcript waiting in the composer, with a sequence so
-  // hearing the same words twice is still two hand-offs.
-  const [heard, setHeard] = useState<{ text: string; seq: number } | null>(null);
-  const heardSeq = useRef(0);
 
   const providerList = providers ?? [];
   const botList = bots ?? [];
@@ -451,24 +583,14 @@ export function BotsPhoneConversation({
         />
       )}
 
-      <BotVoiceStatus />
+      <BotsPhoneVoiceLine onOpen={() => setPickerOpen(true)} />
       <BotComposer
         onSend={send}
         onStop={stop}
-        // Talk mode (Story 62.6): what a button-started turn heard lands here
-        // as the draft; a phrase-started turn goes as said.
-        heard={heard}
-        accessory={
-          <BotVoiceMic
-            onHeard={(text, origin) => {
-              if (origin === "phrase") {
-                send(text);
-                return;
-              }
-              setHeard({ text, seq: heardSeq.current++ });
-            }}
-          />
-        }
+        // Talk mode (Story 62.6; Epic 67, AD-205): the button starts a turn,
+        // and what it hears is sent by Rust to the bot chosen under Bots —
+        // the composer never receives it.
+        accessory={<BotVoiceMic />}
         streaming={streamingId !== null}
         disabled={selectedBotId === null || selectedModel === null}
         pickerPlace={BOTS_PHONE_PICKER_PLACE}

@@ -1,53 +1,53 @@
 /**
- * Talk mode you can see (Story 62.6, FR-407, FR-408, NFR-51, AD-170/AD-171).
+ * Talk mode you can see (Story 62.6, FR-407, FR-408, NFR-51, AD-170/AD-171;
+ * Epic 67, AD-205).
  *
  * What is asserted here that nothing else asserts:
  *
  * 1. **Three states, told apart without colour** — the button's accessible
  *    name, its `data-state` and `aria-pressed` differ across idle, listening
  *    and speaking; the status line says which in words.
- * 2. **Heard text reaches the composer, not the wire** — a button-started
- *    turn's `heard` snapshot is handed to `onHeard` as `"button"` once, and
- *    `BotComposer` puts it in the field where it can be edited; nothing
- *    calls send. A phrase-started turn is handed as `"phrase"`.
+ * 2. **The button sends nothing and speaks nothing (AD-205)** — a turn's
+ *    `heard` snapshot is shown as a status and nothing else happens in the
+ *    webview: no `botsChatSend`, no `voice_speak` (which no longer exists as
+ *    a binding). The send and the speak are Rust's, whether the turn was the
+ *    button's or the phrase's — one path.
  * 3. **Stop abandons** — pressing while listening calls `voice_stop`, and the
  *    idle snapshot that follows is rendered idle: the surface honours the
  *    release rather than remembering a press.
  * 4. **The first press asks, by name, once** — `voice_authorize` precedes
  *    `voice_start`; a granted answer starts; a refusal starts nothing and
  *    renders Rust's sentence with Open Settings.
- * 5. **A voice turn's answer is spoken; a typed one is not** —
- *    `speakIfHeard` calls `voice_speak` from `heard` and never from idle.
- * 6. **Absent** where `capabilities.bots` is off, while availability is
+ * 5. **Absent** where `capabilities.bots` is off, while availability is
  *    unanswered, and on `unsupported`.
  */
 
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { BOT_COMPOSER_LABEL, BotComposer } from "@/components/bots/bot-composer";
 import {
   BotVoiceMic,
   BotVoiceStatus,
   micState,
-  speakIfHeard,
   VOICE_HEARD_STATUS,
   VOICE_LISTENING_STATUS,
   VOICE_OPEN_SETTINGS_LABEL,
+  VOICE_SENDING_STATUS,
   VOICE_SPEAKING_STATUS,
   VOICE_STOP_LISTENING_LABEL,
   VOICE_STOP_SPEAKING_LABEL,
   VOICE_TALK_LABEL,
 } from "@/components/bots/bot-voice-mic";
 import type { VoiceStateVm, VoiceUnavailableVm } from "@/lib/ipc/client";
+import * as client from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
 
 const voiceAuthorize = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceStart = vi.fn<() => Promise<void>>();
 const voiceStop = vi.fn<() => Promise<void>>();
-const voiceSpeak = vi.fn<(text: string) => Promise<void>>();
 const voiceStopSpeaking = vi.fn<() => Promise<void>>();
 const iosOpenAppSettings = vi.fn<() => Promise<void>>();
+const botsChatSend = vi.fn<() => Promise<string>>();
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
@@ -55,9 +55,9 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceAuthorize: () => voiceAuthorize(),
     voiceStart: () => voiceStart(),
     voiceStop: () => voiceStop(),
-    voiceSpeak: (text: string) => voiceSpeak(text),
     voiceStopSpeaking: () => voiceStopSpeaking(),
     iosOpenAppSettings: () => iosOpenAppSettings(),
+    botsChatSend: () => botsChatSend(),
   };
 });
 
@@ -69,6 +69,7 @@ const LISTENING_HALF: VoiceStateVm = {
   level: 0.3,
 };
 const HEARD: VoiceStateVm = { kind: "heard", text: "what did I save yesterday", level: null };
+const SENDING: VoiceStateVm = { kind: "sending", answering: false };
 const SPEAKING: VoiceStateVm = { kind: "speaking" };
 const NOT_AUTHORIZED: VoiceUnavailableVm = {
   kind: "notAuthorized",
@@ -103,11 +104,11 @@ function seed(
 }
 
 /** The controls as a person meets them: the line above, the button in the row. */
-function Surface({ onHeard }: { onHeard: (text: string, origin: "button" | "phrase") => void }) {
+function Surface() {
   return (
     <>
       <BotVoiceStatus />
-      <BotVoiceMic onHeard={onHeard} />
+      <BotVoiceMic />
     </>
   );
 }
@@ -116,15 +117,15 @@ beforeEach(() => {
   voiceAuthorize.mockReset();
   voiceStart.mockReset();
   voiceStop.mockReset();
-  voiceSpeak.mockReset();
   voiceStopSpeaking.mockReset();
   iosOpenAppSettings.mockReset();
+  botsChatSend.mockReset();
   voiceAuthorize.mockResolvedValue(null);
   voiceStart.mockResolvedValue();
   voiceStop.mockResolvedValue();
-  voiceSpeak.mockResolvedValue();
   voiceStopSpeaking.mockResolvedValue();
   iosOpenAppSettings.mockResolvedValue();
+  botsChatSend.mockResolvedValue("never");
   seed();
 });
 
@@ -143,7 +144,7 @@ describe("micState", () => {
 
 describe("BotVoiceMic — three states you can read", () => {
   it("is Talk while idle, unpressed, with no status band", () => {
-    render(<Surface onHeard={() => {}} />);
+    render(<Surface />);
     const button = screen.getByRole("button", { name: VOICE_TALK_LABEL });
     expect(button).toHaveAttribute("data-state", "idle");
     expect(button).toHaveAttribute("aria-pressed", "false");
@@ -152,7 +153,7 @@ describe("BotVoiceMic — three states you can read", () => {
 
   it("is Cancel this question while listening, pressed, and the band shows the transcript as it forms", () => {
     seed({ state: LISTENING });
-    const { rerender } = render(<Surface onHeard={() => {}} />);
+    const { rerender } = render(<Surface />);
     const button = screen.getByRole("button", { name: VOICE_STOP_LISTENING_LABEL });
     expect(button).toHaveAttribute("data-state", "listening");
     expect(button).toHaveAttribute("aria-pressed", "true");
@@ -161,13 +162,13 @@ describe("BotVoiceMic — three states you can read", () => {
     expect(band).toHaveTextContent(VOICE_LISTENING_STATUS);
 
     voiceStore.getState().applyState(LISTENING_HALF);
-    rerender(<Surface onHeard={() => {}} />);
+    rerender(<Surface />);
     expect(screen.getByRole("status")).toHaveTextContent("what did I save");
   });
 
   it("is Stop this answer while the answer is read aloud, and says so", () => {
     seed({ state: SPEAKING });
-    render(<Surface onHeard={() => {}} />);
+    render(<Surface />);
     const button = screen.getByRole("button", { name: VOICE_STOP_SPEAKING_LABEL });
     expect(button).toHaveAttribute("data-state", "speaking");
     expect(button).toHaveAttribute("aria-pressed", "false");
@@ -181,88 +182,60 @@ describe("BotVoiceMic — three states you can read", () => {
   });
 });
 
-describe("BotVoiceMic — heard text goes to the composer, not the wire", () => {
-  it("hands a button-started turn's transcript on as `button`, once", async () => {
-    const onHeard = vi.fn();
-    const { rerender } = render(<Surface onHeard={onHeard} />);
+describe("BotVoiceMic — the turn is Rust's from the phrase to the last word (AD-205)", () => {
+  it("shows a button-started turn's hearing and sending as status, and sends nothing itself", async () => {
+    const { rerender } = render(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_TALK_LABEL }));
     await waitFor(() => expect(voiceStart).toHaveBeenCalledTimes(1));
 
+    // What Rust streams as it hears, sends and speaks — the same path as the
+    // phrase's; the button only pressed `voice_start`.
     voiceStore.getState().applyState(LISTENING);
-    rerender(<Surface onHeard={onHeard} />);
+    rerender(<Surface />);
     voiceStore.getState().applyState(HEARD);
-    rerender(<Surface onHeard={onHeard} />);
-    expect(onHeard).toHaveBeenCalledTimes(1);
-    expect(onHeard).toHaveBeenCalledWith("what did I save yesterday", "button");
+    rerender(<Surface />);
     expect(screen.getByRole("status")).toHaveTextContent(VOICE_HEARD_STATUS);
+    voiceStore.getState().applyState(SENDING);
+    rerender(<Surface />);
+    expect(screen.getByRole("status")).toHaveTextContent(VOICE_SENDING_STATUS);
+    voiceStore.getState().applyState(SPEAKING);
+    rerender(<Surface />);
+    expect(screen.getByRole("status")).toHaveTextContent(VOICE_SPEAKING_STATUS);
 
-    // The same snapshot re-rendered is not a second hearing.
-    rerender(<Surface onHeard={onHeard} />);
-    expect(onHeard).toHaveBeenCalledTimes(1);
+    expect(botsChatSend).not.toHaveBeenCalled();
+    // The composer receives nothing: the field is not this control's to fill.
+    expect(screen.queryByRole("textbox")).toBeNull();
   });
 
-  it("hands a turn nobody pressed for — the phrase's — on as `phrase`", () => {
-    const onHeard = vi.fn();
-    const { rerender } = render(<Surface onHeard={onHeard} />);
+  it("shows a phrase-started turn the same way, with nothing pressed", () => {
+    const { rerender } = render(<Surface />);
     voiceStore.getState().applyState(LISTENING);
-    rerender(<Surface onHeard={onHeard} />);
+    rerender(<Surface />);
     voiceStore.getState().applyState(HEARD);
-    rerender(<Surface onHeard={onHeard} />);
-    expect(onHeard).toHaveBeenCalledWith("what did I save yesterday", "phrase");
+    rerender(<Surface />);
+    expect(screen.getByRole("status")).toHaveTextContent(VOICE_HEARD_STATUS);
     expect(voiceStart).not.toHaveBeenCalled();
+    expect(botsChatSend).not.toHaveBeenCalled();
   });
 
-  it("puts the heard text in the composer's field, where it can be edited, and sends nothing", () => {
-    const onSend = vi.fn();
-    const composer = (heard: { text: string; seq: number } | null) => (
-      <BotComposer
-        onSend={onSend}
-        onStop={() => {}}
-        onCommand={() => null}
-        commandContext={{
-          providerKind: "hermes",
-          hasProvider: true,
-          hasBot: true,
-          hasSession: true,
-          modelTools: null,
-        }}
-        streaming={false}
-        disabled={false}
-        heard={heard}
-      />
-    );
-    const { rerender } = render(composer(null));
-    const field = screen.getByLabelText(BOT_COMPOSER_LABEL);
-    expect(field).toHaveValue("");
-
-    rerender(composer({ text: "what did I save yesterday", seq: 1 }));
-    expect(field).toHaveValue("what did I save yesterday");
-    expect(onSend).not.toHaveBeenCalled();
-
-    fireEvent.change(field, { target: { value: "what did I save on Tuesday" } });
-    expect(field).toHaveValue("what did I save on Tuesday");
-    expect(onSend).not.toHaveBeenCalled();
-
-    // The same words heard again are a new hand-off, not a stale one.
-    rerender(composer({ text: "what did I save yesterday", seq: 2 }));
-    expect(field).toHaveValue("what did I save yesterday");
-
-    fireEvent.keyDown(field, { key: "Enter" });
-    expect(onSend).toHaveBeenCalledWith("what did I save yesterday");
+  it("has no way to read an answer aloud from the webview", () => {
+    // The `voice_speak` binding went with `speakIfHeard`: the answer is
+    // spoken by Rust when the stream closes, screen or no screen.
+    expect("voiceSpeak" in client).toBe(false);
   });
 });
 
 describe("BotVoiceMic — stop abandons, and the surface honours the release", () => {
   it("calls voice_stop while listening and renders the idle snapshot that follows", async () => {
     seed({ state: LISTENING_HALF });
-    const { rerender } = render(<Surface onHeard={() => {}} />);
+    const { rerender } = render(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_STOP_LISTENING_LABEL }));
     await waitFor(() => expect(voiceStop).toHaveBeenCalledTimes(1));
     expect(voiceStopSpeaking).not.toHaveBeenCalled();
 
     // What Rust streams after `Abandoned`: idle, microphone released.
     voiceStore.getState().applyState(IDLE);
-    rerender(<Surface onHeard={() => {}} />);
+    rerender(<Surface />);
     expect(screen.getByRole("button", { name: VOICE_TALK_LABEL })).toHaveAttribute(
       "aria-pressed",
       "false",
@@ -272,7 +245,7 @@ describe("BotVoiceMic — stop abandons, and the surface honours the release", (
 
   it("calls voice_stop_speaking, not voice_stop, while the answer is read aloud", async () => {
     seed({ state: SPEAKING });
-    render(<Surface onHeard={() => {}} />);
+    render(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_STOP_SPEAKING_LABEL }));
     await waitFor(() => expect(voiceStopSpeaking).toHaveBeenCalledTimes(1));
     expect(voiceStop).not.toHaveBeenCalled();
@@ -289,14 +262,14 @@ describe("BotVoiceMic — asks by name, once, on the first press", () => {
     voiceStart.mockImplementation(async () => {
       order.push("start");
     });
-    render(<Surface onHeard={() => {}} />);
+    render(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_TALK_LABEL }));
     await waitFor(() => expect(order).toEqual(["authorize", "start"]));
   });
 
   it("renders a refusal as Rust's sentence with Open Settings, and starts nothing", async () => {
     voiceAuthorize.mockResolvedValue(NOT_AUTHORIZED);
-    render(<Surface onHeard={() => {}} />);
+    render(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_TALK_LABEL }));
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent(NOT_AUTHORIZED.message),
@@ -310,12 +283,12 @@ describe("BotVoiceMic — asks by name, once, on the first press", () => {
 
   it("a grant lifts an earlier refusal but not a missing model", async () => {
     seed({ unavailable: NOT_AUTHORIZED });
-    const { rerender } = render(<Surface onHeard={() => {}} />);
+    const { rerender } = render(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_TALK_LABEL }));
     await waitFor(() => expect(voiceStore.getState().unavailable).toBeNull());
 
     seed({ unavailable: NO_MODEL });
-    rerender(<Surface onHeard={() => {}} />);
+    rerender(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_TALK_LABEL }));
     await waitFor(() => expect(voiceStart).toHaveBeenCalledTimes(2));
     expect(voiceStore.getState().unavailable).toEqual(NO_MODEL);
@@ -324,33 +297,21 @@ describe("BotVoiceMic — asks by name, once, on the first press", () => {
   });
 });
 
-describe("speakIfHeard", () => {
-  it("reads the answer aloud from a turn that heard, and never from idle", () => {
-    voiceStore.getState().applyState(HEARD);
-    speakIfHeard("Three notes and a receipt.");
-    expect(voiceSpeak).toHaveBeenCalledWith("Three notes and a receipt.");
-
-    voiceStore.getState().applyState(IDLE);
-    speakIfHeard("A typed question's answer.");
-    expect(voiceSpeak).toHaveBeenCalledTimes(1);
-  });
-});
-
 describe("BotVoiceMic — absence", () => {
   it("renders nothing without the bots capability", () => {
     seed({ bots: false });
-    render(<Surface onHeard={() => {}} />);
+    render(<Surface />);
     expect(screen.queryByRole("button")).toBeNull();
     expect(screen.queryByRole("status")).toBeNull();
   });
 
   it("renders nothing while availability is unanswered, and on unsupported", () => {
     seed({ unavailable: undefined });
-    const { rerender } = render(<Surface onHeard={() => {}} />);
+    const { rerender } = render(<Surface />);
     expect(screen.queryByRole("button")).toBeNull();
 
     seed({ unavailable: UNSUPPORTED });
-    rerender(<Surface onHeard={() => {}} />);
+    rerender(<Surface />);
     expect(screen.queryByRole("button")).toBeNull();
     expect(screen.queryByRole("status")).toBeNull();
   });

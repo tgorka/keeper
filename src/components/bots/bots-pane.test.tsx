@@ -699,6 +699,8 @@ describe("the Bots pane's voice block folds (Story 64.1)", () => {
     locale: "en-US",
     localeChosen: null,
     onDeviceLocales: ["en-US"],
+    stopPhrase: "stop",
+    voiceTarget: null,
   };
   const NOT_AUTHORIZED: VoiceUnavailableVm = {
     kind: "notAuthorized",

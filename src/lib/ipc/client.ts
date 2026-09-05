@@ -293,6 +293,7 @@ export type { SpaceVm } from "./gen/SpaceVm";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 export type { SyncFootprintVm } from "./gen/SyncFootprintVm";
+export type { SyncGitEngine } from "./gen/SyncGitEngine";
 export type { SyncGitState } from "./gen/SyncGitState";
 export type { SyncGitVm } from "./gen/SyncGitVm";
 export type { SyncListSettingsVm } from "./gen/SyncListSettingsVm";
@@ -338,6 +339,7 @@ export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
+export type { VoiceEventVm } from "./gen/VoiceEventVm";
 export type { VoiceStateVm } from "./gen/VoiceStateVm";
 export type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 export type { VoiceWakeVm } from "./gen/VoiceWakeVm";
@@ -505,6 +507,7 @@ import type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
+import type { VoiceEventVm } from "./gen/VoiceEventVm";
 import type { VoiceStateVm } from "./gen/VoiceStateVm";
 import type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 import type { VoiceWakeVm } from "./gen/VoiceWakeVm";
@@ -2769,6 +2772,16 @@ export async function debugModeSet(enabled: boolean): Promise<void> {
   await invoke("debug_mode_set", { enabled });
 }
 
+/**
+ * Where the app log lives on this device (Story 65.3, AD-192): the path Rust
+ * writes to, as Rust answers it — `~/Library/Logs/keeper/keeper.log` on the
+ * Mac, the app container's `Library/Logs/keeper/keeper.log` on the phone —
+ * so the About sentence names this device's file rather than a literal.
+ */
+export async function debugLogPath(): Promise<string> {
+  return invoke<string>("debug_log_path");
+}
+
 /** Which stage of an app-driven title-bar drag is being reported (Story 34.3). */
 export type TitlebarDragStage = "issued" | "accepted" | "refused";
 
@@ -3365,6 +3378,25 @@ export async function syncBrowse(id: string, subpath: string): Promise<FilesList
  */
 export async function syncOpenEntry(id: string, subpath: string): Promise<void> {
   await invoke<void>("sync_open_entry", { id, subpath });
+}
+
+/**
+ * Hand one file inside a synced folder to the OS share sheet — the phone's
+ * reveal (Story 66.3, FR-466, AD-200).
+ *
+ * Addressed like {@link syncOpenEntry}: a profile id and a profile-relative
+ * `subpath` the listing produced, re-resolved in Rust through the same
+ * containment rule (`share_ios::share_target`), never a path. Offered only
+ * where `CapabilitiesVm.shareOut` is true; a desktop answers `unsupported`
+ * with a sentence naming Finder. A virtual entry is materialized by the caller
+ * first ({@link syncMaterializeEntry}) — sharing a pointer would hand the
+ * sheet the pointer's text.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+ * escapes the root, a folder, a file no longer on disk).
+ */
+export async function shareOut(id: string, subpath: string): Promise<void> {
+  await invoke<void>("share_out", { id, subpath });
 }
 
 /**
@@ -7271,15 +7303,32 @@ export async function voiceWakeGet(): Promise<VoiceWakeVm> {
 }
 
 /**
- * Set the wake switch and phrase (FR-404, FR-405). The phrase is validated by
- * `WakePhrase::parse` in Rust — never here — and a refusal rejects with the
+ * Set the wake switch, phrase and stop phrase (FR-404, FR-405; Epic 67,
+ * AD-208). Both phrases are validated in Rust — `WakePhrase::parse` and
+ * `WakePhrase::parse_stop` — never here, and a refusal rejects with the
  * sentence saying what to type instead, with nothing persisted. On success
- * both are persisted and the turn is armed (or disarmed).
+ * all three are persisted and the turn is armed (or disarmed).
  *
  * Rejects with: `internal` (the refusal, with its sentence).
  */
-export async function voiceWakeSet(enabled: boolean, phrase: string): Promise<VoiceWakeVm> {
-  return await invoke<VoiceWakeVm>("voice_wake_set", { enabled, phrase });
+export async function voiceWakeSet(
+  enabled: boolean,
+  phrase: string,
+  stopPhrase: string,
+): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_wake_set", { enabled, phrase, stopPhrase });
+}
+
+/**
+ * Choose the bot a spoken turn goes to (Epic 67, AD-206): a pinned bot's id,
+ * or `null` for "the pinned bot most recently talked to". Which bot a turn
+ * actually reaches is decided in `keeper_core::bots::voice_target` at send
+ * time, never here; the fresh {@link VoiceWakeVm} says what was stored.
+ *
+ * Rejects with: `internal`.
+ */
+export async function voiceTargetSet(botId: string | null): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_target_set", { botId });
 }
 
 /**
@@ -7312,6 +7361,18 @@ export async function voiceAuthorize(): Promise<VoiceUnavailableVm | null> {
 }
 
 /**
+ * What the voice port did, newest first (Epic 65, Story 65.3, FR-448,
+ * FR-449, AD-192): the last `limit` entries of the in-memory ring the shell
+ * feeds with every arm, refusal, interruption, resume, roll and turn
+ * transition. A view of memory on the device — nothing is read from disk
+ * and nothing leaves. Every target answers; a build without a port answers
+ * the turn's own transitions and an otherwise empty ring.
+ */
+export async function voiceEvents(limit: number): Promise<VoiceEventVm[]> {
+  return await invoke<VoiceEventVm[]>("voice_events", { limit });
+}
+
+/**
  * Start a voice turn by hand (FR-401, FR-407): the microphone opens and
  * recognition begins. Snapshots arrive over the one {@link voiceWatch}
  * channel, not here — the surface keeps exactly one stream.
@@ -7331,13 +7392,22 @@ export async function voiceStop(): Promise<void> {
 }
 
 /**
- * Read `text` aloud (FR-403). From a turn that heard something this is the
- * answer to what was heard; from idle it is the answer to something typed.
- * Speech detected while it plays stops it first (barge-in), decided in
- * `keeper_core::voice`.
+ * The Tauri event the shell forwards a spoken turn's stream on (Epic 67,
+ * AD-205): the turn heard a question and Rust opened the stream itself, with
+ * no pane channel to hand it, so every {@link BotStreamEvent} of that answer
+ * arrives here instead — `opened`, the deltas, `closed` — for a pane that is
+ * mounted to apply exactly as it applies its own channel's. The answer is
+ * read aloud by Rust whether or not anything listens.
  */
-export async function voiceSpeak(text: string): Promise<void> {
-  await invoke<void>("voice_speak", { text });
+export const BOTS_SPOKEN_STREAM_EVENT = "keeper://bots-spoken-stream";
+
+/** Subscribe to the spoken turn's stream events. Resolves with an unlisten function. */
+export async function listenSpokenStream(
+  onEvent: (event: BotStreamEvent) => void,
+): Promise<() => void> {
+  return await listen<BotStreamEvent>(BOTS_SPOKEN_STREAM_EVENT, (event) => {
+    onEvent(event.payload);
+  });
 }
 
 /** Stop reading aloud; the turn ends as if the utterance had finished. */

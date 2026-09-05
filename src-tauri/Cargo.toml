@@ -138,8 +138,38 @@ objc2-foundation = { version = "0.3", features = [
 ] }
 # iOS app-icon badge (Story 14.3 fix, FR-62): safe `UNUserNotificationCenter::setBadgeCount`
 # binding (block2 feature for the optional completion handler). Already resolved in the lock
-# transitively; MIT — passes the cargo-deny license firewall.
-objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "block2"] }
+# transitively; MIT — passes the cargo-deny license firewall. The lock-screen banner
+# (Story 67.2, AD-207) adds the content, request and (nil) trigger classes a local
+# notification is built from, reached only from `voice_notify.rs`; every binding is safe.
+objc2-user-notifications = { version = "0.3", features = [
+    "UNUserNotificationCenter",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationTrigger",
+    "block2",
+] }
+# The share sheet (Story 66.3, AD-200): `UIActivityViewController` presented
+# from the window's `UIViewController`, reached only from `share_ios.rs`. Already
+# in the tree — wry and tao pull it for the webview's own view controller — so
+# this is a direct name for a crate that was going to be compiled either way;
+# the feature list names exactly the classes the one presenting function
+# touches (the popover controller for the iPad anchor). `Zlib OR Apache-2.0 OR
+# MIT` (0.3.2) — passes the cargo-deny license firewall.
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "UIResponder",
+    "UIView",
+    "UIViewController",
+    "UIActivity",
+    "UIActivityViewController",
+    "UIPresentationController",
+    "UIPopoverPresentationController",
+    # `UIApplication.applicationState`, read on the main thread by the
+    # lock-screen banner (Story 67.2, AD-207) — the one true "is keeper in
+    # front" the JS lifecycle cannot give from the background.
+    "UIApplication",
+] }
 # Account registry + opaque account ids (both already present transitively via matrix-sdk).
 ulid = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -274,6 +304,15 @@ base64 = "0.22"
 # own read-back are one copy of one crate rather than two builds of 0.7.2 from
 # two sources.
 gix-quote = { git = "https://github.com/tgorka/gitoxide", branch = "keeper/gix-filter-0.33-reap" }
+# The pack writer behind the phone's push (Story 66.5, AD-202). `gix` pulls
+# `gix-pack` with `default-features = false`, which leaves out `generate` — the
+# feature that turns a set of object ids into a v2 pack (`data::output`). The
+# phone has no `git` binary to run `git push`, so `keeper-sync::git::push_http`
+# writes the pack itself and hands it to `git-receive-pack` over HTTP. Adds no
+# new crate: `gix-pack` is already in the lock through `gix-odb`, and `generate`
+# only enables `gix-traverse`/`gix-diff` edges that `gix` resolves anyway. Same
+# git source as `gix` for the same reason `gix-quote` gives above.
+gix-pack = { git = "https://github.com/tgorka/gitoxide", branch = "keeper/gix-filter-0.33-reap", default-features = false, features = ["generate"] }
 # ---------------------------------------------------------------------------
 # Document rendering (Story 45.8, FR-181, FR-182). Consumed by `keeper-core`
 # only: DOCX, PPTX and XLSX are a ZIP of XML, so keeper parses them in Rust and

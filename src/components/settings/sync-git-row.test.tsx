@@ -32,6 +32,7 @@ function okVm(over: Record<string, unknown> = {}) {
     state: "ok" as const,
     summary: "git 2.52 at /opt/homebrew/bin/git (clears the 2.42 floor)",
     problem: null,
+    engine: "git" as const,
     configuredPath: null,
     ...over,
   };
@@ -43,6 +44,7 @@ function tooOldVm(over: Record<string, unknown> = {}) {
     state: "tooOld" as const,
     summary: null,
     problem: "/usr/local/bin/git is 2.23, below the 2.42 floor\nskipped /usr/bin/git: 2.39",
+    engine: "git" as const,
     configuredPath: null,
     ...over,
   };
@@ -100,6 +102,7 @@ describe("SyncGitRow", () => {
       state: "unsupported",
       summary: null,
       problem: null,
+      engine: "git" as const,
       configuredPath: null,
     });
     render(<SyncGitRow open />);

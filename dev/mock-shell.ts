@@ -63,6 +63,7 @@ import type {
   BotStreamEvent,
   BotVm,
   CapabilitiesVm,
+  DocumentVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
@@ -85,10 +86,12 @@ import type {
   TaskSaveReq,
   TaskSchedulePreviewVm,
   TaskVm,
+  TextFileVm,
   VoiceStateVm,
   VoiceUnavailableVm,
   VoiceWakeVm,
 } from "@/lib/ipc/client";
+import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
@@ -1051,28 +1054,51 @@ const ANSWERS: Record<string, unknown> = {
   // (`app-shell.tsx`), so every task and paced-work fixture below this line was
   // unreachable in `bun run dev` — the one screen this file exists to make
   // visible on Linux. Now a flag added in Rust breaks the build here instead.
-  capabilities: {
-    trayIcon: true,
-    globalHotkey: true,
-    launchAtLogin: true,
-    inAppUpdater: true,
-    nativeMenuBar: true,
-    bridgeSidecar: true,
-    revealInFileManager: true,
-    recording: true,
-    sync: true,
-    notes: true,
-    sessions: true,
-    // Epic 61: `true`, and this is the trap the comment above names. As `false`
-    // every bots fixture below would be unreachable in `bun run dev` — the
-    // pane, the picker, the composer and the fake stream all sit behind it.
-    bots: true,
-    // Epic 62: the drive half, `desktop && sync` in Rust. `true` here so the
-    // grant bar, the tool rows and the reveal control are reachable in `bun
-    // run dev`; flip to `false` to see the phone's shape of the same pane.
-    botTools: true,
-    overlayTitleBar: true,
-  } satisfies CapabilitiesVm,
+  //
+  // `?platform=phone` on the dev URL answers the iPhone's shape instead (Epic
+  // 65, AD-189): every `cfg!(desktop)` flag false and `bots` true, exactly as
+  // `keeper/src/ipc.rs` computes it there. Since AD-189 that answer — not the
+  // window's width — is what puts the shell in the phone tier, so it is the
+  // only way to look at the phone's landscape shape here, and it is what
+  // `dev/measure-bots.ts --phone` drives.
+  capabilities:
+    new URLSearchParams(window.location.search).get("platform") === "phone"
+      ? // Epic 66: the folder links on the phone (`sync`, AD-198), share-out
+        // is its reveal (`shareOut`, Story 66.3, AD-200) and notes ride the
+        // folder (`notes`, Story 66.4) — the three flags `ipc.rs` now computes
+        // true on iOS, so the Files and Notes rows and the capture sheet are
+        // reachable in the phone rig (`dev/measure-files.ts`).
+        ({
+          ...DEFAULT_CAPABILITIES,
+          bots: true,
+          sync: true,
+          shareOut: true,
+          notes: true,
+        } satisfies CapabilitiesVm)
+      : ({
+          trayIcon: true,
+          globalHotkey: true,
+          launchAtLogin: true,
+          inAppUpdater: true,
+          nativeMenuBar: true,
+          bridgeSidecar: true,
+          revealInFileManager: true,
+          // Story 66.3: the phone's reveal, and false on every desktop.
+          shareOut: false,
+          recording: true,
+          sync: true,
+          notes: true,
+          sessions: true,
+          // Epic 61: `true`, and this is the trap the comment above names. As `false`
+          // every bots fixture below would be unreachable in `bun run dev` — the
+          // pane, the picker, the composer and the fake stream all sit behind it.
+          bots: true,
+          // Epic 62: the drive half, `desktop && sync` in Rust. `true` here so the
+          // grant bar, the tool rows and the reveal control are reachable in `bun
+          // run dev`; flip to `false` to see the phone's shape of the same pane.
+          botTools: true,
+          overlayTitleBar: true,
+        } satisfies CapabilitiesVm),
   // ---------------------------------------------------------------------------
   // The two answers that decide WHICH screen boots (`src/App.tsx`
   // `renderContent`). Without them every `bun run dev` stopped at the first-run
@@ -2732,10 +2758,12 @@ let voiceWake: VoiceWakeVm = {
   enabled: false,
   phrase: "nixie",
   limits:
-    "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. It stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit. The microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
+    "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
   locale: VOICE_SYSTEM_LOCALE,
   localeChosen: null,
   onDeviceLocales: voiceOnDeviceLocales,
+  stopPhrase: "stop",
+  voiceTarget: null,
 };
 /** The one watcher, so `voice_wake_set` can push the new idle snapshot. */
 let voiceWatcher: MockChannel<VoiceStateVm> | null = null;
@@ -3089,7 +3117,8 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
         retriable: false,
       };
     }
-    voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase };
+    const stopPhrase = String(payload.stopPhrase ?? "stop").trim();
+    voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase, stopPhrase };
     voiceWatcher?.onmessage?.(voiceIdle());
     return voiceWake;
   },
@@ -3106,14 +3135,24 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     voiceWake = { ...voiceWake, localeChosen: chosen, locale: chosen ?? VOICE_SYSTEM_LOCALE };
     return voiceWake;
   },
-  // --- Voice, the talk mode (Epic 62, Story 62.6) --------------------------
+  // Epic 67 (AD-206): who a spoken turn goes to. Any string is a bot id here;
+  // whether it names a pinned bot is Rust's business at send time.
+  voice_target_set: (payload) => {
+    voiceWake = {
+      ...voiceWake,
+      voiceTarget: typeof payload.botId === "string" && payload.botId !== "" ? payload.botId : null,
+    };
+    return voiceWake;
+  },
+  // --- Voice, the talk mode (Epic 62, Story 62.6; Epic 67, AD-205) ---------
   //
-  // A scripted turn so the mic control's three states can be looked at in
-  // `bun run dev`: listening with an interim transcript, then heard. What is
-  // heard lands in the composer; nothing here sends. `voice_authorize`
-  // answers "granted" — the dialogs are the phone's. The level (Epic 64,
-  // Story 64.3) rises with the words and falls once they are heard, at the
-  // ~25 Hz Rust bounds it to, so an indicator can be looked at too.
+  // A scripted turn so the mic control's states can be looked at in
+  // `bun run dev`: listening with an interim transcript, heard, then — since
+  // Epic 67 the send and the speak are Rust's — sending and speaking, back
+  // to idle. Nothing here opens a stream. `voice_authorize` answers "granted"
+  // — the dialogs are the phone's. The level (Epic 64, Story 64.3) rises
+  // with the words and falls once they are heard, at the ~25 Hz Rust bounds
+  // it to, so an indicator can be looked at too.
   voice_authorize: () => null,
   voice_start: () => {
     const push = (state: VoiceStateVm) => voiceWatcher?.onmessage?.(state);
@@ -3124,15 +3163,14 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       setTimeout(() => push({ kind: "listening", heard, level }), tick * 40);
     }
     setTimeout(() => push({ kind: "heard", text: "what did I save yesterday", level: 0.1 }), 1700);
+    setTimeout(() => push({ kind: "sending", answering: false }), 2200);
+    setTimeout(() => push({ kind: "sending", answering: true }), 3000);
+    setTimeout(() => push({ kind: "speaking" }), 4000);
+    setTimeout(() => push(voiceIdle()), 6500);
     return null;
   },
   voice_stop: () => {
     voiceWatcher?.onmessage?.(voiceIdle());
-    return null;
-  },
-  voice_speak: () => {
-    voiceWatcher?.onmessage?.({ kind: "speaking" });
-    setTimeout(() => voiceWatcher?.onmessage?.(voiceIdle()), 2500);
     return null;
   },
   voice_stop_speaking: () => {
@@ -3862,6 +3900,33 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       write: { writable: true, reason: null, caveat: null, caveatShort: null },
     };
   },
+  // A file opened from the listing (Story 45.6's text reader, Story 45.8's
+  // document reader). Answered so the phone's Files surface (Story 66.3) can
+  // be looked at full-screen here — and measured by `dev/measure-files.ts` —
+  // rather than stopping on the fallback's `null`, which the viewer renders as
+  // a thrown property read. One markdown body for every text path, one
+  // page-count probe for every document; the `keeper-file://` bytes behind a
+  // PDF's `<embed>` are not served here, so the frame draws its facts over an
+  // empty plugin.
+  sync_read_text: (payload): TextFileVm => ({
+    text: `# ${String(payload.subpath ?? "file")}\n\nA note read from the folder keeper syncs, over the mock shell.\n\n- one item\n- another, with a [[wikilink]]\n\n> A quotation, because a body with only headings measures nothing.\n`,
+    sizeBytes: 3_380,
+    sizeLabel: "3.4 kB",
+    oversize: false,
+    binary: false,
+    detail: null,
+  }),
+  sync_read_document: (): DocumentVm => ({
+    format: "pdf",
+    sizeBytes: 8_400_000,
+    sizeLabel: "8.4 MB",
+    detail: null,
+    truncated: false,
+    pdf: { version: "1.7", pageCount: 12, encrypted: false, servable: true },
+    words: null,
+    slides: null,
+    sheets: null,
+  }),
   /**
    * The path plugin's directory lookup, which is not one of the app's own
    * commands and is the only non-`keeper` invoke any screen makes (Story 59.8).

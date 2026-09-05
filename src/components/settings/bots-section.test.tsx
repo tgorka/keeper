@@ -33,8 +33,9 @@
  *   the device reported — so a Polish phone with English assets can pick
  *   English here as well as in the sheet.
  */
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { VOICE_TARGET_LABEL, VOICE_TARGET_RECENT_LABEL } from "@/components/bots/bot-voice-target";
 import { VOICE_LOCALE_LABEL, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
 import {
   BOTS_ADD_BOT_LABEL,
@@ -53,7 +54,14 @@ import {
   BOTS_TOKEN_LABEL,
   BotsSection,
   botProbeSentence,
+  formatVoiceEventAge,
   removalSentence,
+  VOICE_EVENTS_EMPTY,
+  VOICE_EVENTS_LABEL,
+  VOICE_EVENTS_NOTE,
+  VOICE_EVENTS_READ_FAILED,
+  VOICE_EVENTS_REFRESH_MS,
+  VOICE_EVENTS_TITLE,
 } from "@/components/settings/bots-section";
 import type {
   BotProbeVm,
@@ -61,6 +69,7 @@ import type {
   BotProviderVm,
   BotSaveReq,
   BotVm,
+  VoiceEventVm,
 } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
@@ -75,6 +84,8 @@ const botsBotSave = vi.fn();
 const botsBotRemove = vi.fn();
 const voiceAvailability = vi.fn();
 const voiceWakeGet = vi.fn();
+const voiceEvents = vi.fn();
+const voiceTargetSet = vi.fn();
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
@@ -90,6 +101,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     botsBotRemove: (id: string) => botsBotRemove(id),
     voiceAvailability: () => voiceAvailability(),
     voiceWakeGet: () => voiceWakeGet(),
+    voiceEvents: (limit: number) => voiceEvents(limit),
+    voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
   };
 });
 
@@ -157,7 +170,13 @@ beforeEach(() => {
     locale: "en-US",
     localeChosen: null,
     onDeviceLocales: ["en-US"],
+    stopPhrase: "stop",
+    voiceTarget: null,
   });
+  voiceTargetSet.mockReset();
+  // The ring is empty unless a case fills it; the default tier here is the
+  // phone's, so the block reads on every open.
+  voiceEvents.mockResolvedValue([]);
   voiceStore.setState({ state: null, unavailable: undefined, wake: null });
   capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
 });
@@ -206,6 +225,30 @@ describe("BotsSection", () => {
     const control = await screen.findByRole("combobox", { name: VOICE_LOCALE_LABEL });
     expect(control).toHaveValue("");
     expect(screen.getByRole("option", { name: /en-US/ })).toBeInTheDocument();
+  });
+
+  it("offers the pinned bots as who a spoken turn speaks to, unset as most recently talked to (Epic 67, AD-206)", async () => {
+    voiceAvailability.mockResolvedValue(null);
+    render(<BotsSection open />);
+    const control = await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    expect(control).toHaveValue("");
+    expect(screen.getByRole("option", { name: VOICE_TARGET_RECENT_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Llama" })).toBeInTheDocument();
+
+    voiceTargetSet.mockResolvedValue({
+      enabled: false,
+      phrase: "hey nixie",
+      limits: "limits",
+      locale: "en-US",
+      localeChosen: null,
+      onDeviceLocales: ["en-US"],
+      stopPhrase: "stop",
+      voiceTarget: "bot-1",
+    });
+    fireEvent.change(control, { target: { value: "bot-1" } });
+    await waitFor(() => expect(voiceTargetSet).toHaveBeenCalledWith("bot-1"));
+    // What Rust stored is what the control shows.
+    await waitFor(() => expect(control).toHaveValue("bot-1"));
   });
 
   it("does not draw the wake switch before voice_availability has answered", () => {
@@ -502,5 +545,124 @@ describe("removalSentence", () => {
     expect(removalSentence({ kind: "bot", name: "Llama" })).toContain(
       "Conversations you have already had with it are kept.",
     );
+  });
+});
+
+/**
+ * Every tier-telling flag on: the desktop. The Mac has the pill and the
+ * tray; it never shows the port's record here.
+ */
+const DESKTOP_CAPABILITIES = {
+  ...DEFAULT_CAPABILITIES,
+  trayIcon: true,
+  globalHotkey: true,
+  launchAtLogin: true,
+  inAppUpdater: true,
+  nativeMenuBar: true,
+  bridgeSidecar: true,
+  revealInFileManager: true,
+  bots: true,
+};
+
+const NOW = 1_800_000_000_000;
+
+/** A ring as Rust answers it: newest first, timestamps from the shell. */
+const RING: VoiceEventVm[] = [
+  {
+    seq: 4,
+    atMs: NOW - 5_000,
+    kind: "refused",
+    detail:
+      "This phone has no on-device speech for pl-PL. Choose en-US, or add Polish to Settings > General > Keyboard > Dictation.",
+  },
+  { seq: 3, atMs: NOW - 50_000, kind: "rolled", detail: null },
+  { seq: 2, atMs: NOW - 3 * 60_000, kind: "turn:idle", detail: null },
+  { seq: 1, atMs: NOW - 2 * 3_600_000, kind: "armed", detail: "nixie" },
+];
+
+describe("BotsSection shows what the voice port did, on the phone (Story 65.3, AD-192)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ now: NOW, shouldAdvanceTime: true });
+    capabilitiesStore.getState().applySnapshot(PHONE_CAPABILITIES);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  });
+
+  it("lists the ring newest first, each with its kind, its words and how long ago", async () => {
+    voiceEvents.mockResolvedValue(RING);
+    render(<BotsSection open />);
+    const list = await screen.findByRole("list", { name: VOICE_EVENTS_LABEL });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows.map((row) => row.textContent)).toEqual([
+      // A refusal at arming is here with its reason (the story's acceptance).
+      `refused5s ago${RING[0]?.detail}`,
+      "rolled50s ago",
+      "turn:idle3 min ago",
+      "armed2 hr agonixie",
+    ]);
+    expect(screen.getByText(VOICE_EVENTS_TITLE)).toBeInTheDocument();
+    // The ring is a view of memory, and the block says so.
+    expect(screen.getByText(VOICE_EVENTS_NOTE)).toBeInTheDocument();
+    // A read of the last fifty: a screenful, not the whole ring.
+    expect(voiceEvents).toHaveBeenCalledWith(50);
+  });
+
+  it("says in one sentence when nothing has happened yet", async () => {
+    voiceEvents.mockResolvedValue([]);
+    render(<BotsSection open />);
+    expect(await screen.findByText(VOICE_EVENTS_EMPTY)).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: VOICE_EVENTS_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("re-reads while open, so a roll in the background arrives without a reopen", async () => {
+    voiceEvents.mockResolvedValue([]);
+    render(<BotsSection open />);
+    await waitFor(() => expect(voiceEvents).toHaveBeenCalledTimes(1));
+    voiceEvents.mockResolvedValue([{ atMs: NOW, kind: "rolled", detail: null }]);
+    await vi.advanceTimersByTimeAsync(VOICE_EVENTS_REFRESH_MS);
+    expect(await screen.findByText("rolled")).toBeInTheDocument();
+    expect(voiceEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops reading once closed", async () => {
+    voiceEvents.mockResolvedValue([]);
+    const { rerender } = render(<BotsSection open />);
+    await waitFor(() => expect(voiceEvents).toHaveBeenCalledTimes(1));
+    rerender(<BotsSection open={false} />);
+    await vi.advanceTimersByTimeAsync(3 * VOICE_EVENTS_REFRESH_MS);
+    expect(voiceEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it("says a failed read failed rather than showing an empty ring", async () => {
+    voiceEvents.mockRejectedValue(new Error("no such command"));
+    render(<BotsSection open />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(VOICE_EVENTS_READ_FAILED);
+    expect(screen.queryByText(VOICE_EVENTS_EMPTY)).not.toBeInTheDocument();
+  });
+
+  it("is absent on the desktop, which has the pill and the tray", async () => {
+    capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+    voiceEvents.mockResolvedValue(RING);
+    render(<BotsSection open />);
+    await waitFor(() => expect(botsProvidersList).toHaveBeenCalled());
+    expect(screen.queryByText(VOICE_EVENTS_TITLE)).not.toBeInTheDocument();
+    expect(voiceEvents).not.toHaveBeenCalled();
+  });
+});
+
+describe("formatVoiceEventAge", () => {
+  it("reads to the second under a minute, then coarser", () => {
+    expect(formatVoiceEventAge(NOW, NOW)).toBe("0s ago");
+    expect(formatVoiceEventAge(NOW - 45_000, NOW)).toBe("45s ago");
+    expect(formatVoiceEventAge(NOW - 60_000, NOW)).toBe("1 min ago");
+    expect(formatVoiceEventAge(NOW - 59 * 60_000, NOW)).toBe("59 min ago");
+    expect(formatVoiceEventAge(NOW - 3_600_000, NOW)).toBe("1 hr ago");
+    expect(formatVoiceEventAge(NOW - 86_400_000, NOW)).toBe("1 day ago");
+    expect(formatVoiceEventAge(NOW - 3 * 86_400_000, NOW)).toBe("3 days ago");
+    // A clock that went backwards is not the future.
+    expect(formatVoiceEventAge(NOW + 10_000, NOW)).toBe("0s ago");
   });
 });

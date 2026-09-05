@@ -19,10 +19,20 @@ import { useWizardStore } from "@/lib/stores/wizard";
  * permanently in Settings → Notifications, and transcribed one-to-one into
  * `docs/ios.md` by Story 15.2. Sentence case, no exclamation marks, honest
  * consequence-naming — never edit one copy without the others.
+ *
+ * The message half is about Matrix and stays true. The last sentence is
+ * Story 67.2 (AD-207): a voice session armed with keeper in front keeps
+ * listening behind other apps and the lock screen, and what it heard and
+ * answered is posted as a local notification — on this phone, from this
+ * app, never a push. Without that sentence the banner would contradict the
+ * one before it.
  */
 export const NO_BACKGROUND_SYNC_SENTENCE =
-  "On iPhone, keeper syncs and notifies only while open. Close it and messages wait on your " +
-  "homeserver until you return — nothing is lost, and nothing here pretends to be push.";
+  "On iPhone, keeper syncs and notifies about messages only while open. Close it and messages " +
+  "wait on your homeserver until you return — nothing is lost, and nothing here pretends to be " +
+  "push. A voice session you left listening is the one exception: it keeps listening with keeper " +
+  "behind other apps or the screen locked, and posts what it heard and answered as a local " +
+  "banner from this phone.";
 
 /**
  * The badge-honesty note shown next to the canonical sentence in Settings →

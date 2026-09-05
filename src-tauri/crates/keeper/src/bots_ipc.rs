@@ -92,7 +92,10 @@ use keeper_core::bots::error::BotsError;
 use keeper_core::bots::follow;
 use keeper_core::bots::grant::Grant;
 use keeper_core::bots::remote::{self, CapabilityCache, SessionCapabilities};
+// Epic 67's one (AD-206): where a spoken turn goes, decided in core.
+use keeper_core::bots::voice_target;
 use keeper_core::bots::{discover, http, session, store, Bot, Endpoint, Provider, ProviderHealth};
+use keeper_core::registry;
 use keeper_core::vm::{
     BotChatSendReq, BotConversationVm, BotFollowVm, BotMessageVm, BotModelVm, BotProbeVm,
     BotProviderSaveReq, BotProviderVm, BotRetryReq, BotSaveReq, BotSessionListVm,
@@ -106,7 +109,7 @@ use keeper_core::vm::{BotCommandContextReq, BotCommandPreviewVm};
 // Story 61.11's two — the tool row and the context disclosure — likewise.
 use keeper_core::vm::{BotContextBundleVm, BotToolCallVm};
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::ipc::{to_ipc_error, AppState};
 
@@ -1211,10 +1214,22 @@ pub async fn bots_chat_send(
     req: BotChatSendReq,
     channel: Channel<BotStreamEvent>,
 ) -> Result<String, IpcError> {
-    let dir = data_dir(&state)?;
+    open_turn(&state, req, channel).await
+}
+
+/// The body of [`bots_chat_send`], shared with [`send_spoken`] (Epic 67,
+/// AD-205): one stream code path whether the question was typed into the
+/// pane or heard by the turn. See `bots_chat_send` for what has happened by
+/// the time this resolves.
+async fn open_turn(
+    state: &AppState,
+    req: BotChatSendReq,
+    channel: Channel<BotStreamEvent>,
+) -> Result<String, IpcError> {
+    let dir = data_dir(state)?;
     let bot = bot_of(&dir, &req.bot_id)?;
     let row = provider_of(&dir, &bot.provider_id)?;
-    let endpoint = endpoint_of(&state, &row, Some(&bot.target))?;
+    let endpoint = endpoint_of(state, &row, Some(&bot.target))?;
     let now = now_ms();
 
     // The conversation, created on the first message so a titled conversation
@@ -1240,7 +1255,7 @@ pub async fn bots_chat_send(
             created
         }
     };
-    let continuity = adopt_identity(&state, &dir, &row, &mut session_row).await?;
+    let continuity = adopt_identity(state, &dir, &row, &mut session_row).await?;
 
     let user = store_message(&dir, &session_row.id, "user", &req.text, None, false, now)?;
     let assistant = store_message(
@@ -1258,7 +1273,7 @@ pub async fn bots_chat_send(
     // Story 61.12: the pasted images of this turn become `data:` content parts
     // on the user message, here and nowhere else.
     let messages = attach_staged_images(&dir, replay(&history, &assistant.id), &req.attachment_ids);
-    let mut armed = arm_turn(&state, &dir, &row, &bot, &req.model, messages).await;
+    let mut armed = arm_turn(state, &dir, &row, &bot, &req.model, messages).await;
     armed.request.session_id = continuity;
     let context = armed.context;
     let turn = Turn {
@@ -1285,6 +1300,135 @@ pub async fn bots_chat_send(
     // After `Opened`, so the pane has the row the disclosure belongs to.
     emit_context(&channel, context.as_ref());
     Ok(spawn_turn(turn, subscription_id, channel))
+}
+
+/// The Tauri event every stream event of a spoken turn is forwarded on
+/// (Epic 67, AD-205). The turn opened its stream in Rust with no webview
+/// channel to hand it, so the pane — when there is one — observes the
+/// answer arriving through this event instead, and applies each
+/// [`BotStreamEvent`] exactly as it applies the ones on its own channel.
+/// The payload is the event itself; the session it belongs to is on its
+/// `opened`.
+pub const SPOKEN_STREAM_EVENT: &str = "keeper://bots-spoken-stream";
+
+/// Send what the voice turn heard (Epic 67, Story 67.1, AD-205, AD-206).
+///
+/// Called by `voice_ipc::transition` when the turn hands out
+/// `Effect::SendText`. Where the question goes is
+/// `keeper_core::bots::voice_target::resolve`'s answer over `bots.voice_target`,
+/// the pinned bots and the conversation list — never what is open on the
+/// screen — and which model is `voice_target::model_for`'s; this function
+/// gathers the facts and then runs [`open_turn`] exactly as a typed send
+/// would, so there is one stream code path. `arm_turn` sees a turn in
+/// `Heard` and marks the stream spoken, which is what routes its close back
+/// into the turn ([`close`], [`close_failed`]).
+///
+/// A refusal — no bot to talk to, no model to send with, a send that never
+/// opened — ends the turn through `voice_ipc::answer_failed` with the
+/// sentence, which puts it beside the switch (AD-190) and in the ring
+/// (AD-192). Nothing is guessed and nothing is sent to a bot nobody chose.
+pub async fn send_spoken(app: &AppHandle, text: String) {
+    let state = app.state::<AppState>();
+    let outcome = spoken_request(&state, &text).await;
+    let req = match outcome {
+        Ok(req) => req,
+        Err(refusal) => {
+            tracing::warn!(message = %refusal.message, "bots: a spoken turn was refused");
+            crate::voice_ipc::answer_failed(refusal.message);
+            return;
+        }
+    };
+    let forward = app.clone();
+    let channel = Channel::new(move |body: tauri::ipc::InvokeResponseBody| {
+        match body.deserialize::<BotStreamEvent>() {
+            Ok(event) => {
+                if let Err(error) = forward.emit(SPOKEN_STREAM_EVENT, &event) {
+                    tracing::warn!(%error, "bots: could not forward a spoken stream event");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "bots: a spoken stream event did not round-trip");
+            }
+        }
+        Ok(())
+    });
+    tracing::info!(bot = %req.bot_id, session = ?req.session_id, "bots: sending what the voice turn heard");
+    if let Err(error) = open_turn(&state, req, channel).await {
+        crate::voice_ipc::answer_failed(error.message);
+    }
+}
+
+/// The request a spoken turn sends: the target's bot, its conversation (or
+/// none, for a new one) and the model, resolved from the store.
+async fn spoken_request(state: &AppState, text: &str) -> Result<BotChatSendReq, IpcError> {
+    let dir = data_dir(state)?;
+    let (bot, target, history) = spoken_target(&dir)?;
+    // The endpoint's list is asked only when the conversation names no
+    // model of its own — a network round trip spent where it can change the
+    // answer, `arm_turn`'s rule.
+    let offered = match voice_target::model_for(&bot, &history, &[]) {
+        Ok(_) => Vec::new(),
+        Err(_) => offered_models(state, &dir, &bot).await,
+    };
+    let model = voice_target::model_for(&bot, &history, &offered)
+        .map_err(|refusal| refused(refusal.message()))?;
+    Ok(BotChatSendReq {
+        session_id: target.session_id,
+        bot_id: target.bot_id,
+        model,
+        text: text.to_owned(),
+        attachment_ids: Vec::new(),
+    })
+}
+
+/// Where a spoken turn goes, read from the store: `bots.voice_target`, the
+/// pinned bots and the live conversations newest first go to
+/// `voice_target::resolve`; the answer comes back with the bot's row and the
+/// target conversation's messages (empty for a new one). A refusal is the
+/// sentence, as an `IpcError` the caller hands to the turn.
+fn spoken_target(
+    dir: &Path,
+) -> Result<(Bot, voice_target::VoiceTarget, Vec<session::BotMessage>), IpcError> {
+    let chosen = registry::get_bots_voice_target(dir).map_err(to_ipc_error)?;
+    let bots = store::list_bots(dir).map_err(to_ipc_error)?;
+    let sessions = session::list_sessions(dir, false).map_err(to_ipc_error)?;
+    let target = voice_target::resolve(chosen.as_deref(), &bots, &sessions)
+        .map_err(|refusal| refused(refusal.message()))?;
+    let bot = bot_of(dir, &target.bot_id)?;
+    let history = match &target.session_id {
+        Some(id) => session::list_messages(dir, id).map_err(to_ipc_error)?,
+        None => Vec::new(),
+    };
+    Ok((bot, target, history))
+}
+
+/// Every model the bot's endpoint lists right now, or none when keeper
+/// could not ask — `discovered_model`'s read, whole.
+async fn offered_models(state: &AppState, dir: &Path, bot: &Bot) -> Vec<BotModelVm> {
+    let Ok(row) = provider_of(dir, &bot.provider_id) else {
+        return Vec::new();
+    };
+    let Ok(endpoint) = endpoint_of(state, &row, Some(&bot.target)) else {
+        return Vec::new();
+    };
+    let Ok(client) = http::client(read_timeout_of(&row)) else {
+        return Vec::new();
+    };
+    discover::models(&client, &endpoint)
+        .await
+        .unwrap_or_default()
+}
+
+/// A spoken turn's refusal is the person's to act on, so the message is the
+/// point; `internal` only because the taxonomy has no better word
+/// (`voice_ipc::refused`'s reasoning).
+fn refused(message: String) -> IpcError {
+    IpcError {
+        code: IpcErrorCode::Internal,
+        message,
+        account_id: None,
+        retriable: false,
+    }
 }
 
 /// The session id this turn sends, written to the row first (AD-176).
@@ -1690,24 +1834,14 @@ async fn drive(turn: Turn, signal: chat::CancelSignal, channel: Channel<BotStrea
     .await;
 
     match outcome {
-        Ok(ran) => {
-            let cancelled = signal.is_cancelled();
-            let reason = match (&ran.final_outcome.finish_reason, cancelled) {
-                (_, true) => Some("Stopped. What had arrived is kept.".to_owned()),
-                (chat::FinishReason::Failed, false) => {
-                    Some("The answer stopped before it finished.".to_owned())
-                }
-                _ => None,
-            };
-            close(
-                &turn,
-                &channel,
-                &ran.final_outcome,
-                &content,
-                ran.calls.len(),
-                reason,
-            );
-        }
+        Ok(ran) => close(
+            &turn,
+            &channel,
+            &ran.final_outcome,
+            &content,
+            ran.calls.len(),
+            signal.is_cancelled(),
+        ),
         // No stream byte ever existed, so there is nothing to keep. The row
         // stays — marked partial, with the reason — rather than vanishing: a
         // question whose answer disappeared is a surface that lost a message.
@@ -1734,15 +1868,31 @@ fn emit_context(channel: &Channel<BotStreamEvent>, context: Option<&ContextBundl
 /// `content` is the whole turn's prose as the sink accumulated it, not the
 /// final completion's alone: a tool-using turn is several completions and the
 /// row holds what the person saw. `tool_call_count` is every call the loop
-/// ran, for the same reason.
+/// ran, for the same reason. `cancelled` is whether Stop was pressed; the
+/// reason the row and the pane carry is worded here, once.
+///
+/// A spoken turn's close is also the voice turn's cue (Epic 67, AD-205): a
+/// clean finish hands `content` to `voice_ipc::answer_complete`, which reads
+/// it aloud; a Stop is the person abandoning the question
+/// (`answer_stopped`); a failure hands its sentence to `answer_failed`, so
+/// the turn ends with the reason rather than waiting for an answer that is
+/// not coming. After the row is written, so what is spoken is what is
+/// stored.
 fn close(
     turn: &Turn,
     channel: &Channel<BotStreamEvent>,
     outcome: &chat::ChatOutcome,
     content: &str,
     tool_call_count: usize,
-    reason: Option<String>,
+    cancelled: bool,
 ) {
+    let reason = match (&outcome.finish_reason, cancelled) {
+        (_, true) => Some("Stopped. What had arrived is kept.".to_owned()),
+        (chat::FinishReason::Failed, false) => {
+            Some("The answer stopped before it finished.".to_owned())
+        }
+        _ => None,
+    };
     let usage = outcome.usage.unwrap_or_default();
     let partial = reason.is_some();
     let finish_reason = finish_word(&outcome.finish_reason);
@@ -1765,7 +1915,14 @@ fn close(
     if let Err(error) = session::close_message(&turn.dir, close) {
         tracing::warn!(%error, "bots: could not close an answer");
     }
-    emit_closed(turn, channel, reason);
+    emit_closed(turn, channel, reason.clone());
+    if turn.spoken {
+        match reason {
+            None => crate::voice_ipc::answer_complete(content.to_owned()),
+            Some(_) if cancelled => crate::voice_ipc::answer_stopped(),
+            Some(reason) => crate::voice_ipc::answer_failed(reason),
+        }
+    }
 }
 
 /// Write a failure that produced no usable outcome, keeping the row partial.
@@ -1782,6 +1939,9 @@ fn close_failed(turn: &Turn, channel: &Channel<BotStreamEvent>, reason: &str) {
         tracing::warn!(%error, "bots: could not record a failed answer");
     }
     emit_closed(turn, channel, Some(reason.to_owned()));
+    if turn.spoken {
+        crate::voice_ipc::answer_failed(reason.to_owned());
+    }
 }
 
 /// Re-read the row and emit the one terminal event, so the surface renders what
@@ -2029,5 +2189,126 @@ mod tests {
         let replayed = replay(&history, "m4");
         assert_eq!(replayed.len(), 3, "the empty row being filled is excluded");
         assert_eq!(replayed[1].role, Role::Assistant);
+    }
+
+    /// A scratch data dir no other test can land in (the store tests' helper,
+    /// verbatim: pid, nanosecond stamp and a counter).
+    fn temp_dir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "keeper-spoken-test-{}-{}-{n}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        dir
+    }
+
+    fn pin(dir: &Path, id: &str) {
+        store::insert_bot(
+            dir,
+            &Bot {
+                id: id.to_owned(),
+                provider_id: "p1".to_owned(),
+                target: id.to_owned(),
+                name: format!("bot {id}"),
+                pin_order: 0,
+                identity: keeper_core::bots::BotIdentity::default(),
+                created_ms: 0,
+            },
+        )
+        .expect("pin a bot");
+    }
+
+    fn talk(dir: &Path, session_id: &str, bot_id: &str, updated_ms: i64, model: &str) {
+        session::insert_session(
+            dir,
+            &session::BotSession {
+                id: session_id.to_owned(),
+                bot_id: bot_id.to_owned(),
+                provider_id: "p1".to_owned(),
+                title: session_id.to_owned(),
+                created_ms: updated_ms,
+                updated_ms,
+                archived: false,
+                remote_session_id: None,
+                remote_last_active_ms: None,
+                remote_source: None,
+            },
+        )
+        .expect("insert a conversation");
+        store_message(dir, session_id, "user", "hello", None, false, updated_ms).expect("q");
+        store_message(
+            dir,
+            session_id,
+            "assistant",
+            "hi",
+            Some((model, "p1")),
+            false,
+            updated_ms,
+        )
+        .expect("a");
+    }
+
+    /// Epic 67 (AD-206): the spoken turn's target is read from the store the
+    /// way the conversation list reads it — newest activity first, pinned
+    /// bots only, the chosen bot when one is set — and the refusal when there
+    /// is none is core's sentence.
+    #[test]
+    fn the_spoken_target_is_read_from_the_store_and_refused_when_there_is_none() {
+        let dir = temp_dir();
+        store::insert_provider(
+            &dir,
+            &Provider {
+                id: "p1".to_owned(),
+                kind: keeper_core::bots::ProviderKind::Ollama,
+                name: "local".to_owned(),
+                base_url: "http://localhost:11434".to_owned(),
+                created_ms: 0,
+            },
+        )
+        .expect("provider");
+
+        // Nothing pinned, nothing talked to: the sentence, and no bot.
+        let refused = spoken_target(&dir).expect_err("nothing to talk to");
+        assert_eq!(
+            refused.message,
+            keeper_core::bots::voice_target::NO_TARGET_SENTENCE
+        );
+
+        pin(&dir, "a");
+        pin(&dir, "b");
+        talk(&dir, "s1", "a", 10, "llama4:8b");
+        talk(&dir, "s2", "b", 20, "qwen3");
+
+        // Unset: the pinned bot most recently talked to, with its
+        // conversation and the model that answered there.
+        let (bot, target, history) = spoken_target(&dir).expect("b was talked to last");
+        assert_eq!(bot.id, "b");
+        assert_eq!(target.session_id.as_deref(), Some("s2"));
+        assert_eq!(
+            voice_target::model_for(&bot, &history, &[]),
+            Ok("qwen3".to_owned())
+        );
+
+        // Chosen: that bot, its own conversation.
+        registry::set_bots_voice_target(&dir, Some("a")).expect("choose a");
+        let (bot, target, history) = spoken_target(&dir).expect("a is chosen");
+        assert_eq!(bot.id, "a");
+        assert_eq!(target.session_id.as_deref(), Some("s1"));
+        assert_eq!(
+            voice_target::model_for(&bot, &history, &[]),
+            Ok("llama4:8b".to_owned())
+        );
+
+        // A chosen bot that was unpinned since is no choice: back to b.
+        store::delete_bot(&dir, "a").expect("unpin a");
+        let (bot, _, _) = spoken_target(&dir).expect("b remains");
+        assert_eq!(bot.id, "b");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

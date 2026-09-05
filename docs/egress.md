@@ -82,6 +82,45 @@ remote form git accepts — `https`, `ssh`, `git`, the scp-like `git@host:path` 
 `file:`, and bare paths — including the cases that must yield no entry and the cases that
 must not leak a username or token.
 
+### The phone reaches the same remote, and nothing else new
+
+Since Epic 66 (AD-198, AD-204) the phone has a folder, so the sync-remote row above is
+reached from a second device. It is the **same destination class, from a second device,
+and no new row**: a profile on the phone names a remote host and, through it, the LFS
+endpoint that server's batch API answers with — exactly what the Mac's profile for the same
+remote already discloses. What the phone does on the wire, stated so this file can be
+checked against the code:
+
+| Request | Made by | Purpose |
+| --- | --- | --- |
+| gitoxide fetch and clone over HTTPS | `src-tauri/crates/keeper-sync/src/git/fetch.rs` (the `blocking-http-transport-reqwest-rust-tls` transport, `src-tauri/Cargo.toml:199`) | The mirror: a clone into the app container, then a fetch on open, on foreground and on pull-to-refresh (`crates/keeper/src/sync.rs:600-654`). No watcher, no supervisor, no tick. |
+| `GET …/info/refs?service=git-receive-pack`, then `POST …/git-receive-pack` | `src-tauri/crates/keeper-sync/src/git/push_http.rs:127` (Story 66.5, AD-202) | The phone's push — keeper speaks `receive-pack` itself, because there is no `git` on a phone and gitoxide has no push. One pack of the objects the remote lacks; refused client-side before any byte leaves unless the remote's tip is in this copy's history (`:289-328`, AD-50). |
+| The LFS batch API and the object URLs it returns | `src-tauri/crates/keeper-sync/src/lfs/batch.rs`, `lfs/hydrate.rs` | Materialising a pointer on open, and uploading the objects a phone commit stages before its push may run (`engine.rs:6679-6689`). The endpoint is derived from the remote as on the Mac; a `.lfsconfig` `lfs.url` outranks it, as the daemon row above says. |
+
+The credential is a header and never a URL, on every one of those requests. gitoxide gets
+it through its programmatic `set_credentials` callback (`fetch.rs:9-14`, `:140`), so it never
+reaches a helper, an argument list or `~/.git-credentials`; `push_http` builds one
+`Authorization: Basic` value through the same sensitive-header path the LFS client uses
+(`push_http.rs:454-461`, `lfs/batch.rs:422`) and strips userinfo from the URL before the
+request is made (`push_http.rs:434-440`); the LFS client sends its `Authorization` the same
+way. Every server line a push answers with — an `ng`, a hook's stderr — passes through
+`scrub_userinfo` before it becomes an error the person can read (`push_http.rs:204-207`;
+NFR-26). The secret itself lives in the phone's keychain under
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (`crates/keeper/src/ipc.rs:841-849`).
+
+The live list on the phone is derived the same way as the Mac's: `sync_remote_urls` reads
+every profile's remote on every target since Epic 66 (`crates/keeper/src/ipc.rs:10976-10993`)
+and `egress::remote_host` reduces it to the host — so a folder added on the phone appears
+under Settings → About on the phone on the next open, as a host, with no cache and no
+hand-written row.
+
+What the phone does **not** reach, because the code for it is either absent or refuses
+there: no `ssh` (`lfs/ssh.rs:325` and gitoxide's ssh transport both spawn one, and a phone
+spawns nothing — an `ssh://` remote fails at its first sync, DW-241); no `git-lfs-authenticate`
+for the same reason; none of the daemon's rows (`keeper-syncd` does not exist on the phone);
+no `git` credential helper. The phone and the Mac never contact each other — the remote is
+the only meeting point (D-15) — so this section adds no device-to-device destination either.
+
 ## An AI provider is a destination you typed, disclosed as a host
 
 The Bots surface (⌘9, Epic 61) talks to a model over the OpenAI-compatible wire, and a model
@@ -125,6 +164,14 @@ destination is exactly the change the note exists to make visible. The derivatio
 reductions are unit-tested beside the git-remote cases in `keeper-core::egress` — host-only,
 de-duplicated, ordered after the sync remotes and before the update endpoint, and gone entirely
 when the last provider is removed.
+
+Since Epic 67 (AD-205, AD-211) a *spoken* question reaches this same endpoint from Rust —
+`bots_ipc::send_spoken` runs the one `open_turn` a typed message runs
+(`src-tauri/crates/keeper/src/bots_ipc.rs:1330`, `:1356`), with the same request, the same
+host and nothing new on the wire — and the lock-screen banner that says what was heard is a
+local notification posted by the app process with no trigger and no push
+(`crates/keeper/src/voice_notify.rs:175-193`, `UNUserNotificationCenter` in-process; no APNs,
+no token), so the row above is unchanged and no row is added.
 
 ## Screen recording adds no egress
 
@@ -221,6 +268,23 @@ and lets at most one reading through every 40 ms, only when it moved
 `0.0..=1.0` on the existing voice channel — never samples, never a buffer — and nothing is
 recorded or written to disk on the way. The recogniser still receives every buffer unchanged,
 before the meter looks at it.
+
+### The phone's record and the island add no egress
+
+Epic 65 adds nothing to the table above (AD-196): the voice port's record is a bounded ring in
+memory (`keeper-core/src/voice/events.rs:8-9`, `:26` — 200 entries, nothing written to disk,
+read back by the `voice_events` command in `src-tauri/crates/keeper/src/voice_log.rs:81` and
+shown under Settings → Bots on the phone with the sentence "Kept in memory only — nothing is
+written or sent", `src/components/settings/bots-section.tsx:188-189`), and the Live Activity
+is started, updated and ended from the app process with `pushType: nil`
+(`src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperIsland.swift:76`) — no APNs, no push
+entitlement, no App Group, no token — so nothing about what the phone heard leaves the device
+(Apple, `Activity.request(attributes:content:pushType:)`,
+`https://developer.apple.com/documentation/activitykit/activity`, and *Displaying live data
+with Live Activities*, both read 2026-09-05; Epic 65, AD-194, AD-196). The `voice_on_device`
+source scan described above picks up every `voice*.rs` in the shell crate by prefix
+(`keeper-core/tests/voice_on_device.rs:38-56`), so the island's Rust side (`voice_island.rs`)
+is inside the network-API scan without being named.
 
 ## One conversation on two devices adds no egress
 

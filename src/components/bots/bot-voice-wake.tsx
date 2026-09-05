@@ -35,6 +35,15 @@
  * system language sits beside the control that fixes it. An empty list is an
  * AD-27 absence — no control — and the availability sentence explains.
  *
+ * # The stop word (Epic 67, Story 67.3, AD-208)
+ *
+ * One line under the phrase: the word that ends an answer when it is said
+ * while keeper is speaking — `VoiceWakeVm.stopPhrase`, "stop" on a fresh
+ * install. Saved through the same `voiceWakeSet` as the phrase, validated by
+ * `keeper_core::voice::WakePhrase::parse_stop`, and matched by Rust on the
+ * barge-in transcript; nothing here listens. Any other speech mid-answer
+ * still asks a question (FR-403).
+ *
  * # Nothing here decides
  *
  * The phrase is validated by `keeper_core::voice::WakePhrase::parse` and a
@@ -45,6 +54,19 @@
  * from the streamed snapshot; the chip is a projection of it and never of a
  * local "did I turn it on" flag, so a device that refused to open shows no
  * chip.
+ *
+ * # The switch is intent; the port's answer is shown beside it (Epic 65, AD-190)
+ *
+ * `voiceWakeSet(enabled, …)` writes what the person chose, whatever the
+ * port said at arming time. Until Epic 65 a refusal — a Polish system
+ * language with no on-device asset, a microphone not yet granted — wrote
+ * the switch OFF and said nothing, so the phrase on the owner's phone was
+ * never armed. Now the refusal is rendered beside the switch as a refusal
+ * (the `unavailable` sentence, or the turn's `failed` reason when the
+ * probe did not predict it) with the switch ON, and `keeper_core::voice::
+ * should_rearm` has Rust arm the phrase again when the refusal clears: a
+ * grant, a language change, keeper back in front, the port's own resume.
+ * Nothing here re-arms; this file only stops saving a "no" nobody said.
  *
  * # The chip is small, persistent, and not a hover
  *
@@ -68,6 +90,7 @@
  */
 import { ChevronDown, ChevronRight, Mic } from "lucide-react";
 import { useEffect, useId, useState } from "react";
+import { BotVoiceTarget } from "@/components/bots/bot-voice-target";
 import { FoldSection } from "@/components/layout/sidebar-group";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -87,6 +110,12 @@ export const WAKE_SWITCH_LABEL = "Listen for a phrase";
 export const WAKE_PHRASE_LABEL = "Wake phrase";
 /** The save control beside the box. */
 export const WAKE_SAVE_LABEL = "Save phrase";
+/** The stop word box's label (Epic 67, AD-208). */
+export const STOP_PHRASE_LABEL = "Stop word";
+/** The save control beside the stop word. */
+export const STOP_SAVE_LABEL = "Save stop word";
+/** What the stop word does, in one sentence. */
+export const STOP_PHRASE_NOTE = "Said while keeper is answering, it ends the answer.";
 /** The chip while the microphone is open for the phrase. */
 export function wakeListeningLabel(phrase: string | null): string {
   return phrase === null ? "Listening" : `Listening for "${phrase}"`;
@@ -129,23 +158,31 @@ export function voiceListeningIn(locale: string): string {
 export const VOICE_FOLDED_OFF = "Listening off";
 
 /**
+ * A refusal's first clause: Rust's sentences all open with the fact and
+ * follow it, after a comma, a dash or a semicolon, with the remedy — and the
+ * remedy is what unfolding (or, on the phone, opening the sheet) is for. A
+ * sentence with no such break is carried whole.
+ */
+export function voiceRefusalClause(message: string): string {
+  const clause = /^(.*?)(?:,|;| —)\s/.exec(message);
+  return clause?.[1] ?? message;
+}
+
+/**
  * The one line the folded block says (AD-184).
  *
  * `Listening for "nixie" · en-US` while the switch is on, `Listening off ·
  * en-US` while it is not — the SETTING, from `VoiceWakeVm`, not the turn's
  * live state, which the status line above the composer already shows. The
  * identifier rather than {@link voiceLocaleName}'s long form, because this is
- * a glance and the unfolded picker spells the name. A refusal contributes its
- * first clause: Rust's sentences all open with the fact and follow it, after
- * a comma, a dash or a semicolon, with the remedy — and the remedy is what
- * unfolding is for.
+ * a glance and the unfolded picker spells the name. A refusal contributes
+ * {@link voiceRefusalClause}.
  */
 export function voiceFoldedLine(wake: VoiceWakeVm, unavailable: VoiceUnavailableVm | null): string {
   const armed = wake.enabled ? wakeListeningLabel(wake.phrase) : VOICE_FOLDED_OFF;
   const parts = [armed, wake.locale];
   if (unavailable !== null) {
-    const clause = /^(.*?)(?:,|;| —)\s/.exec(unavailable.message);
-    parts.push(clause?.[1] ?? unavailable.message);
+    parts.push(voiceRefusalClause(unavailable.message));
   }
   return parts.join(" · ");
 }
@@ -174,20 +211,28 @@ export function BotVoiceWake({
   const state = useVoiceStore((s) => s.state);
   const switchId = useId();
   const phraseId = useId();
+  const stopId = useId();
   const localeId = useId();
-  /** The box's contents: what the person is typing, seeded from what Rust
+  /** The boxes' contents: what the person is typing, seeded from what Rust
    *  holds. Reseeded whenever Rust's answer changes, so a save that came
    *  back normalised or a read that arrived late lands in the box. */
   const [draft, setDraft] = useState("");
+  const [stopDraft, setStopDraft] = useState("");
   const [refusal, setRefusal] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const held = wake?.phrase ?? null;
+  const heldStop = wake?.stopPhrase ?? null;
   useEffect(() => {
     if (held !== null) {
       setDraft(held);
     }
   }, [held]);
+  useEffect(() => {
+    if (heldStop !== null) {
+      setStopDraft(heldStop);
+    }
+  }, [heldStop]);
 
   if (!bots || unavailable === undefined || unavailable?.kind === "unsupported" || wake === null) {
     return null;
@@ -197,17 +242,22 @@ export function BotVoiceWake({
     setBusy(true);
     // Switching the phrase on is a deliberate voice act, so it is where the
     // microphone and recogniser are asked for by name (FR-408, 62.6's
-    // `voice_authorize`). A refusal is mirrored — the sentence beside the
-    // switch says what to allow — and the switch is written **off**: a switch
-    // persisted on with nothing able to listen would be the AD-27 lie. The
-    // phrase is kept, so the choice survives a trip to Settings and back.
+    // `voice_authorize`). What is written is the person's choice, whatever
+    // the port answered (Epic 65, AD-190): a refusal is mirrored — the
+    // sentence beside the switch says what to allow — and the switch stays
+    // ON, because "no" was the port's word, not theirs, and keeper arms the
+    // phrase itself once the refusal clears. A grant lifts an earlier
+    // refusal and nothing else (the mic button's rule): a missing on-device
+    // model, read at mount, is still missing.
     const gate = enabled ? voiceAuthorize() : Promise.resolve(null);
     void gate
       .then((unavailable) => {
         if (unavailable !== null) {
           voiceStore.getState().applyAvailability(unavailable);
+        } else if (enabled && voiceStore.getState().unavailable?.kind === "notAuthorized") {
+          voiceStore.getState().applyAvailability(null);
         }
-        return voiceWakeSet(enabled && unavailable === null, draft);
+        return voiceWakeSet(enabled, draft, stopDraft);
       })
       .then((next) => {
         voiceStore.getState().applyWake(next);
@@ -290,6 +340,30 @@ export function BotVoiceWake({
           {WAKE_SAVE_LABEL}
         </Button>
       </form>
+      <form
+        className="flex items-center gap-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          save(wake.enabled);
+        }}
+      >
+        <Label htmlFor={stopId} className="shrink-0">
+          {STOP_PHRASE_LABEL}
+        </Label>
+        <Input
+          id={stopId}
+          value={stopDraft}
+          disabled={busy}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          onChange={(event) => setStopDraft(event.target.value)}
+        />
+        <Button type="submit" variant="outline" size="sm" disabled={busy || stopDraft === heldStop}>
+          {STOP_SAVE_LABEL}
+        </Button>
+      </form>
+      <p className="text-muted-foreground text-xs">{STOP_PHRASE_NOTE}</p>
       {wake.onDeviceLocales.length > 0 && (
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2">
@@ -321,18 +395,29 @@ export function BotVoiceWake({
           <p className="text-muted-foreground text-xs">{VOICE_LOCALE_NOTE}</p>
         </div>
       )}
+      <BotVoiceTarget />
       {refusal !== null && (
         <p role="alert" className="text-destructive text-xs">
           {refusal}
         </p>
       )}
-      {unavailable !== null && (
+      {unavailable !== null ? (
         // `status`, not `alert`: a permission not yet given or a model not
         // yet downloaded is a state of the phone worth reading, and the
         // sentence says what to do about it.
         <p role="status" className="text-xs">
           {unavailable.message}
         </p>
+      ) : (
+        // The port refused when the phrase was armed, for a reason the
+        // availability probe did not carry: the turn's own reason, Rust's
+        // sentence with its remedy, beside the switch it belongs to
+        // (AD-190). The switch stays on; keeper re-arms when it clears.
+        state?.kind === "failed" && (
+          <p role="status" className="text-xs">
+            {state.reason}
+          </p>
+        )
       )}
       <p className="text-muted-foreground text-xs">{wake.limits}</p>
     </>

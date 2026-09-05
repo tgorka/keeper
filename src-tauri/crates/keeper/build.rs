@@ -43,6 +43,19 @@ fn main() {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     );
+    // On iOS the crate is linked into the app as a staticlib, and the four
+    // `keeper_island_*` symbols `voice_island.rs` calls are defined by the
+    // app target's Swift (`gen/apple/Sources/keeper/KeeperIsland.swift`), so
+    // they resolve at the app's link and nowhere earlier. Cargo still builds
+    // the `cdylib` crate type on iOS - nothing loads it there - and ld refuses
+    // a dylib with undefined symbols, so that one link is told to look them up
+    // at load time. The staticlib and the app's link are untouched. Measured
+    // on hesperia 2026-09-05: without this, `tauri ios build` dies at
+    // "Undefined symbols for architecture arm64: _keeper_island_end" while
+    // linking `libkeeper_lib.dylib`, an artefact the bundle never carries.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-undefined,dynamic_lookup");
+    }
     // Without this the sha is frozen at whatever the first build saw.
     println!("cargo:rerun-if-changed=../../../.git/HEAD");
     println!("cargo:rerun-if-changed=build.rs");

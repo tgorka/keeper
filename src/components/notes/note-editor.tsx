@@ -41,6 +41,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useNotesBody } from "@/hooks/use-notes-body";
 import { type NoteWriteVm, notesGallery, notesRename, notesTagTree } from "@/lib/ipc/client";
 import { followExternalUrl, resolveWikilink } from "@/lib/notes/follow-link";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { markSaved, readNoteDocument, useNoteDocument } from "@/lib/stores/notes-editor";
 import { ensureNotesVaultsHydrated, useNotesVaultsStore } from "@/lib/stores/notes-vaults";
 import { filePathForNote, SHOW_IN_FILES_LABEL, showNoteInFiles } from "@/lib/vault-link";
@@ -376,6 +377,9 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
   useEffect(() => {
     void ensureNotesVaultsHydrated();
   }, []);
+  // The tier, for the two verbs a phone has no window and no picker for (Epic
+  // 66, Story 66.4): Export below, and `CaptureNoteItem` reads it itself.
+  const reducedCapability = useIsReducedCapabilityPlatform();
 
   const hostRef = useRef<HTMLDivElement>(null);
   const runtimeRef = useRef<EditorRuntime | null>(null);
@@ -1092,9 +1096,19 @@ export function NoteEditor({ vaultId, noteId, onOpenNote, frame }: NoteEditorPro
                     has one Export and not two — the panel's could not flush this
                     buffer before Rust reads the file. The rule above it
                     separates what acts on the note from what only shows it;
-                    `NoteActions` draws the second rule, above Delete. */}
-                <DropdownMenuSeparator />
-                <ExportNoteItem vaultId={vaultId} noteId={noteId} />
+                    `NoteActions` draws the second rule, above Delete.
+
+                    Absent on the reduced tier (Epic 66, Story 66.4): an export
+                    copies to a folder the person picked, and a phone has no
+                    destination picker to pick one with — `sync_export_entry`
+                    compiles there and the frontend must not offer it. Absent,
+                    never disabled (AD-27); share-out is the phone's reveal. */}
+                {reducedCapability ? null : (
+                  <>
+                    <DropdownMenuSeparator />
+                    <ExportNoteItem vaultId={vaultId} noteId={noteId} />
+                  </>
+                )}
               </NoteActions>
             )}
           />

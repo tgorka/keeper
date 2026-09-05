@@ -1629,7 +1629,11 @@ export function ConversationPane({
                   <div className="group flex items-center justify-end gap-2 px-3 py-0.5">
                     <button
                       type="button"
-                      className="rounded-full border border-held/40 px-2 py-0.5 text-held text-xs opacity-0 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-held group-hover:opacity-100"
+                      // Hover-revealed on a pointer that can hover; a coarse
+                      // pointer never hovers, so `pointer-coarse:` puts it on
+                      // screen there (Story 66.1, AD-197) — the same fallback
+                      // the account row's menu wears (`account-footer.tsx`).
+                      className="rounded-full border border-held/40 px-2 py-0.5 text-held text-xs opacity-0 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-held group-hover:opacity-100 pointer-coarse:opacity-100"
                       onClick={() => onDelete(heldKey)}
                       data-testid="held-delete-button"
                       // Honest naming: this Delete undoes an unsent hold (text returns to

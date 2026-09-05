@@ -1,6 +1,14 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountVm, InboxBatch, InboxRoomVm } from "@/lib/ipc/client";
+import type {
+  AccountVm,
+  ApprovalDraftVm,
+  BridgeDiscoveryVm,
+  BridgeNetworkVm,
+  InboxBatch,
+  InboxRoomVm,
+  SyncProfileVm,
+} from "@/lib/ipc/client";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { archiveRoomsStore } from "@/lib/stores/archive-rooms";
@@ -20,6 +28,20 @@ import { searchSurfaceStore } from "@/lib/stores/search-surface";
 // resolve benign empties — the stack under test only projects selection state.
 const subscribeInbox = vi.fn();
 const syncNow = vi.fn(async (): Promise<void> => {});
+// Story 66.1: the view surfaces' reads. Approvals lists drafts; Bridges
+// discovers per account; Sync reads the profile mirror. Each is a spy so a
+// surface test can seed what its pane draws.
+const listPendingDrafts = vi.fn(async (): Promise<ApprovalDraftVm[]> => []);
+const approveDraft = vi.fn(async (_a: string, _r: string, _b: string): Promise<void> => {});
+const clearDraft = vi.fn(async (_a: string, _r: string): Promise<void> => {});
+const bridgeCatalog = vi.fn(async (): Promise<BridgeNetworkVm[]> => []);
+const bridgeDiscover = vi.fn(
+  async (): Promise<BridgeDiscoveryVm> => ({ homeserver: "example.org", networks: [] }),
+);
+const bbctlAvailability = vi.fn();
+const syncProfiles = vi.fn(async (): Promise<SyncProfileVm[]> => []);
+/** A read that never answers, for the voice surfaces (AD-179: unanswered renders nothing). */
+const pending = new Promise<never>(() => {});
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
@@ -51,7 +73,6 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     })),
     loadDraft: vi.fn(async (): Promise<string | null> => null),
     saveDraft: vi.fn(async (): Promise<void> => {}),
-    clearDraft: vi.fn(async (): Promise<void> => {}),
     loadRemoteDraft: vi.fn(async () => null),
     mirrorDraft: vi.fn(async (): Promise<void> => {}),
     clearDraftMirror: vi.fn(async (): Promise<void> => {}),
@@ -64,6 +85,40 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     searchArchive: vi.fn(async () => []),
     // Pull-to-refresh (Story 13.6): the sync-loop kick is a spy.
     syncNow: () => syncNow(),
+    // The Approvals surface (Story 66.1).
+    listPendingDrafts: () => listPendingDrafts(),
+    approveDraft: (a: string, r: string, b: string) => approveDraft(a, r, b),
+    clearDraft: (a: string, r: string) => clearDraft(a, r),
+    // The Bridges surface (Story 66.1): discovery, no runner.
+    bridgeCatalog: () => bridgeCatalog(),
+    bridgeDiscover: () => bridgeDiscover(),
+    bbctlAvailability: () => bbctlAvailability(),
+    // The Sync surface (Story 66.1): the mirror and the per-folder reads.
+    syncProfiles: () => syncProfiles(),
+    syncStatuses: vi.fn(async () => []),
+    syncListSettingsGet: vi.fn(async () => ({ folded: 10, unfolded: 100 })),
+    syncActivity: vi.fn(async () => []),
+    syncPending: vi.fn(async () => []),
+    syncProblems: vi.fn(async () => ({
+      warning: null,
+      error: null,
+      parked: [],
+      conflicts: [],
+      unspellable: [],
+    })),
+    syncSubscribeProgress: vi.fn(async () => 1),
+    syncUnsubscribeProgress: vi.fn(async () => {}),
+    syncGetCredential: vi.fn(async () => null),
+    // The Bots list (Story 62.2), reached by the drawer enumeration below.
+    botsProvidersList: vi.fn(async () => []),
+    botsBotsList: vi.fn(async () => []),
+    botsSessionsList: vi.fn(async () => []),
+    botsSessionsSearch: vi.fn(async () => ({ rows: [], total: 0 })),
+    botsModelsList: vi.fn(async () => []),
+    botsMessageDetailsGet: vi.fn(async () => false),
+    // Unanswered (the mock never resolves), so no voice affordance renders (AD-179).
+    voiceAvailability: vi.fn(() => pending),
+    voiceWakeGet: vi.fn(() => pending),
   };
 });
 
@@ -89,7 +144,17 @@ vi.mock("@tauri-apps/api/webview", () => ({
   }),
 }));
 
+import { dispatchPaletteAction } from "@/components/command-palette/actions";
 import { PhoneShell } from "@/components/layout/phone-shell";
+import { sidebarViews } from "@/components/layout/sidebar-pane";
+import { COPY_SUBMIT_LABEL } from "@/components/layout/sync-pane";
+import {
+  SYNC_ADD_TITLE,
+  SYNC_CHOOSE_FOLDER_LABEL,
+  SYNC_REMOTE_URL_LABEL,
+  SYNC_TOKEN_LABEL,
+} from "@/components/sync/add-folder-form";
+import { phoneRoutesView } from "@/lib/phone-surfaces";
 
 const account: AccountVm = {
   accountId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -1098,6 +1163,8 @@ describe("PhoneShell persistent offline pill (Story 14.6)", () => {
     nativeMenuBar: true,
     bridgeSidecar: true,
     revealInFileManager: true,
+    // Story 66.3: the phone's reveal; false on every desktop fixture.
+    shareOut: false,
     recording: false,
     sync: false,
     notes: false,
@@ -1282,5 +1349,208 @@ describe("PhoneShell keyboard inset (Story 13.5)", () => {
       viewport.dispatchEvent(new Event("resize"));
     });
     expect(["", "0px"]).toContain(document.documentElement.style.getPropertyValue("--kb-inset"));
+  });
+});
+
+describe("PhoneShell view surfaces (Story 66.1, AD-197)", () => {
+  /** The tier a phone hydrates to once its folder links (Epic 66): only what the OS refuses is off. */
+  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, bots: true, sync: true };
+
+  const draft: ApprovalDraftVm = {
+    accountId: account.accountId,
+    accountUserId: account.userId,
+    hueIndex: 0,
+    roomId: "!r1:example.org",
+    displayName: "Room One",
+    network: null,
+    body: "half a message",
+    updatedTs: Date.now() - 5 * 60_000,
+  };
+  /** Open the drawer and tap the row with this label; resolves once the drawer has gone. */
+  async function tapDrawerRow(label: RegExp) {
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    const nav = await screen.findByRole("navigation", { name: "Views" });
+    fireEvent.click(within(nav).getByRole("button", { name: label }));
+    await waitFor(() => expect(leadingDrawerStore.getState().isOpen).toBe(false));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  }
+
+  it("opens Approvals from the drawer as a level 1 with the phone idioms reachable", async () => {
+    mockRectWidth(390);
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_FOLDER);
+    const second: ApprovalDraftVm = {
+      ...draft,
+      roomId: "!r2:example.org",
+      displayName: "Room Two",
+    };
+    listPendingDrafts.mockResolvedValue([draft, second]);
+    accountsStore.getState().addAccount(account);
+    render(<PhoneShell />);
+    expect(document.querySelector('[data-level="1"]')).toBeNull();
+
+    await tapDrawerRow(/^Approvals/);
+    expect(primaryViewStore.getState().view).toBe("approval");
+    const level = stackLevel(1);
+    expect(within(level).getByRole("button", { name: "Back to Inbox" })).toBeInTheDocument();
+    const pane = within(level).getByRole("region", { name: "Approvals" });
+    // The trailing swipe discards — the surface appears past the commit point.
+    const row = await within(pane).findByRole("button", { name: /Draft in Room Two/ });
+    fireEvent.pointerDown(row, { pointerId: 1, clientX: 300, clientY: 30 });
+    fireEvent.pointerMove(row, { pointerId: 1, clientX: 100, clientY: 30 });
+    expect(within(pane).getByTestId("approval-swipe-discard")).toHaveTextContent("Discard");
+    fireEvent.pointerUp(row, { pointerId: 1, clientX: 100, clientY: 30 });
+    expect(clearDraft).toHaveBeenCalledWith(account.accountId, "!r2:example.org");
+    // The ≥44pt per-row Approve, through the single gate.
+    const approve = within(pane).getByRole("button", { name: "Approve draft for Room One" });
+    expect(approve).toHaveClass("min-h-11");
+    fireEvent.click(approve);
+    await waitFor(() =>
+      expect(approveDraft).toHaveBeenCalledWith(
+        account.accountId,
+        "!r1:example.org",
+        "half a message",
+      ),
+    );
+
+    // Back pops to the Inbox view, and the level unmounts (reduced motion).
+    fireEvent.click(within(level).getByRole("button", { name: "Back to Inbox" }));
+    expect(primaryViewStore.getState().view).toBe("inbox");
+    await waitFor(() => expect(document.querySelector('[data-level="1"]')).toBeNull());
+  });
+
+  it("opens Bridges from the drawer with discovery and no runner", async () => {
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_FOLDER);
+    const network: BridgeNetworkVm = {
+      networkId: "whatsapp",
+      name: "WhatsApp",
+      glyph: "WA",
+      tier: "low",
+      tierLabel: "Low-risk",
+      badgeStyle: "secondary",
+      requiresAck: false,
+      ackCopy: null,
+    };
+    bridgeCatalog.mockResolvedValue([network]);
+    bridgeDiscover.mockResolvedValue({
+      homeserver: "beeper.com",
+      networks: [{ networkId: "whatsapp", status: "notLoggedIn" }],
+    });
+    // A Beeper account is the one that could run its own bridge on a Mac.
+    accountsStore.getState().addAccount({ ...account, provider: "beeper" });
+    render(<PhoneShell />);
+
+    await tapDrawerRow(/^Bridges/);
+    expect(primaryViewStore.getState().view).toBe("bridges");
+    const level = stackLevel(1);
+    expect(within(level).getByRole("button", { name: "Back to Inbox" })).toBeInTheDocument();
+    const pane = within(level).getByRole("region", { name: "Bridges" });
+    expect(await within(pane).findByText("WhatsApp")).toBeInTheDocument();
+    // Discovery, provisioning and health survive; the sidecar runner does not.
+    expect(within(pane).queryByRole("region", { name: "Run your own bridge" })).toBeNull();
+    expect(bbctlAvailability).not.toHaveBeenCalled();
+  });
+
+  it("routes the palette's open-approval / open-bridges and ⌘3 / ⌘4 to the same levels", async () => {
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_FOLDER);
+    render(<PhoneShell />);
+    await act(async () => {
+      await dispatchPaletteAction("open-bridges", null);
+    });
+    expect(within(stackLevel(1)).getByRole("region", { name: "Bridges" })).toBeInTheDocument();
+    await act(async () => {
+      await dispatchPaletteAction("open-approval", null);
+    });
+    expect(within(stackLevel(1)).getByRole("region", { name: "Approvals" })).toBeInTheDocument();
+    // The chords set the same store; the level follows without a phone branch.
+    act(() => {
+      primaryViewStore.getState().setView("bridges");
+    });
+    expect(within(stackLevel(1)).getByRole("region", { name: "Bridges" })).toBeInTheDocument();
+  });
+
+  it("renders the Sync surface — profile list and the add form — when the folder can sync", async () => {
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_FOLDER);
+    render(<PhoneShell />);
+    await tapDrawerRow(/^Sync/);
+    expect(primaryViewStore.getState().view).toBe("sync");
+    const level = stackLevel(1);
+    expect(within(level).getByRole("button", { name: "Back to Inbox" })).toBeInTheDocument();
+    const pane = within(level).getByRole("region", { name: "Sync" });
+    // Nothing configured: the add form is the surface, in its phone shape.
+    const form = await within(pane).findByRole("form", { name: SYNC_ADD_TITLE });
+    expect(within(form).getByLabelText(SYNC_REMOTE_URL_LABEL)).toBeInTheDocument();
+    expect(within(form).getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
+    expect(within(form).queryByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL })).toBeNull();
+    expect(within(pane).queryByRole("button", { name: COPY_SUBMIT_LABEL })).toBeNull();
+  });
+
+  it("has no Sync row and no Sync level where the folder cannot sync", async () => {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    render(<PhoneShell />);
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    const nav = await screen.findByRole("navigation", { name: "Views" });
+    expect(within(nav).queryByRole("button", { name: /^Sync/ })).toBeNull();
+    expect(within(nav).queryByRole("button", { name: /^Files/ })).toBeNull();
+    act(() => {
+      leadingDrawerStore.getState().close();
+    });
+    // A stale "sync" view (a chord, a restored state) opens nothing: absent, not blank.
+    act(() => {
+      primaryViewStore.getState().setView("sync");
+    });
+    expect(document.querySelector('[data-level="1"]')).toBeNull();
+  });
+
+  it("every drawer row on the phone lands on a level (the registry against the surfaces)", async () => {
+    // Generic on purpose: whatever rows `SidebarPane` draws for this tier are
+    // tapped one by one, and each must leave the stack either on level 0
+    // (the two chat windows) or on a level 1 with a way back. A surface added
+    // to `phone-surfaces.ts` without its branch in the shell fails here as a
+    // level with no back control; a row the shell cannot route is filtered
+    // out of the drawer by the same table, so the count is asserted too.
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_FOLDER);
+    render(<PhoneShell />);
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    const nav = await screen.findByRole("navigation", { name: "Views" });
+    const list = nav.querySelector<HTMLElement>("#sidebar-views");
+    if (list === null) {
+      throw new Error("the views list is not mounted");
+    }
+    const labels = within(list)
+      .getAllByRole("button")
+      .map((button) => button.textContent ?? "");
+    const routable = sidebarViews(PHONE_WITH_FOLDER).filter((entry) =>
+      phoneRoutesView(entry.view, PHONE_WITH_FOLDER),
+    );
+    expect(labels).toEqual(routable.map((entry) => entry.label));
+    expect(labels).toEqual(expect.arrayContaining(["Approvals", "Bridges", "Sync", "Settings"]));
+
+    // Leave the drawer by Escape, as a finger would, so the first tap below
+    // opens a fresh one.
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    for (const entry of routable) {
+      // The drawer closes on a CHANGE of view (Story 13.3); a tap on the row
+      // already current is a no-op there, so start each tap from elsewhere.
+      if (primaryViewStore.getState().view === entry.view) {
+        act(() => {
+          primaryViewStore.getState().setView(entry.view === "inbox" ? "archive" : "inbox");
+        });
+      }
+      await tapDrawerRow(new RegExp(`^${entry.label}`));
+      expect(primaryViewStore.getState().view).toBe(entry.view);
+      if (entry.view === "inbox" || entry.view === "archive") {
+        expect(document.querySelector('[data-level="1"]'), entry.label).toBeNull();
+        continue;
+      }
+      const level = stackLevel(1);
+      expect(
+        within(level).getByRole("button", { name: "Back to Inbox" }),
+        entry.label,
+      ).toBeVisible();
+      fireEvent.click(within(level).getByRole("button", { name: "Back to Inbox" }));
+      await waitFor(() => expect(document.querySelector('[data-level="1"]')).toBeNull());
+    }
   });
 });

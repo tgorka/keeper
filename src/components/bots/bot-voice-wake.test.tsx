@@ -27,6 +27,14 @@
  *    the phrase and the language live from `VoiceWakeVm`, and the refusal's
  *    first clause when the port refuses. Folded, no control is in the tree;
  *    unfolded, the whole block is. Without a `fold` nothing above changes.
+ * 9. **The switch is intent (Epic 65, Story 65.2, AD-190)** — a refusal at
+ *    arming time is written as ON and shown as a refusal with its remedy;
+ *    a grant through the switch lifts a stale permission refusal and only
+ *    that; a refusal the probe did not predict is the turn's reason, beside
+ *    the switch, once.
+ * 10. **The stop word (Epic 67, Story 67.3, AD-208)** — one line under the
+ *    phrase shows `VoiceWakeVm.stopPhrase` and saves it through the same
+ *    `voiceWakeSet` as the phrase; a refused word renders Rust's sentence.
  */
 
 import { readFileSync } from "node:fs";
@@ -35,6 +43,8 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BotVoiceWake,
+  STOP_PHRASE_LABEL,
+  STOP_SAVE_LABEL,
   VOICE_FOLDED_OFF,
   VOICE_LOCALE_AUTO_LABEL,
   VOICE_LOCALE_LABEL,
@@ -51,7 +61,8 @@ import type { VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/cl
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
 
-const voiceWakeSet = vi.fn<(enabled: boolean, phrase: string) => Promise<VoiceWakeVm>>();
+const voiceWakeSet =
+  vi.fn<(enabled: boolean, phrase: string, stopPhrase: string) => Promise<VoiceWakeVm>>();
 const voiceAuthorize = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceLocaleSet = vi.fn<(locale: string | null) => Promise<VoiceWakeVm>>();
@@ -59,7 +70,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
     ...actual,
-    voiceWakeSet: (enabled: boolean, phrase: string) => voiceWakeSet(enabled, phrase),
+    voiceWakeSet: (enabled: boolean, phrase: string, stopPhrase: string) =>
+      voiceWakeSet(enabled, phrase, stopPhrase),
     voiceAuthorize: () => voiceAuthorize(),
     voiceAvailability: () => voiceAvailability(),
     voiceLocaleSet: (locale: string | null) => voiceLocaleSet(locale),
@@ -87,6 +99,8 @@ const ON_DEVICE = ["en-ID", "en-PH", "en-SA", "en-US"];
 const OFF: VoiceWakeVm = {
   enabled: false,
   phrase: "nixie",
+  stopPhrase: "stop",
+  voiceTarget: null,
   limits: LIMITS,
   locale: "en-US",
   localeChosen: null,
@@ -109,6 +123,10 @@ const POLISH_REFUSED: VoiceUnavailableVm = {
   locale: "pl-PL",
   message:
     "speech recognition for pl-PL has no on-device asset on this phone — downloading it under Settings > General > Keyboard > Dictation Languages may add one, or choose en-ID, en-PH, en-SA or en-US",
+};
+const NO_MICROPHONE: VoiceUnavailableVm = {
+  kind: "noMicrophone",
+  message: "no microphone is available on this device",
 };
 
 function seed(
@@ -184,22 +202,65 @@ describe("BotVoiceWake — the switch and the phrase", () => {
     voiceWakeSet.mockResolvedValue(ON);
     render(<BotVoiceWake />);
     fireEvent.click(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL }));
-    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(true, "nixie"));
+    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(true, "nixie", "stop"));
     expect(voiceAuthorize).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(screen.getByRole("switch")).toBeChecked());
     expect(voiceStore.getState().wake).toEqual(ON);
   });
 
-  it("a refused permission leaves the switch off, keeps the phrase, and shows the sentence saying what to allow", async () => {
+  it("a refused permission persists the switch ON, keeps the phrase, and shows the sentence saying what to allow (AD-190)", async () => {
     seed();
     voiceAuthorize.mockResolvedValue(NOT_AUTHORIZED);
-    voiceWakeSet.mockResolvedValue(OFF);
+    voiceWakeSet.mockResolvedValue(ON);
     render(<BotVoiceWake />);
     fireEvent.click(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL }));
-    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(false, "nixie"));
+    // The person's choice is what is written — never the port's "no".
+    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(true, "nixie", "stop"));
     expect(await screen.findByRole("status")).toHaveTextContent(NOT_AUTHORIZED.message);
-    expect(screen.getByRole("switch")).not.toBeChecked();
+    await waitFor(() => expect(screen.getByRole("switch")).toBeChecked());
     expect(voiceStore.getState().unavailable).toEqual(NOT_AUTHORIZED);
+    expect(voiceStore.getState().wake).toEqual(ON);
+  });
+
+  it("a grant given through the switch clears the stale refusal, as the mic button does", async () => {
+    seed({ unavailable: NOT_AUTHORIZED });
+    voiceWakeSet.mockResolvedValue(ON);
+    render(<BotVoiceWake />);
+    expect(screen.getByRole("status")).toHaveTextContent(NOT_AUTHORIZED.message);
+    fireEvent.click(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL }));
+    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(true, "nixie", "stop"));
+    await waitFor(() => expect(voiceStore.getState().unavailable).toBeNull());
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("a grant lifts only a permission refusal: a missing on-device asset is still missing", async () => {
+    seed({ wake: { ...OFF, locale: "pl-PL" }, unavailable: POLISH_REFUSED });
+    voiceWakeSet.mockResolvedValue({ ...ON, locale: "pl-PL" });
+    render(<BotVoiceWake />);
+    fireEvent.click(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL }));
+    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(true, "nixie", "stop"));
+    expect(voiceStore.getState().unavailable).toEqual(POLISH_REFUSED);
+    expect(screen.getByRole("status")).toHaveTextContent(POLISH_REFUSED.message);
+    await waitFor(() => expect(screen.getByRole("switch")).toBeChecked());
+  });
+
+  it("a refusal the probe did not predict — the turn failed at arming — is Rust's reason beside the switch, switch on", () => {
+    // The port refused `start_listening` for the phrase: `voice_ipc::arm`
+    // fails the turn with the same sentence a probe would have given.
+    seed({ wake: ON, state: { kind: "failed", reason: NO_MICROPHONE.message } });
+    render(<BotVoiceWake />);
+    expect(screen.getByRole("switch")).toBeChecked();
+    expect(screen.getByRole("status")).toHaveTextContent(NO_MICROPHONE.message);
+  });
+
+  it("does not say the same refusal twice when the probe and the turn agree", () => {
+    seed({
+      wake: ON,
+      unavailable: NOT_AUTHORIZED,
+      state: { kind: "failed", reason: NOT_AUTHORIZED.message },
+    });
+    render(<BotVoiceWake />);
+    expect(screen.getAllByRole("status")).toHaveLength(1);
   });
 
   it("turning the switch off asks nothing: only arming is a deliberate voice act", async () => {
@@ -207,7 +268,7 @@ describe("BotVoiceWake — the switch and the phrase", () => {
     voiceWakeSet.mockResolvedValue(OFF);
     render(<BotVoiceWake />);
     fireEvent.click(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL }));
-    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(false, "nixie"));
+    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(false, "nixie", "stop"));
     expect(voiceAuthorize).not.toHaveBeenCalled();
   });
 
@@ -225,7 +286,7 @@ describe("BotVoiceWake — the switch and the phrase", () => {
     const box = screen.getByLabelText(WAKE_PHRASE_LABEL, { selector: "input" });
     fireEvent.change(box, { target: { value: "ok" } });
     fireEvent.click(screen.getByRole("button", { name: WAKE_SAVE_LABEL }));
-    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(false, "ok"));
+    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(false, "ok", "stop"));
     expect(await screen.findByRole("alert")).toHaveTextContent(refusal.message);
     expect(screen.getByRole("switch")).not.toBeChecked();
     expect(voiceStore.getState().wake).toEqual(OFF);
@@ -239,6 +300,43 @@ describe("BotVoiceWake — the switch and the phrase", () => {
       target: { value: "hej keeper" },
     });
     expect(screen.getByRole("button", { name: WAKE_SAVE_LABEL })).toBeEnabled();
+  });
+
+  it("shows the stop word under the phrase and saves it through the same write (Epic 67, AD-208)", async () => {
+    seed();
+    voiceWakeSet.mockResolvedValue({ ...OFF, stopPhrase: "przestań" });
+    render(<BotVoiceWake />);
+    const box = screen.getByLabelText(STOP_PHRASE_LABEL, { selector: "input" });
+    expect(box).toHaveValue("stop");
+    expect(screen.getByRole("button", { name: STOP_SAVE_LABEL })).toBeDisabled();
+    fireEvent.change(box, { target: { value: "przestań" } });
+    expect(screen.getByRole("button", { name: STOP_SAVE_LABEL })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: STOP_SAVE_LABEL }));
+    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(false, "nixie", "przestań"));
+    // Saving the word is not arming: nothing is asked for by name.
+    expect(voiceAuthorize).not.toHaveBeenCalled();
+    await waitFor(() => expect(voiceStore.getState().wake?.stopPhrase).toBe("przestań"));
+    expect(screen.getByRole("button", { name: STOP_SAVE_LABEL })).toBeDisabled();
+  });
+
+  it("a refused stop word renders Rust's sentence and the held word stays", async () => {
+    seed();
+    const refusal = {
+      code: "internal",
+      message:
+        'use at least 3 letters in total — "no" is too short for the recogniser to tell from noise',
+      accountId: null,
+      retriable: false,
+    };
+    voiceWakeSet.mockRejectedValue(refusal);
+    render(<BotVoiceWake />);
+    fireEvent.change(screen.getByLabelText(STOP_PHRASE_LABEL, { selector: "input" }), {
+      target: { value: "no" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: STOP_SAVE_LABEL }));
+    await waitFor(() => expect(voiceWakeSet).toHaveBeenCalledWith(false, "nixie", "no"));
+    expect(await screen.findByRole("alert")).toHaveTextContent(refusal.message);
+    expect(voiceStore.getState().wake).toEqual(OFF);
   });
 });
 
@@ -411,11 +509,6 @@ describe("BotVoiceWake — the language", () => {
 });
 
 describe("BotVoiceWake — folded to one line (Story 64.1)", () => {
-  const NO_MICROPHONE: VoiceUnavailableVm = {
-    kind: "noMicrophone",
-    message: "no microphone is available on this device",
-  };
-
   it("says whether listening is armed, the phrase and the language, from the setting", () => {
     expect(voiceFoldedLine(ON, null)).toBe('Listening for "nixie" · en-US');
     expect(voiceFoldedLine(OFF, null)).toBe(`${VOICE_FOLDED_OFF} · en-US`);

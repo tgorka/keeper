@@ -175,7 +175,7 @@ fn voice_may_record_agrees_with_the_ios_port_in_every_state() {
         TurnEvent::FinalHeard("what time is it".to_owned()),
         TurnEvent::Sent,
         TurnEvent::AnswerDone("noon".to_owned()),
-        TurnEvent::SpeechDetected,
+        TurnEvent::SpeechDetected("hey".to_owned()),
         TurnEvent::Failed("mic gone".to_owned()),
     ] {
         turn.drive(event, &port);
@@ -288,7 +288,7 @@ fn voice_half_duplex_turn_never_records_while_speaking() {
 fn voice_half_duplex_barge_in_still_stops_speech_before_listening() {
     let mut turn = Turn::new(VoicePlatform::MACOS);
     turn.apply(TurnEvent::AnswerDone("long".to_owned()));
-    let effects = turn.apply(TurnEvent::SpeechDetected);
+    let effects = turn.apply(TurnEvent::SpeechDetected("hey".to_owned()));
     assert_eq!(effects, vec![Effect::StopSpeaking, Effect::OpenMicrophone]);
     assert!(turn.microphone_open());
 }

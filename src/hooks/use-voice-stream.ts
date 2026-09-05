@@ -22,6 +22,12 @@
  * Re-arming a persisted switch is deliberately **not** done here: arming is
  * the person's act with keeper in front, and the shell holds the turn across
  * pane remounts, so a phrase armed once stays armed until they turn it off.
+ * Since Epic 65 (AD-190) Rust re-arms it itself when a refusal clears —
+ * one of the clearings is keeper coming back to the foreground — so the two
+ * facts are read again when the document becomes visible: the stream
+ * carries the turn's new state on its own, but `unavailable` is a one-shot
+ * answer, and a line still saying "not allowed" over a microphone that is
+ * open would be the lie AD-191 exists to remove.
  *
  * Since Epic 64 (Story 64.3, AD-186) a `listening`/`heard` snapshot also
  * arrives whenever the input level moves — Rust bounds that to ~25 a second
@@ -53,6 +59,12 @@ export function useVoiceStream(): void {
     };
 
     readVoiceFacts(() => cancelled);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        readVoiceFacts(() => cancelled);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
 
     voiceWatch(onState)
       .then((id) => {
@@ -68,6 +80,7 @@ export function useVoiceStream(): void {
 
     return () => {
       cancelled = true;
+      document.removeEventListener("visibilitychange", onVisible);
       if (watchId !== null) {
         void voiceUnwatch(watchId);
       }

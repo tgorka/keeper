@@ -15,6 +15,8 @@
 //! - **Barge-in stops speech first.** `SpeechDetected` while `Speaking`
 //!   yields [`Effect::StopSpeaking`] before any other effect, because the
 //!   person started talking and nothing should still be talking over them.
+//!   What they said decides what follows (AD-208): the stop phrase ends the
+//!   turn ([`StopHeard`]); anything else asks a new question.
 //! - **Nothing empty is sent.** A final transcript that is blank ends the turn
 //!   without a message; a partial transcript never sends at all.
 //! - **A failure releases the device too.** `Failed` is a state, but it is one
@@ -27,6 +29,7 @@
 //!   platform-free; [`super::Turn`] applies the rule over it.
 //!
 //! [`Silence`]: TurnEvent::Silence
+//! [`StopHeard`]: TurnEvent::StopHeard
 
 use std::time::Duration;
 
@@ -99,8 +102,14 @@ pub enum TurnEvent {
     Level(f32),
     /// The whole answer arrived — the text to read aloud.
     AnswerDone(String),
-    /// The person started speaking (barge-in while `Speaking`).
-    SpeechDetected,
+    /// The person started speaking (barge-in while `Speaking`), with the
+    /// transcript that started it — so [`super::Turn`] can tell the stop
+    /// phrase from a question before the table sees it.
+    SpeechDetected(String),
+    /// The person said the stop phrase while `Speaking` (AD-208). Never
+    /// emitted by a port: [`super::Turn`] makes it out of a `SpeechDetected`
+    /// whose words match `bots.stop_phrase`.
+    StopHeard,
     /// The person stopped the turn.
     Abandoned,
     /// Nothing was heard for the state's silence budget, or the spoken answer
@@ -135,7 +144,7 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
     use Effect::{OpenMicrophone, ReleaseMicrophone, StopSpeaking};
     use TurnEvent::{
         Abandoned, AnswerChunk, AnswerDone, Failed, FinalHeard, PartialHeard, Sent, Silence,
-        SpeechDetected, WakeMatched,
+        SpeechDetected, StopHeard, WakeMatched,
     };
 
     match (state, event) {
@@ -192,12 +201,17 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
         // `OpenMicrophone` restarts recognition on a fresh request so the
         // answer's tail is not transcribed as speech; on a half-duplex one it
         // was released before the speech and this opens it.
-        (TurnState::Speaking, SpeechDetected) => (
+        (TurnState::Speaking, SpeechDetected(_)) => (
             TurnState::Listening {
                 heard: String::new(),
             },
             vec![StopSpeaking, OpenMicrophone],
         ),
+        // The stop phrase ends the turn the way a stop button does: nothing
+        // is asked afterwards, and the device is released for the turn.
+        (TurnState::Speaking, StopHeard) => {
+            (TurnState::Idle, vec![StopSpeaking, ReleaseMicrophone])
+        }
         (TurnState::Speaking, Silence) => (TurnState::Idle, vec![ReleaseMicrophone]),
         (TurnState::Speaking, _) => (TurnState::Speaking, Vec::new()),
     }

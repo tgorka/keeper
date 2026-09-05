@@ -28,6 +28,8 @@ const DESKTOP_CAPABILITIES = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  // Story 66.3: the phone's reveal; false on every desktop fixture.
+  shareOut: false,
   recording: false,
   sync: false,
   notes: false,
@@ -78,6 +80,17 @@ describe("NoBackgroundSyncDisclosure", () => {
     expect(await screen.findByText(NO_BACKGROUND_SYNC_SENTENCE)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Got it" })).toBeInTheDocument();
     expect(mockGet).toHaveBeenCalled();
+  });
+
+  it("keeps the message promise and names the voice banner as the one exception (Story 67.2, AD-207)", () => {
+    // The Matrix half must stay true and honest: nothing is pushed while
+    // closed. The lock-screen banner a listening session posts from the
+    // background would contradict a flat "notifies only while open", so the
+    // sentence scopes that claim to messages and names the banner as local.
+    expect(NO_BACKGROUND_SYNC_SENTENCE).toMatch(/notifies about messages only while open/);
+    expect(NO_BACKGROUND_SYNC_SENTENCE).toMatch(/nothing here pretends to be push/);
+    expect(NO_BACKGROUND_SYNC_SENTENCE).toMatch(/voice session .* local banner from this phone/);
+    expect(NO_BACKGROUND_SYNC_SENTENCE).not.toMatch(/!/);
   });
 
   it("acknowledging latches the persisted flag and hides the card", async () => {

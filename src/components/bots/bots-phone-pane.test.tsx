@@ -17,6 +17,11 @@
  * 4. **No grant affordance** — `botTools` is false on a phone; a conversation
  *    streams and closes with no grant bar drawn and no grant or deliverable
  *    read ever made.
+ * 5. **The ear on the phone's face** (Epic 65, Story 65.2, AD-191) — one
+ *    `shrink-0` line above the composer says the setting, the refusal's
+ *    first clause, and the live state; tapping it opens the sheet; it is
+ *    absent while voice is unanswered so the resting column keeps its three
+ *    bands; and `phoneVoiceLine` is pinned as a pure function.
  */
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,7 +36,8 @@ import { GRANT_ADD_LABEL, GRANT_NONE_HELD } from "@/components/bots/bot-grant-ba
 import { BOT_PICKER_BOT_LABEL } from "@/components/bots/bot-picker";
 import { BOT_PINS_LABEL } from "@/components/bots/bot-pins-strip";
 import { BOT_SESSION_NEW_LABEL } from "@/components/bots/bot-session-list";
-import { VOICE_LOCALE_LABEL } from "@/components/bots/bot-voice-wake";
+import { VOICE_TARGET_LABEL, VOICE_TARGET_RECENT_LABEL } from "@/components/bots/bot-voice-target";
+import { VOICE_LOCALE_LABEL, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
 import { BOTS_PANE_TITLE } from "@/components/bots/bots-pane";
 import {
   BOTS_PHONE_BACK_TO_INBOX,
@@ -39,6 +45,8 @@ import {
   BOTS_PHONE_CONVERSATION_SLOT,
   BOTS_PHONE_PICKER_LABEL,
   BOTS_PHONE_PICKER_PLACE,
+  BOTS_PHONE_VOICE_LINE_LABEL,
+  phoneVoiceLine,
 } from "@/components/bots/bots-phone-pane";
 import { SETTINGS_PANE_TITLE } from "@/components/layout/settings-pane";
 import type {
@@ -48,6 +56,7 @@ import type {
   BotSessionVm,
   BotStreamEvent,
   BotVm,
+  VoiceStateVm,
   VoiceUnavailableVm,
   VoiceWakeVm,
 } from "@/lib/ipc/client";
@@ -65,6 +74,7 @@ const botsDeliverablePaths = vi.fn();
 const botsSessionOpen = vi.fn();
 const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceWakeGet = vi.fn<() => Promise<VoiceWakeVm>>();
+const voiceTargetSet = vi.fn<(botId: string | null) => Promise<VoiceWakeVm>>();
 /** The event sink the level handed to `botsChatSend`, driven as Rust would. */
 let sink: ((event: BotStreamEvent) => void) | null = null;
 
@@ -134,6 +144,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceWatch: () => Promise.resolve(1),
     voiceUnwatch: () => Promise.resolve(),
     voiceWakeGet: () => voiceWakeGet(),
+    voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
   };
 });
 
@@ -426,6 +437,8 @@ describe("the Bots view on the phone stack", () => {
       locale: "en-US",
       localeChosen: null,
       onDeviceLocales: ["en-US"],
+      stopPhrase: "stop",
+      voiceTarget: null,
     });
     render(<PhoneShell />);
     await openBots();
@@ -435,6 +448,43 @@ describe("the Bots view on the phone stack", () => {
     const control = await within(sheet).findByRole("combobox", { name: VOICE_LOCALE_LABEL });
     expect(control).toHaveValue("");
     expect(within(control).getAllByRole("option")).toHaveLength(2);
+  });
+
+  /**
+   * Epic 67, AD-206: who a spoken turn speaks to is chosen in the same sheet,
+   * from the pinned bots, with "most recently talked to" as the unset state —
+   * never inferred from the conversation that happens to be open.
+   */
+  it("reaches the spoken-turn target through the Bot and model sheet", async () => {
+    voiceAvailability.mockResolvedValue(null);
+    const wake: VoiceWakeVm = {
+      enabled: true,
+      phrase: "nixie",
+      limits: "limits",
+      locale: "en-US",
+      localeChosen: null,
+      onDeviceLocales: ["en-US"],
+      stopPhrase: "stop",
+      voiceTarget: null,
+    };
+    voiceWakeGet.mockResolvedValue(wake);
+    voiceTargetSet.mockImplementation((botId) => Promise.resolve({ ...wake, voiceTarget: botId }));
+    render(<PhoneShell />);
+    await openBots();
+    await openConversation();
+    fireEvent.click(screen.getByRole("button", { name: BOTS_PHONE_PICKER_LABEL }));
+    const sheet = await screen.findByRole("dialog", { name: BOTS_PHONE_PICKER_LABEL });
+    const control = await within(sheet).findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    expect(control).toHaveValue("");
+    expect(
+      within(control).getByRole("option", { name: VOICE_TARGET_RECENT_LABEL }),
+    ).toBeInTheDocument();
+    expect(within(control).getByRole("option", { name: BOT.name })).toBeInTheDocument();
+
+    fireEvent.change(control, { target: { value: BOT.id } });
+    await waitFor(() => expect(voiceTargetSet).toHaveBeenCalledWith(BOT.id));
+    await waitFor(() => expect(control).toHaveValue(BOT.id));
+    expect(voiceStore.getState().wake?.voiceTarget).toBe(BOT.id);
   });
 
   /**
@@ -563,6 +613,124 @@ describe("what a phone does not have", () => {
     expect(botsDeliverablePaths).not.toHaveBeenCalled();
     expect(botsGrantsList).not.toHaveBeenCalled();
     expect(screen.queryByText(GRANT_NONE_HELD)).not.toBeInTheDocument();
+  });
+});
+
+describe("the ear on the phone's face (Story 65.2, AD-191)", () => {
+  const WAKE_ON: VoiceWakeVm = {
+    enabled: true,
+    phrase: "nixie",
+    limits: "limits",
+    locale: "en-US",
+    localeChosen: null,
+    onDeviceLocales: ["en-US"],
+    stopPhrase: "stop",
+    voiceTarget: null,
+  };
+  const WAKE_OFF: VoiceWakeVm = { ...WAKE_ON, enabled: false };
+  const NOT_AUTHORIZED: VoiceUnavailableVm = {
+    kind: "notAuthorized",
+    message: "keeper is not allowed to use the microphone — allow both under Settings > keeper",
+  };
+  const ARMED: VoiceStateVm = { kind: "idle", wake: "nixie", listeningForWake: true };
+
+  it("composes the setting, the refusal's first clause and the live state into one line", () => {
+    expect(phoneVoiceLine(WAKE_ON, null, ARMED)).toBe('Listening for "nixie" · en-US');
+    expect(phoneVoiceLine(WAKE_OFF, null, null)).toBe("Listening off · en-US");
+    expect(phoneVoiceLine(WAKE_ON, NOT_AUTHORIZED, null)).toBe(
+      'Listening for "nixie" · en-US · keeper is not allowed to use the microphone',
+    );
+    // The turn's live state rides the same line while one runs.
+    expect(phoneVoiceLine(WAKE_ON, null, { kind: "listening", heard: "", level: null })).toBe(
+      'Listening for "nixie" · en-US · Listening',
+    );
+    expect(phoneVoiceLine(WAKE_ON, null, { kind: "heard", text: "what", level: null })).toBe(
+      'Listening for "nixie" · en-US · Heard',
+    );
+    expect(phoneVoiceLine(WAKE_ON, null, { kind: "sending", answering: false })).toBe(
+      'Listening for "nixie" · en-US · Sending',
+    );
+    expect(phoneVoiceLine(WAKE_ON, null, { kind: "speaking" })).toBe(
+      'Listening for "nixie" · en-US · Speaking',
+    );
+    // Mid-sentence, what is being taken down is the line.
+    expect(
+      phoneVoiceLine(WAKE_ON, null, { kind: "listening", heard: "what time", level: null }),
+    ).toBe("Listening · what time");
+    // A refusal at arming the probe did not carry: the turn's reason, its
+    // first clause; when the probe did carry it, once and not twice.
+    const reason = "no microphone is available on this device";
+    expect(phoneVoiceLine(WAKE_ON, null, { kind: "failed", reason })).toBe(
+      `Listening for "nixie" · en-US · ${reason}`,
+    );
+    expect(
+      phoneVoiceLine(WAKE_ON, NOT_AUTHORIZED, { kind: "failed", reason: NOT_AUTHORIZED.message }),
+    ).toBe('Listening for "nixie" · en-US · keeper is not allowed to use the microphone');
+  });
+
+  it("is one bounded band above the composer that says why the phrase is not listening, and opens the sheet", async () => {
+    voiceAvailability.mockResolvedValue(NOT_AUTHORIZED);
+    voiceWakeGet.mockResolvedValue(WAKE_ON);
+    render(<PhoneShell />);
+    await openBots();
+    await openConversation();
+    const line = await screen.findByRole("button", { name: BOTS_PHONE_VOICE_LINE_LABEL });
+    expect(line).toHaveTextContent(
+      'Listening for "nixie" · en-US · keeper is not allowed to use the microphone',
+    );
+    // On the face, not in the sheet: the band is the column's own child,
+    // bounded, directly above the composer.
+    const column = document.querySelector<HTMLElement>(
+      `[data-slot="${BOTS_PHONE_CONVERSATION_SLOT}"]`,
+    ) as HTMLElement;
+    const children = [...column.children];
+    const band = children.find((child) => child.contains(line)) as HTMLElement;
+    expect(band).toHaveClass("shrink-0");
+    expect(children.indexOf(band)).toBe(children.length - 2);
+    expect(children[children.length - 1]).toContainElement(
+      screen.getByRole("textbox", { name: BOT_COMPOSER_LABEL }),
+    );
+    expect(children).toHaveLength(4);
+    // A refused permission keeps its way to Settings on the same band.
+    expect(within(band).getByRole("button", { name: /Open Settings/ })).toBeInTheDocument();
+    // The switch is on — the intent, not the port's "no" — in the sheet the line opens.
+    fireEvent.click(line);
+    const sheet = await screen.findByRole("dialog", { name: BOTS_PHONE_PICKER_LABEL });
+    expect(within(sheet).getByRole("switch", { name: WAKE_SWITCH_LABEL })).toBeChecked();
+    expect(within(sheet).getByRole("status")).toHaveTextContent(NOT_AUTHORIZED.message);
+  });
+
+  it("follows the turn live: armed, then listening, then heard", async () => {
+    voiceAvailability.mockResolvedValue(null);
+    voiceWakeGet.mockResolvedValue(WAKE_ON);
+    render(<PhoneShell />);
+    await openBots();
+    await openConversation();
+    act(() => voiceStore.getState().applyState(ARMED));
+    const line = await screen.findByRole("button", { name: BOTS_PHONE_VOICE_LINE_LABEL });
+    expect(line).toHaveTextContent('Listening for "nixie" · en-US');
+    expect(within(line).getByRole("status")).toHaveAttribute("data-voice", "idle");
+    act(() => voiceStore.getState().applyState({ kind: "listening", heard: "", level: null }));
+    expect(line).toHaveTextContent('Listening for "nixie" · en-US · Listening');
+    act(() =>
+      voiceStore.getState().applyState({ kind: "listening", heard: "what time", level: null }),
+    );
+    expect(line).toHaveTextContent("Listening · what time");
+    expect(within(line).getByRole("status")).toHaveAttribute("data-voice", "listening");
+    expect(screen.queryByRole("button", { name: /Open Settings/ })).toBeNull();
+  });
+
+  it("is absent — no band — where the wake band is absent", async () => {
+    voiceAvailability.mockResolvedValue({
+      kind: "unsupported",
+      message: "voice is not available in this build",
+    });
+    voiceWakeGet.mockResolvedValue(WAKE_ON);
+    render(<PhoneShell />);
+    await openBots();
+    await openConversation();
+    await waitFor(() => expect(voiceStore.getState().wake).toEqual(WAKE_ON));
+    expect(screen.queryByRole("button", { name: BOTS_PHONE_VOICE_LINE_LABEL })).toBeNull();
   });
 });
 

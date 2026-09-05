@@ -2363,6 +2363,290 @@ pub fn restore_missing_checkout(
     })
 }
 
+/// The commit `name` resolves to, or `None` when no such reference exists.
+///
+/// The in-process spelling of `git rev-parse --verify <name>` for the phone
+/// (AD-198): the engine asks about `refs/remotes/origin/<branch>` after a
+/// fetch, and an absent tracking ref is an ordinary answer — a brand-new
+/// remote — rather than a failure.
+pub fn resolve_reference(repo: &gix::Repository, name: &str) -> Result<Option<gix::ObjectId>> {
+    let Ok(mut reference) = repo.find_reference(name) else {
+        return Ok(None);
+    };
+    let id = reference.peel_to_id().map_err(|err| {
+        SyncError::Git(format!(
+            "could not peel {name}: {}",
+            super::fetch::flatten(&err)
+        ))
+    })?;
+    Ok(Some(id.detach()))
+}
+
+/// Is `ancestor` reachable from `descendant`?
+///
+/// `git merge-base --is-ancestor`, answered by gitoxide's own merge-base walk
+/// — the same call [`super::fetch`] uses for its fast-forward verdict. Two
+/// histories with no common commit answer `false`, which is the shape a
+/// divergence takes, not an error.
+pub fn is_ancestor(
+    repo: &gix::Repository,
+    ancestor: gix::ObjectId,
+    descendant: gix::ObjectId,
+) -> Result<bool> {
+    if ancestor == descendant {
+        return Ok(true);
+    }
+    match repo.merge_base(ancestor, descendant) {
+        Ok(base) => Ok(base.detach() == ancestor),
+        Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
+        Err(err) => Err(SyncError::Git(format!(
+            "could not read the merge base: {}",
+            super::fetch::flatten(&err)
+        ))),
+    }
+}
+
+/// How many commits `tip` reaches that `other` does not — the `N` in "this
+/// phone has N commits the remote does not" (AD-199).
+pub fn commits_ahead(
+    repo: &gix::Repository,
+    tip: gix::ObjectId,
+    other: gix::ObjectId,
+) -> Result<usize> {
+    let walk = repo
+        .rev_walk([tip])
+        .with_hidden([other])
+        .all()
+        .map_err(|err| {
+            SyncError::Git(format!(
+                "could not walk the local history: {}",
+                super::fetch::flatten(&err)
+            ))
+        })?;
+    let mut count = 0usize;
+    for info in walk {
+        info.map_err(|err| {
+            SyncError::Git(format!(
+                "could not walk the local history: {}",
+                super::fetch::flatten(&err)
+            ))
+        })?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// What [`fast_forward`] did to the working tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FastForward {
+    /// Paths written because `target`'s tree adds or changes them.
+    pub written: usize,
+    /// Paths removed because `target`'s tree no longer holds them.
+    pub removed: usize,
+}
+
+/// Advance the current branch to `target`, moving index and working tree
+/// with it — `git merge --ff-only`, in-process, for the phone (AD-198).
+///
+/// # What is and is not checked
+///
+/// The *history* precondition is the caller's: [`super::fetch::fetch`]
+/// already answered whether `target` descends from `HEAD`, and this function
+/// is only reached on a `fast_forward: true` outcome. What is checked here is
+/// the *worktree* precondition git checks too — a path this would write or
+/// remove must not carry a local change git has not seen, because
+/// `overwrite_existing` below does exactly what it says. The engine commits
+/// before it pulls, so in the ordinary pass nothing is dirty; a file still
+/// settling is the case this guards, and it answers with a transient error
+/// so the next pass tries again once the commit has taken it.
+///
+/// # The order of the three writes
+///
+/// Worktree, then index, then the reference — and the reference last on
+/// purpose. A process killed after the reference moved but before the index
+/// followed would leave `HEAD` naming a tree the index and the worktree do
+/// not hold, and the next status walk would read every difference as a
+/// local reversal to commit. The other way round, a kill leaves the branch
+/// where it was and the worktree partly advanced; the next pass fast-forwards
+/// again over files that already match, which `overwrite_existing` makes an
+/// idempotent write.
+///
+/// Entries `target` leaves untouched are marked `SKIP_WORKTREE` for the
+/// checkout — [`restore_missing_checkout`]'s trick — and keep the stat the
+/// index already remembers, so a folder of a hundred thousand pointers pays
+/// for the paths that changed and not for the ones that did not.
+pub fn fast_forward(
+    repo: &gix::Repository,
+    target: gix::ObjectId,
+    interrupt: &AtomicBool,
+) -> Result<FastForward> {
+    let workdir = workdir(repo)?;
+    let head = head_commit_id(repo)?;
+    if head == Some(target) {
+        return Ok(FastForward::default());
+    }
+    let tree = repo
+        .find_commit(target)
+        .map_err(|err| {
+            SyncError::Git(format!(
+                "could not read the commit to fast-forward to: {}",
+                super::fetch::flatten(&err)
+            ))
+        })?
+        .tree_id()
+        .map_err(|err| SyncError::Git(format!("could not read the target tree: {err}")))?
+        .detach();
+    let current = repo
+        .index_or_empty()
+        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    let mut next = repo.index_from_tree(&tree).map_err(|err| {
+        SyncError::Git(format!("could not build the index for the target: {err}"))
+    })?;
+
+    // Which paths the target changes, decided against the index this
+    // repository holds now rather than against HEAD's tree: the index is what
+    // the worktree was written from, and it carries the stat data an unchanged
+    // entry keeps.
+    let mut to_write: Vec<PathBuf> = Vec::new();
+    let mut standing: Vec<usize> = Vec::new();
+    for (position, (entry, rela)) in next.entries_mut_with_paths().enumerate() {
+        match current.entry_by_path(rela) {
+            Some(known) if known.id == entry.id && known.mode == entry.mode => {
+                entry.stat = known.stat;
+                entry.flags |= gix::index::entry::Flags::SKIP_WORKTREE;
+                standing.push(position);
+            }
+            _ => to_write.push(gix::path::from_bstr(rela).into_owned()),
+        }
+    }
+    let to_remove: Vec<PathBuf> = current
+        .entries_with_paths_by_filter_map(|rela, _| {
+            next.entry_by_path(rela).is_none().then_some(())
+        })
+        .map(|(rela, ())| gix::path::from_bstr(rela).into_owned())
+        .collect();
+
+    // git's own refusal, in git's own terms: a local change on a path about
+    // to move is never silently overwritten.
+    let status = status_paths(repo)?;
+    let touched = |path: &PathBuf| to_write.contains(path) || to_remove.contains(path);
+    let in_the_way = status
+        .modified
+        .iter()
+        .chain(&status.added)
+        .chain(&status.untracked)
+        .filter(|path| touched(path))
+        .count();
+    if in_the_way > 0 {
+        return Err(SyncError::Git(format!(
+            "{in_the_way} local change(s) sit on paths the remote also changed; they are \
+             committed on the next pass and the fast-forward retried"
+        )));
+    }
+
+    for rela in &to_remove {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err(SyncError::Cancelled);
+        }
+        let path = workdir.join(rela);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(SyncError::io("remove a path the remote deleted", path, err)),
+        }
+    }
+
+    let mut options = repo
+        .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+        .map_err(|err| SyncError::Git(format!("could not read checkout options: {err}")))?;
+    options.destination_is_initially_empty = false;
+    options.overwrite_existing = true;
+    options.keep_going = false;
+    let objects = repo
+        .objects
+        .clone()
+        .into_arc()
+        .map_err(|err| SyncError::io("open the object database", repo.git_dir(), err))?;
+    let outcome = gix::worktree::state::checkout(
+        &mut next,
+        &workdir,
+        objects,
+        &gix::progress::Discard,
+        &gix::progress::Discard,
+        interrupt,
+        options,
+    )
+    .map_err(|err| {
+        cancelled_or(interrupt, || {
+            SyncError::Git(format!(
+                "could not check out the fast-forward: {}",
+                super::fetch::flatten(&err)
+            ))
+        })
+    })?;
+    if interrupt.load(Ordering::Relaxed) {
+        return Err(SyncError::Cancelled);
+    }
+    if let Some(first) = outcome.errors.first() {
+        return Err(SyncError::Git(format!(
+            "{} path(s) could not be written (first: {}: {})",
+            outcome.errors.len(),
+            first.path,
+            first.error
+        )));
+    }
+    if let Some(first) = outcome.collisions.first() {
+        return Err(SyncError::Git(format!(
+            "{} path(s) are blocked by something else on disk (first: {})",
+            outcome.collisions.len(),
+            first.path
+        )));
+    }
+
+    // Only the flags this function set: a written `SKIP_WORKTREE` tells the
+    // next status walk the entry is sparse and must not be compared.
+    let entries = next.entries_mut();
+    for position in &standing {
+        entries[*position]
+            .flags
+            .remove(gix::index::entry::Flags::SKIP_WORKTREE);
+    }
+    next.write(gix::index::write::Options::default())
+        .map_err(|err| {
+            SyncError::Git(format!("could not write the fast-forwarded index: {err}"))
+        })?;
+
+    let branch = repo
+        .head_name()
+        .map_err(|err| SyncError::Git(format!("could not read HEAD: {err}")))?
+        .ok_or_else(|| SyncError::Git("HEAD is detached; nothing to fast-forward".to_owned()))?;
+    let expected = match head {
+        Some(id) => {
+            gix::refs::transaction::PreviousValue::MustExistAndMatch(gix::refs::Target::Object(id))
+        }
+        None => gix::refs::transaction::PreviousValue::MustNotExist,
+    };
+    repo.edit_reference(gix::refs::transaction::RefEdit {
+        change: gix::refs::transaction::Change::Update {
+            log: gix::refs::transaction::LogChange {
+                mode: gix::refs::transaction::RefLog::AndReference,
+                force_create_reflog: false,
+                message: "keeper: fast-forward".into(),
+            },
+            expected,
+            new: gix::refs::Target::Object(target),
+        },
+        name: branch,
+        deref: false,
+    })
+    .map_err(|err| SyncError::Git(format!("could not advance the branch: {err}")))?;
+
+    Ok(FastForward {
+        written: to_write.len(),
+        removed: to_remove.len(),
+    })
+}
+
 /// Whether the index or the working tree differs from `HEAD`.
 ///
 /// Untracked files do **not** make a repository dirty, matching `git status`.

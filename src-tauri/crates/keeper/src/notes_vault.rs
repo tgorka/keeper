@@ -28,7 +28,11 @@
 //!   (AD-63);
 //! * the **cadence** (AD-62), evaluated on the ~1 Hz supervisor tick that
 //!   already exists. There is no second clock, no notes scheduler, no notes
-//!   timer.
+//!   timer — on the desktop. A phone runs no supervisor (Epic 66, NFR-57), so
+//!   there a write arms exactly one delayed pass (`arm_phone_cadence`), the
+//!   commit and the push are one engine call (`phone_commit_and_push`), and
+//!   the history readers below walk the repository in-process
+//!   (`keeper_sync::git::history`) instead of spawning `git`.
 //!
 //! One consequence of that last part is worth stating so nobody "fixes" it:
 //! provenance is a git fact, so it arrives one publish *after* the index does.
@@ -57,6 +61,7 @@ use keeper_core::notes::vm::{
 use keeper_core::notes::{links, naming, recording_note, tags, templates, NotesError};
 use keeper_core::platform::Platform;
 use keeper_sync::exclude::ExcludeSet;
+use keeper_sync::git::history;
 use keeper_sync::profile::{NotesCadence, NotesConfig, SyncProfile};
 use keeper_sync::provenance::{Provenance, SyncSource};
 use tauri::{AppHandle, Manager};
@@ -2132,6 +2137,29 @@ fn refresh_heads(app: &AppHandle, vault: &Vault) {
 /// concerns notes that changed recently.
 fn read_heads(app: &AppHandle, vault: &Vault) -> (String, HashMap<String, HeadRevision>) {
     let mut heads = HashMap::new();
+    let this_device = crate::sync::engine_if_open().map(|engine| engine.device().label);
+    let prefix = format!("{}/", vault.config.subfolder);
+    if is_phone() {
+        // The same window, walked in-process (Epic 66, AD-198): the last
+        // `PROVENANCE_COMMITS` commits and the vault paths each touched,
+        // first record wins, exactly as the `git log --name-only` arm below.
+        let commits = history::recent_commits(
+            &vault.local_path,
+            &prefix,
+            usize::try_from(PROVENANCE_COMMITS).unwrap_or(usize::MAX),
+        )
+        .inspect_err(|error| tracing::warn!(%error, "notes: the phone could not read its heads"))
+        .unwrap_or_default();
+        for commit in commits {
+            let head = phone_revision(&commit.revision, this_device.as_deref());
+            for path in &commit.paths {
+                if let Some(rel) = path.strip_prefix(&prefix) {
+                    heads.entry(rel.to_owned()).or_insert_with(|| head.clone());
+                }
+            }
+        }
+        return (vault.id.clone(), heads);
+    }
     let Some(output) = git_out(
         app,
         &vault.local_path,
@@ -2149,8 +2177,6 @@ fn read_heads(app: &AppHandle, vault: &Vault) -> (String, HashMap<String, HeadRe
         // not an error (AD-63).
         return (vault.id.clone(), heads);
     };
-    let this_device = crate::sync::engine_if_open().map(|engine| engine.device().label);
-    let prefix = format!("{}/", vault.config.subfolder);
     for record in output.split(RECORD_SEP).skip(1) {
         let mut fields = record.split(FIELD_SEP);
         let (Some(rev), Some(when), Some(subject), Some(body), Some(paths)) = (
@@ -2205,6 +2231,33 @@ fn revision_of(
     }
 }
 
+/// The same revision, from the in-process walk (Epic 66, AD-198). One
+/// projection for both tiers: the phone's `FileRevision` is handed to
+/// [`revision_of`] as the four `git log` fields it stands for, so `origin:`
+/// and the unread mark cannot mean different things on a phone.
+fn phone_revision(revision: &history::FileRevision, this_device: Option<&str>) -> HeadRevision {
+    revision_of(
+        &revision.id,
+        &revision.committed_secs.to_string(),
+        revision.subject(),
+        &revision.message,
+        this_device,
+    )
+}
+
+/// Whether this build reads history in-process (AD-198). A `const` on the
+/// engine rather than a `cfg`, so both arms of every reader above are
+/// type-checked on every host — the shell crate does not build on Linux, and
+/// a phone arm nobody can compile locally is a phone arm nobody has read.
+fn is_phone() -> bool {
+    keeper_sync::git::cli::GitEngine::HOST == keeper_sync::git::cli::GitEngine::Gix
+}
+
+/// A vault-relative path as the repository names it: under the subfolder.
+fn repo_rel(vault: &Vault, rel: &str) -> String {
+    format!("{}/{rel}", vault.config.subfolder)
+}
+
 /// The `origin:` vocabulary for one commit's trailers.
 fn origin_of(provenance: Option<&Provenance>, this_device: Option<&str>) -> String {
     let Some(provenance) = provenance else {
@@ -2227,7 +2280,24 @@ fn origin_of(provenance: Option<&Provenance>, this_device: Option<&str>) -> Stri
 ///
 /// A revwalk per call rather than a cached store: "who changed this note" is a
 /// git question and git already has the answer (AD-63).
+///
+/// On a phone the walk is gitoxide's (`history::file_log`) and does **not**
+/// follow renames: the list stops where the filename changed, and the ULID
+/// identity that survives a rename (FR-97) is not consulted for the older
+/// names. Said in the module that reads it rather than hidden.
 pub fn revisions(app: &AppHandle, vault: &Vault, rel: &str, limit: u32) -> Vec<NoteRevisionVm> {
+    let this_device = crate::sync::engine_if_open().map(|engine| engine.device().label);
+    if is_phone() {
+        let limit = usize::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
+        return history::file_log(&vault.local_path, &repo_rel(vault, rel), limit)
+            .inspect_err(
+                |error| tracing::warn!(%error, "notes: the phone could not read a history"),
+            )
+            .unwrap_or_default()
+            .iter()
+            .map(|revision| phone_revision(revision, this_device.as_deref()).vm())
+            .collect();
+    }
     let Some(output) = git_out(
         app,
         &vault.local_path,
@@ -2245,7 +2315,6 @@ pub fn revisions(app: &AppHandle, vault: &Vault, rel: &str, limit: u32) -> Vec<N
     ) else {
         return Vec::new();
     };
-    let this_device = crate::sync::engine_if_open().map(|engine| engine.device().label);
     output
         .split(RECORD_SEP)
         .skip(1)
@@ -2270,6 +2339,22 @@ pub fn diff(
     from_rev: &str,
     to_rev: Option<&str>,
 ) -> NoteDiffVm {
+    if is_phone() {
+        // The same hunk text `git diff --unified=3` prints, from gitoxide,
+        // through the same parser — one reading of a hunk on both tiers.
+        let hunks =
+            history::unified_diff(&vault.local_path, &repo_rel(vault, rel), from_rev, to_rev)
+                .inspect_err(
+                    |error| tracing::warn!(%error, "notes: the phone could not diff a note"),
+                )
+                .map(|text| parse_hunks(&text))
+                .unwrap_or_default();
+        return NoteDiffVm {
+            hunks,
+            from_rev: from_rev.to_owned(),
+            to_rev: to_rev.map(str::to_owned),
+        };
+    }
     let mut args = vec![
         "diff".to_owned(),
         "--no-color".to_owned(),
@@ -2343,7 +2428,20 @@ fn split_span(span: &str) -> Option<(u32, u32)> {
 /// no new engine API and `keeper` needs no gitoxide dependency of its own. A
 /// failure — no git, no repository, a path with no history — is `None`, because
 /// an empty history is an honest answer and a missing one is not an error.
+///
+/// **Never on a phone.** Every reader above takes its in-process route first
+/// (`keeper_sync::git::history`, Epic 66, AD-198); this is the desktop's
+/// half, and on the phone it refuses before `Command::new` rather than
+/// spawning a process the OS would deny — the same boundary
+/// `keeper_sync::git::cli` draws for the engine's four verbs.
 fn git_out(app: &AppHandle, repo: &Path, args: &[String]) -> Option<String> {
+    if is_phone() {
+        tracing::warn!(
+            ?args,
+            "notes: a git read reached the binary path on a phone; answering with nothing"
+        );
+        return None;
+    }
     let platform = Arc::clone(&app.state::<crate::ipc::AppState>().platform);
     let program = crate::sync::git_resolution(platform.as_ref())
         .program()
@@ -2368,6 +2466,14 @@ fn git_out(app: &AppHandle, repo: &Path, args: &[String]) -> Option<String> {
 /// the same string [`revisions`] lists, so "undo" and "the history panel" are
 /// looking at one object rather than two that have to agree.
 pub fn head_rev_of(app: &AppHandle, vault: &Vault, rel: &str) -> Option<String> {
+    if is_phone() {
+        return history::file_log(&vault.local_path, &repo_rel(vault, rel), 1)
+            .inspect_err(|error| tracing::warn!(%error, "notes: the phone could not read a head"))
+            .ok()?
+            .into_iter()
+            .next()
+            .map(|revision| revision.id);
+    }
     let out = git_out(
         app,
         &vault.local_path,
@@ -2390,6 +2496,15 @@ pub fn head_rev_of(app: &AppHandle, vault: &Vault, rel: &str) -> Option<String> 
 /// no engine API. Binary-safe by omission: a note is UTF-8 by construction and a
 /// file that is not is not a note keeper will restore.
 pub fn revision_text(app: &AppHandle, vault: &Vault, rel: &str, rev: &str) -> Option<String> {
+    if is_phone() {
+        return history::blob_at(&vault.local_path, rev, &repo_rel(vault, rel))
+            .inspect_err(
+                |error| tracing::warn!(%error, "notes: the phone could not read a revision"),
+            )
+            .ok()
+            .flatten()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    }
     git_out(
         app,
         &vault.local_path,
@@ -2413,6 +2528,19 @@ pub fn revision_text(app: &AppHandle, vault: &Vault, rel: &str, rev: &str) -> Op
 /// and not an empty set.
 pub fn uncommitted_paths(app: &AppHandle, vault: &Vault) -> Option<HashSet<String>> {
     let prefix = format!("{}/", vault.config.subfolder);
+    if is_phone() {
+        return history::dirty_paths(&vault.local_path, &prefix)
+            .map(|paths| {
+                paths
+                    .into_iter()
+                    .filter_map(|path| path.strip_prefix(&prefix).map(str::to_owned))
+                    .collect()
+            })
+            .inspect_err(
+                |error| tracing::warn!(%error, "notes: the phone could not read its status"),
+            )
+            .ok();
+    }
     let out = git_out(
         app,
         &vault.local_path,
@@ -2576,9 +2704,17 @@ fn decide(state: &CadenceState, cadence: &NotesCadence, now_ms: i64, forced: boo
 }
 
 /// Mark a vault dirty from outside the watcher tap — keeper's own writes.
+///
+/// On a phone this is also what starts the clock: with no supervisor tick to
+/// evaluate the cadence, the write arms one pass `commit_idle_ms` later
+/// ([`arm_phone_cadence`]).
 pub fn mark_dirty(vault_id: &str) {
-    if let Some(slot) = registry().get(vault_id) {
+    let idle_ms = registry().get(vault_id).map(|slot| {
         slot.cadence.mark_dirty();
+        slot.vault.config.cadence.commit_idle_ms
+    });
+    if let Some(idle_ms) = idle_ms.filter(|_| is_phone()) {
+        arm_phone_cadence(vault_id, idle_ms);
     }
 }
 
@@ -2660,6 +2796,11 @@ fn dispatch_cadence(forced: bool) {
             if let Some(slot) = registry().get(&vault_id) {
                 slot.cadence.finish(ahead, push_interval_ms);
             }
+            // The desktop's supervisor tick will find `Ahead` at its deadline;
+            // the phone has to come back for it itself.
+            if ahead && is_phone() {
+                arm_phone_cadence(&vault_id, push_interval_ms);
+            }
         });
     }
 }
@@ -2695,6 +2836,10 @@ async fn run_cadence_action(vault_id: &str, action: Action) -> bool {
         return false;
     };
     match action {
+        // A phone has no supervisor to wake and no watcher to settle a file
+        // for it (Epic 66, AD-198, NFR-57): the commit and the push are one
+        // act here, on the engine's own pass.
+        Action::Commit if is_phone() => phone_commit_and_push(&engine, vault_id).await,
         Action::Commit => {
             // `wake_now`, never `rescan`: the cadence is asking the engine to
             // notice *now*, and its own next pass walks the tree, applies the
@@ -2724,6 +2869,86 @@ async fn run_cadence_action(vault_id: &str, action: Action) -> bool {
             false
         }
         Action::None => false,
+    }
+}
+
+/// The phone's commit-and-push (Epic 66, Story 66.4, AD-198, AD-202).
+///
+/// The desktop's cadence commits by waking the supervisor and pushes on a
+/// later tick; a phone has neither, so a save is one engine pass: declare the
+/// container's own writes settled — there is no other writer in an app
+/// container, so the settle window would be waiting for nobody
+/// (`Engine::prime_worktree_changes`) — then `sync_once_recording`, whose
+/// order is commit, fetch, fast-forward, push. The push is
+/// `Engine::push_after_commit` → `git::push_http::push`, the phone's own
+/// engine, never a binary (AD-202); a history the phone cannot fast-forward
+/// is the divergence sentence beside the profile (AD-199), and the commit is
+/// kept locally either way.
+///
+/// `true` — still ahead — when the pass refused, which is what re-arms the
+/// retry in [`dispatch_cadence`]. Offline is the ordinary case, not a fault.
+async fn phone_commit_and_push(engine: &keeper_sync::Engine, vault_id: &str) -> bool {
+    match engine.prime_worktree_changes(vault_id) {
+        Ok(primed) => tracing::debug!(
+            vault_id,
+            primed,
+            "notes: the phone declared its writes settled"
+        ),
+        Err(error) => {
+            tracing::warn!(vault_id, %error, "notes: the phone could not declare its writes")
+        }
+    }
+    match engine
+        .sync_once_recording(vault_id, SyncSource::Watch)
+        .await
+    {
+        Ok(outcome) => {
+            tracing::info!(
+                vault_id,
+                committed = outcome.files_changed,
+                pushed = outcome.pushed,
+                "notes: the phone committed and pushed its notes"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(vault_id, %error, "notes: the phone's commit-and-push is deferred");
+            true
+        }
+    }
+}
+
+/// Arm one delayed cadence pass on the phone (Epic 66, NFR-57).
+///
+/// The desktop evaluates the cadence on the supervisor's 1 Hz tick; a phone
+/// runs no clock on a battery, so a write arms exactly one pass `delay_ms`
+/// later. A burst of autosaves arms a burst of passes, and only the one that
+/// lands after the last write finds the vault idle for `commit_idle_ms` — the
+/// rest see `Action::None` and cost nothing. A pass that leaves the vault
+/// ahead of its remote re-arms itself at `push_interval_ms`, so an offline
+/// save is retried while the app is in front and picked up by the next
+/// foreground sync otherwise.
+fn arm_phone_cadence(vault_id: &str, delay_ms: u64) {
+    let vault_id = vault_id.to_owned();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        tracing::debug!(vault_id, delay_ms, "notes: the phone's cadence pass");
+        dispatch_cadence(false);
+    });
+}
+
+/// Re-read the registry and re-walk every vault after a phone sync pass
+/// (Epic 66, NFR-57): a clone that just landed becomes a vault, and a
+/// fast-forward that just wrote notes reaches the index — there is no
+/// watcher tap on a phone to announce either.
+///
+/// A rescan keeps the `.keeper/index.json` cache, so it is one stat per
+/// note plus a parse of whatever the fast-forward changed, not a cold scan.
+#[cfg(not(desktop))]
+pub fn phone_synced(app: &AppHandle) {
+    refresh(app);
+    for slot in registry().values() {
+        let _ = slot.work.send(Work::Rescan);
     }
 }
 

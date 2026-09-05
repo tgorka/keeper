@@ -28,7 +28,10 @@ import { Button } from "@/components/ui/button";
 import { Lamp } from "@/components/ui/lamp";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useShellLayout } from "@/hooks/use-shell-layout";
 import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
+import type { CapabilitiesVm } from "@/lib/ipc/client";
+import { phoneRoutesView } from "@/lib/phone-surfaces";
 import { useShellOffline } from "@/lib/stores/account-status";
 import { useWorstBridgeHealth } from "@/lib/stores/bridge-health";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
@@ -36,7 +39,7 @@ import { usePendingDraftCount } from "@/lib/stores/drafts";
 import { type PrimaryView, primaryViewStore, usePrimaryView } from "@/lib/stores/primary-view";
 import { cn } from "@/lib/utils";
 
-interface SidebarView {
+export interface SidebarView {
   label: string;
   icon: typeof MessageSquare;
   /** The primary view this entry switches to.
@@ -243,6 +246,43 @@ const VIEWS_LIST_ID = "sidebar-views";
  */
 const RAIL_INDICATOR = "absolute top-px right-px";
 
+/**
+ * The nav registry for one build: the always-present entries with the
+ * capability-gated ones spliced in before Settings, each only when supported.
+ * Pure, so the phone's routing test can enumerate exactly what the drawer
+ * would draw for any capability shape.
+ */
+export function sidebarViews(capabilities: CapabilitiesVm): SidebarView[] {
+  return [
+    ...BASE_VIEWS,
+    // Screen recording is a desktop-macOS-≥13 capability (Story 16.3): the
+    // capture surface and the browser over what it produced ride the one
+    // `recording` flag together (Story 42.3) — where recordings cannot be made
+    // neither entry exists, never a dead button.
+    ...(capabilities.recording ? [RECORDING_VIEW, RECORDINGS_VIEW] : []),
+    // Folder sync needs a usable engine (Story 32.5, AD-41; on the phone,
+    // gix — Epic 66): the folder's diagnostics and the browser over its
+    // contents ride the one `sync` flag together (Story 43.8), for the same
+    // reason the two recording entries do.
+    ...(capabilities.sync ? [SYNC_VIEW, FILES_VIEW] : []),
+    // A vault is a folder keeper already syncs (AD-54), so notes exists only
+    // where folder sync does (Story 37.1, FR-122) — absent, not disabled.
+    ...(capabilities.notes ? [NOTES_VIEW] : []),
+    // A sessions root is the same construction (AD-107, FR-223) — same gate.
+    ...(capabilities.sessions ? [SESSIONS_VIEW] : []),
+    // The task record lives in the same `sync.db` (AD-137), so it rides the
+    // same gate — and it is last before Settings, which is where a person who
+    // cannot find their schedules goes looking.
+    ...(capabilities.sessions ? [TASKS_VIEW] : []),
+    // Bots is the one entry here that does NOT ride the sync gate (Epic 61,
+    // FR-378): a conversation needs no `git` and no `sync.db`, so this row can
+    // be present on a machine where Sync, Files, Notes, Sessions and Tasks are
+    // all absent.
+    ...(capabilities.bots ? [BOTS_VIEW] : []),
+    SETTINGS_VIEW,
+  ];
+}
+
 export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
   const offline = useShellOffline();
   // Controlled state for the Settings dialog (Story 2.6). Only the Settings view
@@ -258,43 +298,17 @@ export function SidebarPane({ collapsed, onToggleFold }: SidebarPaneProps) {
   // The count of chats with a pending draft across all accounts (Story 7.3). Drives
   // the amber "Approvals" count badge — shown only when at least one draft is held.
   const pendingDraftCount = usePendingDraftCount();
-  // Screen recording is a desktop-macOS-≥13 capability (Story 16.3): the Recording
-  // nav entry (and its ⌘5) is present only when the flag is on, never a dead button.
-  const recording = useCapabilitiesStore((s) => s.capabilities.recording);
-  // Folder sync needs a usable `git` (Story 32.5, AD-41): the Sync nav entry is
-  // present only when the flag is on, for the same reason.
-  const sync = useCapabilitiesStore((s) => s.capabilities.sync);
-  // A vault is a folder keeper already syncs (AD-54), so notes exists only where
-  // folder sync does (Story 37.1, FR-122) — the entry is absent, not disabled.
-  const notes = useCapabilitiesStore((s) => s.capabilities.notes);
-  // A sessions root is the same construction (AD-107, FR-223) — same gate.
-  const sessions = useCapabilitiesStore((s) => s.capabilities.sessions);
-  // Bots is the one entry here that does NOT ride the sync gate (Epic 61,
-  // FR-378): a conversation needs no `git` and no `sync.db`, so this row can be
-  // present on a machine where Sync, Files, Notes, Sessions and Tasks are all
-  // absent.
-  const bots = useCapabilitiesStore((s) => s.capabilities.bots);
-  // Splice the gated entries in before Settings, each only when supported.
-  const views: SidebarView[] = [
-    ...BASE_VIEWS,
-    // The capture surface and the browser over what it produced ride the one
-    // `recording` flag together (Story 42.3): where recordings cannot be made
-    // neither entry exists.
-    ...(recording ? [RECORDING_VIEW, RECORDINGS_VIEW] : []),
-    // The folder's diagnostics and the browser over its contents ride the one
-    // `sync` flag together (Story 43.8), for the same reason the two recording
-    // entries do.
-    ...(sync ? [SYNC_VIEW, FILES_VIEW] : []),
-    ...(notes ? [NOTES_VIEW] : []),
-    ...(sessions ? [SESSIONS_VIEW] : []),
-    // The task record lives in the same `sync.db` (AD-137), so it rides the
-    // same gate — and it is last before Settings, which is where a person who
-    // cannot find their schedules goes looking.
-    ...(sessions ? [TASKS_VIEW] : []),
-    // Its own flag, for the reason stated where it is read.
-    ...(bots ? [BOTS_VIEW] : []),
-    SETTINGS_VIEW,
-  ];
+  const capabilities = useCapabilitiesStore((s) => s.capabilities);
+  // On the phone this pane is the drawer (Story 13.3), and a row there must
+  // land on a level of the stack (Story 66.1, AD-197): the registry is
+  // filtered to the views `phone-surfaces.ts` routes, so a surface the phone
+  // has not been given yet is absent rather than a tap that does nothing
+  // (AD-27). Off the phone the registry is drawn whole.
+  const { phone } = useShellLayout();
+  const registry = sidebarViews(capabilities);
+  const views = phone
+    ? registry.filter((entry) => phoneRoutesView(entry.view, capabilities))
+    : registry;
 
   // The way back, built once and placed twice: bare while the drawer is open
   // and its title says which drawer this is, tooltipped while it is folded and

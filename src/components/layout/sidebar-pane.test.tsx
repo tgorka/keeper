@@ -19,9 +19,10 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
 });
 
 import { FOLD_STRIP } from "@/components/layout/fold-strip";
-import { SidebarPane } from "@/components/layout/sidebar-pane";
+import { SidebarPane, sidebarViews } from "@/components/layout/sidebar-pane";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { BridgeHealth } from "@/lib/ipc/client";
+import { phoneRoutesView } from "@/lib/phone-surfaces";
 import { accountStatusStore } from "@/lib/stores/account-status";
 import { accountsStore } from "@/lib/stores/accounts";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
@@ -53,6 +54,14 @@ const other: AccountVm = {
   hueIndex: 1,
   provider: "password",
 };
+
+/**
+ * A desktop that can sync. `sync` alone no longer tells the tiers apart (Epic
+ * 66: a phone can sync too), so a desktop fixture must carry something the
+ * phone's OS refuses — here the native menu bar — or it reads as a phone and
+ * the drawer filter (Story 66.1) drops the rows the phone has no surface for.
+ */
+const DESKTOP_WITH_SYNC = { ...DEFAULT_CAPABILITIES, nativeMenuBar: true, sync: true };
 
 function renderSidebar(collapsed = false, onToggleFold: (() => void) | null = () => {}) {
   return render(
@@ -426,7 +435,7 @@ describe("SidebarPane files entry (Story 43.8)", () => {
   });
 
   it("places Files immediately after Sync, before Settings", () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITH_SYNC);
     renderSidebar();
 
     const labels = screen
@@ -437,7 +446,7 @@ describe("SidebarPane files entry (Story 43.8)", () => {
   });
 
   it("switches the primary view to files, leaving Sync unmarked", () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITH_SYNC);
     renderSidebar();
 
     fireEvent.click(screen.getByRole("button", { name: "Files" }));
@@ -459,13 +468,13 @@ describe("SidebarPane notes entry (Story 37.1)", () => {
   });
 
   it("shows the Notes entry only when the notes capability is on", () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true });
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_WITH_SYNC, notes: true });
     renderSidebar();
     expect(screen.getByRole("button", { name: "Notes" })).toBeInTheDocument();
   });
 
   it("switches the primary view to notes when the Notes entry is clicked", () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true });
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_WITH_SYNC, notes: true });
     renderSidebar();
     expect(primaryViewStore.getState().view).toBe("inbox");
 
@@ -489,6 +498,45 @@ describe("SidebarPane notes entry (Story 37.1)", () => {
           label === "Recording" || label === "Sync" || label === "Notes" || label === "Settings",
       );
     expect(labels).toEqual(["Recording", "Sync", "Notes", "Settings"]);
+  });
+});
+
+describe("SidebarPane as the phone drawer (Story 66.1, AD-197, AD-27)", () => {
+  /** The tier a phone hydrates to once its folder links (Epic 66). */
+  const PHONE_WITH_FOLDER = { ...DEFAULT_CAPABILITIES, bots: true, sync: true };
+
+  it("keeps only the rows the phone stack can land, in registry order", () => {
+    capabilitiesStore.getState().applySnapshot(PHONE_WITH_FOLDER);
+    renderSidebar(false, null);
+    const labels = screen
+      .getAllByRole("button")
+      .map((button) => button.textContent)
+      .filter((label) => sidebarViews(PHONE_WITH_FOLDER).some((entry) => entry.label === label));
+    // Files rides the same `sync` flag on the desktop and, since Story 66.3,
+    // lands on the phone too; Notes waits for its surface (66.4) and is absent
+    // rather than dead until then.
+    expect(labels).toEqual([
+      "Chats",
+      "Archive",
+      "Approvals",
+      "Bridges",
+      "Sync",
+      "Files",
+      "Bots",
+      "Settings",
+    ]);
+    expect(
+      sidebarViews(PHONE_WITH_FOLDER)
+        .filter((entry) => phoneRoutesView(entry.view, PHONE_WITH_FOLDER))
+        .map((entry) => entry.label),
+    ).toEqual(labels);
+  });
+
+  it("draws the whole registry off the phone, whatever the flags", () => {
+    capabilitiesStore.getState().applySnapshot({ ...DESKTOP_WITH_SYNC, notes: true });
+    renderSidebar();
+    expect(screen.getByRole("button", { name: "Files" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Notes" })).toBeInTheDocument();
   });
 });
 

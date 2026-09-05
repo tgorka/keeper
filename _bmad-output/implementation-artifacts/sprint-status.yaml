@@ -1229,6 +1229,28 @@ development_status:
   64-4-a-pill-that-shows-it-hears: backlog
   64-5-the-record-and-the-gates: backlog
 
+# Epic 65 (`epic-65-a-phone-that-keeps-its-shape-and-says-what-its-ear-is-doing.md`).
+  65-1-a-phone-that-keeps-its-shape: backlog
+  65-2-a-switch-that-tells-the-truth-and-re-arms-itself: backlog
+  65-3-what-the-port-did-on-the-phone: backlog
+  65-4-listening-that-survives-the-background-measured: backlog
+  65-5-a-glance-from-the-island: backlog
+  65-6-the-record-and-the-gates: backlog
+
+  # Epic 66 — the rest of the Mac a phone can carry (2026-09-05)
+  66-1-approvals-bridges-and-the-thumb: backlog
+  66-2-the-folder-on-the-phone: backlog
+  66-3-files-on-the-phone: backlog
+  66-4-notes-and-capture-on-the-phone: backlog
+  66-5-a-push-keeper-does-itself: backlog
+  66-6-the-disclosure-the-docs-and-the-gates: backlog
+
+  # Epic 67 — a turn that finishes without the screen (2026-09-05)
+  67-1-the-turn-lives-in-rust: backlog
+  67-2-the-lock-screen-says-what-keeper-heard: backlog
+  67-3-stop-and-an-ear-that-does-not-hear-itself: backlog
+  67-4-the-record-and-the-gates: backlog
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5

@@ -1,8 +1,7 @@
 /**
  * Talk mode you can see (Epic 62, Story 62.6, FR-407, FR-408, NFR-51,
  * AD-170/AD-171): a microphone control with three legible states, the
- * transcript as it forms, a stop that abandons, and what it heard landing in
- * the composer rather than being sent.
+ * transcript as it forms, and a stop that abandons.
  *
  * # Two pieces, one store
  *
@@ -21,17 +20,18 @@
  * `data-state`; `aria-pressed` is true while the microphone is open. A
  * driver glancing over, a screen reader, and a test read the same fact.
  *
- * # What it heard is shown before it is sent
+ * # The turn is Rust's from the phrase to the last word (Epic 67, AD-205)
  *
- * A transcriber that sends what it mis-heard is worse than one that asks.
- * So a turn the person started with the button ends in the composer: the
- * `heard` text becomes the draft (`BotComposer`'s `heard` prop), edited
- * there, and sent by the same Enter or Send as typing. The one exception is
- * deliberate and narrow: a turn the wake phrase started — the person is
- * driving with another app in front and cannot reach a field — is handed to
- * the pane as `"phrase"` and goes as said. Which is which is known here
- * because this component is the only thing that presses `voice_start`; a
- * `listening` snapshot that arrives without it was the phrase's.
+ * This button starts a turn and can stop one; it sends nothing and speaks
+ * nothing. What the turn heard is sent by the shell (`voice_ipc::transition`
+ * → `bots_ipc::send_spoken`) to the bot chosen under Bots (AD-206), and the
+ * answer is read aloud by the shell when the stream closes — so a turn
+ * finishes with the screen locked, which is the point. A turn the button
+ * started takes the same path as one the phrase started: one turn, not two.
+ * The pane observes it — the snapshot here, the stream's events through
+ * `listenSpokenStream` — and drives nothing. (Until Epic 67 a button turn
+ * landed in the composer to be checked; that hand-off was the webview's,
+ * and a webview is not there when the phone is in a pocket.)
  *
  * # Stop abandons
  *
@@ -54,13 +54,11 @@
  * again and the person needs the way to Settings > keeper.
  */
 import { Mic, Square, Volume2 } from "lucide-react";
-import { useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import type { VoiceStateVm } from "@/lib/ipc/client";
 import {
   iosOpenAppSettings,
   voiceAuthorize,
-  voiceSpeak,
   voiceStart,
   voiceStop,
   voiceStopSpeaking,
@@ -80,17 +78,14 @@ export const VOICE_STOP_SPEAKING_LABEL = "Stop this answer";
 export const VOICE_LISTENING_STATUS = "Listening";
 /** The status line while the answer is read aloud. */
 export const VOICE_SPEAKING_STATUS = "Speaking the answer";
-/** The status line while what was heard waits in the composer. */
-export const VOICE_HEARD_STATUS = "Heard — check it, then send";
+/** The status line once the question is heard and on its way to the bot. */
+export const VOICE_HEARD_STATUS = "Heard — sending it";
 /** The status line while the answer is on its way. */
 export const VOICE_SENDING_STATUS = "Sending what you said";
 /** The control beside a permission that was refused. */
 export const VOICE_OPEN_SETTINGS_LABEL = "Open Settings";
 /** When the shell rejected a start for a reason it did not name. */
 const VOICE_START_FAILED = "Could not start listening.";
-
-/** Who started the turn that is ending in `heard`. */
-export type VoiceHeardOrigin = "button" | "phrase";
 
 /** The button's state, from the snapshot. */
 export type VoiceMicState = "idle" | "listening" | "speaking";
@@ -107,57 +102,13 @@ export function micState(state: VoiceStateVm | null): VoiceMicState {
 }
 
 /**
- * Whether the answer that just finished belongs to a voice turn, and if so
- * read it aloud. The pane calls this on the stream's `closed` event: a turn
- * that heard something is waiting in `heard` (or `sending`) for exactly
- * this, and any other state — idle, a turn the person stopped — means the
- * answer was to something typed and stays on the screen.
- */
-export function speakIfHeard(answer: string): void {
-  const state = voiceStore.getState().state;
-  if (state?.kind !== "heard" && state?.kind !== "sending") {
-    return;
-  }
-  void voiceSpeak(answer).catch((raw: unknown) => {
-    botsStore.getState().setError(syncErrorMessage(raw, VOICE_START_FAILED));
-  });
-}
-
-/**
  * The microphone button. Absent where voice is unsupported or its
  * availability is not yet known (AD-27: absence, never a dead control).
  */
-export function BotVoiceMic({
-  onHeard,
-}: {
-  /**
-   * What the turn heard, once per turn, with who started it. `"button"`
-   * belongs in the composer; `"phrase"` goes as said.
-   */
-  onHeard: (text: string, origin: VoiceHeardOrigin) => void;
-}) {
+export function BotVoiceMic() {
   const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   const unavailable = useVoiceStore((s) => s.unavailable);
   const state = useVoiceStore((s) => s.state);
-  /** True from this button's start until the turn is back to idle. */
-  const startedHere = useRef(false);
-  /** The last `heard` snapshot handed on, so a re-render does not repeat it. */
-  const handed = useRef<VoiceStateVm | null>(null);
-  const onHeardRef = useRef(onHeard);
-  onHeardRef.current = onHeard;
-
-  useEffect(() => {
-    if (state === null) {
-      return;
-    }
-    if (state.kind === "heard" && handed.current !== state) {
-      handed.current = state;
-      onHeardRef.current(state.text, startedHere.current ? "button" : "phrase");
-    }
-    if (state.kind === "idle" || state.kind === "failed") {
-      startedHere.current = false;
-    }
-  }, [state]);
 
   if (!bots || unavailable === undefined || unavailable?.kind === "unsupported") {
     return null;
@@ -166,11 +117,9 @@ export function BotVoiceMic({
   const face = micState(state);
 
   const start = () => {
-    startedHere.current = true;
     void voiceAuthorize()
       .then((refusal) => {
         if (refusal !== null) {
-          startedHere.current = false;
           voiceStore.getState().applyAvailability(refusal);
           return;
         }
@@ -182,7 +131,6 @@ export function BotVoiceMic({
         return voiceStart();
       })
       .catch((raw: unknown) => {
-        startedHere.current = false;
         botsStore.getState().setError(syncErrorMessage(raw, VOICE_START_FAILED));
       });
   };

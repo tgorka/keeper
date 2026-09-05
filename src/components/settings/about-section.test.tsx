@@ -7,6 +7,9 @@ vi.mock("@/lib/ipc/client", () => ({
   egressList: vi.fn(() => Promise.resolve([])),
   debugModeGet: vi.fn(() => Promise.resolve(false)),
   debugModeSet: vi.fn(() => Promise.resolve()),
+  // Where this device's log is (Story 65.3): the default is the Mac's answer,
+  // so the pre-existing sentence assertions hold; the phone case opts in.
+  debugLogPath: vi.fn(() => Promise.resolve("/Users/alice/Library/Logs/keeper/keeper.log")),
   // The voice facts `useVoiceFacts` reads on open (Story 63.8, AD-179). The
   // default is every build without a voice port, so the pre-existing
   // assertions see no "On this Mac" block; the cases that care opt in.
@@ -34,10 +37,16 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import {
   AboutSection,
+  debugModeSentence,
   IOS_DISCLOSURE_LINES,
   MACOS_DISCLOSURE_LINES,
 } from "@/components/settings/about-section";
-import { type EgressEndpointVm, egressList, voiceAvailability } from "@/lib/ipc/client";
+import {
+  debugLogPath,
+  type EgressEndpointVm,
+  egressList,
+  voiceAvailability,
+} from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
 
@@ -47,6 +56,7 @@ const mockRelaunch = vi.mocked(relaunch);
 const mockOpenUrl = vi.mocked(openUrl);
 const mockGetVersion = vi.mocked(getVersion);
 const mockVoiceAvailability = vi.mocked(voiceAvailability);
+const mockDebugLogPath = vi.mocked(debugLogPath);
 
 /** All seven capabilities present = the desktop tier (updater block renders). */
 const DESKTOP_CAPABILITIES = {
@@ -57,6 +67,8 @@ const DESKTOP_CAPABILITIES = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  // Story 66.3: the phone's reveal; false on every desktop fixture.
+  shareOut: false,
   recording: false,
   sync: false,
   notes: false,
@@ -109,6 +121,8 @@ beforeEach(() => {
     kind: "unsupported",
     message: "voice is not available in this build",
   });
+  mockDebugLogPath.mockReset();
+  mockDebugLogPath.mockResolvedValue("/Users/alice/Library/Logs/keeper/keeper.log");
   voiceStore.setState({ state: null, unavailable: undefined, wake: null });
   // Default the mirror to the desktop tier so the software-update block renders for
   // the egress/update-flow assertions; the reduced-platform cases opt in explicitly.
@@ -375,9 +389,13 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     expect(screen.queryByRole("button", { name: "Check for updates" })).not.toBeInTheDocument();
     // The "On this iPhone" list renders every honesty line.
     expect(screen.getByText("On this iPhone")).toBeInTheDocument();
-    expect(screen.getByText(/syncs and notifies only while it's open/)).toBeInTheDocument();
-    expect(screen.getByText(/No self-hosted bridge runner/)).toBeInTheDocument();
-    expect(screen.getByText("No global summon hotkey.")).toBeInTheDocument();
+    expect(
+      screen.getByText(/syncs and notifies about messages only while it's open/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/mirrors a remote your Mac already syncs/)).toBeInTheDocument();
+    expect(screen.getByText(/Nothing is merged on a phone/)).toBeInTheDocument();
+    expect(screen.getByText(/the self-hosted bridge runner/)).toBeInTheDocument();
+    expect(screen.getByText(/the global summon hotkey/)).toBeInTheDocument();
     expect(screen.getByText(/signature renews every 7 days/)).toBeInTheDocument();
     expect(screen.getByText(/the drive tools live on your Mac/)).toBeInTheDocument();
     for (const line of IOS_DISCLOSURE_LINES) {
@@ -420,6 +438,39 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(vi.mocked(debugModeSet)).toHaveBeenCalledWith(true));
     expect(toggle).toBeChecked();
+  });
+
+  // ── The debug sentence names this device's log (Story 65.3, AD-192) ───────
+  it("names the log path Rust answers — the phone's own container, not the Mac's folder", async () => {
+    const PHONE_LOG =
+      "/private/var/mobile/Containers/Data/Application/1F2E/Library/Logs/keeper/keeper.log";
+    mockDebugLogPath.mockResolvedValue(PHONE_LOG);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<AboutSection open />);
+
+    expect(await screen.findByText(debugModeSentence(PHONE_LOG))).toBeInTheDocument();
+    // The literal the sentence used to carry is gone: nothing on the phone
+    // names `~/Library/Logs`.
+    expect(screen.queryByText(/~\/Library\/Logs/)).not.toBeInTheDocument();
+  });
+
+  it("names the Mac's log path on the Mac, from the same answer", async () => {
+    mockDebugLogPath.mockResolvedValue("/Users/alice/Library/Logs/keeper/keeper.log");
+    render(<AboutSection open />);
+
+    expect(
+      await screen.findByText(
+        /Writes app logs to \/Users\/alice\/Library\/Logs\/keeper\/keeper\.log/,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("names the file without a folder while the path is unanswered, never a guessed folder", async () => {
+    mockDebugLogPath.mockRejectedValue(new Error("not answered"));
+    render(<AboutSection open />);
+
+    expect(await screen.findByText(debugModeSentence(null))).toBeInTheDocument();
+    expect(screen.queryByText(/Library\/Logs/)).not.toBeInTheDocument();
   });
 
   // ── "On this Mac" (Story 63.8, AD-175, AD-179) ────────────────────────────

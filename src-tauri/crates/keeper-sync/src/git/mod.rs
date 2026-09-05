@@ -29,6 +29,10 @@
 //! * [`commit`] — worktree → index → tree → commit, with provenance trailers.
 //! * [`conflict`] — the pure AD-43 convergence policy.
 //! * [`cli`] — push, worktree mutation, sparse patterns, gc.
+//! * [`push_http`] — the phone's push: a pack from `gix-pack` handed to
+//!   `git-receive-pack` over smart HTTP, because iOS spawns no process (AD-202).
+//! * [`history`] — the phone's `git log` / `show` / `diff` / `status` for one
+//!   path, in-process, for the notes surfaces (Story 66.4).
 //! * [`resolve`] — which of the machine's `git` binaries [`cli`] gets to drive.
 //!
 //! Two hazards documented in [`repo`] are load-bearing rather than defensive:
@@ -41,6 +45,8 @@ pub mod cli;
 pub mod commit;
 pub mod conflict;
 pub mod fetch;
+pub mod history;
+pub mod push_http;
 pub mod repo;
 pub mod resolve;
 
@@ -48,5 +54,6 @@ pub use cli::{GitCapabilities, GitCli};
 pub use commit::StagedChange;
 pub use conflict::{ChangeKind, Resolution, Side};
 pub use fetch::{Credential, FetchOptions, FetchOutcome, TransferProgress};
+pub use push_http::PushReport;
 pub use repo::{RepoStatus, UnreadablePath};
 pub use resolve::{GitChoice, GitOrigin, GitReject, GitRejection, GitRequest, GitResolution};

@@ -93,9 +93,10 @@ import { BotPicker } from "@/components/bots/bot-picker";
 import { BotPinsStrip } from "@/components/bots/bot-pins-strip";
 import { BOT_SESSION_NEW_LABEL, BotSessionList } from "@/components/bots/bot-session-list";
 import { botCommandContext, botCommandHost } from "@/components/bots/bot-slash-menu";
-import { BotVoiceMic, BotVoiceStatus, speakIfHeard } from "@/components/bots/bot-voice-mic";
+import { BotVoiceMic, BotVoiceStatus } from "@/components/bots/bot-voice-mic";
 import { BotVoiceWake } from "@/components/bots/bot-voice-wake";
 import { useSurfaceColumn } from "@/components/layout/surface-column";
+import { useSpokenStream } from "@/hooks/use-spoken-stream";
 import { useVoiceStream } from "@/hooks/use-voice-stream";
 import { type CountNoun, countLabel } from "@/lib/count-label";
 import type { BotModelVm, BotStreamEvent } from "@/lib/ipc/client";
@@ -176,11 +177,6 @@ export function onStreamEvent(event: BotStreamEvent): void {
     return;
   }
   botsStore.getState().applyStreamEvent(event);
-  // A voice turn's answer is read aloud (Story 62.6, FR-403); typed ones are
-  // not. `speakIfHeard` reads the turn's state and decides nothing else.
-  if (event.kind === "closed" && event.reason === null) {
-    speakIfHeard(event.message.content);
-  }
 }
 
 export function BotsPane() {
@@ -211,10 +207,6 @@ export function BotsPane() {
   // Story 61.12: the images this message will carry, and the tray that shows
   // them. The hook owns the bytes path, the caps and the object-URL lifetime.
   const imagePaste = useBotImagePaste(selectedBotId, selectedModel, pickedModel?.vision ?? null);
-  // Story 62.6: the transcript waiting in the composer, with a sequence so
-  // hearing the same words twice is still two hand-offs.
-  const [heard, setHeard] = useState<{ text: string; seq: number } | null>(null);
-  const heardSeq = useRef(0);
   // A stale-read token, the Tasks pane's idiom: a second refresh landing after
   // a first must not restore the older answer.
   const readToken = useRef(0);
@@ -260,6 +252,16 @@ export function BotsPane() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // Epic 67 (AD-205): a turn the voice heard is sent and spoken by Rust; the
+  // pane observes its stream the way it observes its own, and re-reads the
+  // list when it closes, because `updated_ms` moved.
+  useSpokenStream((event) => {
+    onStreamEvent(event);
+    if (event.kind === "closed") {
+      void refresh();
+    }
+  });
 
   const openConversation = (sessionId: string) => {
     void botsSessionOpen(sessionId)
@@ -485,21 +487,10 @@ export function BotsPane() {
             // gives for a `null` context — rather than a refusal.
             pasteContext={botTools ? imagePaste.context : null}
             onPaste={botTools ? imagePaste.handle : undefined}
-            // Talk mode (Story 62.6): what a button-started turn heard lands
-            // here as the draft; a phrase-started turn goes as said, because
-            // the person is driving with another app in front.
-            heard={heard}
-            accessory={
-              <BotVoiceMic
-                onHeard={(text, origin) => {
-                  if (origin === "phrase") {
-                    send(text);
-                    return;
-                  }
-                  setHeard({ text, seq: heardSeq.current++ });
-                }}
-              />
-            }
+            // Talk mode (Story 62.6; Epic 67, AD-205): the button starts a
+            // turn, and what it hears is sent by Rust to the bot chosen under
+            // Bots — the composer never receives it.
+            accessory={<BotVoiceMic />}
             onStop={stop}
             streaming={streamingId !== null}
             disabled={selectedBotId === null || selectedModel === null}

@@ -48,19 +48,38 @@
 //! final result or an error. The microphone never closes for a roll, so
 //! nothing said across the seam is lost to a route change.
 //!
-//! # Interruptions re-arm, they do not end
+//! # Interruptions re-arm, they do not end — within a bound (Story 65.4)
 //!
 //! A phone call, Siri, or another app taking the microphone stops the engine
 //! and posts `AVAudioSessionInterruptionNotification`. A port that reported
 //! that as `Failed` would leave the phrase dead after the first call of the
 //! drive — the defect this design exists to prevent. Instead the worker
-//! remembers what the turn asked for (`wanted`), tears the dead capture down,
-//! and rebuilds it when the interruption ends — or, when the end never comes
-//! (Siri is known not to send one), every [`RESUME_RETRY`] while the request
-//! stands. An engine configuration change (headphones, a car connecting)
-//! and a media-services reset take the same path. The turn is told nothing:
-//! its `Idle { listening_for_wake: true }` is the promise the port is keeping,
-//! a few seconds late.
+//! keeps what the turn asked for (`wanted` — the *begin* never clears it),
+//! tears the dead capture down, and rebuilds it when the interruption ends
+//! — or, when the end never comes (Siri is known not to send one; Apple
+//! says an end is never guaranteed), every [`RESUME_RETRY`] while the
+//! request stands. A media-services reset takes the same path with the
+//! synthesiser thrown away too; a route change (headphones, a car kit)
+//! is recorded and the capture continues, rebuilt only when the engine's
+//! own configuration-change notification says it stopped. The turn is told
+//! nothing: its `Idle { listening_for_wake: true }` is the promise the port
+//! is keeping, a few seconds late.
+//!
+//! The retry is bounded, because one interruption cannot be recovered from
+//! here: after an *accepted* call the app is suspended, and when the call
+//! ends iOS refuses to reactivate a record session from the background
+//! (`setActive:` answers `!int`, forum thread 813278) until the app is in
+//! front — the same rule as "cannot start recording from the background".
+//! An unbounded retry would ask every five seconds for the rest of the
+//! drive, each time building and tearing down an engine. So after
+//! [`RESUME_FAILURES_TOLERATED`] refusals in a row the port stops wanting,
+//! records `refused` with a sentence saying listening starts again when
+//! keeper is opened, and tells the turn `Failed` — which releases
+//! `Turn::armed`, so `voice_ipc::voice_rearm()` on `RunEvent::Resumed`
+//! (the phone's did-become-active) arms the phrase again from the persisted
+//! intent the moment keeper is in front, by AD-190's rule. Will-resign
+//! needs no hook: the capture is meant to outlive the foreground, which is
+//! what `UIBackgroundModes: audio` is for.
 //!
 //! # Sharing the speaker with the app in front
 //!
@@ -72,9 +91,14 @@
 //! docs), so the answer sits over a quieter Maps prompt rather than a paused
 //! one, and the volume comes back the moment the utterance ends. Bluetooth
 //! HFP and A2DP are both allowed so a car kit is a route; the speaker is the
-//! default when nothing else is. The mode stays `.default`: `.voiceChat`
-//! would route to the receiver, and `.voicePrompt` is for playback-only
-//! sessions.
+//! default when nothing else is. The mode is `.voiceChat`, set explicitly
+//! (Epic 67, AD-209): Apple's `AVAudioSession.Mode.voiceChat` page says it
+//! is the mode the voice-processing unit is tuned for, and that a session
+//! using voice processing without a chat mode gets `voiceChat` set
+//! implicitly anyway — so what was written here as `.default` was never the
+//! mode in force, and a field report measured `.default` + `defaultToSpeaker`
+//! as the pair that silently defeats echo cancellation. `defaultToSpeaker`
+//! stays, so the answer is on the speaker and not the receiver.
 //!
 //! # Stale results are not failures
 //!
@@ -83,16 +107,20 @@
 //! that is no longer current is dropped — so a roll, a stop and the restart
 //! inside `speak` never surface as `Failed`.
 //!
-//! # Barge-in (FR-403)
+//! # Barge-in (FR-403) and the stop word (Epic 67, AD-208, AD-209)
 //!
 //! `speak` rolls to a fresh request before the utterance begins and raises a
 //! `speaking` flag; while it is up, any non-empty transcript is
-//! `SpeechDetected` rather than `PartialHeard`. Echo cancellation
-//! (`setVoiceProcessingEnabled`) is what keeps the app's own voice out of
-//! that transcript. The synthesiser's end is polled from the worker loop
-//! rather than through an `AVSpeechSynthesizerDelegate`, which would need an
-//! Objective-C subclass declared from Rust — more blind code than a 250 ms
-//! poll is worth.
+//! `SpeechDetected` with its words rather than `PartialHeard`, and the turn
+//! decides whether the words were the stop phrase or a question. Voice
+//! processing (`setVoiceProcessingEnabled`) is what keeps most of the app's
+//! own voice out of that transcript; what it lets through is measured, not
+//! assumed: for [`TAIL_GATE`] after every utterance ends the port drops
+//! every transcript, records each as `echo_dropped` with its words, and
+//! only then tells the turn `Silence`. The synthesiser's end is polled from
+//! the worker loop rather than through an `AVSpeechSynthesizerDelegate`,
+//! which would need an Objective-C subclass declared from Rust — more blind
+//! code than a 250 ms poll is worth.
 //!
 //! # Which voice (Epic 64, Story 64.2, AD-182, AD-188)
 //!
@@ -140,6 +168,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
+use keeper_core::voice::events::VoiceEventKind;
 use keeper_core::voice::level::{self, Meter};
 use keeper_core::voice::locale::{self, DeviceLocales};
 use keeper_core::voice::{
@@ -155,8 +184,10 @@ use objc2_avf_audio::{
     AVAudioSessionInterruptionNotification, AVAudioSessionInterruptionOptionKey,
     AVAudioSessionInterruptionOptions, AVAudioSessionInterruptionType,
     AVAudioSessionInterruptionTypeKey, AVAudioSessionMediaServicesWereResetNotification,
-    AVAudioSessionModeDefault, AVAudioSessionRecordPermission, AVAudioSessionSetActiveOptions,
-    AVAudioTime, AVSpeechBoundary, AVSpeechSynthesisVoice, AVSpeechSynthesizer, AVSpeechUtterance,
+    AVAudioSessionModeVoiceChat, AVAudioSessionRecordPermission,
+    AVAudioSessionRouteChangeNotification, AVAudioSessionRouteChangeReason,
+    AVAudioSessionRouteChangeReasonKey, AVAudioSessionSetActiveOptions, AVAudioTime,
+    AVSpeechBoundary, AVSpeechSynthesisVoice, AVSpeechSynthesizer, AVSpeechUtterance,
 };
 use objc2_foundation::{
     NSArray, NSError, NSLocale, NSNotification, NSNotificationCenter, NSNumber, NSString,
@@ -176,6 +207,19 @@ const SPEAK_POLL: Duration = Duration::from_millis(250);
 /// queue-to-speaking gap on a cold voice.
 const SPEAK_GRACE: Duration = Duration::from_millis(500);
 
+/// How long after an utterance ends the port keeps its ears shut (Epic 67,
+/// AD-209): every transcript that arrives inside the gate is dropped and
+/// recorded as `echo_dropped` with its words, and the turn is told
+/// `Silence` only once the gate has passed. Voice processing subtracts the
+/// output from the input; it does not cancel it (Apple engineer, forum
+/// 665706), and a 2026 field report on iOS 18 measured the residual tail of
+/// a synthesised utterance being transcribed as speech in a quiet room,
+/// with ~800 ms — not 300 — the gate that stopped it
+/// (barock.dev/2026/04/22/why-your-ios-voice-agent-still-hears-itself).
+/// The number is that report's; the ring on kalypso is what says whether
+/// this phone needs it.
+const TAIL_GATE: Duration = Duration::from_millis(800);
+
 /// Frames per tap buffer: ~64 ms at 16 kHz, the recogniser's native rate.
 const TAP_FRAMES: u32 = 1024;
 
@@ -193,8 +237,23 @@ const REQUEST_ROLL_QUIET: Duration = Duration::from_millis(1500);
 const REQUEST_LONGEST: Duration = Duration::from_secs(58);
 
 /// How often a listener the system took away is tried again while the turn
-/// still wants it.
+/// still wants it. Siri's interruption-ended is late or absent
+/// (rdar://44895456), so this clock is what brings the phrase back after
+/// Siri.
 const RESUME_RETRY: Duration = Duration::from_secs(5);
+
+/// Reactivations that may fail in a row after an interruption — a minute
+/// at [`RESUME_RETRY`] — before the port stops asking. A minute outlives a
+/// Siri exchange and a hand-over between apps; what it does not outlive is
+/// the case Apple's rule makes unrecoverable from here, a record session
+/// after an accepted call while keeper is still in the background. The
+/// count restarts on every begin and end the system posts, so it measures
+/// silence from the system, not the length of an interruption it announced.
+const RESUME_FAILURES_TOLERATED: u32 = 12;
+
+/// What the ring and the switch say when the port gives up resuming: the
+/// remedy is the foreground, which re-arms without the switch being touched.
+const RESUME_GAVE_UP: &str = "Listening stopped: iOS did not give the microphone back within a minute, which is what happens after a phone call while keeper is in the background. It starts listening again when you open keeper.";
 
 /// Fresh requests that may fail to start in a row before the port stops
 /// trying and tells the turn — bounded so a broken recogniser is a sentence,
@@ -251,6 +310,11 @@ enum AudioNotice {
     /// `AVAudioSessionMediaServicesWereResetNotification`: every audio
     /// object is invalid.
     MediaReset,
+    /// `AVAudioSessionRouteChangeNotification`: the input or output route
+    /// changed — headphones, a car kit, the speaker — for `reason` as the
+    /// framework names it. The capture continues unless the engine says
+    /// otherwise.
+    RouteChanged { reason: &'static str },
     /// The recognition task with this serial ended — a final result, or the
     /// error in `reason`.
     RequestEnded { serial: u64 },
@@ -426,11 +490,22 @@ struct Worker {
     speaking: Arc<AtomicBool>,
     /// When the current utterance was handed to the synthesiser.
     speaking_since: Option<Instant>,
+    /// Milliseconds since the worker's epoch until which the ears are shut
+    /// (AD-209): set to the end of the last utterance plus [`TAIL_GATE`],
+    /// read by the result handler. Zero before the first utterance.
+    gate_until: Arc<AtomicU64>,
+    /// When the turn is owed the `Silence` for an utterance that ended on
+    /// its own — the end of its gate. `None` while nothing is owed.
+    silence_due: Option<Instant>,
     /// When the system took the capture away, for the retry clock; `None`
     /// while capturing or not wanted.
     suspended: Option<Instant>,
     /// Fresh requests that failed to start since the last that worked.
     failed_starts: u32,
+    /// Reactivations refused in a row since the system last spoke (an
+    /// interruption's begin or end) or the capture last came back; against
+    /// [`RESUME_FAILURES_TOLERATED`].
+    failed_resumes: u32,
     /// The person's choice of locale (`bots.voice_locale`); `None` is
     /// "choose for me". Handed to `locale::choose` with `locales`.
     requested: Option<String>,
@@ -460,8 +535,11 @@ impl Worker {
             current: Arc::new(AtomicU64::new(0)),
             speaking: Arc::new(AtomicBool::new(false)),
             speaking_since: None,
+            gate_until: Arc::new(AtomicU64::new(0)),
+            silence_due: None,
             suspended: None,
             failed_starts: 0,
+            failed_resumes: 0,
             requested: None,
             locales: None,
             voices: None,
@@ -547,10 +625,12 @@ impl Worker {
         self.availability()?;
         self.wanted = Some(hints);
         self.failed_starts = 0;
+        self.failed_resumes = 0;
         match self.arm() {
             Ok(()) => Ok(()),
             Err(error) => {
                 tracing::warn!(%error, "voice: the capture did not start; will retry");
+                crate::voice_log::record(VoiceEventKind::Refused, Some(error.clone()));
                 self.suspend();
                 Ok(())
             }
@@ -710,6 +790,7 @@ impl Worker {
             last_heard,
         ) {
             Ok(recognition) => {
+                crate::voice_log::record(VoiceEventKind::Rolled, None);
                 self.recognition = Some(recognition);
                 self.failed_starts = 0;
                 Ok(())
@@ -752,6 +833,8 @@ impl Worker {
             }
         }
         let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
+        // A new utterance: whatever the last one still owed is moot.
+        self.silence_due = None;
         self.speaking.store(true, Ordering::SeqCst);
         self.speaking_since = Some(Instant::now());
         speak_text(synthesizer, text, &voice);
@@ -765,11 +848,17 @@ impl Worker {
         self.speech_over();
     }
 
-    /// The utterance is over, one way or another: flag down, others back
-    /// to full volume.
+    /// The utterance is over, one way or another: the ears shut for
+    /// [`TAIL_GATE`] (AD-209) — before the flag comes down, so no transcript
+    /// slips between the two as a `PartialHeard` — then flag down, others
+    /// back to full volume.
     fn speech_over(&mut self) {
+        let gate_ms = u64::try_from(TAIL_GATE.as_millis()).unwrap_or(u64::MAX);
+        self.gate_until
+            .store(self.millis().saturating_add(gate_ms), Ordering::SeqCst);
         self.speaking.store(false, Ordering::SeqCst);
         self.speaking_since = None;
+        self.silence_due = None;
         if self.capture.is_some() {
             if let Err(error) = set_session_options(ARMED) {
                 tracing::debug!(%error, "voice: others did not un-duck");
@@ -777,7 +866,8 @@ impl Worker {
         }
     }
 
-    /// Between commands: the retry clock, the roll clock, the synthesiser.
+    /// Between commands: the retry clock, the roll clock, the synthesiser,
+    /// the gate.
     fn tick(&mut self) {
         if self.wanted.is_some() {
             if let Some(since) = self.suspended {
@@ -791,6 +881,10 @@ impl Worker {
             {
                 // Stopped without a word from the system — Siri does this.
                 tracing::info!("voice: the engine stopped on its own; resuming");
+                crate::voice_log::record(
+                    VoiceEventKind::Resumed,
+                    Some("the engine stopped on its own".to_owned()),
+                );
                 self.resume();
             } else if self.roll_due() {
                 if let Err(error) = self.roll_request() {
@@ -799,6 +893,18 @@ impl Worker {
             }
         }
         self.watch_speech_end();
+        self.settle_silence();
+    }
+
+    /// The `Silence` owed for an utterance that ended on its own is
+    /// reported once its gate has passed (AD-209): the turn's end re-arms
+    /// the phrase on a fresh request, and that request must not open on
+    /// the tail of the answer.
+    fn settle_silence(&mut self) {
+        if self.silence_due.is_some_and(|due| Instant::now() >= due) {
+            self.silence_due = None;
+            (self.sink)(TurnEvent::Silence);
+        }
     }
 
     /// Whether the current request has run long enough to be replaced.
@@ -821,22 +927,46 @@ impl Worker {
     }
 
     /// Rebuild the capture after the system took it; on refusal, wait for
-    /// the next tick of the retry clock.
+    /// the next tick of the retry clock — [`RESUME_FAILURES_TOLERATED`]
+    /// times, after which the port gives up (see the module doc: after an
+    /// accepted call, a record session is not reactivated from the
+    /// background, and the foreground is the only remedy).
     fn resume(&mut self) {
         self.end_recognition();
         self.end_capture();
         match self.arm() {
             Ok(()) => {
+                self.failed_resumes = 0;
                 if self.suspended.take().is_some() {
                     tracing::info!("voice: listening resumed after an interruption");
+                    crate::voice_log::record(VoiceEventKind::Resumed, None);
                 }
             }
             Err(error) => {
-                tracing::debug!(%error, "voice: not yet; will retry");
                 self.end_capture();
-                self.suspended = Some(Instant::now());
+                self.failed_resumes += 1;
+                if self.failed_resumes >= RESUME_FAILURES_TOLERATED {
+                    tracing::warn!(
+                        %error,
+                        attempts = self.failed_resumes,
+                        "voice: the session would not reactivate; stopping until keeper is opened"
+                    );
+                    self.give_up(RESUME_GAVE_UP.to_owned());
+                } else {
+                    tracing::debug!(%error, attempt = self.failed_resumes, "voice: not yet; will retry");
+                    self.suspended = Some(Instant::now());
+                }
             }
         }
+    }
+
+    /// Stop wanting, say why in the ring, and tell the turn: `Failed`
+    /// releases `Turn::armed`, which is what lets `voice_rearm()` arm the
+    /// phrase again from the persisted intent when the refusal clears.
+    fn give_up(&mut self, reason: String) {
+        crate::voice_log::record(VoiceEventKind::Refused, Some(reason.clone()));
+        self.stop();
+        (self.sink)(TurnEvent::Failed(reason));
     }
 
     /// A fresh request would not start. Bounded: after enough in a row the
@@ -844,8 +974,7 @@ impl Worker {
     fn roll_failed(&mut self, error: String) {
         if self.failed_starts >= ROLL_FAILURES_TOLERATED {
             tracing::warn!(%error, "voice: recognition keeps failing to start");
-            self.stop();
-            (self.sink)(TurnEvent::Failed(error));
+            self.give_up(error);
         } else {
             tracing::debug!(%error, "voice: recognition did not restart; retrying");
             self.suspend();
@@ -857,6 +986,13 @@ impl Worker {
         tracing::debug!(?notice, "voice: audio notice");
         match notice {
             AudioNotice::Interrupted => {
+                // The begin is reliable; the end is not (Apple: never
+                // guaranteed). `wanted` stays as it is — the capture is
+                // still asked for, and the retry clock is what brings it
+                // back when no end comes. A fresh interruption is a fresh
+                // budget of retries.
+                crate::voice_log::record(VoiceEventKind::InterruptionBegun, None);
+                self.failed_resumes = 0;
                 if self.speaking_since.is_some() {
                     // The answer is gone with the speaker; the turn ends as
                     // if it had finished.
@@ -869,23 +1005,62 @@ impl Worker {
             }
             AudioNotice::InterruptionEnded { should_resume } => {
                 // Apple's hint is about playback etiquette; a microphone the
-                // person armed comes back either way.
+                // person armed comes back either way. The end itself is a
+                // word from the system, so the retry budget starts over —
+                // after a call, this is where the background reactivation
+                // begins to be refused.
                 tracing::info!(should_resume, "voice: interruption ended");
+                crate::voice_log::record(
+                    VoiceEventKind::InterruptionEnded,
+                    Some(format!("should_resume={should_resume}")),
+                );
+                self.failed_resumes = 0;
                 if self.wanted.is_some() {
                     self.resume();
                 }
             }
             AudioNotice::EngineChanged => {
                 if self.wanted.is_some() && self.suspended.is_none() {
+                    crate::voice_log::record(
+                        VoiceEventKind::Resumed,
+                        Some(
+                            "the engine's configuration changed; rebuilding the capture".to_owned(),
+                        ),
+                    );
                     self.resume();
                 }
             }
             AudioNotice::MediaReset => {
+                // Every audio object is invalid (Apple: "dispose of any
+                // orphaned audio objects ... and create new ones"): the
+                // synthesiser is thrown away and the capture rebuilt from
+                // nothing, on the same path an interruption takes.
+                crate::voice_log::record(VoiceEventKind::MediaReset, None);
                 self.synthesizer = None;
                 self.speech_over();
                 if self.wanted.is_some() {
+                    self.failed_resumes = 0;
                     self.resume();
                 }
+            }
+            AudioNotice::RouteChanged { reason } => {
+                // Headphones, a car kit, the speaker: the session is still
+                // active and the tap still feeds the request, so the
+                // capture continues. When the change did stop the engine,
+                // its own configuration-change notification follows and
+                // `EngineChanged` rebuilds it; here the change is only
+                // recorded, with whether the engine survived it.
+                let running = self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|c| engine_running(&c.engine));
+                let detail = match (self.wanted.is_some(), running) {
+                    (true, true) => format!("{reason}; capture continues"),
+                    (true, false) => format!("{reason}; engine stopped, rebuilding"),
+                    (false, _) => format!("{reason}; not listening"),
+                };
+                tracing::info!(reason, running, "voice: audio route changed");
+                crate::voice_log::record(VoiceEventKind::RouteChanged, Some(detail));
             }
             AudioNotice::RequestEnded { serial } => {
                 let current = self
@@ -901,7 +1076,8 @@ impl Worker {
         }
     }
 
-    /// While an utterance is out, notice it ending and say so once.
+    /// While an utterance is out, notice it ending; the turn hears of it
+    /// once, after the gate ([`Worker::settle_silence`]).
     fn watch_speech_end(&mut self) {
         let Some(since) = self.speaking_since else {
             return;
@@ -915,7 +1091,7 @@ impl Worker {
             .is_some_and(|synthesizer| is_speaking(synthesizer));
         if !still {
             self.speech_over();
-            (self.sink)(TurnEvent::Silence);
+            self.silence_due = Some(Instant::now() + TAIL_GATE);
         }
     }
 
@@ -924,8 +1100,15 @@ impl Worker {
     }
 
     /// The block the recogniser calls with each result. Captures the serial
-    /// it belongs to, the current-serial cell, the speaking flag, the sink
-    /// and the worker's inbox — all `Send`, none of them a framework object.
+    /// it belongs to, the current-serial cell, the speaking flag, the gate,
+    /// the sink and the worker's inbox — all `Send`, none of them a
+    /// framework object.
+    ///
+    /// A transcript while the flag is up is barge-in, with its words (the
+    /// turn tells the stop phrase from a question, AD-208). A transcript
+    /// inside the gate after an utterance is the port hearing its own tail,
+    /// or a person talking into it; either way it is dropped and recorded
+    /// with its words (AD-209), so the ring on hardware is the measurement.
     fn result_handler(
         &self,
         serial: u64,
@@ -933,6 +1116,7 @@ impl Worker {
     ) -> RcBlock<dyn Fn(*mut SFSpeechRecognitionResult, *mut NSError)> {
         let current = Arc::clone(&self.current);
         let speaking = Arc::clone(&self.speaking);
+        let gate_until = Arc::clone(&self.gate_until);
         let sink = Arc::clone(&self.sink);
         let commands = self.commands.clone();
         let epoch = self.epoch;
@@ -943,14 +1127,19 @@ impl Worker {
                 }
                 match read_result(result, error) {
                     Ok(Some((text, is_final))) => {
-                        if !text.trim().is_empty() {
-                            let now =
-                                u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let now = u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let heard_something = !text.trim().is_empty();
+                        if heard_something {
                             last_heard.store(now, Ordering::SeqCst);
                         }
                         if speaking.load(Ordering::SeqCst) {
-                            if !text.trim().is_empty() {
-                                sink(TurnEvent::SpeechDetected);
+                            if heard_something {
+                                sink(TurnEvent::SpeechDetected(text));
+                            }
+                        } else if now < gate_until.load(Ordering::SeqCst) {
+                            if heard_something {
+                                tracing::info!(%text, "voice: transcript inside the tail gate dropped");
+                                crate::voice_log::record(VoiceEventKind::EchoDropped, Some(text));
                             }
                         } else if is_final {
                             sink(TurnEvent::FinalHeard(text));
@@ -1239,12 +1428,24 @@ fn recognizer_for(locale: &NSLocale) -> Recognizer {
     Recognizer::Ready(recognizer)
 }
 
-/// Put the shared session in `.playAndRecord` with `options` and activate
-/// it.
+/// Put the shared session in `.playAndRecord`, `.voiceChat`, with `options`
+/// and activate it.
+///
+/// The mode is `.voiceChat`, explicitly, in both places the category is
+/// set (AD-209). Apple, `AVAudioSession.Mode.voiceChat`: the mode "for
+/// voice-over-IP (VoIP) apps that use the voice-processing I/O audio unit";
+/// an app that enables voice processing "without explicitly setting its
+/// mode to a chat variant" has `voiceChat` set implicitly, and an app in a
+/// chat mode that does not use voice processing gets no echo cancellation.
+/// Writing `.default` here while VPIO is on was writing a mode that was not
+/// in force; writing `.voiceChat` is the same session, stated. It is set on
+/// the options change too, because `setCategory:mode:options:` writes all
+/// three, and a mode that flipped back to `.default` while ducking would be
+/// the silent defeat the field report measured.
 #[allow(unsafe_code)]
 fn configure_session(options: AVAudioSessionCategoryOptions) -> Result<(), String> {
     // SAFETY: `AVAudioSessionCategoryPlayAndRecord` and
-    // `AVAudioSessionModeDefault` are Apple's process-lifetime extern
+    // `AVAudioSessionModeVoiceChat` are Apple's process-lifetime extern
     // `NSString` constants; reading them carries no other obligation, and a
     // nil (which no iOS ships) is answered rather than dereferenced.
     // `setCategory:mode:options:error:` and `setActive:error:` take the
@@ -1254,7 +1455,8 @@ fn configure_session(options: AVAudioSessionCategoryOptions) -> Result<(), Strin
     let session = unsafe { AVAudioSession::sharedInstance() };
     let category = unsafe { AVAudioSessionCategoryPlayAndRecord }
         .ok_or("AVAudioSessionCategoryPlayAndRecord is nil")?;
-    let mode = unsafe { AVAudioSessionModeDefault }.ok_or("AVAudioSessionModeDefault is nil")?;
+    let mode =
+        unsafe { AVAudioSessionModeVoiceChat }.ok_or("AVAudioSessionModeVoiceChat is nil")?;
     unsafe { session.setCategory_mode_options_error(category, mode, options) }
         .map_err(|error| error.localizedDescription().to_string())?;
     unsafe { session.setActive_error(true) }
@@ -1262,7 +1464,8 @@ fn configure_session(options: AVAudioSessionCategoryOptions) -> Result<(), Strin
 }
 
 /// Change the active session's options without deactivating it: ducking on
-/// for an utterance, off after.
+/// for an utterance, off after. The mode stays `.voiceChat` (see
+/// [`configure_session`]).
 #[allow(unsafe_code)]
 fn set_session_options(options: AVAudioSessionCategoryOptions) -> Result<(), String> {
     // SAFETY: as in `configure_session`, minus activation. Apple allows
@@ -1272,7 +1475,8 @@ fn set_session_options(options: AVAudioSessionCategoryOptions) -> Result<(), Str
     let session = unsafe { AVAudioSession::sharedInstance() };
     let category = unsafe { AVAudioSessionCategoryPlayAndRecord }
         .ok_or("AVAudioSessionCategoryPlayAndRecord is nil")?;
-    let mode = unsafe { AVAudioSessionModeDefault }.ok_or("AVAudioSessionModeDefault is nil")?;
+    let mode =
+        unsafe { AVAudioSessionModeVoiceChat }.ok_or("AVAudioSessionModeVoiceChat is nil")?;
     unsafe { session.setCategory_mode_options_error(category, mode, options) }
         .map_err(|error| error.localizedDescription().to_string())
 }
@@ -1508,8 +1712,8 @@ fn read_result(
     Ok(Some((text, is_final)))
 }
 
-/// Watch the shared session for interruptions and media resets, posting each
-/// to the worker's inbox.
+/// Watch the shared session for interruptions, media resets and route
+/// changes, posting each to the worker's inbox.
 #[allow(unsafe_code)]
 fn observe_session(
     commands: &Sender<Command>,
@@ -1523,7 +1727,7 @@ fn observe_session(
     // safe accessors, and never touches a worker-owned object. The
     // notification names are Apple's process-lifetime constants; a nil one
     // (which no iOS ships) means no observer rather than a null deref.
-    let mut observers = Vec::with_capacity(2);
+    let mut observers = Vec::with_capacity(3);
     let center = NSNotificationCenter::defaultCenter();
     let session = unsafe { AVAudioSession::sharedInstance() };
 
@@ -1556,7 +1760,57 @@ fn observe_session(
         };
         observers.push(token);
     }
+
+    if let Some(name) = unsafe { AVAudioSessionRouteChangeNotification } {
+        let inbox = commands.clone();
+        let on_route = RcBlock::new(move |note: std::ptr::NonNull<NSNotification>| {
+            let notification = unsafe { note.as_ref() };
+            let reason = route_change_reason(notification);
+            let _ = inbox.send(Command::Audio(AudioNotice::RouteChanged { reason }));
+        });
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(name),
+                Some(&session),
+                None,
+                &on_route,
+            )
+        };
+        observers.push(token);
+    }
     observers
+}
+
+/// Read a route-change notification's reason (Apple: an `NSNumber` under
+/// `AVAudioSessionRouteChangeReasonKey`) as the framework names it, for the
+/// ring; `"unknown"` when the dictionary does not say.
+#[allow(unsafe_code)]
+fn route_change_reason(notification: &NSNotification) -> &'static str {
+    // SAFETY: the key is Apple's process-lifetime `NSString` constant, read
+    // once; the lookup is a safe, null-checked accessor on the retained
+    // dictionary, and the number is downcast before it is read.
+    let reason = notification
+        .userInfo()
+        .and_then(|info| {
+            let key = unsafe { AVAudioSessionRouteChangeReasonKey }?;
+            info.objectForKey(key)
+        })
+        .and_then(|value| value.downcast::<NSNumber>().ok())
+        .map(|number| AVAudioSessionRouteChangeReason(number.unsignedIntegerValue()));
+    match reason {
+        Some(AVAudioSessionRouteChangeReason::NewDeviceAvailable) => "new device available",
+        Some(AVAudioSessionRouteChangeReason::OldDeviceUnavailable) => "old device unavailable",
+        Some(AVAudioSessionRouteChangeReason::CategoryChange) => "category change",
+        Some(AVAudioSessionRouteChangeReason::Override) => "override",
+        Some(AVAudioSessionRouteChangeReason::WakeFromSleep) => "wake from sleep",
+        Some(AVAudioSessionRouteChangeReason::NoSuitableRouteForCategory) => {
+            "no suitable route for category"
+        }
+        Some(AVAudioSessionRouteChangeReason::RouteConfigurationChange) => {
+            "route configuration change"
+        }
+        _ => "unknown",
+    }
 }
 
 /// Read an interruption notification's `userInfo` into a notice.

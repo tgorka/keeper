@@ -40,6 +40,29 @@
  * to whatever view was under it. Back, edge-swipe and Escape pop these
  * levels through the same `onBack`; the Bots surface adds no navigation of
  * its own (`bots-phone-pane.tsx`).
+ *
+ * Story 66.1 (FR-457…FR-459, AD-197) makes Approvals, Bridges and Sync the
+ * same kind of level: `src/lib/phone-surfaces.ts` is the table of views the
+ * stack renders, and every setter of `primaryViewStore` that already exists —
+ * the drawer rows, the Inbox header's Approvals chip, the palette's
+ * `open-approval`/`open-bridges`, the ⌘3/⌘4 chords, a bridge notification —
+ * lands here without knowing the phone exists, because the level is derived
+ * from the store rather than routed to. The chords are therefore *routed the
+ * same way* rather than withheld on the phone tier: the registry pattern
+ * (`use-approval-shortcut.ts`, `use-bridges-shortcut.ts`) sets the view and
+ * nothing else, and a hardware keyboard on an iPad-sized phone gets the
+ * surface it asked for. What the phone has no surface for is absent from the
+ * drawer (`SidebarPane` filters by the same table), never a dead row.
+ *
+ * Story 66.3 (FR-464…FR-466, AD-200) adds Files by the same three edits:
+ * `files-phone-pane.tsx` is the desktop's readers in one column — the folders,
+ * one listing, one file — and keeps its own navigation inside the level, so
+ * the stack sees one surface and pops it as a whole.
+ *
+ * Story 66.4 (FR-467…FR-469, AD-200) adds Notes as the Bots shape: the list at
+ * level 1, the note at level 2 (`notes-phone-pane.tsx`), the second level
+ * pushed through the same `pushedSurface` state the Bots conversation uses.
+ * Quick capture is a sheet mounted beside the drawer (`CapturePhoneSheet`).
  */
 import { RefreshCw, WifiOff } from "lucide-react";
 import {
@@ -48,12 +71,17 @@ import {
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
   type TransitionEvent,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
   useState,
 } from "react";
+import { ApprovalPane } from "@/components/approval/approval-pane";
 import { BotsPhoneConversation, BotsPhoneList } from "@/components/bots/bots-phone-pane";
+import { CapturePhoneSheet } from "@/components/capture/capture-phone-sheet";
+import { FilesPhonePane } from "@/components/files/files-phone-pane";
+import { BridgesPane } from "@/components/layout/bridges-pane";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
@@ -68,11 +96,14 @@ import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
 import { PhoneSearchSurface } from "@/components/layout/phone-search-surface";
 import { SettingsPane } from "@/components/layout/settings-pane";
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
+import { SyncPane } from "@/components/layout/sync-pane";
+import { NotesPhoneList, NotesPhoneNote } from "@/components/notes/notes-phone-pane";
 import { useKeyboardInset } from "@/hooks/use-keyboard-inset";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useStaleResumePill } from "@/hooks/use-stale-resume-pill";
 import { syncNow } from "@/lib/ipc/client";
+import { type PhoneSurface, phoneSurfaceFor } from "@/lib/phone-surfaces";
 import { accountStatusStore, useShellOffline } from "@/lib/stores/account-status";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
@@ -261,25 +292,34 @@ export function PhoneShell() {
   const { phone } = useShellLayout();
   useKeyboardInset({ enabled: phone });
 
-  // Story 62.2: the view levels. With no room selected, the Bots view (only
-  // where the capability is on — absent, never a dead level) or the Settings
-  // view occupies level 1, and an open Bots conversation level 2. A selected
-  // room outranks both: a notification tap must land on the Room.
+  // Story 62.2 / 66.1 / 66.4: the view levels. With no room selected, a view
+  // the phone has a surface for occupies level 1 (`phoneSurfaceFor` is the
+  // table; Bots, Sync, Files and Notes only where their capability is on —
+  // absent, never a dead level), and a surface's pushed second view — the
+  // Bots conversation, the open note — level 2. A selected room outranks them
+  // all: a notification tap must land on the Room.
   const view = usePrimaryView();
-  const botsCapability = useCapabilitiesStore((s) => s.capabilities.bots);
-  const surface: "bots" | "settings" | null =
-    view === "bots" && botsCapability ? "bots" : view === "settings" ? "settings" : null;
-  // Whether the Bots conversation is pushed over its list. Shell state rather
-  // than a store field because only this stack has two views to choose from —
-  // the desktop pane shows both at once — and it resets whenever the surface
-  // is no longer Bots, so re-entering always lands on the list. Derived during
-  // render, the sanctioned setState-in-render adjustment `StackLevel` uses.
-  const [botConversationOpen, setBotConversationOpen] = useState(false);
-  if (surface !== "bots" && botConversationOpen) {
-    setBotConversationOpen(false);
+  const capabilities = useCapabilitiesStore((s) => s.capabilities);
+  const surface = phoneSurfaceFor(view, capabilities);
+  // Which surface has its second view pushed over its first, or null. Shell
+  // state rather than a store field because only this stack has two views to
+  // choose from — the desktop panes show both at once — and it resets whenever
+  // the surface it belongs to is no longer showing, so re-entering always
+  // lands on the list. Derived during render, the sanctioned setState-in-render
+  // adjustment `StackLevel` uses.
+  const [pushedSurface, setPushedSurface] = useState<PhoneSurface | null>(null);
+  if (pushedSurface !== null && surface !== pushedSurface) {
+    setPushedSurface(null);
   }
   const surfaceOpen = selected === null && surface !== null;
-  const botConversationLevelOpen = surfaceOpen && surface === "bots" && botConversationOpen;
+  const pushedLevelOpen = surfaceOpen && pushedSurface !== null && pushedSurface === surface;
+  // What level 2 draws, held across its exit for the same reason level 1
+  // holds `shownSurface` below.
+  const lastPushedRef = useRef(pushedSurface);
+  if (pushedSurface !== null) {
+    lastPushedRef.current = pushedSurface;
+  }
+  const shownPushed = pushedSurface ?? lastPushedRef.current;
   // What the view level draws, held across its exit: `surface` goes null the
   // moment the view leaves, but the level stays mounted until its slide ends
   // (presence), and it must keep drawing the surface that is leaving — not
@@ -292,9 +332,13 @@ export function PhoneShell() {
 
   // One visible level, derived purely from existing state:
   //   selected -> Room (1) or, with Detail open, Detail (2);
-  //   else a view surface -> level 1, or the Bots conversation -> 2; else Inbox (0).
+  //   else a view surface -> level 1, or its pushed level -> 2; else Inbox (0).
   const level =
-    selected !== null ? (detailOpen ? 2 : 1) : botConversationLevelOpen ? 2 : surfaceOpen ? 1 : 0;
+    selected !== null ? (detailOpen ? 2 : 1) : pushedLevelOpen ? 2 : surfaceOpen ? 1 : 0;
+
+  // The Notes list pushes its note from an effect that fires on the active
+  // panel target changing, so the callback identity has to hold still.
+  const pushNotes = useCallback(() => setPushedSurface("notes"), []);
 
   // DW-109 (phone-scoped): a selection change never lands on Detail — close it
   // whenever `selected` changes so a room (re)selected with Detail open resolves
@@ -329,8 +373,8 @@ export function PhoneShell() {
       roomsStore.getState().selectRoom(null);
       return;
     }
-    if (botConversationLevelOpen) {
-      setBotConversationOpen(false);
+    if (pushedLevelOpen) {
+      setPushedSurface(null);
       return;
     }
     primaryViewStore.getState().setView("inbox");
@@ -887,10 +931,14 @@ export function PhoneShell() {
           <DetailPanel />
         </div>
       </StackLevel>
-      {/* Story 62.2 — the view levels, occupying levels 1 and 2 only while no
-          room is selected (the room levels above are closed then, so the two
-          families never share a level). Bots is the list, then the
-          conversation; Settings is the same pane the desktop renders. */}
+      {/* Story 62.2 / 66.1 — the view levels, occupying levels 1 and 2 only
+          while no room is selected (the room levels above are closed then, so
+          the two families never share a level). Bots is the list, then the
+          conversation; Notes is the list, then the note (66.4); Approvals,
+          Bridges, Sync, Files and Settings are the same panes the desktop
+          renders, under one "Back to Inbox" bar. A new surface is one more
+          `PhoneSurface` member, one arm in `phoneSurfaceFor`, and one branch
+          here — plus a `pushedSurface` case if it pushes a level 2. */}
       <StackLevel
         levelIndex={1}
         open={surfaceOpen}
@@ -907,9 +955,11 @@ export function PhoneShell() {
           <BotsPhoneList
             onBack={onBack}
             backRef={surfaceBack1Ref}
-            onOpen={() => setBotConversationOpen(true)}
+            onOpen={() => setPushedSurface("bots")}
           />
-        ) : shownSurface === "settings" ? (
+        ) : shownSurface === "notes" ? (
+          <NotesPhoneList onBack={onBack} backRef={surfaceBack1Ref} onOpen={pushNotes} />
+        ) : shownSurface !== null ? (
           <>
             <PhoneBackBar
               backLabel={PHONE_BACK_TO_INBOX}
@@ -918,14 +968,28 @@ export function PhoneShell() {
               backRef={surfaceBack1Ref}
             />
             <div className="flex min-h-0 min-w-0 flex-1">
-              <SettingsPane />
+              {shownSurface === "settings" ? (
+                <SettingsPane />
+              ) : shownSurface === "approval" ? (
+                <ApprovalPane />
+              ) : shownSurface === "bridges" ? (
+                <BridgesPane />
+              ) : shownSurface === "sync" ? (
+                <SyncPane />
+              ) : shownSurface === "files" ? (
+                <FilesPhonePane />
+              ) : (
+                // Exhaustive: a `PhoneSurface` member with no pane here is a
+                // type error, not a blank level.
+                (shownSurface satisfies never)
+              )}
             </div>
           </>
         ) : null}
       </StackLevel>
       <StackLevel
         levelIndex={2}
-        open={botConversationLevelOpen}
+        open={pushedLevelOpen}
         covered={false}
         inert={level !== 2}
         reducedMotion={reducedMotion}
@@ -935,11 +999,22 @@ export function PhoneShell() {
         className="absolute inset-0 z-20"
       >
         {level === 2 && edgeSwipeZone}
-        <BotsPhoneConversation onBack={onBack} backRef={surfaceBack2Ref} />
+        {/* Held across the exit exactly as level 1 holds `shownSurface`: the
+            level keeps drawing the pane that is leaving. */}
+        {shownPushed === "notes" ? (
+          <NotesPhoneNote onBack={onBack} backRef={surfaceBack2Ref} />
+        ) : (
+          <BotsPhoneConversation onBack={onBack} backRef={surfaceBack2Ref} />
+        )}
       </StackLevel>
       {/* The always-mounted leading nav drawer (Story 13.3); a portalled Sheet,
           so it renders outside the stack's transform layers. */}
       <LeadingDrawer />
+      {/* The always-mounted quick-capture sheet (Story 66.4, AD-200): the
+          phone's twin of the desktop's capture window, a portalled Sheet
+          opened by the Inbox header, the Notes level, the palette and ⌘⌥K
+          through one store. */}
+      <CapturePhoneSheet />
       {/* The always-mounted merged full-screen Search surface (Story 13.4); a
           portalled Dialog, store-driven, so it renders outside the transform
           layers and never mounts on the desktop tier (this shell is phone-only). */}

@@ -28,20 +28,15 @@ mod bots_drive_ipc;
 #[cfg(desktop)]
 mod bots_tools;
 mod build_identity;
-// Desktop only: the copy engine drives `keeper_sync`, which is not a
-// dependency on iOS or Android (see this crate's Cargo.toml), and
-// `AppState.copies` is gated the same way. Its three commands already sit
-// inside the `#[cfg(desktop)]` half of the handler list.
-#[cfg(desktop)]
+// The copy engine drives `keeper_sync`, which links on every target since
+// Epic 66 (AD-198); its three commands sit in the shared handler list.
 mod copy_ipc;
 mod debug_log;
 #[cfg(desktop)]
 #[cfg(target_os = "macos")]
 mod pdf_export;
-// The `keeper-file://` asset scheme (Story 45.7). Desktop-only for the same
-// reason `note_protocol` is: it serves files out of a synced folder, and the
-// folder sync it is rooted in is desktop-only.
-#[cfg(desktop)]
+// The `keeper-file://` asset scheme (Story 45.7). Every target since Epic 66
+// (AD-200): it serves files out of a synced folder, and a phone now has one.
 mod file_protocol;
 #[cfg(desktop)]
 mod hotkey;
@@ -51,13 +46,14 @@ mod macos_version;
 mod media_protocol;
 #[cfg(desktop)]
 mod menu;
-// The `keeper-note://` asset scheme (AD-59). Desktop-only with the rest of notes:
-// a vault is a synced folder, and iOS has no folder sync to put one in.
-#[cfg(desktop)]
+// The `keeper-note://` asset scheme (AD-59). Every target since Epic 66: a
+// vault is a synced folder, and the phone has folder sync now (AD-198).
 mod note_protocol;
-#[cfg(desktop)]
+// The notes surface. The module links everywhere; what needs a window, the
+// tray or a file manager is `#[cfg(desktop)]` inside it, with `Unsupported`
+// twins in `ipc` so the handler list is identical on every target. Whether
+// the phone *renders* notes is `CapabilitiesVm.notes` — Story 66.4's.
 mod notes_ipc;
-#[cfg(desktop)]
 mod notes_vault;
 #[cfg(desktop)]
 mod notes_window;
@@ -72,9 +68,16 @@ mod sessions_exec;
 mod sessions_ipc;
 #[cfg(desktop)]
 mod sessions_root;
-#[cfg(desktop)]
+// Share out (Story 66.3, AD-200): the phone's reveal. The containment half
+// compiles everywhere and is tested on Linux; the `UIActivityViewController`
+// half is `cfg(target_os = "ios")` inside, and a desktop answers `unsupported`
+// with a sentence naming Finder.
+mod share_ios;
+// Folder sync (Epic 29): the engine wiring and its command surface, on every
+// target since Epic 66 (AD-198). What the phone does differently — no
+// supervisor, no watcher, a sync on open, on foreground and on pull-to-refresh
+// (NFR-57) — is decided in `sync`, not by absence.
 mod sync;
-#[cfg(desktop)]
 mod sync_ipc;
 #[cfg(desktop)]
 mod tray;
@@ -85,12 +88,25 @@ mod tray;
 // port, so the command list stays identical.
 #[cfg(target_os = "ios")]
 mod voice_ios;
+// The island (Story 65.5, AD-194): the Live Activity that shows the phone's
+// ear on the lock screen and in the Dynamic Island. iOS-only, like the port
+// it mirrors; the decision is `keeper_core::voice::island`.
+#[cfg(target_os = "ios")]
+mod voice_island;
+// The lock-screen banner (Story 67.2, AD-207): the local notification every
+// free-team build has; decision in keeper_core::voice::banner.
 #[cfg(target_os = "macos")]
 mod voice_macos;
+#[cfg(target_os = "ios")]
+mod voice_notify;
 // The voice commands (Story 62.4): a call site over `keeper_core::voice`.
 // Registered on every target — a phone lists them for real, a desktop
 // answers `unsupported` — so the frontend never special-cases the call.
 mod voice_ipc;
+// The voice port's record (Story 65.3, AD-192): the in-memory ring every
+// port event and turn transition feeds, and the command the phone reads
+// it through. Every target, like the commands it records for.
+mod voice_log;
 // Reach (Story 63.5, AD-174/AD-179): the hotkey, tray and deep-link call
 // sites that start a turn while keeper is not in front, and the voice
 // hotkey's commands. Every target, because the deep link is every target's;
@@ -144,8 +160,9 @@ static QUIT_CONFIRM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// first argument (Finder passes none, older macOS passes `-psn_…`), and nothing
 /// here writes to stdout except object bytes, because git reads stdout as content.
 ///
-/// Desktop-only, like the `keeper-sync` dependency itself: an iOS build has no
-/// folder sync and therefore no filter to be.
+/// Desktop-only: a phone cannot be a git filter — iOS spawns nothing, so no
+/// `git` will ever invoke this binary — and its engine registers no filter
+/// driver at all (`Engine::open_with_engine`, AD-198).
 #[cfg(desktop)]
 fn served_as_lfs_filter() -> bool {
     use keeper_sync::lfs::filter;
@@ -182,7 +199,7 @@ fn served_as_lfs_filter() -> bool {
     true
 }
 
-/// The iOS shell links no sync engine, so it can never be a git filter.
+/// A phone is never invoked as a git filter (see above).
 #[cfg(not(desktop))]
 fn served_as_lfs_filter() -> bool {
     false
@@ -278,7 +295,6 @@ pub fn run() {
     // resolves against the Matrix media cache: putting user-file path handling
     // inside the code path that serves decrypted message media would make one bug
     // there worse than two handlers.
-    #[cfg(desktop)]
     let builder = builder.register_asynchronous_uri_scheme_protocol(
         "keeper-note",
         |ctx, request, responder| {
@@ -305,7 +321,6 @@ pub fn run() {
     // `keeper-note://`, whose root is the notes SUBFOLDER and therefore narrower
     // than the tree the Files pane browses. This one is contained to the sync
     // profile's own root, through the same `browse::resolve` the listing uses.
-    #[cfg(desktop)]
     let builder = builder.register_asynchronous_uri_scheme_protocol(
         file_protocol::SCHEME,
         |ctx, request, responder| {
@@ -363,7 +378,7 @@ pub fn run() {
                     Some(home) => keeper_core::config::load_app_layers(home, &host),
                     None => keeper_core::config::AppLayers::default(),
                 };
-                #[cfg(desktop)]
+                // Every target since Epic 66: the phone has folders now.
                 keeper_sync::profile::install_folder_tier(keeper_sync::profile::FolderTier::new(
                     host,
                     layers.main_folder.clone(),
@@ -404,8 +419,10 @@ pub fn run() {
                 // The voice recogniser's language (Epic 63): the port is
                 // process-wide and `voice_availability` takes no state, so
                 // the persisted choice reaches it here, once, before any
-                // surface or the tray asks.
-                voice_ipc::load_locale(&data_dir);
+                // surface or the tray asks. The same call keeps the data dir
+                // for the re-arm hooks below (Epic 65, AD-190) and the app
+                // handle for the spoken send (Epic 67, AD-205).
+                voice_ipc::boot(app.handle(), &data_dir);
             }
 
             // Forward every incoming `keeper://` deep link: `keeper://voice/talk`
@@ -531,6 +548,8 @@ pub fn run() {
             // request notification permission best-effort. A permission failure only
             // means the OS will drop notifications — it never blocks startup.
             ipc::set_notify_app_handle(app.handle().clone());
+            #[cfg(target_os = "ios")]
+            voice_notify::install(app.handle());
 
             // Store the app handle for the desktop dock-badge port (Story 10.3) so
             // `Platform::set_badge_count` can drive the main window's OS dock badge from
@@ -666,11 +685,18 @@ pub fn run() {
             // port is live; a machine without git has no sync capability and the
             // call returns quietly. Stopped on the quit path so an in-flight push
             // aborts resumably rather than mid-write.
+            //
+            // A phone runs no supervisor and no watcher (Epic 66, AD-198,
+            // NFR-57): it syncs every folder once here, on open, again on
+            // `RunEvent::Resumed` below, and on pull-to-refresh through
+            // `sync_folder_now` — a battery is not a wall socket.
             #[cfg(desktop)]
             {
                 let state = app.state::<ipc::AppState>();
                 sync::start_supervisor(std::sync::Arc::clone(&state.platform));
             }
+            #[cfg(not(desktop))]
+            sync::phone_sync_all(app.handle(), "open");
 
             // AD-101's phase two: the one fact about the layer stack that
             // could not be checked until the engine existed.
@@ -739,7 +765,13 @@ pub fn run() {
             // and there is nothing to subscribe to before it exists; a machine
             // with no usable `git` has no engine, therefore no vaults, and this
             // returns quietly — `CapabilitiesVm.notes` is already false there.
-            #[cfg(desktop)]
+            //
+            // On every target since Epic 66 (Story 66.4, AD-200): the phone's
+            // engine opened synchronously in `phone_sync_all` above, so the
+            // registry sees it here; a vault whose clone has not landed yet is
+            // adopted by `notes_vault::phone_synced` when the pass ends. The
+            // tap subscribes to a watcher the phone never arms — the phone's
+            // index is refreshed after each sync pass instead.
             notes_vault::start(app.handle());
 
             // Build the sessions-root registry beside it (Phase 7, AD-107/108):
@@ -862,9 +894,10 @@ pub fn run() {
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,
                 voice_ipc::voice_stop,
-                voice_ipc::voice_speak,
                 voice_ipc::voice_stop_speaking,
                 voice_ipc::voice_wake_set,
+                // Epic 67 (AD-206): the bot a spoken turn goes to.
+                voice_ipc::voice_target_set,
                 // Story 62.5: the watcher without a turn, and the persisted phrase.
                 voice_ipc::voice_watch,
                 voice_ipc::voice_unwatch,
@@ -873,6 +906,8 @@ pub fn run() {
                 voice_ipc::voice_locale_set,
                 // Story 62.6: the two permission dialogs, on the first deliberate act.
                 voice_ipc::voice_authorize,
+                // Story 65.3: what the port did, newest first, for the phone.
+                voice_log::voice_events,
                 // Story 63.5: the voice hotkey's binding, for Settings.
                 voice_reach::voice_hotkey_get,
                 voice_reach::voice_hotkey_set,
@@ -1056,7 +1091,206 @@ pub fn run() {
                 ipc::recording_note_stub_save,
                 ipc::recording_note_stub_dismiss,
                 ipc::recovered_sessions_list,
-                ipc::recovered_session_acknowledge
+                ipc::recovered_session_acknowledge,
+                // The folder surfaces — sync, the Files reads and writes, the
+                // Tasks verbs, the copy engine, sessions and notes — on every
+                // target since Epic 66 (AD-198): `keeper-sync` links on the
+                // phone. Which of them a phone *renders* is `CapabilitiesVm`
+                // (`sync` true there; `notes`, `sessions`, `botTools` their
+                // own stories'), never the handler list. The commands that need
+                // a window or a file manager stay in the desktop splice below
+                // with `Unsupported` twins on the phone.
+                sync_ipc::sync_profiles,
+                sync_ipc::sync_statuses,
+                sync_ipc::sync_profile_save,
+                sync_ipc::sync_profile_remove,
+                sync_ipc::sync_profile_set_enabled,
+                sync_ipc::sync_folder_now,
+                sync_ipc::sync_verify,
+                sync_ipc::sync_rescan,
+                sync_ipc::sync_footprint,
+                sync_ipc::sync_open_path,
+                // The Files tab's listing command and its actions (Story 43.8; the text
+                // read added by Story 45.6). Desktop-only with the rest of sync: a build
+                // with no folder sync has no synced folder to browse.
+                sync_ipc::sync_browse,
+                sync_ipc::sync_open_entry,
+                sync_ipc::sync_read_text,
+                sync_ipc::sync_export_pdf,
+                // On-demand hydration for one virtual path (Story 56.3, FR-338).
+                // Beside the read commands because it is the same address — profile id
+                // plus the subpath the listing produced — and desktop-only with the
+                // rest of sync.
+                sync_ipc::sync_materialize_entry,
+                // And the two verbs beside it that the row offers once the content is
+                // here (Story 56.9, FR-343, FR-334): let it go again, and hold it
+                // against being let go. Desktop-only with the rest of sync — `mod
+                // sync_ipc` is itself `#[cfg(desktop)]`, so neither has a
+                // `#[cfg(not(desktop))]` twin to name.
+                sync_ipc::sync_release_entry,
+                sync_ipc::sync_pin_entry,
+                // The document reader (Story 45.8). Returns a bounded projection of a
+                // PDF, DOCX, PPTX or XLSX; the bytes themselves never cross IPC.
+                sync_ipc::sync_read_document,
+                // Export (Story 45.21). Reads inside the profile, writes outside it, so
+                // it is here rather than with the write commands below: it needs no
+                // vault and refuses nothing for being outside one.
+                sync_ipc::sync_export_entry,
+                // Share out (Story 66.3, AD-200): the phone's reveal, addressed like
+                // `sync_open_entry` and refused on a desktop with a sentence naming
+                // Finder. Registered everywhere so the handler list is one list.
+                share_ios::share_out,
+                // And the write half (Story 45.3, AD-89, which retired AD-75). Every
+                // one of these goes through `notes_vault`'s single writer and refuses
+                // anything outside a notes vault; the decisions are in
+                // `keeper_sync::files_write`, and these are the call sites.
+                sync_ipc::sync_write_entry,
+                sync_ipc::sync_delete_plan,
+                sync_ipc::sync_delete_entries,
+                sync_ipc::sync_create_entry,
+                // A file's own properties (Story 50.4, FR-283). Beside the write
+                // commands because they are one question: the same `WriteScope::route`
+                // decides whether a file's properties may be read and whether they may
+                // be written, so a panel is never offered where a write would refuse.
+                sync_ipc::sync_read_frontmatter,
+                sync_ipc::sync_write_frontmatter,
+                sync_ipc::sync_subscribe_progress,
+                sync_ipc::sync_unsubscribe_progress,
+                sync_ipc::sync_activity,
+                sync_ipc::sync_pending,
+                sync_ipc::sync_problems,
+                sync_ipc::sync_retry_parked,
+                sync_ipc::sync_set_credential,
+                sync_ipc::sync_get_credential,
+                sync_ipc::sync_clear_credential,
+                sync_ipc::sync_device,
+                sync_ipc::sync_device_set_label,
+                // The Tasks surface (Epic 57, FR-351, AD-137): the five verbs the ⌘8
+                // view drives, over the engine door Stories 57.1–57.4 built. Desktop
+                // only with the rest of sync — `mod sync_ipc` is itself
+                // `#[cfg(desktop)]`, so none of them has a `#[cfg(not(desktop))]` twin
+                // to name, and iOS is not a task host at all (AD-137: the OS owns the
+                // runtime, `pause_all()` runs on backgrounding).
+                sync_ipc::sync_tasks,
+                sync_ipc::sync_task_history,
+                sync_ipc::sync_task_run_now,
+                sync_ipc::sync_task_save,
+                sync_ipc::sync_task_forget,
+                sync_ipc::sync_paced_work,
+                sync_ipc::sync_task_schedule_preview,
+                // The batched pair (Story 59.4): the Tasks pane's multi-selection acts
+                // on several ids in one call and renders the per-id receipt. The
+                // single-id `sync_task_save` / `sync_task_forget` above stay — the edit
+                // form and the one-row Forget are still their callers.
+                sync_ipc::sync_tasks_set_enabled,
+                sync_ipc::sync_tasks_forget,
+                copy_ipc::copy_start,
+                copy_ipc::copy_status,
+                copy_ipc::copy_cancel,
+                sessions_ipc::sessions_roots,
+                sessions_ipc::sessions_list,
+                sessions_ipc::sessions_rescan,
+                sessions_ipc::sessions_detail,
+                sessions_ipc::sessions_tree,
+                sessions_ipc::sessions_refs,
+                sessions_ipc::sessions_patterns,
+                sessions_ipc::sessions_create,
+                sessions_ipc::sessions_log_today,
+                sessions_ipc::sessions_migrate_preview,
+                sessions_ipc::sessions_migrate,
+                sessions_ipc::sessions_record_migrate,
+                sessions_ipc::sessions_set_pinned,
+                sessions_ipc::sessions_archive,
+                sessions_ipc::sessions_delete,
+                sessions_ipc::sessions_unarchive,
+                sessions_ipc::sessions_spaces,
+                sessions_ipc::sessions_space_files,
+                sessions_ipc::sessions_space_save,
+                // The repair beside `save`, not beside the reads: it IS a save (Story
+                // 53.4), delegating to the one above it.
+                sessions_ipc::sessions_space_narrow,
+                sessions_ipc::sessions_space_delete,
+                sessions_ipc::sessions_spaces_restore,
+                sessions_ipc::sessions_template_install,
+                sessions_ipc::sessions_template_entries,
+                sessions_ipc::sessions_template_rename,
+                sessions_ipc::sessions_template_file_new,
+                sessions_ipc::sessions_template_dir_new,
+                sessions_ipc::sessions_template_rename_entry,
+                sessions_ipc::sessions_template_delete_entry,
+                sessions_ipc::sessions_file_new,
+                sessions_ipc::sessions_dir_new,
+                sessions_ipc::sessions_file_new_kind,
+                sessions_ipc::sessions_file_delete,
+                sessions_ipc::sessions_file_rename,
+                sessions_ipc::sessions_file_path,
+                sessions_ipc::sessions_task_move,
+                sessions_ipc::sessions_ref_candidates,
+                sessions_ipc::sessions_ref_add,
+                sessions_ipc::sessions_search,
+                sessions_ipc::sessions_search_cancel,
+                notes_ipc::notes_vaults,
+                notes_ipc::notes_vault_flag,
+                notes_ipc::notes_vault_settings_save,
+                notes_ipc::notes_vault_active,
+                notes_ipc::notes_vault_set_active,
+                notes_ipc::notes_capture_impact,
+                notes_ipc::notes_index_rebuild,
+                notes_ipc::notes_list,
+                notes_ipc::notes_tag_tree,
+                notes_ipc::tags_vocabulary,
+                notes_ipc::notes_tree,
+                notes_ipc::notes_gallery,
+                notes_ipc::notes_spaces,
+                notes_ipc::notes_space_save,
+                notes_ipc::notes_space_validate,
+                notes_ipc::notes_space_terms,
+                notes_ipc::notes_spaces_restore_defaults,
+                notes_ipc::notes_widget,
+                notes_ipc::notes_widget_move,
+                notes_ipc::notes_create,
+                notes_ipc::notes_journal_today,
+                notes_ipc::notes_templates,
+                notes_ipc::notes_templates_restore_defaults,
+                notes_ipc::notes_open,
+                notes_ipc::notes_close,
+                notes_ipc::notes_buffer_report,
+                notes_ipc::notes_save,
+                notes_ipc::notes_rename,
+                notes_ipc::notes_set_flag,
+                notes_ipc::notes_set_order,
+                notes_ipc::notes_delete_plan,
+                notes_ipc::notes_delete,
+                notes_ipc::notes_search,
+                notes_ipc::notes_link_targets,
+                notes_ipc::notes_resolve_link,
+                notes_ipc::notes_backlinks,
+                notes_ipc::notes_forwardlinks,
+                notes_ipc::notes_field_vocabulary,
+                notes_ipc::notes_history,
+                notes_ipc::notes_diff,
+                notes_ipc::notes_mark_read,
+                notes_ipc::notes_restore_revision,
+                notes_ipc::notes_template_update_preview,
+                notes_ipc::notes_template_update_apply,
+                notes_ipc::notes_conflicts,
+                notes_ipc::notes_resolve_conflict,
+                notes_ipc::notes_attachment_paste,
+                notes_ipc::notes_attach_sources,
+                notes_ipc::notes_attach_targets,
+                notes_ipc::notes_body_read,
+                notes_ipc::notes_body_write,
+                notes_ipc::notes_csv_read,
+                notes_ipc::notes_csv_set_cell,
+                notes_ipc::notes_table_from_csv,
+                notes_ipc::notes_csv_from_table,
+                notes_ipc::notes_embed_paths,
+                notes_ipc::notes_embed_read,
+                notes_ipc::notes_embed_write,
+                notes_ipc::notes_capture_draft,
+                notes_ipc::notes_subscribe_changes,
+                notes_ipc::notes_unsubscribe_changes,
+                notes_ipc::notes_subscribe_index,
             ])
         };
     }
@@ -1107,193 +1341,9 @@ pub fn run() {
         bots_drive_ipc::bots_image_paste,
         bots_drive_ipc::bots_image_discard,
         bots_drive_ipc::bots_deliverable_paths,
-        sync_ipc::sync_profiles,
-        sync_ipc::sync_statuses,
-        sync_ipc::sync_profile_save,
-        sync_ipc::sync_profile_remove,
-        sync_ipc::sync_profile_set_enabled,
-        sync_ipc::sync_folder_now,
-        sync_ipc::sync_verify,
-        sync_ipc::sync_rescan,
-        sync_ipc::sync_footprint,
-        sync_ipc::sync_open_path,
-        // The Files tab's listing command and its actions (Story 43.8; the text
-        // read added by Story 45.6). Desktop-only with the rest of sync: a build
-        // with no folder sync has no synced folder to browse.
-        sync_ipc::sync_browse,
-        sync_ipc::sync_open_entry,
-        sync_ipc::sync_read_text,
-        sync_ipc::sync_export_pdf,
-        // On-demand hydration for one virtual path (Story 56.3, FR-338).
-        // Beside the read commands because it is the same address — profile id
-        // plus the subpath the listing produced — and desktop-only with the
-        // rest of sync.
-        sync_ipc::sync_materialize_entry,
-        // And the two verbs beside it that the row offers once the content is
-        // here (Story 56.9, FR-343, FR-334): let it go again, and hold it
-        // against being let go. Desktop-only with the rest of sync — `mod
-        // sync_ipc` is itself `#[cfg(desktop)]`, so neither has a
-        // `#[cfg(not(desktop))]` twin to name.
-        sync_ipc::sync_release_entry,
-        sync_ipc::sync_pin_entry,
-        // The document reader (Story 45.8). Returns a bounded projection of a
-        // PDF, DOCX, PPTX or XLSX; the bytes themselves never cross IPC.
-        sync_ipc::sync_read_document,
-        // Export (Story 45.21). Reads inside the profile, writes outside it, so
-        // it is here rather than with the write commands below: it needs no
-        // vault and refuses nothing for being outside one.
-        sync_ipc::sync_export_entry,
-        // And the write half (Story 45.3, AD-89, which retired AD-75). Every
-        // one of these goes through `notes_vault`'s single writer and refuses
-        // anything outside a notes vault; the decisions are in
-        // `keeper_sync::files_write`, and these are the call sites.
-        sync_ipc::sync_write_entry,
-        sync_ipc::sync_delete_plan,
-        sync_ipc::sync_delete_entries,
-        sync_ipc::sync_create_entry,
-        // A file's own properties (Story 50.4, FR-283). Beside the write
-        // commands because they are one question: the same `WriteScope::route`
-        // decides whether a file's properties may be read and whether they may
-        // be written, so a panel is never offered where a write would refuse.
-        sync_ipc::sync_read_frontmatter,
-        sync_ipc::sync_write_frontmatter,
-        sync_ipc::sync_subscribe_progress,
-        sync_ipc::sync_unsubscribe_progress,
-        sync_ipc::sync_activity,
-        sync_ipc::sync_pending,
-        sync_ipc::sync_problems,
-        sync_ipc::sync_retry_parked,
-        sync_ipc::sync_set_credential,
-        sync_ipc::sync_get_credential,
-        sync_ipc::sync_clear_credential,
-        sync_ipc::sync_device,
-        sync_ipc::sync_device_set_label,
-        // The Tasks surface (Epic 57, FR-351, AD-137): the five verbs the ⌘8
-        // view drives, over the engine door Stories 57.1–57.4 built. Desktop
-        // only with the rest of sync — `mod sync_ipc` is itself
-        // `#[cfg(desktop)]`, so none of them has a `#[cfg(not(desktop))]` twin
-        // to name, and iOS is not a task host at all (AD-137: the OS owns the
-        // runtime, `pause_all()` runs on backgrounding).
-        sync_ipc::sync_tasks,
-        sync_ipc::sync_task_history,
-        sync_ipc::sync_task_run_now,
-        sync_ipc::sync_task_save,
-        sync_ipc::sync_task_forget,
-        sync_ipc::sync_paced_work,
-        sync_ipc::sync_task_schedule_preview,
-        // The batched pair (Story 59.4): the Tasks pane's multi-selection acts
-        // on several ids in one call and renders the per-id receipt. The
-        // single-id `sync_task_save` / `sync_task_forget` above stay — the edit
-        // form and the one-row Forget are still their callers.
-        sync_ipc::sync_tasks_set_enabled,
-        sync_ipc::sync_tasks_forget,
-        copy_ipc::copy_start,
-        copy_ipc::copy_status,
-        copy_ipc::copy_cancel,
-        sessions_ipc::sessions_roots,
-        sessions_ipc::sessions_list,
-        sessions_ipc::sessions_rescan,
-        sessions_ipc::sessions_detail,
-        sessions_ipc::sessions_tree,
-        sessions_ipc::sessions_refs,
-        sessions_ipc::sessions_patterns,
-        sessions_ipc::sessions_create,
-        sessions_ipc::sessions_log_today,
-        sessions_ipc::sessions_migrate_preview,
-        sessions_ipc::sessions_migrate,
-        sessions_ipc::sessions_record_migrate,
-        sessions_ipc::sessions_set_pinned,
-        sessions_ipc::sessions_archive,
-        sessions_ipc::sessions_delete,
-        sessions_ipc::sessions_unarchive,
-        sessions_ipc::sessions_spaces,
-        sessions_ipc::sessions_space_files,
-        sessions_ipc::sessions_space_save,
-        // The repair beside `save`, not beside the reads: it IS a save (Story
-        // 53.4), delegating to the one above it.
-        sessions_ipc::sessions_space_narrow,
-        sessions_ipc::sessions_space_delete,
-        sessions_ipc::sessions_spaces_restore,
-        sessions_ipc::sessions_template_install,
-        sessions_ipc::sessions_template_entries,
-        sessions_ipc::sessions_template_rename,
-        sessions_ipc::sessions_template_file_new,
-        sessions_ipc::sessions_template_dir_new,
-        sessions_ipc::sessions_template_rename_entry,
-        sessions_ipc::sessions_template_delete_entry,
-        sessions_ipc::sessions_file_new,
-        sessions_ipc::sessions_dir_new,
-        sessions_ipc::sessions_file_new_kind,
-        sessions_ipc::sessions_file_delete,
-        sessions_ipc::sessions_file_rename,
-        sessions_ipc::sessions_file_path,
-        sessions_ipc::sessions_task_move,
-        sessions_ipc::sessions_ref_candidates,
-        sessions_ipc::sessions_ref_add,
-        sessions_ipc::sessions_search,
-        sessions_ipc::sessions_search_cancel,
-        notes_ipc::notes_vaults,
-        notes_ipc::notes_vault_flag,
-        notes_ipc::notes_vault_settings_save,
-        notes_ipc::notes_vault_active,
-        notes_ipc::notes_vault_set_active,
-        notes_ipc::notes_capture_impact,
-        notes_ipc::notes_index_rebuild,
-        notes_ipc::notes_list,
-        notes_ipc::notes_tag_tree,
-        notes_ipc::tags_vocabulary,
-        notes_ipc::notes_tree,
-        notes_ipc::notes_gallery,
-        notes_ipc::notes_spaces,
-        notes_ipc::notes_space_save,
-        notes_ipc::notes_space_validate,
-        notes_ipc::notes_space_terms,
-        notes_ipc::notes_spaces_restore_defaults,
-        notes_ipc::notes_widget,
-        notes_ipc::notes_widget_move,
-        notes_ipc::notes_create,
-        notes_ipc::notes_journal_today,
-        notes_ipc::notes_templates,
-        notes_ipc::notes_templates_restore_defaults,
-        notes_ipc::notes_open,
-        notes_ipc::notes_close,
-        notes_ipc::notes_buffer_report,
-        notes_ipc::notes_save,
-        notes_ipc::notes_rename,
-        notes_ipc::notes_set_flag,
-        notes_ipc::notes_set_order,
-        notes_ipc::notes_delete_plan,
-        notes_ipc::notes_delete,
-        notes_ipc::notes_search,
-        notes_ipc::notes_link_targets,
-        notes_ipc::notes_resolve_link,
-        notes_ipc::notes_backlinks,
-        notes_ipc::notes_forwardlinks,
-        notes_ipc::notes_field_vocabulary,
-        notes_ipc::notes_history,
-        notes_ipc::notes_diff,
-        notes_ipc::notes_mark_read,
-        notes_ipc::notes_restore_revision,
-        notes_ipc::notes_template_update_preview,
-        notes_ipc::notes_template_update_apply,
-        notes_ipc::notes_conflicts,
-        notes_ipc::notes_resolve_conflict,
-        notes_ipc::notes_attachment_paste,
-        notes_ipc::notes_attach_sources,
-        notes_ipc::notes_attach_targets,
-        notes_ipc::notes_body_read,
-        notes_ipc::notes_body_write,
-        notes_ipc::notes_csv_read,
-        notes_ipc::notes_csv_set_cell,
-        notes_ipc::notes_table_from_csv,
-        notes_ipc::notes_csv_from_table,
-        notes_ipc::notes_embed_paths,
-        notes_ipc::notes_embed_read,
-        notes_ipc::notes_embed_write,
-        notes_ipc::notes_capture_draft,
-        notes_ipc::notes_subscribe_changes,
-        notes_ipc::notes_unsubscribe_changes,
-        notes_ipc::notes_subscribe_index,
+        // The notes commands that need a window (the quick-capture panel), a
+        // file manager or an opener — the rest of notes is in the shared body
+        // since Epic 66. Each has an `Unsupported` twin in `ipc` below.
         notes_ipc::notes_capture_show,
         notes_ipc::notes_capture_hide,
         notes_ipc::notes_capture_open,
@@ -1303,16 +1353,16 @@ pub fn run() {
         notes_ipc::notes_capture_windows,
         notes_ipc::notes_reveal,
         notes_ipc::notes_open_file,
-        // Export (Story 45.21). Desktop-only with the rest of the Files surface
-        // it shares an engine with; iOS has no folder chooser to pick a
-        // destination from and `CapabilitiesVm.notes` is false there.
+        // Export (Story 45.21): desktop-only with `notes_ipc::notes_export`
+        // itself — a phone has no folder chooser to pick a destination from,
+        // and the control is absent there rather than a twin that refuses.
         notes_ipc::notes_export,
     );
-    // The notes surface is desktop-only, but the commands that touch a window
-    // or a file manager have `Unsupported` twins so the handler list is identical
-    // on every target and `cargo check --target aarch64-apple-ios` stays green
-    // (AD-27, AD-33). The rest of the notes commands are absent on iOS by
-    // construction: `CapabilitiesVm.notes` is false there, so nothing calls them.
+    // The commands that touch a window or a file manager have `Unsupported`
+    // twins so the handler list is identical on every target and
+    // `cargo check --target aarch64-apple-ios` stays green (AD-27, AD-33). The
+    // rest of the notes surface is real on a phone since Epic 66; whether it
+    // renders is `CapabilitiesVm.notes` (Story 66.4).
     #[cfg(not(desktop))]
     let builder = keeper_with_commands!(
         builder,
@@ -1351,6 +1401,13 @@ pub fn run() {
                 // the one that fires when the user switches app without hiding
                 // anything. `push_on_blur` decides whether it reaches the network.
                 WindowEvent::Focused(false) => notes_vault::flush(),
+                // Keeper back in front is one of the things that clear a
+                // refusal to listen for the phrase (Epic 65, AD-190): the
+                // person allowed the microphone in System Settings and came
+                // back. The rule is `keeper_core::voice::should_rearm`; an
+                // armed or switched-off phrase costs one probe and nothing
+                // else, and the probe runs off this thread.
+                WindowEvent::Focused(true) => voice_ipc::voice_rearm(),
                 // The voice pill sits on the main window's screen (Story
                 // 64.4): a drag onto another display takes it along. Per
                 // compositor frame, but `follow` returns on one lock while
@@ -1511,6 +1568,28 @@ pub fn run() {
             // so this is deliberately coarse — never exact-message routing (deferred to
             // Epic 11).
             //
+            // The phone came back to the foreground (`willEnterForeground` on
+            // iOS; never at launch, which keeps AD-169's "keeper never arms
+            // itself"): if the phrase is switched on and its refusal has
+            // cleared — the microphone allowed under Settings > keeper, a
+            // language downloaded — it is armed again (Epic 65, AD-190).
+            // The desktop's equivalent is the main window's focus, above.
+            tauri::RunEvent::Resumed => {
+                voice_ipc::voice_rearm();
+                // A Live Activity can be requested only with keeper in
+                // front (Story 65.5): one refused while it was not — the
+                // eight-hour renew, an arm from the port's own resume — is
+                // requested now.
+                #[cfg(target_os = "ios")]
+                voice_island::resumed();
+                #[cfg(target_os = "ios")]
+                voice_notify::resumed();
+                // The folder on the phone syncs on foreground (Epic 66,
+                // NFR-57): no supervisor ticks here, so this and
+                // pull-to-refresh are the only times a remote change arrives.
+                #[cfg(not(desktop))]
+                sync::phone_sync_all(app_handle, "foreground");
+            }
             // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
             // Linux/Windows), so this arm is gated on macOS specifically rather than on
             // `desktop` — the wider gate does not compile on the Linux desktop target.

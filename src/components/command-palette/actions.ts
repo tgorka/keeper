@@ -13,10 +13,24 @@
  * currently selected chat context (never `null` — the palette only offers open-chat
  * actions when a chat is open). Ranking/filtering is never done here; the Rust
  * `palette_query` is authoritative per query.
+ *
+ * The phone (Story 66.1, AD-197, DW-108/DW-111): the view switches below are
+ * deliberately NOT tier-aware. `open-approval`, `open-bridges` and the rest set
+ * `primaryViewStore`, and the phone stack derives its level-1 surface from that
+ * store (`src/lib/phone-surfaces.ts`) — so a navigation action lands on the phone
+ * surface by construction, the same way ⌘3/⌘4 (`use-approval-shortcut.ts`,
+ * `use-bridges-shortcut.ts`) do. That is the registry pattern: one setter, every
+ * caller, no per-platform routing table here. The chords are routed rather than
+ * withheld on the phone tier for the same reason — a hardware keyboard on a phone
+ * gets the surface it asked for. The one action that must know the tier is
+ * `open-search`, because the desktop and the phone have *different surfaces* for
+ * it (a centered dialog vs the full-screen `PhoneSearchSurface`) driven by two
+ * stores; it reads the tier at dispatch and opens the right one.
  */
 import { toggleBotMessageDetails } from "@/components/bots/bot-message-meta";
 import { createNote, openJournalToday, showCapture } from "@/hooks/use-notes-actions";
 import { logTodayInCurrentSession } from "@/hooks/use-sessions-shortcut";
+import { isPhoneTier } from "@/hooks/use-shell-layout";
 import {
   archiveRoom,
   chatNotifyModeSet,
@@ -43,6 +57,7 @@ import { notesVaultsStore } from "@/lib/stores/notes-vaults";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import type { RoomSelection } from "@/lib/stores/rooms";
 import { searchStore } from "@/lib/stores/search";
+import { searchSurfaceStore } from "@/lib/stores/search-surface";
 import { sessionsListStore } from "@/lib/stores/sessions-list";
 
 /** The open-chat context an open-chat action operates on. */
@@ -171,7 +186,11 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
 
   // --- Global actions (dialogs / commands) ---
   "new-chat": () => newChatStore.getState().open(),
-  "open-search": () => searchStore.getState().open("global"),
+  // DW-111: the phone's only Search is the full-screen surface (Story 13.4);
+  // the desktop's is the centered overlay. Same verb, two surfaces, so this
+  // is the one action that reads the tier.
+  "open-search": () =>
+    isPhoneTier() ? searchSurfaceStore.getState().open() : searchStore.getState().open("global"),
   "start-export": () =>
     exportStore.getState().open({ scope: "everything", accountId: null, roomId: null }),
   "add-account": () => addAccountStore.getState().openAddAccount(),

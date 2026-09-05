@@ -922,7 +922,8 @@ resolution: Won't fix. The premise holds (ExportOptions.plist hard-codes method=
 origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
 location: src/components/layout/phone-shell.tsx (does not read usePrimaryView; renders ChatListPane only) + src/components/layout/app-shell.tsx (phone branch replaces SidebarPane with PhoneShell)
 reason: Intended staging, not a 13.1 defect. Epic 13 sequences the sidebar's contents into the **leading drawer** delivered by Story 13.3 (the drawer renders "the entire desktop sidebar verbatim inside a leading Sheet" — primary views, SPACES/NETWORKS, account switcher, sync/offline status), and the Inbox header status cluster (13.3) surfaces the offline/approval state. On an actual iPhone at 13.1 these states are also not reachable: ⌘3/⌘4 need a hardware keyboard and the native menu bar is desktop-only (`nativeMenuBar` capability false on iOS), so `primaryView` never leaves `inbox`/`archive`. Both reviewers flagged the absence as "silently dropped functionality"; it is real but owned by 13.3. Revisit when implementing Story 13.3 (leading drawer + Inbox header status cluster) — ensure bridges/approval routing and offline/Settings/account access land there, and that the phone tier honors `primaryView` for the drawer-selected full-surface panes.
-status: open
+status: closed 2026-09-05
+resolution: Story 66.1 (AD-197). `PhoneShell` derives its level-1 surface from `primaryViewStore` through `src/lib/phone-surfaces.ts:36` (`phoneSurfaceFor`: approval, bridges, sync, bots, settings) and renders `ApprovalPane`/`BridgesPane`/`SyncPane` under one back bar (`src/components/layout/phone-shell.tsx:288`, `:909-936`); the drawer keeps only the rows the stack can land (`src/components/layout/sidebar-pane.tsx:310`), so ⌘3/⌘4, the palette's `open-approval`/`open-bridges`, the Inbox header chip and a bridge notification all reach a surface with no phone branch of their own (`src/components/command-palette/actions.ts:17-28`). The registry-vs-surfaces guard: `src/components/layout/phone-shell.test.tsx` "every drawer row on the phone lands on a level" and `src/lib/phone-surfaces.test.ts`.
 
 ### DW-109: `detailStore.open` is never reset when the room selection changes or clears, so a room (re)selected while detail is open computes level 2 and lands directly on the Detail overlay, skipping the Room level.
 
@@ -942,14 +943,16 @@ resolution: Verified already fixed by Story 13.2 — the phone stack now manages
 origin: spec-13-4-merged-full-screen-search-surface.md, 2026-07-11
 location: src/components/command-palette/actions.ts ("open-search": () => searchStore.getState().open("global")) + app-shell.tsx mounts <SearchOverlay/> in both tiers, so on phone the desktop dialog opens.
 reason: Not a 13.4 defect and explicitly out of scope: Story 13.4's contract forbids new palette actions and changes to the desktop `searchStore` wiring, and reuses the shared action registry verbatim (so parity is structural). `open-search` is not a "dead" entry (the app-shell-mounted `SearchOverlay` does open), but on phone it presents a desktop centered dialog — a second visual language wart. Per-platform action routing/capability-gating is Story 13.7's domain (capability-gated surfaces + "On this iPhone"); the clean fix is to make `open-search` route to `searchSurfaceStore.open()` on the phone tier (or gate/reroute via capabilities). Revisit with Story 13.7.
-status: open
+status: closed 2026-09-05
+resolution: Story 66.1 (DW-111). `open-search` reads the tier at dispatch — `isPhoneTier()` (`src/hooks/use-shell-layout.ts:52`) — and opens `searchSurfaceStore` on the phone, `searchStore` on the desktop (`src/components/command-palette/actions.ts:192-195`); tested in `src/components/command-palette/actions.test.ts` "open-search on the phone tier".
 
 ### DW-112: The reused message-search offline header reads "Search works fully offline against your local archive on this Mac." verbatim on the iPhone Messages scope, where "on this Mac" is factually wrong device copy.
 
 origin: spec-13-4-merged-full-screen-search-surface.md, 2026-07-11
 location: src/components/search/search-panel.tsx (~line 266, hardcoded "on this Mac") — reused verbatim by src/components/layout/phone-search-surface.tsx (Messages scope).
 reason: The shared `SearchPanel` was extracted verbatim from the desktop overlay to keep byte-for-byte desktop behavior; its honest-offline copy is Mac-specific. Making it platform-aware ("On this iPhone" / "on this device") is Story 13.7's capability-honest-disclosure domain ("On this iPhone" disclosure states foreground-only sync, no bbctl, etc., and owns the phone's platform-honest strings); changing it in 13.4 would alter shared desktop copy or introduce a platform check outside this story's scope. Low consequence (functionally correct; only the platform noun is wrong). Revisit with Story 13.7.
-status: open
+status: closed 2026-09-05
+resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SEARCH_OFFLINE_MAC_SENTENCE` where `!isReducedCapabilityPlatform`, the device-neutral `SEARCH_OFFLINE_DEVICE_SENTENCE` on the phone (`src/components/search/search-panel.tsx:52-55`, `:303`); tested in `src/components/search/search-panel.test.tsx` "never says 'on this Mac' on the reduced-capability tier".
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-13-5-safe-areas-and-the-keyboard-avoiding-composer.md`
   summary: On the phone timeline, the keyboard-resize bottom-pin ResizeObserver and the batch history-prepend layout effect both write scrollTop with no coordination, so a keyboard open/resize coinciding with an inbound history prepend can produce an occasional scroll jump.
@@ -3433,17 +3436,39 @@ resolution: collected by epic 63, story 63.4. The "honest first move" this row n
   and the licence question this row was about does not arise. What remains is not this row's
   question — the port has never been compiled or run on a Mac, and that is DW-228.
 
-### DW-220: The drive tools cannot reach a phone, and the honest route inverts the connection.
+### DW-220: The drive half of Bots is still desktop-only, and since epic 66 that is a choice, not a linking fact.
 
-origin: epic 62, 2026-09-03
-location: `crates/keeper/src/bots_drive_ipc.rs` (`#[cfg(desktop)]`), `keeper-sync/src/bots_fs.rs`
-reason: `keeper-sync` is not a dependency of the shell crate on iOS or Android, so the grant, the
-  audit and the seven filesystem verbs cannot exist there — `CapabilitiesVm.botTools` is false on a
-  phone and the affordances are absent rather than disabled. The route that would work is the one
-  Epic 61 already recorded for Hermes (DW-215): keeper *serving* MCP to something that can reach
-  the files, which inverts the direction of the connection and needs its own threat model. Filed
-  together because they are one decision taken twice.
-status: open
+origin: epic 62, 2026-09-03; re-scoped by epic 66, story 66.6, 2026-09-05
+location: `crates/keeper/src/lib.rs:22-29` (`bots_drive_ipc` and `bots_tools`, both still
+  `#[cfg(desktop)]`), `crates/keeper/src/ipc.rs:1482-1495` (`bot_tools: notes_available(&state)`,
+  whose comment still says the desktop half "is a linking fact rather than a design choice"),
+  `keeper-sync/src/bots_fs.rs`, `src/components/bots/bot-empty-state.tsx:74-75` (the
+  "drive tools live on your Mac" sentence), `docs/ios.md` *Limitations* (fifth item)
+reason: As filed, the wall was that `keeper-sync` was not a dependency of the shell crate on iOS,
+  so the grant, the audit and the seven filesystem verbs could not exist there, and the honest
+  route was the inverted one (keeper *serving* MCP to something that can reach the files, DW-215).
+  Epic 66 measured the premise false: `keeper-sync` links on the phone
+  (`crates/keeper/Cargo.toml:26-32`; `cargo check -p keeper-sync --target aarch64-apple-ios`,
+  hesperia, 2026-09-05), the phone has a folder (D-15), and `keeper_sync::bots_fs` compiles
+  there. The inverted route is now refused outright (D-15: the remote is the hub, the Mac is
+  never a server), so that half of this row is closed. What remains is the Bots drive half
+  itself: `bots_drive_ipc` / `bots_tools` are `#[cfg(desktop)]` by inertia, `botTools` is
+  `notes_available` (which 66.4 flips to `sync` on every target for notes — the flag would then
+  be true on a phone with nothing behind it unless the gate is kept desktop-only on purpose),
+  and the empty-state sentence and the disclosure's fifth item both say the drive tools live on
+  the Mac. Why it stays desktop for now: a grant names a synced profile and the seven verbs
+  read and write inside it; on a fully virtual folder every read of an LFS path is a
+  materialisation over the air, a bot's `list`/`read` loop would fetch whatever it touched,
+  and the audit's deliverable-path reveal has no file manager to open into (`sync_open_path`
+  refuses on the phone, `sync_ipc.rs:2800`). What would flip it: drop the two `cfg(desktop)`
+  gates and register the `bots_drive_ipc::*` commands in the shared handler list, keep
+  `botTools` on a gate that is honest on the phone, decide what a tool read of a *virtual*
+  path does (refuse with the pointer's size, or materialise under a per-call budget — the
+  question Epic 56's `ContentRefusal` already words for a person), and replace the
+  deliverable reveal with the share sheet 66.3 builds. Then the sentence in
+  `bot-empty-state.tsx` and the fifth disclosure line come out together (the byte-identical
+  guard in `about-section.test.tsx` holds them to `docs/ios.md`).
+status: open (re-scoped)
 
 ### DW-221: Ollama on the phone is neither built nor blocked.
 
@@ -3470,6 +3495,35 @@ reason: Armed listening keeps running with another app in front, which is the wh
   its own signing story on a free Personal Team, where every extension is another target to
   re-sign every seven days.
 status: open
+note: 2026-09-05, epic 65, story 65.5 (built), story 65.6 (recorded) — the Live Activity is
+  written: a `@_cdecl` bridge in the app target (`gen/apple/Sources/keeper/KeeperIsland.swift`),
+  the `KeeperIsland` widget-extension target with the shared `ActivityAttributes` and the four
+  presentations (`gen/apple/KeeperIsland/**`, `project.yml`), `NSSupportsLiveActivities` in
+  `project.yml` and `Info.ios.plist`, `crates/keeper/src/voice_island.rs` on the Rust side,
+  and `scripts/install-ios.sh` printing whether the `.appex` and the plist key are in the
+  installed bundle; the design is `docs/decisions.md` D-14 and the costs are `docs/ios.md`
+  *Live Activity*. **Not closed**, because nothing here has run: no Swift line has compiled
+  (the Mac gate is the first compile), the second App ID has not been minted on the free team,
+  and no photograph exists. What closes it, in order: the coordinator's `install-ios.sh` report
+  showing the `.appex` inside the installed bundle and the extension's profile minted (or the
+  exact signing refusal, which becomes its own DW row per AD-194); then, with the phrase armed
+  on kalypso, a photograph or screen recording of the island showing keeper's state and the
+  Lock Screen its card, and the card gone after disarming. Record both here and flip to done.
+note: 2026-09-05, epic 67, story 67.2 (built), story 67.4 (re-scoped) — the lock screen no
+  longer waits on this row. Every build now says what keeper heard and answered there
+  through a local notification with one fixed identifier, replaced in place — "Heard: …",
+  "Thinking", "Answering", "Answer: …", "Listening stopped: …" — posted only while
+  `UIApplication.applicationState` is not active and cleared when the turn ends or keeper
+  comes to front (`crates/keeper/src/voice_notify.rs`, `keeper-core/src/voice/banner.rs`;
+  AD-207; `docs/ios.md` *A turn that finishes without the screen*; `docs/decisions.md`
+  D-17). It needs no extension, no second App ID and nothing the free team lacks. What this
+  row still owes is the *richer* surface — a keeper-owned state word in the Dynamic Island
+  and a card that says "armed" before anything has been heard, which a notification cannot
+  be — and what closes it is unchanged in kind and smaller in scope: an Apple ID in
+  hesperia's Xcode so the extension's profile can be minted (the second App ID), the
+  `install-ios.sh` proofs showing the `.appex` in the installed bundle, and a photograph of
+  the island showing keeper's state with the phrase armed on kalypso. The banner is not a
+  reason to skip that; it is the reason the wait costs nothing.
 
 ### DW-223: A files-pane restore test that only fails on the CI runner.
 
@@ -3614,6 +3668,30 @@ reason: The port was authored on the Linux dev host, where the shell crate canno
   5. Record the answers in `docs/constraints-and-limitations.md` (replace "not yet compiled where
      it was written") and close this row.
 status: open
+note: 2026-09-05, epic 65 — this row has an **iOS half** the title does not name, and epic 65
+  collects it: the iOS port's background listening has never been run on hardware either.
+  Epic 62 designed it (a `.playAndRecord` session with `mixWithOthers`, `UIBackgroundModes:
+  audio`, requests rolled every 45 s — `crates/keeper/src/voice_ios.rs`), and epic 62's own
+  switch could not arm it (D-13), so nothing on the owner's phone ever listened in the
+  background. Apple documents only the *audio session* surviving backgrounding; whether the
+  on-device recogniser keeps delivering results for tens of minutes is forum-grade, and a
+  same-shaped API (ShazamKit, FB15255903) is reported to stop ~20 s after backgrounding with the
+  microphone still open (Epic 65 research, §1, read 2026-09-05). Story 65.4 made the
+  foreground/background/interruption handling explicit (a third observer on
+  `AVAudioSessionRouteChangeNotification`, a bounded resume — `RESUME_FAILURES_TOLERATED`,
+  twelve 5 s tries — after which the port records `refused`), rewrote the limits sentence from
+  Apple's documented interruptions (`keeper-core/src/voice/platform.rs:82`) and wrote the
+  kalypso protocol; the ring from story 65.3 (Settings → Bots, *What the voice port did*) is
+  the instrument. **The iOS half is not closed**: the run has not happened. What closes it —
+  the coordinator runs it on kalypso with the owner at the phone: (1) arm in the foreground,
+  put another app in front, wait three minutes, say the phrase, and read the ring — `rolled`
+  ticks at 45 s and a `wake_matched` followed by the turn states are the evidence; (2) accept
+  a phone call while armed, end it, and read the ring — `interruption_begun`, then either
+  `resumed` or `refused`, and after reopening keeper an `armed` from the re-arm; (3) note
+  whether the on-device recogniser delivered after minutes in the background, which no Apple
+  document promises. Record the three answers here, in `docs/ios.md` *Limitations* (replace
+  "what Apple documents, not what has been observed") and, if (3) is "no", as a new row rather
+  than a softened sentence. The macOS half above keeps its own five steps.
 
 ### DW-229: The voice pill does not appear over another app's full-screen Space.
 
@@ -3735,6 +3813,329 @@ reason: Apple's guidance is to tell VoiceOver when visible content changes and t
   which already renders the same `VoiceStateVm` and is where a VoiceOver user is. Verify on
   hesperia with VoiceOver on and a voice turn started from the hotkey while another app is in
   front; record the answer here and, if it is "no", move the live region rather than duplicate it.
+status: open
+
+### DW-234: A tablet tier — an iPad now gets the phone tier at every width.
+
+origin: epic 65, *What stays out*, story 65.6 (recorded), 2026-09-05
+location: `src/hooks/use-shell-layout.ts:18-23`, `:84` (the tier is the platform's — AD-189),
+  `src/lib/stores/capabilities.ts` (`useIsReducedCapabilityPlatform`), `docs/decisions.md` D-12,
+  `docs/ios.md` *Orientation*
+reason: Story 65.1 made a reduced-capability platform the phone tier in every orientation,
+  because the width rule rendered the desktop frame on a rotated iPhone at 430 pt tall. An iPad
+  is the same `CapabilitiesVm` answer and rotates too, so it now gets the single-pane stack at
+  1024 pt and wider — which is honest about what the build can do, and is not a layout anyone
+  has designed for a tablet. The owner's report is a phone; iPad support is its own decision
+  (which surfaces get columns, whether the drawer exists, what a keyboard attached to an iPad
+  means for the hotkey tier), not a breakpoint. Do not reintroduce a width rule on a reduced
+  platform to get there: that is the defect 65.1 removed. Take it, if at all, as a third tier
+  named by the platform.
+note: 2026-09-05, epic 66, story 66.6 — untouched by epic 66. Every surface the epic adds to
+  the phone stack (Approvals, Bridges, Sync, Files, Notes) is a level in the single-pane stack,
+  so an iPad gets them one at a time too; nothing here reintroduces a width rule.
+status: open
+
+### DW-235: Push-updated Live Activities.
+
+origin: epic 65, *What stays out*, story 65.6 (recorded), 2026-09-05
+location: `src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperIsland.swift` (the bridge;
+  `Activity.request(…, pushType: nil)`), `crates/keeper/src/voice_island.rs`, `docs/egress.md`
+  *The phone's record and the island add no egress* (AD-196), `docs/decisions.md` D-14
+reason: The island is updated from the app process only. A push-updated activity would let the
+  card change while keeper is suspended — after a phone call, say — but it needs APNs and the
+  push capability, which the free Personal Team does not hold (Apple, *Supported capabilities
+  (iOS)*, read 2026-09-05) and which is a new destination `docs/egress.md` would have to name;
+  under NFR-11 push must never ride project infrastructure (D-1). So this is refused for the
+  same reason D-1 defers the paid program, and it reopens only under D-1's own trigger and only
+  through a homeserver operator's gateway or a user-run relay — never keeper's. Nothing about
+  an indicator of *listening* needs it: while keeper listens, the app process is alive to
+  update the card, and when it is not, the card ending is the truth.
+status: open
+
+### DW-236: Recognition through an accepted phone call, in the background.
+
+origin: epic 65, *What stays out*, story 65.4 (the behaviour), story 65.6 (recorded), 2026-09-05
+location: `crates/keeper/src/voice_ios.rs` (the interruption observer, `RESUME_RETRY`,
+  `RESUME_FAILURES_TOLERATED`), `keeper-core/src/voice/platform.rs:82` (the limits sentence:
+  "a phone call ends it until you open keeper again"), `docs/ios.md` *Limitations*,
+  `docs/decisions.md` D-13 (the re-arm on `RunEvent::Resumed`)
+reason: Accepting a call suspends the app (Apple, *Audio Session Programming Guide*, "The
+  interruption life cycle", steps 6–8), and reactivating a *record* session from the background
+  once the call ends is reported to fail with `NSOSStatusErrorDomain 560557684 ('!int')` until
+  the app is foregrounded (Apple Developer Forums thread 813278, forum excerpt, read
+  2026-09-05) — the cannot-start-recording-from-the-background rule Apple's DTS states plainly.
+  keeper therefore says listening stopped and re-arms on the next open rather than pretending.
+  Two routes exist and neither is taken yet: `setPrefersNoInterruptionsFromSystemAlerts(_:)`,
+  which Apple documents for apps that prefer not to be interrupted by incoming-call alerts but
+  which changes the person's call experience and is unverified for a record session; and a
+  Live Activity button (App Intents) that re-arms from the Lock Screen without opening keeper —
+  which still runs in the app process and may hit the same rule. Take either only with a
+  kalypso measurement of the post-call reactivation first; the ring (AD-192) is the instrument.
+status: open
+
+### DW-237: The sessions board on the phone.
+
+origin: epic 66, AD-201, story 66.6 (recorded), 2026-09-05
+location: `crates/keeper/src/sessions_ipc.rs:41-44` and every `unsupported()` twin below it,
+  `crates/keeper/src/lib.rs:66-70` (`sessions_root`, `sessions_exec` — `#[cfg(desktop)]`),
+  `crates/keeper/src/ipc.rs:1456` (`sessions: notes_available(&state)`),
+  `src/components/layout/sidebar-pane.tsx:272` (the row rides the `sessions` flag),
+  `src/components/sessions/**` (the desktop pane), `docs/ios.md` *Limitations* (fifth item)
+reason: A sessions root is a synced folder plus a flag (AD-107), and the phone has synced folders
+  now (D-15), so the board *could* follow the notes reader onto the phone the way 66.4 takes
+  Notes there: `sessions_root` is a registry over the profile list, and reading a session's
+  tree, refs and detail is the same `browse::resolve` the Files pane uses. It stays on the Mac
+  by decision (AD-201) because it is forty-odd commands (`sessions_ipc.rs`, `sessions_roots`
+  through `sessions_search_cancel`), each with a mobile twin that answers `unsupported`, plus
+  the lifecycle executor (`sessions_exec.rs`, plans with a journal beside them, one at a time
+  per zone) — its own epic, not a story in this one. The disclosure's fifth line names it.
+  Take it as: the read-only half first (roots, list, detail, tree, refs, search) through the
+  phone stack, the executor and the space editors after, and `sessions` on a gate that is
+  honest on the phone rather than `notes_available` inherited.
+status: open
+
+### DW-238: Tasks on the phone — and the reason is not the one the epic gave.
+
+origin: epic 66, AD-201, story 66.6 (recorded), 2026-09-05
+location: `keeper-sync/src/tasks.rs:148-173` (the closed `TaskKind` — `Sync`, `Release`,
+  `Verify`; "a shell string would name a verb nobody in this tree wrote"),
+  `keeper-core/src/tasks.rs:95` (`HOST_SENTENCE_APP`: "keeper runs this — only while keeper is
+  running"), `crates/keeper/src/sync.rs:600-616` (no supervisor and no watcher on the phone),
+  `src/components/layout/sidebar-pane.tsx:276` (the Tasks row rides `sessions`),
+  `src/components/layout/tasks-pane.tsx`, `docs/ios.md` *Limitations* (fifth item)
+reason: AD-201 says tasks stay on the Mac because "tasks run user commands and iOS spawns
+  nothing". The first half is not true of the code: `TaskKind` is a closed vocabulary of
+  keeper's own verbs and there is no shell-string kind, deliberately
+  (`keeper-sync/src/tasks.rs:148-161`; `ARCHITECTURE-SCHEDULED-TASKS.md` `## Deferred`), so
+  nothing a task does today spawns a process. The real wall is the host: a schedule needs a
+  process that is awake to see the due time, the Mac's host sentence is already "only while
+  keeper is running", and a phone process is suspended the moment it leaves the foreground
+  (NFR-57) — the app would be a host for minutes at a time and every scheduled row would read
+  *Unhosted* the rest of the day, which is the enabled-and-quiet shape AD-137 exists to
+  forbid. The spawn wall (Apple DTS, Developer Forums thread 747499: iOS denies `posix_spawn`
+  to third-party apps) applies only if the deferred shell-string kind ever lands, and then it
+  is a refusal sentence at the boundary like every other phone spawn (D-15), not a reason to
+  keep the surface off. What would put tasks on the phone honestly: a `TaskHostKind` for
+  "runs on the next open" (a due task fires from `phone_sync_all`'s pass, the way the release
+  sweep already rides a sync's success edge), the row saying so in `task_host`'s voice, and
+  no pretence of a schedule. Until then the Tasks row is absent on the phone because it rides
+  `sessions` (DW-237), and the disclosure's fifth line names it. Correct AD-201's wording when
+  the epic file is next touched.
+status: open
+
+### DW-239: An audio memo on the phone.
+
+origin: epic 66, AD-203, *What stays out*, story 66.6 (recorded), 2026-09-05
+location: `crates/keeper/src/ipc.rs:1435` (`recording: macos_version::recording_supported()`),
+  `crates/keeper/src/recorder.rs` (the `keeper-rec` sidecar, macOS screen+audio),
+  `crates/keeper/src/voice_ios.rs` (the phone already opens the microphone under
+  `.playAndRecord` for talk mode), `docs/ios.md` *Limitations* (fifth item), `docs/egress.md`
+  *Screen recording adds no egress*
+reason: Screen recording is the Mac's: ScreenCaptureKit, a sidecar process, a destination
+  folder — no iOS concept below iOS 27, no sidecar on a phone, and the disclosure says so.
+  What a phone *can* do is record the microphone into a file in a synced folder, which is a
+  different feature with a different name — an audio memo — and not "screen recording with
+  the screen removed": no session manifest, no events.log, no `keeper-recording://` embed
+  (that scheme is desktop-only, `lib.rs:64-65`), and a new place bytes land that `docs/egress.md`
+  would state adds nothing. The voice port already holds the audio session and the
+  interruption handling a memo needs (DW-236's rules apply to it unchanged). Refused in this
+  epic so the Mac's recording model is not bent around a phone; take it, if at all, as its own
+  story with its own sentence.
+status: open
+
+### DW-240: A share-in extension.
+
+origin: epic 66, *What was measured*, 4, and *What stays out*, story 66.6 (recorded), 2026-09-05
+location: `src-tauri/crates/keeper/gen/apple/project.yml` (the `KeeperIsland` target is the one
+  extension the project declares), `docs/ios.md` *Live Activity* (the free team's costs),
+  `docs/decisions.md` D-14 (the second App ID), DW-222 (the island's install, not yet recorded)
+reason: Sharing *out* of keeper is a `UIActivityViewController` from the app process and 66.3
+  builds it. Sharing *into* keeper — a file or a URL from another app's share sheet — is a
+  share extension: a second app-extension target, a third bundle id beside the app's and the
+  island's, Swift (`NSExtensionPrincipalClass`), and an App Group if the extension is to hand
+  bytes to the app's container rather than only to a URL scheme. Epic 65 already paid for one
+  extension and measured the first wall: a second App ID counts against the free team's budget
+  of roughly ten per seven days, both profiles lapse and are re-signed together, and hesperia's
+  Xcode holds no Apple ID, so no new App ID can be minted from the build host today (Epic 66,
+  *What was measured*, 4, citing AD-194's lesson; `docs/ios.md`, *Live Activity*, costs 1–2).
+  DW-222 has not yet recorded whether even the island's profile minted on the free team, so a
+  third App ID is not a cost to take before the second is proven. What is possible without an
+  extension and is not built either: a custom URL scheme the app already registers for deep
+  links (`tauri-plugin-deep-link`), which takes a URL, not a file. Take this after DW-222
+  closes, with the same install-script proofs (`.appex` in the bundle, the profile minted or
+  the exact refusal).
+status: open
+
+### DW-241: An `ssh://` remote on a phone profile is not refused at the sheet.
+
+origin: epic 66, story 66.2 (found), story 66.6 (recorded), 2026-09-05
+location: `crates/keeper/src/sync_ipc.rs:990-1051` (`parse_req` — checks direction, lane and
+  LFS mode, never the remote's scheme), `keeper-sync/src/lfs/ssh.rs:325` (`Command::new(ssh)`
+  for `git-lfs-authenticate`) and `:296-297` ("`ssh` is taken from `PATH`, which is where
+  gitoxide's own ssh transport finds it"), `src/components/sync/add-folder-form.tsx` (the
+  phone shape of the sheet, Story 66.1), `docs/ios.md` *Reachable on the phone, failing at
+  run time*
+reason: The phone's engine is gitoxide over HTTPS (`blocking-http-transport-reqwest-rust-tls`,
+  `src-tauri/Cargo.toml:199`); an `ssh://` or `git@host:` remote needs an `ssh` process for
+  the transport and a second one for `git-lfs-authenticate`, and a phone spawns nothing.
+  Today a phone profile that names one saves cleanly and fails at its first sync with the
+  spawn's own error — an `io` failure naming `ssh` — recorded beside the profile with no next
+  step, which is a refusal without a sentence (AD-198 forbids exactly that). This is a 66.2
+  seam: the refusal belongs where the profile is parsed, `parse_req` or the phone-shaped
+  request beside it (`sync_ipc.rs:1327`), as one sentence — "this is a phone: keeper reaches a
+  remote over HTTPS here; an ssh remote needs an ssh process, which a phone cannot run — use
+  the https URL of the same repository and a token" — and, if the sheet can know the tier, the
+  same sentence under the URL field before save. `keeper_core::egress::remote_host` already
+  parses every remote form git accepts, so the scheme test is one call.
+status: open
+
+### DW-242: The freedesktop trash path lands under the app container on a phone.
+
+origin: epic 66, story 66.2 (found), story 66.6 (recorded), 2026-09-05
+location: `keeper-sync/src/files_write.rs:926-930` (the home trash: `$XDG_DATA_HOME/Trash`,
+  defaulting to `$HOME/.local/share/Trash`), `:968-981` (`trash_unmanaged` — `Finder` on macOS,
+  `Freedesktop` everywhere else), `crates/keeper/src/sync_ipc.rs:4721` (`sync_delete_entries`,
+  the caller for a non-vault path), `docs/ios.md` *Reachable on the phone, failing at run time*
+reason: The trash target is chosen by "macOS or not", and iOS is "not", so deleting a
+  non-vault file from a synced folder on the phone would write a `.trashinfo` and move the
+  bytes into `$HOME/.local/share/Trash` under the app's own container — a directory no file
+  manager will ever show, that the container's backup exclusion does not cover, and that
+  nothing prunes. NFR-30 ("never an `unlink`") is honoured in letter and not in spirit: the
+  file is recoverable by nobody. Nothing on the phone reaches it today — 66.3's Files surface
+  offers no delete — so this is a seam, not a defect a person can meet. Decide before a delete
+  exists on the phone: either a `TrashTarget::Container` that keeps the freedesktop layout under
+  `<app data dir>/Trash` and gets a "Recently deleted" row in the Files pane that can put a
+  file back, or a refusal sentence for delete on the phone ("this is a phone: there is no
+  trash to put this in — delete it on the Mac"). Either way the choice is a `SyncPlatform`
+  fact, not an `if cfg!(target_os = "macos")`.
+status: open
+
+### DW-243: Whether the phone hears its own answer is not yet measured.
+
+origin: epic 67, AD-209, story 67.3 (built), story 67.4 (recorded), 2026-09-05
+location: `crates/keeper/src/voice_ios.rs:221` (`TAIL_GATE`, 800 ms), `:855-867`
+  (`speech_over` — the gate opens before the speaking flag drops), `:1139-1143` (the drop and
+  the `echo_dropped` row), `:1458-1459` and `:1478-1479` (`AVAudioSessionModeVoiceChat`, set
+  explicitly), `:1185-1188` / `:1197-1200` (`defaultToSpeaker` kept), `keeper-core/src/voice/events.rs:69`,
+  `docs/ios.md` *A turn that finishes without the screen* ("What the run on kalypso must show")
+reason: The session mode was written as `.default` and was never the mode in force (voice
+  processing sets `voiceChat` implicitly), and a 2026 field report measures `.default` +
+  `defaultToSpeaker` as the pair that silently defeats echo cancellation; keeper now sets
+  `voiceChat` on purpose and, for 800 ms after every utterance ends, drops every transcript
+  and records it in the ring as `echo_dropped` with the words. That makes the question
+  answerable and does not answer it: nothing has run on hardware. Open until a run on kalypso
+  with the screen locked, the phrase, a question and an answer of several sentences is read
+  back from Settings → Bots → *What the voice port did*. Three readings, each with its
+  consequence: no `echo_dropped` between `spoken` and `turn:idle` — the phone does not hear
+  itself, and the gate is a belt over braces that costs a person 800 ms of silence after every
+  answer (record the reading, keep the gate, close); `echo_dropped` rows carrying the answer's
+  last words — the phone hears its tail and the gate is the measure that catches it (record
+  the words and how many rows; if a row is more than the last clause of the answer the gate is
+  too short and `TAIL_GATE` is retuned from that number, not guessed); a `stop_matched` or a
+  `turn:listening` immediately after `spoken` with no `echo_dropped` and nobody having spoken —
+  the tail leaks *inside* the utterance, which the gate cannot see, and the fix is on the
+  capture side (the voice-processing tap, `setVoiceProcessingEnabled`, or a second gate that
+  ignores transcripts while `isSpeaking`), which is its own row. What closes this one is the
+  reading, written here with the ring rows verbatim.
+status: open
+
+### DW-244: With several bots pinned and none chosen, a spoken question goes to whichever was talked to last — and with none ever talked to, a locked phone stops listening.
+
+origin: epic 67, AD-206, story 67.1 (built), story 67.4 (recorded), 2026-09-05
+location: `keeper-core/src/bots/voice_target.rs:77-101` (`resolve`: the chosen pinned bot,
+  else the newest conversation whose bot is still pinned, else `NoTarget`), `:32`
+  (`NO_TARGET_SENTENCE`), `crates/keeper/src/bots_ipc.rs:1389-1396` (`spoken_target`, over
+  `session::list_sessions(dir, false)` — newest activity first), `crates/keeper/src/voice_ipc.rs:312-317`
+  (`answer_failed` → ring `refused` + `TurnEvent::Failed`), `src/components/bots/bot-voice-target.tsx:29-34`
+  ("Speak to", "Most recently talked to"), `docs/decisions.md` D-17 (the costs)
+reason: `bots.voice_target` unset is not an error — it is the stated rule "the pinned bot most
+  recently talked to", and the picker shows it as its own option — but the rule has a shape a
+  person will meet: the newest conversation in the list is whichever bot was *typed to* last
+  on either device, since the list is shared through the folder and Hermes sessions, so a
+  question spoken in the car goes to the bot somebody was testing on the Mac ten minutes ago,
+  and the answer lands in that conversation. Nothing on the phone says which bot is about to
+  answer before the phrase is spoken; the "Heard: …" banner names the words, not the bot. And
+  the rule's empty case is worse than a wrong bot: with pinned bots and no conversation on any
+  of them, the turn is refused with "Nothing to talk to yet: choose a bot to talk to under
+  Bots." — correct in front, where the sentence is beside the switch — but on a locked phone
+  the refusal leaves the turn in `Failed`, the phrase is re-armed only on the next foreground
+  (D-13, `voice_rearm` on `RunEvent::Resumed`), and listening is over until keeper is opened;
+  the only trace is the "Listening stopped: Nothing to talk to yet…" banner, which stays until
+  then. Two decisions, both small and neither taken here: (1) whether an unset target with
+  more than one pinned bot should be *refused* at arming time rather than resolved at three in
+  the morning — the switch already refuses for a missing locale, and "choose who to speak to
+  under Bots" is the same kind of sentence; (2) whether a no-target refusal on a hands-free
+  turn should re-arm the phrase at once (the sentence survives in the ring and on the lock
+  screen) instead of on the next foreground — Story 67.1's report raises exactly this and kept
+  the foreground rule so the snapshot is not erased before anyone reads it. Take (1) first;
+  it removes the case (2) is about.
+status: open
+
+### DW-245: The default stop word is "stop" in every locale, and a recogniser that writes another script never spells it that way.
+
+origin: epic 67, AD-208 and *What stays out* ("'stop' is a word in every listening locale
+  keeper offers"), story 67.3 (built), story 67.4 (found, recorded), 2026-09-05
+location: `keeper-core/src/voice/mod.rs:70` (`DEFAULT_STOP_PHRASE = "stop"`), `keeper-core/src/voice/phrase.rs:154-167`
+  (`matches`: whole-word containment after `normalise`), `:184-214` (`normalise` folds case
+  and strips combining marks; every alphanumeric char of every script survives as itself),
+  `crates/keeper/src/voice_ios.rs:1382` (`on_device_locales` — the listening locales are
+  whatever `SFSpeechRecognizer.supportedLocales()` supports on-device, not a keeper list),
+  `crates/keeper/src/voice_ipc.rs:519-540` (the stored word read at boot),
+  `src/components/bots/bot-voice-wake.tsx:114-118` (the "Stop word" box)
+reason: keeper offers no locale list of its own: the choice is the phone's on-device set,
+  which on a current iPhone includes Japanese, Korean, Mandarin and Cantonese, Russian,
+  Ukrainian, Arabic, Hebrew, Greek and Thai beside the Latin-script locales. Apple's
+  recogniser for those writes its own script — "ストップ", "стоп", "스톱", "停" — and
+  `normalise` keeps those letters as they are, so the transcript never contains the four
+  Latin letters "stop" and the default word never matches; even in a Latin locale the
+  recogniser's own spelling can differ ("Stopp" in de-DE is not the whole word "stop").
+  The setting exists and works — `parse_stop` accepts any script with three or more letters
+  (`is_alphanumeric`), and `voice_turn_matches_a_polish_stop_phrase` proves a non-default
+  word — so the defect is the default and the silence around it: a person listening in
+  ja-JP has no working stop word until they type one, and nothing tells them. The epic's
+  claim that "stop" is a word in every listening locale is true of the locales the owner
+  uses (pl-PL, en-*) and not of the set the phone offers. Two remedies, the first enough:
+  a per-locale default table in core beside `DEFAULT_STOP_PHRASE` (`stop` for Latin-script
+  locales, `стоп` for ru/uk, `ストップ` for ja, `정지` or `그만` for ko, `停` for zh — each
+  chosen with a native speaker, not guessed here), chosen by `bots.voice_locale`'s language
+  when `bots.stop_phrase` is unset; and, cheaper, the "Stop word" note naming the rule
+  ("matched as the recogniser spells it — in your listening language"). Which of keeper's
+  locales: none of keeper's, because keeper has none; every non-Latin on-device locale of the
+  phone's.
+status: open
+
+### DW-246: A media-services reset mid-answer ends the speech without telling the turn.
+
+origin: epic 67, story 67.3 (the deferred `Silence`), story 67.4 (found while reading
+  `settle_silence`, recorded), 2026-09-05; the gap predates epic 67
+location: `crates/keeper/src/voice_ios.rs:1033-1045` (`AudioNotice::MediaReset` — the
+  synthesiser is dropped and `speech_over` is called, no `Silence` is sunk), `:855-867`
+  (`speech_over` clears `silence_due`), `:1081-1096` (`watch_speech_end`, the one place that
+  owes a `Silence`, which returns at once because `speaking_since` is already `None`),
+  `:988-1001` (the interruption arm, which *does* sink `Silence` — the shape the reset arm
+  should have), `keeper-core/src/voice/turn.rs:215-216` (`Speaking` leaves only on
+  `Silence`, `StopHeard`, `SpeechDetected`, `Abandoned`, `Failed`)
+reason: Story 67.4 was asked whether a `Silence` owed during the tail gate could fail to
+  settle if the worker's tick stopped. It cannot: the worker loop ticks after every command
+  and every 250 ms timeout and leaves only when its command channel disconnects
+  (`voice_ios.rs:552-614`), which is the port being dropped, and a dropped port owes no
+  turn anything; the only other writer that clears `silence_due` is `speech_over` through
+  `stop_speaking`, which the turn sends after it has already left `Speaking`. The read did
+  find the neighbour: a `AVAudioSessionMediaServicesWereResetNotification` while an answer
+  is being spoken throws the synthesiser away and calls `speech_over`, which drops the
+  flag and any owed `Silence`, and nothing sinks one — before epic 67 the same arm relied on
+  `watch_speech_end`, which had already been disarmed by `speaking_since = None`, so the gap
+  is old and the deferred `Silence` only makes it legible. The turn stays `Speaking`; the
+  capture `resume()` rebuilds keeps transcribing (iOS is full duplex), but with the flag
+  down its transcripts are `PartialHeard`/`FinalHeard`, which `Speaking` ignores
+  (`turn.rs:216`), the wake phrase is matched only in `Idle`, and listening is over until
+  the person presses Stop (`Abandoned`) or turns the switch off and on — the foreground
+  re-arm does not fire, because `Turn::armed` is true in any non-idle state
+  (`voice/mod.rs:418-421`, `voice_ipc.rs:703-710`). Rare — a media-services
+  reset is `mediaserverd` dying — and the fix is one line in the reset arm, `(self.sink)(TurnEvent::Silence)`
+  when `speaking_since` was `Some`, mirroring `:996-1001`, with a test through the
+  worker's `on_audio` if one can be written without the frameworks (the interruption arm
+  has none either). Record on the same pass that adds one.
 status: open
 
 - source_spec: none

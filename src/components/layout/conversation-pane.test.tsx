@@ -1240,6 +1240,20 @@ describe("ConversationPane — held-aware Delete (Story 8.4)", () => {
     await waitFor(() => expect(composerStore.getState().restoreBody).toBe("held body"));
   });
 
+  it("held-bubble Delete is on screen under a coarse pointer (Story 66.1, AD-197)", async () => {
+    // Hover-revealed on a mouse; a finger never hovers, so the class list must
+    // carry the `pointer-coarse:` fallback the account row's menu wears —
+    // otherwise the only way to discard a held send on the phone is `⌫` on a
+    // keyboard the phone does not have.
+    await renderWithOwnMessage();
+    act(() => {
+      seedHeld();
+    });
+    const deleteBtn = await screen.findByTestId("held-delete-button");
+    expect(deleteBtn.className).toContain("group-hover:opacity-100");
+    expect(deleteBtn.className).toContain("pointer-coarse:opacity-100");
+  });
+
   it("`⌫` on a selected held bubble resolves as an undo and never opens the delete dialog", async () => {
     cancelHeldSend.mockResolvedValue("held body");
     await renderWithOwnMessage();

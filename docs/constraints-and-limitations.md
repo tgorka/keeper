@@ -44,6 +44,17 @@ risk sections.
 - **Tauri mobile (iOS/iPad/Android)** shipped but is younger than desktop; the Rust core is
   the portable asset (AD-24), and an iOS walking-skeleton spike should happen early in the
   mobile phase.
+- **The Live Activity is the repository's first Swift, and a second App ID on the free
+  team** (Epic 65, Story 65.5, AD-194; `docs/decisions.md` D-14). ActivityKit has no
+  Objective-C surface, so `objc2` cannot reach it and the island is a `@_cdecl` bridge in
+  the app target plus a `KeeperIsland` widget-extension target in `gen/apple/project.yml`,
+  compiled only on the Mac gate — the Linux host proves the Rust `extern` block and nothing
+  else. On a free Personal Team the extension's bundle id `dev.tgorka.keeper.island` is a
+  second App ID against the ~10-per-7-days budget with its own 7-day profile, and whether
+  the automatic profile refuses it (`ActivityAuthorizationError.unentitled`) is proven only
+  by the install on kalypso — Apple's capability table already mis-predicted Data Protection
+  for this team (`docs/ios.md`, *Signing on a free Personal Team*, *Live Activity*). Until
+  the install report and a photograph exist, DW-222 is open and the island is a design.
 - **E-mail, AI-bot client, terminal client** are future-phase items tracked in the PRD's
   post-MVP section, not storied yet.
 
@@ -106,23 +117,72 @@ safe binding. Current inventory:
   `removeTapOnBus:`, `prepare`, `startAndReturnError:`, `stop`, `isRunning`),
   `AVSpeechSynthesizer` (`speakUtterance:`, `stopSpeakingAtBoundary:`, `isSpeaking`) and
   `NSNotificationCenter` (`addObserverForName:object:queue:usingBlock:` for
-  `AVAudioSessionInterruptionNotification`, `AVAudioSessionMediaServicesWereResetNotification`
-  and `AVAudioEngineConfigurationChangeNotification`, `removeObserver:`) via objc2-speech,
+  `AVAudioSessionInterruptionNotification`, `AVAudioSessionMediaServicesWereResetNotification`,
+  `AVAudioEngineConfigurationChangeNotification` and, since Epic 65,
+  `AVAudioSessionRouteChangeNotification`, `removeObserver:`) via objc2-speech,
   objc2-avf-audio and objc2-foundation, behind `keeper_core::voice::VoicePort` and
-  `keeper_core::voice::ConsentPort` — twenty-seven function-level `#[allow(unsafe_code)]`
+  `keeper_core::voice::ConsentPort` — twenty-eight function-level `#[allow(unsafe_code)]`
   fns in `crates/keeper/src/voice_ios.rs`, one per concern (`speech_authorization`,
   `microphone`, `microphone_consent`, `ask_speech`, `ask_microphone`,
   `on_device_locales`, `recognizer_for`, `configure_session`, `set_session_options`,
   `release_session`, `start_capture`, `stop_capture`, `engine_running`, `start_request`,
-  `end_request`, `read_result`, `observe_session`, `interruption_notice`,
-  `forget_observer`, `new_synthesizer`, `voice_languages`, `voice_for_language`,
-  `voice_name`, `detect_language`, `speak_text`, `stop_speech`, `is_speaking`), each
+  `end_request`, `read_result`, `observe_session`, `route_change_reason`,
+  `interruption_notice`, `forget_observer`, `new_synthesizer`, `voice_languages`,
+  `voice_for_language`, `voice_name`, `detect_language`, `speak_text`, `stop_speech`,
+  `is_speaking`), each
   with a `// SAFETY:` comment citing the Apple contract it relies on. `start_capture`
   also carries `#[allow(clippy::arc_with_non_send_sync)]`: the request slot the audio tap
   reads is shared with the audio thread inside a block, which Rust cannot see — the
   SAFETY comment is the argument. No server recognition path exists in the file, and the
   port never prompts on its own: the two permission dialogs are reached only through
   `ConsentPort`, whose timing is decided in `keeper_core::voice::authorization`.
+- The background made explicit, iOS port (Epic 65, Story 65.4, FR-450–FR-452, NFR-55,
+  AD-193): one new audited fn, `route_change_reason` (`crates/keeper/src/voice_ios.rs:1705-1731`)
+  — reads `AVAudioSessionRouteChangeReasonKey` from a route-change notification's `userInfo`
+  into the framework's own name for the reason (headphones, a car kit, the speaker), for the
+  phone's record; and `observe_session` (`:1635-1699`) grows a third observer, on
+  `AVAudioSessionRouteChangeNotification` (`:1681`), counted in the twenty-eight above. No
+  new class is reached. What changed in behaviour rather than in FFI (module doc `:51-82`;
+  `Worker::resume` `:882-909`, `Worker::give_up` `:914-918`, `Worker::on_audio` `:933-1022`):
+  a resume after an interruption is bounded — `RESUME_FAILURES_TOLERATED` (`:230`), twelve tries at the
+  existing 5 s `RESUME_RETRY`, a minute — after which the port records `refused` in the ring
+  and tells the turn, so a session the system will not give back (an accepted call, a
+  suspension) reads as a refusal with its remedy (open keeper; D-13 re-arms on
+  `RunEvent::Resumed`) rather than as silence. The limits sentence the port shows is
+  rewritten from Apple's documented interruptions (`keeper-core/src/voice/platform.rs:82`;
+  `docs/ios.md`, *Limitations*). **Not yet run on hardware where it matters**: the
+  background run on kalypso — armed, another app in front, three minutes, the phrase heard;
+  a call accepted and ended — is the story's acceptance and is owed in DW-228 (its iOS
+  half); until it is recorded, the sentence is what Apple documents, not what was observed.
+- The Live Activity bridge, iOS only (Epic 65, Story 65.5, FR-453–FR-455, NFR-56, AD-194):
+  the first FFI in the shell crate that is **not** objc2 — ActivityKit has no Objective-C
+  surface, so `crates/keeper/src/voice_island.rs` (`#[cfg(target_os = "ios")]`) declares one
+  `extern "C"` block (`:182-187`: `keeper_island_start`, `keeper_island_update`,
+  `keeper_island_end`, `keeper_island_free`) against `@_cdecl` functions compiled into the
+  app target from `gen/apple/Sources/keeper/KeeperIsland.swift`, and three function-level
+  `#[allow(unsafe_code)]` fns, one per call — `bridge_start` (`:197-218`), `bridge_update`
+  (`:221-228`), `bridge_end` (`:231-238`) — each with a `// SAFETY:` comment: NUL-terminated
+  buffers that outlive the call, copied on the Swift side; the one string that crosses back
+  (the refusal sentence from `start`) is `strdup`'d by Swift and released by
+  `keeper_island_free`, the ownership stated in the Swift file's header. `libapp.a` is a
+  static archive the Xcode project links, so the four symbols resolve against the app's own
+  Swift objects at link time; the `extern` block compiles on the Linux host and only the
+  Mac link proves it exists. What is decided — the state word per turn state, when to renew
+  before Apple's eight-hour end (`RENEW_AFTER`, 7 h 45 m,
+  `keeper-core/src/voice/island.rs:43`), how long a failure card lingers (`FAILURE_LINGER`,
+  30 s, `:38`) — is `keeper_core::voice::island`, pure and tested on the dev host, with no
+  platform `cfg` and no `tauri`; the bridge only carries it. Every call is local
+  (`pushType: nil`, no APNs, no App Group — `docs/egress.md`, *The phone's record and the
+  island add no egress*), and a request the system refuses (in the background, on a free
+  team) is recorded once in the ring as `island:refused` and retried on `RunEvent::Resumed`
+  rather than looped. **Not yet compiled anywhere**: the Swift, the extension target and
+  the link are proven only by the Mac gate and the kalypso install (DW-222).
+- The island's colours are Swift literals the design gate cannot see (Epic 65, Story 65.5):
+  `gen/apple/KeeperIsland/KeeperIslandLiveActivity.swift` carries the dark set's hexes —
+  ground, text, text-dim, accent, ok, danger — as SwiftUI `Color` literals with the token
+  names in comments, because there is no Swift token file and `check:design` scans no Swift.
+  A retune of `DESIGN.md`'s dark set does not reach the card until someone edits those
+  literals by hand; the comment names the token so the edit is a lookup, not a guess.
 - macOS voice port (Epic 63, Story 63.4, FR-417–FR-419, FR-408, NFR-53, AD-175):
   `SFSpeechRecognizer` (`authorizationStatus`, `requestAuthorization:`, `initWithLocale:`,
   `supportsOnDeviceRecognition`, `isAvailable`, `supportedLocales` — enumerated once and

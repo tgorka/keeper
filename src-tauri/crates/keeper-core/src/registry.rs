@@ -853,6 +853,52 @@ pub fn set_bots_voice_locale(data_dir: &Path, locale: Option<&str>) -> Result<()
     )
 }
 
+/// The `settings` key holding the bot a spoken turn goes to (Epic 67,
+/// Story 67.1, AD-206): a bot id, or absent/blank for "the pinned bot most
+/// recently talked to". Which bot that is, and what happens when there is
+/// none, is `keeper_core::bots::voice_target::resolve`'s answer.
+const BOTS_VOICE_TARGET_KEY: &str = "bots.voice_target";
+
+/// Read the chosen voice target (AD-206). Absent or blank ⇒ `None`, "the
+/// pinned bot most recently talked to".
+pub fn get_bots_voice_target(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, BOTS_VOICE_TARGET_KEY)?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Write the chosen voice target (AD-206): `None` clears the choice back to
+/// "most recently talked to". Stored trimmed under `bots.voice_target`.
+pub fn set_bots_voice_target(data_dir: &Path, bot_id: Option<&str>) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        BOTS_VOICE_TARGET_KEY,
+        bot_id.map(str::trim).unwrap_or_default(),
+    )
+}
+
+/// The `settings` key holding the stop phrase as typed (Epic 67, Story 67.3,
+/// AD-208) — the word that ends a spoken answer. Absent or blank =
+/// [`crate::voice::DEFAULT_STOP_PHRASE`]. Stored raw, like the wake phrase:
+/// `WakePhrase::parse_stop` decides matching form every time it is set.
+const BOTS_STOP_PHRASE_KEY: &str = "bots.stop_phrase";
+
+/// Read the stop phrase as typed (AD-208). Absent or blank ⇒
+/// [`crate::voice::DEFAULT_STOP_PHRASE`], so an answer can always be
+/// stopped by a word.
+pub fn get_bots_stop_phrase(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, BOTS_STOP_PHRASE_KEY)?
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| crate::voice::DEFAULT_STOP_PHRASE.to_owned()))
+}
+
+/// Write the stop phrase as typed (AD-208). Stored verbatim under
+/// `bots.stop_phrase`; validation is `WakePhrase::parse_stop`'s, run by the
+/// caller before this is reached.
+pub fn set_bots_stop_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, BOTS_STOP_PHRASE_KEY, phrase)
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -4079,6 +4125,44 @@ mod tests {
         assert_eq!(
             get_setting(&dir, "bots.voice_locale").expect("read raw"),
             Some(String::new())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bots_voice_target_defaults_to_unset_and_clears_to_unset() {
+        let dir = temp_dir();
+        // Absent ⇒ "the pinned bot most recently talked to".
+        assert_eq!(get_bots_voice_target(&dir).expect("read default"), None);
+        set_bots_voice_target(&dir, Some(" 01ARZ3NDEKTSV4RRFFQ69G5FAV ")).expect("write");
+        assert_eq!(
+            get_bots_voice_target(&dir).expect("read back"),
+            Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned())
+        );
+        set_bots_voice_target(&dir, None).expect("clear");
+        assert_eq!(get_bots_voice_target(&dir).expect("read cleared"), None);
+        assert_eq!(
+            get_setting(&dir, "bots.voice_target").expect("read raw"),
+            Some(String::new())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bots_stop_phrase_defaults_to_stop_and_round_trips_verbatim() {
+        let dir = temp_dir();
+        assert_eq!(
+            get_bots_stop_phrase(&dir).expect("read default"),
+            crate::voice::DEFAULT_STOP_PHRASE
+        );
+        set_bots_stop_phrase(&dir, "Dość").expect("write");
+        assert_eq!(get_bots_stop_phrase(&dir).expect("read back"), "Dość");
+        // Blank falls back to the default rather than leaving an answer
+        // nothing can stop.
+        set_bots_stop_phrase(&dir, "   ").expect("write blank");
+        assert_eq!(
+            get_bots_stop_phrase(&dir).expect("read blank"),
+            crate::voice::DEFAULT_STOP_PHRASE
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

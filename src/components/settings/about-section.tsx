@@ -7,7 +7,13 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
-import { debugModeGet, debugModeSet, type EgressEndpointVm, egressList } from "@/lib/ipc/client";
+import {
+  debugLogPath,
+  debugModeGet,
+  debugModeSet,
+  type EgressEndpointVm,
+  egressList,
+} from "@/lib/ipc/client";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { useVoiceStore } from "@/lib/stores/voice";
 
@@ -43,28 +49,47 @@ const IOS_DOCS_URL = "https://github.com/tgorka/keeper/blob/main/docs/ios.md";
 /**
  * The honest debug-mode disclosure (Story 22.5, FR-79): names exactly what
  * lands on disk and where, and that it is local-only. Off by default.
+ *
+ * `logPath` is what Rust answers for this device (`debug_log_path`, Story
+ * 65.3, AD-192) — the Mac's `~/Library/Logs/keeper/keeper.log`, the phone's
+ * own container path — never a literal typed here, because the one literal
+ * this sentence used to carry named the Mac's folder on every platform.
+ * `null` is the answer not yet in, and names the file without a folder.
  */
-export const DEBUG_MODE_SENTENCE =
-  "Writes app logs to ~/Library/Logs/keeper/keeper.log and a per-recording events.log beside each session's manifest. Local files only — nothing is uploaded.";
+export function debugModeSentence(logPath: string | null): string {
+  return `Writes app logs to ${logPath ?? "keeper.log"} and a per-recording events.log beside each session's manifest. Local files only — nothing is uploaded.`;
+}
 
 /**
- * The five honesty lines of the reduced-platform (phone tier) "On this iPhone"
- * disclosure (Story 13.7; the fifth from Epic 62, Story 62.3, FR-400). Project
- * voice: sentence case, no exclamation marks, honest consequence-naming. Each
- * names a desktop-only affordance the phone lacks.
+ * The eight honesty lines of the reduced-platform (phone tier) "On this iPhone"
+ * disclosure (Story 13.7; rewritten by Epic 66, Story 66.6, AD-204, after the
+ * phone gained the folder; the first and seventh lines by Epic 67, Story 67.4,
+ * AD-210, once a spoken turn finished with the screen locked). Project voice:
+ * sentence case, no exclamation marks, honest consequence-naming. Each names a
+ * fact a person can act on: what the phone does differently, and what stays on
+ * the Mac (AD-201, AD-203).
  *
  * Mirrored one-to-one into the Limitations list of `docs/ios.md`, which the
  * disclosure links to; `about-section.test.tsx` reads that file from disk and
- * fails when the two lists differ. Edit both together or neither.
+ * fails when the two lists differ. Edit both together or neither. The eighth
+ * line is, byte for byte, `VoicePlatform::IOS.limits` in
+ * `keeper-core/src/voice/platform.rs` (Epic 65, Story 65.4, AD-193): the
+ * sentence read here before switching listening on is the sentence shown
+ * beside the switch. The third line's fact is `phone_divergence_sentence` in
+ * `keeper-sync/src/engine.rs` (AD-199), worded for a list rather than a status
+ * row. The first line's exception is `NO_BACKGROUND_SYNC_SENTENCE`'s last
+ * sentence (AD-207), in the list's voice: the message half stays scoped to
+ * messages, because a voice banner would otherwise contradict it.
  */
 export const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
-  "keeper syncs and notifies only while it's open; background notifications await a future decision.",
-  "No self-hosted bridge runner — manage your own bridges from your Mac.",
-  "No global summon hotkey.",
+  "keeper syncs and notifies about messages only while it's open; background notifications await a future decision. A voice session you left listening is the exception: it answers with the screen locked and posts what it heard as a banner from this phone.",
+  "A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.",
+  "Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.",
+  "Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.",
+  "What stays on your Mac: the self-hosted bridge runner, the sessions board, tasks, screen recording and the global summon hotkey; Bots talks to a model here, but the drive tools live on your Mac.",
   "Updates arrive by reinstalling keeper; its signature renews every 7 days.",
-  "Bots talks to a model but cannot reach the folders you sync — the drive tools live on your Mac.",
-  "Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.",
-  "Listening stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit; while it listens the microphone indicator stays lit and it uses battery.",
+  'Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying "stop" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.',
+  "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
 ];
 
 /**
@@ -178,6 +203,9 @@ export function AboutSection({ open }: { open: boolean }) {
   // Debug-mode toggle (Story 22.5): `undefined` = still loading.
   const [debugMode, setDebugMode] = useState<boolean | undefined>(undefined);
   const debugWriteId = useRef(0);
+  // Where this device's app log is, as Rust answers it (Story 65.3): `null`
+  // until it has, or when it could not.
+  const [logPath, setLogPath] = useState<string | null>(null);
   // The detected-but-not-yet-installed update, held between the two clicks. Not state:
   // it is not rendered, only consumed by the install step.
   const pendingUpdate = useRef<Update | null>(null);
@@ -227,6 +255,19 @@ export function AboutSection({ open }: { open: boolean }) {
         // A read failure renders the honest default (off) rather than a stuck spinner.
         if (!cancelled) {
           setDebugMode(false);
+        }
+      });
+    void debugLogPath()
+      .then((path) => {
+        if (!cancelled) {
+          setLogPath(path);
+        }
+      })
+      .catch(() => {
+        // Unanswered: the sentence names the file and no folder, never the
+        // Mac's folder on a phone.
+        if (!cancelled) {
+          setLogPath(null);
         }
       });
     void egressList()
@@ -410,7 +451,7 @@ export function AboutSection({ open }: { open: boolean }) {
             onCheckedChange={onDebugModeChange}
           />
         </div>
-        <p className="text-muted-foreground text-xs">{DEBUG_MODE_SENTENCE}</p>
+        <p className="text-muted-foreground text-xs">{debugModeSentence(logPath)}</p>
       </div>
 
       {macVoice && (

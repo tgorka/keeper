@@ -128,6 +128,7 @@ import type {
   SyncStatusVm,
 } from "@/lib/ipc/client";
 import { syncFootprint } from "@/lib/ipc/client";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import {
   type CopyGroup,
   cancelCopyJob,
@@ -752,6 +753,10 @@ export function SyncPane() {
    * empty to populated.
    */
   const [adding, setAdding] = useState(false);
+  // Story 66.1: this pane is also the phone's Sync surface (Epic 66, AD-198).
+  // What the phone cannot do is absent from it, by the tier the capabilities
+  // report — never a control that fails on tap.
+  const reducedCapability = useIsReducedCapabilityPlatform();
 
   // Three lifetimes, all torn down together: the shared profile/status mirror
   // poll, the modest per-profile detail poll, and the progress stream that is
@@ -887,9 +892,17 @@ export function SyncPane() {
             <SyncProfileCard key={profile.id} profile={profile} status={statuses[profile.id]} />
           ))}
           {/* The break between the folders keeper keeps, and the one thing on
-              this surface it keeps nothing about. */}
-          <Separator />
-          <CopyCard />
+              this surface it keeps nothing about. Desktop only: the copy job
+              is `copy_ipc`, a desktop command (no spawn-free equivalent is
+              needed — the phone has no second folder to copy from), so on the
+              reduced tier the card is absent, not a form that errors on Copy
+              (Story 66.1, AD-27). */}
+          {!reducedCapability && (
+            <>
+              <Separator />
+              <CopyCard />
+            </>
+          )}
           {/* The last card ends where the pane does; without this the surface
               stops mid-scroll and the background shows through under it. */}
           <div className="min-h-6 flex-1 bg-card" />

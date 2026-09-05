@@ -1019,6 +1019,10 @@ fn default_journal_template() -> String {
     DEFAULT_JOURNAL_TEMPLATE.to_owned()
 }
 
+/// The one pattern that makes a folder fully virtual: every path may stay
+/// away, and only an open brings its bytes (AD-199).
+pub const FULLY_VIRTUAL_PATTERN: &str = "**";
+
 impl SyncProfile {
     /// A bidirectional profile with every default applied.
     pub fn new(
@@ -1056,6 +1060,22 @@ impl SyncProfile {
             notes: None,
             recordings: None,
             sessions: None,
+        }
+    }
+
+    /// Make this profile fully virtual: every LFS path may stay a pointer
+    /// until it is opened (Epic 66, AD-199).
+    ///
+    /// The phone's default, applied by the shell when a profile is created
+    /// there. A profile that already names patterns keeps them — the folder
+    /// tier or the person has spoken — so this widens nothing that was set on
+    /// purpose. `lfs_mode` stays `Materialize`, because that is the one mode
+    /// under which a request for a single path materializes it (see
+    /// `Engine::materialize_pending`); `PointerOnly` would refuse the very
+    /// open the phone exists for.
+    pub fn make_fully_virtual(&mut self) {
+        if self.virtual_patterns.is_empty() {
+            self.virtual_patterns = vec![FULLY_VIRTUAL_PATTERN.to_owned()];
         }
     }
 
