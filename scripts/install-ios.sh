@@ -49,6 +49,8 @@
 #                               extension has no step of its own.
 #   KEEPER_IOS_DEVICE=<udid>    pick the phone when several are cabled.
 #   KEEPER_IOS_BUILD_ONLY=1     build, gate and stop before the phone.
+#   KEEPER_IOS_NO_ISLAND=1      drop the Live Activity extension: a Mac whose
+#                               Xcode holds no Apple ID cannot mint its profile.
 #
 # Requirements on the remote: Xcode with the iOS SDK, xcodegen and cocoapods
 # from Homebrew, bun, a Rust toolchain with the aarch64-apple-ios target, an
@@ -264,16 +266,45 @@ remote "cd \$HOME/$REMOTE_DIR && $REMOTE_ENV && bun install --frozen-lockfile --
 # comment on `dependencies`), so it has to be shown to have dropped the
 # entitlement AND kept the framework — four references when this was last
 # done by hand.
-# The extension's team. tauri-cli writes DEVELOPMENT_TEAM into the APP
-# target's pbxproj at build time and touches no other target, and
-# `$(APPLE_DEVELOPMENT_TEAM)` in project.yml does not survive xcodebuild's
-# signing check (measured 2026-09-05: "Signing for KeeperIsland requires a
-# development team" both ways). So the team is stamped into the REMOTE copy
-# of project.yml here, the way the entitlement is stripped below - the
-# committed file keeps the placeholder and no team id (AD-32). The
-# regeneration that follows (free team or not) then carries it.
-say "stamping team $APPLE_DEVELOPMENT_TEAM into the remote project's extension target"
-remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && $(cat <<EOF
+# The island needs an account that this Mac may not have. Signing the
+# extension target mints a profile for `dev.tgorka.keeper.island`, which
+# xcodebuild can only do through an Apple ID signed in to Xcode; hesperia
+# holds none (measured 2026-09-05: "No Accounts: Add a new account in
+# Accounts settings", keychain without an Xcode token). Until one is added,
+# `KEEPER_IOS_NO_ISLAND=1` removes the extension target and the app's
+# dependency on it from the REMOTE copy of project.yml, so the rest of the
+# build - the port, the ring, the background listening - reaches the phone.
+# The bridge in Sources/keeper/KeeperIsland.swift stays in the app target;
+# without the extension `Activity.request` throws `unsupported`, which the
+# ring shows as its own sentence (Story 65.5's refusal path), and the
+# NSSupportsLiveActivities key is left so the plist parity guard still holds.
+NO_ISLAND="${KEEPER_IOS_NO_ISLAND:-}"
+if [ -n "$NO_ISLAND" ]; then
+  say "no Apple ID on $HOST: dropping the KeeperIsland extension from the remote project.yml"
+  remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && $(cat <<'EOF'
+set -euo pipefail
+command -v yq >/dev/null || { echo "error: yq is not installed on this Mac (brew install yq); it edits project.yml for KEEPER_IOS_NO_ISLAND" >&2; exit 1; }
+yq -i 'del(.targets.KeeperIsland) | del(.targets.keeper_iOS.dependencies[] | select(.target == "KeeperIsland"))' project.yml
+grep -q '^  KeeperIsland:' project.yml && { echo "error: the KeeperIsland target is still in project.yml after the edit" >&2; exit 1; }
+grep -q 'target: KeeperIsland' project.yml && { echo "error: keeper_iOS still depends on KeeperIsland after the edit" >&2; exit 1; }
+mkdir -p Externals assets
+xcodegen generate >/dev/null
+if grep -q 'KeeperIsland.appex' keeper.xcodeproj/project.pbxproj; then echo "error: project.pbxproj still embeds KeeperIsland.appex after xcodegen generate" >&2; exit 1; fi
+grep -q 'KeeperIsland.swift' keeper.xcodeproj/project.pbxproj || { echo "error: the app target lost Sources/keeper/KeeperIsland.swift; the bridge Rust links against would be missing" >&2; exit 1; }
+echo "==> Regenerated without the extension; the bridge stays in the app target."
+EOF
+)" || fail "could not drop the island on $HOST (output above)."
+else
+  # The extension's team. tauri-cli writes DEVELOPMENT_TEAM into the APP
+  # target's pbxproj at build time and touches no other target, and
+  # `$(APPLE_DEVELOPMENT_TEAM)` in project.yml does not survive xcodebuild's
+  # signing check (measured 2026-09-05: "Signing for KeeperIsland requires a
+  # development team" both ways). So the team is stamped into the REMOTE copy
+  # of project.yml here, the way the entitlement is stripped below - the
+  # committed file keeps the placeholder and no team id (AD-32). The
+  # regeneration that follows (free team or not) then carries it.
+  say "stamping team $APPLE_DEVELOPMENT_TEAM into the remote project's extension target"
+  remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && $(cat <<EOF
 set -euo pipefail
 sed -i '' 's/DEVELOPMENT_TEAM: \\\$(APPLE_DEVELOPMENT_TEAM)/DEVELOPMENT_TEAM: $APPLE_DEVELOPMENT_TEAM/' project.yml
 grep -q 'DEVELOPMENT_TEAM: $APPLE_DEVELOPMENT_TEAM' project.yml || { echo "error: the extension target's DEVELOPMENT_TEAM placeholder was not found in project.yml" >&2; exit 1; }
@@ -282,10 +313,11 @@ xcodegen generate >/dev/null
 grep -q 'DEVELOPMENT_TEAM = $APPLE_DEVELOPMENT_TEAM' keeper.xcodeproj/project.pbxproj || grep -q 'DEVELOPMENT_TEAM = "$APPLE_DEVELOPMENT_TEAM"' keeper.xcodeproj/project.pbxproj || { echo "error: project.pbxproj carries no DEVELOPMENT_TEAM after xcodegen generate" >&2; exit 1; }
 EOF
 )" || fail "could not stamp the team into the remote project (output above)."
+fi
 
 if [ -n "${KEEPER_IOS_FREE_TEAM:-}" ]; then
   say "free Personal Team: dropping the data-protection entitlement from the remote project.yml"
-  remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && $(cat <<'EOF'
+  remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && NO_ISLAND='$NO_ISLAND' && $(cat <<'EOF'
 set -euo pipefail
 awk 'skip && /^    [^ ]/ { skip = 0 } /^    entitlements:/ { skip = 1 } !skip' project.yml > project.yml.free
 mv project.yml.free project.yml
@@ -314,8 +346,12 @@ fi
 # `Activity.request` throws `unsupported`, which the ring would show and a
 # reviewer might read as the free team's refusal.
 appex="$(grep -c 'KeeperIsland.appex' keeper.xcodeproj/project.pbxproj || true)"
-if [ "$appex" -eq 0 ]; then
+if [ -z "$NO_ISLAND" ] && [ "$appex" -eq 0 ]; then
   echo "error: project.pbxproj does not reference KeeperIsland.appex after xcodegen generate; the Live Activity extension was dropped" >&2
+  exit 1
+fi
+if [ -n "$NO_ISLAND" ] && [ "$appex" -ne 0 ]; then
+  echo "error: project.pbxproj still references KeeperIsland.appex although KEEPER_IOS_NO_ISLAND was set" >&2
   exit 1
 fi
 if ! grep -q 'NSSupportsLiveActivities' keeper_iOS/Info.plist; then
