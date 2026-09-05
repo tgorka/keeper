@@ -502,6 +502,23 @@ fn ensure_task_columns(conn: &Connection) -> Result<()> {
     if !existing.iter().any(|c| c == "missed_delay_ms") {
         conn.execute("ALTER TABLE tasks ADD COLUMN missed_delay_ms INTEGER", [])?;
     }
+    // Story 69.4's three, all nullable and all `NULL` on every row of the three
+    // older kinds: a `bot` task names a bot, a prompt file and (optionally) a
+    // model, and the row is the one place those facts may live — three columns
+    // rather than one JSON blob, by AD-139, so nothing can ever enumerate more
+    // than one target per row. `prompt_subpath` is **profile-relative**, the
+    // same spelling every other path this crate stores; the session check —
+    // inside a session of the folder, under `prompts/`, tagged `prompt` — is
+    // the shell's at save, because only the shell can see the sessions folder.
+    if !existing.iter().any(|c| c == "bot_id") {
+        conn.execute("ALTER TABLE tasks ADD COLUMN bot_id TEXT", [])?;
+    }
+    if !existing.iter().any(|c| c == "prompt_subpath") {
+        conn.execute("ALTER TABLE tasks ADD COLUMN prompt_subpath TEXT", [])?;
+    }
+    if !existing.iter().any(|c| c == "model") {
+        conn.execute("ALTER TABLE tasks ADD COLUMN model TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -2894,7 +2911,8 @@ pub const TASK_RUNS_CAP: usize = 50;
 /// constant so a reader added later cannot drift out of step with the decoder.
 const TASK_COLUMNS: &str = "id, profile_id, kind, schedule, mode, next_due_ms, \
                             enabled, updated_ms, running_host, lease_until_ms, \
-                            on_missed, description, missed_delay_ms";
+                            on_missed, description, missed_delay_ms, \
+                            bot_id, prompt_subpath, model";
 
 /// One stored task.
 ///
@@ -2949,6 +2967,25 @@ pub struct TaskRow {
     /// missed windows. Refused outside [`crate::tasks::validate_missed_delay_ms`]'
     /// bounds at the write door, and honoured as stored on the read path.
     pub missed_delay_ms: Option<i64>,
+    /// The bot a `bot` task asks, as an opaque id into the shell's bot store,
+    /// or `None` on every other kind (Story 69.4, AD-224).
+    ///
+    /// Stored verbatim and not checked here: `keeper.db` — where bots live —
+    /// is a database this crate cannot see (AD-40), so whether the id names a
+    /// bot is the shell's question at save and the runner's at run.
+    pub bot_id: Option<String>,
+    /// The prompt file a `bot` task sends, **profile-relative**, or `None` on
+    /// every other kind (Story 69.4, AD-224).
+    ///
+    /// The same spelling every path this crate stores has, and resolved at run
+    /// through `browse::resolve` — the one join a root and a subpath are
+    /// allowed (AD-65). That the path is inside a session of the folder, under
+    /// `prompts/` and tagged `prompt` is the shell's rule at save; this crate
+    /// stores what it was handed and refuses only what leaves the folder.
+    pub prompt_subpath: Option<String>,
+    /// The model a `bot` task sends as, or `None` to let the runner choose by
+    /// its own default rule (Story 69.4, AD-224). `None` on every other kind.
+    pub model: Option<String>,
 }
 
 impl TaskRow {
@@ -3037,6 +3074,9 @@ type StoredTask = (
     String,
     Option<String>,
     Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 /// Read one `tasks` row, tolerating every column but the primary key.
@@ -3063,6 +3103,12 @@ type StoredTask = (
 /// for a reason that is cosmetic in one case and recoverable in the other, which
 /// is the outcome NFR-43 is about. An unreadable delay reads as *not chosen*, so
 /// the task falls back to the constant and keeps running.
+///
+/// Story 69.4's `bot_id`, `prompt_subpath` and `model` take the same fallback
+/// for a different reason: `None` is not the answer there but the **arm's**
+/// question — a `bot` row with no bot or no prompt is a run the arm refuses
+/// by name, which is a recorded failure a person can act on, where an
+/// unreadable row is a task that silently never ran.
 fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
     Ok((
         row.get(0)?,
@@ -3078,6 +3124,9 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTask> {
         row.get(10).unwrap_or_default(),
         row.get(11).unwrap_or_default(),
         row.get(12).unwrap_or_default(),
+        row.get(13).unwrap_or_default(),
+        row.get(14).unwrap_or_default(),
+        row.get(15).unwrap_or_default(),
     ))
 }
 
@@ -3104,6 +3153,9 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         on_missed,
         description,
         missed_delay_ms,
+        bot_id,
+        prompt_subpath,
+        model,
     ) = stored;
     let unknown = |reason: String| UnknownTask {
         id: id.clone(),
@@ -3134,6 +3186,9 @@ fn decode_task(stored: StoredTask) -> std::result::Result<TaskRow, UnknownTask> 
         on_missed,
         description,
         missed_delay_ms,
+        bot_id,
+        prompt_subpath,
+        model,
     };
     if let Err(err) = row.parsed_schedule() {
         return Err(unknown(format!("unreadable schedule: {err}")));
@@ -6102,6 +6157,9 @@ mod tests {
             id: id.to_owned(),
             profile_id: Some("p".to_owned()),
             kind: TaskKind::Sync,
+            bot_id: None,
+            prompt_subpath: None,
+            model: None,
             schedule: schedule.map(str::to_owned),
             mode,
             next_due_ms: None,
@@ -6202,6 +6260,11 @@ mod tests {
                 "on_missed",
                 "description",
                 "missed_delay_ms",
+                // Story 69.4's three, additive and nullable through
+                // `ensure_task_columns` like every late column before them.
+                "bot_id",
+                "prompt_subpath",
+                "model",
             ]
         );
         assert_eq!(

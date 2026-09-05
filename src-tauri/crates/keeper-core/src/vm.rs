@@ -4276,6 +4276,30 @@ pub struct FilesEntryVm {
     /// never offer an action that will fail. The pane renders the reason where
     /// the action would have been.
     pub write: FilesWriteVm,
+    /// How many entries beneath this **directory** are virtual — content that
+    /// is not fetched (Story 69.2, AD-219).
+    ///
+    /// `0` for a file, and `0` for a directory whose marks walk did not read
+    /// the inventory, which is why the folder row says "N not fetched" only
+    /// when N is non-zero: a zero is "nothing to fetch, or nothing known" and
+    /// the row must not claim the first when it means the second.
+    ///
+    /// The count is the reason a folder can carry a Fetch verb at all. Without
+    /// it the pane would have to walk every child to know whether the verb
+    /// applies, which is the walk this listing exists to avoid.
+    pub virtual_children: u32,
+    /// The bytes those children would bring down, from their pointers' own
+    /// `size` (Story 69.2).
+    ///
+    /// The pointer states the object's size, so this is exact rather than an
+    /// estimate — the one number a person needs before pressing Fetch on a
+    /// folder over a phone connection. `0` wherever
+    /// [`Self::virtual_children`] is.
+    ///
+    /// `number` for [`FileSizeVm::bytes`]'s reason: a folder of pointers is
+    /// bytes, not a bigint, and every other size on this wire is a number.
+    #[ts(type = "number")]
+    pub virtual_bytes: u64,
 }
 
 /// Everything [`FilesEntryVm::new`] needs, named at the call site.
@@ -4313,6 +4337,12 @@ pub struct FilesEntryFacts<'a> {
     pub roles: FilesFolderRoles<'a>,
     /// The location verdict `keeper_sync::files_write` already reached.
     pub write: FilesWriteVm,
+    /// How many entries beneath a **directory** are virtual, from the marks
+    /// walk's own inventory. A file's caller passes `0`; the constructor
+    /// discards a file's the way it discards a directory's size.
+    pub virtual_children: u32,
+    /// The bytes those children would bring down. `0` with the count.
+    pub virtual_bytes: u64,
 }
 
 impl FilesEntryVm {
@@ -4372,6 +4402,8 @@ impl FilesEntryVm {
             release,
             roles,
             write,
+            virtual_children,
+            virtual_bytes,
         } = facts;
         let kind = if is_dir {
             RecordingNoteTargetKind::Folder
@@ -4407,6 +4439,12 @@ impl FilesEntryVm {
             relative_path,
             sync,
             write,
+            // Dropped for a file for the release deadline's reason inverted: a
+            // file IS the thing that can be fetched, and its own status
+            // already says so — a count on a file row would be a second,
+            // weaker way to say `Virtual` and the two could disagree.
+            virtual_children: if is_dir { virtual_children } else { 0 },
+            virtual_bytes: if is_dir { virtual_bytes } else { 0 },
         }
     }
 }
@@ -9174,6 +9212,8 @@ mod tests {
                 release: None,
                 roles: FilesFolderRoles::default(),
                 write: FilesWriteVm::allowed(),
+                virtual_children: 0,
+                virtual_bytes: 0,
             });
             assert_eq!(entry.kind, expected, "{name}");
         }
@@ -9196,6 +9236,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(entry.kind, RecordingNoteTargetKind::Folder);
     }
@@ -9667,6 +9709,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         let json = serde_json::to_string(&entry).expect("serialize files entry");
         assert!(
@@ -9734,6 +9778,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(entry.size, None, "a folder's size is absent, never zero");
         let json = serde_json::to_string(&entry).expect("serialize");
@@ -9785,6 +9831,8 @@ mod tests {
                 release: Some(offered.clone()),
                 roles: FilesFolderRoles::default(),
                 write: FilesWriteVm::allowed(),
+                virtual_children: 0,
+                virtual_bytes: 0,
             })
             .release
         };
@@ -9826,6 +9874,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(unknown.size, None);
         let empty = FilesEntryVm::new(FilesEntryFacts {
@@ -9840,6 +9890,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(
             empty.size.as_ref().map(|size| size.label.as_str()),
@@ -9875,6 +9927,8 @@ mod tests {
                 release: None,
                 roles,
                 write: FilesWriteVm::allowed(),
+                virtual_children: 0,
+                virtual_bytes: 0,
             })
             .folder_role
         };
@@ -9907,6 +9961,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(unconfigured.folder_role, None);
     }

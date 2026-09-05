@@ -113,6 +113,8 @@ function entry(name: string, relativePath: string): FilesEntryVm {
     // Story 56.9: `null` because an ordinary file has no release standing —
     // keeper put none of these bytes here, so there is nothing to let go of.
     release: null,
+    virtualChildren: 0,
+    virtualBytes: 0,
     folderRole: null,
     write: {
       writable: false,

@@ -2942,8 +2942,9 @@ pub async fn sync_unsubscribe_progress(
 /// Rejects with: `unsupported`, `internal` (no such profile, a malformed
 /// profile exclude pattern, a subpath that escapes the root, an unreadable
 /// directory).
-/// How long a listing waits for the sync marks before showing the folder without
-/// them.
+/// How long a listing waits for the sync marks before showing the folder with
+/// the last marks it had (Epic 69, AD-220) — or, for a profile that has never
+/// answered, without them.
 ///
 /// [`Engine::pending`] is a `git status` over the whole worktree plus an
 /// untracked expansion that `lstat`s every candidate. On a folder of tens of
@@ -2953,7 +2954,7 @@ pub async fn sync_unsubscribe_progress(
 /// order to name a directory's entries.
 const BROWSE_MARKS_BUDGET: Duration = Duration::from_secs(3);
 
-/// How long one answer is reused by later listings.
+/// How long one pending answer is reused by later listings.
 ///
 /// Short, because it decorates rows a person is looking at. Long enough to
 /// cover the burst that matters: the Files pane's refresh re-reads EVERY open
@@ -2961,56 +2962,57 @@ const BROWSE_MARKS_BUDGET: Duration = Duration::from_secs(3);
 /// of the same tree at the same moment.
 const BROWSE_MARKS_TTL: Duration = Duration::from_secs(3);
 
-/// What the row's `unavailable` reason says when the walk outran its budget.
+/// How long one pointer inventory is reused (Epic 69, AD-219).
+///
+/// The inventory is [`Engine::lfs_files`] — one object-header lookup per
+/// index entry — and it feeds only a folder row's "N not fetched" roll-up,
+/// which the verbs that change it ([`browse_marks_forget`]) refresh sooner.
+/// The engine's own walk floor is a minute; this matches it.
+const BROWSE_VIRTUAL_TTL: Duration = Duration::from_secs(60);
+
+/// What the row's `unavailable` reason says when the walk outran its budget
+/// and there has never been an answer to serve instead.
 const BROWSE_MARKS_SLOW_SENTENCE: &str =
     "This folder is busy, so the sync marks are not ready yet. They appear on the next listing.";
 
-/// The last pending view per profile, and whether one is being computed.
+/// The event the shell emits when a marks walk lands (Epic 69, AD-220).
 ///
-/// A process-wide memo rather than a field on `AppState`: it is a cache of an
-/// answer the engine already owns, it must be shared by every window, and
-/// nothing outside this one command reads it. `Instant` is stamped when the
-/// answer arrives, not when it was asked for, so a walk that took two minutes
-/// does not hand back a view that is two minutes stale the moment it lands.
-static BROWSE_MARKS: OnceLock<Mutex<HashMap<String, MarkSlot>>> = OnceLock::new();
+/// Payload: the profile id. The Files pane re-lists on it, which is how a
+/// listing served `stale` gets its fresh marks without a person pressing
+/// Refresh. Emitted from the walk's own task rather than from the progress
+/// stream, because the stream's `Scanning` frames come only from
+/// `Engine::pending`'s status walk — which it skips inside a minute of the
+/// last one — and a walk that answered late without walking is exactly the
+/// case that needs the signal.
+pub const FILES_MARKS_EVENT: &str = "keeper://files-marks";
 
-#[derive(Default)]
-struct MarkSlot {
-    answered: Option<(Instant, browse::PendingView)>,
-    walking: bool,
+/// The last marks per profile, and whether a walk is computing fresher ones.
+///
+/// A process-wide memo rather than a field on `AppState`: it is a cache of
+/// answers the engine already owns, it must be shared by every window, and
+/// nothing outside this file reads it. The policy — what to serve, when to
+/// walk, what `stale` means — is [`browse::MarksCache`]'s and is asserted in
+/// `keeper-sync`; this file owns only the clock, the engine, the timeout and
+/// the event.
+static BROWSE_MARKS: LazyLock<Mutex<browse::MarksCache>> = LazyLock::new(|| {
+    Mutex::new(browse::MarksCache::new(
+        BROWSE_MARKS_TTL,
+        BROWSE_VIRTUAL_TTL,
+    ))
+});
+
+fn browse_marks() -> std::sync::MutexGuard<'static, browse::MarksCache> {
+    BROWSE_MARKS.lock().expect("browse marks lock")
 }
 
-/// What a listing should do about one profile's marks.
-#[derive(Debug, PartialEq, Eq)]
-enum MarkPlan {
-    /// Use this answer as it stands.
-    Serve(browse::PendingView),
-    /// A walk is already running and this is the best answer there is. `None`
-    /// means there has never been one, and the row says so rather than
-    /// claiming every entry is clean.
-    ServeWhileWalking(Option<browse::PendingView>),
-    /// Nothing usable and nobody walking: start one.
-    Walk,
-}
-
-impl MarkSlot {
-    /// The policy, separated from the plumbing so it can be read and tested
-    /// without an engine, a disk or a clock.
-    fn plan(&self, ttl: Duration) -> MarkPlan {
-        if let Some((at, view)) = self.answered.as_ref() {
-            if at.elapsed() < ttl {
-                return MarkPlan::Serve(view.clone());
-            }
-        }
-        if self.walking {
-            return MarkPlan::ServeWhileWalking(self.answered.as_ref().map(|(_, v)| v.clone()));
-        }
-        MarkPlan::Walk
-    }
-}
-
-fn browse_marks() -> &'static Mutex<HashMap<String, MarkSlot>> {
-    BROWSE_MARKS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Expire one profile's cached marks, so the next listing walks again and
+/// serves the old ones marked stale only until it lands.
+///
+/// For the verbs that change what the marks say — a fetch, a release, a pin —
+/// whose callers re-list the folder the moment they return and would
+/// otherwise read a folder count up to [`BROWSE_VIRTUAL_TTL`] old.
+pub(crate) fn browse_marks_forget(id: &str) {
+    browse_marks().forget(id);
 }
 
 /// The sync marks for one profile: cached, or computed within a budget.
@@ -3018,69 +3020,114 @@ fn browse_marks() -> &'static Mutex<HashMap<String, MarkSlot>> {
 /// The walk is spawned rather than awaited in place, and the task stores its
 /// own result — so a walk that outruns [`BROWSE_MARKS_BUDGET`] is not wasted.
 /// Dropping the `JoinHandle` (which is what the timeout does) does not cancel a
-/// tokio task, so it runs to completion and the NEXT listing finds the answer
-/// waiting. Without that, a folder slow enough to time out once would never
-/// show a mark at all.
+/// tokio task, so it runs to completion, the NEXT listing finds the answer
+/// waiting, and [`FILES_MARKS_EVENT`] tells the pane to ask for it.
+///
+/// Returns the marks and, when every row will read `Unknown`, the engine's own
+/// words for why. Under AD-220 that second half is `Some` only for a profile
+/// that has never answered; a late walk serves the last answer marked
+/// [`browse::MarksAnswer::stale`] instead.
 async fn browse_marks_for(
+    app: &tauri::AppHandle,
     engine: &Arc<keeper_sync::engine::Engine>,
     id: &str,
-) -> (browse::PendingView, Option<String>) {
-    {
-        let mut marks = browse_marks().lock().expect("browse marks lock");
-        let slot = marks.entry(id.to_owned()).or_default();
-        match slot.plan(BROWSE_MARKS_TTL) {
-            MarkPlan::Serve(view) => return (view, None),
-            // One walk at a time per folder. A second would read the same tree
-            // off the same disk for the same answer, and on this hardware that
-            // is the difference the transfers feel.
-            MarkPlan::ServeWhileWalking(Some(view)) => return (view, None),
-            MarkPlan::ServeWhileWalking(None) => {
-                return (
-                    browse::PendingView::Unavailable,
-                    Some(BROWSE_MARKS_SLOW_SENTENCE.to_owned()),
-                )
-            }
-            MarkPlan::Walk => slot.walking = true,
+) -> (browse::MarksAnswer, Option<String>) {
+    let unknown = |sentence: String| {
+        (
+            browse::MarksAnswer {
+                pending: browse::PendingView::Unavailable,
+                virtual_paths: browse::VirtualView::none(),
+                stale: false,
+            },
+            Some(sentence),
+        )
+    };
+    let (generation, refresh_virtual) = {
+        match browse_marks().plan(id, Instant::now()) {
+            browse::MarksPlan::Serve(answer) => return (answer, None),
+            browse::MarksPlan::Wait => return unknown(BROWSE_MARKS_SLOW_SENTENCE.to_owned()),
+            browse::MarksPlan::Walk {
+                generation,
+                refresh_virtual,
+            } => (generation, refresh_virtual),
         }
-    }
+    };
 
     let walker = {
+        let app = app.clone();
         let engine = Arc::clone(engine);
         let id = id.to_owned();
         tokio::spawn(async move {
-            let answered = engine.pending(&id).await;
-            let mut marks = browse_marks().lock().expect("browse marks lock");
-            let slot = marks.entry(id).or_default();
-            slot.walking = false;
-            match &answered {
-                Ok(files) => {
-                    slot.answered = Some((
-                        Instant::now(),
-                        browse::PendingView::from_pending(files.clone()),
-                    ));
+            let pending = engine.pending(&id).await;
+            // The inventory is a blocking repository read; off the runtime
+            // for the reason `Engine::pending`'s own scans are. A failure
+            // costs the folder counts and nothing else — the last inventory
+            // stands — so it is logged rather than raised.
+            let virtual_paths = if refresh_virtual {
+                let engine = Arc::clone(&engine);
+                let id = id.clone();
+                match tokio::task::spawn_blocking(move || engine.lfs_files(&id)).await {
+                    Ok(Ok(files)) => Some(browse::VirtualView::from_lfs_files(&files)),
+                    Ok(Err(error)) => {
+                        tracing::warn!(profile = id, %error, "files: could not read which paths are virtual");
+                        None
+                    }
+                    Err(join) => {
+                        tracing::warn!(profile = id, error = %join, "files: the virtual inventory task failed");
+                        None
+                    }
                 }
-                Err(_) => slot.answered = None,
-            }
-            answered.map(browse::PendingView::from_pending)
+            } else {
+                None
+            };
+            let failure = pending.as_ref().err().map(ToString::to_string);
+            browse_marks().finish(
+                &id,
+                generation,
+                pending.ok().map(browse::PendingView::from_pending),
+                virtual_paths,
+                Instant::now(),
+            );
+            // Whatever landed, the cache now holds the freshest answer there
+            // is; the pane re-lists and reads it. A window that is gone makes
+            // the emit fail, which is not the walk's problem.
+            let _ = app.emit(FILES_MARKS_EVENT, id.clone());
+            (id, failure)
         })
     };
 
     match tokio::time::timeout(BROWSE_MARKS_BUDGET, walker).await {
-        Ok(Ok(Ok(view))) => (view, None),
-        Ok(Ok(Err(error))) => (browse::PendingView::Unavailable, Some(error.to_string())),
+        Ok(Ok((id, failure))) => {
+            let last = browse_marks().last(&id, Instant::now());
+            match (last, failure) {
+                // The walk answered: the last answer IS this walk's.
+                (Some(answer), None) => (answer, None),
+                // The engine failed but had answered before: the old marks
+                // stand, marked stale, and the failure is the log's.
+                (Some(answer), Some(error)) => {
+                    tracing::warn!(profile = id, %error, "files: the marks walk failed; serving the last answer");
+                    (answer, None)
+                }
+                (None, Some(error)) => unknown(error),
+                (None, None) => unknown(BROWSE_MARKS_SLOW_SENTENCE.to_owned()),
+            }
+        }
         // The task panicked. The slot stays flagged as walking, which is the
         // safe way round: it stops a panicking walk being re-entered on every
         // keystroke, and a restart clears it.
-        Ok(Err(join)) => (browse::PendingView::Unavailable, Some(join.to_string())),
-        Err(_) => (
-            browse::PendingView::Unavailable,
-            Some(BROWSE_MARKS_SLOW_SENTENCE.to_owned()),
-        ),
+        Ok(Err(join)) => unknown(join.to_string()),
+        // Late. Serve what there is, marked stale; `Unknown` only for a
+        // profile that has never answered (AD-220).
+        Err(_) => match browse_marks().last(id, Instant::now()) {
+            Some(answer) => (answer, None),
+            None => unknown(BROWSE_MARKS_SLOW_SENTENCE.to_owned()),
+        },
     }
 }
 
 #[tauri::command]
 pub async fn sync_browse(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     id: String,
     subpath: String,
@@ -3093,7 +3140,12 @@ pub async fn sync_browse(
     // Before the walk, so one answer covers every entry in the directory and a
     // thousand-row folder asks the engine once — and bounded, so a folder whose
     // walk takes minutes still lists its entries now. See `browse_marks_for`.
-    let (pending, unavailable) = browse_marks_for(&engine, &id).await;
+    let (marks, unavailable) = browse_marks_for(&app, &engine, &id).await;
+    let browse::MarksAnswer {
+        pending,
+        virtual_paths,
+        stale,
+    } = marks;
 
     // One indexed SELECT, deliberately not part of `browse_marks_for`'s cached
     // walk (Story 56.7): that cache exists to stop a repeated tree walk, and a
@@ -3168,7 +3220,14 @@ pub async fn sync_browse(
         let profile = profile.clone();
         let subpath = subpath.clone();
         tokio::task::spawn_blocking(move || {
-            browse::browse(&profile, &subpath, &excludes, &pending, &materialized)
+            browse::browse(
+                &profile,
+                &subpath,
+                &excludes,
+                &pending,
+                &materialized,
+                &virtual_paths,
+            )
         })
         .await
         .map_err(|err| open_failure(format!("could not read the folder: {err}")))?
@@ -3186,6 +3245,7 @@ pub async fn sync_browse(
         subpath,
         listing,
         unavailable.as_deref(),
+        stale,
         &scope,
         &schedules,
     ))
@@ -3217,11 +3277,15 @@ pub async fn sync_browse(
 /// with a hold is proven in that crate's tests, so all this layer does is read
 /// three accessors. An absent key is a path with no ledger row, which is every
 /// ordinary file.
+///
+/// `stale` is [`browse::MarksAnswer::stale`]: the marks are the last the engine
+/// gave rather than fresh ones, and a fresher walk is on its way (AD-220).
 fn files_listing_vm(
     profile: &SyncProfile,
     subpath: String,
     listing: browse::BrowseListing,
     engine_failure: Option<&str>,
+    stale: bool,
     scope: &files_write::WriteScope<'_>,
     schedules: &HashMap<String, ReleaseSchedule>,
 ) -> FilesListingVm {
@@ -3280,6 +3344,8 @@ fn files_listing_vm(
                         lfs_oid: entry.lfs_oid,
                         mtime_ms: entry.mtime_ms,
                         release,
+                        virtual_children: entry.virtual_children,
+                        virtual_bytes: entry.virtual_bytes,
                         roles,
                         write,
                     })
@@ -3345,6 +3411,9 @@ fn files_listing_vm(
         entries,
         detail,
         truncated,
+        // A listing that was never `Listed` carries no marks to be stale
+        // about; the flag follows the entries.
+        stale: stale && state == FilesListingState::Listed,
         write,
     }
 }
@@ -3494,6 +3563,51 @@ pub(crate) fn missing_sentence(profile: &SyncProfile, subpath: &str) -> String {
     )
 }
 
+/// Fetch a virtual entry's content before a reader serves it (Story 69.1,
+/// AD-223).
+///
+/// One call site shape for the four doors that hand a file to someone —
+/// [`sync_open_entry`], [`sync_read_text`], [`sync_read_document`] and
+/// `keeper-file://` — so the rule cannot be applied to three of them and
+/// forgotten on the fourth. Every decision is
+/// [`keeper_sync::engine::Engine::materialize_before_serving`]: whether the
+/// bytes at `resolved` are a pointer, how the content is fetched, how long it is
+/// kept, and which refusal a transfer that did not land is. This function maps
+/// the answer onto the IPC envelope and logs a refusal, for the reason
+/// [`sync_materialize_entry`] logs one: a refusal is the thing a person asks
+/// about later (DW-162), and `GatedMakeWriter` only puts `INFO` on disk in
+/// debug mode.
+///
+/// `resolved` is the path the caller has already put through
+/// [`browse::resolve`]; nothing is composed here (AD-65).
+pub(crate) async fn fetch_before_serving(
+    engine: &keeper_sync::engine::Engine,
+    id: &str,
+    subpath: &str,
+    resolved: &std::path::Path,
+) -> Result<(), IpcError> {
+    match engine
+        .materialize_before_serving(id, subpath, resolved)
+        .await
+    {
+        Ok(None) => Ok(()),
+        Ok(Some(outcome)) => {
+            tracing::info!(
+                path = %outcome.path,
+                outcome = %outcome.outcome,
+                "files: fetched before serving"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            if let SyncError::Refused(refusal) = &err {
+                tracing::warn!(%refusal, "files: fetch before serving refused");
+            }
+            Err(sync_ipc_error(&err))
+        }
+    }
+}
+
 /// Hand one file inside a synced folder to the system's default handler
 /// (Story 43.8, FR-153, AD-65).
 ///
@@ -3539,6 +3653,10 @@ pub async fn sync_open_entry(
         let resolved = browse::resolve(&profile.local_path, &subpath)
             .map_err(|refusal| open_failure(refusal.to_string()))?
             .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+        // A virtual entry is fetched before the opener sees it (Story 69.1,
+        // AD-223): a pointer handed to Preview is a broken file, and the phone
+        // has materialised on open since 66.3. See `fetch_before_serving`.
+        fetch_before_serving(&engine, &id, &subpath, &resolved).await?;
         // A use keeper can observe, so the release clock for this path moves
         // (Story 56.5, AD-126). Best-effort by signature and no policy here: the
         // engine owns every rule, because a rule in this crate is one nobody can
@@ -3803,6 +3921,9 @@ pub async fn sync_read_text(
     let resolved = browse::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| open_failure(refusal.to_string()))?
         .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    // A pointer is fetched before it is read, so the editor opens the content
+    // and not the pointer text (Story 69.1, AD-223); see `fetch_before_serving`.
+    fetch_before_serving(&engine, &id, &subpath, &resolved).await?;
     // A use keeper can observe (Story 56.5, AD-126); see `sync_open_entry`.
     engine.note_use(&id, &subpath);
     let named = subpath.clone();
@@ -4001,6 +4122,9 @@ pub async fn sync_read_document(
     let resolved = browse::resolve(&profile.local_path, &subpath)
         .map_err(|refusal| open_failure(refusal.to_string()))?
         .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+    // A pointer is fetched before it is parsed, so the viewer gets the document
+    // and not a sentence about pointer text (Story 69.1, AD-223).
+    fetch_before_serving(&engine, &id, &subpath, &resolved).await?;
     // A use keeper can observe (Story 56.5, AD-126); see `sync_open_entry`.
     engine.note_use(&id, &subpath);
     let named = subpath.clone();

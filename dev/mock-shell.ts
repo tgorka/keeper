@@ -256,6 +256,8 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
     // keeper itself put here and none of these rows is that. The two rows that
     // are get one below.
     release: null,
+    virtualChildren: 0,
+    virtualBytes: 0,
     // Writable, because the write path — New file, Delete, and the header's
     // count that gates them — is exactly what a viewing aid has to be able to
     // show. A refusal is a different fixture and this is not it.

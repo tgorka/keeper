@@ -87,10 +87,11 @@
 //! [`BrowseEntry::lfs_oid`] meaning exactly "this row's size came from a
 //! pointer".
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::engine::{PendingFile, PendingReason};
 use crate::exclude::{ExcludeSet, ExcludeVerdict};
@@ -239,6 +240,24 @@ pub struct BrowseEntry {
     /// `None` for every ordinary entry, so a surface that ignores this field
     /// behaves exactly as it did before it existed.
     pub unspellable: Option<crate::names::UnspellableName>,
+    /// How many virtual paths sit anywhere beneath this entry, when it is a
+    /// directory (Epic 69, AD-219).
+    ///
+    /// **Recursive, and read off the index rather than the disk.** A listing
+    /// never walks a tree, so the count cannot come from the dirents beneath
+    /// the folder; it comes from [`VirtualView`], which the caller built once
+    /// from the repository's own inventory of pointer paths and which answers
+    /// "how many below `dir/`" with one ordered range probe — the same shape
+    /// [`PendingView::waiting`] uses for a folder's roll-up. `0` for every
+    /// file, and for a folder with nothing virtual beneath it; a caller that
+    /// did not read the inventory ([`VirtualView::none`]) reads `0`
+    /// everywhere, which is the same less-specific truth an unread
+    /// [`MaterializedView`] gives.
+    pub virtual_children: u32,
+    /// The bytes those virtual paths name — the sum of their pointers' sizes,
+    /// never of the pointer files themselves (FR-336). `0` exactly when
+    /// [`Self::virtual_children`] is.
+    pub virtual_bytes: u64,
 }
 
 /// What the engine's own state says about one browsed entry.
@@ -497,6 +516,87 @@ impl MaterializedView {
     }
 }
 
+/// The repository's inventory of virtual paths — every LFS path whose worktree
+/// bytes are still the committed pointer — with the size each pointer names
+/// (Epic 69, AD-219).
+///
+/// Exists for one question a listing cannot answer from its own `read_dir`:
+/// **how much of what is beneath this folder is not here?** A row's own mark
+/// comes off its own bytes ([`classify`]'s pointer probe), but a folder's
+/// roll-up needs every path below it, and a listing that walked a tree to
+/// count them would be the recursive walk this module refuses in
+/// [`BrowseEntry::size_bytes`]'s own words. So the inventory is built once by
+/// the caller — from [`crate::lfs::listing::collect`], the index-driven
+/// listing `keeper-syncd ls-files` already renders — and read here with the
+/// same ordered range probe [`PendingView::waiting`] uses for a folder's
+/// pending roll-up.
+///
+/// # The polarity
+///
+/// [`MaterializedView`]'s, not [`PendingView`]'s: an empty inventory makes a
+/// folder read "nothing virtual beneath", which is true and merely less
+/// specific for a caller that never asked — a notes gallery, a session tree —
+/// and there is no "unavailable" spelling for the same reason that type has
+/// none. A row's own `Virtual` mark never depends on this view, so a folder
+/// whose count reads `0` still lists every virtual child as virtual when it
+/// is expanded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualView(BTreeMap<String, u64>);
+
+impl VirtualView {
+    /// Index one [`crate::engine::Engine::lfs_files`] answer, keeping only the
+    /// paths whose state is [`crate::lfs::listing::LfsFileState::Virtual`].
+    ///
+    /// `Absent` is deliberately not counted: a path with no file at all is
+    /// not a row the folder will show, and "N not fetched" over a folder
+    /// whose expansion lists N−1 pointers would be the count disagreeing with
+    /// the rows beneath it.
+    pub fn from_lfs_files(files: &[crate::lfs::listing::LfsFile]) -> Self {
+        Self(
+            files
+                .iter()
+                .filter(|file| file.state == crate::lfs::listing::LfsFileState::Virtual)
+                .map(|file| (file.path.clone(), file.size_bytes))
+                .collect(),
+        )
+    }
+
+    /// Index paths and pointer sizes the caller already has, `/`-joined and
+    /// profile-relative like every other key in this module.
+    pub fn from_paths(paths: BTreeMap<String, u64>) -> Self {
+        Self(paths)
+    }
+
+    /// A caller that did not read the inventory. Named rather than derived for
+    /// the reason [`MaterializedView::none`] gives.
+    pub fn none() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    /// How many virtual paths sit beneath `dir`, and how many bytes their
+    /// pointers name. `dir` is a `/`-joined profile-relative directory; the
+    /// probe is one ordered range over `dir/`, so a thousand folder rows
+    /// against a forty-thousand-path inventory stay linear in the matches.
+    pub fn beneath(&self, dir: &str) -> (u32, u64) {
+        let mut prefix = String::with_capacity(dir.len() + 1);
+        prefix.push_str(dir);
+        prefix.push('/');
+        let mut children: u32 = 0;
+        let mut bytes: u64 = 0;
+        for (path, size) in self
+            .0
+            .range::<String, _>((Bound::Included(&prefix), Bound::Unbounded))
+        {
+            if !path.starts_with(prefix.as_str()) {
+                break;
+            }
+            children = children.saturating_add(1);
+            bytes = bytes.saturating_add(*size);
+        }
+        (children, bytes)
+    }
+}
+
 /// One directory's worth of entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowseDirectory {
@@ -737,9 +837,10 @@ pub fn plain_segments(subpath: &str) -> Result<Vec<&OsStr>, BrowseRefusal> {
 /// `subpath` is `""` for the profile root and otherwise a `/`-joined path this
 /// module previously handed out. `excludes` is compiled by the caller so a
 /// surface expanding a tree pays for the glob compilation once rather than per
-/// click. `pending` is the engine's own pending list and `materialized` its
-/// `materialized` ledger, both gathered once by the caller for the same reason
-/// and read here rather than re-derived.
+/// click. `pending` is the engine's own pending list, `materialized` its
+/// `materialized` ledger and `virtual_paths` its inventory of pointer paths,
+/// all gathered once by the caller for the same reason and read here rather
+/// than re-derived.
 ///
 /// The order of the checks is the contract:
 ///
@@ -754,6 +855,7 @@ pub fn browse(
     excludes: &ExcludeSet,
     pending: &PendingView,
     materialized: &MaterializedView,
+    virtual_paths: &VirtualView,
 ) -> Result<BrowseListing, BrowseRefusal> {
     let resolved = resolve(&profile.local_path, subpath)?;
 
@@ -785,6 +887,7 @@ pub fn browse(
         excludes,
         pending,
         materialized,
+        virtual_paths,
     )
 }
 
@@ -803,19 +906,28 @@ pub fn browse(
 /// knows nothing about sync must say so with [`PendingView::Unavailable`]
 /// rather than be handed an empty [`PendingView::Known`] — an empty known list
 /// marks every entry `Synced`, which is the exact lie [`EntrySyncStatus`]
-/// documents against. `materialized` is asked for as well and for the same
-/// reason, with the difference [`MaterializedView`] documents: its empty value
-/// is not a lie, only a less specific truth, which is why it has no
-/// "unavailable" spelling to reach for.
+/// documents against. `materialized` and `virtual_paths` are asked for as
+/// well and for the same reason, with the difference [`MaterializedView`]
+/// documents: their empty values are not a lie, only a less specific truth,
+/// which is why neither has an "unavailable" spelling to reach for.
 pub fn browse_root(
     root: &Path,
     subpath: &str,
     excludes: &ExcludeSet,
     pending: &PendingView,
     materialized: &MaterializedView,
+    virtual_paths: &VirtualView,
 ) -> Result<BrowseListing, BrowseRefusal> {
     let resolved = resolve(root, subpath)?;
-    list_resolved(root, resolved, subpath, excludes, pending, materialized)
+    list_resolved(
+        root,
+        resolved,
+        subpath,
+        excludes,
+        pending,
+        materialized,
+        virtual_paths,
+    )
 }
 
 /// Read the directory [`resolve`] already located, or say why there is none.
@@ -832,6 +944,7 @@ fn list_resolved(
     excludes: &ExcludeSet,
     pending: &PendingView,
     materialized: &MaterializedView,
+    virtual_paths: &VirtualView,
 ) -> Result<BrowseListing, BrowseRefusal> {
     let Some(dir) = resolved else {
         return Ok(BrowseListing::Missing);
@@ -958,6 +1071,14 @@ fn list_resolved(
                 .map(std::fs::Metadata::len)
         });
         let lfs_oid = pointer.map(|pointer| pointer.oid);
+        // One range probe per folder row and nothing for a file: the inventory
+        // is the index's, so a folder's count is recursive without this
+        // listing descending anywhere (Epic 69, AD-219).
+        let (virtual_children, virtual_bytes) = if is_dir {
+            virtual_paths.beneath(&relative_path)
+        } else {
+            (0, 0)
+        };
         entries.push(BrowseEntry {
             name,
             relative_path,
@@ -968,6 +1089,8 @@ fn list_resolved(
             mtime_ms,
             sync,
             unspellable,
+            virtual_children,
+            virtual_bytes,
         });
     }
 
@@ -1097,8 +1220,18 @@ pub fn status_of(
 ///    also what keeps a ledger row from ever reaching an excluded path: a
 ///    pattern added after content landed does not un-record the landing, and
 ///    "excluded" is still the answer somebody has to act on.
-/// 2. **An engine that could not answer says so**, rather than letting the
-///    absence of a pending row read as success.
+/// 2. **An engine that could not answer says so** — after one look at the
+///    bytes (Epic 69, AD-220). Pointer text in a repository is a fact about
+///    the disk, not about the engine, and it was the fact the owner needed
+///    told: on a folder whose walk takes minutes every row read `Unknown`,
+///    so no row was virtual and nothing offered to fetch it. The probe runs
+///    here only under [`PendingView::Unavailable`], which since AD-220 is a
+///    profile that has *never* answered rather than one that is late; it
+///    accepts rung 5's one false positive — an untracked file somebody wrote
+///    pointer text into — because no pending list exists to rule it out, and
+///    a fetch that refuses is a smaller lie than a state that says nothing.
+///    Everything else the engine would have said is still `Unknown`, rather
+///    than the absence of a pending row reading as success.
 /// 3. **Content arriving beats waiting** (Story 56.7). A queued LFS download
 ///    over a path whose worktree bytes are still the pointer is not "waiting
 ///    to sync" — it is this content on its way in, the one thing in this enum
@@ -1183,7 +1316,14 @@ fn classify(
         return EntrySyncStatus::Excluded;
     }
     if matches!(pending, PendingView::Unavailable) {
-        return EntrySyncStatus::Unknown;
+        // The one look at the bytes rung 2 documents. A directory never
+        // reaches the probe (`None`), and a folder in no repository has no
+        // remote for the pointer to point at.
+        return if in_repository && worktree_bytes() == Some(true) {
+            EntrySyncStatus::Virtual
+        } else {
+            EntrySyncStatus::Unknown
+        };
     }
     if let Some(reason) = pending.waiting(relative_path, is_dir) {
         // A queued LFS download whose worktree bytes are still the pointer is
@@ -1249,6 +1389,220 @@ fn classify(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The marks cache (Epic 69, AD-220)
+// ---------------------------------------------------------------------------
+
+/// One profile's marks, as a listing consumes them.
+///
+/// The two engine-derived inputs a Files listing needs beside its `read_dir`,
+/// plus the one fact about their age a surface may render: `stale` is set
+/// when the pending half is older than the cache's freshness window — the
+/// engine was asked for a fresher one and had not answered by the time the
+/// listing had to go out. The marks are still the last thing the engine
+/// said, which is why they are served at all; before AD-220 that listing read
+/// `Unknown` on every row, and on the owner's folder — whose walk takes
+/// minutes — that was every listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarksAnswer {
+    pub pending: PendingView,
+    pub virtual_paths: VirtualView,
+    pub stale: bool,
+}
+
+/// What a listing should do about one profile's marks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarksPlan {
+    /// Use this answer as it stands — fresh, or the last one there is, marked.
+    Serve(MarksAnswer),
+    /// A walk is already running and nothing has ever been answered for this
+    /// profile. The listing says so rather than claiming every entry is
+    /// clean; this is the only plan that yields [`PendingView::Unavailable`].
+    Wait,
+    /// Nothing fresh and nobody walking: start one. The caller runs the walk
+    /// and hands its result to [`MarksCache::finish`] under this generation.
+    /// `refresh_virtual` says whether the inventory half is due too — it is
+    /// the costlier half and has its own, longer window.
+    Walk {
+        generation: u64,
+        refresh_virtual: bool,
+    },
+}
+
+#[derive(Default)]
+struct MarksSlot {
+    /// The last pending answer and when it arrived — stamped when the answer
+    /// lands, not when it was asked for, so a walk that took two minutes does
+    /// not hand back a view that is two minutes stale the moment it lands.
+    pending: Option<(Instant, PendingView)>,
+    /// The last inventory and when it arrived.
+    virtual_paths: Option<(Instant, VirtualView)>,
+    /// The generation of the walk in flight, if one is.
+    walking: Option<u64>,
+    /// The next generation to hand out.
+    generation: u64,
+    /// Set by [`MarksCache::forget`]: both halves count as outside their
+    /// windows whatever their stamps say, until a walk lands.
+    expired: bool,
+}
+
+/// The last marks per profile, and whether a walk is computing fresher ones
+/// (AD-220).
+///
+/// **A mark that was known stays known.** The policy this type holds, and the
+/// reason it lives in this crate rather than beside the command that calls
+/// it: a listing served from here never reads `Unknown` on a profile that
+/// has answered once. When the engine is late the last answer is served and
+/// marked [`MarksAnswer::stale`]; when a walk is already running the same;
+/// `Unknown` is reserved for a profile that has never answered at all. The
+/// shell that owns the clock, the engine and the timeout does exactly three
+/// things with this — [`Self::plan`], [`Self::finish`], [`Self::last`] — and
+/// every branch of the policy is asserted here with no engine, no disk and
+/// no clock.
+///
+/// # Two windows, not one
+///
+/// The pending half decorates rows a person is looking at and is cheap to
+/// re-ask once the engine's own once-a-minute walk floor is in force, so its
+/// window is short — long enough to cover the burst that matters, a pane
+/// refresh re-reading every open directory at once. The inventory half is
+/// [`crate::engine::Engine::lfs_files`], one object-header lookup per index
+/// entry, which its own doc records as "the honest figure for a verb a human
+/// invokes, and the reason nothing calls it on a tick"; so it is refreshed on
+/// its own longer window, and [`Self::forget`] is how a verb that changed the
+/// inventory — a fetch, a release — asks for it sooner.
+///
+/// # The generation
+///
+/// Each walk is handed a number, and a result is stored only under the
+/// number of the walk in flight, so a walk the cache has stopped waiting for
+/// — one that panicked and was restarted — cannot land a late answer over a
+/// fresher one.
+pub struct MarksCache {
+    slots: HashMap<String, MarksSlot>,
+    ttl: Duration,
+    virtual_ttl: Duration,
+}
+
+impl MarksCache {
+    /// A cache whose pending answers are fresh for `ttl` and whose inventory
+    /// is fresh for `virtual_ttl`.
+    pub fn new(ttl: Duration, virtual_ttl: Duration) -> Self {
+        Self {
+            slots: HashMap::new(),
+            ttl,
+            virtual_ttl,
+        }
+    }
+
+    /// Decide what a listing of `id` should do at `now`. A [`MarksPlan::Walk`]
+    /// marks the slot as walking; the caller owes it a [`Self::finish`].
+    pub fn plan(&mut self, id: &str, now: Instant) -> MarksPlan {
+        let ttl = self.ttl;
+        let virtual_ttl = self.virtual_ttl;
+        let slot = self.slots.entry(id.to_owned()).or_default();
+        let fresh = !slot.expired
+            && slot
+                .pending
+                .as_ref()
+                .is_some_and(|(at, _)| now.duration_since(*at) < ttl);
+        let virtual_fresh = !slot.expired
+            && slot
+                .virtual_paths
+                .as_ref()
+                .is_some_and(|(at, _)| now.duration_since(*at) < virtual_ttl);
+        if fresh && virtual_fresh {
+            return MarksPlan::Serve(Self::answer(slot, false));
+        }
+        if slot.walking.is_some() {
+            // One walk at a time per folder. A second would read the same
+            // tree off the same disk for the same answer, and on the hardware
+            // this was written for that is the difference the transfers feel.
+            return match slot.pending {
+                Some(_) => MarksPlan::Serve(Self::answer(slot, !fresh)),
+                None => MarksPlan::Wait,
+            };
+        }
+        let generation = slot.generation;
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.walking = Some(generation);
+        MarksPlan::Walk {
+            generation,
+            refresh_virtual: !virtual_fresh,
+        }
+    }
+
+    /// Land a walk's result at `now`. `pending` is `None` when the engine
+    /// could not answer, and the last answer stands — an engine that failed
+    /// once does not un-know what it said before. `virtual_paths` is `None`
+    /// when the walk was not asked for the inventory, and the last one stands
+    /// too. Returns `false` when the walk was not the one in flight, in which
+    /// case nothing was stored.
+    pub fn finish(
+        &mut self,
+        id: &str,
+        generation: u64,
+        pending: Option<PendingView>,
+        virtual_paths: Option<VirtualView>,
+        now: Instant,
+    ) -> bool {
+        let slot = self.slots.entry(id.to_owned()).or_default();
+        if slot.walking != Some(generation) {
+            return false;
+        }
+        slot.walking = None;
+        slot.expired = false;
+        if let Some(view) = pending {
+            slot.pending = Some((now, view));
+        }
+        if let Some(inventory) = virtual_paths {
+            slot.virtual_paths = Some((now, inventory));
+        }
+        true
+    }
+
+    /// The last answer for `id`, whatever its age, marked stale when the
+    /// pending half is outside the freshness window at `now`. What a caller
+    /// serves when the walk it started has not returned in time; `None` when
+    /// this profile has never answered, which is the one case that reads
+    /// `Unknown`.
+    pub fn last(&self, id: &str, now: Instant) -> Option<MarksAnswer> {
+        let slot = self.slots.get(id)?;
+        let (at, _) = slot.pending.as_ref()?;
+        Some(Self::answer(
+            slot,
+            slot.expired || now.duration_since(*at) >= self.ttl,
+        ))
+    }
+
+    /// Expire `id`'s answers without discarding them: the next listing walks
+    /// again (both halves), and until that walk lands the old answers are
+    /// served marked stale. A walk already in flight keeps running and still
+    /// lands — it started after the profile's last change or it did not, and
+    /// either way it is fresher than what is held.
+    pub fn forget(&mut self, id: &str) {
+        if let Some(slot) = self.slots.get_mut(id) {
+            slot.expired = true;
+        }
+    }
+
+    fn answer(slot: &MarksSlot, stale: bool) -> MarksAnswer {
+        MarksAnswer {
+            pending: slot
+                .pending
+                .as_ref()
+                .map(|(_, view)| view.clone())
+                .unwrap_or(PendingView::Unavailable),
+            virtual_paths: slot
+                .virtual_paths
+                .as_ref()
+                .map(|(_, inventory)| inventory.clone())
+                .unwrap_or_else(VirtualView::none),
+            stale,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,6 +1642,13 @@ mod tests {
         MaterializedView::none()
     }
 
+    /// A caller that did not read the pointer inventory — the same polarity
+    /// as [`nothing_materialized`]: every folder's count reads `0`, which is
+    /// less specific and not a lie.
+    fn nothing_virtual() -> VirtualView {
+        VirtualView::none()
+    }
+
     fn names(listing: &BrowseListing) -> Vec<String> {
         match listing {
             BrowseListing::Listed(dir) => dir.entries.iter().map(|e| e.name.clone()).collect(),
@@ -1319,6 +1680,7 @@ mod tests {
             &excludes,
             &pending,
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("listing");
         let BrowseListing::Listed(dir) = &listing else {
@@ -1431,6 +1793,7 @@ mod tests {
                 &no_excludes(),
                 &nothing_pending(),
                 &nothing_materialized(),
+                &nothing_virtual(),
             ),
             Err(BrowseRefusal::EscapesAfterResolution {
                 subpath: "escape".to_owned()
@@ -1452,7 +1815,8 @@ mod tests {
                 "../..",
                 &no_excludes(),
                 &nothing_pending(),
-                &nothing_materialized()
+                &nothing_materialized(),
+                &nothing_virtual(),
             ),
             Err(BrowseRefusal::Escapes {
                 subpath: "../..".to_owned()
@@ -1474,7 +1838,8 @@ mod tests {
                 "",
                 &no_excludes(),
                 &nothing_pending(),
-                &nothing_materialized()
+                &nothing_materialized(),
+                &nothing_virtual(),
             )
             .expect("no refusal"),
             BrowseListing::MediaAbsent
@@ -1491,6 +1856,7 @@ mod tests {
                 &no_excludes(),
                 &nothing_pending(),
                 &nothing_materialized(),
+                &nothing_virtual(),
             )
             .expect("no refusal"),
             BrowseListing::Listed(BrowseDirectory {
@@ -1519,7 +1885,8 @@ mod tests {
                 "",
                 &no_excludes(),
                 &nothing_pending(),
-                &nothing_materialized()
+                &nothing_materialized(),
+                &nothing_virtual(),
             )
             .expect("no refusal"),
             BrowseListing::MediaUnexpected { .. }
@@ -1543,7 +1910,8 @@ mod tests {
                     "",
                     &no_excludes(),
                     &nothing_pending(),
-                    &nothing_materialized()
+                    &nothing_materialized(),
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
@@ -1561,6 +1929,7 @@ mod tests {
                 &no_excludes(),
                 &nothing_pending(),
                 &nothing_materialized(),
+                &nothing_virtual(),
             )
             .expect("no refusal"),
             BrowseListing::Missing
@@ -1586,6 +1955,7 @@ mod tests {
                     &no_excludes(),
                     &nothing_pending(),
                     &nothing_materialized(),
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
@@ -1617,6 +1987,7 @@ mod tests {
             &excludes,
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal") else {
             panic!("expected a listing");
@@ -1651,6 +2022,7 @@ mod tests {
                     &no_excludes(),
                     &nothing_pending(),
                     &nothing_materialized(),
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
@@ -1670,6 +2042,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal");
         let BrowseListing::Listed(dir) = listing else {
@@ -1710,6 +2083,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal");
         let BrowseListing::Listed(dir) = listing else {
@@ -1785,6 +2159,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal") else {
             panic!("expected a listing");
@@ -1876,6 +2251,7 @@ mod tests {
             &excludes,
             &pending,
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal");
         assert_eq!(
@@ -1990,6 +2366,7 @@ mod tests {
             &no_excludes(),
             &pending,
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal");
         assert_eq!(
@@ -2061,6 +2438,7 @@ mod tests {
             &no_excludes(),
             &pending,
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal");
         assert_eq!(
@@ -2117,6 +2495,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &ledger,
+            &nothing_virtual(),
         )
         .expect("no refusal");
         assert_eq!(
@@ -2190,7 +2569,8 @@ mod tests {
                     "",
                     &excludes,
                     &nothing_pending(),
-                    &ledger
+                    &ledger,
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
@@ -2208,7 +2588,8 @@ mod tests {
                     "bundle",
                     &excludes,
                     &nothing_pending(),
-                    &ledger
+                    &ledger,
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
@@ -2306,8 +2687,15 @@ mod tests {
         let ledger =
             MaterializedView::from_paths(std::collections::HashSet::from(["held.mp4".to_owned()]));
 
-        let listing = browse(&profile(root.path()), "", &no_excludes(), &pending, &ledger)
-            .expect("no refusal");
+        let listing = browse(
+            &profile(root.path()),
+            "",
+            &no_excludes(),
+            &pending,
+            &ledger,
+            &nothing_virtual(),
+        )
+        .expect("no refusal");
         assert_eq!(
             marks(&listing)
                 .into_iter()
@@ -2371,6 +2759,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal") else {
             panic!("expected a listing");
@@ -2407,6 +2796,7 @@ mod tests {
                     &no_excludes(),
                     &nothing_pending(),
                     &nothing_materialized(),
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
@@ -2414,9 +2804,20 @@ mod tests {
             "no repository, so nothing is on a remote yet"
         );
 
-        // ...and with a repository present but the engine mute, `Unknown` still
-        // wins: a mark nobody can stand behind is not replaced by a cheerful
-        // one just because the bytes happen to parse.
+        // ...and with a repository present but the engine mute, the pointer on
+        // disk is enough: `Virtual` since Story 69.2 (AD-220).
+        //
+        // This assertion said `Unknown` until then, on the rule that a mark
+        // nobody can stand behind is not replaced by a cheerful one just
+        // because the bytes happen to parse. The owner's folder is what
+        // changed it: 155k entries, the marks walk over its 3 s budget, and
+        // EVERY row read "Sync state unknown" with no Fetch verb anywhere —
+        // so the careful mark hid the one fact the row was for. Pointer text
+        // inside a repository is not a guess: the file IS the pointer, which
+        // is what `Virtual` means (FR-331). What the engine alone can say —
+        // whether the object is on the remote, whether a download is queued —
+        // is what the later rungs are for, and a stale answer now carries
+        // `MarksAnswer::stale` instead.
         std::fs::create_dir(root.path().join(".git")).expect("repo marker");
         assert_eq!(
             marks(
@@ -2426,10 +2827,11 @@ mod tests {
                     &no_excludes(),
                     &PendingView::Unavailable,
                     &nothing_materialized(),
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
-            vec![("away.mp4".to_owned(), EntrySyncStatus::Unknown)]
+            vec![("away.mp4".to_owned(), EntrySyncStatus::Virtual)]
         );
     }
 
@@ -2445,6 +2847,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal") else {
             panic!("expected a listing");
@@ -2464,6 +2867,7 @@ mod tests {
                 &no_excludes(),
                 &nothing_pending(),
                 &nothing_materialized(),
+                &nothing_virtual(),
             )
             .expect("no refusal"),
             BrowseListing::Missing
@@ -2601,8 +3005,15 @@ mod tests {
 
         let pending = PendingView::from_pending(engine.pending(&p.id).await.expect("pending"));
         let excludes = ExcludeSet::new(&p.excludes).expect("compiles");
-        let listing =
-            browse(&p, "", &excludes, &pending, &nothing_materialized()).expect("no refusal");
+        let listing = browse(
+            &p,
+            "",
+            &excludes,
+            &pending,
+            &nothing_materialized(),
+            &nothing_virtual(),
+        )
+        .expect("no refusal");
 
         assert_eq!(
             marks(&listing),
@@ -2633,8 +3044,15 @@ mod tests {
         // roll-up, carries git's own word for why it is waiting.
         assert_eq!(
             marks(
-                &browse(&p, "notes", &excludes, &pending, &nothing_materialized())
-                    .expect("no refusal")
+                &browse(
+                    &p,
+                    "notes",
+                    &excludes,
+                    &pending,
+                    &nothing_materialized(),
+                    &nothing_virtual()
+                )
+                .expect("no refusal")
             ),
             vec![
                 (
@@ -2678,7 +3096,15 @@ mod tests {
         );
 
         for subpath in ["", "notes", "archive"] {
-            browse(&p, subpath, &excludes, &pending, &nothing_materialized()).expect("no refusal");
+            browse(
+                &p,
+                subpath,
+                &excludes,
+                &pending,
+                &nothing_materialized(),
+                &nothing_virtual(),
+            )
+            .expect("no refusal");
         }
 
         assert_eq!(
@@ -2726,6 +3152,7 @@ mod tests {
                     &ExcludeSet::new(&p.excludes).expect("compiles"),
                     &PendingView::from_pending(files),
                     &nothing_materialized(),
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
@@ -2752,6 +3179,7 @@ mod tests {
                     &excludes,
                     &PendingView::Unavailable,
                     &nothing_materialized(),
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
@@ -2787,7 +3215,8 @@ mod tests {
                     "",
                     &no_excludes(),
                     &pending,
-                    &nothing_materialized()
+                    &nothing_materialized(),
+                    &nothing_virtual(),
                 )
                 .expect("no refusal")
             ),
@@ -2820,6 +3249,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal");
         let through_a_root = browse_root(
@@ -2828,6 +3258,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal");
 
@@ -2854,7 +3285,8 @@ mod tests {
                         subpath,
                         &no_excludes(),
                         &nothing_pending(),
-                        &nothing_materialized()
+                        &nothing_materialized(),
+                        &nothing_virtual(),
                     ),
                     Err(BrowseRefusal::Escapes { .. })
                 ),
@@ -2875,7 +3307,8 @@ mod tests {
                 "gone",
                 &no_excludes(),
                 &nothing_pending(),
-                &nothing_materialized()
+                &nothing_materialized(),
+                &nothing_virtual(),
             )
             .expect("no refusal"),
             BrowseListing::Missing,
@@ -2901,6 +3334,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         );
 
         // Restored before the assertion so a failure does not leave the temp
@@ -2940,6 +3374,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal") else {
             panic!("expected a listing");
@@ -2999,6 +3434,7 @@ mod tests {
             &no_excludes(),
             &nothing_pending(),
             &nothing_materialized(),
+            &nothing_virtual(),
         )
         .expect("no refusal") else {
             panic!("expected a listing");

@@ -2627,6 +2627,11 @@ impl Engine {
             // verification writes nothing at all, so there is not even a
             // deletion for a provenance to be attached to.
             tasks::TaskKind::Verify => self.perform_verify_task(task, profiles).await,
+            // No `source` either, and no folder walk at all: a bot run reads
+            // one prompt file and writes nothing to the worktree. It is the
+            // one kind whose work happens outside this crate (AD-224), so the
+            // arm is a resolve, a read and one call through the port.
+            tasks::TaskKind::Bot => self.perform_bot_task(task, profiles).await,
         }
     }
 
@@ -3067,6 +3072,148 @@ impl Engine {
             None if walked == 0 => (tasks::TaskOutcome::Deferred, detail),
             None => (tasks::TaskOutcome::Ok, detail),
         }
+    }
+
+    /// One prompt, asked of one bot, through the port (Story 69.4, AD-224).
+    ///
+    /// Everything this arm does itself is a path and a file: it finds the
+    /// profile, resolves `prompt_subpath` inside it through
+    /// [`crate::browse::resolve`] — the same containment every other path in
+    /// this crate goes through (AD-65), so a row edited by hand cannot read
+    /// `../../.ssh/id_rsa` — and reads the text. It parses nothing: markdown
+    /// and frontmatter are `keeper-core`'s and this crate is
+    /// `keeper-core`-free (AD-40).
+    ///
+    /// A host with no runner is the ordinary case, not an error condition:
+    /// `keeper-syncd` has none, so it records
+    /// [`crate::platform::NO_BOT_RUNNER_SENTENCE`] and leaves the row for the
+    /// host that can (NFR-43's shape — listed, never run, and now also
+    /// *said*). No `Busy`: this kind takes no reservation.
+    async fn perform_bot_task(
+        &self,
+        task: &db::TaskRow,
+        profiles: &[SyncProfile],
+    ) -> (tasks::TaskOutcome, String) {
+        let (Some(bot_id), Some(prompt_subpath)) =
+            (task.bot_id.as_deref(), task.prompt_subpath.as_deref())
+        else {
+            // A bot row without both is a row the save door refuses; reaching
+            // here means the database was edited by something else.
+            return (
+                tasks::TaskOutcome::Failed,
+                "this bot task names no bot or no prompt file".to_owned(),
+            );
+        };
+        let Some(profile_id) = task.profile_id.as_deref() else {
+            // Host-wide has no meaning for a prompt: a prompt file lives in
+            // exactly one folder.
+            return (
+                tasks::TaskOutcome::Failed,
+                "a bot task names one folder; this row names none".to_owned(),
+            );
+        };
+        let Some(profile) = profiles.iter().find(|profile| profile.id == profile_id) else {
+            return (
+                tasks::TaskOutcome::Failed,
+                format!("no such folder: {profile_id}"),
+            );
+        };
+        if !profile.enabled {
+            // A pause is an answer, as it is for every other kind.
+            return (
+                tasks::TaskOutcome::Deferred,
+                format!("{} is paused, so nothing was asked", profile.name),
+            );
+        }
+        let resolved = match crate::browse::resolve(&profile.local_path, prompt_subpath) {
+            Err(refusal) => {
+                return (tasks::TaskOutcome::Failed, refusal.to_string());
+            }
+            Ok(None) => {
+                return (
+                    tasks::TaskOutcome::Failed,
+                    format!("{prompt_subpath} is not in {}", profile.name),
+                );
+            }
+            Ok(Some(path)) => path,
+        };
+        // A virtual prompt would be its pointer text, which is not a prompt.
+        // Reading it as one would send 130 bytes of `oid sha256:…` to a model,
+        // so the refusal names what to do instead.
+        let prompt_text = match std::fs::read_to_string(&resolved) {
+            Ok(text) => text,
+            Err(error) => {
+                return (
+                    tasks::TaskOutcome::Failed,
+                    format!("could not read {prompt_subpath}: {error}"),
+                );
+            }
+        };
+        if crate::lfs::pointer::Pointer::parse(prompt_text.as_bytes()).is_some() {
+            return (
+                tasks::TaskOutcome::Failed,
+                format!("{prompt_subpath} is not fetched yet, so its text is a pointer; fetch it and run again"),
+            );
+        }
+        let Some(runner) = self.platform.bot_task_runner() else {
+            return (
+                tasks::TaskOutcome::Deferred,
+                crate::platform::NO_BOT_RUNNER_SENTENCE.to_owned(),
+            );
+        };
+        let record = runner
+            .run(crate::platform::BotTaskSpec {
+                task_id: task.id.clone(),
+                profile_id: profile.id.clone(),
+                bot_id: bot_id.to_owned(),
+                model: task.model.clone(),
+                prompt_subpath: prompt_subpath.to_owned(),
+                prompt_text,
+            })
+            .await;
+        let detail = Self::bot_run_detail(&record);
+        (record.outcome, detail)
+    }
+
+    /// The one line `task_runs.detail` keeps for a bot run, until Story 69.5
+    /// writes the log the session keeps.
+    ///
+    /// The answer's opening is what a person recognises the run by, so it
+    /// leads; the counts follow. An error record has no answer, so its
+    /// sentences are the line — the first two, because a detail is one line
+    /// and a stream that broke usually says the same thing twice.
+    fn bot_run_detail(record: &crate::platform::BotRunRecord) -> String {
+        if !record.errors.is_empty() {
+            return record
+                .errors
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+        }
+        let head: String = record
+            .answer
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let head = if head.chars().count() > 80 {
+            let mut cut: String = head.chars().take(80).collect();
+            cut.push('…');
+            cut
+        } else if head.is_empty() {
+            "no answer arrived".to_owned()
+        } else {
+            head
+        };
+        let mut parts = vec![format!("{:.1}s", record.ms as f64 / 1000.0)];
+        if record.tool_calls > 0 {
+            parts.push(format!("{} tool calls", record.tool_calls));
+        }
+        if let Some(tokens) = record.completion_tokens {
+            parts.push(format!("{tokens} tokens"));
+        }
+        format!("{head} — {}", parts.join(", "))
     }
 
     /// Who holds a lease, as something a reader can act on.
@@ -5655,6 +5802,29 @@ impl Engine {
     /// spans an await point.
     fn ensure_repo(&self, profile: &SyncProfile) -> Result<()> {
         self.open_repo(profile)?;
+        // The phone finishes its own first checkout (Epic 69, AD-222).
+        //
+        // A clone killed between the fetch and the index write leaves `HEAD`
+        // holding a tree and the index holding nothing — see
+        // [`git::repo::checkout_is_unfinished`]. On a desktop the supervisor's
+        // `tick_profile` gates on exactly this predicate and drains a
+        // `WorkKind::CHECKOUT` unit through `do_checkout`; the phone runs no
+        // supervisor and drives `sync_once` only, so the repair had no door
+        // there: every pull-to-refresh reached `collect_stable_changes`, which
+        // refused with "keeper restores the missing files on its next pass" —
+        // a pass that, on a phone, never came. So the same predicate is asked
+        // here, before the commit leg, and the same repair runs inline. The
+        // predicate's healthy answer is one `exists()` and a 12-byte header
+        // read, which is what lets it sit on a path every sync takes.
+        //
+        // `Gix` only: the desktop's repair stays with the journal, whose
+        // `reschedule_after` backoff is what paces a clone the remote keeps
+        // refusing, and a second inline caller would race the unit it
+        // enqueues. A refusal here carries `finish_first_checkout`'s own
+        // sentence, which names what was and was not written.
+        if self.git.engine() == GitEngine::Gix && self.first_checkout_is_unfinished(profile) {
+            self.finish_first_checkout(profile)?;
+        }
         self.ensure_lane(profile)
     }
 
@@ -10937,6 +11107,75 @@ impl Engine {
         })
     }
 
+    /// Bring one path's content here before a reader hands it over (Story
+    /// 69.1, AD-223).
+    ///
+    /// **The rule the phone has had since 66.3, moved into the crate every
+    /// host compiles.** `sync_open_entry`, `sync_read_text`,
+    /// `sync_read_document` and `keeper-file://` all resolve a subpath and
+    /// serve whatever bytes are at it — and for a virtual entry those bytes are
+    /// ~130 characters of pointer text, which the OS opener shows as a broken
+    /// file and the in-app readers show as a document about `oid sha256:…`.
+    /// The form beside `virtualPatterns` had promised the opposite. This is the
+    /// one call that makes the promise true, and every reader in the shell
+    /// crate — which does not build on Linux — is a call site of it and decides
+    /// nothing (AD-55, AD-56).
+    ///
+    /// `resolved` is the absolute path the caller has ALREADY put through
+    /// [`crate::browse::resolve`]; this function composes no path of its own
+    /// (AD-65). It is used for one `stat` and a read of at most
+    /// `MAX_POINTER_BYTES` — [`lfs::stage::worktree_pointer`], the probe the
+    /// listing's own mark uses — so an ordinary file costs a stat and nothing
+    /// else, and `Ok(None)` says the bytes at the path are the content: serve
+    /// them as they are. This is the same pre-check
+    /// [`crate::copy::ContentSource::materialize`] makes, and for the same
+    /// reason: by the time `materialize_entry` answers it has already queued,
+    /// labelled and promoted a unit, so asking it about a file that is not a
+    /// pointer would be a journal write per double-click.
+    ///
+    /// A pointer goes through [`Self::materialize_entry_now`] — the request
+    /// AND the bounded drain that satisfies it — because an opener handed a
+    /// path has to find the content there when it looks, and "queued, come
+    /// back later" is not a file. [`lfs::hydrate::KeepFor::Unspecified`], as
+    /// the phone's tap sends: opening a file is a use, not a statement about
+    /// how long the person wants it, so no deadline is written and a standing
+    /// one is left alone; the release clock moves through the caller's own
+    /// [`Self::note_use`], exactly as before. [`SyncSource::Manual`]: a person
+    /// asked for this file by opening it.
+    ///
+    /// A transfer that did not land in this run — the remote unreachable, the
+    /// object gone — is [`lfs::hydrate::ContentRefusal::ContentNotHere`], the
+    /// sentence written for exactly "keeper refused rather than pass off the
+    /// pointer as the file", rather than `Ok` with a `Queued` outcome a caller
+    /// could mistake for content. Every other refusal (`Busy` while the folder
+    /// is mid-pass, the cone, a paused folder) is `materialize_entry_now`'s
+    /// own and passes through by name.
+    pub async fn materialize_before_serving(
+        &self,
+        id: &str,
+        subpath: &str,
+        resolved: &Path,
+    ) -> Result<Option<lfs::hydrate::Materialization>> {
+        use lfs::hydrate::{ContentRefusal, KeepFor, MaterializeOutcome};
+
+        let is_pointer = std::fs::symlink_metadata(resolved)
+            .ok()
+            .and_then(|meta| lfs::stage::worktree_pointer(resolved, &meta))
+            .is_some();
+        if !is_pointer {
+            return Ok(None);
+        }
+        let landed = self
+            .materialize_entry_now(id, subpath, SyncSource::Manual, KeepFor::Unspecified)
+            .await?;
+        if landed.outcome == MaterializeOutcome::Queued {
+            return Err(SyncError::Refused(ContentRefusal::ContentNotHere {
+                path: subpath.to_owned(),
+            }));
+        }
+        Ok(Some(landed))
+    }
+
     /// Of the downloads this profile owes, how many are still outstanding?
     ///
     /// [`Self::lfs_uploads_outstanding`]'s mirror and it counts the same way —
@@ -13833,6 +14072,9 @@ mod tests {
             id: id.to_owned(),
             profile_id: profile_id.map(str::to_owned),
             kind: tasks::TaskKind::Sync,
+            bot_id: None,
+            prompt_subpath: None,
+            model: None,
             schedule: Some(schedule.to_owned()),
             mode: tasks::TaskMode::Scheduled,
             next_due_ms: None,
@@ -22117,6 +22359,7 @@ mod tests {
             // and never reaches the ledger. Saying "no rows" is therefore the
             // honest input as well as the cheap one.
             &crate::browse::MaterializedView::none(),
+            &crate::browse::VirtualView::none(),
         )
         .expect("no refusal") else {
             panic!("expected a listing");
@@ -25382,6 +25625,100 @@ mod tests {
             ),
             Err(SyncError::Config(_))
         ));
+    }
+
+    /// Opening a virtual file fetches it, on every platform (Story 69.1,
+    /// AD-223).
+    ///
+    /// The rule every reader in the shell crate now calls before it serves,
+    /// driven here because that crate does not build on Linux: a pointer whose
+    /// object is in the local store is published before the caller looks, the
+    /// same path asked again is content and costs nothing, and a file that
+    /// never was a pointer is left exactly as it is — no journal row, no
+    /// refusal, no "not tracked" for the README beside the video.
+    #[tokio::test]
+    async fn opening_a_pointer_puts_its_content_where_the_opener_will_look() {
+        use lfs::hydrate::MaterializeOutcome;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.ensure_repo(&p).expect("adopt");
+        let content = vec![7u8; 2_048];
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        store.ensure_layout().expect("store layout");
+        let (oid, size) = store
+            .insert_streaming(std::io::Cursor::new(content.clone()))
+            .expect("seed");
+        let pointer = lfs::pointer::Pointer::new(oid, size);
+        std::fs::create_dir_all(p.local_path.join("media")).expect("zone");
+        std::fs::write(p.local_path.join("media/clip.mp4"), pointer.render())
+            .expect("write pointer");
+        let repo = git::repo::open(&p.local_path, false).expect("open");
+        let changes = git::commit::StagedChange {
+            added: vec![PathBuf::from("media/clip.mp4"), PathBuf::from("keep.txt")],
+            ..Default::default()
+        };
+        let signature = gix::actor::Signature {
+            name: "t".into(),
+            email: "t@example.invalid".into(),
+            time: gix::date::Time::new(1_700_000_000, 0),
+        };
+        let provenance = Provenance::new(
+            &p.name,
+            "dev",
+            "01JDEV",
+            "host",
+            crate::provenance::SyncSource::Cli,
+        );
+        git::commit::stage_and_commit(
+            &repo,
+            &changes,
+            &provenance,
+            &p,
+            &signature,
+            &std::collections::BTreeMap::new(),
+            None,
+        )
+        .expect("commit the pointer");
+        drop(repo);
+
+        let clip = p.local_path.join("media/clip.mp4");
+        let landed = engine
+            .materialize_before_serving(&p.id, "media/clip.mp4", &clip)
+            .await
+            .expect("a pointer whose object is here is published")
+            .expect("and the call reports that it did something");
+        assert_eq!(landed.outcome, MaterializeOutcome::Materialized);
+        assert_eq!(
+            std::fs::read(&clip).expect("read"),
+            content,
+            "the opener finds the content, not 130 bytes of pointer"
+        );
+        assert_eq!(
+            engine
+                .materialize_before_serving(&p.id, "media/clip.mp4", &clip)
+                .await
+                .expect("content is served as it is"),
+            None,
+            "the second open is a read without a fetch"
+        );
+        assert_eq!(
+            engine
+                .materialize_before_serving(&p.id, "keep.txt", &p.local_path.join("keep.txt"))
+                .await
+                .expect("a plain file is never refused for not being a pointer"),
+            None
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("keep.txt")).expect("read"),
+            b"ordinary",
+            "and it is untouched"
+        );
     }
 
     // -----------------------------------------------------------------------

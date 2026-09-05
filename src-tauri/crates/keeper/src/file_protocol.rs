@@ -20,6 +20,7 @@
 //! | is this URL well formed, and what are its two halves | [`keeper_core::file_asset::parse_file_url`] | any machine |
 //! | may this FORMAT's bytes reach the webview | [`keeper_core::file_asset::is_servable_path`] | any machine |
 //! | is this a profile keeper knows, and is this path inside it | [`keeper_sync::file_serve::resolve_served_path`] | any machine |
+//! | is this a pointer, and how is its content fetched first (Story 69.1, AD-223) | [`keeper_sync::engine::Engine::materialize_before_serving`] | any machine |
 //! | what `Content-Type`, what `Range`, what status | [`crate::note_protocol`] | macOS |
 //!
 //! What is left below is the wiring: read the request, hop to the blocking
@@ -50,10 +51,13 @@ pub const SCHEME: &str = keeper_core::file_asset::SCHEME;
 
 /// Entry point invoked from the registered async URI-scheme protocol.
 ///
-/// **Everything after the URL parse runs on the blocking pool.** Listing
-/// profiles opens `sync.db`, and resolving canonicalizes a path that may sit on
-/// a removable or network volume — doing either on the webview thread would
-/// stall the UI on exactly the media the user is trying to watch.
+/// **Everything after the URL parse runs off the webview thread.** Listing
+/// profiles opens `sync.db`, resolving canonicalizes a path that may sit on a
+/// removable or network volume, and — since Story 69.1 — a pointer is fetched
+/// before its bytes are served (AD-223); doing any of it on the webview thread
+/// would stall the UI on exactly the media the user is trying to watch. The
+/// fetch is the engine's own `async` drain and is awaited on the runtime; the
+/// open, the list and the read stay on the blocking pool.
 pub fn handle<R: Runtime>(
     app: AppHandle<R>,
     request: &Request<Vec<u8>>,
@@ -90,18 +94,53 @@ pub fn handle<R: Runtime>(
     };
 
     tauri::async_runtime::spawn(async move {
-        let response = tokio::task::spawn_blocking(move || {
-            let Ok(engine) = crate::sync::engine(platform) else {
-                tracing::info!("keeper-file: the sync engine is unavailable, so nothing is served");
-                return note_protocol::not_found();
-            };
+        let opened = tokio::task::spawn_blocking(move || {
+            let engine = crate::sync::engine(platform).ok()?;
             let profiles: Vec<SyncProfile> = match engine.list_profiles() {
                 Ok(profiles) => profiles,
                 Err(error) => {
                     tracing::info!(%error, "keeper-file: profiles could not be listed");
-                    return note_protocol::not_found();
+                    return None;
                 }
             };
+            Some((engine, profiles))
+        })
+        .await;
+        let (engine, profiles) = match opened {
+            Ok(Some(opened)) => opened,
+            Ok(None) => {
+                tracing::info!("keeper-file: the sync engine is unavailable, so nothing is served");
+                responder.respond(note_protocol::not_found());
+                return;
+            }
+            Err(error) => {
+                tracing::debug!(%error, "keeper-file: open task failed");
+                responder.respond(note_protocol::not_found());
+                return;
+            }
+        };
+        // A pointer is fetched before its bytes are served (Story 69.1,
+        // AD-223): a `<video>` handed 130 bytes of pointer text shows a broken
+        // element and nothing else. `serve` below resolves again and stays
+        // pure; a path this cannot resolve is left for `serve` to refuse with
+        // the one 404, so the log names the refusal exactly once. A fetch the
+        // engine refuses is the same 404 — `ContentNotHere`'s sentence is
+        // "keeper refused rather than pass off the pointer as the file", and a
+        // media element cannot show a sentence.
+        if let Ok(path) = file_serve::resolve_served_path(&profiles, &profile_id, &rel) {
+            if let Err(error) =
+                crate::sync_ipc::fetch_before_serving(&engine, &profile_id, &rel, &path).await
+            {
+                tracing::info!(
+                    profile = %profile_id,
+                    refusal = %error.message,
+                    "keeper-file: the content could not be fetched, so nothing is served"
+                );
+                responder.respond(note_protocol::not_found());
+                return;
+            }
+        }
+        let response = tokio::task::spawn_blocking(move || {
             // A use keeper can observe, so the release clock for this path
             // moves (Story 56.5, AD-126) — but only for the head of a stream.
             // A video scrub issues a Range request per seek, and treating each

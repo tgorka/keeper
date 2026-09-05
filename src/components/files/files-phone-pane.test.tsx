@@ -180,6 +180,8 @@ function entry(
     folderRole: null,
     write: { writable: true, reason: null, caveat: null, caveatShort: null },
     release: null,
+    virtualChildren: 0,
+    virtualBytes: 0,
   };
 }
 

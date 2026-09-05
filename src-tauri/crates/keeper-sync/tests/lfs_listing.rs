@@ -20,7 +20,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use keeper_sync::browse::{self, BrowseListing, EntrySyncStatus, MaterializedView, PendingView};
+use keeper_sync::browse::{
+    self, BrowseListing, EntrySyncStatus, MaterializedView, PendingView, VirtualView,
+};
 use keeper_sync::engine::{Engine, PendingReason};
 use keeper_sync::exclude::ExcludeSet;
 use keeper_sync::git;
@@ -157,6 +159,7 @@ fn a_committed_pointer_reports_its_own_size_through_browse_and_through_the_engin
         // empty view is what a caller that never read one hands over too. This
         // assertion therefore also fixes what the *less specific* answer is.
         &MaterializedView::none(),
+        &VirtualView::none(),
     )
     .expect("no refusal") else {
         panic!("expected a listing");
@@ -369,6 +372,7 @@ fn a_materialized_path_reads_materialized_and_its_untouched_sibling_stays_virtua
         &excludes,
         &pending,
         &MaterializedView::from_paths(ledger),
+        &VirtualView::none(),
     )
     .expect("no refusal") else {
         panic!("expected a listing");
@@ -524,6 +528,7 @@ async fn a_queued_download_reads_materializing_through_the_engines_own_pending_l
         // the worktree, and must not need a row keeper has not written yet —
         // it writes one when the content lands, not when it is asked for.
         &MaterializedView::none(),
+        &VirtualView::none(),
     )
     .expect("no refusal") else {
         panic!("expected a listing");

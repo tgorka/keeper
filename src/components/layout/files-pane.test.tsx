@@ -61,8 +61,8 @@ import {
   FILES_CREATE_LABEL,
   FILES_DELETE_LABEL,
   FILES_EMPTY_FOLDER_SENTENCE,
-  FILES_MATERIALIZE_DURATIONS,
-  FILES_MATERIALIZE_LABEL,
+  FILES_FETCH_DURATIONS,
+  FILES_FETCH_LABEL,
   FILES_MTIME_SLOT,
   FILES_NAME_FLOOR_PX,
   FILES_NAME_LABEL,
@@ -254,6 +254,10 @@ function entry(
     // the field for everything but a materialized file — so the tests that ARE
     // about it pass one through `extra`, which stays LAST for that reason.
     release: null,
+    // Story 69.2's directory inventory. Zero is the ordinary case: a file row
+    // never carries it, and a folder with nothing away says nothing.
+    virtualChildren: 0,
+    virtualBytes: 0,
     ...extra,
   };
 }
@@ -1059,10 +1063,10 @@ function verbs(row: HTMLElement): string[] {
         FILES_OPEN_LABEL,
         FILES_REVEAL_LABEL,
         FILES_COPY_PATH_LABEL,
-        FILES_MATERIALIZE_LABEL,
+        FILES_FETCH_LABEL,
         FILES_RELEASE_LABEL,
         FILES_PIN_LABEL,
-        ...FILES_MATERIALIZE_DURATIONS.map((choice) => choice.label),
+        ...FILES_FETCH_DURATIONS.map((choice) => choice.label),
       ].includes(label),
     );
 }
@@ -3811,18 +3815,24 @@ describe("FilesPane — the state verbs and the release clock", () => {
 
     // Content that is HERE can be let go of or held on to; content that is not
     // here can be fetched. Nothing else offers either.
+    //
+    // The STATE verbs come first since Story 69.1 (AD-219): the cluster
+    // promotes a prefix of this array, and at the shipped column width only
+    // three fit — so ordering Fetch behind Reveal and Copy is what made the
+    // owner unable to find it at all. Reveal and Copy are always reachable
+    // from the row's menu; Fetch is now also always painted.
     expect(verbs(screen.getByRole("treeitem", { name: "here.mp4" }))).toEqual([
       FILES_OPEN_LABEL,
-      FILES_REVEAL_LABEL,
-      FILES_COPY_PATH_LABEL,
       FILES_RELEASE_LABEL,
       FILES_PIN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
     ]);
     expect(verbs(screen.getByRole("treeitem", { name: "gone.mp4" }))).toEqual([
+      FILES_FETCH_LABEL,
       FILES_OPEN_LABEL,
       FILES_REVEAL_LABEL,
       FILES_COPY_PATH_LABEL,
-      FILES_MATERIALIZE_LABEL,
     ]);
     // A row whose content is already on its way offers nothing: the only honest
     // verb there would be a cancel, and this story was not asked for one.
@@ -3853,10 +3863,10 @@ describe("FilesPane — the state verbs and the release clock", () => {
 
     expect(verbs(row)).toEqual([
       FILES_OPEN_LABEL,
-      FILES_REVEAL_LABEL,
-      FILES_COPY_PATH_LABEL,
       FILES_RELEASE_LABEL,
       FILES_PIN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
     ]);
 
     await act(async () => {
@@ -3871,10 +3881,10 @@ describe("FilesPane — the state verbs and the release clock", () => {
       FILES_OPEN_HERE_LABEL,
       FILES_OPEN_BESIDE_LABEL,
       FILES_OPEN_LABEL,
-      FILES_REVEAL_LABEL,
-      FILES_COPY_PATH_LABEL,
       FILES_RELEASE_LABEL,
       FILES_PIN_LABEL,
+      FILES_REVEAL_LABEL,
+      FILES_COPY_PATH_LABEL,
     ]);
   });
 
@@ -3896,7 +3906,10 @@ describe("FilesPane — the state verbs and the release clock", () => {
     await tree([counting("clip.mp4", Date.now() + 3_600_000)], 320);
     const row = screen.getByRole("treeitem", { name: "clip.mp4" });
 
-    expect(verbs(row)).toEqual([FILES_OPEN_LABEL, FILES_REVEAL_LABEL]);
+    // Two verbs, and since Story 69.1 (AD-219) the second is the STATE verb
+    // rather than Reveal: a row with room for two says what it can do about its
+    // own content, and Reveal is one right-click away.
+    expect(verbs(row)).toEqual([FILES_OPEN_LABEL, FILES_RELEASE_LABEL]);
     const cell = releaseCell("clip.mp4");
     expect(cell?.className).toBe("sr-only");
     expect(cell?.textContent).not.toBe("");
@@ -3930,9 +3943,9 @@ describe("FilesPane — the state verbs and the release clock", () => {
 
     expect(verbs(clip)).toEqual([
       FILES_OPEN_LABEL,
-      FILES_REVEAL_LABEL,
-      FILES_COPY_PATH_LABEL,
       FILES_RELEASE_LABEL,
+      FILES_PIN_LABEL,
+      FILES_REVEAL_LABEL,
     ]);
     expect(releaseCell("clip.mp4")?.className).not.toContain("sr-only");
     expect(clip.querySelector(`[data-slot="${FILES_MTIME_SLOT}"]`)?.className).toBe("sr-only");
@@ -3951,7 +3964,7 @@ describe("FilesPane — the state verbs and the release clock", () => {
 
     await click(
       within(screen.getByRole("treeitem", { name: "gone.mp4" })).getByRole("button", {
-        name: FILES_MATERIALIZE_LABEL,
+        name: FILES_FETCH_LABEL,
       }),
     );
 
@@ -3993,7 +4006,7 @@ describe("FilesPane — the state verbs and the release clock", () => {
     // sixth verb beside it.
     await click(
       within(await screen.findByRole("menu")).getByRole("menuitem", {
-        name: FILES_MATERIALIZE_LABEL,
+        name: FILES_FETCH_LABEL,
       }),
     );
 
@@ -4001,10 +4014,10 @@ describe("FilesPane — the state verbs and the release clock", () => {
     // folder's own default, and the indefinite this verb has always meant.
     const offered = (await screen.findAllByRole("menuitem"))
       .map((item) => item.textContent)
-      .filter((text) => FILES_MATERIALIZE_DURATIONS.some((choice) => choice.label === text));
-    expect(offered).toEqual(FILES_MATERIALIZE_DURATIONS.map((choice) => choice.label));
+      .filter((text) => FILES_FETCH_DURATIONS.some((choice) => choice.label === text));
+    expect(offered).toEqual(FILES_FETCH_DURATIONS.map((choice) => choice.label));
 
-    const eightHours = FILES_MATERIALIZE_DURATIONS[1];
+    const eightHours = FILES_FETCH_DURATIONS[1];
     expect(eightHours?.keepForMs).toBe(28_800_000);
     await click(screen.getByRole("menuitem", { name: eightHours?.label ?? "" }));
 
@@ -4041,12 +4054,12 @@ describe("FilesPane — the state verbs and the release clock", () => {
 
     await click(
       within(screen.getByRole("treeitem", { name: "gone.mp4" })).getByRole("button", {
-        name: FILES_MATERIALIZE_LABEL,
+        name: FILES_FETCH_LABEL,
       }),
     );
 
     expect(syncMaterializeEntry).toHaveBeenCalledWith("01VAULT", "40-media/gone.mp4", undefined);
-    expect(FILES_MATERIALIZE_DURATIONS[FILES_MATERIALIZE_DURATIONS.length - 1]?.keepForMs).toBe(0);
+    expect(FILES_FETCH_DURATIONS[FILES_FETCH_DURATIONS.length - 1]?.keepForMs).toBe(0);
   });
 
   /**
