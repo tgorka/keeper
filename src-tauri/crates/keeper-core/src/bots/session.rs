@@ -779,6 +779,39 @@ pub fn list_messages(data_dir: &Path, session_id: &str) -> Result<Vec<BotMessage
     Ok(out)
 }
 
+/// `ttft_ms` of a bot's latest answers, newest first (Epic 68, AD-216): at
+/// most `limit` assistant rows across every conversation of `bot_id` that
+/// recorded a first token. Rows without one — a send that never got a
+/// delta, an answer written by a build that did not measure — are not
+/// zeros and are not counted. The window is cut here rather than after the
+/// read so a bot with a thousand answers costs one indexed scan of ten.
+pub fn first_token_samples(
+    data_dir: &Path,
+    bot_id: &str,
+    limit: usize,
+) -> Result<Vec<i64>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.ttft_ms FROM bot_messages m \
+             JOIN bot_sessions s ON s.id = m.session_id \
+             WHERE s.bot_id = ?1 AND m.role = 'assistant' AND m.ttft_ms IS NOT NULL \
+             ORDER BY m.created_ms DESC, m.seq DESC LIMIT ?2",
+        )
+        .map_err(|e| CoreError::Internal(format!("could not prepare first-token read: {e}")))?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let rows = stmt
+        .query_map(rusqlite::params![bot_id, limit], |r| r.get::<_, i64>(0))
+        .map_err(|e| CoreError::Internal(format!("could not read first tokens: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(
+            row.map_err(|e| CoreError::Internal(format!("could not read a first token: {e}")))?,
+        );
+    }
+    Ok(out)
+}
+
 /// Delete one message (Story 61.4). Idempotent.
 ///
 /// Retry's other half: the pane replaces a failed assistant row rather than
@@ -1200,6 +1233,48 @@ mod tests {
             .map(|row| row.id)
             .collect();
         assert_eq!(ids, vec!["new", "mid", "old"]);
+    }
+
+    /// The first-token read (Epic 68, AD-216): a bot's assistant rows with a
+    /// `ttft_ms`, across its conversations, newest first, cut to the limit;
+    /// user rows, unmeasured rows and another bot's rows are not counted.
+    #[test]
+    fn first_token_samples_are_the_bots_measured_answers_newest_first() {
+        let dir = temp_dir();
+        insert_session(&dir, &session("s1", 1)).expect("insert");
+        insert_session(&dir, &session("s2", 2)).expect("insert");
+        let other = BotSession {
+            bot_id: "bot-2".to_owned(),
+            ..session("s3", 3)
+        };
+        insert_session(&dir, &other).expect("insert other bot's session");
+        let measured = |id: &str, session_id: &str, role: &str, ttft: Option<i64>, at: i64| {
+            let mut row = message(id, session_id, role, "x");
+            row.ttft_ms = ttft;
+            row.created_ms = at;
+            row
+        };
+        append_message(&dir, &measured("m1", "s1", "assistant", Some(100), 10)).expect("m1");
+        append_message(&dir, &measured("m2", "s1", "user", Some(999), 20)).expect("m2");
+        append_message(&dir, &measured("m3", "s2", "assistant", None, 30)).expect("m3");
+        append_message(&dir, &measured("m4", "s2", "assistant", Some(300), 40)).expect("m4");
+        append_message(&dir, &measured("m5", "s3", "assistant", Some(777), 50)).expect("m5");
+        append_message(&dir, &measured("m6", "s1", "assistant", Some(200), 60)).expect("m6");
+        assert_eq!(
+            first_token_samples(&dir, "bot-1", 10).expect("read"),
+            vec![200, 300, 100]
+        );
+        assert_eq!(
+            first_token_samples(&dir, "bot-1", 2).expect("read cut"),
+            vec![200, 300]
+        );
+        assert_eq!(
+            first_token_samples(&dir, "bot-2", 10).expect("other"),
+            vec![777]
+        );
+        assert!(first_token_samples(&dir, "nobody", 10)
+            .expect("none")
+            .is_empty());
     }
 
     /// Archiving is reversible, and the default listing does not show an

@@ -103,7 +103,7 @@ use keeper_core::vm::{
     IpcErrorCode,
 };
 // Epic 64's one: the sentence a spoken turn opens with (AD-182).
-use keeper_core::voice::speech;
+use keeper_core::voice::speech::{self, Segmenter};
 // Story 61.9's two, on their own line so the story that owns them is legible.
 use keeper_core::vm::{BotCommandContextReq, BotCommandPreviewVm};
 // Story 61.11's two — the tool row and the context disclosure — likewise.
@@ -981,9 +981,14 @@ pub(crate) struct Turn {
     /// Whether the voice turn heard the question this answer is to (Epic
     /// 64, AD-182, AD-186): the request carried the answer-in-this-language
     /// instruction, and the voice turn is told when the request leaves and
-    /// when the first token arrives, so its indicator has a middle. A typed
-    /// turn never touches the voice turn.
+    /// when the first token arrives, so its indicator has a middle. Since
+    /// Epic 68 (AD-214) it is also handed the answer sentence by sentence
+    /// as the stream closes each one, so the first is spoken when it
+    /// arrives. A typed turn never touches the voice turn.
     pub(crate) spoken: bool,
+    /// The bot's display name, for the voice turn's "Waiting for nixie"
+    /// (AD-215).
+    pub(crate) bot_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,6 +1289,7 @@ async fn open_turn(
         session_id: session_row.id.clone(),
         provider_id: bot.provider_id.clone(),
         bot_id: bot.id.clone(),
+        bot_name: bot.name.clone(),
         assistant_id: assistant.id.clone(),
         drive: armed.drive,
         default_profile_id: armed.default_profile_id,
@@ -1363,14 +1369,16 @@ pub async fn send_spoken(app: &AppHandle, text: String) {
 async fn spoken_request(state: &AppState, text: &str) -> Result<BotChatSendReq, IpcError> {
     let dir = data_dir(state)?;
     let (bot, target, history) = spoken_target(&dir)?;
-    // The endpoint's list is asked only when the conversation names no
-    // model of its own — a network round trip spent where it can change the
-    // answer, `arm_turn`'s rule.
-    let offered = match voice_target::model_for(&bot, &history, &[]) {
+    let kind = provider_of(&dir, &bot.provider_id)?.provider.kind;
+    // The endpoint's list is asked only when neither the conversation nor
+    // the provider names a model of its own (AD-217's first two rungs) — a
+    // network round trip spent where it can change the answer, `arm_turn`'s
+    // rule.
+    let offered = match voice_target::model_for(&bot, kind, &history, &[]) {
         Ok(_) => Vec::new(),
         Err(_) => offered_models(state, &dir, &bot).await,
     };
-    let model = voice_target::model_for(&bot, &history, &offered)
+    let model = voice_target::model_for(&bot, kind, &history, &offered)
         .map_err(|refusal| refused(refusal.message()))?;
     Ok(BotChatSendReq {
         session_id: target.session_id,
@@ -1549,6 +1557,7 @@ pub async fn bots_message_retry(
         session_id: req.session_id.clone(),
         provider_id: bot.provider_id.clone(),
         bot_id: bot.id.clone(),
+        bot_name: bot.name.clone(),
         assistant_id: assistant.id.clone(),
         drive: armed.drive,
         default_profile_id: armed.default_profile_id,
@@ -1735,7 +1744,7 @@ async fn drive(turn: Turn, signal: chat::CancelSignal, channel: Channel<BotStrea
     // AD-186: the voice turn's "thinking" state begins when its request
     // leaves and ends at the first token; only a turn it heard is told.
     if turn.spoken {
-        crate::voice_ipc::note_sent();
+        crate::voice_ipc::note_sent(&turn.bot_name);
     }
 
     // The host is the port's to build, not this file's: `channel` and
@@ -1754,16 +1763,25 @@ async fn drive(turn: Turn, signal: chat::CancelSignal, channel: Channel<BotStrea
     // one answer in the row.
     let mut content = String::new();
     let mut unflushed = 0usize;
+    // AD-214: a spoken turn's answer is cut into sentences as it streams and
+    // each is handed to the voice turn as it closes; what is left when the
+    // stream ends goes with the close. The boundary rule is `keeper-core`'s.
+    let mut segmenter = Segmenter::new();
     let mut sink = |event: ToolLoopEvent| match event {
         ToolLoopEvent::Chat(ChatEvent::FirstToken { after_ms }) => {
             if turn.spoken {
-                crate::voice_ipc::note_answer_chunk();
+                crate::voice_ipc::note_answer_chunk(after_ms);
             }
             let _ = channel.send(BotStreamEvent::FirstToken { after_ms });
         }
         ToolLoopEvent::Chat(ChatEvent::ContentDelta(text)) => {
             unflushed += text.len();
             content.push_str(&text);
+            if turn.spoken {
+                for sentence in segmenter.push(&text) {
+                    crate::voice_ipc::answer_sentence(sentence);
+                }
+            }
             let _ = channel.send(BotStreamEvent::Delta { text });
             if unflushed >= FLUSH_BYTES {
                 unflushed = 0;
@@ -1839,6 +1857,7 @@ async fn drive(turn: Turn, signal: chat::CancelSignal, channel: Channel<BotStrea
             &channel,
             &ran.final_outcome,
             &content,
+            segmenter.flush().unwrap_or_default(),
             ran.calls.len(),
             signal.is_cancelled(),
         ),
@@ -1871,18 +1890,21 @@ fn emit_context(channel: &Channel<BotStreamEvent>, context: Option<&ContextBundl
 /// ran, for the same reason. `cancelled` is whether Stop was pressed; the
 /// reason the row and the pane carry is worded here, once.
 ///
-/// A spoken turn's close is also the voice turn's cue (Epic 67, AD-205): a
-/// clean finish hands `content` to `voice_ipc::answer_complete`, which reads
-/// it aloud; a Stop is the person abandoning the question
-/// (`answer_stopped`); a failure hands its sentence to `answer_failed`, so
-/// the turn ends with the reason rather than waiting for an answer that is
-/// not coming. After the row is written, so what is spoken is what is
-/// stored.
+/// A spoken turn's close is also the voice turn's cue (Epic 67, AD-205;
+/// Epic 68, AD-214): a clean finish hands `rest` — what the segmenter had
+/// not yet closed as a sentence, the whole answer when it closed none — to
+/// `voice_ipc::answer_complete`, which queues it and closes the answer; a
+/// Stop is the person abandoning the question (`answer_stopped`), which
+/// drops whatever is still queued; a failure hands its sentence to
+/// `answer_failed`, so the turn ends with the reason rather than waiting for
+/// an answer that is not coming. After the row is written, so what is
+/// spoken is what is stored.
 fn close(
     turn: &Turn,
     channel: &Channel<BotStreamEvent>,
     outcome: &chat::ChatOutcome,
     content: &str,
+    rest: String,
     tool_call_count: usize,
     cancelled: bool,
 ) {
@@ -1918,7 +1940,7 @@ fn close(
     emit_closed(turn, channel, reason.clone());
     if turn.spoken {
         match reason {
-            None => crate::voice_ipc::answer_complete(content.to_owned()),
+            None => crate::voice_ipc::answer_complete(rest),
             Some(_) if cancelled => crate::voice_ipc::answer_stopped(),
             Some(reason) => crate::voice_ipc::answer_failed(reason),
         }
@@ -2291,7 +2313,7 @@ mod tests {
         assert_eq!(bot.id, "b");
         assert_eq!(target.session_id.as_deref(), Some("s2"));
         assert_eq!(
-            voice_target::model_for(&bot, &history, &[]),
+            voice_target::model_for(&bot, keeper_core::bots::ProviderKind::Ollama, &history, &[]),
             Ok("qwen3".to_owned())
         );
 
@@ -2301,7 +2323,7 @@ mod tests {
         assert_eq!(bot.id, "a");
         assert_eq!(target.session_id.as_deref(), Some("s1"));
         assert_eq!(
-            voice_target::model_for(&bot, &history, &[]),
+            voice_target::model_for(&bot, keeper_core::bots::ProviderKind::Ollama, &history, &[]),
             Ok("llama4:8b".to_owned())
         );
 

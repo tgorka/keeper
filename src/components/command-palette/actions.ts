@@ -27,6 +27,7 @@
  * it (a centered dialog vs the full-screen `PhoneSearchSurface`) driven by two
  * stores; it reads the tier at dispatch and opens the right one.
  */
+import { toggleVoiceListening } from "@/components/bots/bot-listening-toggle";
 import { toggleBotMessageDetails } from "@/components/bots/bot-message-meta";
 import { createNote, openJournalToday, showCapture } from "@/hooks/use-notes-actions";
 import { logTodayInCurrentSession } from "@/hooks/use-sessions-shortcut";
@@ -183,6 +184,11 @@ export const paletteActionHandlers: Record<string, PaletteActionHandler> = {
   // no second surface was the switch. Routed through the SAME function the
   // pane's own chip calls, so the two provably do one thing (UX-DR42).
   "bots-toggle-metadata": () => toggleBotMessageDetails(),
+  // Listening for the wake phrase (Epic 68, AD-218): the same verb the pane
+  // headers on both tiers call, and the same Rust command the tray calls.
+  // Registry-gated in Rust on the voice port's answer, so it only reaches
+  // this dispatch where something can listen (AD-27).
+  "bots-toggle-listening": () => toggleVoiceListening(),
 
   // --- Global actions (dialogs / commands) ---
   "new-chat": () => newChatStore.getState().open(),

@@ -6,9 +6,12 @@
 //!
 //! # The rules the table pins
 //!
-//! - **Abandon releases the device from every state** (NFR-51). There is no
-//!   state in which `Abandoned` leaves the microphone open — including `Idle`,
-//!   where a wake phrase may be holding it.
+//! - **Abandon releases the device from every state** (NFR-51), and while
+//!   `Speaking` it stops the voice first (AD-212). There is no state in which
+//!   `Abandoned` leaves the microphone open — including `Idle`, where a wake
+//!   phrase may be holding it — and every *manual* stop is `Abandoned`: the
+//!   mic button, the tray item, the hotkey, the deep link. [`Silence`] in
+//!   `Speaking` is only the synthesiser's own end.
 //! - **A turn cannot record forever.** `Listening` has a silence budget
 //!   ([`silence_budget`]); when the shell's timer fires it feeds [`Silence`],
 //!   and the turn either sends what it heard or ends.
@@ -21,13 +24,26 @@
 //!   without a message; a partial transcript never sends at all.
 //! - **A failure releases the device too.** `Failed` is a state, but it is one
 //!   the microphone has already been released from.
-//! - **The port never records its own answer** (AD-175). Whether the device
-//!   may be open while an utterance is read aloud is [`may_record`]'s answer,
-//!   and it depends on the platform: iOS keeps keeper's voice out of the
-//!   transcript, so the microphone stays open for barge-in; macOS has nothing
-//!   that does, so it is released before the `Speak`. The table below is
-//!   platform-free; [`super::Turn`] applies the rule over it.
+//! - **The first sentence is spoken when it arrives** (Epic 68, AD-214). A
+//!   streamed answer reaches the table sentence by sentence
+//!   ([`AnswerSentence`]): the first one takes `Sending` to `Speaking` with a
+//!   [`Effect::Speak`], every later one is an [`Effect::Enqueue`] behind it,
+//!   and [`AnswerDone`] carries the rest — the tail after the last boundary,
+//!   or the whole answer when nothing was streamed. Whether the turn may end
+//!   on the synthesiser's [`Silence`] before the answer is closed is
+//!   [`super::Turn`]'s rule over this table, because "closed" is a fact about
+//!   the stream and not about the state.
+//! - **The port never records its own answer** (AD-175, revised by AD-213).
+//!   Whether the device may be open while an utterance is read aloud is
+//!   [`may_record`]'s answer, and it depends on the platform: both Apple
+//!   ports keep keeper's voice out of the transcript through the input
+//!   node's voice processing, so the microphone stays open for barge-in on
+//!   both; `full_duplex: false` is the absent port's, and there the device
+//!   is released before the `Speak`. The table below is platform-free;
+//!   [`super::Turn`] applies the rule over it.
 //!
+//! [`AnswerSentence`]: TurnEvent::AnswerSentence
+//! [`AnswerDone`]: TurnEvent::AnswerDone
 //! [`Silence`]: TurnEvent::Silence
 //! [`StopHeard`]: TurnEvent::StopHeard
 
@@ -100,7 +116,13 @@ pub enum TurnEvent {
     /// port's [`super::level::Meter`]. Not a transition: [`super::Turn`]
     /// records it for the snapshot and the table ignores it everywhere.
     Level(f32),
-    /// The whole answer arrived — the text to read aloud.
+    /// One sentence of the answer, as the stream closed it (AD-214) — the
+    /// text to read aloud now, or to queue behind what is being read.
+    AnswerSentence(String),
+    /// The answer has finished arriving, with what was left after the last
+    /// sentence handed out — the whole answer when nothing was streamed
+    /// sentence by sentence, nothing when the last sentence closed the
+    /// answer.
     AnswerDone(String),
     /// The person started speaking (barge-in while `Speaking`), with the
     /// transcript that started it — so [`super::Turn`] can tell the stop
@@ -110,10 +132,14 @@ pub enum TurnEvent {
     /// emitted by a port: [`super::Turn`] makes it out of a `SpeechDetected`
     /// whose words match `bots.stop_phrase`.
     StopHeard,
-    /// The person stopped the turn.
+    /// The person stopped the turn by hand — the mic button, the tray item,
+    /// the hotkey or the deep link (AD-212). While `Speaking` this is what
+    /// stops the voice mid-word; [`Silence`] there is never manual.
     Abandoned,
-    /// Nothing was heard for the state's silence budget, or the spoken answer
-    /// came to its end.
+    /// Nothing was heard for the state's silence budget, or the synthesiser
+    /// reached the end of the spoken answer on its own. No control feeds
+    /// this while `Speaking`; it never stops the voice, because there is
+    /// nothing left to stop.
     Silence,
     /// The port or the conversation failed.
     Failed(String),
@@ -128,8 +154,12 @@ pub enum Effect {
     ReleaseMicrophone,
     /// Hand this text to the conversation as the person's message.
     SendText(String),
-    /// Read this text aloud.
+    /// Read this text aloud, now — the first utterance of an answer.
     Speak(String),
+    /// Read this text aloud after what is being read (AD-214): queued on the
+    /// same synthesiser, spoken in its turn. Whatever is queued goes with
+    /// [`Effect::StopSpeaking`].
+    Enqueue(String),
     /// Stop reading aloud, now, mid-word.
     StopSpeaking,
 }
@@ -143,13 +173,14 @@ pub enum Effect {
 pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
     use Effect::{OpenMicrophone, ReleaseMicrophone, StopSpeaking};
     use TurnEvent::{
-        Abandoned, AnswerChunk, AnswerDone, Failed, FinalHeard, PartialHeard, Sent, Silence,
-        SpeechDetected, StopHeard, WakeMatched,
+        Abandoned, AnswerChunk, AnswerDone, AnswerSentence, Failed, FinalHeard, PartialHeard, Sent,
+        Silence, SpeechDetected, StopHeard, WakeMatched,
     };
 
     match (state, event) {
         // -- Abandon and failure: the same answer from every state, first so
-        //    no later arm can forget them (NFR-51). ---------------------------
+        //    no later arm can forget them (NFR-51). A manual stop while
+        //    speaking stops the voice before the device is released (AD-212).
         (TurnState::Speaking, Abandoned) => {
             (TurnState::Idle, vec![StopSpeaking, ReleaseMicrophone])
         }
@@ -168,7 +199,7 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
             },
             vec![OpenMicrophone],
         ),
-        (TurnState::Idle | TurnState::Failed { .. }, AnswerDone(text)) => {
+        (TurnState::Idle | TurnState::Failed { .. }, AnswerDone(text) | AnswerSentence(text)) => {
             speak_or_end(text, vec![OpenMicrophone])
         }
         (state @ (TurnState::Idle | TurnState::Failed { .. }), _) => (state, Vec::new()),
@@ -185,14 +216,18 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
         (TurnState::Heard { .. }, Sent) => (TurnState::Sending { answering: false }, Vec::new()),
         // The answer may arrive without a `Sent` in between: `Sending` is a
         // progress marker for the surface, not a gate on the answer.
-        (TurnState::Heard { .. }, AnswerDone(text)) => speak_or_end(text, Vec::new()),
+        (TurnState::Heard { .. }, AnswerDone(text) | AnswerSentence(text)) => {
+            speak_or_end(text, Vec::new())
+        }
         (state @ TurnState::Heard { .. }, _) => (state, Vec::new()),
 
         // -- Sending ----------------------------------------------------------
         (TurnState::Sending { .. }, AnswerChunk) => {
             (TurnState::Sending { answering: true }, Vec::new())
         }
-        (TurnState::Sending { .. }, AnswerDone(text)) => speak_or_end(text, Vec::new()),
+        (TurnState::Sending { .. }, AnswerDone(text) | AnswerSentence(text)) => {
+            speak_or_end(text, Vec::new())
+        }
         (state @ TurnState::Sending { .. }, _) => (state, Vec::new()),
 
         // -- Speaking ---------------------------------------------------------
@@ -212,6 +247,12 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
         (TurnState::Speaking, StopHeard) => {
             (TurnState::Idle, vec![StopSpeaking, ReleaseMicrophone])
         }
+        // The answer keeps arriving while the first of it is read: every
+        // further sentence, and the rest at the end, joins the queue.
+        (TurnState::Speaking, AnswerSentence(text) | AnswerDone(text)) => {
+            (TurnState::Speaking, enqueue(text))
+        }
+        // The synthesiser's own end: nothing is left to stop.
         (TurnState::Speaking, Silence) => (TurnState::Idle, vec![ReleaseMicrophone]),
         (TurnState::Speaking, _) => (TurnState::Speaking, Vec::new()),
     }
@@ -244,6 +285,17 @@ fn speak_or_end(text: String, mut before: Vec<Effect>) -> (TurnState, Vec<Effect
     (TurnState::Speaking, before)
 }
 
+/// A later piece of the answer joins the queue — unless there is nothing in
+/// it to say.
+fn enqueue(text: String) -> Vec<Effect> {
+    let text = text.trim();
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![Effect::Enqueue(text.to_owned())]
+    }
+}
+
 /// How long the shell may let `state` sit without a new event before it feeds
 /// [`TurnEvent::Silence`] — `None` where silence means nothing.
 ///
@@ -266,10 +318,11 @@ pub fn silence_budget(state: &TurnState) -> Option<Duration> {
 /// device is already released. `false` in `Speaking` on a platform that is
 /// not [`VoicePlatform::full_duplex`]: nothing there keeps the answer out
 /// of the microphone, so a port that recorded while it spoke would hear
-/// itself, and the first transcript it produced would stop its own speech.
-/// `true` everywhere else, including `Idle` (a wake phrase may hold the
-/// device) and `Speaking` where the OS arbitrates, which is what the iOS
-/// port has always done.
+/// itself, and the first transcript it produced would stop its own speech —
+/// since AD-213 that is the absent port alone; both Apple ports keep
+/// keeper's voice out through the input node's voice processing. `true`
+/// everywhere else, including `Idle` (a wake phrase may hold the device)
+/// and `Speaking` where the OS arbitrates.
 pub fn may_record(platform: &VoicePlatform, state: &TurnState) -> bool {
     match state {
         TurnState::Failed { .. } => false,

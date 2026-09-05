@@ -52,8 +52,11 @@ pub fn present() -> bool {
 
 /// Perform one ask against the turn as it is now: read the face, decide
 /// ([`reach_verb`]), act through the same `voice_ipc` function the webview's
-/// command is. A talk against an open turn is a no-op, which is what makes a
-/// repeated hotkey press or a twice-fired Shortcut start exactly one turn.
+/// command is. A talk against a turn that is listening or sending is a
+/// no-op, which is what makes a repeated hotkey press or a twice-fired
+/// Shortcut start exactly one turn; against an answer being read aloud it
+/// is the stop (AD-212), the one thing a person reaching for keeper from
+/// another app can mean while it talks.
 ///
 /// Guarded by [`present`] on every call rather than only at install, so a
 /// stored chord or a link on a build whose port answers `unsupported` does
@@ -69,8 +72,7 @@ pub fn reach(ask: ReachAsk) {
     tracing::info!(?ask, ?face, ?verb, "voice reach");
     let result = match verb {
         Some(ReachVerb::Start) => crate::voice_ipc::voice_start(),
-        Some(ReachVerb::Stop) => crate::voice_ipc::voice_stop(),
-        Some(ReachVerb::StopSpeaking) => crate::voice_ipc::voice_stop_speaking(),
+        Some(ReachVerb::Stop | ReachVerb::StopSpeaking) => crate::voice_ipc::voice_stop(),
         None => Ok(()),
     };
     if let Err(error) = result {

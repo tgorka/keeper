@@ -4145,14 +4145,19 @@ pub async fn palette_query(
     // (and thus the cheat sheet + native menu) when unavailable (Story 16.3); the
     // notes capability does the same for the whole Notes section (FR-122, AD-27),
     // and `bots` for the Bots section (Epic 61, FR-384). The bots flag is spelled
-    // here exactly as `capabilities` spells it — `cfg!(desktop)` — rather than
-    // borrowed from `notes`, because a desktop build with folder sync off still
-    // has a Bots pane.
+    // here exactly as `capabilities` spells it — desktop or mobile, the phone
+    // has a Bots pane too (Epic 68, AD-218: the section was `cfg!(desktop)`
+    // while the pane was not) — rather than borrowed from `notes`, because a
+    // desktop build with folder sync off still has a Bots pane. The voice gate
+    // is `voice_availability`'s one answer, read as the tray reads it
+    // (AD-179), so a listening toggle is never offered where nothing listens.
     let recording = crate::macos_version::recording_supported();
     let notes = notes_available(&state);
+    let bots = cfg!(desktop) || cfg!(mobile);
+    let voice = crate::voice_ipc::port_present();
     Ok(state
         .accounts
-        .palette_query(&query, mode, open_chat, recording, notes, cfg!(desktop))
+        .palette_query(&query, mode, open_chat, recording, notes, bots, voice)
         .await)
 }
 
@@ -4171,11 +4176,13 @@ pub fn cheat_sheet_sections(state: State<'_, AppState>) -> Result<Vec<MenuSectio
     // notes gate rides the same mechanism (Story 36.2): six actions declared once
     // reach the palette, the ⌘? sheet, the native menu bar and the tray, so the
     // four cannot drift (UX-DR42). The bots gate is its own (Epic 61, FR-384) and
-    // is spelled the way `capabilities` spells it.
+    // is spelled the way `capabilities` spells it; the voice gate is the tray's
+    // (Epic 68, AD-218).
     Ok(keeper_core::palette::registry_sections(
         crate::macos_version::recording_supported(),
         notes_available(&state),
-        cfg!(desktop),
+        cfg!(desktop) || cfg!(mobile),
+        crate::voice_ipc::port_present(),
     ))
 }
 

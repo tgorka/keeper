@@ -7001,6 +7001,15 @@ impl BotDeliverableVm {
 /// where the port has not measured one — before the first buffer, and on a
 /// port that has no meter. A snapshot with a level is streamed at most ~25
 /// times a second and only while the level changes.
+///
+/// Since Epic 68 (Story 68.3, AD-215) `sending` carries the wait — whom the
+/// question went to, when the request left and when its first token came,
+/// as the shell's clock stamped them — and `idle` carries how long the
+/// last answer's first token took. The surface counts from `sentAtMs`
+/// against its own clock; the numbers themselves are Rust's. Each is
+/// optional on the wire because each is genuinely absent at times: before
+/// the shell stamped the request, before the first token, before any turn
+/// has answered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "kind",
@@ -7015,6 +7024,10 @@ pub enum VoiceStateVm {
         wake: Option<String>,
         /// Whether the microphone is open, waiting for the phrase.
         listening_for_wake: bool,
+        /// How long the last answer's first token took, in milliseconds —
+        /// "first word after 28 s" — or `None` before a turn has answered.
+        #[ts(optional, type = "number | null")]
+        last_wait_ms: Option<i64>,
     },
     /// The microphone is open and the recogniser is transcribing.
     Listening {
@@ -7035,6 +7048,18 @@ pub enum VoiceStateVm {
         /// Whether the first piece of the answer has arrived: `false` is a
         /// model thinking, `true` one that has begun to answer (AD-186).
         answering: bool,
+        /// The bot the question went to, by its display name — "Waiting
+        /// for nixie" — or `None` before the shell stamped the request.
+        #[ts(optional = nullable)]
+        bot: Option<String>,
+        /// When the request left, milliseconds since the Unix epoch, or
+        /// `None` before the shell stamped it.
+        #[ts(optional, type = "number | null")]
+        sent_at_ms: Option<i64>,
+        /// When the first token came, milliseconds since the Unix epoch, or
+        /// `None` while the model is still thinking.
+        #[ts(optional, type = "number | null")]
+        first_token_ms: Option<i64>,
     },
     /// The answer is being read aloud.
     Speaking,
@@ -7150,6 +7175,25 @@ pub struct VoiceWakeVm {
     /// `bots.voice_target` as stored — the id of the pinned bot a spoken
     /// turn goes to; `None` means "the pinned bot most recently talked to".
     pub voice_target: Option<String>,
+}
+
+/// How fast a pinned bot starts answering (Epic 68, Story 68.4, AD-216),
+/// one per pinned bot, from `voice_target_speeds`. Read beside the voice
+/// target picker, so choosing a bot to talk to is a choice made with
+/// numbers: `bot_messages` already holds `ttft_ms` per answer, and this is
+/// `keeper_core::bots::voice_target::median_first_token` over the bot's
+/// last ten. Nothing is measured that is not already stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VoiceTargetSpeedVm {
+    /// The pinned bot's id.
+    pub bot_id: String,
+    /// The median milliseconds to the first token over the bot's last ten
+    /// answers, or `None` with fewer than three measured answers — the picker
+    /// shows nothing rather than a number one slow answer made.
+    #[ts(type = "number | null")]
+    pub first_token_median_ms: Option<u64>,
 }
 
 /// One thing the voice port did (Epic 65, Story 65.3, AD-192), from

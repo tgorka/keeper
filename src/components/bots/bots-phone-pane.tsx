@@ -69,6 +69,7 @@ import { type Ref, useEffect, useState } from "react";
 import { BotComposer } from "@/components/bots/bot-composer";
 import { BotConversation } from "@/components/bots/bot-conversation";
 import { BOTS_NO_DRIVE_HERE_SENTENCE, BotEmptyState } from "@/components/bots/bot-empty-state";
+import { BotListeningToggle } from "@/components/bots/bot-listening-toggle";
 import { BotMetaToggle } from "@/components/bots/bot-message-meta";
 import { BotPicker } from "@/components/bots/bot-picker";
 import { BotPinsStrip } from "@/components/bots/bot-pins-strip";
@@ -117,7 +118,7 @@ import { botsStore, lastAnswer, useBotsStore } from "@/lib/stores/bots";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { primaryViewStore } from "@/lib/stores/primary-view";
 import { syncErrorMessage } from "@/lib/stores/sync";
-import { useVoiceStore } from "@/lib/stores/voice";
+import { useVoiceClock, useVoiceStore, voiceLastWaitLine, voiceWaitWord } from "@/lib/stores/voice";
 import { cn } from "@/lib/utils";
 
 /** The list level's back control: the level beneath it is the Inbox. */
@@ -175,13 +176,17 @@ export const VOICE_PHONE_STATE_WORDS = {
  * replaces: a person mid-sentence needs to see what is being taken down,
  * not the phrase. A port that refused when the phrase was armed puts the
  * turn in `failed`; when the availability probe did not carry that reason,
- * the turn's own is appended, so the line says why either way. Nothing here
- * decides — every word is Rust's, or the setting's.
+ * the turn's own is appended, so the line says why either way. While the
+ * model has said nothing yet the state word is the counted wait — "Waiting
+ * for nixie · 12 s" at `nowMs`, then "Answering" (AD-215) — and once the
+ * turn is over the line carries how long that first word took. Nothing
+ * here decides — every word is Rust's, or the setting's.
  */
 export function phoneVoiceLine(
   wake: VoiceWakeVm,
   unavailable: VoiceUnavailableVm | null,
   state: VoiceStateVm | null,
+  nowMs: number = Date.now(),
 ): string {
   if (state?.kind === "listening" && state.heard.length > 0) {
     return `${VOICE_PHONE_STATE_WORDS.listening} · ${state.heard}`;
@@ -190,11 +195,16 @@ export function phoneVoiceLine(
   switch (state?.kind) {
     case "listening":
     case "heard":
-    case "sending":
     case "speaking":
       return `${line} · ${VOICE_PHONE_STATE_WORDS[state.kind]}`;
+    case "sending":
+      return `${line} · ${voiceWaitWord(state, nowMs) ?? VOICE_PHONE_STATE_WORDS.sending}`;
     case "failed":
       return unavailable === null ? `${line} · ${voiceRefusalClause(state.reason)}` : line;
+    case "idle": {
+      const lastWait = voiceLastWaitLine(state);
+      return lastWait === null ? line : `${line} · ${lastWait}`;
+    }
     default:
       return line;
   }
@@ -211,12 +221,13 @@ export function BotsPhoneVoiceLine({ onOpen }: { onOpen: () => void }) {
   const unavailable = useVoiceStore((s) => s.unavailable);
   const wake = useVoiceStore((s) => s.wake);
   const state = useVoiceStore((s) => s.state);
+  const now = useVoiceClock(state);
 
   if (!bots || unavailable === undefined || unavailable?.kind === "unsupported" || wake === null) {
     return null;
   }
 
-  const line = phoneVoiceLine(wake, unavailable, state);
+  const line = phoneVoiceLine(wake, unavailable, state, now);
   const failed = unavailable === null && state?.kind === "failed";
   return (
     <div className="flex shrink-0 items-center gap-2 border-border border-t px-4">
@@ -366,6 +377,9 @@ export function BotsPhoneList({
         onBack={onBack}
       >
         <h1 className="min-w-0 flex-1 truncate font-heading text-title">{BOTS_PANE_TITLE}</h1>
+        {/* Epic 68, AD-218: listening, one tap from the list. Absent unless
+            voice exists here; the conversation's sheet keeps the phrase. */}
+        <BotListeningToggle phone />
       </PhoneBackBar>
       {error !== null && (
         <div

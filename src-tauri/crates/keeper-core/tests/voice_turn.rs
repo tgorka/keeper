@@ -22,6 +22,8 @@ enum Call {
     Stop,
     /// The text and the language it was asked to be spoken in.
     Speak(String, String),
+    /// A sentence queued behind the running utterance, with its language.
+    Enqueue(String, String),
     StopSpeaking,
 }
 
@@ -33,7 +35,9 @@ struct FakePort {
     /// answers (Epic 65, AD-190).
     granted: AtomicBool,
     refuse_speak: Option<VoiceUnavailable>,
-    /// Half-duplex when set, so the same fake stands in for either platform.
+    /// Half-duplex when set — the absent port's platform, the one left with
+    /// `full_duplex: false` since AD-213 — so the same fake stands in for
+    /// either rule.
     half_duplex: bool,
     /// The languages this fake has voices for (Epic 64): an English one by
     /// default, so a turn that speaks has something to speak with.
@@ -82,7 +86,7 @@ impl FakePort {
 impl VoicePort for FakePort {
     fn platform(&self) -> VoicePlatform {
         if self.half_duplex {
-            VoicePlatform::MACOS
+            VoicePlatform::ABSENT
         } else {
             VoicePlatform::IOS
         }
@@ -114,6 +118,10 @@ impl VoicePort for FakePort {
         self.record(Call::Speak(text.to_owned(), language.to_owned()));
         self.refuse_speak.clone().map_or(Ok(()), Err)
     }
+    fn enqueue(&self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
+        self.record(Call::Enqueue(text.to_owned(), language.to_owned()));
+        self.refuse_speak.clone().map_or(Ok(()), Err)
+    }
     fn stop_speaking(&self) {
         self.record(Call::StopSpeaking);
     }
@@ -122,6 +130,25 @@ impl VoicePort for FakePort {
 fn listening(heard: &str) -> TurnState {
     TurnState::Listening {
         heard: heard.to_owned(),
+    }
+}
+
+/// The `sending` snapshot of a turn nobody stamped (no `note_sent`).
+fn sending_vm(answering: bool) -> VoiceStateVm {
+    VoiceStateVm::Sending {
+        answering,
+        bot: None,
+        sent_at_ms: None,
+        first_token_ms: None,
+    }
+}
+
+/// The `idle` snapshot before any turn has answered.
+fn idle_vm(wake: Option<&str>, listening_for_wake: bool) -> VoiceStateVm {
+    VoiceStateVm::Idle {
+        wake: wake.map(str::to_owned),
+        listening_for_wake,
+        last_wait_ms: None,
     }
 }
 
@@ -498,7 +525,7 @@ fn voice_driver_matches_the_phrase_while_idle() {
     let mut turn = Turn::new(VoicePlatform::IOS);
     let armed = turn.set_wake(Some(phrase("hej keeper")));
     assert_eq!(armed, vec![Effect::OpenMicrophone]);
-    perform(&armed, &port, turn.wake()).expect("arming succeeds");
+    perform(&armed, &port, turn.wake(), &mut None).expect("arming succeeds");
 
     let effects = turn.drive(TurnEvent::PartialHeard("no keeper here".to_owned()), &port);
     assert!(effects.is_empty(), "noise while idle: {effects:?}");
@@ -538,13 +565,7 @@ fn voice_driver_rearms_the_phrase_after_a_turn_ends_on_its_own() {
     turn.drive(TurnEvent::Silence, &port);
     assert_eq!(turn.state(), &TurnState::Idle);
     assert!(turn.microphone_open());
-    assert_eq!(
-        turn.vm(),
-        VoiceStateVm::Idle {
-            wake: Some("hej keeper".to_owned()),
-            listening_for_wake: true,
-        }
-    );
+    assert_eq!(turn.vm(), idle_vm(Some("hej keeper"), true));
     assert_eq!(
         port.calls().last(),
         Some(&Call::Start(Some("hej keeper".to_owned())))
@@ -567,17 +588,53 @@ fn voice_driver_rearms_the_phrase_after_abandon() {
         vec![Effect::ReleaseMicrophone, Effect::OpenMicrophone]
     );
     assert!(turn.microphone_open());
-    assert_eq!(
-        turn.vm(),
-        VoiceStateVm::Idle {
-            wake: Some("hej keeper".to_owned()),
-            listening_for_wake: true,
-        }
-    );
+    assert_eq!(turn.vm(), idle_vm(Some("hej keeper"), true));
     let calls = port.calls();
     assert_eq!(
         &calls[calls.len() - 2..],
         &[Call::Stop, Call::Start(Some("hej keeper".to_owned()))]
+    );
+}
+
+/// AD-212 at the driver: the manual stop while the answer is read aloud —
+/// the button, the tray, the hotkey, the deep link are all `Abandoned` —
+/// stops the synthesiser first, releases the turn's device, and re-arms the
+/// phrase, so "stop" and the phrase are heard again the moment the voice
+/// is cut. `Silence` (`voice_speaking_ends_on_silence`) stays the
+/// synthesiser's own end and stops nothing.
+#[test]
+fn voice_driver_manual_stop_while_speaking_cuts_the_voice_and_rearms() {
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.set_wake(Some(phrase("hej keeper")));
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
+    turn.drive(TurnEvent::AnswerDone("a long answer".to_owned()), &port);
+    assert_eq!(turn.state(), &TurnState::Speaking);
+    let effects = turn.drive(TurnEvent::Abandoned, &port);
+    assert_eq!(
+        effects,
+        vec![
+            Effect::StopSpeaking,
+            Effect::ReleaseMicrophone,
+            Effect::OpenMicrophone
+        ]
+    );
+    assert_eq!(turn.state(), &TurnState::Idle);
+    assert!(turn.microphone_open(), "the phrase is listening again");
+    let calls = port.calls();
+    assert_eq!(
+        &calls[calls.len() - 3..],
+        &[
+            Call::StopSpeaking,
+            Call::Stop,
+            Call::Start(Some("hej keeper".to_owned()))
+        ]
+    );
+    assert_eq!(
+        calls.iter().filter(|c| **c == Call::StopSpeaking).count(),
+        1,
+        "the synthesiser is told to stop exactly once"
     );
 }
 
@@ -591,6 +648,277 @@ fn voice_driver_abandon_without_a_phrase_stays_released() {
     assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
     assert!(!turn.microphone_open());
     assert_eq!(port.calls().last(), Some(&Call::Stop));
+}
+
+// ---------------------------------------------------------------------------
+// Epic 68, Story 68.3 (AD-214, AD-215): the first sentence is spoken when it
+// arrives, the rest queues, the turn ends only after the answer is closed.
+// ---------------------------------------------------------------------------
+
+/// The table: the first sentence takes `Sending` to `Speaking` with a
+/// `Speak`; every later one, and the rest at the end, is an `Enqueue`; an
+/// empty rest queues nothing.
+#[test]
+fn voice_table_speaks_the_first_sentence_and_queues_the_rest() {
+    let sentence = |s: &str| TurnEvent::AnswerSentence(s.to_owned());
+    let (s, e) = advance(TurnState::Sending { answering: true }, sentence("First."));
+    assert_eq!(s, TurnState::Speaking);
+    assert_eq!(e, vec![Effect::Speak("First.".to_owned())]);
+
+    let (s, e) = advance(s, sentence(" Second. "));
+    assert_eq!(s, TurnState::Speaking);
+    assert_eq!(e, vec![Effect::Enqueue("Second.".to_owned())]);
+
+    let (s, e) = advance(s, TurnEvent::AnswerDone("and the rest".to_owned()));
+    assert_eq!(s, TurnState::Speaking);
+    assert_eq!(e, vec![Effect::Enqueue("and the rest".to_owned())]);
+
+    let (s, e) = advance(s, TurnEvent::AnswerDone("  ".to_owned()));
+    assert_eq!(s, TurnState::Speaking);
+    assert!(e.is_empty(), "nothing left to say queues nothing: {e:?}");
+
+    // A sentence with no `Sent` before it, and one for a typed answer, take
+    // the same paths `AnswerDone` always took.
+    let (s, e) = advance(heard("hi"), sentence("Hello."));
+    assert_eq!(
+        (s, e),
+        (
+            TurnState::Speaking,
+            vec![Effect::Speak("Hello.".to_owned())]
+        )
+    );
+    let (s, e) = advance(TurnState::Idle, sentence("Hello."));
+    assert_eq!(s, TurnState::Speaking);
+    assert_eq!(
+        e,
+        vec![Effect::OpenMicrophone, Effect::Speak("Hello.".to_owned())]
+    );
+}
+
+/// The driver, end to end over a fake port: three sentences become one
+/// `speak` and two `enqueue`s in the answer's language; the synthesiser's
+/// `Silence` before the answer is closed keeps the turn `Speaking`; the
+/// close, then `Silence`, ends it and re-arms the phrase.
+#[test]
+fn voice_driver_streams_sentences_and_ends_only_after_the_answer_is_closed() {
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.set_wake(Some(phrase("nixie")));
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("tell me a story".to_owned()), &port);
+    turn.drive(TurnEvent::Sent, &port);
+
+    let effects = turn.drive(
+        TurnEvent::AnswerSentence("Once upon a time.".to_owned()),
+        &port,
+    );
+    assert_eq!(effects, vec![Effect::Speak("Once upon a time.".to_owned())]);
+    assert_eq!(turn.state(), &TurnState::Speaking);
+    assert!(!turn.answer_closed());
+
+    let effects = turn.drive(
+        TurnEvent::AnswerSentence("There was a fox.".to_owned()),
+        &port,
+    );
+    assert_eq!(
+        effects,
+        vec![Effect::Enqueue("There was a fox.".to_owned())]
+    );
+
+    // The queue drained before the next sentence arrived: not the end.
+    assert!(turn.drive(TurnEvent::Silence, &port).is_empty());
+    assert_eq!(turn.state(), &TurnState::Speaking);
+
+    let effects = turn.drive(
+        TurnEvent::AnswerSentence("It was hungry.".to_owned()),
+        &port,
+    );
+    assert_eq!(effects, vec![Effect::Enqueue("It was hungry.".to_owned())]);
+
+    assert!(turn
+        .drive(TurnEvent::AnswerDone(String::new()), &port)
+        .is_empty());
+    assert_eq!(
+        turn.state(),
+        &TurnState::Speaking,
+        "the last sentence is still playing"
+    );
+    assert!(turn.answer_closed());
+
+    let effects = turn.drive(TurnEvent::Silence, &port);
+    assert_eq!(
+        effects,
+        vec![Effect::ReleaseMicrophone, Effect::OpenMicrophone]
+    );
+    assert_eq!(turn.state(), &TurnState::Idle);
+
+    let calls = port.calls();
+    let spoken: Vec<&Call> = calls
+        .iter()
+        .filter(|c| matches!(c, Call::Speak(..) | Call::Enqueue(..)))
+        .collect();
+    assert_eq!(
+        spoken,
+        vec![
+            &Call::Speak("Once upon a time.".to_owned(), "en-US".to_owned()),
+            &Call::Enqueue("There was a fox.".to_owned(), "en-US".to_owned()),
+            &Call::Enqueue("It was hungry.".to_owned(), "en-US".to_owned()),
+        ]
+    );
+}
+
+/// The close arriving after the queue already drained, with nothing left to
+/// say, ends the turn at once: no `Silence` is coming for it.
+#[test]
+fn voice_driver_ends_at_once_when_the_close_finds_the_queue_drained() {
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
+    turn.drive(TurnEvent::AnswerSentence("Hello.".to_owned()), &port);
+    assert!(turn.drive(TurnEvent::Silence, &port).is_empty());
+    assert_eq!(turn.state(), &TurnState::Speaking);
+    let effects = turn.drive(TurnEvent::AnswerDone(String::new()), &port);
+    assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
+    assert_eq!(turn.state(), &TurnState::Idle);
+    // A whole answer in one `AnswerDone` is closed at once: the next
+    // `Silence` ends the turn as it always did.
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
+    turn.drive(TurnEvent::AnswerDone("All of it.".to_owned()), &port);
+    assert!(turn.answer_closed());
+    turn.drive(TurnEvent::Silence, &port);
+    assert_eq!(turn.state(), &TurnState::Idle);
+}
+
+/// A manual stop mid-queue stops the synthesiser — which drops the queue —
+/// exactly once, and nothing more is spoken or queued afterwards.
+#[test]
+fn voice_driver_abandon_mid_queue_stops_speaking_once() {
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
+    turn.drive(TurnEvent::AnswerSentence("One.".to_owned()), &port);
+    turn.drive(TurnEvent::AnswerSentence("Two.".to_owned()), &port);
+    let effects = turn.drive(TurnEvent::Abandoned, &port);
+    assert_eq!(
+        effects,
+        vec![Effect::StopSpeaking, Effect::ReleaseMicrophone]
+    );
+    assert_eq!(turn.state(), &TurnState::Idle);
+    // The stream is still closing behind the stop: its late sentences and
+    // close reach an idle turn and are nothing.
+    assert!(
+        turn.drive(TurnEvent::AnswerDone("Three.".to_owned()), &port)
+            .is_empty()
+            || turn.state() == &TurnState::Speaking
+    );
+    let stops = port
+        .calls()
+        .iter()
+        .filter(|c| **c == Call::StopSpeaking)
+        .count();
+    assert_eq!(stops, 1);
+}
+
+/// The voice of the answer is chosen once, on the first sentence, and kept
+/// for the later ones — unless a sentence is long enough for the detector
+/// to be sure it is another language. The turn keeps the choice, not the
+/// port, so two fakes whose detectors disagree stand in for one detector
+/// answering differently per sentence.
+#[test]
+fn voice_driver_keeps_the_first_voice_unless_a_sentence_is_confidently_another() {
+    let long_polish = "Jutro będzie słonecznie i ciepło, około dwudziestu stopni.";
+    let says_english = FakePort {
+        voices: vec!["en-US".to_owned(), "pl-PL".to_owned()],
+        detected: Some("en".to_owned()),
+        ..FakePort::default()
+    };
+    let says_polish = FakePort {
+        voices: vec!["en-US".to_owned(), "pl-PL".to_owned()],
+        detected: Some("pl".to_owned()),
+        ..FakePort::default()
+    };
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.drive(TurnEvent::WakeMatched, &says_english);
+    turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &says_english);
+    // The first sentence's detection is the answer's choice, short or not.
+    turn.drive(TurnEvent::AnswerSentence("Sure.".to_owned()), &says_english);
+    // A short sentence keeps it, whatever the detector says of it.
+    turn.drive(TurnEvent::AnswerSentence("Tak.".to_owned()), &says_polish);
+    // A long one the detector is sure about switches the voice.
+    turn.drive(
+        TurnEvent::AnswerSentence(long_polish.to_owned()),
+        &says_polish,
+    );
+    // And the switch holds for what follows, by the same rule.
+    turn.drive(TurnEvent::AnswerSentence("OK.".to_owned()), &says_english);
+    assert_eq!(
+        says_english.calls(),
+        vec![
+            Call::Start(None),
+            Call::Speak("Sure.".to_owned(), "en-US".to_owned()),
+            Call::Enqueue("OK.".to_owned(), "pl-PL".to_owned()),
+        ]
+    );
+    assert_eq!(
+        says_polish.calls(),
+        vec![
+            Call::Enqueue("Tak.".to_owned(), "en-US".to_owned()),
+            Call::Enqueue(long_polish.to_owned(), "pl-PL".to_owned()),
+        ]
+    );
+}
+
+/// AD-215 at the driver: the shell's stamps become the snapshot's wait, the
+/// first token's `after_ms` is the number kept, and the last wait survives
+/// into `idle` for the "first word after" line.
+#[test]
+fn voice_driver_carries_the_wait_into_the_snapshot() {
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.set_wake(Some(phrase("nixie")));
+    turn.drive(TurnEvent::WakeMatched, &port);
+    // A stamp before anything was heard is nothing: no request is out.
+    turn.note_sent("nixie".to_owned(), 5);
+    turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
+    turn.note_sent("nixie".to_owned(), 1_000);
+    turn.drive(TurnEvent::Sent, &port);
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Sending {
+            answering: false,
+            bot: Some("nixie".to_owned()),
+            sent_at_ms: Some(1_000),
+            first_token_ms: None,
+        }
+    );
+    assert!(
+        turn.note_first_token(28_550),
+        "the first token is the one recorded"
+    );
+    assert!(!turn.note_first_token(30_000), "a second is not");
+    turn.drive(TurnEvent::AnswerChunk, &port);
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Sending {
+            answering: true,
+            bot: Some("nixie".to_owned()),
+            sent_at_ms: Some(1_000),
+            first_token_ms: Some(29_550),
+        }
+    );
+    turn.drive(TurnEvent::AnswerDone("Hello.".to_owned()), &port);
+    turn.drive(TurnEvent::Silence, &port);
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Idle {
+            wake: Some("nixie".to_owned()),
+            listening_for_wake: true,
+            last_wait_ms: Some(28_550),
+        }
+    );
 }
 
 /// A failed turn does not re-arm even with a phrase set: the port that
@@ -622,7 +950,7 @@ fn voice_driver_clearing_the_phrase_releases_the_microphone() {
     turn.set_wake(Some(phrase("hej keeper")));
     let effects = turn.set_wake(None);
     assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
-    perform(&effects, &port, turn.wake()).expect("release is infallible");
+    perform(&effects, &port, turn.wake(), &mut None).expect("release is infallible");
     assert!(!turn.microphone_open());
     assert_eq!(turn.wake(), None);
 }
@@ -717,13 +1045,7 @@ fn voice_driver_orders_port_calls_for_barge_in() {
 #[test]
 fn voice_state_projects_to_its_view_model() {
     let mut turn = Turn::new(VoicePlatform::IOS);
-    assert_eq!(
-        turn.vm(),
-        VoiceStateVm::Idle {
-            wake: None,
-            listening_for_wake: false
-        }
-    );
+    assert_eq!(turn.vm(), idle_vm(None, false));
     turn.apply(TurnEvent::WakeMatched);
     turn.apply(TurnEvent::PartialHeard("he".to_owned()));
     assert_eq!(
@@ -742,9 +1064,9 @@ fn voice_state_projects_to_its_view_model() {
         }
     );
     turn.apply(TurnEvent::Sent);
-    assert_eq!(turn.vm(), VoiceStateVm::Sending { answering: false });
+    assert_eq!(turn.vm(), sending_vm(false));
     turn.apply(TurnEvent::AnswerChunk);
-    assert_eq!(turn.vm(), VoiceStateVm::Sending { answering: true });
+    assert_eq!(turn.vm(), sending_vm(true));
     turn.apply(TurnEvent::AnswerDone("x".to_owned()));
     assert_eq!(turn.vm(), VoiceStateVm::Speaking);
     turn.apply(TurnEvent::Failed("boom".to_owned()));
@@ -1102,13 +1424,13 @@ fn voice_turn_has_a_middle_between_heard_and_speaking() {
 
     assert!(turn.drive(TurnEvent::Sent, &port).is_empty());
     assert_eq!(turn.state(), &TurnState::Sending { answering: false });
-    assert_eq!(turn.vm(), VoiceStateVm::Sending { answering: false });
+    assert_eq!(turn.vm(), sending_vm(false));
 
     assert!(turn.drive(TurnEvent::AnswerChunk, &port).is_empty());
-    assert_eq!(turn.vm(), VoiceStateVm::Sending { answering: true });
+    assert_eq!(turn.vm(), sending_vm(true));
     // A second chunk changes nothing: the first is the one that matters.
     assert!(turn.drive(TurnEvent::AnswerChunk, &port).is_empty());
-    assert_eq!(turn.vm(), VoiceStateVm::Sending { answering: true });
+    assert_eq!(turn.vm(), sending_vm(true));
 
     turn.drive(TurnEvent::AnswerDone("It is noon.".to_owned()), &port);
     assert_eq!(turn.state(), &TurnState::Speaking);
@@ -1170,7 +1492,7 @@ fn voice_level_rides_listening_and_heard_only() {
 
     turn.apply(TurnEvent::Sent);
     assert_eq!(turn.level(), None, "sending has no microphone to meter");
-    assert_eq!(turn.vm(), VoiceStateVm::Sending { answering: false });
+    assert_eq!(turn.vm(), sending_vm(false));
     turn.apply(TurnEvent::Level(0.9));
     assert_eq!(turn.level(), None, "a late reading is dropped");
 
@@ -1189,7 +1511,7 @@ fn voice_level_rides_listening_and_heard_only() {
 /// fail the turn so the device is released and the reason is on the snapshot.
 fn arm(turn: &mut Turn, port: &FakePort, wake: Option<WakePhrase>) -> Vec<Effect> {
     let effects = turn.set_wake(wake);
-    if let Err(why) = perform(&effects, port, turn.wake()) {
+    if let Err(why) = perform(&effects, port, turn.wake(), &mut None) {
         return turn.drive(TurnEvent::Failed(why.message(turn.platform())), port);
     }
     effects
@@ -1260,13 +1582,7 @@ fn voice_driver_rearms_from_a_refusal_once_it_clears() {
     assert_eq!(effects, vec![Effect::OpenMicrophone]);
     assert_eq!(turn.state(), &TurnState::Idle, "the stale reason is gone");
     assert!(turn.armed());
-    assert_eq!(
-        turn.vm(),
-        VoiceStateVm::Idle {
-            wake: Some("nixie".to_owned()),
-            listening_for_wake: true,
-        }
-    );
+    assert_eq!(turn.vm(), idle_vm(Some("nixie"), true));
     assert_eq!(
         port.calls(),
         vec![

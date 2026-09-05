@@ -17,13 +17,18 @@
 //!    the switch's refusal is shown and recorded in the ring. Nothing is
 //!    sent to a bot nobody chose.
 //!
-//! The model a spoken turn sends is decided here too ([`model_for`]): the
-//! one that last answered in the target conversation, else the endpoint's
-//! first — the rule the pane's picker applies when a bot is chosen without a
-//! model — else a refusal that says what to open.
+//! The model a spoken turn sends is decided here too ([`model_for`], AD-217):
+//! the one that last answered in the target conversation, else the
+//! provider's own default, else the first offered model that can chat —
+//! never one whose name says `embed` — else a refusal that says what to open.
+//!
+//! And how long a bot takes to start answering ([`median_first_token`],
+//! AD-216): `bot_messages` already holds `ttft_ms` per answer, so the picker
+//! can show each pinned bot's median first token over its last ten answers.
+//! Nothing is measured that is not already stored.
 
 use crate::bots::session::{BotMessage, BotSession};
-use crate::bots::Bot;
+use crate::bots::{Bot, ProviderKind};
 use crate::vm::BotModelVm;
 
 /// The sentence a spoken turn is refused with when there is no bot to send
@@ -100,15 +105,37 @@ pub fn resolve(
         .ok_or(SpokenRefusal::NoTarget)
 }
 
-/// The model a spoken turn sends with.
+/// The alias a Hermes gateway always answers to (`/v1/models` lists it first
+/// on a stock install, research §2.9): the provider's own default when the
+/// conversation names no model. Ollama has no default of its own.
+pub const HERMES_DEFAULT_MODEL: &str = "hermes-agent";
+
+/// How many of a bot's latest answers the first-token median is taken over.
+pub const FIRST_TOKEN_WINDOW: usize = 10;
+
+/// Fewer answers than this and no median is shown: one or two numbers are
+/// an anecdote, not a speed.
+pub const FIRST_TOKEN_MIN_SAMPLES: usize = 3;
+
+/// The model a spoken turn sends with (AD-217).
 ///
 /// `history` is the target conversation's messages in order (empty for a new
 /// conversation); `offered` is what the endpoint lists for the bot, in its
-/// order. The last assistant row that names its model wins — the person
-/// chose it, or the picker did, and a follow-up question goes to the model
-/// that was answering — else the first offered, the picker's own default.
+/// order. The rule, rung by rung:
+///
+/// 1. the last assistant row that names its model — the person chose it, or
+///    the picker did, and a follow-up question goes to the model that was
+///    answering;
+/// 2. else the provider's own default: [`HERMES_DEFAULT_MODEL`] on Hermes,
+///    which the gateway answers to whatever it lists; Ollama has none;
+/// 3. else the first offered model that can chat — one whose name does not
+///    say `embed`. The old rule took "first offered" and on a Hermes that
+///    listed `embeddinggemma:latest` first, eight answers went out under a
+///    name that cannot chat (epic 68's measurement 4);
+/// 4. else the refusal, naming the bot and what to open.
 pub fn model_for(
     bot: &Bot,
+    kind: ProviderKind,
     history: &[BotMessage],
     offered: &[BotModelVm],
 ) -> Result<String, SpokenRefusal> {
@@ -117,10 +144,57 @@ pub fn model_for(
         .rev()
         .filter(|message| message.role == "assistant")
         .find_map(|message| message.model.clone())
-        .or_else(|| offered.first().map(|model| model.id.clone()))
+        .or_else(|| provider_default(kind).map(str::to_owned))
+        .or_else(|| {
+            offered
+                .iter()
+                .find(|model| can_chat(&model.id))
+                .map(|model| model.id.clone())
+        })
         .ok_or_else(|| SpokenRefusal::NoModel {
             bot: bot.name.clone(),
         })
+}
+
+/// The model a provider answers with when none is named, where it has one.
+fn provider_default(kind: ProviderKind) -> Option<&'static str> {
+    match kind {
+        ProviderKind::Hermes => Some(HERMES_DEFAULT_MODEL),
+        ProviderKind::Ollama => None,
+    }
+}
+
+/// Whether a model's name says it can chat: an embedding model answers a
+/// prompt with a vector, and every provider keeper knows names one with
+/// `embed` somewhere in the tag (`embeddinggemma`, `nomic-embed-text`,
+/// `mxbai-embed-large`, `text-embedding-3-small`).
+fn can_chat(model_id: &str) -> bool {
+    !model_id.to_ascii_lowercase().contains("embed")
+}
+
+/// A bot's first-token median over its latest answers (AD-216), in
+/// milliseconds: `samples` is `ttft_ms` of the bot's assistant rows, newest
+/// first, as `session::first_token_samples` reads them. Only the first
+/// [`FIRST_TOKEN_WINDOW`] are counted, and fewer than
+/// [`FIRST_TOKEN_MIN_SAMPLES`] answer `None` — the picker shows nothing
+/// rather than a number one slow answer made. An even count takes the mean
+/// of the two middle values.
+pub fn median_first_token(samples: &[i64]) -> Option<u64> {
+    let mut window: Vec<u64> = samples
+        .iter()
+        .take(FIRST_TOKEN_WINDOW)
+        .map(|ms| ms.unsigned_abs())
+        .collect();
+    if window.len() < FIRST_TOKEN_MIN_SAMPLES {
+        return None;
+    }
+    window.sort_unstable();
+    let mid = window.len() / 2;
+    Some(if window.len().is_multiple_of(2) {
+        (window[mid - 1] + window[mid]) / 2
+    } else {
+        window[mid]
+    })
 }
 
 #[cfg(test)]
@@ -266,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn the_model_is_the_one_that_last_answered_else_the_first_offered() {
+    fn the_model_is_the_one_that_last_answered() {
         let b = bot("a");
         let history = [
             message("user", None),
@@ -275,18 +349,93 @@ mod tests {
             message("assistant", None),
         ];
         let offered = [model("qwen3"), model("llama4:8b")];
+        // Whatever the provider: a conversation's own model wins.
         assert_eq!(
-            model_for(&b, &history, &offered),
+            model_for(&b, ProviderKind::Ollama, &history, &offered),
             Ok("llama4:8b".to_owned())
         );
-        assert_eq!(model_for(&b, &[], &offered), Ok("qwen3".to_owned()));
-        let refused = model_for(&b, &[], &[]).expect_err("nothing to send with");
         assert_eq!(
-            refused,
-            SpokenRefusal::NoModel {
-                bot: "Bot a".to_owned()
-            }
+            model_for(&b, ProviderKind::Hermes, &history, &[]),
+            Ok("llama4:8b".to_owned())
         );
-        assert!(refused.message().contains("Bot a"));
+    }
+
+    #[test]
+    fn else_the_providers_own_default_where_it_has_one() {
+        let b = bot("a");
+        // Hermes answers to its alias whatever it lists — even an embedding
+        // model first, the measured case — and even with nothing listed.
+        let offered = [model("embeddinggemma:latest"), model("qwen3")];
+        assert_eq!(
+            model_for(&b, ProviderKind::Hermes, &[], &offered),
+            Ok(HERMES_DEFAULT_MODEL.to_owned())
+        );
+        assert_eq!(
+            model_for(&b, ProviderKind::Hermes, &[], &[]),
+            Ok(HERMES_DEFAULT_MODEL.to_owned())
+        );
+        // Ollama has none: the first offered that can chat.
+        assert_eq!(
+            model_for(
+                &b,
+                ProviderKind::Ollama,
+                &[],
+                &[model("qwen3"), model("llama4:8b")]
+            ),
+            Ok("qwen3".to_owned())
+        );
+    }
+
+    #[test]
+    fn else_the_first_offered_that_is_not_an_embedding_model() {
+        let b = bot("a");
+        let offered = [
+            model("nomic-embed-text"),
+            model("mxbai-EMBED-large"),
+            model("qwen3"),
+            model("llama4:8b"),
+        ];
+        assert_eq!(
+            model_for(&b, ProviderKind::Ollama, &[], &offered),
+            Ok("qwen3".to_owned())
+        );
+    }
+
+    #[test]
+    fn else_the_refusal_names_the_bot() {
+        let b = bot("a");
+        // Nothing offered, and only embedding models offered, refuse alike.
+        for offered in [Vec::new(), vec![model("embeddinggemma:latest")]] {
+            let refused = model_for(&b, ProviderKind::Ollama, &[], &offered)
+                .expect_err("nothing to send with");
+            assert_eq!(
+                refused,
+                SpokenRefusal::NoModel {
+                    bot: "Bot a".to_owned()
+                }
+            );
+            assert!(refused.message().contains("Bot a"));
+        }
+    }
+
+    #[test]
+    fn the_median_is_over_the_last_ten_and_needs_three() {
+        assert_eq!(median_first_token(&[]), None);
+        assert_eq!(median_first_token(&[28_550]), None);
+        assert_eq!(median_first_token(&[28_550, 1_000]), None);
+        // Three: the middle one, whatever the order they arrived in.
+        assert_eq!(median_first_token(&[28_550, 1_000, 2_000]), Some(2_000));
+        // Even: the mean of the two middle values.
+        assert_eq!(median_first_token(&[4, 1, 3, 2]), Some(2));
+        // Newest first: the eleventh and later are not counted. Ten small
+        // recent answers hide one huge old one entirely.
+        let mut samples = vec![100; 10];
+        samples.push(1_000_000);
+        assert_eq!(median_first_token(&samples), Some(100));
+        // And a newest slow answer among ten counts as one of ten.
+        let mut samples = vec![90_000];
+        samples.extend(std::iter::repeat_n(2_000, 9));
+        samples.push(1);
+        assert_eq!(median_first_token(&samples), Some(2_000));
     }
 }

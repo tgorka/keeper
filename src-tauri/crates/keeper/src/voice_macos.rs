@@ -64,16 +64,32 @@
 //!
 //! - **Category, activation, ducking:** none. Capture is the engine's input
 //!   node and nothing else; keeper does not duck other audio on the Mac.
-//! - **Half-duplex** is `keeper_core::voice::may_record`'s (AD-175): the
-//!   turn releases the microphone before every `Speak` on this platform,
-//!   so this port never has a capture up while it speaks and does not
-//!   re-implement the rule. It obeys the effects it is handed, in order.
-//! - **Barge-in by voice** therefore does not exist here. Without voice
-//!   processing on the input there is nothing to keep keeper's own answer
-//!   out of the transcript, so the port never classifies a transcript as
-//!   `SpeechDetected`; an answer is stopped by the button, the hotkey or
-//!   the tray (Story 63.5). A transcript that did arrive while speaking is
-//!   ignored by the turn's table.
+//! - **Voice processing** is not the session's but the input node's, and
+//!   the Mac has it (Epic 68, Story 68.2, AD-213, revising AD-175):
+//!   [`start_capture`] enables it before the engine starts, exactly as
+//!   the iOS port does. The unit is `kAudioUnitSubType_VoiceProcessingIO`,
+//!   whose echo reference on macOS is the output device's mix — Story 22.7
+//!   measured the far end dropping ~24 dB on hesperia — so keeper's own
+//!   answer is subtracted from what the recogniser hears, and the
+//!   microphone stays open while keeper speaks (`MACOS.full_duplex`).
+//! - **Barge-in by voice** therefore exists here as on the phone: a
+//!   transcript while the `speaking` flag is up is `SpeechDetected` with
+//!   its words, and the turn tells the stop phrase from a question
+//!   (AD-208). After an utterance the ears shut for [`TAIL_GATE`], and
+//!   what arrives inside the gate is dropped and recorded as
+//!   `echo_dropped` with its words (AD-209) — the ring is the measurement
+//!   of what this Mac hears of itself.
+//! - **Half duplex, for one kind of input.** The unit builds a private
+//!   aggregate of the input and output devices, and refuses to sit on an
+//!   input that is already an aggregate (BlackHole, Loopback — Story 22.7).
+//!   Then the capture is brought up on the plain input node, the refusal
+//!   is a `refused` ring row naming the device, and for that capture the
+//!   port answers [`VoicePort::half_duplex`] with the device's name, which
+//!   core turns into the sentence beside the switch. A transcript while
+//!   speaking is then keeper hearing itself, dropped and recorded as
+//!   `echo_dropped`, never `SpeechDetected` — the word cannot stop an
+//!   answer on such a device; the button, the hotkey and the tray still
+//!   do (AD-212). The turn's rule is the platform's and does not change.
 //! - **Interruptions:** none are posted. The capture can still die under
 //!   the port — `AVAudioEngineConfigurationChangeNotification` when
 //!   headphones or a dock change the input, or the engine simply stopping —
@@ -164,7 +180,8 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -203,6 +220,29 @@ const SPEAK_POLL: Duration = Duration::from_millis(250);
 /// `isSpeaking` before its silence counts as the utterance ending — the
 /// queue-to-speaking gap on a cold voice.
 const SPEAK_GRACE: Duration = Duration::from_millis(500);
+
+/// How long after an utterance ends the port keeps its ears shut (Epic 67,
+/// AD-209; on the Mac since Epic 68, AD-213): every transcript that arrives
+/// inside the gate is dropped and recorded as `echo_dropped` with its
+/// words, and the turn is told `Silence` only once the gate has passed.
+/// Voice processing subtracts the output from the input; it does not
+/// cancel it (Apple engineer, forum 665706). The number is the iOS port's
+/// — a 2026 field report's ~800 ms — and this Mac's `echo_dropped` rows are
+/// what say whether the Mac needs it.
+const TAIL_GATE: Duration = Duration::from_millis(800);
+
+/// `kAudioObjectSystemObject`: the CoreAudio object that answers which
+/// device is the default input.
+const AUDIO_OBJECT_SYSTEM: u32 = 1;
+/// `kAudioHardwarePropertyDefaultInputDevice` (`'dIn '`).
+const DEFAULT_INPUT_DEVICE: u32 = u32::from_be_bytes(*b"dIn ");
+/// `kAudioObjectPropertyName` (`'lnam'`): a device's name as the person sees
+/// it in Sound settings — "MacBook Pro Microphone", "BlackHole 2ch".
+const OBJECT_NAME: u32 = u32::from_be_bytes(*b"lnam");
+/// `kAudioObjectPropertyScopeGlobal` (`'glob'`).
+const SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+/// `kAudioObjectPropertyElementMain`.
+const ELEMENT_MAIN: u32 = 0;
 
 /// Frames per tap buffer: ~21 ms at the 48 kHz most Mac inputs run at,
 /// ~64 ms at 16 kHz. The recogniser takes whatever the input node's format
@@ -266,7 +306,18 @@ enum Command {
         language: String,
         reply: SyncSender<Result<(), VoiceUnavailable>>,
     },
+    /// A further utterance behind the one out now, on the same synthesiser
+    /// (Epic 68, AD-214): no roll, no flag — those happened once, at
+    /// `Speak`.
+    Enqueue {
+        text: String,
+        language: String,
+        reply: SyncSender<Result<(), VoiceUnavailable>>,
+    },
     StopSpeaking,
+    /// The input device voice processing was refused on for the capture up
+    /// now, if any (AD-213).
+    HalfDuplex(SyncSender<Option<String>>),
     /// Something that happened to the capture or a request, reported by an
     /// observer or a result handler, to be acted on from the worker's own
     /// thread.
@@ -388,8 +439,23 @@ impl VoicePort for MacVoicePort {
         .unwrap_or(Err(VoiceUnavailable::Unsupported))
     }
 
+    fn enqueue(&self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
+        let text = text.to_owned();
+        let language = language.to_owned();
+        self.ask(|reply| Command::Enqueue {
+            text,
+            language,
+            reply,
+        })
+        .unwrap_or(Err(VoiceUnavailable::Unsupported))
+    }
+
     fn stop_speaking(&self) {
         self.tell(Command::StopSpeaking);
+    }
+
+    fn half_duplex(&self) -> Option<String> {
+        self.ask(Command::HalfDuplex).flatten()
     }
 }
 
@@ -422,6 +488,10 @@ struct Capture {
     change_observer: Retained<ProtocolObject<dyn NSObjectProtocol>>,
     /// The App Nap assertion, ended with the capture.
     activity: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+    /// The input device voice processing was refused on, when it was
+    /// (AD-213): this capture is on the plain input node and hears keeper's
+    /// own answer. `None` when the unit is on and the Mac is full duplex.
+    half_duplex: Option<String>,
 }
 
 /// One recognition request and the task answering it. Rolled by
@@ -453,9 +523,21 @@ struct Worker {
     /// The serial of the current request; handlers from older serials are
     /// stale and dropped.
     current: Arc<AtomicU64>,
+    /// Whether an utterance is out: raised at `speakUtterance`, dropped
+    /// when it ends or is stopped. Read by the result handler on the
+    /// recogniser's thread, so a transcript that arrives while it is up is
+    /// barge-in and not the person's next question (AD-208, AD-213).
+    speaking: Arc<AtomicBool>,
     /// When the current utterance was handed to the synthesiser; `None`
     /// while not speaking.
     speaking_since: Option<Instant>,
+    /// Milliseconds since `epoch` until which a transcript is the tail of
+    /// keeper's own utterance and dropped (AD-209); read by the result
+    /// handler.
+    gate_until: Arc<AtomicU64>,
+    /// The `Silence` owed to the turn for an utterance that ended on its
+    /// own, reported once the gate has passed; `None` when none is owed.
+    silence_due: Option<Instant>,
     /// When the system took the capture away, for the retry clock; `None`
     /// while capturing or not wanted.
     suspended: Option<Instant>,
@@ -487,7 +569,10 @@ impl Worker {
             recognition: None,
             synthesizer: None,
             current: Arc::new(AtomicU64::new(0)),
+            speaking: Arc::new(AtomicBool::new(false)),
             speaking_since: None,
+            gate_until: Arc::new(AtomicU64::new(0)),
+            silence_due: None,
             suspended: None,
             failed_starts: 0,
             requested: None,
@@ -550,7 +635,17 @@ impl Worker {
                 }) => {
                     let _ = reply.send(self.speak(&text, &language));
                 }
+                Ok(Command::Enqueue {
+                    text,
+                    language,
+                    reply,
+                }) => {
+                    let _ = reply.send(self.enqueue(&text, &language));
+                }
                 Ok(Command::StopSpeaking) => self.stop_speaking(),
+                Ok(Command::HalfDuplex(reply)) => {
+                    let _ = reply.send(self.capture.as_ref().and_then(|c| c.half_duplex.clone()));
+                }
                 Ok(Command::Audio(notice)) => self.on_audio(notice),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
@@ -697,12 +792,21 @@ impl Worker {
     }
 
     /// End recognition and stop capture. Nothing else to let go of: there
-    /// is no session on this platform.
+    /// is no session on this platform. An utterance still out when the turn
+    /// releases the device is over as far as the turn is concerned
+    /// (AD-212): the flag comes down and the tail gate opens here too, so
+    /// the next request after a re-arm does not classify the person's
+    /// first words — "stop", the phrase — as barge-in against a voice the
+    /// turn already left. The synthesiser itself is not touched: every arm
+    /// that releases the device while `Speaking` sends `StopSpeaking` first.
     fn stop(&mut self) {
         self.wanted = None;
         self.suspended = None;
         self.end_recognition();
         self.end_capture();
+        if self.speaking.load(Ordering::SeqCst) {
+            self.speech_over();
+        }
     }
 
     fn end_recognition(&mut self) {
@@ -755,18 +859,54 @@ impl Worker {
     }
 
     /// Read `text` aloud in the voice for `language` — core's choice over
-    /// this Mac's inventory (Epic 64, AD-182). The turn released the
-    /// microphone before this on a half-duplex platform (`may_record`), so
-    /// there is no request to roll and nothing to duck; the port only
-    /// speaks. A language the framework answers no voice for is refused:
-    /// the default voice would be the wrong language, which is the failure
-    /// the epic opens with.
+    /// this Mac's inventory (Epic 64, AD-182). The microphone stays open
+    /// (AD-213), so recognition rolls to a fresh request first, so that the
+    /// first transcript to arrive is the person and not the tail of what
+    /// they said before; nothing ducks, there is no session to duck with.
+    /// A language the framework answers no voice for is refused before
+    /// anything rolls: the default voice would be the wrong language.
     fn speak(&mut self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
+        let voice = self.voice_for(language)?;
         if self.capture.is_some() {
-            // Not an error — the turn owns the rule — but worth a line if
-            // it ever happens, because it means the rule was not applied.
-            tracing::debug!("voice: speaking while a capture is up on a half-duplex platform");
+            if let Err(error) = self.roll_request() {
+                tracing::warn!(%error, "voice: could not roll the request before speaking");
+            }
         }
+        let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
+        // A new utterance: whatever the last one still owed is moot.
+        self.silence_due = None;
+        self.speaking.store(true, Ordering::SeqCst);
+        self.speaking_since = Some(Instant::now());
+        speak_text(synthesizer, text, &voice);
+        Ok(())
+    }
+
+    /// A further sentence of the same answer (Epic 68, AD-214): one more
+    /// `speakUtterance` on the live synthesiser, whose own queue plays it
+    /// after the one out now. No roll and no flag — the answer's barge-in
+    /// request was opened at `Speak` and a roll here would lose whatever
+    /// the person has begun saying into it. `isSpeaking` stays true across
+    /// the queue, so [`Worker::watch_speech_end`] does not end the turn
+    /// between two sentences; a stop clears the queue with the utterance.
+    fn enqueue(&mut self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
+        let voice = self.voice_for(language)?;
+        let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
+        self.silence_due = None;
+        if self.speaking_since.is_none() {
+            // The queue had drained before this sentence arrived: it is a
+            // fresh utterance as far as the grace clock is concerned.
+            self.speaking.store(true, Ordering::SeqCst);
+            self.speaking_since = Some(Instant::now());
+        }
+        speak_text(synthesizer, text, &voice);
+        Ok(())
+    }
+
+    /// The voice for `language`, or the refusal that names it.
+    fn voice_for(
+        &self,
+        language: &str,
+    ) -> Result<Retained<AVSpeechSynthesisVoice>, VoiceUnavailable> {
         let Some(voice) = voice_for_language(language) else {
             tracing::warn!(
                 language,
@@ -781,20 +921,31 @@ impl Worker {
             voice = %voice_name(&voice),
             "voice: utterance voice chosen"
         );
-        let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
-        self.speaking_since = Some(Instant::now());
-        speak_text(synthesizer, text, &voice);
-        Ok(())
+        Ok(voice)
     }
 
     fn stop_speaking(&mut self) {
         if let Some(synthesizer) = &self.synthesizer {
             stop_speech(synthesizer);
         }
-        self.speaking_since = None;
+        self.speech_over();
     }
 
-    /// Between commands: the retry clock, the roll clock, the synthesiser.
+    /// The utterance is over, one way or another: the ears shut for
+    /// [`TAIL_GATE`] (AD-209) — before the flag comes down, so no transcript
+    /// slips between the two as a `PartialHeard` — then flag down. Nothing
+    /// to un-duck: there is no session on this platform.
+    fn speech_over(&mut self) {
+        let gate_ms = u64::try_from(TAIL_GATE.as_millis()).unwrap_or(u64::MAX);
+        self.gate_until
+            .store(self.millis().saturating_add(gate_ms), Ordering::SeqCst);
+        self.speaking.store(false, Ordering::SeqCst);
+        self.speaking_since = None;
+        self.silence_due = None;
+    }
+
+    /// Between commands: the retry clock, the roll clock, the synthesiser,
+    /// the gate.
     fn tick(&mut self) {
         if self.wanted.is_some() {
             if let Some(since) = self.suspended {
@@ -820,6 +971,18 @@ impl Worker {
             }
         }
         self.watch_speech_end();
+        self.settle_silence();
+    }
+
+    /// The `Silence` owed for an utterance that ended on its own is
+    /// reported once its gate has passed (AD-209): the turn's end re-arms
+    /// the phrase on a fresh request, and that request must not open on
+    /// the tail of the answer.
+    fn settle_silence(&mut self) {
+        if self.silence_due.is_some_and(|due| Instant::now() >= due) {
+            self.silence_due = None;
+            (self.sink)(TurnEvent::Silence);
+        }
     }
 
     /// Whether the current request has run long enough to be replaced.
@@ -898,7 +1061,10 @@ impl Worker {
         }
     }
 
-    /// While an utterance is out, notice it ending and say so once.
+    /// While an utterance is out, notice it ending; the turn hears of it
+    /// once, after the gate ([`Worker::settle_silence`]). `isSpeaking` is
+    /// true while any utterance is queued, so a queued answer (AD-214)
+    /// ends here once, at its last sentence.
     fn watch_speech_end(&mut self) {
         let Some(since) = self.speaking_since else {
             return;
@@ -911,8 +1077,8 @@ impl Worker {
             .as_ref()
             .is_some_and(|synthesizer| is_speaking(synthesizer));
         if !still {
-            self.speaking_since = None;
-            (self.sink)(TurnEvent::Silence);
+            self.speech_over();
+            self.silence_due = Some(Instant::now() + TAIL_GATE);
         }
     }
 
@@ -921,18 +1087,31 @@ impl Worker {
     }
 
     /// The block the recogniser calls with each result. Captures the serial
-    /// it belongs to, the current-serial cell, the sink and the worker's
-    /// inbox — all `Send`, none of them a framework object.
+    /// it belongs to, the current-serial cell, the speaking flag, the gate,
+    /// whether this capture is full duplex, the sink and the worker's inbox
+    /// — all `Send`, none of them a framework object.
     ///
-    /// No barge-in classification: on this platform the turn has already
-    /// released the microphone before an utterance, so a transcript is
-    /// always the person and never keeper's own answer.
+    /// A transcript while the flag is up is barge-in, with its words (the
+    /// turn tells the stop phrase from a question, AD-208) — on a capture
+    /// with voice processing. On the half-duplex capture (voice processing
+    /// refused, AD-213) it is keeper hearing its own answer: dropped and
+    /// recorded as `echo_dropped`, so the answer does not stop itself. A
+    /// transcript inside the gate after an utterance is the port hearing
+    /// its own tail, or a person talking into it; either way it is dropped
+    /// and recorded with its words (AD-209), so the ring on hardware is the
+    /// measurement.
     fn result_handler(
         &self,
         serial: u64,
         last_heard: Arc<AtomicU64>,
     ) -> RcBlock<dyn Fn(*mut SFSpeechRecognitionResult, *mut NSError)> {
         let current = Arc::clone(&self.current);
+        let speaking = Arc::clone(&self.speaking);
+        let gate_until = Arc::clone(&self.gate_until);
+        let full_duplex = self
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.half_duplex.is_none());
         let sink = Arc::clone(&self.sink);
         let commands = self.commands.clone();
         let epoch = self.epoch;
@@ -943,17 +1122,31 @@ impl Worker {
                 }
                 match read_result(result, error) {
                     Ok(Some((text, is_final))) => {
-                        if !text.trim().is_empty() {
-                            let now =
-                                u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let now = u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let heard_something = !text.trim().is_empty();
+                        if heard_something {
                             last_heard.store(now, Ordering::SeqCst);
                         }
-                        if is_final {
+                        if speaking.load(Ordering::SeqCst) {
+                            if heard_something && full_duplex {
+                                sink(TurnEvent::SpeechDetected(text));
+                            } else if heard_something {
+                                tracing::info!(%text, "voice: transcript while speaking on a half-duplex capture dropped");
+                                crate::voice_log::record(VoiceEventKind::EchoDropped, Some(text));
+                            }
+                        } else if now < gate_until.load(Ordering::SeqCst) {
+                            if heard_something {
+                                tracing::info!(%text, "voice: transcript inside the tail gate dropped");
+                                crate::voice_log::record(VoiceEventKind::EchoDropped, Some(text));
+                            }
+                        } else if is_final {
                             sink(TurnEvent::FinalHeard(text));
-                            let _ =
-                                commands.send(Command::Audio(AudioNotice::RequestEnded { serial }));
                         } else {
                             sink(TurnEvent::PartialHeard(text));
+                        }
+                        if is_final {
+                            let _ =
+                                commands.send(Command::Audio(AudioNotice::RequestEnded { serial }));
                         }
                     }
                     Ok(None) => {}
@@ -1223,10 +1416,18 @@ fn recognizer_for(locale: &NSLocale) -> Recognizer {
 /// Nap assertion for as long as the capture stands.
 ///
 /// The engine is built new per capture rather than kept: a fresh one is
-/// always stopped and carries no tap from a previous input device. No voice
-/// processing is enabled — this platform is half-duplex by
-/// `keeper_core::voice::may_record`, and the microphone is never open while
-/// keeper speaks, so there is nothing to cancel. The tap reads the slot on
+/// always stopped and carries no tap from a previous input device. Voice
+/// processing is enabled on the input node before the engine starts,
+/// exactly as on the phone (AD-213): the unit subtracts the output
+/// device's mix from the microphone, so the capture may stay up while
+/// keeper speaks. The unit binds its reference at init and does not follow
+/// an output-device change mid-utterance (Story 22.7); the
+/// configuration-change notification rebuilds the capture, and with it the
+/// reference. A refusal — the unit will not sit on an aggregate input
+/// device such as BlackHole or Loopback, because it builds one itself — is
+/// not a failed capture: a second, plain engine is built on the same
+/// input, the refusal is recorded with the device's name, and the capture
+/// carries that name as its `half_duplex` fact. The tap reads the slot on
 /// every buffer, so a request can be rolled underneath it without touching
 /// the engine.
 ///
@@ -1235,13 +1436,19 @@ fn recognizer_for(locale: &NSLocale) -> Recognizer {
 /// readings its limiter lets through — at most ~25 a second, only while
 /// the level moves — reach `sink` as [`TurnEvent::Level`]. The recogniser
 /// still receives every buffer, untouched, before the meter looks at it.
+/// With voice processing on, the input node's format is the unit's: mono
+/// at the device's native rate (Story 22.7); the request resamples.
 #[allow(unsafe_code)]
 // The slot crosses to the audio thread inside a block, which Rust cannot see
 // and clippy therefore flags; the SAFETY comment below is the argument.
 #[allow(clippy::arc_with_non_send_sync)]
 fn start_capture(commands: &Sender<Command>, sink: EventSink) -> Result<Capture, String> {
     // SAFETY: every object below is freshly allocated or retained here and
-    // outlives every call made on it. The tap block is copied by
+    // outlives every call made on it. `setVoiceProcessingEnabled:error:` is
+    // called on a fresh, stopped engine's input node before `prepare` and
+    // `startAndReturnError:`, which Apple requires; an engine it was refused
+    // on is dropped whole and a new one built, so no node is used after a
+    // failed reconfiguration. The tap block is copied by
     // `installTapOnBus:…` and also kept in `Capture` so it cannot be freed
     // while installed; on each call it locks the slot and appends the buffer
     // to the request there, which Apple's SpeakToMe sample does from the
@@ -1257,14 +1464,38 @@ fn start_capture(commands: &Sender<Command>, sink: EventSink) -> Result<Capture,
     // `endActivity:` in `stop_capture`. The meter reads the buffer after the
     // append: `floatChannelData` is null when the format is not float (the
     // tap is installed with the input node's own format, which is float on
-    // every Mac input, but the null is checked rather than assumed); when
-    // non-null it points at `stride`-interleaved samples of which
-    // `frameLength * stride` are valid for the duration of the tap call, so
-    // the slice built over them is read only inside the call and never
-    // stored. The meter's mutex is touched by the audio thread alone; the
-    // sink is `Send + Sync` by its type.
+    // every Mac input and on the voice-processing unit, but the null is
+    // checked rather than assumed); when non-null it points at
+    // `stride`-interleaved samples of which `frameLength * stride` are
+    // valid for the duration of the tap call, so the slice built over them
+    // is read only inside the call and never stored. The meter's mutex is
+    // touched by the audio thread alone; the sink is `Send + Sync` by its
+    // type.
     let engine = unsafe { AVAudioEngine::new() };
     let input = unsafe { engine.inputNode() };
+    let (engine, input, half_duplex) = match unsafe { input.setVoiceProcessingEnabled_error(true) }
+    {
+        Ok(()) => (engine, input, None),
+        Err(error) => {
+            let device = default_input_device_name()
+                .unwrap_or_else(|| "the current input device".to_owned());
+            let why = error.localizedDescription().to_string();
+            tracing::warn!(
+                device,
+                %why,
+                "voice: voice processing refused on the input; listening half duplex"
+            );
+            crate::voice_log::record(
+                VoiceEventKind::Refused,
+                Some(format!(
+                    "voice processing refused on {device}: {why}; listening half duplex"
+                )),
+            );
+            let plain = unsafe { AVAudioEngine::new() };
+            let plain_input = unsafe { plain.inputNode() };
+            (plain, plain_input, Some(device))
+        }
+    };
     let format = unsafe { input.outputFormatForBus(0) };
 
     let slot: Arc<RequestSlot> = Arc::new(Mutex::new(None));
@@ -1334,7 +1565,90 @@ fn start_capture(commands: &Sender<Command>, sink: EventSink) -> Result<Capture,
         _tap: tap,
         change_observer,
         activity,
+        half_duplex,
     })
+}
+
+/// `AudioObjectPropertyAddress`, as CoreAudio lays it out.
+#[repr(C)]
+struct AudioObjectPropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+// CoreAudio's one property reader, for the name of the input device voice
+// processing was refused on: the sentence beside the switch names the
+// device (AD-213), and `AVAudioEngine` has no spelling of it. (A plain
+// comment: rustdoc has no page for an extern block, and a `///` here is an
+// error under `-D warnings`.)
+#[link(name = "CoreAudio", kind = "framework")]
+extern "C" {
+    fn AudioObjectGetPropertyData(
+        object: u32,
+        address: *const AudioObjectPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const c_void,
+        size: *mut u32,
+        data: *mut c_void,
+    ) -> i32;
+}
+
+/// The default input device's name as Sound settings show it ("MacBook Pro
+/// Microphone", "BlackHole 2ch"), or `None` when CoreAudio has no default
+/// input or will not name it. Read only after voice processing was refused,
+/// for the refusal's sentence; never on the capture path that worked.
+#[allow(unsafe_code)]
+fn default_input_device_name() -> Option<String> {
+    // SAFETY: `AudioObjectGetPropertyData` is called with the address, size
+    // and out-pointer shapes its header documents: the default-input query
+    // fills one `AudioDeviceID` (u32) into `device`, and the name query fills
+    // one `CFStringRef` into `name`, which the caller owns (+1) and which is
+    // toll-free bridged to `NSString`, so `Retained::from_raw` takes that
+    // ownership and releases it once. Each call's `size` is the exact size
+    // of its out value, and a non-zero status leaves the out value unread.
+    let mut device: u32 = 0;
+    let mut size = u32::try_from(std::mem::size_of::<u32>()).ok()?;
+    let address = AudioObjectPropertyAddress {
+        selector: DEFAULT_INPUT_DEVICE,
+        scope: SCOPE_GLOBAL,
+        element: ELEMENT_MAIN,
+    };
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            AUDIO_OBJECT_SYSTEM,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            (&mut device as *mut u32).cast(),
+        )
+    };
+    if status != 0 || device == 0 {
+        return None;
+    }
+    let mut name: *mut NSString = std::ptr::null_mut();
+    let mut size = u32::try_from(std::mem::size_of::<*mut NSString>()).ok()?;
+    let address = AudioObjectPropertyAddress {
+        selector: OBJECT_NAME,
+        scope: SCOPE_GLOBAL,
+        element: ELEMENT_MAIN,
+    };
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            (&mut name as *mut *mut NSString).cast(),
+        )
+    };
+    if status != 0 || name.is_null() {
+        return None;
+    }
+    let name = unsafe { Retained::from_raw(name) }?;
+    Some(name.to_string())
 }
 
 /// Tear one capture down: observer off, tap off, engine stopped, slot

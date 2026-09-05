@@ -25,6 +25,7 @@ enum Call {
     Start,
     Stop,
     Speak(String),
+    Enqueue(String),
     StopSpeaking,
 }
 
@@ -72,6 +73,10 @@ impl VoicePort for FakePort {
     }
     fn speak(&self, text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
         self.record(Call::Speak(text.to_owned()));
+        Ok(())
+    }
+    fn enqueue(&self, text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
+        self.record(Call::Enqueue(text.to_owned()));
         Ok(())
     }
     fn stop_speaking(&self) {

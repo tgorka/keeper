@@ -625,6 +625,9 @@ pub fn run() {
                         // label is right while the window is hidden, and
                         // `apply_voice_state` writes only on a change.
                         tray::apply_voice_state(&handle, &voice_ipc::voice_snapshot());
+                        // The listening switch's words follow the stored
+                        // choice (Epic 68, AD-218), on the same clock.
+                        tray::apply_listening_state(&handle);
                     }
                 });
             }
@@ -894,10 +897,14 @@ pub fn run() {
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,
                 voice_ipc::voice_stop,
-                voice_ipc::voice_stop_speaking,
                 voice_ipc::voice_wake_set,
                 // Epic 67 (AD-206): the bot a spoken turn goes to.
                 voice_ipc::voice_target_set,
+                // Epic 68 (AD-216, AD-218): each pinned bot's first-token
+                // median for the picker, and the one listening toggle every
+                // menu with a Bots section calls.
+                voice_ipc::voice_target_speeds,
+                voice_ipc::voice_wake_toggle,
                 // Story 62.5: the watcher without a turn, and the persisted phrase.
                 voice_ipc::voice_watch,
                 voice_ipc::voice_unwatch,

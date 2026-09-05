@@ -15,6 +15,15 @@
  * where the port has not measured one — before the first buffer, and on a
  * port that has no meter. A snapshot with a level is streamed at most ~25
  * times a second and only while the level changes.
+ *
+ * Since Epic 68 (Story 68.3, AD-215) `sending` carries the wait — whom the
+ * question went to, when the request left and when its first token came,
+ * as the shell's clock stamped them — and `idle` carries how long the
+ * last answer's first token took. The surface counts from `sentAtMs`
+ * against its own clock; the numbers themselves are Rust's. Each is
+ * optional on the wire because each is genuinely absent at times: before
+ * the shell stamped the request, before the first token, before any turn
+ * has answered.
  */
 export type VoiceStateVm = { "kind": "idle", 
 /**
@@ -24,7 +33,12 @@ wake: string | null,
 /**
  * Whether the microphone is open, waiting for the phrase.
  */
-listeningForWake: boolean, } | { "kind": "listening", 
+listeningForWake: boolean, 
+/**
+ * How long the last answer's first token took, in milliseconds —
+ * "first word after 28 s" — or `None` before a turn has answered.
+ */
+lastWaitMs?: number | null, } | { "kind": "listening", 
 /**
  * The interim transcript as it forms (Story 62.6 shows it).
  */
@@ -45,7 +59,22 @@ level: number | null, } | { "kind": "sending",
  * Whether the first piece of the answer has arrived: `false` is a
  * model thinking, `true` one that has begun to answer (AD-186).
  */
-answering: boolean, } | { "kind": "speaking" } | { "kind": "failed", 
+answering: boolean, 
+/**
+ * The bot the question went to, by its display name — "Waiting
+ * for nixie" — or `None` before the shell stamped the request.
+ */
+bot?: string | null, 
+/**
+ * When the request left, milliseconds since the Unix epoch, or
+ * `None` before the shell stamped it.
+ */
+sentAtMs?: number | null, 
+/**
+ * When the first token came, milliseconds since the Unix epoch, or
+ * `None` while the model is still thinking.
+ */
+firstTokenMs?: number | null, } | { "kind": "speaking" } | { "kind": "failed", 
 /**
  * Why, in a sentence.
  */

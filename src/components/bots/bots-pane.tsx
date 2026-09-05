@@ -88,6 +88,7 @@ import { BotComposer } from "@/components/bots/bot-composer";
 import { BotConversation } from "@/components/bots/bot-conversation";
 import { BotEmptyState, type BotsEmptyKind } from "@/components/bots/bot-empty-state";
 import { BotGrantBar } from "@/components/bots/bot-grant-bar";
+import { BotListeningToggle } from "@/components/bots/bot-listening-toggle";
 import { BotMetaToggle } from "@/components/bots/bot-message-meta";
 import { BotPicker } from "@/components/bots/bot-picker";
 import { BotPinsStrip } from "@/components/bots/bot-pins-strip";
@@ -374,8 +375,14 @@ export function BotsPane() {
           <h1 className="font-heading text-title">{BOTS_PANE_TITLE}</h1>
           <p className="text-muted-foreground text-sm">{BOTS_PANE_SUBTITLE}</p>
         </div>
-        {/* Story 61.8's metadata toggle. It hydrates itself. */}
-        <BotMetaToggle />
+        <div className="flex shrink-0 items-center gap-2">
+          {/* Epic 68, AD-218: listening, beside the metadata chip. Absent
+              unless voice exists here; the folded band below keeps the
+              phrase, the sentence and the refusal. */}
+          <BotListeningToggle />
+          {/* Story 61.8's metadata toggle. It hydrates itself. */}
+          <BotMetaToggle />
+        </div>
       </header>
 
       <BotPinsStrip

@@ -21,9 +21,15 @@
 //! - The answer is spoken, not read: the banner carries its first sentence
 //!   only, clipped at [`BODY_LIMIT`] on a word so a lock screen never shows
 //!   half a word. A transcript is clipped the same way, for the same reason.
+//! - The wait is named (Epic 68, AD-215): under `Thinking` the banner says
+//!   whose time it is and how long so far ([`waiting`]); under `Answering`,
+//!   how long the first word took ([`first_word`]). Each is posted once,
+//!   when its word is: a banner re-posted every second would be a clock,
+//!   and the pane is where the clock ticks.
 //! - Nothing is posted with keeper in front ([`should_post`]).
 
 use super::island::Word;
+use super::speech::Segmenter;
 
 /// The most characters a banner's body carries. A lock-screen banner shows
 /// two or three lines; past that the system truncates it anyway, and it
@@ -44,15 +50,16 @@ pub struct Banner {
 }
 
 /// The banner for `word`, with `detail` as the words that go with it — the
-/// transcript for `Heard`, the answer for `Speaking`, the reason for
+/// transcript for `Heard`, the wait ([`waiting`], [`first_word`]) for
+/// `Thinking` and `Answering`, the answer for `Speaking`, the reason for
 /// `Failed`, ignored otherwise — or `None` for a word that has none.
 #[must_use]
 pub fn sentence(word: Word, detail: &str) -> Option<Banner> {
     let (title, body) = match word {
         Word::Heard => ("Heard", clip(detail.trim())),
-        Word::Thinking => ("Thinking", String::new()),
-        Word::Answering => ("Answering", String::new()),
-        Word::Speaking => ("Answer", clip(first_sentence(detail))),
+        Word::Thinking => ("Thinking", clip(detail.trim())),
+        Word::Answering => ("Answering", clip(detail.trim())),
+        Word::Speaking => ("Answer", clip(&first_sentence(detail))),
         Word::Failed => ("Listening stopped", clip(detail.trim())),
         Word::Armed | Word::Listening | Word::Off => return None,
     };
@@ -69,35 +76,41 @@ pub fn should_post(in_front: bool, word: Word) -> bool {
     !in_front && !matches!(word, Word::Armed | Word::Listening | Word::Off)
 }
 
-/// The first sentence of `text`: up to and including the first `.`, `!`
-/// or `?` that ends a word, or the first line, whichever comes first. A
-/// dot inside a number (`3.5`) does not end a sentence; an abbreviation's
-/// (`e.g. this`) does, and the banner is a glance, not the answer.
-fn first_sentence(text: &str) -> &str {
-    let text = text.trim_start();
-    let first_line = text.lines().next().unwrap_or_default();
-    let mut end = first_line.len();
-    for (index, mark) in first_line.char_indices() {
-        if !matches!(mark, '.' | '!' | '?') {
-            continue;
-        }
-        let after = index + mark.len_utf8();
-        let ends_a_word = first_line[after..]
-            .chars()
-            .next()
-            .is_none_or(|next| next.is_whitespace() || matches!(next, '.' | '!' | '?'));
-        if ends_a_word {
-            // Take the whole run of marks: `?!`, `...`.
-            end = after
-                + first_line[after..]
-                    .chars()
-                    .take_while(|next| matches!(next, '.' | '!' | '?'))
-                    .map(char::len_utf8)
-                    .sum::<usize>();
-            break;
-        }
+/// The line under "Thinking" (AD-215): whose time the wait is, counted in
+/// whole seconds from the moment the request left. `bot` is the bot's
+/// name, or `None` when the turn has not been told one.
+#[must_use]
+pub fn waiting(bot: Option<&str>, elapsed_ms: i64) -> String {
+    let seconds = elapsed_ms.max(0) / 1000;
+    match bot {
+        Some(bot) => format!("Waiting for {bot} · {seconds} s"),
+        None => format!("Waiting · {seconds} s"),
     }
-    first_line[..end].trim_end()
+}
+
+/// The line under "Answering", and the state line's word once the turn is
+/// over (AD-215): how long the first token took to arrive — the provider's
+/// seconds, said plainly.
+#[must_use]
+pub fn first_word(after_ms: i64) -> String {
+    format!("first word after {} s", after_ms.max(0) / 1000)
+}
+
+/// The first sentence of `text`, by the rule the streaming segmenter
+/// ([`Segmenter`]) cuts an answer with — the same rule, so the banner's
+/// sentence is the first one the synthesiser is handed: up to and including
+/// the first `.`, `!` or `?` that ends a word, or the first line, whichever
+/// comes first. A dot inside a number (`3.5`) does not end a sentence; an
+/// abbreviation's (`e.g. this`) does, and the banner is a glance, not the
+/// answer. Text with no boundary at all is one sentence.
+fn first_sentence(text: &str) -> String {
+    let mut segmenter = Segmenter::new();
+    segmenter
+        .push(text)
+        .into_iter()
+        .next()
+        .or_else(|| segmenter.flush())
+        .unwrap_or_default()
 }
 
 /// `text` when it fits [`BODY_LIMIT`]; otherwise the longest prefix that
@@ -144,12 +157,21 @@ mod tests {
     }
 
     #[test]
-    fn thinking_and_answering_have_no_words_yet() {
-        assert_eq!(sentence(Word::Thinking, "ignored"), banner("Thinking", ""));
+    fn thinking_and_answering_carry_the_wait() {
         assert_eq!(
-            sentence(Word::Answering, "ignored"),
-            banner("Answering", "")
+            sentence(Word::Thinking, &waiting(Some("nixie"), 12_400)),
+            banner("Thinking", "Waiting for nixie · 12 s")
         );
+        assert_eq!(
+            sentence(Word::Thinking, &waiting(None, 0)),
+            banner("Thinking", "Waiting · 0 s")
+        );
+        assert_eq!(
+            sentence(Word::Answering, &first_word(28_550)),
+            banner("Answering", "first word after 28 s")
+        );
+        // A clock that ran backwards is not a negative wait.
+        assert_eq!(first_word(-5), "first word after 0 s");
     }
 
     #[test]

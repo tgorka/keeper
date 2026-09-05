@@ -35,12 +35,14 @@
  *
  * # Stop abandons
  *
- * While listening, the button sends `voice_stop`, which is `Abandoned` in
- * `keeper_core::voice`: the microphone is released and nothing heard is sent
- * (NFR-51). While the answer is spoken, it sends `voice_stop_speaking`,
- * which ends the turn as if the utterance had finished. Either way a wake
- * phrase that is switched on is re-armed by `keeper_core::voice::Turn`:
- * Stop ends this turn, and only the switch ends listening.
+ * In both stopping faces the button sends `voice_stop`, which is
+ * `Abandoned` in `keeper_core::voice` (AD-212). While listening, the
+ * microphone is released and nothing heard is sent (NFR-51). While the
+ * answer is spoken, the voice is cut mid-word first — `Abandoned`'s
+ * `Speaking` arm is `StopSpeaking` before the release — and then the
+ * microphone goes. Either way a wake phrase that is switched on is
+ * re-armed by `keeper_core::voice::Turn`: Stop ends this turn, and only
+ * the switch ends listening.
  *
  * # Asking, once, by name (FR-408)
  *
@@ -56,17 +58,17 @@
 import { Mic, Square, Volume2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { VoiceStateVm } from "@/lib/ipc/client";
-import {
-  iosOpenAppSettings,
-  voiceAuthorize,
-  voiceStart,
-  voiceStop,
-  voiceStopSpeaking,
-} from "@/lib/ipc/client";
+import { iosOpenAppSettings, voiceAuthorize, voiceStart, voiceStop } from "@/lib/ipc/client";
 import { botsStore } from "@/lib/stores/bots";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
-import { useVoiceStore, voiceStore } from "@/lib/stores/voice";
+import {
+  useVoiceClock,
+  useVoiceStore,
+  voiceLastWaitLine,
+  voiceStore,
+  voiceWaitWord,
+} from "@/lib/stores/voice";
 
 /** The button while idle: pressing it starts a turn. */
 export const VOICE_TALK_LABEL = "Talk";
@@ -80,7 +82,7 @@ export const VOICE_LISTENING_STATUS = "Listening";
 export const VOICE_SPEAKING_STATUS = "Speaking the answer";
 /** The status line once the question is heard and on its way to the bot. */
 export const VOICE_HEARD_STATUS = "Heard — sending it";
-/** The status line while the answer is on its way. */
+/** The status line while the answer is on its way and Rust has not stamped when it left (AD-215 counts it otherwise). */
 export const VOICE_SENDING_STATUS = "Sending what you said";
 /** The control beside a permission that was refused. */
 export const VOICE_OPEN_SETTINGS_LABEL = "Open Settings";
@@ -141,10 +143,8 @@ export function BotVoiceMic() {
         start();
         return;
       case "listening":
-        void voiceStop().catch(() => {});
-        return;
       case "speaking":
-        void voiceStopSpeaking().catch(() => {});
+        void voiceStop().catch(() => {});
         return;
     }
   };
@@ -181,12 +181,17 @@ export function BotVoiceMic() {
 /**
  * The line above the composer: what the turn is doing, in words, or why it
  * cannot. Absent while there is nothing to say (the 61.14 height contract:
- * a band exists only while it earns its height).
+ * a band exists only while it earns its height). While the model has said
+ * nothing yet the line counts the wait — "Waiting for nixie · 12 s", from
+ * Rust's `sentAtMs` against the wall clock once a second (AD-215) — says
+ * "Answering" once the first token is in, and after the turn says how long
+ * that first word took, which is the one number the owner asked about.
  */
 export function BotVoiceStatus() {
   const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   const unavailable = useVoiceStore((s) => s.unavailable);
   const state = useVoiceStore((s) => s.state);
+  const now = useVoiceClock(state);
 
   if (!bots || unavailable === undefined || unavailable?.kind === "unsupported") {
     return null;
@@ -253,7 +258,7 @@ export function BotVoiceStatus() {
           data-voice="sending"
           className="shrink-0 border-border border-t px-6 py-2 text-muted-foreground text-xs"
         >
-          {VOICE_SENDING_STATUS}
+          {voiceWaitWord(state, now) ?? VOICE_SENDING_STATUS}
         </p>
       );
     case "speaking":
@@ -277,7 +282,17 @@ export function BotVoiceStatus() {
           {state.reason}
         </p>
       );
-    case "idle":
-      return null;
+    case "idle": {
+      const lastWait = voiceLastWaitLine(state);
+      return lastWait === null ? null : (
+        <p
+          role="status"
+          data-voice="idle"
+          className="shrink-0 border-border border-t px-6 py-2 text-muted-foreground text-xs"
+        >
+          {lastWait}
+        </p>
+      );
+    }
   }
 }

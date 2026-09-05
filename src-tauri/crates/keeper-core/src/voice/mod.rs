@@ -298,8 +298,26 @@ pub trait VoicePort: Send + Sync {
     /// barge-in; on a half-duplex one the turn released it first.
     fn speak(&self, text: &str, language: &str) -> Result<(), VoiceUnavailable>;
 
-    /// Stop reading aloud immediately. Idempotent.
+    /// Read `text` aloud after what is being read (Epic 68, AD-214): queued
+    /// on the same synthesiser as the running utterance, in the voice for
+    /// `language`, spoken in its turn. Nothing else changes for it — no roll
+    /// of the recogniser, no ducking, no new flag: those happened once at
+    /// [`VoicePort::speak`] and hold for the answer. `stop_speaking` drops
+    /// the queue with the utterance. Refuses the way `speak` does.
+    fn enqueue(&self, text: &str, language: &str) -> Result<(), VoiceUnavailable>;
+
+    /// Stop reading aloud immediately, queued utterances included.
+    /// Idempotent.
     fn stop_speaking(&self);
+
+    /// The name of the input device this port could not get voice
+    /// processing on for the capture it has up — the Mac's fact for
+    /// `VoicePlatform::half_duplex_sentence` (AD-213). `None` on every port
+    /// that keeps its own voice out, and on every port whose platform has
+    /// no such refusal.
+    fn half_duplex(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The turn the shell holds: the machine's state plus the wake and stop
@@ -329,6 +347,17 @@ pub trait VoicePort: Send + Sync {
 /// transition. It is recorded while the device is open for a turn —
 /// `Listening` and `Heard` — and cleared when the turn moves anywhere else,
 /// so a snapshot never carries a level from a microphone that is closed.
+/// **Closing** (Epic 68, AD-214): the table ends `Speaking` on the
+/// synthesiser's [`TurnEvent::Silence`], but while the answer is still
+/// arriving a queue that drained faster than the stream is not the end —
+/// that `Silence` is swallowed, and the turn stays `Speaking` for the next
+/// sentence. Once [`TurnEvent::AnswerDone`] has closed the answer, the next
+/// `Silence` ends the turn; and an `AnswerDone` with nothing left to say,
+/// arriving after the queue already drained, ends it at once, since no
+/// `Silence` is coming. **The wait** (AD-215): the shell stamps when the
+/// request left and when its first token came ([`Turn::note_sent`],
+/// [`Turn::note_first_token`]) — the clock is the shell's, the arithmetic
+/// and what the snapshot says are here.
 #[derive(Debug)]
 pub struct Turn {
     platform: VoicePlatform,
@@ -343,6 +372,38 @@ pub struct Turn {
     /// The last level the port reported while `Listening` or `Heard`;
     /// `None` before the first reading and in every other state.
     level: Option<f32>,
+    /// The answer being read aloud, as a stream (AD-214).
+    answer: Answer,
+    /// The request out right now (AD-215): whom it went to and when, and
+    /// when its first token came. `None` outside `Sending`/`Speaking`.
+    sent: Option<Sent>,
+    /// How long the last answer's first token took, kept across turns for
+    /// the "first word after" line; `None` until a turn has answered.
+    last_wait_ms: Option<i64>,
+}
+
+/// What the driver knows about the answer's stream that the table does not.
+#[derive(Debug, Default)]
+struct Answer {
+    /// `AnswerDone` has arrived: nothing more will be queued.
+    closed: bool,
+    /// The synthesiser reported `Silence` since the last utterance was
+    /// handed to it, so nothing is playing and no `Silence` is owed.
+    drained: bool,
+    /// The language the first sentence was spoken in — the answer's choice,
+    /// kept for every later sentence unless one is confidently another.
+    language: Option<String>,
+}
+
+/// One request, stamped by the shell (AD-215).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sent {
+    /// The bot's display name, for "Waiting for nixie".
+    bot: String,
+    /// When the request left, milliseconds since the Unix epoch.
+    at_ms: i64,
+    /// When the first token came, or `None` while the model is thinking.
+    first_token_ms: Option<i64>,
 }
 
 impl Turn {
@@ -356,6 +417,9 @@ impl Turn {
             stop: None,
             microphone_open: false,
             level: None,
+            answer: Answer::default(),
+            sent: None,
+            last_wait_ms: None,
         }
     }
 
@@ -408,6 +472,41 @@ impl Turn {
             self.state,
             TurnState::Heard { .. } | TurnState::Sending { .. }
         )
+    }
+
+    /// The request for what the turn heard has left (AD-215): to `bot`, at
+    /// `at_ms` on the shell's clock. Only a turn waiting for an answer is
+    /// stamped; a typed message leaving while no turn runs is nothing here.
+    pub fn note_sent(&mut self, bot: String, at_ms: i64) {
+        if self.awaiting_send() {
+            self.sent = Some(Sent {
+                bot,
+                at_ms,
+                first_token_ms: None,
+            });
+        }
+    }
+
+    /// The first token of the answer came `after_ms` after the request left
+    /// (AD-215) — the stream's own measurement, the same number the row's
+    /// `ttft_ms` carries, so the line and the caption never disagree. Only
+    /// the first is kept; a request never stamped is not measured. Returns
+    /// whether this was the first, for the ring.
+    pub fn note_first_token(&mut self, after_ms: i64) -> bool {
+        match &mut self.sent {
+            Some(sent) if sent.first_token_ms.is_none() => {
+                sent.first_token_ms = Some(sent.at_ms.saturating_add(after_ms));
+                self.last_wait_ms = Some(after_ms);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the answer being read has finished arriving (AD-214) — for
+    /// the log, which records the close once.
+    pub fn answer_closed(&self) -> bool {
+        matches!(self.state, TurnState::Speaking) && self.answer.closed
     }
 
     /// Whether the standing choice is in force (Epic 65, AD-190): a phrase
@@ -473,6 +572,21 @@ impl Turn {
             }
             _ => event,
         };
+        // AD-214, closing: the synthesiser's end is the turn's end only once
+        // the answer is closed; before that the queue merely ran dry.
+        let event = match (&self.state, event) {
+            (TurnState::Speaking, TurnEvent::Silence) if !self.answer.closed => {
+                self.answer.drained = true;
+                return Vec::new();
+            }
+            (TurnState::Speaking, TurnEvent::AnswerDone(rest))
+                if rest.trim().is_empty() && self.answer.drained =>
+            {
+                TurnEvent::Silence
+            }
+            (_, event) => event,
+        };
+        let closes = matches!(event, TurnEvent::AnswerDone(_));
         let turn_ended = matches!(
             event,
             TurnEvent::Silence
@@ -498,6 +612,30 @@ impl Turn {
                 effects.insert(0, Effect::ReleaseMicrophone);
             }
         }
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Speak(_)))
+        {
+            self.answer = Answer::default();
+        }
+        if closes {
+            self.answer.closed = true;
+        }
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Speak(_) | Effect::Enqueue(_)))
+        {
+            self.answer.drained = false;
+        }
+        if !matches!(next, TurnState::Speaking) {
+            self.answer = Answer::default();
+        }
+        if matches!(
+            next,
+            TurnState::Idle | TurnState::Listening { .. } | TurnState::Failed { .. }
+        ) {
+            self.sent = None;
+        }
         self.state = next;
         if !self.meters() {
             self.level = None;
@@ -515,10 +653,20 @@ impl Turn {
     /// too. Returns every effect that was attempted, for the caller's log.
     pub fn drive(&mut self, event: TurnEvent, port: &dyn VoicePort) -> Vec<Effect> {
         let mut effects = self.apply(event);
-        if let Err(why) = perform(&effects, port, self.wake.as_ref()) {
+        if let Err(why) = perform(
+            &effects,
+            port,
+            self.wake.as_ref(),
+            &mut self.answer.language,
+        ) {
             let recovery = self.apply(TurnEvent::Failed(why.message(&self.platform)));
             // A failed release cannot fail: `stop_*` are infallible.
-            let _ = perform(&recovery, port, self.wake.as_ref());
+            let _ = perform(
+                &recovery,
+                port,
+                self.wake.as_ref(),
+                &mut self.answer.language,
+            );
             effects.extend(recovery);
         }
         effects
@@ -530,6 +678,7 @@ impl Turn {
             TurnState::Idle => VoiceStateVm::Idle {
                 wake: self.wake.as_ref().map(|w| w.as_str().to_owned()),
                 listening_for_wake: self.wake.is_some() && self.microphone_open,
+                last_wait_ms: self.last_wait_ms,
             },
             TurnState::Listening { heard } => VoiceStateVm::Listening {
                 heard: heard.clone(),
@@ -541,6 +690,9 @@ impl Turn {
             },
             TurnState::Sending { answering } => VoiceStateVm::Sending {
                 answering: *answering,
+                bot: self.sent.as_ref().map(|sent| sent.bot.clone()),
+                sent_at_ms: self.sent.as_ref().map(|sent| sent.at_ms),
+                first_token_ms: self.sent.as_ref().and_then(|sent| sent.first_token_ms),
             },
             TurnState::Speaking => VoiceStateVm::Speaking,
             TurnState::Failed { reason } => VoiceStateVm::Failed {
@@ -580,13 +732,19 @@ fn device_after(open: bool, effects: &[Effect]) -> bool {
 /// nothing to do. [`Effect::Speak`] is where the voice is chosen (AD-182,
 /// AD-183): the port supplies its inventory, the listening locale and the
 /// text's detected language, [`speech::choose_voice`] decides, and the port
-/// is told which language to speak in. Releases and stops are infallible by
-/// the port's contract, so the only errors are an `OpenMicrophone` or a
-/// `Speak` the device refused — including a language it has no voice for.
+/// is told which language to speak in; the choice is kept in `language` as
+/// the answer's. [`Effect::Enqueue`] speaks in that language unless the
+/// sentence's own detection is confident ([`speech::confident`]) — a
+/// sentence long enough for the detector to be sure of, in which case the
+/// voice follows it (AD-214). Releases and stops are infallible by the
+/// port's contract, so the only errors are an `OpenMicrophone`, a `Speak` or
+/// an `Enqueue` the device refused — including a language it has no voice
+/// for.
 pub fn perform(
     effects: &[Effect],
     port: &dyn VoicePort,
     wake: Option<&WakePhrase>,
+    language: &mut Option<String>,
 ) -> Result<(), VoiceUnavailable> {
     for effect in effects {
         match effect {
@@ -594,17 +752,41 @@ pub fn perform(
             Effect::ReleaseMicrophone => port.stop_listening(),
             Effect::SendText(_) => {}
             Effect::Speak(text) => {
-                let voices = port.voices();
-                let listening = port.listening();
-                let detected =
-                    port.detect_language(text, &speech::constraints(&listening, &voices));
-                let language = speech::choose_voice(detected.as_deref(), &listening, &voices)?;
-                port.speak(text, &language)?;
+                let chosen = voice_for(port, text, None)?;
+                port.speak(text, &chosen)?;
+                *language = Some(chosen);
+            }
+            Effect::Enqueue(text) => {
+                let chosen = voice_for(port, text, language.as_deref())?;
+                port.enqueue(text, &chosen)?;
+                // A confident switch is the answer's choice from here on:
+                // the short sentences after it follow it, not the first.
+                *language = Some(chosen);
             }
             Effect::StopSpeaking => port.stop_speaking(),
         }
     }
     Ok(())
+}
+
+/// The language to read `text` in on `port`: the answer's `first` choice,
+/// kept unless the detector is confident the sentence is another language;
+/// with no first choice yet, [`speech::choose_voice`] over the detection.
+fn voice_for(
+    port: &dyn VoicePort,
+    text: &str,
+    first: Option<&str>,
+) -> Result<String, VoiceUnavailable> {
+    let voices = port.voices();
+    let listening = port.listening();
+    let detected = port.detect_language(text, &speech::constraints(&listening, &voices));
+    match first {
+        Some(first) => match speech::confident(detected.as_deref(), text) {
+            Some(sure) => speech::choose_voice(Some(sure), &listening, &voices),
+            None => Ok(first.to_owned()),
+        },
+        None => speech::choose_voice(detected.as_deref(), &listening, &voices),
+    }
 }
 
 /// Whether keeper arms the phrase again without being asked (Epic 65,

@@ -3173,10 +3173,6 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     voiceWatcher?.onmessage?.(voiceIdle());
     return null;
   },
-  voice_stop_speaking: () => {
-    voiceWatcher?.onmessage?.(voiceIdle());
-    return null;
-  },
   // Story 61.9's registry, faked. See `mockCommandPreview` for why it is crude.
   bots_command_preview: (payload) => mockCommandPreview(String(payload.draft ?? "")),
   // --- Tasks (Epic 57, Story 57.6) ---------------------------------------

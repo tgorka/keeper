@@ -127,6 +127,12 @@ const NOTE_EMPTY_SLOT: &str = "\u{2014}";
 /// which is the AD-27 absence, never a disabled row.
 const VOICE_STATUS_ID: &str = "tray-voice-status";
 const VOICE_TALK_ID: &str = "tray-voice-talk";
+/// The listening switch (Epic 68, AD-218): one item that flips
+/// `bots.wake_enabled` through `voice_ipc::voice_wake_toggle` — the same
+/// command the palette, the native menu and the pane headers call — and
+/// whose label names the state ("Listening on · hey nixie"). Built with
+/// the two above, so it is absent exactly where they are.
+const VOICE_LISTENING_ID: &str = "tray-voice-listening";
 
 /// What the tray should currently say about notes — composed in Rust, so the
 /// tray, the palette and the window can never word the same fact differently.
@@ -171,11 +177,13 @@ struct NotesItems {
 /// the turn through `set_text` — never `set_menu` (AD-61). The status line
 /// says where the turn is; the verb item says what a click will do, in the
 /// mic control's own words, and its click toggles (start / cancel / stop the
-/// answer) through `voice_reach`.
+/// answer) through `voice_reach`. The listening item (Epic 68, AD-218) names
+/// the switch's state and flips it.
 #[derive(Clone)]
 struct VoiceItems {
     status: MenuItem<Wry>,
     talk: MenuItem<Wry>,
+    listening: MenuItem<Wry>,
 }
 
 /// The sections an idle-family menu carries that are built once and then
@@ -647,15 +655,37 @@ fn build_voice_items(app: &AppHandle) -> Option<VoiceItems> {
         return None;
     }
     let labels = keeper_core::voice_reach::tray_voice_labels(&crate::voice_ipc::voice_snapshot());
+    let listening = listening_label(app).unwrap_or_else(|| {
+        keeper_core::voice_reach::tray_listening_label(
+            false,
+            keeper_core::voice::DEFAULT_WAKE_PHRASE,
+        )
+    });
     Some(VoiceItems {
         status: menu_item(app, VOICE_STATUS_ID, &labels.status, false)?,
         talk: menu_item(app, VOICE_TALK_ID, labels.verb, true)?,
+        listening: menu_item(app, VOICE_LISTENING_ID, &listening, true)?,
     })
 }
 
+/// The listening item's words from the stored choice (Epic 68, AD-218):
+/// `bots.wake_enabled` and the phrase as typed, read from the registry —
+/// the choice, not the turn's arm, for `tray_listening_label`'s reason.
+/// `None` when the registry could not be read (no data dir yet, a failed
+/// open); the caller keeps the previous words.
+fn listening_label(app: &AppHandle) -> Option<String> {
+    let state = app.try_state::<crate::ipc::AppState>()?;
+    let data_dir = state.platform.data_dir().ok()?;
+    let enabled = keeper_core::registry::get_bots_wake_enabled(&data_dir).ok()?;
+    let phrase = keeper_core::registry::get_bots_wake_phrase(&data_dir).ok()?;
+    Some(keeper_core::voice_reach::tray_listening_label(
+        enabled, &phrase,
+    ))
+}
+
 /// Append the voice section to a menu under construction: the status line,
-/// the verb, a separator — below the notes section and above the recording
-/// verbs, and nothing at all where there is no voice.
+/// the verb, the listening switch, a separator — below the notes section and
+/// above the recording verbs, and nothing at all where there is no voice.
 fn add_voice_section<'a>(
     builder: MenuBuilder<'a, Wry, AppHandle>,
     items: Option<&'a VoiceItems>,
@@ -663,7 +693,9 @@ fn add_voice_section<'a>(
     let Some(items) = items else {
         return builder;
     };
-    builder.items(&[&items.status, &items.talk]).separator()
+    builder
+        .items(&[&items.status, &items.talk, &items.listening])
+        .separator()
 }
 
 /// Build both mutated-in-place sections for an idle-family menu.
@@ -807,6 +839,11 @@ fn build_tray(app: &AppHandle) -> Option<(TrayIcon, Sections)> {
             // answer it will do. Performed in Rust — no webview in the path —
             // so it works with the window hidden.
             VOICE_TALK_ID => crate::voice_reach::reach(keeper_core::voice_reach::ReachAsk::Toggle),
+            // The listening switch (Epic 68, AD-218): the same command the
+            // palette, the native menu and the pane headers call, run off the
+            // event thread because switching on may ask the OS for the
+            // microphone. The label follows on the next tick.
+            VOICE_LISTENING_ID => toggle_listening(app),
             id => {
                 if let Some(slot) = NOTE_RECENT_IDS.iter().position(|recent| *recent == id) {
                     crate::notes_ipc::tray_open_recent(app, slot);
@@ -2221,6 +2258,52 @@ pub fn apply_voice_state(app: &AppHandle, snapshot: &VoiceStateVm) {
         set_label(&items.status, &labels.status);
         set_label(&items.talk, labels.verb);
     }
+}
+
+/// The listening item's last painted words, memoised like [`VOICE_MODEL`]
+/// so a tick writes only on a change.
+static LISTENING_MODEL: Mutex<Option<String>> = Mutex::new(None);
+
+/// Render the listening switch from the stored choice (Epic 68, AD-218).
+/// Rides the same 1 Hz tick as [`apply_voice_state`]: the choice is written
+/// by `voice_wake_set` from five surfaces, some without a window, and a
+/// tick that reads two settings rows is how the tray follows all of them
+/// without a second event path. A write happens on a change, never on a
+/// tick; an unreadable registry leaves the previous words.
+pub fn apply_listening_state(app: &AppHandle) {
+    let Some(label) = listening_label(app) else {
+        return;
+    };
+    {
+        let mut slot = LISTENING_MODEL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.as_deref() == Some(label.as_str()) {
+            return;
+        }
+        *slot = Some(label.clone());
+    }
+    let items = {
+        let guard = tray_guard();
+        guard.as_ref().and_then(|state| state.voice.clone())
+    };
+    if let Some(items) = items {
+        set_label(&items.listening, &label);
+    }
+}
+
+/// Flip the listening switch from the tray (Epic 68, AD-218) through
+/// `voice_ipc::voice_wake_toggle`, the one command every surface calls. Off
+/// the event thread: switching on asks for the microphone by name, and the
+/// OS draws that dialog on the main thread the click arrived on.
+fn toggle_listening(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<crate::ipc::AppState>();
+        if let Err(error) = crate::voice_ipc::voice_wake_toggle(state).await {
+            tracing::warn!(error = %error.message, "tray: could not toggle listening");
+        }
+    });
 }
 
 /// Push one model onto one set of retained handles. Best-effort throughout: a

@@ -9,7 +9,7 @@
  * class's presence is the whole of what can be checked here, and the
  * `data-motion` mark is what a screenshot's DOM probe reads on the Mac.
  */
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { VoiceStateVm } from "@/lib/ipc/client";
 import {
@@ -79,6 +79,41 @@ describe("VoicePill per state", () => {
     thinking.unmount();
     render(<VoicePill state={{ kind: "sending", answering: true }} />);
     expect(screen.getByRole("status")).toHaveTextContent(PILL_ANSWERING);
+  });
+
+  it("counts the wait from Rust's sentAtMs once a second, then says Answering (AD-215)", () => {
+    vi.useFakeTimers();
+    try {
+      const sentAtMs = Date.now() - 11_800;
+      const waiting: VoiceStateVm = { kind: "sending", answering: false, bot: "nixie", sentAtMs };
+      const { rerender } = render(<VoicePill state={waiting} />);
+      // Mounted mid-wait: the seconds are the true ones, not zero.
+      expect(screen.getByRole("status")).toHaveTextContent("Waiting for nixie · 11 s");
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+      expect(screen.getByRole("status")).toHaveTextContent("Waiting for nixie · 12 s");
+      act(() => {
+        vi.advanceTimersByTime(3_000);
+      });
+      expect(screen.getByRole("status")).toHaveTextContent("Waiting for nixie · 15 s");
+      rerender(
+        <VoicePill state={{ ...waiting, answering: true, firstTokenMs: sentAtMs + 15_200 }} />,
+      );
+      expect(screen.getByRole("status")).toHaveTextContent(PILL_ANSWERING);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says how long the last first word took beside the armed phrase", () => {
+    render(
+      <VoicePill
+        state={{ kind: "idle", wake: "nixie", listeningForWake: true, lastWaitMs: 28_550 }}
+      />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(pillArmedLine("nixie"));
+    expect(screen.getByText("first word after 28 s")).toBeInTheDocument();
   });
 
   it("says Speaking with a live lamp", () => {

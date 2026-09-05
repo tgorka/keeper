@@ -12,7 +12,8 @@
  *    webview: no `botsChatSend`, no `voice_speak` (which no longer exists as
  *    a binding). The send and the speak are Rust's, whether the turn was the
  *    button's or the phrase's — one path.
- * 3. **Stop abandons** — pressing while listening calls `voice_stop`, and the
+ * 3. **Stop abandons** — pressing while listening or while the answer is
+ *    read aloud calls `voice_stop` (the one manual stop, AD-212), and the
  *    idle snapshot that follows is rendered idle: the surface honours the
  *    release rather than remembering a press.
  * 4. **The first press asks, by name, once** — `voice_authorize` precedes
@@ -22,7 +23,7 @@
  *    unanswered, and on `unsupported`.
  */
 
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BotVoiceMic,
@@ -45,7 +46,6 @@ import { voiceStore } from "@/lib/stores/voice";
 const voiceAuthorize = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceStart = vi.fn<() => Promise<void>>();
 const voiceStop = vi.fn<() => Promise<void>>();
-const voiceStopSpeaking = vi.fn<() => Promise<void>>();
 const iosOpenAppSettings = vi.fn<() => Promise<void>>();
 const botsChatSend = vi.fn<() => Promise<string>>();
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
@@ -55,7 +55,6 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceAuthorize: () => voiceAuthorize(),
     voiceStart: () => voiceStart(),
     voiceStop: () => voiceStop(),
-    voiceStopSpeaking: () => voiceStopSpeaking(),
     iosOpenAppSettings: () => iosOpenAppSettings(),
     botsChatSend: () => botsChatSend(),
   };
@@ -117,13 +116,11 @@ beforeEach(() => {
   voiceAuthorize.mockReset();
   voiceStart.mockReset();
   voiceStop.mockReset();
-  voiceStopSpeaking.mockReset();
   iosOpenAppSettings.mockReset();
   botsChatSend.mockReset();
   voiceAuthorize.mockResolvedValue(null);
   voiceStart.mockResolvedValue();
   voiceStop.mockResolvedValue();
-  voiceStopSpeaking.mockResolvedValue();
   iosOpenAppSettings.mockResolvedValue();
   botsChatSend.mockResolvedValue("never");
   seed();
@@ -223,6 +220,35 @@ describe("BotVoiceMic — the turn is Rust's from the phrase to the last word (A
     // spoken by Rust when the stream closes, screen or no screen.
     expect("voiceSpeak" in client).toBe(false);
   });
+
+  it("counts the wait from Rust's sentAtMs, says Answering, and after the turn how long the first word took (AD-215)", () => {
+    vi.useFakeTimers();
+    try {
+      const sentAtMs = Date.now() - 4_200;
+      seed({ state: { kind: "sending", answering: false, bot: "nixie", sentAtMs } });
+      const { rerender } = render(<Surface />);
+      expect(screen.getByRole("status")).toHaveTextContent("Waiting for nixie · 4 s");
+      act(() => {
+        vi.advanceTimersByTime(2_000);
+      });
+      expect(screen.getByRole("status")).toHaveTextContent("Waiting for nixie · 6 s");
+      voiceStore.getState().applyState({
+        kind: "sending",
+        answering: true,
+        bot: "nixie",
+        sentAtMs,
+        firstTokenMs: sentAtMs + 6_300,
+      });
+      rerender(<Surface />);
+      expect(screen.getByRole("status")).toHaveTextContent("Answering");
+      voiceStore.getState().applyState({ ...IDLE, lastWaitMs: 6_300 });
+      rerender(<Surface />);
+      expect(screen.getByRole("status")).toHaveTextContent("first word after 6 s");
+      expect(screen.getByRole("status")).toHaveAttribute("data-voice", "idle");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("BotVoiceMic — stop abandons, and the surface honours the release", () => {
@@ -231,7 +257,6 @@ describe("BotVoiceMic — stop abandons, and the surface honours the release", (
     const { rerender } = render(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_STOP_LISTENING_LABEL }));
     await waitFor(() => expect(voiceStop).toHaveBeenCalledTimes(1));
-    expect(voiceStopSpeaking).not.toHaveBeenCalled();
 
     // What Rust streams after `Abandoned`: idle, microphone released.
     voiceStore.getState().applyState(IDLE);
@@ -243,12 +268,21 @@ describe("BotVoiceMic — stop abandons, and the surface honours the release", (
     expect(screen.queryByRole("status")).toBeNull();
   });
 
-  it("calls voice_stop_speaking, not voice_stop, while the answer is read aloud", async () => {
+  it("calls the same voice_stop while the answer is read aloud (AD-212)", async () => {
     seed({ state: SPEAKING });
-    render(<Surface />);
+    const { rerender } = render(<Surface />);
     fireEvent.click(screen.getByRole("button", { name: VOICE_STOP_SPEAKING_LABEL }));
-    await waitFor(() => expect(voiceStopSpeaking).toHaveBeenCalledTimes(1));
-    expect(voiceStop).not.toHaveBeenCalled();
+    await waitFor(() => expect(voiceStop).toHaveBeenCalledTimes(1));
+    expect(voiceStart).not.toHaveBeenCalled();
+
+    // What Rust streams after `Abandoned` from `Speaking`: the voice cut,
+    // the microphone released, the phrase re-armed.
+    voiceStore.getState().applyState(IDLE);
+    rerender(<Surface />);
+    expect(screen.getByRole("button", { name: VOICE_TALK_LABEL })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
   });
 });
 

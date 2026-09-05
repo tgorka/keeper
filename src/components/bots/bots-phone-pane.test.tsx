@@ -33,6 +33,7 @@ import {
 import { BOT_CONVERSATION_LABEL } from "@/components/bots/bot-conversation";
 import { BOTS_EMPTY_COPY } from "@/components/bots/bot-empty-state";
 import { GRANT_ADD_LABEL, GRANT_NONE_HELD } from "@/components/bots/bot-grant-bar";
+import { LISTENING_TOGGLE_LABEL } from "@/components/bots/bot-listening-toggle";
 import { BOT_PICKER_BOT_LABEL } from "@/components/bots/bot-picker";
 import { BOT_PINS_LABEL } from "@/components/bots/bot-pins-strip";
 import { BOT_SESSION_NEW_LABEL } from "@/components/bots/bot-session-list";
@@ -75,6 +76,8 @@ const botsSessionOpen = vi.fn();
 const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceWakeGet = vi.fn<() => Promise<VoiceWakeVm>>();
 const voiceTargetSet = vi.fn<(botId: string | null) => Promise<VoiceWakeVm>>();
+/** The listening switch's one command (Epic 68, AD-218). */
+const voiceWakeToggle = vi.fn<() => Promise<VoiceWakeVm>>();
 /** The event sink the level handed to `botsChatSend`, driven as Rust would. */
 let sink: ((event: BotStreamEvent) => void) | null = null;
 
@@ -145,6 +148,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceUnwatch: () => Promise.resolve(),
     voiceWakeGet: () => voiceWakeGet(),
     voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
+    voiceWakeToggle: () => voiceWakeToggle(),
+    voiceTargetSpeeds: () => Promise.resolve([]),
   };
 });
 
@@ -668,6 +673,35 @@ describe("the ear on the phone's face (Story 65.2, AD-191)", () => {
     ).toBe('Listening for "nixie" · en-US · keeper is not allowed to use the microphone');
   });
 
+  it("counts the wait for the named bot, says Answering, then how long the first word took (AD-215)", () => {
+    const sentAtMs = 1_700_000_000_000;
+    expect(
+      phoneVoiceLine(
+        WAKE_ON,
+        null,
+        { kind: "sending", answering: false, bot: "nixie", sentAtMs },
+        sentAtMs + 12_400,
+      ),
+    ).toBe('Listening for "nixie" · en-US · Waiting for nixie · 12 s');
+    expect(
+      phoneVoiceLine(
+        WAKE_ON,
+        null,
+        {
+          kind: "sending",
+          answering: true,
+          bot: "nixie",
+          sentAtMs,
+          firstTokenMs: sentAtMs + 28_550,
+        },
+        sentAtMs + 30_000,
+      ),
+    ).toBe('Listening for "nixie" · en-US · Answering');
+    expect(phoneVoiceLine(WAKE_ON, null, { ...ARMED, lastWaitMs: 28_550 })).toBe(
+      'Listening for "nixie" · en-US · first word after 28 s',
+    );
+  });
+
   it("is one bounded band above the composer that says why the phrase is not listening, and opens the sheet", async () => {
     voiceAvailability.mockResolvedValue(NOT_AUTHORIZED);
     voiceWakeGet.mockResolvedValue(WAKE_ON);
@@ -731,6 +765,62 @@ describe("the ear on the phone's face (Story 65.2, AD-191)", () => {
     await openConversation();
     await waitFor(() => expect(voiceStore.getState().wake).toEqual(WAKE_ON));
     expect(screen.queryByRole("button", { name: BOTS_PHONE_VOICE_LINE_LABEL })).toBeNull();
+  });
+});
+
+/**
+ * Listening in the list-level back bar (Epic 68, Story 68.4, AD-218): one
+ * 44 pt button whose words are the state, flipping the switch through the
+ * one command every menu calls, without opening a conversation or the
+ * sheet — absent where voice is unsupported (AD-27).
+ */
+describe("listening from the phone's Bots list bar (Epic 68, AD-218)", () => {
+  const WAKE_OFF: VoiceWakeVm = {
+    enabled: false,
+    phrase: "hey nixie",
+    limits: "limits",
+    locale: "en-US",
+    localeChosen: null,
+    onDeviceLocales: ["en-US"],
+    stopPhrase: "stop",
+    voiceTarget: null,
+  };
+
+  beforeEach(() => {
+    voiceWakeToggle.mockReset();
+  });
+
+  it("toggles with one tap from the list and shows what Rust stored", async () => {
+    voiceAvailability.mockResolvedValue(null);
+    voiceWakeGet.mockResolvedValue(WAKE_OFF);
+    voiceWakeToggle.mockResolvedValue({ ...WAKE_OFF, enabled: true });
+    render(<PhoneShell />);
+    await openBots();
+    const button = await screen.findByRole("button", { name: LISTENING_TOGGLE_LABEL });
+    expect(button).toHaveTextContent("Listening off");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    expect(button).toHaveClass("h-11");
+    // In the bar beside the title, not behind a conversation or a sheet.
+    expect(button.closest("header")).toContainElement(
+      screen.getByRole("heading", { name: BOTS_PANE_TITLE }),
+    );
+    fireEvent.click(button);
+    await waitFor(() => expect(voiceWakeToggle).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(button).toHaveTextContent("Listening on · hey nixie"));
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("is absent where voice is unsupported", async () => {
+    voiceAvailability.mockResolvedValue({
+      kind: "unsupported",
+      message: "voice is not available in this build",
+    });
+    voiceWakeGet.mockResolvedValue(WAKE_OFF);
+    render(<PhoneShell />);
+    await openBots();
+    await waitFor(() => expect(voiceStore.getState().wake).toEqual(WAKE_OFF));
+    expect(screen.queryByRole("button", { name: LISTENING_TOGGLE_LABEL })).toBeNull();
   });
 });
 

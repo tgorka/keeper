@@ -78,6 +78,21 @@ pub enum VoiceEventKind {
     /// surface that cannot be read back from the app, so the ring is where
     /// its refusal on a free team is measured.
     Island(&'static str),
+    /// The first piece of the answer arrived (Epic 68, Story 68.3,
+    /// AD-215). The detail is `after_ms=<n>`: how long after the request
+    /// left — the provider's seconds, not keeper's.
+    FirstToken,
+    /// The whole answer has arrived; whatever the synthesiser still holds is
+    /// the rest of it (AD-214). The turn ends on the synthesiser's own
+    /// `Silence` only after this.
+    AnswerClosed,
+    /// A sentence was queued on the synthesiser behind the one it is reading
+    /// (AD-214). The sentence's first words ([`first_words`]) are the detail.
+    Enqueued,
+    /// The person stopped the turn by a control — the button, the tray, the
+    /// hotkey, the pill (Epic 68, Story 68.1, AD-212). Mid-answer this is the
+    /// stop that stops the voice.
+    Abandoned,
 }
 
 impl VoiceEventKind {
@@ -113,8 +128,30 @@ impl VoiceEventKind {
             Self::EchoDropped => "echo_dropped".to_owned(),
             Self::Notified => "notified".to_owned(),
             Self::Island(what) => format!("island:{what}"),
+            Self::FirstToken => "first_token".to_owned(),
+            Self::AnswerClosed => "answer_closed".to_owned(),
+            Self::Enqueued => "enqueued".to_owned(),
+            Self::Abandoned => "abandoned".to_owned(),
         }
     }
+}
+
+/// How many words of a queued sentence the ring keeps as its detail.
+pub const DETAIL_WORDS: usize = 5;
+
+/// The first [`DETAIL_WORDS`] words of `text`, with `…` where more followed
+/// — enough to tell one sentence from the next on the ring, not the answer.
+pub fn first_words(text: &str) -> String {
+    let mut words = text.split_whitespace();
+    let mut detail = words
+        .by_ref()
+        .take(DETAIL_WORDS)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if words.next().is_some() {
+        detail.push('…');
+    }
+    detail
 }
 
 /// One thing the port did, when.

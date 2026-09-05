@@ -291,6 +291,13 @@ enum Command {
         language: String,
         reply: SyncSender<Result<(), VoiceUnavailable>>,
     },
+    /// A later sentence of the same answer, queued behind the running
+    /// utterance (AD-214).
+    Enqueue {
+        text: String,
+        language: String,
+        reply: SyncSender<Result<(), VoiceUnavailable>>,
+    },
     StopSpeaking,
     /// Something the system did to the audio, reported by an observer or a
     /// result handler, to be acted on from the worker's own thread.
@@ -416,6 +423,17 @@ impl VoicePort for IosVoicePort {
         let text = text.to_owned();
         let language = language.to_owned();
         self.ask(|reply| Command::Speak {
+            text,
+            language,
+            reply,
+        })
+        .unwrap_or(Err(VoiceUnavailable::Unsupported))
+    }
+
+    fn enqueue(&self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
+        let text = text.to_owned();
+        let language = language.to_owned();
+        self.ask(|reply| Command::Enqueue {
             text,
             language,
             reply,
@@ -601,6 +619,13 @@ impl Worker {
                 }) => {
                     let _ = reply.send(self.speak(&text, &language));
                 }
+                Ok(Command::Enqueue {
+                    text,
+                    language,
+                    reply,
+                }) => {
+                    let _ = reply.send(self.enqueue(&text, &language));
+                }
                 Ok(Command::StopSpeaking) => self.stop_speaking(),
                 Ok(Command::Audio(notice)) => self.on_audio(notice),
                 Err(RecvTimeoutError::Timeout) => {}
@@ -744,12 +769,22 @@ impl Worker {
         self.suspended = Some(Instant::now());
     }
 
-    /// End recognition, stop capture, and let the session go.
+    /// End recognition, stop capture, and let the session go. An utterance
+    /// still out when the turn releases the device is over as far as the
+    /// turn is concerned (AD-212): the flag comes down and the tail gate
+    /// opens here too, so the next request after a re-arm does not classify
+    /// the person's first words — "stop", the phrase — as barge-in against a
+    /// voice the turn already left. The synthesiser itself is not touched:
+    /// every arm that releases the device while `Speaking` sends
+    /// `StopSpeaking` first.
     fn stop(&mut self) {
         self.wanted = None;
         self.suspended = None;
         self.end_recognition();
         self.end_capture();
+        if self.speaking.load(Ordering::SeqCst) {
+            self.speech_over();
+        }
         release_session();
     }
 
@@ -841,6 +876,45 @@ impl Worker {
         Ok(())
     }
 
+    /// Queue `text` behind what is being read (Epic 68, AD-214): a second
+    /// `speakUtterance:` on the same synthesiser, which plays its utterances
+    /// in order. None of `speak`'s per-answer work runs again — no roll of
+    /// the request (the in-flight barge-in transcript would be lost on
+    /// every sentence), no ducking (still in force). One thing may need
+    /// redoing: when the queue ran dry before this sentence arrived,
+    /// [`Worker::watch_speech_end`] took the flag down and opened the gate;
+    /// the turn swallowed that `Silence`, and this raises the flag again so
+    /// the sentence about to play is not transcribed as the person.
+    fn enqueue(&mut self, text: &str, language: &str) -> Result<(), VoiceUnavailable> {
+        let Some(voice) = voice_for_language(language) else {
+            tracing::warn!(
+                language,
+                "voice: no synthesiser voice for the chosen language"
+            );
+            return Err(VoiceUnavailable::NoVoice {
+                language: language.to_owned(),
+            });
+        };
+        let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
+        if !self.speaking.load(Ordering::SeqCst) {
+            if self.capture.is_some() {
+                if let Err(error) = set_session_options(DUCKING) {
+                    tracing::debug!(%error, "voice: others did not duck");
+                }
+            }
+            self.speaking.store(true, Ordering::SeqCst);
+            self.speaking_since = Some(Instant::now());
+        }
+        // Whatever the drained queue still owed is moot: a new utterance is
+        // about to play and its own end will be watched.
+        self.silence_due = None;
+        speak_text(synthesizer, text, &voice);
+        Ok(())
+    }
+
+    /// Cut the utterance mid-word (the manual stop, the stop phrase, a
+    /// barge-in), and treat it as over: flag down, gate open (AD-212), so
+    /// the transcript that follows is heard rather than dropped as barge-in.
     fn stop_speaking(&mut self) {
         if let Some(synthesizer) = &self.synthesizer {
             stop_speech(synthesizer);
@@ -1922,7 +1996,10 @@ fn detect_language(text: &str, constraints: &[String]) -> Option<String> {
 
 /// `speakUtterance:` with `voice` set on the utterance explicitly (Epic
 /// 64, AD-182) — never the default voice, which is the language of the
-/// system and not necessarily of the text.
+/// system and not necessarily of the text. Apple's `speak(_:)` "adds the
+/// utterance you specify to the speech synthesizer's queue", so calling it
+/// again while an utterance plays is how a sentence is queued behind it,
+/// not spoken over it.
 #[allow(unsafe_code)]
 fn speak_text(synthesizer: &AVSpeechSynthesizer, text: &str, voice: &AVSpeechSynthesisVoice) {
     // SAFETY: the utterance is freshly allocated from a Rust string and
@@ -1937,7 +2014,10 @@ fn speak_text(synthesizer: &AVSpeechSynthesizer, text: &str, voice: &AVSpeechSyn
 }
 
 /// `stopSpeakingAtBoundary:AVSpeechBoundaryImmediate` — mid-word, which is
-/// what barge-in means.
+/// what barge-in means. Apple's `stopSpeaking(at:)`: "stopping the
+/// synthesizer immediately cancels speech and removes all unspoken
+/// utterances from the synthesizer's queue" — so this one call is also how
+/// a stop drops the sentences [`Worker::enqueue`] queued (AD-214).
 #[allow(unsafe_code)]
 fn stop_speech(synthesizer: &AVSpeechSynthesizer) {
     // SAFETY: a documented enum value on the retained synthesiser; returns

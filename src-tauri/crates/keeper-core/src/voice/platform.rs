@@ -13,10 +13,18 @@
 //! The one non-lexical difference lives here too, because it is a fact about
 //! the platform and not about any turn: whether the OS keeps keeper's own
 //! voice out of the transcript while an utterance is read aloud
-//! ([`VoicePlatform::full_duplex`]). iOS does, through the audio session's
-//! voice processing, which is what makes barge-in possible there; macOS has
-//! no `AVAudioSession`, so nothing does, and [`super::may_record`] closes
-//! the microphone for the duration of every utterance.
+//! ([`VoicePlatform::full_duplex`]). Both platforms do, through the same
+//! call: `AVAudioEngine.inputNode.setVoiceProcessingEnabled(true)`, which
+//! is `kAudioUnitSubType_VoiceProcessingIO` — on iOS through the audio
+//! session, on macOS on the input node directly, where its echo reference
+//! is the output device's mix (Story 22.7 measured the far end dropping
+//! ~24 dB on hesperia). What macOS lacks is only the `AVAudioSession`
+//! around it, which is ducking and interruptions, not the canceller. A Mac
+//! whose input is an aggregate device (BlackHole, Loopback) is refused the
+//! unit — it builds one itself — and there the port answers half duplex
+//! for that capture with [`VoicePlatform::half_duplex_sentence`] beside the
+//! switch, while the turn's rule ([`super::may_record`]) stays the
+//! platform's (Epic 68, AD-213).
 
 /// The nouns and the one capability that differ between the platforms a
 /// [`super::VoicePort`] runs on.
@@ -45,7 +53,10 @@ pub struct VoicePlatform {
     /// Whether the OS keeps the port's own voice out of the transcript, so
     /// the microphone may stay open while an utterance is read aloud. Where
     /// it is `false`, [`super::may_record`] answers `false` while speaking
-    /// and the turn releases the microphone before it speaks (AD-175).
+    /// and the turn releases the microphone before it speaks (AD-175). Both
+    /// Apple platforms answer `true` since AD-213; a capture that could not
+    /// get voice processing is the port's fact, told through
+    /// [`super::VoicePort::half_duplex`].
     pub full_duplex: bool,
     /// What armed listening costs and what ends it, as the whole sentence
     /// shown beside the switch (FR-406). Per platform because the thing
@@ -85,15 +96,15 @@ impl VoicePlatform {
     /// macOS: the Mac. The microphone grant lives in System Settings >
     /// Privacy & Security > Microphone; on-device recognition depends on
     /// Dictation being on and its language downloaded, under System
-    /// Settings > Keyboard > Dictation; and with no `AVAudioSession` there
-    /// is nothing to keep keeper's answer out of its own microphone, so the
-    /// port never records while it speaks (AD-175).
+    /// Settings > Keyboard > Dictation; and the input node's voice
+    /// processing keeps keeper's answer out of its own microphone (AD-213,
+    /// revising AD-175), so the port records while it speaks.
     pub const MACOS: Self = Self {
         noun: "Mac",
         allow: "allow the microphone under System Settings > Privacy & Security > Microphone",
         download: "turn Dictation on and download that language under System Settings > Keyboard > Dictation",
         voice_download: "download a voice for it under System Settings > Accessibility > Spoken Content > System Voice",
-        full_duplex: false,
+        full_duplex: true,
         // No screen-lock clause: with no `AVAudioSession` there is no
         // documented macOS rule about a locked screen that this session
         // verified, and a sentence beside a switch is the wrong place to
@@ -118,4 +129,19 @@ impl VoicePlatform {
         // ever drawn. Present so that every platform answers every question.
         limits: "Listening is not available on this device.",
     };
+
+    /// The sentence beside the switch when a port on this platform could not
+    /// keep its own voice out of the transcript for the capture it has up —
+    /// on a Mac, voice processing refused on `device`, an aggregate input
+    /// (Story 22.7: the unit builds its own aggregate and will not sit on
+    /// one). Names the device, says what is lost (the word) and what is not
+    /// (the button, the hotkey, the tray still stop an answer, AD-212).
+    /// Decided once here; the port supplies only the device's name.
+    #[must_use]
+    pub fn half_duplex_sentence(&self, device: &str) -> String {
+        format!(
+            "keeper cannot keep its own voice out of {device}, so saying the stop word while this {noun} speaks does nothing; the button, the hotkey and the tray still stop an answer. Choose a plain microphone as the input device to talk over an answer.",
+            noun = self.noun
+        )
+    }
 }

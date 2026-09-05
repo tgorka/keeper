@@ -205,6 +205,9 @@ impl VoicePort for AbsentPort {
     fn speak(&self, _text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
     }
+    fn enqueue(&self, _text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
+        Err(VoiceUnavailable::Unsupported)
+    }
     fn stop_speaking(&self) {}
 }
 
@@ -292,14 +295,34 @@ fn transition(event: TurnEvent) {
     }
 }
 
-/// The spoken turn's answer has finished arriving (Epic 67, AD-205): the
-/// bots adapter calls this from the stream's clean close with the whole
-/// answer, and the turn reads it aloud — the `Speak` effect, performed on
-/// the port the way every other effect is. Only a turn that is waiting for
-/// an answer moves; a typed conversation's close is nothing here.
-pub fn answer_complete(text: String) {
-    if voice().turn.awaiting_send() {
-        transition(TurnEvent::AnswerDone(text));
+/// Whether the stream's events are this turn's to act on: it is waiting for
+/// the answer, or already reading it aloud while the rest streams (Epic 68,
+/// AD-214). A typed conversation's stream is never fed here (`bots_ipc`
+/// gates on `turn.spoken`), so no other turn can be in either state.
+fn owns_answer(turn: &Turn) -> bool {
+    turn.awaiting_send() || matches!(turn.state(), TurnState::Speaking)
+}
+
+/// One sentence of the spoken turn's answer has arrived (Epic 68, AD-214):
+/// the bots adapter calls this from the stream as its segmenter closes each
+/// one. The first takes the turn to `Speaking` with a `Speak`; every later
+/// one is an `Enqueue` behind it. Only the turn that owns the answer moves.
+pub fn answer_sentence(text: String) {
+    if owns_answer(&voice().turn) {
+        transition(TurnEvent::AnswerSentence(text));
+    }
+}
+
+/// The spoken turn's answer has finished arriving (Epic 67, AD-205; Epic
+/// 68, AD-214): the bots adapter calls this from the stream's clean close
+/// with what was left after the last sentence it handed out — the whole
+/// answer when nothing was streamed sentence by sentence, nothing when the
+/// last sentence closed it. The turn queues the rest, and from here the
+/// synthesiser's own end is the turn's end. Only the turn that owns the
+/// answer moves; a typed conversation's close is nothing here.
+pub fn answer_complete(rest: String) {
+    if owns_answer(&voice().turn) {
+        transition(TurnEvent::AnswerDone(rest));
     }
 }
 
@@ -310,7 +333,7 @@ pub fn answer_complete(text: String) {
 /// nothing coming would hold the device open until somebody noticed. Only a
 /// turn that is waiting for an answer moves.
 pub fn answer_failed(reason: String) {
-    if voice().turn.awaiting_send() {
+    if owns_answer(&voice().turn) {
         crate::voice_log::record(VoiceEventKind::Refused, Some(reason.clone()));
         transition(TurnEvent::Failed(reason));
     }
@@ -318,36 +341,58 @@ pub fn answer_failed(reason: String) {
 
 /// The spoken turn's stream was stopped by hand (Epic 67, AD-205): the
 /// person pressed Stop on the answer, which is the question abandoned —
-/// nothing is read aloud, the microphone is released and a switched-on
-/// phrase is re-armed by the turn's own rule. Only a turn that is waiting
-/// for an answer moves.
+/// whatever was queued to be read stops (AD-212), the microphone is
+/// released and a switched-on phrase is re-armed by the turn's own rule.
+/// Only the turn that owns the answer moves.
 pub fn answer_stopped() {
-    if voice().turn.awaiting_send() {
+    if owns_answer(&voice().turn) {
         transition(TurnEvent::Abandoned);
     }
 }
 
-/// The request for what the turn heard has left (Story 64.3, AD-186): the
-/// bots adapter calls this as it spawns a turn's driver, whatever started
-/// that turn. Only a turn in `Heard` moves — to `Sending` — so a typed
-/// message leaving while no voice turn runs is nothing here, and nothing is
-/// streamed or re-armed for it.
-pub fn note_sent() {
-    let awaiting = matches!(voice().turn.state(), TurnState::Heard { .. });
+/// The request for what the turn heard has left (Story 64.3, AD-186), to
+/// the bot named `bot`: the bots adapter calls this as it spawns a turn's
+/// driver, whatever started that turn. Only a turn in `Heard` moves — to
+/// `Sending` — so a typed message leaving while no voice turn runs is
+/// nothing here, and nothing is streamed or re-armed for it. The moment is
+/// stamped on the turn (AD-215), so the surface can count from it.
+pub fn note_sent(bot: &str) {
+    let awaiting = {
+        let mut voice = voice();
+        let awaiting = matches!(voice.turn.state(), TurnState::Heard { .. });
+        if awaiting {
+            voice
+                .turn
+                .note_sent(bot.to_owned(), crate::voice_log::now_ms());
+        }
+        awaiting
+    };
     if awaiting {
         transition(TurnEvent::Sent);
     }
 }
 
-/// The first token of the answer arrived (Story 64.3, AD-186): the bots
-/// adapter calls this on the stream's first delta. Only a turn in `Sending`
-/// that has not yet seen one moves, so a stream that is not the voice
-/// turn's costs a lock and nothing else.
-pub fn note_answer_chunk() {
-    let thinking = matches!(
-        voice().turn.state(),
-        TurnState::Sending { answering: false }
-    );
+/// The first token of the answer arrived, `after_ms` after the request left
+/// (Story 64.3, AD-186; Epic 68, AD-215): the bots adapter calls this on the
+/// stream's first delta. Only a turn in `Sending` that has not yet seen one
+/// moves, so a stream that is not the voice turn's costs a lock and nothing
+/// else. The wait is stamped on the turn and recorded in the ring as
+/// `first_token` — the provider's seconds, named.
+pub fn note_answer_chunk(after_ms: u64) {
+    let thinking = {
+        let mut voice = voice();
+        let thinking = matches!(voice.turn.state(), TurnState::Sending { answering: false });
+        if thinking {
+            let after_ms = i64::try_from(after_ms).unwrap_or(i64::MAX);
+            if voice.turn.note_first_token(after_ms) {
+                crate::voice_log::record(
+                    VoiceEventKind::FirstToken,
+                    Some(format!("after_ms={after_ms}")),
+                );
+            }
+        }
+        thinking
+    };
     if thinking {
         transition(TurnEvent::AnswerChunk);
     }
@@ -493,18 +538,16 @@ pub fn voice_start() -> Result<(), IpcError> {
     Ok(())
 }
 
-/// Abandon the turn, whatever state it is in; the microphone is released
-/// (NFR-51).
+/// The one manual stop (AD-212): abandon the turn, whatever state it is in.
+/// While the answer is read aloud the turn's `Speaking` arm stops the voice
+/// mid-word before the device goes; everywhere else the microphone is
+/// released and nothing heard is sent (NFR-51). The mic button in both its
+/// stopping faces, the tray item and — from `Speaking` — the hotkey and the
+/// deep link all end here, so `port.stop_speaking()` is reached from every
+/// control that says "stop".
 #[tauri::command]
 pub fn voice_stop() -> Result<(), IpcError> {
     transition(TurnEvent::Abandoned);
-    Ok(())
-}
-
-/// Stop reading aloud. The turn ends as if the utterance had finished.
-#[tauri::command]
-pub fn voice_stop_speaking() -> Result<(), IpcError> {
-    transition(TurnEvent::Silence);
     Ok(())
 }
 
@@ -558,12 +601,23 @@ fn wake_vm(
     let stop_phrase = registry::get_bots_stop_phrase(data_dir).map_err(to_ipc_error)?;
     let voice_target = registry::get_bots_voice_target(data_dir).map_err(to_ipc_error)?;
     let locale::DeviceLocales { system, on_device } = port.locales();
+    // The port's own platform, not one const for every target: a Mac was
+    // showing iOS's sentence under its switch (screenshot, 2026-09-04). A
+    // capture that could not get voice processing (AD-213) adds the
+    // sentence naming the device; `arm` ran first, so the port knows.
+    let platform = port.platform();
+    let limits = match port.half_duplex() {
+        Some(device) => format!(
+            "{} {}",
+            platform.limits,
+            platform.half_duplex_sentence(&device)
+        ),
+        None => platform.limits.to_owned(),
+    };
     Ok(VoiceWakeVm {
         enabled,
         phrase,
-        // The port's own platform, not one const for every target: a Mac was
-        // showing iOS's sentence under its switch (screenshot, 2026-09-04).
-        limits: port.platform().limits.to_owned(),
+        limits,
         locale: locale::in_force(locale_chosen.as_deref(), &system, &on_device),
         locale_chosen,
         on_device_locales: on_device,
@@ -592,7 +646,7 @@ pub fn voice_wake_get(state: State<'_, AppState>) -> Result<VoiceWakeVm, IpcErro
 fn arm(voice: &mut Voice, wake: Option<WakePhrase>) {
     let effects = voice.turn.set_wake(wake);
     let port = Arc::clone(&voice.port);
-    match keeper_core::voice::perform(&effects, port.as_ref(), voice.turn.wake()) {
+    match keeper_core::voice::perform(&effects, port.as_ref(), voice.turn.wake(), &mut None) {
         Ok(()) => crate::voice_log::armed(voice.turn.wake()),
         Err(why) => {
             let message = why.message(&port.platform());
@@ -652,6 +706,77 @@ pub fn voice_target_set(
     let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
     let port = Arc::clone(&voice().port);
     wake_vm(&data_dir, enabled, phrase, port.as_ref())
+}
+
+/// Flip the wake switch (Epic 68, Story 68.4, AD-218): the one command the
+/// palette, the native menu, the pane headers on both tiers and the tray
+/// call, so five surfaces are one setting. The rule is the pane's switch's
+/// (`bot-voice-wake.tsx`'s `save`), kept here so no surface can skip it:
+/// switching ON is a deliberate voice act, so the recogniser and the
+/// microphone are asked for by name first ([`voice_authorize`], FR-408);
+/// what is written is the person's choice whatever the port answered
+/// (AD-190) — a refusal is mirrored through the turn by [`arm`], and the
+/// switch stays on because keeper arms the phrase itself once the refusal
+/// clears. The phrases are the stored ones, already accepted, and go
+/// through [`voice_wake_set`] so the flip is that command's path exactly.
+/// Returns the wake VM the surface renders the state from.
+#[tauri::command]
+pub async fn voice_wake_toggle(state: State<'_, AppState>) -> Result<VoiceWakeVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let enabled = !registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
+    if enabled {
+        // The verdict is the port's to show beside the switch; the surface
+        // re-reads availability after the flip, as the locale picker does.
+        if let Some(why) = voice_authorize().await? {
+            tracing::info!(?why, "voice: listening switched on under a refusal");
+        }
+    }
+    let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
+    let stop_phrase = registry::get_bots_stop_phrase(&data_dir).map_err(to_ipc_error)?;
+    voice_wake_set(state, enabled, phrase, stop_phrase)
+}
+
+/// How fast each pinned bot starts answering (Epic 68, Story 68.4, AD-216),
+/// for the voice target picker: `bot_messages` already holds `ttft_ms` per
+/// answer, and `keeper_core::bots::voice_target::median_first_token` over
+/// each bot's last ten is the number. One row per pinned bot, in the pinned
+/// order, `None` where fewer than three answers were measured. Nothing is
+/// measured here and nothing leaves the device.
+#[tauri::command]
+pub fn voice_target_speeds(
+    state: State<'_, AppState>,
+) -> Result<Vec<keeper_core::vm::VoiceTargetSpeedVm>, IpcError> {
+    use keeper_core::bots::voice_target::{median_first_token, FIRST_TOKEN_WINDOW};
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let bots = keeper_core::bots::store::list_bots(&data_dir).map_err(to_ipc_error)?;
+    bots.into_iter()
+        .map(|bot| {
+            let samples = keeper_core::bots::session::first_token_samples(
+                &data_dir,
+                &bot.id,
+                FIRST_TOKEN_WINDOW,
+            )
+            .map_err(to_ipc_error)?;
+            Ok(keeper_core::vm::VoiceTargetSpeedVm {
+                bot_id: bot.id,
+                first_token_median_ms: median_first_token(&samples),
+            })
+        })
+        .collect()
+}
+
+/// Whether this build has a voice port at all (AD-179), for the gates that
+/// are asked often — the palette per keystroke, the menus per build — and
+/// so without the log line [`voice_availability`] writes once per surface
+/// mount. The same answer `voice_reach::present` reads: only
+/// `Unsupported` is absence; every other refusal is a surface with a
+/// sentence.
+pub fn port_present() -> bool {
+    let port = Arc::clone(&voice().port);
+    !matches!(
+        port.availability(),
+        Err(keeper_core::voice::VoiceUnavailable::Unsupported)
+    )
 }
 
 /// Choose the recogniser's language (Epic 63): `None` is "choose for me".
@@ -768,4 +893,186 @@ pub async fn voice_authorize() -> Result<Option<VoiceUnavailableVm>, IpcError> {
         }
     }
     Ok(verdict.err().as_ref().map(|why| why.vm(&platform)))
+}
+
+/// Story 68.1 (AD-212), the failure shape Epic 67 must not repeat: every
+/// control that says "stop" is driven through the shell's own entry points
+/// — the button's command, the tray's toggle, the hotkey's and the deep
+/// link's talk — against a port that counts `stop_speaking`, so the fact
+/// tested is that the synthesiser is told to stop, not that the turn ended.
+/// Story 68.3 (AD-214) drives the stream's entry points the same way:
+/// `answer_sentence`, `answer_complete`, `answer_stopped`.
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
+    use keeper_core::voice_reach::ReachAsk;
+
+    use super::*;
+
+    /// A port that answers every ask, keeps what it was told to say —
+    /// `speak:` and `enqueue:` prefixed, so the two calls stay apart — and
+    /// counts what it was told to stop.
+    #[derive(Default)]
+    struct CountingPort {
+        stopped_speaking: AtomicUsize,
+        spoken: Mutex<Vec<String>>,
+    }
+
+    impl VoicePort for CountingPort {
+        fn platform(&self) -> VoicePlatform {
+            VoicePlatform::MACOS
+        }
+        fn availability(&self) -> Result<(), VoiceUnavailable> {
+            Ok(())
+        }
+        fn locales(&self) -> locale::DeviceLocales {
+            locale::DeviceLocales::default()
+        }
+        fn set_locale(&self, _requested: Option<String>) {}
+        fn start_listening(&self, _wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
+            Ok(())
+        }
+        fn stop_listening(&self) {}
+        fn voices(&self) -> Vec<String> {
+            vec!["en-US".to_owned()]
+        }
+        fn listening(&self) -> String {
+            "en-US".to_owned()
+        }
+        fn detect_language(&self, _text: &str, _constraints: &[String]) -> Option<String> {
+            None
+        }
+        fn speak(&self, text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
+            self.spoken
+                .lock()
+                .expect("lock")
+                .push(format!("speak:{text}"));
+            Ok(())
+        }
+        fn enqueue(&self, text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
+            self.spoken
+                .lock()
+                .expect("lock")
+                .push(format!("enqueue:{text}"));
+            Ok(())
+        }
+        fn stop_speaking(&self) {
+            self.stopped_speaking.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Put `port` behind the process-wide state with a fresh, armed turn,
+    /// and take it to `Speaking` the way a real turn gets there.
+    fn speaking_on(port: Arc<CountingPort>) {
+        {
+            let mut voice = voice();
+            voice.turn = Turn::new(port.platform());
+            voice.port = port;
+            voice.turn.set_wake(WakePhrase::parse("hey nixie").ok());
+        }
+        transition(TurnEvent::WakeMatched);
+        transition(TurnEvent::FinalHeard("what time is it".to_owned()));
+        transition(TurnEvent::AnswerDone("noon".to_owned()));
+        assert_eq!(voice().turn.state(), &TurnState::Speaking);
+    }
+
+    /// The three entry points, and what each is: the mic button's command
+    /// (`voice_stop`), the tray item (`Toggle`), the hotkey and the deep
+    /// link (`Talk`) — and, for contrast, the synthesiser's own end, which
+    /// stops nothing because nothing is left to stop. One process-wide
+    /// turn, so one test drives them in sequence rather than four tests
+    /// racing for it.
+    #[test]
+    fn the_button_the_tray_and_the_hotkey_each_stop_the_voice_once() {
+        let controls: [(&str, fn(), usize); 4] = [
+            (
+                "the mic button",
+                || voice_stop().expect("the button's command"),
+                1,
+            ),
+            (
+                "the tray item",
+                || crate::voice_reach::reach(ReachAsk::Toggle),
+                1,
+            ),
+            (
+                "the hotkey / deep link",
+                || crate::voice_reach::reach(ReachAsk::Talk),
+                1,
+            ),
+            (
+                "the synthesiser's own end",
+                || transition(TurnEvent::Silence),
+                0,
+            ),
+        ];
+        for (name, press, stops) in controls {
+            let port = Arc::new(CountingPort::default());
+            speaking_on(Arc::clone(&port));
+            press();
+            assert_eq!(
+                port.stopped_speaking.load(Ordering::SeqCst),
+                stops,
+                "{name}: how often the synthesiser is told to stop"
+            );
+            let voice = voice();
+            assert_eq!(voice.turn.state(), &TurnState::Idle, "{name} ends the turn");
+            assert!(
+                voice.turn.microphone_open(),
+                "{name}: the phrase is listening again afterwards"
+            );
+        }
+    }
+
+    /// Story 68.3's shell claim: the stream's sentences reach the port as one
+    /// `speak` and then `enqueue`s; the close queues the rest and closes the
+    /// answer; and a Stop pressed after the first sentence tells the
+    /// synthesiser to stop once — which is what drops the queue — so the
+    /// second is never spoken and the phrase listens again.
+    #[test]
+    fn three_chunks_become_two_utterances_and_a_stop_leaves_the_second_unspoken() {
+        let port = Arc::new(CountingPort::default());
+        {
+            let mut voice = voice();
+            voice.turn = Turn::new(port.platform());
+            voice.port = Arc::clone(&port) as Arc<dyn VoicePort>;
+            voice.turn.set_wake(WakePhrase::parse("hey nixie").ok());
+        }
+        transition(TurnEvent::WakeMatched);
+        transition(TurnEvent::FinalHeard("tell me something".to_owned()));
+        note_sent("nixie");
+        note_answer_chunk(2_000);
+        // The stream, as `bots_ipc::drive` cuts it: three chunks close two
+        // sentences and leave a tail for the close.
+        let mut segmenter = keeper_core::voice::speech::Segmenter::new();
+        for chunk in ["The sky is", " blue. The grass", " is green. And"] {
+            for sentence in segmenter.push(chunk) {
+                answer_sentence(sentence);
+            }
+        }
+        assert_eq!(
+            *port.spoken.lock().expect("lock"),
+            vec![
+                "speak:The sky is blue.".to_owned(),
+                "enqueue:The grass is green.".to_owned()
+            ]
+        );
+        assert_eq!(voice().turn.state(), &TurnState::Speaking);
+        assert_eq!(port.stopped_speaking.load(Ordering::SeqCst), 0);
+
+        // Stop pressed on the stream after the first sentence.
+        answer_stopped();
+        assert_eq!(port.stopped_speaking.load(Ordering::SeqCst), 1);
+        {
+            let voice = voice();
+            assert_eq!(voice.turn.state(), &TurnState::Idle);
+            assert!(voice.turn.microphone_open(), "the phrase listens again");
+        }
+        // The stream's late close reaches an idle turn: nothing more is said.
+        answer_complete(segmenter.flush().unwrap_or_default());
+        assert_eq!(port.spoken.lock().expect("lock").len(), 2);
+        assert_eq!(voice().turn.state(), &TurnState::Idle);
+    }
 }
