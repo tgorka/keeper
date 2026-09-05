@@ -1,0 +1,72 @@
+# Epic 69 — The file you can fetch, and the task a bot can run
+
+created: '2026-09-05'
+source: the owner, after epics 65–67 merged — "virtual files: in Files I do not see the files (and folders) that are not downloaded, with a button to fetch locally, temporarily"; "tasks: I want to create a task for a bot (one-off or scheduled) that runs a command; the command may be in an .md file — eventually under the sessions folder's prompts subfolder — and writes its output stack to an .md or log"; "integrate sessions with tasks: use the prompt from prompts, write output in a subfolder, and separately errors, warnings and the next run's status into files in the right sessions subfolder". Grounded by two deep reads (`agent://VirtualAndMenu` §Report 1, `agent://TasksSessions`), 2026-09-05.
+binds: FR-497…FR-512 (allocated here); NFR-60 (allocated here); AD-219…AD-226 (new); AD-27, AD-40 (`keeper-sync` is `keeper-core`-free — consumed), AD-125 (a release needs a known open-file state — consumed and made answerable), AD-139 (no JSON blob in a row — consumed), AD-C7 (a task kind is one of keeper's verbs, never a shell string — consumed; a bot turn is keeper's own verb), FR-331 (a virtual path is a pointer file on disk — consumed), FR-121 (byte preservation of a person's markdown — consumed), NFR-43 (an unknown kind is listed, never run); collects DW-220 (re-scoped in 66; the drive half stays), the epic-56 "virtual files RELEASE only on Linux" deferral (`sprint-status.yaml:929-933`), and the unwritten Epic 60 (arbitrary commands — refused again here, with the bill).
+see-also: epic 56 (virtual files), 57–59 (tasks), 50–55 (sessions), 66 (the folder on the phone).
+
+## What was measured
+
+1. **Virtual entries are listed; the button is not where he looks.** `browse.rs:828-996` walks the filesystem and a pointer file IS on disk (FR-331), so after a complete clone every virtual path is a row with `EntrySyncStatus::Virtual`, the cloud glyph and the pointer's honest size. `Materialize` is the fourth verb of a prefix-promoted cluster and at the default 360 px column only three promote (`files-pane.tsx:875-889`, `:2330-2424`, `:2508-2513`; `column-widths.ts:142`); it lives in the right-click menu with its 1 h / 8 h / 24 h / indefinitely submenu (`:353-365`). The phone withholds every verb by design (66.3: tap = materialise + open).
+2. **On his folder every row reads "Sync state unknown".** `browse_marks_for` gives `Engine::pending` three seconds and answers `Unavailable` on timeout **even when a previous answer exists** (`sync_ipc.rs:2954`, `:3074-3078`); `classify`'s second rung returns `Unknown` before the pointer probe (`browse.rs:1180-1185`); the pane never re-lists on its own (`files-pane.tsx:1264`). On a 155k-entry folder that is every row, so no `virtual` mark and no Materialize anywhere, on both machines.
+3. **"Temporarily" exists and never releases on his machines.** The durations are in the submenu, but `open_file_state` is `Unknown` off Linux (`platform.rs:55-72`) and every release and every TTL sweep refuses `OpenUnknown` (`engine.rs:11304-11305`, `:9419-9422`) — recorded in 56.4 as "release only on Linux".
+4. **On the phone, an interrupted first clone leaves files and folders absent forever.** The repair lives in the supervisor's `tick_profile` (`engine.rs:3251-3255` → `do_checkout`); the phone runs `sync_once` only, whose `ensure_repo` never calls `finish_first_checkout` (`engine.rs:5656-5659`) and whose commit leg refuses "restores the missing files on its next pass" (`:6952-6960`) — a pass that never comes.
+5. **A folder of virtual children reads "Synced"; the form says a virtual file "fetches when you open it", which is false on the Mac.** `classify` gives a directory `None` → `Synced` with no size (`browse.rs:914-930`, `:1252-1257`); `sync_open_entry` hands the pointer file to the OS opener and the in-app readers serve pointer bytes verbatim (`sync_ipc.rs:3520-3552`, `:3806-3809`; `file_protocol.rs:113-116`) — on-read hydration was deliberately not built in 56, but the sentence was written as if it had been (`add-folder-form.tsx:277-278`).
+6. **A task is one of three verbs and keeps one line.** `TaskKind = Sync | Release | Verify` (`keeper-sync/src/tasks.rs:170-243`); the row has no field for a target or a path (`db.rs:191-202`); `perform_task` returns `(outcome, one-line detail)` into `task_runs`, capped at 50, no stdout, no artefact (`engine.rs:2617-2703`). The runner is the engine's 1 Hz tick, hosted by the desktop supervisor and `keeper-syncd`; the phone has no tick (`sync.rs:622-665`). `keeper-sync` is `keeper-core`-free (AD-40): the engine cannot call `bots::chat`; the shell already hands it `notify` and `secret_get` through `SyncPlatform` (`platform.rs:287-305`). The refusal of arbitrary commands is a Deferred with a stated bill (`ARCHITECTURE-SCHEDULED-TASKS.md:364-369`, `docs/sync.md:1953-1962`): egress to any host, credentials, no timeout, no capture. A bot turn pays none of it — its only egress is a provider disclosed under Settings, it spawns nothing, it has the stream's 120 s read timeout, and its output is text.
+7. **The sessions folder already has the words.** Kind = tag, closed set `about | log | prompt | ref | task` (`shape.rs:20-26`); `prompts/NN-slug.md` with `tags: [prompt]` sorted by name (`spaces.rs:199-211`); `logs/YYYY-MM-DD-HHMM-<slug>.md` with `tags: [log]`, one sitting, never rewritten (`template.rs:171-174`); `tasks/<slug>.md` with `tags: [task]`, `status:` and `order:` — the board's cards (`spaces.rs:160-171`); bookkeeping under `keeper:` in frontmatter (`model.rs:27-42`); one journaled writer (`sessions_exec::run`) and a write fence (`files.rs:197-260`). Nothing runs anything; `sessions_exec` executes file plans. Every `sessions_*` command is desktop-only (`sessions_ipc.rs:40-44`).
+8. **A turn's origin is global state.** `arm_turn` marks a turn *spoken* from `voice_ipc::spoken_turn` (`bots_ipc.rs:1179-1198`); a headless turn closing while a person is mid-voice-turn would be spoken as the voice answer (`:1918-1925`).
+
+## The one sentence
+
+**The file is there and the button is not; the runner is there and the verb is not — keeper has every part of "fetch this for an hour" and "let the bot run this prompt tonight and write down what happened", and none of them is reachable from where a person stands.**
+
+## Decisions this epic takes
+
+- **AD-219 — Fetch is a first-class verb wherever a virtual entry is shown.** State verbs outrank `copy` in promotion: a virtual row always paints `Fetch` (with its durations), a materialised row `Release`/`Pin`, at every column width; a folder whose children include virtual entries reads "N not fetched · size" with a folder-level `Fetch` (the marks walk already knows each child). The phone gets the verbs it withheld: a long-press sheet with Fetch (1 h / 8 h / 24 h / keep), Release, Pin; the tap still materialises-and-opens.
+- **AD-220 — A mark that was known stays known.** `browse_marks_for` answers the last pending view when the engine is late, marked `stale`, and the pane re-lists when the progress stream says the walk finished; `Unknown` is reserved for a profile that has never answered. `classify` probes the pointer before it gives up.
+- **AD-221 — Release works on every platform, or says why not.** `open_file_state` on macOS through `libproc` (`proc_listpids` + `proc_pidfdinfo`, the fd table of every process the user can read — the same fact `lsof` reads); on iOS the app is the only process that can hold the file, so the answer is keeper's own open-handle table; a path whose state cannot be read is refused with the reason named. The TTL sweep runs on the phone's `sync_once` too.
+- **AD-222 — The phone finishes its own first checkout.** `ensure_repo` on a `Gix` engine calls `finish_first_checkout`; a partial clone is repaired on the next open, not "the next pass".
+- **AD-223 — Opening a virtual file fetches it, on every platform.** `sync_open_entry`, the readers and `keeper-file://` materialise a virtual entry before serving it (the phone's rule from 66.3, brought to the Mac); the form's sentence becomes true. Cone-sparse `subpaths` stay what they are (Story 27.2): a path outside the cone has no file and no row; the form's note says so beside the field.
+- **AD-224 — A bot task is keeper's own verb: a prompt file, a bot, a record.** `TaskKind::Bot` with three nullable columns (`bot_id`, `prompt_subpath` profile-relative to a session's `prompts/`, `model`), saved through the same doors, listed and run by the same tick, leased and capped like the others. `keeper-sync` reaches the bot through a `SyncPlatform` port (`bot_task_runner() -> Option<Arc<dyn BotTaskRunner>>`, default `None` — `keeper-syncd` and the phone answer "this host cannot run a bot task; the keeper app on the Mac runs it", listed-not-run per NFR-43); the desktop shell implements it over `open_turn` with an explicit **origin** (`TurnOrigin::{Typed, Spoken, Task}` replaces the global `spoken_turn` read), so a task never speaks. Nothing is spawned. A task with a prompt outside a session, or a session that has no such prompt, is refused at save with the sentence.
+- **AD-225 — The record is written where the session keeps its history.** Each run writes `runs/YYYY-MM-DD-HHMM-<task-slug>.md` (`tags: [log]`, sections Prompt / Answer / Tool calls / Warnings / Errors / Result — written once at close, never rewritten) through `sessions_exec::run` so the journal, the write fence and the rescan apply; and rewrites the task's own card `tasks/<task-slug>.md` (`tags: [task]`, `keeper.bot-task: <id>`, `status: todo` while scheduled and enabled, `deferred` otherwise; body Next run / Last run / Errors / Warnings) with a `GuardedWrite` — keeper-authored, so FR-121 does not bind. `task_runs.detail` names the run file. The board and the Tasks pane both show the next run and the last result.
+- **AD-226 — The phone reads the record; the Mac runs the task.** Bot tasks appear on the phone's Tasks and Sessions surfaces from the synced folder; the phone's task row says which host runs it. No tick on a battery.
+
+## Stories
+
+### 69.1 — The verb you can find
+AD-219, AD-223. Promotion by state; the folder-level count and Fetch; the phone's long-press sheet; open-fetches on the Mac; the form's sentences.
+**Acceptance:** at 360 px a virtual row paints Fetch (component test, and the measure rig on hesperia's Chrome at 360/480 px); a folder with virtual children reads the count; on the phone a long-press shows the sheet and Fetch 1 h materialises (kalypso); on the Mac double-clicking a pointer opens the content, not 130 bytes of pointer; `SYNC_VIRTUAL_PATTERNS_NOTE` test updated.
+**binds:** FR-497, FR-498, FR-499, FR-500, AD-219, AD-223
+
+### 69.2 — Marks that stay known, and a clone that finishes
+AD-220, AD-222. The stale-not-unknown pending view; re-list on walk end; the pointer probe before `Unknown`; `finish_first_checkout` on the phone.
+**Acceptance:** Rust test: a pending view that times out answers the previous view marked stale; a browse of a fixture with 10k entries never answers `Unknown` after the first walk; the phone test: an interrupted clone completes on the next `sync_once` (two bare repos, a checkout cut short); on his `tgdrive` profile on hesperia every row carries a state after one walk (measured: the count of `Unknown` rows before and after).
+**binds:** FR-501, FR-502, FR-503, AD-220, AD-222
+
+### 69.3 — Release on every platform
+AD-221. `open_file_state` on macOS via libproc; the phone's own handle table; the TTL sweep on the phone; the refusal sentence.
+**Acceptance:** Rust test on macOS (hesperia): a file held open by a test process is reported open and refused; released when closed; a materialised-for-1 h entry is released by the sweep after the hour (clock-driven test); on kalypso Fetch 1 h then Release reads a pointer again.
+**binds:** FR-504, FR-505, AD-221
+
+### 69.4 — A task a bot can run
+AD-224. `TaskKind::Bot`, the columns, the wire trio, the form (bot picker, prompt picker over the session's prompts, model), the CLI mirror, the port, the desktop runner over `open_turn` with `TurnOrigin`, the refusals.
+**Acceptance:** a bot task saved from the form runs on the next tick against a fake provider (shell test on hesperia) and once from "Run now"; `keeper-syncd` lists it and refuses with the host sentence; a task whose prompt path leaves the session is refused at save; a turn of origin `Task` never reaches `voice_ipc`; the CLI `tasks set --kind bot` doc line exists.
+**binds:** FR-506, FR-507, FR-508, FR-509, AD-224
+
+### 69.5 — The record in the session
+AD-225, AD-226. The run log and the card through `sessions_exec`; `task_runs.detail`; the board and the Tasks pane rows; the phone's read.
+**Acceptance:** after a run the session shows a new log with the six sections and the card's Next/Last/Errors/Warnings; a second run adds a log and rewrites the card; a person's own edits elsewhere in the session are byte-identical; the Log space lists the run; on kalypso the synced session shows the card and the log after pull-to-refresh.
+**binds:** FR-510, FR-511, AD-225, AD-226
+
+### 69.6 — The record and the gates
+`docs/sync.md` (virtual files: the verb, the marks, release everywhere), `docs/sessions.md` and the flat contract (`runs/` as a container, the card's `keeper.bot-task`), the tasks architecture (the bot kind and why it is not exec — the bill, item by item), `docs/egress.md` (a task reaches a provider already disclosed), `docs/decisions.md` D-19 (a bot task is a verb), D-20 (release everywhere), DW rows closed/opened, every gate, both installs.
+**binds:** FR-512, NFR-60, AD-219…AD-226
+
+## What stays out
+- Arbitrary commands as tasks (Epic 60 stays unwritten; the bill stands).
+- Listing cone-excluded paths as ghost rows: needs the listing to open the repository, which `browse.rs` refuses by design; the form says what the cone excludes.
+- Bot tasks on the phone's tick.
+- A sixth session kind. `runs/` is a container of `log`-tagged files; the card is a `task`.
+
+## The failure shape this epic must not repeat
+Epic 56 shipped Fetch behind a promotion rule that hid it at the default width and a release that worked on the one platform the owner does not use, and both were recorded as done because the tests exercised the verb, not the pane. Every surface story here ends with the pane measured at the shipped width and the verb pressed on the owner's machines.
