@@ -85,6 +85,11 @@ mod tray;
 // port, so the command list stays identical.
 #[cfg(target_os = "ios")]
 mod voice_ios;
+// The island (Story 65.5, AD-194): the Live Activity that shows the phone's
+// ear on the lock screen and in the Dynamic Island. iOS-only, like the port
+// it mirrors; the decision is `keeper_core::voice::island`.
+#[cfg(target_os = "ios")]
+mod voice_island;
 #[cfg(target_os = "macos")]
 mod voice_macos;
 // The voice commands (Story 62.4): a call site over `keeper_core::voice`.
@@ -1531,7 +1536,15 @@ pub fn run() {
             // cleared — the microphone allowed under Settings > keeper, a
             // language downloaded — it is armed again (Epic 65, AD-190).
             // The desktop's equivalent is the main window's focus, above.
-            tauri::RunEvent::Resumed => voice_ipc::voice_rearm(),
+            tauri::RunEvent::Resumed => {
+                voice_ipc::voice_rearm();
+                // A Live Activity can be requested only with keeper in
+                // front (Story 65.5): one refused while it was not — the
+                // eight-hour renew, an arm from the port's own resume — is
+                // requested now.
+                #[cfg(target_os = "ios")]
+                voice_island::resumed();
+            }
             // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
             // Linux/Windows), so this arm is gated on macOS specifically rather than on
             // `desktop` — the wider gate does not compile on the Linux desktop target.

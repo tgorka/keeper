@@ -41,6 +41,13 @@ pub enum VoiceEventKind {
     InterruptionBegun,
     /// The system gave the audio session back.
     InterruptionEnded,
+    /// The media server restarted under the port and every audio object it
+    /// held is invalid (Epic 65, Story 65.4); the capture is rebuilt.
+    MediaReset,
+    /// The audio route changed — headphones, a car kit, a speaker — with
+    /// the reason as the detail (Story 65.4). The capture continues, or is
+    /// rebuilt when the change stopped the engine.
+    RouteChanged,
     /// The capture was rebuilt after the system took it, or after the
     /// engine stopped on its own.
     Resumed,
@@ -52,6 +59,12 @@ pub enum VoiceEventKind {
     WakeMatched,
     /// An answer was handed to the synthesiser.
     Spoken,
+    /// The Live Activity on the phone (Epic 65, Story 65.5, AD-194) did
+    /// this — `started`, `updated`, `ended`, `refused` — with the state
+    /// word or the system's refusal as the detail. The island is the only
+    /// surface that cannot be read back from the app, so the ring is where
+    /// its refusal on a free team is measured.
+    Island(&'static str),
 }
 
 impl VoiceEventKind {
@@ -76,11 +89,14 @@ impl VoiceEventKind {
             Self::Refused => "refused".to_owned(),
             Self::InterruptionBegun => "interruption_begun".to_owned(),
             Self::InterruptionEnded => "interruption_ended".to_owned(),
+            Self::MediaReset => "media_reset".to_owned(),
+            Self::RouteChanged => "route_changed".to_owned(),
             Self::Resumed => "resumed".to_owned(),
             Self::Rolled => "rolled".to_owned(),
             Self::Turn(state) => format!("turn:{state}"),
             Self::WakeMatched => "wake_matched".to_owned(),
             Self::Spoken => "spoken".to_owned(),
+            Self::Island(what) => format!("island:{what}"),
         }
     }
 }
@@ -243,10 +259,13 @@ mod tests {
             VoiceEventKind::InterruptionEnded.as_str(),
             "interruption_ended"
         );
+        assert_eq!(VoiceEventKind::MediaReset.as_str(), "media_reset");
+        assert_eq!(VoiceEventKind::RouteChanged.as_str(), "route_changed");
         assert_eq!(VoiceEventKind::Resumed.as_str(), "resumed");
         assert_eq!(VoiceEventKind::Rolled.as_str(), "rolled");
         assert_eq!(VoiceEventKind::WakeMatched.as_str(), "wake_matched");
         assert_eq!(VoiceEventKind::Spoken.as_str(), "spoken");
+        assert_eq!(VoiceEventKind::Island("refused").as_str(), "island:refused");
         assert_eq!(
             VoiceEventKind::turn(&TurnState::Listening {
                 heard: String::new()

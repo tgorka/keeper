@@ -490,7 +490,7 @@ build. These are the same seven points keeper shows in-app under **Settings → 
 - Updates arrive by reinstalling keeper; its signature renews every 7 days.
 - Bots talks to a model but cannot reach the folders you sync — the drive tools live on your Mac.
 - Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.
-- Listening stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit; while it listens the microphone indicator stays lit and it uses battery.
+- Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.
 
 > This list is mirrored from `IOS_DISCLOSURE_LINES` in
 > `src/components/settings/about-section.tsx`, which is the single source of truth —
@@ -530,11 +530,184 @@ listening is switched on while keeper is in front; what iOS supports is a sessio
 keeps running afterwards — with Maps in front, or the screen locked — under
 `UIBackgroundModes: audio`, which the generated project declares. keeper cannot arm
 itself: after a force-quit or a restart, listening is off until you open keeper and
-switch it on again, and a call, Siri or another app taking the microphone can end the
-session, which the port re-arms when it can and reports when it cannot. The orange
-microphone indicator is the system's and stays lit for the whole of an armed session.
-Recognition is on-device only — a locale whose model is not on the phone gets a
-sentence naming the language to download, never a server round trip — because
-`egress.md` names every destination keeper contacts and Apple's speech servers are not
-on it. The full reasoning, including why this is possible on the phone while voice
-stays deferred on the Mac, is [decisions.md](decisions.md) D-5.
+switch it on again. The orange microphone indicator is the system's and stays lit for
+the whole of an armed session. Recognition is on-device only — a locale whose model is
+not on the phone gets a sentence naming the language to download, never a server round
+trip — because `egress.md` names every destination keeper contacts and Apple's speech
+servers are not on it. The full reasoning, including why this is possible on the phone
+while voice stays deferred on the Mac, is [decisions.md](decisions.md) D-5.
+
+The seventh item is, byte for byte, the limits sentence the port shows beside the
+switch — `VoicePlatform::IOS.limits`, `keeper-core/src/voice/platform.rs:82` — rewritten
+in epic 65 (Story 65.4, AD-193) to name what ends an armed session by behaviour rather
+than "when iOS ends the audio session". Each clause is one of Apple's documented
+interruptions (Apple, *Audio Session Programming Guide*, "Handling audio interruptions",
+and `AVAudioSession.InterruptionReason`, both read 2026-09-05; Epic 65 research, §2).
+Siri and a non-mixing app deliver an interruption *began* and are not guaranteed to
+deliver an *ended* — Apple's own note — so the port polls every 5 s (`RESUME_RETRY`,
+`crates/keeper/src/voice_ios.rs:221`) and rebuilds the capture when the session comes back
+(`Worker::resume`, `:882-909`); after a bounded run of failed resumes
+(`RESUME_FAILURES_TOLERATED`, `:230`, twelve tries, a minute — `Worker::give_up`, `:914-918`)
+it records `refused` and tells the turn rather than retrying forever. An
+accepted phone call suspends the app, and reactivating a *record* session from the
+background afterwards is reported to fail until the app is foregrounded (Apple Developer
+Forums thread 813278, read 2026-09-05, forum excerpt) — the same rule as "cannot start
+recording from the background" — so keeper says listening stopped and re-arms on the
+next open (D-13's re-arm on `RunEvent::Resumed`) rather than pretending. Process
+suspension is silent: the session is deactivated and keeper learns of it on its next
+launch, which is why a force-quit leaves listening off until you open keeper. Whether
+the on-device recogniser — not just the microphone — keeps delivering for tens of
+minutes in the background is not documented by Apple; it is what the run on kalypso
+measures (Story 65.4), and until that run is recorded in the deferral ledger (DW-228,
+the iOS half) the sentence above is what Apple documents, not what has been observed.
+
+### Orientation
+
+The tier is the platform's, not the width's (Epic 65, Story 65.1, AD-189;
+[decisions.md](decisions.md) D-12). Until epic 65, `src/hooks/use-shell-layout.ts`
+chose the phone tier by `(max-width: 767px)` and nothing else, so an iPhone 14 Pro Max
+rotated — 932 pt wide — rendered the **desktop** frame at 430 pt tall: a rail, "MENU", a
+Conversation list column, the desktop pane's header and voice block, the Talk and Send
+controls clipped at the bottom edge; and rotating back re-entered the phone tier with
+whatever the desktop frame had written into its cookies meanwhile. Now a
+reduced-capability platform is the phone tier at every width (`use-shell-layout.ts:18-23`,
+`:84`), the root is `h-dvh` rather than `h-screen` so it follows the viewport the phone
+has right now (`src/components/layout/app-shell.tsx:296-302`, `:323`), the four
+desktop-cookie hydrations never run on the phone (`app-shell.tsx:138-188`), and a
+rotation is a resize the stack handles, never a tier change.
+
+Measured on the phone rig — `dev/measure-bots.ts --phone` and `--phone-landscape`,
+hesperia's headless Chrome emulating the iPhone 14 Pro Max, 2026-09-05, the Bots
+conversation open (`app-shell.tsx:304-322`; `dev/measure-bots.ts:52-59`; commit `26816fb`):
+
+| Viewport | Before | After |
+| --- | --- | --- |
+| 430×932 (upright) | phone tier; transcript 742 of 932 px (79.6 %) | phone tier; 742 of 932 px (79.6 %) |
+| 932×430 (rotated) | **desktop tier**; transcript 48 of 430 px (11.2 %), Talk/Send clipped | phone tier; 240 of 430 px (55.8 %); 52 px back bar, 37 px state line, 102 px composer; bottom edge at 430, inside the viewport |
+| 430×932 → 932×430, rotated live | desktop tier, the open conversation level gone, 24 px (5.6 %) | phone tier, the same level still open, 79.6 % ⇄ 55.8 % |
+
+A headless viewport has no dynamic chrome, so the numbers show the tier and its
+budget, not the `vh`/`dvh` gap. Pixels from a physical phone still need a human or
+Xcode (see [Installing from a machine you only reach over ssh](#installing-from-a-machine-you-only-reach-over-ssh)).
+A tablet tier is not decided here: an iPad is a reduced-capability platform too and now
+gets the phone tier at 1024 pt; whether that is right for an iPad is DW-234.
+
+### Live Activity
+
+With the phrase armed, keeper's name and state — armed, listening, heard, speaking —
+appear in the Dynamic Island and as a card on the Lock Screen (Epic 65, Story 65.5,
+AD-194; [decisions.md](decisions.md) D-14). The orange dot is the system's privacy
+indicator and says only that *some* app holds the microphone; it never appears on the
+Lock Screen and is not keeper's to label (Apple Support 108331; Epic 65 research, §4).
+A Live Activity is the only route to keeper's own name and state there, and it is the
+first Swift in this repository, because ActivityKit is Swift-only — `Activity<Attributes>`
+is a generic Swift class with no Objective-C surface, so `objc2` cannot reach it (Apple,
+`https://developer.apple.com/documentation/activitykit/activity`, read 2026-09-05).
+
+What it is made of, all under `src-tauri/crates/keeper/gen/apple/` unless stated:
+
+- `Sources/keeper/KeeperIsland.swift` — the `@_cdecl` bridge compiled into the **app**
+  target: `keeper_island_start` / `_update` / `_end` / `_free`, which Rust calls through
+  `extern "C"` declarations in `crates/keeper/src/voice_island.rs` (`#[cfg(target_os =
+  "ios")]`, the audited `#[allow(unsafe_code)]` fns listed in
+  [constraints-and-limitations.md](constraints-and-limitations.md)). `libapp.a` is a
+  static archive linked by the Xcode project, so its undefined symbols resolve against
+  the app's own Swift objects at link time; the `extern` block compiles on the Linux
+  host and only the Mac link proves it.
+- `KeeperIsland/KeeperIslandAttributes.swift` — the `ActivityAttributes`, a member of
+  **both** targets (no App Group: data flows through ActivityKit, and an App Group is
+  needed only if the extension read the app's files, which it does not).
+- `KeeperIsland/KeeperIslandBundle.swift`, `KeeperIsland/KeeperIslandLiveActivity.swift`,
+  `KeeperIsland/Info.plist` — the widget-extension target `KeeperIsland`
+  (`com.apple.widgetkit-extension`, bundle id `dev.tgorka.keeper.island`,
+  `project.yml:172-178`), with the `ActivityConfiguration` and all four presentations
+  Apple makes mandatory: Lock Screen, compact leading/trailing, minimal, expanded. Its
+  deployment target is **16.2**, above the app's 16.0, because `ActivityContent` and
+  `Activity.request(attributes:content:pushType:)` are 16.2 APIs; on an older phone the
+  bridge answers a refusal sentence and the app is otherwise unchanged
+  (`Sources/keeper/KeeperIsland.swift:140-141`).
+- `project.yml` — the second target, embedded by `keeper_iOS`, plus
+  `NSSupportsLiveActivities` (`project.yml:95`); restated in `crates/keeper/Info.ios.plist:41`.
+  The macOS plist does not carry this key, so the merge the
+  [regeneration loop](#project-generation-and-the-regeneration-loop) describes would keep
+  `project.yml`'s on its own — it is stated in the last file the merge reads anyway,
+  because it is the one key without which `Activity.request` throws `unsupported` and the
+  whole story renders nothing (`Info.ios.plist:33-40`). Both copies say `true`.
+- `crates/keeper/src/voice_island.rs` — the Rust side, and `keeper-core/src/voice/island.rs`
+  — the decisions it carries (the state word per turn state, when to renew, how long a
+  failure card lingers), pure and tested on the dev host, with no platform `cfg` and no
+  `tauri`.
+
+It is started when the phrase is armed, updated on every turn state, ended on disarm.
+Apple ends every Live Activity at eight hours, so Rust ends and re-requests it at
+**7 h 45 m** (`keeper_core::voice::island::RENEW_AFTER`, `island.rs:43`) while still
+armed; a request the system refuses because keeper is in the background (start is
+foreground-only, Apple's rule) is recorded once in the phone's record as `island:refused`
+and tried again on `RunEvent::Resumed`, never looped. When listening fails the card ends
+with "Stopped — <reason>" and stays 30 s (`FAILURE_LINGER`, `island.rs:38`) so the reason
+can be read from the Lock Screen. Every update is local:
+`Activity.request(…, pushType: nil)`, no APNs, no push entitlement, no token; the
+`egress.md` sentence for AD-196 says so.
+
+What it costs on a free Personal Team, stated so it is chosen rather than discovered
+(Epic 65 research, §3; Apple, *Supported capabilities (iOS)*, read 2026-09-05):
+
+1. **A second App ID.** `dev.tgorka.keeper.island` counts against the free tier's
+   budget of roughly ten App IDs per seven days, and gets its own automatic
+   provisioning profile.
+2. **The same 7-day expiry, twice.** Both profiles lapse together; the
+   [re-arm ritual](#the-7-day-re-arm-ritual) re-signs both, because the extension is
+   embedded in the app bundle.
+3. **No new environment variable and no new registration step.** The
+   `KEEPER_IOS_REGISTER_DEVICE=1` `xcodebuild` in `scripts/install-ios.sh` builds the
+   `keeper_iOS` scheme, which depends on the extension, so `-allowProvisioningUpdates`
+   mints both profiles in that one step. The `KEEPER_IOS_FREE_TEAM=1` entitlements strip
+   is untouched: the extension declares no entitlements, and Apple's Live Activity
+   guide names no signed entitlement — `NSSupportsLiveActivities` in the plist is the
+   gate.
+4. **Two more gates and three more proofs in the script.** After `xcodegen generate`,
+   `scripts/install-ios.sh:289-297` refuses if `project.pbxproj` no longer references
+   `KeeperIsland.appex` or `keeper_iOS/Info.plist` lost `NSSupportsLiveActivities` — because
+   a target missing from the generated project builds and ships every command and shows
+   nothing, exactly as a missing framework once did. After the install, the proofs step
+   (`:457-472`) prints `NSSupportsLiveActivities` off the bundle, whether
+   `PlugIns/KeeperIsland.appex` is embedded with its bundle id and point identifier, and
+   whether `ActivityKit.framework` is in `otool -L`.
+5. **The residual risk.** Apple's capability table says nothing is needed, but that
+   table already mis-predicted Data Protection for this team (above), so whether a
+   Personal-Team automatic profile ever yields `ActivityAuthorizationError.unentitled`
+   is proven only by the install on kalypso. AD-194: if the free team refuses the
+   extension, the refusal is measured and filed as a DW row, not silently narrowed.
+
+Start is foreground-only by Apple's rule (`ActivityAuthorizationError.visibility`),
+which arming satisfies by construction — listening is switched on while keeper is in
+front. Updates and the end are allowed from the background. Live Activities are a
+per-app toggle in Settings and a Lock Screen toggle under Face ID & Passcode; a fresh
+sideload should show both on, which the kalypso install confirms or corrects.
+
+Two things about this target are untested as of 2026-09-05 and are said here so they
+are not discovered: `xcodegen generate` has to be re-run on the Mac and the regenerated
+`project.pbxproj` re-committed (the Linux host cannot run it; the install script does it
+on its own remote copy, which proves the spec but commits nothing); and the one
+documented Tauri precedent for a Live Activity reports it working under `tauri ios
+build` and not under `tauri ios dev` (tauri-apps discussion #14555, read 2026-09-05),
+which the scripted path — a `build` — sidesteps rather than answers.
+
+### Reading what the port did
+
+A phone has no console beside it. Settings → Bots on the phone shows **What the voice
+port did**: the last fifty of a bounded ring of two hundred events the voice port fed —
+`armed` with the phrase, `disarmed`, `refused` with the sentence you were shown,
+`interruption_begun`, `interruption_ended`, `media_reset`, `route_changed` with the
+reason (headphones, a car kit, the speaker), `resumed`, `rolled` (the recogniser's request
+replaced, every 45 s while armed), every turn state as `turn:<state>`, `wake_matched`,
+`spoken`, and the island's own `island:started` / `updated` / `ended` / `refused` with the
+system's refusal as the detail — newest first, each with how long ago (Epic 65, Story
+65.3, AD-192; `keeper-core/src/voice/events.rs:28-68`, `:82-101`;
+`src/components/settings/bots-section.tsx:186-202`, `:233-301`). It is
+read on open and every 2 s while open, kept in memory only, and neither written nor sent
+(`egress.md`, *The phone's record and the island add no egress*). It is how every story in
+epic 65 is evidenced on hardware: a refusal at arming appears there with its reason; a
+background run shows the roll ticks and the wake match; a phone call shows
+`interruption_begun` and what followed. Settings → About's debug sentence names this
+phone's own log path rather than the Mac's (`about-section.tsx:53-56`; `debug_log_path`).

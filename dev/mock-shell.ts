@@ -2743,7 +2743,7 @@ let voiceWake: VoiceWakeVm = {
   enabled: false,
   phrase: "nixie",
   limits:
-    "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. It stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit. The microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
+    "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
   locale: VOICE_SYSTEM_LOCALE,
   localeChosen: null,
   onDeviceLocales: voiceOnDeviceLocales,

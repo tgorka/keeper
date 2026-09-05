@@ -222,6 +222,23 @@ and lets at most one reading through every 40 ms, only when it moved
 recorded or written to disk on the way. The recogniser still receives every buffer unchanged,
 before the meter looks at it.
 
+### The phone's record and the island add no egress
+
+Epic 65 adds nothing to the table above (AD-196): the voice port's record is a bounded ring in
+memory (`keeper-core/src/voice/events.rs:8-9`, `:26` — 200 entries, nothing written to disk,
+read back by the `voice_events` command in `src-tauri/crates/keeper/src/voice_log.rs:81` and
+shown under Settings → Bots on the phone with the sentence "Kept in memory only — nothing is
+written or sent", `src/components/settings/bots-section.tsx:188-189`), and the Live Activity
+is started, updated and ended from the app process with `pushType: nil`
+(`src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperIsland.swift:76`) — no APNs, no push
+entitlement, no App Group, no token — so nothing about what the phone heard leaves the device
+(Apple, `Activity.request(attributes:content:pushType:)`,
+`https://developer.apple.com/documentation/activitykit/activity`, and *Displaying live data
+with Live Activities*, both read 2026-09-05; Epic 65, AD-194, AD-196). The `voice_on_device`
+source scan described above picks up every `voice*.rs` in the shell crate by prefix
+(`keeper-core/tests/voice_on_device.rs:38-56`), so the island's Rust side (`voice_island.rs`)
+is inside the network-API scan without being named.
+
 ## One conversation on two devices adds no egress
 
 Epic 63 lets a conversation started on the phone be read and followed on the Mac, and the other

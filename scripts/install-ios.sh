@@ -42,7 +42,11 @@
 #                               first install from this Mac: register the phone
 #                               with the team before building, so a profile
 #                               exists to sign against (a headless build never
-#                               does this itself).
+#                               does this itself). The one xcodebuild builds
+#                               the keeper_iOS scheme, whose graph includes the
+#                               KeeperIsland extension (Story 65.5), so it
+#                               mints both App IDs and both profiles — the
+#                               extension has no step of its own.
 #   KEEPER_IOS_DEVICE=<udid>    pick the phone when several are cabled.
 #   KEEPER_IOS_BUILD_ONLY=1     build, gate and stop before the phone.
 #
@@ -120,6 +124,13 @@ IDENTITY_COUNT="$(remote 'security find-identity -v -p codesigning | grep -c "Ap
 # whether an iPhone is on the USB bus at all: a plugged-in iPhone shows up in
 # `ioreg -p IOUSB` BEFORE any pairing or Trust step, so an empty devicectl
 # list with an empty bus is the cable, the port or the phone — not a prompt.
+# A build-only run needs no phone: the artefact is gated and kept on the Mac.
+# Measured need, 2026-09-05: the phone dropped off the cable mid-session while
+# the extension's signing still had to be proven.
+if [ -n "${KEEPER_IOS_BUILD_ONLY:-}" ]; then
+  say "build only: not looking for a phone"
+  UDID=""; DEVICE_NAME=""
+else
 say "looking for the phone"
 DEVICES="$(remote "$(cat <<'EOF'
 json="$(mktemp /tmp/keeper-devicectl.XXXXXX)"
@@ -186,6 +197,7 @@ DEVICE_NAME="$(printf '%s' "$PICKED" | cut -f6)"
   || fail "$DEVICE_NAME ($UDID) has Developer Mode off (developerModeStatus: $DEVMODE). On the phone: Settings > Privacy & Security > Developer Mode, turn it on, and let it reboot — it asks again after the restart. The toggle only appears after a development tool has tried the phone once; if it is missing, do docs/ios.md \"First device install\" steps 3–4 with the phone at the Mac, then re-run."
 
 say "phone: $DEVICE_NAME ($UDID), paired, Developer Mode on"
+fi
 
 # --- 2. The team ------------------------------------------------------------
 #
@@ -252,6 +264,25 @@ remote "cd \$HOME/$REMOTE_DIR && $REMOTE_ENV && bun install --frozen-lockfile --
 # comment on `dependencies`), so it has to be shown to have dropped the
 # entitlement AND kept the framework — four references when this was last
 # done by hand.
+# The extension's team. tauri-cli writes DEVELOPMENT_TEAM into the APP
+# target's pbxproj at build time and touches no other target, and
+# `$(APPLE_DEVELOPMENT_TEAM)` in project.yml does not survive xcodebuild's
+# signing check (measured 2026-09-05: "Signing for KeeperIsland requires a
+# development team" both ways). So the team is stamped into the REMOTE copy
+# of project.yml here, the way the entitlement is stripped below - the
+# committed file keeps the placeholder and no team id (AD-32). The
+# regeneration that follows (free team or not) then carries it.
+say "stamping team $APPLE_DEVELOPMENT_TEAM into the remote project's extension target"
+remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && $(cat <<EOF
+set -euo pipefail
+sed -i '' 's/DEVELOPMENT_TEAM: \\\$(APPLE_DEVELOPMENT_TEAM)/DEVELOPMENT_TEAM: $APPLE_DEVELOPMENT_TEAM/' project.yml
+grep -q 'DEVELOPMENT_TEAM: $APPLE_DEVELOPMENT_TEAM' project.yml || { echo "error: the extension target's DEVELOPMENT_TEAM placeholder was not found in project.yml" >&2; exit 1; }
+mkdir -p Externals assets
+xcodegen generate >/dev/null
+grep -q 'DEVELOPMENT_TEAM = $APPLE_DEVELOPMENT_TEAM' keeper.xcodeproj/project.pbxproj || grep -q 'DEVELOPMENT_TEAM = "$APPLE_DEVELOPMENT_TEAM"' keeper.xcodeproj/project.pbxproj || { echo "error: project.pbxproj carries no DEVELOPMENT_TEAM after xcodegen generate" >&2; exit 1; }
+EOF
+)" || fail "could not stamp the team into the remote project (output above)."
+
 if [ -n "${KEEPER_IOS_FREE_TEAM:-}" ]; then
   say "free Personal Team: dropping the data-protection entitlement from the remote project.yml"
   remote "cd \$HOME/$REMOTE_DIR/$APPLE_DIR && $REMOTE_ENV && $(cat <<'EOF'
@@ -277,7 +308,21 @@ if [ "$speech" -eq 0 ]; then
   echo "error: project.pbxproj no longer references Speech.framework after xcodegen generate; a build from it would have no SFSpeechRecognizer" >&2
   exit 1
 fi
-echo "==> Regenerated without CODE_SIGN_ENTITLEMENTS; Speech.framework referenced $speech times (4 when last done by hand)."
+# The island (Story 65.5): the extension target and the plist key it needs
+# are both project.yml's, so the same regeneration has to be shown to have
+# kept them — a project without the .appex builds and ships an app whose
+# `Activity.request` throws `unsupported`, which the ring would show and a
+# reviewer might read as the free team's refusal.
+appex="$(grep -c 'KeeperIsland.appex' keeper.xcodeproj/project.pbxproj || true)"
+if [ "$appex" -eq 0 ]; then
+  echo "error: project.pbxproj does not reference KeeperIsland.appex after xcodegen generate; the Live Activity extension was dropped" >&2
+  exit 1
+fi
+if ! grep -q 'NSSupportsLiveActivities' keeper_iOS/Info.plist; then
+  echo "error: keeper_iOS/Info.plist has no NSSupportsLiveActivities after xcodegen generate; project.yml's info.properties lost the key" >&2
+  exit 1
+fi
+echo "==> Regenerated without CODE_SIGN_ENTITLEMENTS; Speech.framework referenced $speech times (4 when last done by hand); KeeperIsland.appex referenced $appex times."
 EOF
 )" || fail "could not drop the entitlement on $HOST (output above). The remote project.yml is a fresh copy on every run, so nothing is left half-edited; fix the cause and re-run."
 fi
@@ -324,7 +369,7 @@ PAYLOAD" 2>&1 | tee "$BUILD_LOG"; then
     fail "signing failed on the data-protection entitlement: team $APPLE_DEVELOPMENT_TEAM is a free Personal Team and Apple does not grant it that capability. Re-run with KEEPER_IOS_FREE_TEAM=1, which drops the entitlement from the remote copy of the generated project (the committed value stays)."
   fi
   if grep -q "couldn't find any iOS App Development provisioning profiles" "$BUILD_LOG"; then
-    fail "no provisioning profile for $BUNDLE_ID: this phone is not registered with team $APPLE_DEVELOPMENT_TEAM from this Mac. Re-run with KEEPER_IOS_REGISTER_DEVICE=1, which mints the profile before building."
+    fail "no provisioning profile for $BUNDLE_ID or for the KeeperIsland extension ($BUNDLE_ID.island): this phone is not registered with team $APPLE_DEVELOPMENT_TEAM from this Mac, or the extension's App ID has not been minted yet. Re-run with KEEPER_IOS_REGISTER_DEVICE=1, which mints both profiles before building (the transcript above names which bundle id lacked one)."
   fi
   if grep -q 'errSecInternalComponent' "$BUILD_LOG"; then
     fail "codesign could not reach the login keychain even from Terminal.app. Log in to $HOST's GUI session (the screen must be unlocked once) and re-run."
@@ -432,6 +477,29 @@ done
 # PlistBuddy prints an array as "Array {" / one indented item per line / "}".
 modes="\$(/usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "\$plist" 2>/dev/null | sed -n 's/^    //p' | paste -sd, -)"
 echo "  UIBackgroundModes:              \${modes:-(absent — an armed session would end when keeper leaves the front)}"
+# The island (Story 65.5): the key, the extension and its point identifier,
+# each read off the bundle. An app with the key and no .appex has an
+# `Activity.request` that succeeds and a lock screen that draws nothing; an
+# .appex with the wrong point identifier is never loaded by WidgetKit.
+live="\$(/usr/libexec/PlistBuddy -c "Print :NSSupportsLiveActivities" "\$plist" 2>/dev/null || echo absent)"
+echo "  NSSupportsLiveActivities:       \$live\$([ "\$live" = true ] || echo ' — Activity.request will throw unsupported; check project.yml and Info.ios.plist')"
+appex="\$app/PlugIns/KeeperIsland.appex"
+if [ -d "\$appex" ]; then
+  point="\$(/usr/libexec/PlistBuddy -c "Print :NSExtension:NSExtensionPointIdentifier" "\$appex/Info.plist" 2>/dev/null || echo absent)"
+  appex_id="\$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "\$appex/Info.plist" 2>/dev/null || echo absent)"
+  echo "  KeeperIsland.appex:             embedded (\$appex_id, \$point)"
+  case "\$point" in
+    com.apple.widgetkit-extension) ;;
+    *) echo "      WARNING: not a WidgetKit extension; the Live Activity will never be drawn" ;;
+  esac
+else
+  echo "  KeeperIsland.appex:             NOT embedded — the Live Activity cannot be drawn; check project.yml's target dependency and regenerate"
+fi
+if otool -L "\$bin" | grep -q 'ActivityKit.framework'; then
+  echo "  ActivityKit.framework:          linked (otool -L)"
+else
+  echo "  ActivityKit.framework:          NOT linked — the bridge did not compile into the app; check Sources/keeper/KeeperIsland.swift is in the target"
+fi
 dr="\$(codesign -d -r- "\$app" 2>/dev/null | sed -n 's/^designated => //p')"
 case "\$dr" in
   *cdhash*) echo "  Designated requirement:         bare cdhash — this is NOT a signed build, whatever the launch said"; exit 1 ;;
@@ -464,6 +532,14 @@ done from here:
      phrase", in Settings > Bots and inside the "Bot and model" sheet on the
      Bots surface; the phrase beside it is "nixie" until you change it. The
      orange microphone indicator stays lit while it is armed.
+  4. Look at the island. With the phrase armed, the Dynamic Island shows
+     keeper's ear and "nixie" (or your phrase), and the lock screen a card
+     saying "Listening for “nixie”"; while you talk it says Listening, Heard
+     you, Thinking, Answering, Speaking. If nothing appears, Settings > Bots
+     on the phone lists what happened: an `island:refused` row names the
+     reason — Live Activities off for keeper in Settings, or the free
+     team's profile refusing (`unentitled`), which is the measurement
+     Epic 65 asks for rather than a fault in this install.
 
 The certificate is a free Personal Team's: the app stops launching after 7
 days until this script is run again (docs/ios.md, "The 7-day re-arm ritual").

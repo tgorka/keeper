@@ -61,6 +61,17 @@ impl VoicePlatform {
     /// on-device model is a dictation language download; and the audio
     /// session's voice processing lets recognition run while the answer
     /// plays.
+    ///
+    /// The limits are Apple's documented interruptions (Epic 65, AD-193),
+    /// each named by what the person sees rather than by the notification:
+    /// `UIBackgroundModes: audio` keeps an active session alive with
+    /// another app in front or the screen locked; Siri and a non-mixing app
+    /// deactivate it and the port re-arms when they let go (Siri sends no
+    /// end, so the port asks again on a clock); an accepted call suspends
+    /// the app, and a record session cannot be reactivated from the
+    /// background afterwards, so it stays stopped until keeper is opened —
+    /// which is what re-arms it. Force-quit and the switch are the person's
+    /// own ends. The orange dot is the system's and stays regardless.
     pub const IOS: Self = Self {
         noun: "phone",
         allow: "allow both under Settings > keeper",
@@ -68,7 +79,7 @@ impl VoicePlatform {
             "download that language under Settings > General > Keyboard > Dictation Languages",
         voice_download: "download a voice for it under Settings > Accessibility > Spoken Content > Voices",
         full_duplex: true,
-        limits: "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. It stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit. The microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
+        limits: "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
     };
 
     /// macOS: the Mac. The microphone grant lives in System Settings >

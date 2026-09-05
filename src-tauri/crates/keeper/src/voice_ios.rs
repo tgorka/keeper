@@ -48,19 +48,38 @@
 //! final result or an error. The microphone never closes for a roll, so
 //! nothing said across the seam is lost to a route change.
 //!
-//! # Interruptions re-arm, they do not end
+//! # Interruptions re-arm, they do not end — within a bound (Story 65.4)
 //!
 //! A phone call, Siri, or another app taking the microphone stops the engine
 //! and posts `AVAudioSessionInterruptionNotification`. A port that reported
 //! that as `Failed` would leave the phrase dead after the first call of the
 //! drive — the defect this design exists to prevent. Instead the worker
-//! remembers what the turn asked for (`wanted`), tears the dead capture down,
-//! and rebuilds it when the interruption ends — or, when the end never comes
-//! (Siri is known not to send one), every [`RESUME_RETRY`] while the request
-//! stands. An engine configuration change (headphones, a car connecting)
-//! and a media-services reset take the same path. The turn is told nothing:
-//! its `Idle { listening_for_wake: true }` is the promise the port is keeping,
-//! a few seconds late.
+//! keeps what the turn asked for (`wanted` — the *begin* never clears it),
+//! tears the dead capture down, and rebuilds it when the interruption ends
+//! — or, when the end never comes (Siri is known not to send one; Apple
+//! says an end is never guaranteed), every [`RESUME_RETRY`] while the
+//! request stands. A media-services reset takes the same path with the
+//! synthesiser thrown away too; a route change (headphones, a car kit)
+//! is recorded and the capture continues, rebuilt only when the engine's
+//! own configuration-change notification says it stopped. The turn is told
+//! nothing: its `Idle { listening_for_wake: true }` is the promise the port
+//! is keeping, a few seconds late.
+//!
+//! The retry is bounded, because one interruption cannot be recovered from
+//! here: after an *accepted* call the app is suspended, and when the call
+//! ends iOS refuses to reactivate a record session from the background
+//! (`setActive:` answers `!int`, forum thread 813278) until the app is in
+//! front — the same rule as "cannot start recording from the background".
+//! An unbounded retry would ask every five seconds for the rest of the
+//! drive, each time building and tearing down an engine. So after
+//! [`RESUME_FAILURES_TOLERATED`] refusals in a row the port stops wanting,
+//! records `refused` with a sentence saying listening starts again when
+//! keeper is opened, and tells the turn `Failed` — which releases
+//! `Turn::armed`, so `voice_ipc::voice_rearm()` on `RunEvent::Resumed`
+//! (the phone's did-become-active) arms the phrase again from the persisted
+//! intent the moment keeper is in front, by AD-190's rule. Will-resign
+//! needs no hook: the capture is meant to outlive the foreground, which is
+//! what `UIBackgroundModes: audio` is for.
 //!
 //! # Sharing the speaker with the app in front
 //!
@@ -156,8 +175,10 @@ use objc2_avf_audio::{
     AVAudioSessionInterruptionNotification, AVAudioSessionInterruptionOptionKey,
     AVAudioSessionInterruptionOptions, AVAudioSessionInterruptionType,
     AVAudioSessionInterruptionTypeKey, AVAudioSessionMediaServicesWereResetNotification,
-    AVAudioSessionModeDefault, AVAudioSessionRecordPermission, AVAudioSessionSetActiveOptions,
-    AVAudioTime, AVSpeechBoundary, AVSpeechSynthesisVoice, AVSpeechSynthesizer, AVSpeechUtterance,
+    AVAudioSessionModeDefault, AVAudioSessionRecordPermission,
+    AVAudioSessionRouteChangeNotification, AVAudioSessionRouteChangeReason,
+    AVAudioSessionRouteChangeReasonKey, AVAudioSessionSetActiveOptions, AVAudioTime,
+    AVSpeechBoundary, AVSpeechSynthesisVoice, AVSpeechSynthesizer, AVSpeechUtterance,
 };
 use objc2_foundation::{
     NSArray, NSError, NSLocale, NSNotification, NSNotificationCenter, NSNumber, NSString,
@@ -194,8 +215,23 @@ const REQUEST_ROLL_QUIET: Duration = Duration::from_millis(1500);
 const REQUEST_LONGEST: Duration = Duration::from_secs(58);
 
 /// How often a listener the system took away is tried again while the turn
-/// still wants it.
+/// still wants it. Siri's interruption-ended is late or absent
+/// (rdar://44895456), so this clock is what brings the phrase back after
+/// Siri.
 const RESUME_RETRY: Duration = Duration::from_secs(5);
+
+/// Reactivations that may fail in a row after an interruption — a minute
+/// at [`RESUME_RETRY`] — before the port stops asking. A minute outlives a
+/// Siri exchange and a hand-over between apps; what it does not outlive is
+/// the case Apple's rule makes unrecoverable from here, a record session
+/// after an accepted call while keeper is still in the background. The
+/// count restarts on every begin and end the system posts, so it measures
+/// silence from the system, not the length of an interruption it announced.
+const RESUME_FAILURES_TOLERATED: u32 = 12;
+
+/// What the ring and the switch say when the port gives up resuming: the
+/// remedy is the foreground, which re-arms without the switch being touched.
+const RESUME_GAVE_UP: &str = "Listening stopped: iOS did not give the microphone back within a minute, which is what happens after a phone call while keeper is in the background. It starts listening again when you open keeper.";
 
 /// Fresh requests that may fail to start in a row before the port stops
 /// trying and tells the turn — bounded so a broken recogniser is a sentence,
@@ -252,6 +288,11 @@ enum AudioNotice {
     /// `AVAudioSessionMediaServicesWereResetNotification`: every audio
     /// object is invalid.
     MediaReset,
+    /// `AVAudioSessionRouteChangeNotification`: the input or output route
+    /// changed — headphones, a car kit, the speaker — for `reason` as the
+    /// framework names it. The capture continues unless the engine says
+    /// otherwise.
+    RouteChanged { reason: &'static str },
     /// The recognition task with this serial ended — a final result, or the
     /// error in `reason`.
     RequestEnded { serial: u64 },
@@ -432,6 +473,10 @@ struct Worker {
     suspended: Option<Instant>,
     /// Fresh requests that failed to start since the last that worked.
     failed_starts: u32,
+    /// Reactivations refused in a row since the system last spoke (an
+    /// interruption's begin or end) or the capture last came back; against
+    /// [`RESUME_FAILURES_TOLERATED`].
+    failed_resumes: u32,
     /// The person's choice of locale (`bots.voice_locale`); `None` is
     /// "choose for me". Handed to `locale::choose` with `locales`.
     requested: Option<String>,
@@ -463,6 +508,7 @@ impl Worker {
             speaking_since: None,
             suspended: None,
             failed_starts: 0,
+            failed_resumes: 0,
             requested: None,
             locales: None,
             voices: None,
@@ -548,6 +594,7 @@ impl Worker {
         self.availability()?;
         self.wanted = Some(hints);
         self.failed_starts = 0;
+        self.failed_resumes = 0;
         match self.arm() {
             Ok(()) => Ok(()),
             Err(error) => {
@@ -828,23 +875,46 @@ impl Worker {
     }
 
     /// Rebuild the capture after the system took it; on refusal, wait for
-    /// the next tick of the retry clock.
+    /// the next tick of the retry clock — [`RESUME_FAILURES_TOLERATED`]
+    /// times, after which the port gives up (see the module doc: after an
+    /// accepted call, a record session is not reactivated from the
+    /// background, and the foreground is the only remedy).
     fn resume(&mut self) {
         self.end_recognition();
         self.end_capture();
         match self.arm() {
             Ok(()) => {
+                self.failed_resumes = 0;
                 if self.suspended.take().is_some() {
                     tracing::info!("voice: listening resumed after an interruption");
                     crate::voice_log::record(VoiceEventKind::Resumed, None);
                 }
             }
             Err(error) => {
-                tracing::debug!(%error, "voice: not yet; will retry");
                 self.end_capture();
-                self.suspended = Some(Instant::now());
+                self.failed_resumes += 1;
+                if self.failed_resumes >= RESUME_FAILURES_TOLERATED {
+                    tracing::warn!(
+                        %error,
+                        attempts = self.failed_resumes,
+                        "voice: the session would not reactivate; stopping until keeper is opened"
+                    );
+                    self.give_up(RESUME_GAVE_UP.to_owned());
+                } else {
+                    tracing::debug!(%error, attempt = self.failed_resumes, "voice: not yet; will retry");
+                    self.suspended = Some(Instant::now());
+                }
             }
         }
+    }
+
+    /// Stop wanting, say why in the ring, and tell the turn: `Failed`
+    /// releases `Turn::armed`, which is what lets `voice_rearm()` arm the
+    /// phrase again from the persisted intent when the refusal clears.
+    fn give_up(&mut self, reason: String) {
+        crate::voice_log::record(VoiceEventKind::Refused, Some(reason.clone()));
+        self.stop();
+        (self.sink)(TurnEvent::Failed(reason));
     }
 
     /// A fresh request would not start. Bounded: after enough in a row the
@@ -852,9 +922,7 @@ impl Worker {
     fn roll_failed(&mut self, error: String) {
         if self.failed_starts >= ROLL_FAILURES_TOLERATED {
             tracing::warn!(%error, "voice: recognition keeps failing to start");
-            crate::voice_log::record(VoiceEventKind::Refused, Some(error.clone()));
-            self.stop();
-            (self.sink)(TurnEvent::Failed(error));
+            self.give_up(error);
         } else {
             tracing::debug!(%error, "voice: recognition did not restart; retrying");
             self.suspend();
@@ -866,7 +934,13 @@ impl Worker {
         tracing::debug!(?notice, "voice: audio notice");
         match notice {
             AudioNotice::Interrupted => {
+                // The begin is reliable; the end is not (Apple: never
+                // guaranteed). `wanted` stays as it is — the capture is
+                // still asked for, and the retry clock is what brings it
+                // back when no end comes. A fresh interruption is a fresh
+                // budget of retries.
                 crate::voice_log::record(VoiceEventKind::InterruptionBegun, None);
+                self.failed_resumes = 0;
                 if self.speaking_since.is_some() {
                     // The answer is gone with the speaker; the turn ends as
                     // if it had finished.
@@ -879,27 +953,62 @@ impl Worker {
             }
             AudioNotice::InterruptionEnded { should_resume } => {
                 // Apple's hint is about playback etiquette; a microphone the
-                // person armed comes back either way.
+                // person armed comes back either way. The end itself is a
+                // word from the system, so the retry budget starts over —
+                // after a call, this is where the background reactivation
+                // begins to be refused.
                 tracing::info!(should_resume, "voice: interruption ended");
                 crate::voice_log::record(
                     VoiceEventKind::InterruptionEnded,
                     Some(format!("should_resume={should_resume}")),
                 );
+                self.failed_resumes = 0;
                 if self.wanted.is_some() {
                     self.resume();
                 }
             }
             AudioNotice::EngineChanged => {
                 if self.wanted.is_some() && self.suspended.is_none() {
+                    crate::voice_log::record(
+                        VoiceEventKind::Resumed,
+                        Some(
+                            "the engine's configuration changed; rebuilding the capture".to_owned(),
+                        ),
+                    );
                     self.resume();
                 }
             }
             AudioNotice::MediaReset => {
+                // Every audio object is invalid (Apple: "dispose of any
+                // orphaned audio objects ... and create new ones"): the
+                // synthesiser is thrown away and the capture rebuilt from
+                // nothing, on the same path an interruption takes.
+                crate::voice_log::record(VoiceEventKind::MediaReset, None);
                 self.synthesizer = None;
                 self.speech_over();
                 if self.wanted.is_some() {
+                    self.failed_resumes = 0;
                     self.resume();
                 }
+            }
+            AudioNotice::RouteChanged { reason } => {
+                // Headphones, a car kit, the speaker: the session is still
+                // active and the tap still feeds the request, so the
+                // capture continues. When the change did stop the engine,
+                // its own configuration-change notification follows and
+                // `EngineChanged` rebuilds it; here the change is only
+                // recorded, with whether the engine survived it.
+                let running = self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|c| engine_running(&c.engine));
+                let detail = match (self.wanted.is_some(), running) {
+                    (true, true) => format!("{reason}; capture continues"),
+                    (true, false) => format!("{reason}; engine stopped, rebuilding"),
+                    (false, _) => format!("{reason}; not listening"),
+                };
+                tracing::info!(reason, running, "voice: audio route changed");
+                crate::voice_log::record(VoiceEventKind::RouteChanged, Some(detail));
             }
             AudioNotice::RequestEnded { serial } => {
                 let current = self
@@ -1522,8 +1631,8 @@ fn read_result(
     Ok(Some((text, is_final)))
 }
 
-/// Watch the shared session for interruptions and media resets, posting each
-/// to the worker's inbox.
+/// Watch the shared session for interruptions, media resets and route
+/// changes, posting each to the worker's inbox.
 #[allow(unsafe_code)]
 fn observe_session(
     commands: &Sender<Command>,
@@ -1537,7 +1646,7 @@ fn observe_session(
     // safe accessors, and never touches a worker-owned object. The
     // notification names are Apple's process-lifetime constants; a nil one
     // (which no iOS ships) means no observer rather than a null deref.
-    let mut observers = Vec::with_capacity(2);
+    let mut observers = Vec::with_capacity(3);
     let center = NSNotificationCenter::defaultCenter();
     let session = unsafe { AVAudioSession::sharedInstance() };
 
@@ -1570,7 +1679,57 @@ fn observe_session(
         };
         observers.push(token);
     }
+
+    if let Some(name) = unsafe { AVAudioSessionRouteChangeNotification } {
+        let inbox = commands.clone();
+        let on_route = RcBlock::new(move |note: std::ptr::NonNull<NSNotification>| {
+            let notification = unsafe { note.as_ref() };
+            let reason = route_change_reason(notification);
+            let _ = inbox.send(Command::Audio(AudioNotice::RouteChanged { reason }));
+        });
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(name),
+                Some(&session),
+                None,
+                &on_route,
+            )
+        };
+        observers.push(token);
+    }
     observers
+}
+
+/// Read a route-change notification's reason (Apple: an `NSNumber` under
+/// `AVAudioSessionRouteChangeReasonKey`) as the framework names it, for the
+/// ring; `"unknown"` when the dictionary does not say.
+#[allow(unsafe_code)]
+fn route_change_reason(notification: &NSNotification) -> &'static str {
+    // SAFETY: the key is Apple's process-lifetime `NSString` constant, read
+    // once; the lookup is a safe, null-checked accessor on the retained
+    // dictionary, and the number is downcast before it is read.
+    let reason = notification
+        .userInfo()
+        .and_then(|info| {
+            let key = unsafe { AVAudioSessionRouteChangeReasonKey }?;
+            info.objectForKey(key)
+        })
+        .and_then(|value| value.downcast::<NSNumber>().ok())
+        .map(|number| AVAudioSessionRouteChangeReason(number.unsignedIntegerValue()));
+    match reason {
+        Some(AVAudioSessionRouteChangeReason::NewDeviceAvailable) => "new device available",
+        Some(AVAudioSessionRouteChangeReason::OldDeviceUnavailable) => "old device unavailable",
+        Some(AVAudioSessionRouteChangeReason::CategoryChange) => "category change",
+        Some(AVAudioSessionRouteChangeReason::Override) => "override",
+        Some(AVAudioSessionRouteChangeReason::WakeFromSleep) => "wake from sleep",
+        Some(AVAudioSessionRouteChangeReason::NoSuitableRouteForCategory) => {
+            "no suitable route for category"
+        }
+        Some(AVAudioSessionRouteChangeReason::RouteConfigurationChange) => {
+            "route configuration change"
+        }
+        _ => "unknown",
+    }
 }
 
 /// Read an interruption notification's `userInfo` into a notice.

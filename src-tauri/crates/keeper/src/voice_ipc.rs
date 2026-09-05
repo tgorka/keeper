@@ -323,11 +323,14 @@ fn after_change(state: &mut Voice) {
 /// (`voice_window::observe`) — a Rust-side fan-out rather than a second
 /// registration, because the watcher slot is one deep on purpose and a
 /// second `voice_watch` would evict the pane. `observe` only queues onto
-/// the main thread, so it is safe under this lock.
+/// the main thread, so it is safe under this lock. On the phone the island
+/// (`voice_island::observe`, Story 65.5) is the same fan-out.
 fn push(voice: &mut Voice) {
     let snapshot = voice.turn.vm();
     #[cfg(desktop)]
     crate::voice_window::observe(&snapshot);
+    #[cfg(target_os = "ios")]
+    crate::voice_island::observe(&snapshot);
     if let Some(channel) = &voice.watcher {
         if channel.send(snapshot).is_err() {
             voice.watcher = None;

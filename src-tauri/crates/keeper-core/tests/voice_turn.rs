@@ -833,7 +833,10 @@ fn voice_phrase_counts_letters_not_words() {
 }
 
 /// The sentence beside the switch (FR-406) states every fact the epic
-/// established, and none of them as "not yet".
+/// established, and none of them as "not yet". Since Epic 65 (AD-193) the
+/// interruptions are named by behaviour — a call ends it until keeper is
+/// opened, Siri and a non-mixing app pause it and keeper resumes — and the
+/// vaguer "when iOS ends the audio session" is gone.
 #[test]
 fn voice_limits_sentence_states_every_fact_and_no_to_do() {
     let s = VoicePlatform::IOS.limits;
@@ -843,11 +846,29 @@ fn voice_limits_sentence_states_every_fact_and_no_to_do() {
         "continues in the background and locked: {s}"
     );
     assert!(
-        s.contains("turn it off") && s.contains("audio session") && s.contains("force-quit"),
-        "names every way it stops: {s}"
+        s.contains("Siri") && s.contains("takes the microphone") && s.contains("pauses it"),
+        "Siri and a non-mixing app pause it: {s}"
     );
     assert!(
-        s.contains("microphone indicator") && s.contains("cannot be hidden"),
+        s.contains("resumes on its own"),
+        "keeper resumes after a pause: {s}"
+    );
+    assert!(
+        s.contains("phone call") && s.contains("until you open keeper again"),
+        "a call ends it until the next open: {s}"
+    );
+    assert!(
+        s.contains("turn it off") && s.contains("force-quit"),
+        "names the person's own ends: {s}"
+    );
+    assert!(
+        !s.contains("audio session"),
+        "the interruptions are named by behaviour, not by the session: {s}"
+    );
+    assert!(
+        s.contains("orange")
+            && s.contains("microphone indicator")
+            && s.contains("cannot be hidden"),
         "{s}"
     );
     assert!(s.contains("battery"), "{s}");

@@ -13,9 +13,9 @@
 
   Only keys the macOS file also carries belong here — every other iOS key
   lives in `gen/apple/project.yml` (AD-32), which is what `xcodegen
-  generate` and a plain Xcode run see. The sentence below MUST equal the one
-  in `project.yml`: that copy is the project's truth, this copy is the
-  override that reaches the bundle.
+  generate` and a plain Xcode run see — with one exception, stated below.
+  The sentences MUST equal the ones in `project.yml`: that copy is the
+  project's truth, this copy is the override that reaches the bundle.
 -->
 <plist version="1.0">
 <dict>
@@ -30,5 +30,15 @@
 	-->
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>keeper turns what you say into text on this phone, using on-device recognition only, so it can send your words to the model you chose. Your voice never leaves the device; keeper refuses server recognition.</string>
+	<!--
+	  The island (Epic 65, Story 65.5, AD-194). The macOS file does not carry
+	  this key, so the merge alone would keep project.yml's — but this is the
+	  one key without which `Activity.request` throws `unsupported` and the
+	  whole story renders nothing, and install-ios.sh reads it off the
+	  installed bundle as a proof. Stated in the last file the merge reads so
+	  that no earlier step can drop it. Both copies say `true`.
+	-->
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 </dict>
 </plist>

@@ -5,8 +5,9 @@
  * `voice_events`, newest first. A projection of
  * `keeper_core::voice::events::VoiceEvent`: `kind` is the closed set's
  * stable string (`armed`, `refused`, `interruption_begun`,
- * `interruption_ended`, `resumed`, `rolled`, `turn:<state>`,
- * `wake_matched`, `spoken`, `disarmed`) and `detail` the words that go with
+ * `interruption_ended`, `media_reset`, `route_changed`, `resumed`,
+ * `rolled`, `turn:<state>`, `wake_matched`, `spoken`, `disarmed`,
+ * `island:<what>`) and `detail` the words that go with
  * it — a refusal's sentence, a transcript — or `null`. A view of memory: the
  * ring is bounded, on the device, and never written anywhere.
  */

@@ -3470,6 +3470,20 @@ reason: Armed listening keeps running with another app in front, which is the wh
   its own signing story on a free Personal Team, where every extension is another target to
   re-sign every seven days.
 status: open
+note: 2026-09-05, epic 65, story 65.5 (built), story 65.6 (recorded) — the Live Activity is
+  written: a `@_cdecl` bridge in the app target (`gen/apple/Sources/keeper/KeeperIsland.swift`),
+  the `KeeperIsland` widget-extension target with the shared `ActivityAttributes` and the four
+  presentations (`gen/apple/KeeperIsland/**`, `project.yml`), `NSSupportsLiveActivities` in
+  `project.yml` and `Info.ios.plist`, `crates/keeper/src/voice_island.rs` on the Rust side,
+  and `scripts/install-ios.sh` printing whether the `.appex` and the plist key are in the
+  installed bundle; the design is `docs/decisions.md` D-14 and the costs are `docs/ios.md`
+  *Live Activity*. **Not closed**, because nothing here has run: no Swift line has compiled
+  (the Mac gate is the first compile), the second App ID has not been minted on the free team,
+  and no photograph exists. What closes it, in order: the coordinator's `install-ios.sh` report
+  showing the `.appex` inside the installed bundle and the extension's profile minted (or the
+  exact signing refusal, which becomes its own DW row per AD-194); then, with the phrase armed
+  on kalypso, a photograph or screen recording of the island showing keeper's state and the
+  Lock Screen its card, and the card gone after disarming. Record both here and flip to done.
 
 ### DW-223: A files-pane restore test that only fails on the CI runner.
 
@@ -3614,6 +3628,30 @@ reason: The port was authored on the Linux dev host, where the shell crate canno
   5. Record the answers in `docs/constraints-and-limitations.md` (replace "not yet compiled where
      it was written") and close this row.
 status: open
+note: 2026-09-05, epic 65 — this row has an **iOS half** the title does not name, and epic 65
+  collects it: the iOS port's background listening has never been run on hardware either.
+  Epic 62 designed it (a `.playAndRecord` session with `mixWithOthers`, `UIBackgroundModes:
+  audio`, requests rolled every 45 s — `crates/keeper/src/voice_ios.rs`), and epic 62's own
+  switch could not arm it (D-13), so nothing on the owner's phone ever listened in the
+  background. Apple documents only the *audio session* surviving backgrounding; whether the
+  on-device recogniser keeps delivering results for tens of minutes is forum-grade, and a
+  same-shaped API (ShazamKit, FB15255903) is reported to stop ~20 s after backgrounding with the
+  microphone still open (Epic 65 research, §1, read 2026-09-05). Story 65.4 made the
+  foreground/background/interruption handling explicit (a third observer on
+  `AVAudioSessionRouteChangeNotification`, a bounded resume — `RESUME_FAILURES_TOLERATED`,
+  twelve 5 s tries — after which the port records `refused`), rewrote the limits sentence from
+  Apple's documented interruptions (`keeper-core/src/voice/platform.rs:82`) and wrote the
+  kalypso protocol; the ring from story 65.3 (Settings → Bots, *What the voice port did*) is
+  the instrument. **The iOS half is not closed**: the run has not happened. What closes it —
+  the coordinator runs it on kalypso with the owner at the phone: (1) arm in the foreground,
+  put another app in front, wait three minutes, say the phrase, and read the ring — `rolled`
+  ticks at 45 s and a `wake_matched` followed by the turn states are the evidence; (2) accept
+  a phone call while armed, end it, and read the ring — `interruption_begun`, then either
+  `resumed` or `refused`, and after reopening keeper an `armed` from the re-arm; (3) note
+  whether the on-device recogniser delivered after minutes in the background, which no Apple
+  document promises. Record the three answers here, in `docs/ios.md` *Limitations* (replace
+  "what Apple documents, not what has been observed") and, if (3) is "no", as a new row rather
+  than a softened sentence. The macOS half above keeps its own five steps.
 
 ### DW-229: The voice pill does not appear over another app's full-screen Space.
 
@@ -3735,6 +3773,61 @@ reason: Apple's guidance is to tell VoiceOver when visible content changes and t
   which already renders the same `VoiceStateVm` and is where a VoiceOver user is. Verify on
   hesperia with VoiceOver on and a voice turn started from the hotkey while another app is in
   front; record the answer here and, if it is "no", move the live region rather than duplicate it.
+status: open
+
+### DW-234: A tablet tier — an iPad now gets the phone tier at every width.
+
+origin: epic 65, *What stays out*, story 65.6 (recorded), 2026-09-05
+location: `src/hooks/use-shell-layout.ts:18-23`, `:84` (the tier is the platform's — AD-189),
+  `src/lib/stores/capabilities.ts` (`useIsReducedCapabilityPlatform`), `docs/decisions.md` D-12,
+  `docs/ios.md` *Orientation*
+reason: Story 65.1 made a reduced-capability platform the phone tier in every orientation,
+  because the width rule rendered the desktop frame on a rotated iPhone at 430 pt tall. An iPad
+  is the same `CapabilitiesVm` answer and rotates too, so it now gets the single-pane stack at
+  1024 pt and wider — which is honest about what the build can do, and is not a layout anyone
+  has designed for a tablet. The owner's report is a phone; iPad support is its own decision
+  (which surfaces get columns, whether the drawer exists, what a keyboard attached to an iPad
+  means for the hotkey tier), not a breakpoint. Do not reintroduce a width rule on a reduced
+  platform to get there: that is the defect 65.1 removed. Take it, if at all, as a third tier
+  named by the platform.
+status: open
+
+### DW-235: Push-updated Live Activities.
+
+origin: epic 65, *What stays out*, story 65.6 (recorded), 2026-09-05
+location: `src-tauri/crates/keeper/gen/apple/Sources/keeper/KeeperIsland.swift` (the bridge;
+  `Activity.request(…, pushType: nil)`), `crates/keeper/src/voice_island.rs`, `docs/egress.md`
+  *The phone's record and the island add no egress* (AD-196), `docs/decisions.md` D-14
+reason: The island is updated from the app process only. A push-updated activity would let the
+  card change while keeper is suspended — after a phone call, say — but it needs APNs and the
+  push capability, which the free Personal Team does not hold (Apple, *Supported capabilities
+  (iOS)*, read 2026-09-05) and which is a new destination `docs/egress.md` would have to name;
+  under NFR-11 push must never ride project infrastructure (D-1). So this is refused for the
+  same reason D-1 defers the paid program, and it reopens only under D-1's own trigger and only
+  through a homeserver operator's gateway or a user-run relay — never keeper's. Nothing about
+  an indicator of *listening* needs it: while keeper listens, the app process is alive to
+  update the card, and when it is not, the card ending is the truth.
+status: open
+
+### DW-236: Recognition through an accepted phone call, in the background.
+
+origin: epic 65, *What stays out*, story 65.4 (the behaviour), story 65.6 (recorded), 2026-09-05
+location: `crates/keeper/src/voice_ios.rs` (the interruption observer, `RESUME_RETRY`,
+  `RESUME_FAILURES_TOLERATED`), `keeper-core/src/voice/platform.rs:82` (the limits sentence:
+  "a phone call ends it until you open keeper again"), `docs/ios.md` *Limitations*,
+  `docs/decisions.md` D-13 (the re-arm on `RunEvent::Resumed`)
+reason: Accepting a call suspends the app (Apple, *Audio Session Programming Guide*, "The
+  interruption life cycle", steps 6–8), and reactivating a *record* session from the background
+  once the call ends is reported to fail with `NSOSStatusErrorDomain 560557684 ('!int')` until
+  the app is foregrounded (Apple Developer Forums thread 813278, forum excerpt, read
+  2026-09-05) — the cannot-start-recording-from-the-background rule Apple's DTS states plainly.
+  keeper therefore says listening stopped and re-arms on the next open rather than pretending.
+  Two routes exist and neither is taken yet: `setPrefersNoInterruptionsFromSystemAlerts(_:)`,
+  which Apple documents for apps that prefer not to be interrupted by incoming-call alerts but
+  which changes the person's call experience and is unverified for a record session; and a
+  Live Activity button (App Intents) that re-arms from the Lock Screen without opening keeper —
+  which still runs in the app process and may hit the same rule. Take either only with a
+  kalypso measurement of the post-call reactivation first; the ring (AD-192) is the instrument.
 status: open
 
 - source_spec: none

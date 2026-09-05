@@ -68,7 +68,11 @@ export function debugModeSentence(logPath: string | null): string {
  *
  * Mirrored one-to-one into the Limitations list of `docs/ios.md`, which the
  * disclosure links to; `about-section.test.tsx` reads that file from disk and
- * fails when the two lists differ. Edit both together or neither.
+ * fails when the two lists differ. Edit both together or neither. The seventh
+ * line is, byte for byte, `VoicePlatform::IOS.limits` in
+ * `keeper-core/src/voice/platform.rs` (Epic 65, Story 65.4, AD-193): the
+ * sentence read here before switching listening on is the sentence shown
+ * beside the switch.
  */
 export const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
   "keeper syncs and notifies only while it's open; background notifications await a future decision.",
@@ -77,7 +81,7 @@ export const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
   "Updates arrive by reinstalling keeper; its signature renews every 7 days.",
   "Bots talks to a model but cannot reach the folders you sync — the drive tools live on your Mac.",
   "Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.",
-  "Listening stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit; while it listens the microphone indicator stays lit and it uses battery.",
+  "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
 ];
 
 /**

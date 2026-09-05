@@ -39,6 +39,7 @@
 
 pub mod authorization;
 pub mod events;
+pub mod island;
 pub mod level;
 pub mod locale;
 pub mod phrase;

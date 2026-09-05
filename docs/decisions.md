@@ -521,3 +521,209 @@ fails to show over a full-screen browser.
   `macOSPrivateApi` for a reason of its own, which would reopen only the transparency clause.
 - **Status / owner:** decided. Owner is the architect; Epic 64, Story 64.4 implements the window,
   Story 64.5 records the limit.
+
+## D-12 — The phone tier is the platform's, not the width's
+
+keeper will render the phone tier — the single-pane stack — on a reduced-capability platform in
+every orientation, size its root by the dynamic viewport, and treat a rotation as a resize; and it
+will **not** choose the tier from the viewport's width on such a platform, or let the desktop
+frame's cookies be written or read there. Recorded here because the width rule was right for
+two years of desktop windows and wrong the first time a phone was turned sideways, and because
+"just add a height breakpoint" is the fix that will be proposed next.
+
+- **What was measured:** `src/hooks/use-shell-layout.ts` decided the phone tier by
+  `(max-width: 767px)` and nothing else. An iPhone 14 Pro Max is 430×932 pt; rotated it is 932
+  wide, so the **desktop tier** rendered at 430 pt tall — a rail, "MENU", a Conversation list
+  column, the desktop pane's header and voice block, the Talk and Send controls clipped at the
+  bottom edge. Reproduced on the simulator, then on the phone rig (`dev/measure-bots.ts --phone`
+  and `--phone-landscape`, hesperia's headless Chrome, iPhone 14 Pro Max metrics, 2026-09-05),
+  the Bots conversation open: before, 430×932 was the phone tier with the transcript 742 of 932
+  px (79.6 %) and 932×430 was the desktop tier with the transcript 48 of 430 px (11.2 %); rotated
+  from upright, the open conversation was gone and the transcript 24 px (5.6 %). After: both
+  orientations are the phone tier, 79.6 % upright and 240 of 430 px (55.8 %) rotated — a 52 px
+  back bar, a 37 px state line, a 102 px composer, the bottom edge at 430, inside the viewport —
+  and rotating either way keeps the same conversation level open
+  (`src/components/layout/app-shell.tsx:304-322`; `dev/measure-bots.ts:52-59`; Epic 65, *What he
+  saw, and what was measured*, 1; commit `26816fb`).
+- **What is built:** `useShellLayout` returns `phone: true` on a reduced-capability platform at
+  every width, and keeps the width rule — below 768 px — only off such a platform, so the desktop
+  dev harness and a narrow Mac window get the stack as they always have
+  (`src/hooks/use-shell-layout.ts:18-23`, `:42`, `:84`; tests
+  `src/hooks/use-shell-layout.test.ts:82-99` and `src/components/layout/app-shell.test.tsx:185`).
+  The root is `h-dvh`, not `h-screen`: on a phone `100vh` is the largest viewport, the one with
+  the browser chrome retracted, so a root sized by it ends below the screen; `100dvh` is the
+  height the viewport has right now and follows a rotation (`app-shell.tsx:296-302`, `:323`).
+  The four cookie hydrations — the sidebar fold, the panel strip, the Files tree, the surface
+  columns — never run on the phone tier, because all four are desktop state, and until this
+  decision the rotated desktop frame wrote them and the phone tier read them back
+  (`app-shell.tsx:138-188`). The platform answer is `useIsReducedCapabilityPlatform`, computed
+  from `CapabilitiesVm` — the same capability that gates every other tier-telling surface
+  (AD-137). (AD-189, AD-195; FR-441…FR-443; Epic 65, Story 65.1)
+- **Why the platform and not a height breakpoint:** a height rule would make the tier flip on
+  the keyboard, on the browser chrome, on a split-screen Mac window, and would still let a
+  landscape phone write desktop cookies for the few frames before it flipped. The phone is a
+  fact about the build, already answered in `CapabilitiesVm` and already the thing that decides
+  what the phone tier lacks (AD-31, AD-137); the width was only ever a proxy for it. Before Rust
+  has answered `capabilities()` the width decides alone — the honest default, because it is
+  what every build rendered until now and it corrects itself the moment the answer lands, where
+  the reverse guess would flash the stack over every desktop window
+  (`use-shell-layout.ts:25-32`).
+- **Why measured in both orientations with the pane's own rig:** the owner's report was a
+  rotation, and jsdom computes no layout, so the rig that measured the Mac's fold (D-10) grew a
+  phone mode that emulates the device, loads the app with `?platform=phone` so the mock shell
+  answers the iPhone's capabilities, measures, rotates the emulated device and measures again
+  (`dev/measure-bots.ts:34-50`; AD-195). A number from a real engine in both orientations is the
+  acceptance; a screenshot is the picture.
+- **What is not decided:** a tablet tier. An iPad rotates too, and at 1024 pt wide the width rule
+  would render the desktop frame on a reduced-capability platform that this decision now calls
+  the phone tier; whether that is right for an iPad is its own decision, recorded as DW-234
+  (Epic 65, *What stays out*).
+- **Revisit triggers:** an iPad build (DW-234); a platform that is reduced in capability and
+  yet wants columns. Neither reopens the first paragraph for the phone.
+- **Status / owner:** decided. Owner is the architect; Epic 65, Story 65.1 implements it.
+
+## D-13 — The switch persists what the person chose, shows what the port did, and keeper re-arms itself
+
+keeper will keep `bots.wake_enabled` as the person's intent, show a refusal at arming time
+beside the switch as a refusal with its reason and remedy, and arm the phrase again — without
+being asked — when the refusal clears; and it will **not** persist a "no" the person did not
+say, or retry a port that still refuses. Recorded here because the first phone build saved
+"no" silently and nobody could tell, because the fix needed a core defect found only by the
+re-arm test, and because "if it failed, turn the switch off" is the tidy-looking rule that
+will be proposed again.
+
+- **What was wrong:** `bot-voice-wake.tsx` wrote `voiceWakeSet(enabled && unavailable === null)`,
+  so toggling on while the port refused — a Polish system language with no on-device asset, a
+  microphone not yet granted — persisted OFF and rendered the switch off; nothing re-armed when
+  the refusal cleared, and a grant given through the switch did not clear the stale sentence.
+  The phrase on the owner's phone was never armed (Epic 65, *What he saw, and what was
+  measured*, 2; `src/components/bots/bot-voice-wake.tsx:51-60`, which records the old rule).
+- **What is built:** the switch writes what the person chose, whatever the port answered
+  (`voice_ipc.rs:532-533` persists the phrase and the intent before arming; `bot-voice-wake.tsx:
+  221-236`); a refusal is rendered beside the switch — the availability sentence, or the turn's
+  own `failed` reason when the probe did not predict it — with the switch on
+  (`bot-voice-wake.tsx:350-366`; the refusal is also pushed to the phone's record,
+  `voice_ipc.rs:508`). The rule "arm again now?" is one pure function in the core,
+  `keeper_core::voice::should_rearm(intent, armed, refusal_cleared)`: never with the intent off,
+  never while `Turn::armed` already holds, never while the port still refuses
+  (`keeper-core/src/voice/mod.rs:576-589`; `Turn::armed`, `:386-395`). The shell gathers the
+  three facts — the registry's `bots.wake_enabled`, the turn, the port's availability — in
+  `rearm_locked` (`src-tauri/crates/keeper/src/voice_ipc.rs:586-593`) and runs it on a grant
+  (`voice_authorize`), on a language change that makes the locale capable (`voice_locale_set`),
+  on keeper coming back in front (`RunEvent::Resumed` on the phone, the main window's focus on
+  the desktop — `lib.rs:1372`, `:1539-1540`, through `voice_ipc::voice_rearm`, `voice_ipc.rs:601-611`)
+  and on the port's own resume. On the phone's face the setting, the refusal's first clause and
+  the live state are one caption above the composer (`src/components/bots/bots-phone-pane.tsx:
+  38-44`, `:169-191`; the desktop's equivalent is D-10's folded line). (AD-190, AD-191;
+  FR-444…FR-447; Epic 65, Story 65.2)
+- **The core defect the frontend fix alone would not have reached:** `Turn::set_wake` from
+  `Failed` recorded the phrase and opened nothing — the arm after a refusal left the turn in
+  `Failed` with the device released, so every later toggle was inert however the switch was
+  drawn. `set_wake` now treats `Failed` as `Idle` with a reason attached: set moves to `Idle`
+  and opens the device, clear moves to `Idle` and releases it, and the stale reason goes with
+  either (`keeper-core/src/voice/mod.rs:397-421`). The proof is by mutation: reverting that
+  line fails `voice_driver_rearms_from_a_refusal_once_it_clears`
+  (`keeper-core/tests/voice_turn.rs:1099-1159` — refused arm leaves `Failed` with the intent
+  kept and `armed()` false; `should_rearm` says no while refused and yes once cleared; the
+  second arm yields `OpenMicrophone`, `Idle`, `armed()` true, and a third foreground changes
+  nothing), which the wave A commit `26816fb` records as run. The companion
+  `voice_driver_clearing_the_phrase_from_a_refusal_rests_idle` (`:1164`) pins the other half.
+- **Why intent and not outcome:** the switch is the one place the person says what they want,
+  and a port's refusal is a fact about the device now — a language not yet downloaded, a
+  permission not yet given — that the person is about to change. A switch that flips itself off
+  turns the person's "yes" into a "no" they have to notice and repeat, after doing the very
+  thing keeper asked of them. Absence, never a dead control (AD-27) cuts the same way: a switch
+  drawn on while nothing listens must say why beside itself, and it does.
+- **Why never re-arm while the port still refuses:** a refusal retried on every foreground
+  would be a loop — the port that refused would refuse again — which is the reason the turn's
+  own end never re-arms from `Failed` (`mod.rs:308-311`;
+  `voice_driver_does_not_rearm_after_failure_because_the_port_would_refuse_again`,
+  `voice_turn.rs:507`). The third argument to `should_rearm` is what keeps the two rules from
+  contradicting each other.
+- **Revisit triggers:** a refusal that clears without any of the four triggers firing (none is
+  known: a grant, a language, a foreground and a resume are the four ways a refusal ends);
+  a platform where availability cannot be probed cheaply enough to ask on every foreground.
+  Neither reopens the first paragraph.
+- **Status / owner:** decided. Owner is the architect; Epic 65, Story 65.2 implements it.
+
+## D-14 — The island is Swift, because Swift is the only door; the free team's costs are paid knowingly
+
+keeper will show its name and its ear's state — armed, listening, heard, speaking — in the
+Dynamic Island and on the Lock Screen through a Live Activity, built as the first Swift in the
+repository: a `@_cdecl` bridge in the app target and a widget-extension target with the four
+presentations; and it will **not** push-update it, will **not** take an App Group for it, and
+will **not** claim it works on a free Personal Team until the extension has signed, installed
+and been photographed on kalypso. Recorded here because "no Swift in this repo" was a real
+discipline until now, because the decision rests on a fact about ActivityKit that is easy to
+re-litigate, and because each free-team cost will be rediscovered the next time a profile
+lapses.
+
+- **What the owner has today, and why it is not enough:** the orange dot. It is the system's
+  privacy indicator, driven by microphone use and not by keeper; it says *some* app holds the
+  microphone, it never appears on the Lock Screen, Apple names the app only in Control Center,
+  and no tap on it opens keeper. Voice Memos gets its name in the island because Apple's app
+  ships a Live Activity, not because it records (Apple Support 108331,
+  `https://support.apple.com/en-us/108331`; Apple, *View Live Activities in the Dynamic
+  Island*; both read 2026-09-05; Epic 65 research, §4; DW-222).
+- **The fact the shape rests on:** ActivityKit is Swift-only. `Activity<Attributes>` is a
+  generic Swift class whose symbol is Swift-mangled (`s:11ActivityKit0A0C`) and which has no
+  `@objc` surface, so there is no Objective-C runtime class for `objc2` to message — compare
+  `SFSpeechRecognizer`, `c:objc(cs)SFSpeechRecognizer`, which every voice port reaches that way
+  (Apple, `https://developer.apple.com/documentation/activitykit/activity`, read 2026-09-05).
+  The Rust-only route does not exist; the choice was Swift or nothing.
+- **What is built:** `Sources/keeper/KeeperIsland.swift`, compiled into the app target, exports
+  `keeper_island_start` / `_update` / `_end` / `_free` with `@_cdecl`; `crates/keeper/src/
+  voice_island.rs` (`#[cfg(target_os = "ios")]`) declares them `extern "C"` and calls them from
+  the one hook in `voice_ipc::push`, so the activity is started when the phrase is armed,
+  updated on every turn state, ended on disarm, and — because Apple ends every activity at eight
+  hours — ended and requested again at 7 h 45 m while still armed
+  (`keeper_core::voice::island::RENEW_AFTER`, `keeper-core/src/voice/island.rs:43`); a request
+  refused in the background is recorded once as `island:refused` and retried on
+  `RunEvent::Resumed`. The decisions — the state word, the renewal, the 30 s a failure card
+  lingers (`FAILURE_LINGER`, `:38`) — are the core's, pure and tested on the dev host; the bridge
+  is three audited `#[allow(unsafe_code)]` fns over one `extern "C"` block
+  (`voice_island.rs:182-187`, `:197-238`; `docs/constraints-and-limitations.md`). The extension's
+  deployment target is 16.2, above the app's 16.0, because `ActivityContent` is a 16.2 API; an
+  older phone gets a refusal sentence and nothing else changes
+  (`gen/apple/project.yml:175`; `KeeperIsland.swift:140-141`). `KeeperIsland/KeeperIslandAttributes.swift` is
+  the `ActivityAttributes`, a member of both targets; `KeeperIsland/KeeperIslandLiveActivity.swift`
+  holds the `ActivityConfiguration` with the Lock Screen, compact leading/trailing, minimal and
+  expanded presentations Apple makes mandatory; the `KeeperIsland` target
+  (`com.apple.widgetkit-extension`, `dev.tgorka.keeper.island`) is declared in `project.yml`
+  and embedded by `keeper_iOS`; `NSSupportsLiveActivities` is in `project.yml` and restated in
+  `Info.ios.plist`. The `extern` block compiles on the Linux host and only the Mac link proves
+  it, so the Mac gate is the first compile of every Swift line. (AD-194; FR-453…FR-455, NFR-56;
+  Epic 65, Story 65.5; `docs/ios.md`, *Live Activity*)
+- **Why the app process updates it, and never a push:** `Activity.request(…, pushType: nil)` is
+  accepted and updates from the app need no APNs, no push entitlement and no token (Apple,
+  *Displaying live data with Live Activities*, read 2026-09-05). Push would be a new
+  destination, which AD-196 and `docs/egress.md` refuse, and the free tier cannot hold the push
+  capability anyway (Apple, *Supported capabilities (iOS)*, read 2026-09-05). Recorded as
+  DW-235.
+- **Why no App Group:** Apple's Live Activity guide never mentions one; data flows through
+  ActivityKit, and the shared attributes file is compiled into both targets. An App Group is
+  needed only if the extension read the app's files, which an indicator does not — and the
+  third-party Tauri guidance that says widgets need a paid team is about App Groups, not
+  activities (tauri-plugin-widgets iOS setup, read 2026-09-05; Epic 65 research, §3).
+- **The free team's costs, stated so they are chosen:** a second App ID against the free
+  tier's budget of roughly ten per seven days; a second automatic profile that lapses with the
+  app's every seven days and is re-signed by the same ritual; the four presentations in
+  SwiftUI; the eight-hour end; a foreground-only start, which the arm tap satisfies; and the
+  residual risk that a Personal-Team automatic profile trips
+  `ActivityAuthorizationError.unentitled` — Apple's table says nothing is needed, and the same
+  table mis-predicted Data Protection for this team on 2026-09-03 (`docs/ios.md`, *Signing on
+  a free Personal Team*). No new environment variable: the `KEEPER_IOS_REGISTER_DEVICE=1`
+  build already mints both profiles because the `keeper_iOS` scheme depends on the extension,
+  and the install script prints whether the `.appex` and `NSSupportsLiveActivities` are in the
+  installed bundle. (`docs/ios.md`, *Live Activity*; Epic 65 research, §3 and *Verdict* (b))
+- **The refusal rule:** if the free team refuses to sign the extension, the refusal is measured
+  — the exact xcodebuild sentence, the profile it asked for — and the story ends in a DW row
+  with that measurement, never in a quietly narrowed feature (AD-194). Until the coordinator's
+  install report and the owner's photograph exist, DW-222 stays open and this decision claims
+  a design, not a working island.
+- **Revisit triggers:** Apple exposing ActivityKit to Objective-C (none announced); a paid team,
+  which reopens only the push clause and only under AD-196's egress rule; the free-team
+  refusal measuring true, which reopens the whole shape. None reopens the first paragraph's
+  "Swift where Swift is the only door".
+- **Status / owner:** decided. Owner is the architect; Epic 65, Story 65.5 implements it; the
+  hardware proof is Story 65.6's gate.

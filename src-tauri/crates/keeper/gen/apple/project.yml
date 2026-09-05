@@ -36,6 +36,12 @@ targets:
         buildPhase: resources
         type: folder
       - path: LaunchScreen.storyboard
+      # The island (Story 65.5): the one file both targets compile. ActivityKit
+      # matches the app's request to the extension's card by this type, so the
+      # SAME file is listed here and under KeeperIsland's `sources` (a Target
+      # Source may be one file; ProjectSpec.md, "Sources"). `Sources/keeper/
+      # KeeperIsland.swift`, the bridge, is picked up by `Sources` above.
+      - path: KeeperIsland/KeeperIslandAttributes.swift
     info:
       path: keeper_iOS/Info.plist
       properties:
@@ -81,6 +87,12 @@ targets:
         # time it is armed. This build is a Personal-Team sideload, never App Store, so
         # Guideline 2.5.4 is not a gate here — docs/ios.md.
         UIBackgroundModes: [audio]
+        # The island (Epic 65, Story 65.5, AD-194): without this key
+        # `Activity.request` throws `unsupported` and the lock screen shows nothing
+        # of keeper's. Duplicated in crates/keeper/Info.ios.plist for the same
+        # reason as the two sentences above — the build's plist merge is the last
+        # word, and install-ios.sh reads the key off the installed bundle.
+        NSSupportsLiveActivities: true
     entitlements:
       path: keeper_iOS/keeper_iOS.entitlements
       # Source of truth for the entitlements (Story 14.7, FR-65): XcodeGen REGENERATES
@@ -126,6 +138,16 @@ targets:
       # after editing — project.pbxproj must list them too, and once did not.
       - sdk: Speech.framework
       - sdk: AVFAudio.framework
+      # The island (Story 65.5): `Sources/keeper/KeeperIsland.swift` imports
+      # ActivityKit, and Swift autolinks what it imports, so this line is the
+      # discipline of the two above rather than a necessity — the framework is
+      # named where every other one is, and `otool -L` on the bundle proves it.
+      - sdk: ActivityKit.framework
+      # The widget extension that draws the Live Activity, embedded under
+      # PlugIns/ (XcodeGen's `embed` defaults to true on an application target;
+      # ProjectSpec.md, "Dependency"). Its shared attributes file is compiled
+      # into this target through `sources` above.
+      - target: KeeperIsland
     preBuildScripts:
       - script: bun tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
         name: Build Rust Code
@@ -133,3 +155,55 @@ targets:
         outputFiles:
           - $(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a
           - $(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a
+  # The island (Epic 65, Story 65.5, AD-194): the widget extension that draws
+  # keeper's Live Activity in the Dynamic Island and on the lock screen. A
+  # WidgetKit extension with no widgets — Apple's only door to a Live Activity
+  # — so `NSExtensionPointIdentifier` is WidgetKit's. Its own bundle id, so on a
+  # free Personal Team it is a second App ID (one of the ten a week) with its
+  # own automatic profile that lapses with the app's (docs/ios.md). It declares
+  # no entitlements: install-ios.sh's free-team strip has nothing to remove
+  # here and must find no CODE_SIGN_ENTITLEMENTS afterwards. Deployment target
+  # 16.2, above the app's 16.0: `ActivityContent` and `Activity.request(
+  # attributes:content:pushType:)` are 16.2, and an older phone loads the app
+  # without the extension. `SWIFT_VERSION` comes from XcodeGen's base preset
+  # (5.0), the same one the app target gets. No scheme: it is built through the
+  # app's. Regenerate with `xcodegen generate` after editing, and check
+  # project.pbxproj lists `KeeperIsland.appex` under Embed Foundation Extensions.
+  KeeperIsland:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.2"
+    sources:
+      - path: KeeperIsland
+    info:
+      path: KeeperIsland/Info.plist
+      properties:
+        CFBundleDisplayName: keeper
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "0.1.0"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.tgorka.keeper.island
+        # The team, without committing it (AD-32). tauri-cli writes
+        # DEVELOPMENT_TEAM into the APP target's pbxproj configurations from
+        # APPLE_DEVELOPMENT_TEAM at build time and touches no other target, so
+        # the first install with this extension died at "Signing for
+        # KeeperIsland requires a development team" (hesperia, 2026-09-05).
+        # xcodebuild exposes its environment as build settings, and
+        # scripts/install-ios.sh exports APPLE_DEVELOPMENT_TEAM inside the
+        # dispatched build, so this resolves there; a plain Xcode run without
+        # the variable will ask for a team in Signing & Capabilities, which is
+        # the honest outcome for a project that stores none.
+        DEVELOPMENT_TEAM: $(APPLE_DEVELOPMENT_TEAM)
+        CODE_SIGN_STYLE: Automatic
+        ARCHS: [arm64]
+        EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+        # An extension is a product of the app's archive, never its own
+        # (Xcode's own extension template sets this).
+        SKIP_INSTALL: true
+    dependencies:
+      - sdk: SwiftUI.framework
+      - sdk: WidgetKit.framework
+      - sdk: ActivityKit.framework
