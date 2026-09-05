@@ -1229,6 +1229,14 @@ development_status:
   64-4-a-pill-that-shows-it-hears: backlog
   64-5-the-record-and-the-gates: backlog
 
+# Epic 65 (`epic-65-a-phone-that-keeps-its-shape-and-says-what-its-ear-is-doing.md`).
+  65-1-a-phone-that-keeps-its-shape: backlog
+  65-2-a-switch-that-tells-the-truth-and-re-arms-itself: backlog
+  65-3-what-the-port-did-on-the-phone: backlog
+  65-4-listening-that-survives-the-background-measured: backlog
+  65-5-a-glance-from-the-island: backlog
+  65-6-the-record-and-the-gates: backlog
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
