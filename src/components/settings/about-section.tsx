@@ -63,9 +63,11 @@ export function debugModeSentence(logPath: string | null): string {
 /**
  * The eight honesty lines of the reduced-platform (phone tier) "On this iPhone"
  * disclosure (Story 13.7; rewritten by Epic 66, Story 66.6, AD-204, after the
- * phone gained the folder). Project voice: sentence case, no exclamation marks,
- * honest consequence-naming. Each names a fact a person can act on: what the
- * phone does differently, and what stays on the Mac (AD-201, AD-203).
+ * phone gained the folder; the first and seventh lines by Epic 67, Story 67.4,
+ * AD-210, once a spoken turn finished with the screen locked). Project voice:
+ * sentence case, no exclamation marks, honest consequence-naming. Each names a
+ * fact a person can act on: what the phone does differently, and what stays on
+ * the Mac (AD-201, AD-203).
  *
  * Mirrored one-to-one into the Limitations list of `docs/ios.md`, which the
  * disclosure links to; `about-section.test.tsx` reads that file from disk and
@@ -75,16 +77,18 @@ export function debugModeSentence(logPath: string | null): string {
  * sentence read here before switching listening on is the sentence shown
  * beside the switch. The third line's fact is `phone_divergence_sentence` in
  * `keeper-sync/src/engine.rs` (AD-199), worded for a list rather than a status
- * row.
+ * row. The first line's exception is `NO_BACKGROUND_SYNC_SENTENCE`'s last
+ * sentence (AD-207), in the list's voice: the message half stays scoped to
+ * messages, because a voice banner would otherwise contradict it.
  */
 export const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
-  "keeper syncs and notifies only while it's open; background notifications await a future decision.",
+  "keeper syncs and notifies about messages only while it's open; background notifications await a future decision. A voice session you left listening is the exception: it answers with the screen locked and posts what it heard as a banner from this phone.",
   "A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.",
   "Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.",
   "Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.",
   "What stays on your Mac: the self-hosted bridge runner, the sessions board, tasks, screen recording and the global summon hotkey; Bots talks to a model here, but the drive tools live on your Mac.",
   "Updates arrive by reinstalling keeper; its signature renews every 7 days.",
-  "Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.",
+  'Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying "stop" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.',
   "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
 ];
 

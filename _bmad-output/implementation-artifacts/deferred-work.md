@@ -3509,6 +3509,21 @@ note: 2026-09-05, epic 65, story 65.5 (built), story 65.6 (recorded) — the Liv
   exact signing refusal, which becomes its own DW row per AD-194); then, with the phrase armed
   on kalypso, a photograph or screen recording of the island showing keeper's state and the
   Lock Screen its card, and the card gone after disarming. Record both here and flip to done.
+note: 2026-09-05, epic 67, story 67.2 (built), story 67.4 (re-scoped) — the lock screen no
+  longer waits on this row. Every build now says what keeper heard and answered there
+  through a local notification with one fixed identifier, replaced in place — "Heard: …",
+  "Thinking", "Answering", "Answer: …", "Listening stopped: …" — posted only while
+  `UIApplication.applicationState` is not active and cleared when the turn ends or keeper
+  comes to front (`crates/keeper/src/voice_notify.rs`, `keeper-core/src/voice/banner.rs`;
+  AD-207; `docs/ios.md` *A turn that finishes without the screen*; `docs/decisions.md`
+  D-17). It needs no extension, no second App ID and nothing the free team lacks. What this
+  row still owes is the *richer* surface — a keeper-owned state word in the Dynamic Island
+  and a card that says "armed" before anything has been heard, which a notification cannot
+  be — and what closes it is unchanged in kind and smaller in scope: an Apple ID in
+  hesperia's Xcode so the extension's profile can be minted (the second App ID), the
+  `install-ios.sh` proofs showing the `.appex` in the installed bundle, and a photograph of
+  the island showing keeper's state with the phrase armed on kalypso. The banner is not a
+  reason to skip that; it is the reason the wait costs nothing.
 
 ### DW-223: A files-pane restore test that only fails on the CI runner.
 
@@ -3993,6 +4008,134 @@ reason: The trash target is chosen by "macOS or not", and iOS is "not", so delet
   file back, or a refusal sentence for delete on the phone ("this is a phone: there is no
   trash to put this in — delete it on the Mac"). Either way the choice is a `SyncPlatform`
   fact, not an `if cfg!(target_os = "macos")`.
+status: open
+
+### DW-243: Whether the phone hears its own answer is not yet measured.
+
+origin: epic 67, AD-209, story 67.3 (built), story 67.4 (recorded), 2026-09-05
+location: `crates/keeper/src/voice_ios.rs:221` (`TAIL_GATE`, 800 ms), `:855-867`
+  (`speech_over` — the gate opens before the speaking flag drops), `:1139-1143` (the drop and
+  the `echo_dropped` row), `:1458-1459` and `:1478-1479` (`AVAudioSessionModeVoiceChat`, set
+  explicitly), `:1185-1188` / `:1197-1200` (`defaultToSpeaker` kept), `keeper-core/src/voice/events.rs:69`,
+  `docs/ios.md` *A turn that finishes without the screen* ("What the run on kalypso must show")
+reason: The session mode was written as `.default` and was never the mode in force (voice
+  processing sets `voiceChat` implicitly), and a 2026 field report measures `.default` +
+  `defaultToSpeaker` as the pair that silently defeats echo cancellation; keeper now sets
+  `voiceChat` on purpose and, for 800 ms after every utterance ends, drops every transcript
+  and records it in the ring as `echo_dropped` with the words. That makes the question
+  answerable and does not answer it: nothing has run on hardware. Open until a run on kalypso
+  with the screen locked, the phrase, a question and an answer of several sentences is read
+  back from Settings → Bots → *What the voice port did*. Three readings, each with its
+  consequence: no `echo_dropped` between `spoken` and `turn:idle` — the phone does not hear
+  itself, and the gate is a belt over braces that costs a person 800 ms of silence after every
+  answer (record the reading, keep the gate, close); `echo_dropped` rows carrying the answer's
+  last words — the phone hears its tail and the gate is the measure that catches it (record
+  the words and how many rows; if a row is more than the last clause of the answer the gate is
+  too short and `TAIL_GATE` is retuned from that number, not guessed); a `stop_matched` or a
+  `turn:listening` immediately after `spoken` with no `echo_dropped` and nobody having spoken —
+  the tail leaks *inside* the utterance, which the gate cannot see, and the fix is on the
+  capture side (the voice-processing tap, `setVoiceProcessingEnabled`, or a second gate that
+  ignores transcripts while `isSpeaking`), which is its own row. What closes this one is the
+  reading, written here with the ring rows verbatim.
+status: open
+
+### DW-244: With several bots pinned and none chosen, a spoken question goes to whichever was talked to last — and with none ever talked to, a locked phone stops listening.
+
+origin: epic 67, AD-206, story 67.1 (built), story 67.4 (recorded), 2026-09-05
+location: `keeper-core/src/bots/voice_target.rs:77-101` (`resolve`: the chosen pinned bot,
+  else the newest conversation whose bot is still pinned, else `NoTarget`), `:32`
+  (`NO_TARGET_SENTENCE`), `crates/keeper/src/bots_ipc.rs:1389-1396` (`spoken_target`, over
+  `session::list_sessions(dir, false)` — newest activity first), `crates/keeper/src/voice_ipc.rs:312-317`
+  (`answer_failed` → ring `refused` + `TurnEvent::Failed`), `src/components/bots/bot-voice-target.tsx:29-34`
+  ("Speak to", "Most recently talked to"), `docs/decisions.md` D-17 (the costs)
+reason: `bots.voice_target` unset is not an error — it is the stated rule "the pinned bot most
+  recently talked to", and the picker shows it as its own option — but the rule has a shape a
+  person will meet: the newest conversation in the list is whichever bot was *typed to* last
+  on either device, since the list is shared through the folder and Hermes sessions, so a
+  question spoken in the car goes to the bot somebody was testing on the Mac ten minutes ago,
+  and the answer lands in that conversation. Nothing on the phone says which bot is about to
+  answer before the phrase is spoken; the "Heard: …" banner names the words, not the bot. And
+  the rule's empty case is worse than a wrong bot: with pinned bots and no conversation on any
+  of them, the turn is refused with "Nothing to talk to yet: choose a bot to talk to under
+  Bots." — correct in front, where the sentence is beside the switch — but on a locked phone
+  the refusal leaves the turn in `Failed`, the phrase is re-armed only on the next foreground
+  (D-13, `voice_rearm` on `RunEvent::Resumed`), and listening is over until keeper is opened;
+  the only trace is the "Listening stopped: Nothing to talk to yet…" banner, which stays until
+  then. Two decisions, both small and neither taken here: (1) whether an unset target with
+  more than one pinned bot should be *refused* at arming time rather than resolved at three in
+  the morning — the switch already refuses for a missing locale, and "choose who to speak to
+  under Bots" is the same kind of sentence; (2) whether a no-target refusal on a hands-free
+  turn should re-arm the phrase at once (the sentence survives in the ring and on the lock
+  screen) instead of on the next foreground — Story 67.1's report raises exactly this and kept
+  the foreground rule so the snapshot is not erased before anyone reads it. Take (1) first;
+  it removes the case (2) is about.
+status: open
+
+### DW-245: The default stop word is "stop" in every locale, and a recogniser that writes another script never spells it that way.
+
+origin: epic 67, AD-208 and *What stays out* ("'stop' is a word in every listening locale
+  keeper offers"), story 67.3 (built), story 67.4 (found, recorded), 2026-09-05
+location: `keeper-core/src/voice/mod.rs:70` (`DEFAULT_STOP_PHRASE = "stop"`), `keeper-core/src/voice/phrase.rs:154-167`
+  (`matches`: whole-word containment after `normalise`), `:184-214` (`normalise` folds case
+  and strips combining marks; every alphanumeric char of every script survives as itself),
+  `crates/keeper/src/voice_ios.rs:1382` (`on_device_locales` — the listening locales are
+  whatever `SFSpeechRecognizer.supportedLocales()` supports on-device, not a keeper list),
+  `crates/keeper/src/voice_ipc.rs:519-540` (the stored word read at boot),
+  `src/components/bots/bot-voice-wake.tsx:114-118` (the "Stop word" box)
+reason: keeper offers no locale list of its own: the choice is the phone's on-device set,
+  which on a current iPhone includes Japanese, Korean, Mandarin and Cantonese, Russian,
+  Ukrainian, Arabic, Hebrew, Greek and Thai beside the Latin-script locales. Apple's
+  recogniser for those writes its own script — "ストップ", "стоп", "스톱", "停" — and
+  `normalise` keeps those letters as they are, so the transcript never contains the four
+  Latin letters "stop" and the default word never matches; even in a Latin locale the
+  recogniser's own spelling can differ ("Stopp" in de-DE is not the whole word "stop").
+  The setting exists and works — `parse_stop` accepts any script with three or more letters
+  (`is_alphanumeric`), and `voice_turn_matches_a_polish_stop_phrase` proves a non-default
+  word — so the defect is the default and the silence around it: a person listening in
+  ja-JP has no working stop word until they type one, and nothing tells them. The epic's
+  claim that "stop" is a word in every listening locale is true of the locales the owner
+  uses (pl-PL, en-*) and not of the set the phone offers. Two remedies, the first enough:
+  a per-locale default table in core beside `DEFAULT_STOP_PHRASE` (`stop` for Latin-script
+  locales, `стоп` for ru/uk, `ストップ` for ja, `정지` or `그만` for ko, `停` for zh — each
+  chosen with a native speaker, not guessed here), chosen by `bots.voice_locale`'s language
+  when `bots.stop_phrase` is unset; and, cheaper, the "Stop word" note naming the rule
+  ("matched as the recogniser spells it — in your listening language"). Which of keeper's
+  locales: none of keeper's, because keeper has none; every non-Latin on-device locale of the
+  phone's.
+status: open
+
+### DW-246: A media-services reset mid-answer ends the speech without telling the turn.
+
+origin: epic 67, story 67.3 (the deferred `Silence`), story 67.4 (found while reading
+  `settle_silence`, recorded), 2026-09-05; the gap predates epic 67
+location: `crates/keeper/src/voice_ios.rs:1033-1045` (`AudioNotice::MediaReset` — the
+  synthesiser is dropped and `speech_over` is called, no `Silence` is sunk), `:855-867`
+  (`speech_over` clears `silence_due`), `:1081-1096` (`watch_speech_end`, the one place that
+  owes a `Silence`, which returns at once because `speaking_since` is already `None`),
+  `:988-1001` (the interruption arm, which *does* sink `Silence` — the shape the reset arm
+  should have), `keeper-core/src/voice/turn.rs:215-216` (`Speaking` leaves only on
+  `Silence`, `StopHeard`, `SpeechDetected`, `Abandoned`, `Failed`)
+reason: Story 67.4 was asked whether a `Silence` owed during the tail gate could fail to
+  settle if the worker's tick stopped. It cannot: the worker loop ticks after every command
+  and every 250 ms timeout and leaves only when its command channel disconnects
+  (`voice_ios.rs:552-614`), which is the port being dropped, and a dropped port owes no
+  turn anything; the only other writer that clears `silence_due` is `speech_over` through
+  `stop_speaking`, which the turn sends after it has already left `Speaking`. The read did
+  find the neighbour: a `AVAudioSessionMediaServicesWereResetNotification` while an answer
+  is being spoken throws the synthesiser away and calls `speech_over`, which drops the
+  flag and any owed `Silence`, and nothing sinks one — before epic 67 the same arm relied on
+  `watch_speech_end`, which had already been disarmed by `speaking_since = None`, so the gap
+  is old and the deferred `Silence` only makes it legible. The turn stays `Speaking`; the
+  capture `resume()` rebuilds keeps transcribing (iOS is full duplex), but with the flag
+  down its transcripts are `PartialHeard`/`FinalHeard`, which `Speaking` ignores
+  (`turn.rs:216`), the wake phrase is matched only in `Idle`, and listening is over until
+  the person presses Stop (`Abandoned`) or turns the switch off and on — the foreground
+  re-arm does not fire, because `Turn::armed` is true in any non-idle state
+  (`voice/mod.rs:418-421`, `voice_ipc.rs:703-710`). Rare — a media-services
+  reset is `mediaserverd` dying — and the fix is one line in the reset arm, `(self.sink)(TurnEvent::Silence)`
+  when `speaking_since` was `Some`, mirroring `:996-1001`, with a test through the
+  worker's `on_audio` if one can be written without the frameworks (the interruption arm
+  has none either). Record on the same pass that adds one.
 status: open
 
 - source_spec: none

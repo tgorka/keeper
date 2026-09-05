@@ -729,15 +729,16 @@ gate dropped, the git-ok gate kept on the desktop), and the phone parts of
 On a free Personal Team, keeper on iPhone is deliberately narrower than the desktop
 build. These are the same eight points keeper shows in-app under **Settings → About →
 "On this iPhone"** (rewritten by Epic 66, Story 66.6, AD-204, when the phone gained the
-folder):
+folder; the first and seventh by Epic 67, Story 67.4, AD-210, when a spoken turn learned
+to finish with the screen locked):
 
-- keeper syncs and notifies only while it's open; background notifications await a future decision.
+- keeper syncs and notifies about messages only while it's open; background notifications await a future decision. A voice session you left listening is the exception: it answers with the screen locked and posts what it heard as a banner from this phone.
 - A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.
 - Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.
 - Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.
 - What stays on your Mac: the self-hosted bridge runner, the sessions board, tasks, screen recording and the global summon hotkey; Bots talks to a model here, but the drive tools live on your Mac.
 - Updates arrive by reinstalling keeper; its signature renews every 7 days.
-- Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.
+- Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; the answer is spoken there too, and saying "stop" (or the stop word you chose) ends it. Speech is recognised on this phone and never sent to a server.
 - Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.
 
 > This list is mirrored from `IOS_DISCLOSURE_LINES` in
@@ -746,14 +747,22 @@ folder):
 > Edit both together or neither; `about-section.test.tsx` reads this list from disk
 > and fails when they differ.
 
-On the first item, the canonical in-app wording spells out the sync consequence:
-"On iPhone, keeper syncs and notifies only while open. Close it and messages wait on
-your homeserver until you return — nothing is lost, and nothing here pretends to be
-push." The app-icon badge follows the same honesty: "The app-icon badge is not a live
-count while keeper is closed; it reflects what keeper knew when it was last open."
+On the first item, the canonical in-app wording spells out the sync consequence and its
+one exception (`NO_BACKGROUND_SYNC_SENTENCE`,
+`src/components/settings/no-background-sync-disclosure.tsx:30-35`): "On iPhone, keeper
+syncs and notifies about messages only while open. Close it and messages wait on your
+homeserver until you return — nothing is lost, and nothing here pretends to be push. A
+voice session you left listening is the one exception: it keeps listening with keeper
+behind other apps or the screen locked, and posts what it heard and answered as a local
+banner from this phone." The app-icon badge follows the same honesty: "The app-icon badge
+is not a live count while keeper is closed; it reflects what keeper knew when it was last
+open."
 
 The "future decision" the first item names is recorded in [decisions.md](decisions.md) D-1 —
-the deferred paid Apple Developer Program that would unlock APNs push and the NSE.
+the deferred paid Apple Developer Program that would unlock APNs push and the NSE. The
+exception is not push and needs none of that: it is a local notification the app posts
+from its own process, and [A turn that finishes without the screen](#a-turn-that-finishes-without-the-screen)
+below is what it is made of.
 
 The second and third items are [The folder on the phone](#the-folder-on-the-phone)
 above, Epic 66 (AD-198, AD-199; D-15). "Mirrors a remote your Mac already syncs" is the
@@ -820,7 +829,14 @@ the whole of an armed session. Recognition is on-device only — a locale whose 
 not on the phone gets a sentence naming the language to download, never a server round
 trip — because `egress.md` names every destination keeper contacts and Apple's speech
 servers are not on it. The full reasoning, including why this is possible on the phone
-while voice stays deferred on the Mac, is [decisions.md](decisions.md) D-5.
+while voice stays deferred on the Mac, is [decisions.md](decisions.md) D-5. *The answer
+is spoken there too, and saying "stop" ends it* is Epic 67: until it, the send and the
+speak were the webview's, and a webview with the screen locked does not run, so the turn
+heard the question and waited for somebody to open keeper. Now the turn is Rust's from
+the phrase to the last word, the lock screen shows what it heard, and the stop word ends
+an answer — [A turn that finishes without the screen](#a-turn-that-finishes-without-the-screen)
+below, and [decisions.md](decisions.md) D-17. The stop word is `bots.stop_phrase`,
+"stop" by default, shown beside the wake phrase on both tiers.
 
 The eighth item is, byte for byte, the limits sentence the port shows beside the
 switch — `VoicePlatform::IOS.limits`, `keeper-core/src/voice/platform.rs:82` — rewritten
@@ -978,6 +994,184 @@ documented Tauri precedent for a Live Activity reports it working under `tauri i
 build` and not under `tauri ios dev` (tauri-apps discussion #14555, read 2026-09-05),
 which the scripted path — a `build` — sidesteps rather than answers.
 
+### A turn that finishes without the screen
+
+Epics 62 to 65 designed the hands-free turn with the screen as a participant, and nobody
+noticed, because on the Mac the screen is always there. The owner noticed on kalypso:
+with the phrase armed and keeper behind Maps or the lock screen, the phone heard the
+question and then waited for somebody to open keeper (Epic 67, *What was measured*, 1;
+[decisions.md](decisions.md) D-17). This section is what changed, what each part is
+made of, and what the run on the phone must show — written before that run, so every
+sentence about hardware below is a prediction until the ring says otherwise.
+
+**Why the turn was the webview's.** Before Epic 67, `keeper_core::voice::Turn::perform`
+treated `Effect::SendText` as nothing to do (`voice/mod.rs:561` at the time) and the
+send was the pane's: `BotVoiceMic`'s `onHeard` → `botsChatSend`
+(`bot-voice-mic.tsx:135-146`, `bots-phone-pane.tsx:587-594`), and the speak was the
+pane's reaction to the stream's `closed` event (`speakIfHeard`, `bot-voice-mic.tsx:116-124`,
+called from `bots-pane.tsx:181-183`). On the phone that JavaScript ran only while a Bots
+conversation was the pushed level (`phone-shell.tsx:990-1009`, unmounted at `:229-231`),
+and WebKit keeps a WebContent process runnable only for a visible view, a page that
+itself plays audio, or a page that itself captures (`WebPageProxy.cpp:3823-3893`).
+keeper's audio is native — `AVAudioEngine` and `AVSpeechSynthesizer` in the app process
+— so the page qualified for none of the three, and with the screen locked the turn
+parked in `Heard` until the webview ran again. Speech itself was never the problem:
+the session is `.playAndRecord`, activated while the phrase is armed, and Apple says the
+synthesiser "obeys the same rules as other audio" — it had simply never been reached
+from the background (Epic 67, *What was measured*, 2).
+
+**What is Rust's now (AD-205, Story 67.1).** The port's result handler sinks
+`FinalHeard` into `voice_ipc::transition` (`crates/keeper/src/voice_ipc.rs:267`), which
+drives the turn: the phrase match takes `Idle` to `Listening`, the next final transcript
+is `Heard { text }` with `[SendText(text)]` (`keeper-core/src/voice/turn.rs:222-235`).
+`transition` finds the `SendText` in the effects it just drove and spawns
+`bots_ipc::send_spoken(&app, text)` on the runtime with the voice lock released
+(`voice_ipc.rs:278-291`). `send_spoken` (`crates/keeper/src/bots_ipc.rs:1330`) resolves
+the target (`spoken_request` `:1363`, `spoken_target` `:1389`), opens a Rust
+`Channel` whose sink re-emits every `BotStreamEvent` as the app event
+`keeper://bots-spoken-stream` (`SPOKEN_STREAM_EVENT`, `:1312`, `:1341-1354`), and runs
+`open_turn` (`:1224`) — the former body of `bots_chat_send`, so there is one stream code
+path. The driver marks the turn sent at its first byte (`drive` `:1723`, `note_sent`
+`:1738` → `Sending`) and answering at the first token (`note_answer_chunk` `:1760`), and
+the stream's close (`close` `:1881`) hands the whole answer to
+`voice_ipc::answer_complete` (`:1921` → `voice_ipc.rs:300`), a stop to `answer_stopped`
+(`:1922` → `:324`) and a failure to `answer_failed` (`:1923`, `close_failed` `:1943` →
+`:312`). `answer_complete` drives `AnswerDone`, which is `Speaking` with `[Speak(text)]`
+(`turn.rs:238-244`), and `perform` hands the text to the port's synthesiser. No webview
+is anywhere in that loop. The pane observes: `listenSpokenStream`
+(`src/lib/ipc/client.ts:7405`) → `useSpokenStream` (`src/hooks/use-spoken-stream.ts:25`)
+→ the pane's own `onStreamEvent` (`bots-pane.tsx:259`, `bots-phone-pane.tsx:339`), so the
+conversation on screen shows the heard text and the answer as before; `speakIfHeard`,
+the `onHeard` hand-off and the `voice_speak` command are gone, and
+`src/test/voice-capability.test.ts` pins that no voice component sends a message or
+reads an answer aloud. A button-started turn takes the same path — the transcript no
+longer lands in the composer to be checked first (`BotComposer.heard` is gone; the
+status reads "Heard — sending it", `bot-voice-mic.tsx:82`), because Rust cannot know a
+turn's origin once it performs the send and the epic asked for one turn, not two.
+
+**The voice target (AD-206).** A spoken question goes to `bots.voice_target` — the bot
+picked under "Speak to" in the voice section on both tiers (`bot-voice-target.tsx:29`,
+mounted in `bot-voice-wake.tsx:398`) — and to that bot's newest conversation, or a new
+one; unset, or naming a bot no longer pinned, it goes to the pinned bot most recently
+talked to, in the conversation list's own order; and with neither it is refused
+(`keeper-core/src/bots/voice_target.rs:77-101`) with one sentence, "Nothing to talk to
+yet: choose a bot to talk to under Bots." (`NO_TARGET_SENTENCE`, `:32`), which reaches
+the turn as `Failed { reason }` — beside the switch, on the lock screen as "Listening
+stopped: …", and in the ring as `refused` (`bots_ipc.rs:1337`, `voice_ipc.rs:312-317`).
+The model is the target conversation's last answering model, else the endpoint's first
+listed (`model_for`, `voice_target.rs:110`). Nothing is ever taken from what is open on
+the screen: the picker's note says so ("Where a spoken question goes, whatever is open on
+the screen", `bot-voice-target.tsx:33-34`), and a stream opened by Rust replaces the
+conversation on screen with the target's rather than the other way round.
+
+**The banner (AD-207, Story 67.2).** `crates/keeper/src/voice_notify.rs` is iOS-only and
+is called from the same fan-out as the island (`voice_ipc.rs:409-412`). On every change of
+the island word (`keeper-core/src/voice/island.rs:102-118`), `observe`
+(`voice_notify.rs:116-136`) builds the sentence under the voice lock and queues one job on
+the main thread; there, `UIApplication.sharedApplication.applicationState == Active` is
+the one definition of "in front" (`:169-171`, read through `MainThreadMarker`, `:155`;
+`Inactive` counts as not in front), never the JS lifecycle, which stops running exactly
+when this matters. Not in front, it posts a local notification with the fixed identifier
+`keeper.voice` (`IDENTIFIER`, `:64`), which replaces the delivered one in place, so the
+lock screen shows one line that moves rather than a stack; interruption level `.active`
+(`:179`) lights the screen; no sound, because the answer is the sound. The sentences are
+`keeper_core::voice::banner::sentence` (`banner.rs:50-58`): **Heard** with the transcript,
+**Thinking**, **Answering** (title only, while the first tokens arrive), **Answer** with
+the first sentence of the answer (`first_sentence`, `:76`; a dot inside a number does not
+end it), and **Listening stopped** with the reason; bodies are clipped on a word at 120
+characters (`BODY_LIMIT`, `:31`). Armed, listening and off post nothing (`should_post`,
+`:68-70`). Three things clear it (`clear`, `:196-205`): the turn ending or moving to a
+word that posts nothing, keeper coming to front (`resumed`, `:140-142`, from
+`RunEvent::Resumed`), and nothing else — a `Listening stopped` banner is left on the lock
+screen until keeper is opened, because a reason nobody read is unactionable. Every post
+is a ring row `notified <word>` and every clear `notified cleared` (`:207-210`). It is
+`objc2-user-notifications` directly rather than the notification plugin, because the
+plugin allows only an integer identifier, no interruption level, and would park the
+caller on a channel under the voice lock; every call used is a safe binding, and the
+completion handler is omitted the way the badge's is, so a refusal by the system loses
+its `NSError` text and the ring still says a banner was asked for. No entitlement, no
+App ID, nothing the free team lacks — the island (above) stays the richer surface where
+it can be signed; this is the one every build has.
+
+**The stop word (AD-208, Story 67.3).** `SpeechDetected` now carries its transcript
+(`turn.rs:108`), and `Turn::apply` matches it against `bots.stop_phrase` while the turn is
+`Speaking` (`voice/mod.rs:462-475`): a match becomes `StopHeard`, a core-only event no
+port ever emits (`turn.rs:109-112`), and `(Speaking, StopHeard)` is `Idle` with
+`[StopSpeaking, ReleaseMicrophone]` (`turn.rs:212-214`); because `StopHeard` counts as
+the turn ending (`mod.rs:476-483`), the wake phrase is re-armed on the way out
+(`:485-491`, `OpenMicrophone` pushed after the release — D-13's rule). Any other speech
+mid-answer keeps FR-403's shape, `Listening` with `[StopSpeaking, OpenMicrophone]`
+(`turn.rs:204-210`). The word is `WakePhrase::parse_stop` (`phrase.rs:112-114`): the wake
+phrase's normalisation and word rules with a shorter letter minimum —
+`STOP_MIN_LETTERS = 3` (`:50`) instead of five — because the word people say to stop
+something must be allowed, and a false match costs the rest of an answer rather than an
+open microphone in someone's car (`:14-18`); "stop" by default (`DEFAULT_STOP_PHRASE`,
+`mod.rs:70`), matched whole-word after the same `normalise` (`:154-167` — "Stop." and
+"okay stop now" match, "stopped" and "nonstop" do not). It is read at boot
+(`voice_ipc.rs:519-540`), validated and stored by the same `voice_wake_set` as the wake
+phrase (`:618-628`), and shown beside it as "Stop word" with its own Save on both tiers
+(`bot-voice-wake.tsx:114-118`, `:350-366`). The ring records the match as `stop_matched`
+with the words that matched (`voice_log.rs:61-65`).
+
+**The echo measure (AD-209, Story 67.3).** The session mode is `voiceChat` explicitly —
+set in `configure_session` and again in `set_session_options` (`voice_ios.rs:1458-1459`,
+`:1478-1479`) — with `defaultToSpeaker` kept (`:1185-1188`, `:1197-1200`): Apple
+documents voice processing as setting `voiceChat` implicitly, and a 2026 field report
+measured `.default` + `defaultToSpeaker` as the pair that silently defeats echo
+cancellation, so what the file said before was never the mode in force (`:98-101`).
+After every utterance ends — on its own (`watch_speech_end`, `:1081-1096`) or by a stop
+(`stop_speaking`, `:844-849`) — `speech_over` (`:855-867`) opens a gate of `TAIL_GATE`,
+800 ms (`:221`), *before* the speaking flag comes down, so nothing slips between the two
+as a `PartialHeard`; a transcript that arrives while the flag is down and the gate is open
+is dropped and recorded as `echo_dropped` with its words (`result_handler`,
+`:1139-1143`). The `Silence` the turn is owed for an utterance that ended on its own is
+deferred to the end of the gate (`silence_due`, `:1094`; `settle_silence`, `:903-908`,
+from the worker's 250 ms tick, `:613`), so the request the re-arm opens does not open on
+the tail of the answer. Two things are deliberate and said here so they are not
+discovered: a genuine sentence spoken whole inside the 800 ms after an answer ends is
+dropped with the roll (its words are in the ring as `echo_dropped`, so the loss is
+visible), and an interruption while speaking still reports `Silence` at once
+(`:996-1001`) because the capture is suspended and nothing can be transcribed. A
+`Silence` owed during the gate cannot be lost to the tick stopping: the worker loop
+ticks after every command and every 250 ms timeout and leaves only when its command
+channel disconnects (`:552-614`), which is the port being dropped — no turn is owed
+anything then. What the read did find is DW-246: a media-services reset mid-utterance
+goes through `speech_over` without owing a `Silence` (`:1033-1045`).
+
+**What the run on kalypso must show (AD-210).** Not yet measured as of 2026-09-05; this
+is the prediction the ring is checked against. Phrase armed in keeper, "Speak to" set (or
+a pinned bot already talked to), then the phone locked. Say the phrase and a question;
+keeper posts "Heard: …" on the lock screen within a second, then "Thinking", then
+"Answer: …" as the answer begins to be spoken aloud with the screen still locked; say
+"stop" mid-answer and the speech ends and the phrase works again without opening keeper.
+Afterwards, Settings → Bots → *What the voice port did* must list, newest first, each
+with a timestamp:
+
+1. `wake_matched`, then `turn:listening`;
+2. `turn:heard` with the question as its detail, then `notified heard` — the "Heard: …"
+   banner;
+3. `turn:sending`, then `notified thinking`, then `notified answering` at the first
+   token (the turn state does not change for that, so there is no second `turn:` row);
+4. `turn:speaking` and `spoken` together, then `notified speaking` — the row behind the
+   "Answer: …" banner;
+5. `stop_matched` with the words that matched (for example "Stop."), then `turn:idle`,
+   then `notified cleared` — or, when the answer was let finish, `turn:idle` and
+   `notified cleared` 800–1050 ms after the speech ended, with no `stop_matched`;
+6. `rolled` for the fresh request the re-arm opened;
+7. any `echo_dropped`, each with the words heard, between `spoken` and `turn:idle`.
+
+The `turn:` rows and `wake_matched`, `spoken`, `stop_matched` are written under the voice
+lock in that order; `notified …` rows are written from the main thread and `rolled` and
+`echo_dropped` from the port's worker, so each of those may sit one row off the place
+above. The reading of 7 is the measurement AD-209 exists for: no `echo_dropped` rows
+means the voice-processing path kept the phone's own tail out of its ears; rows carrying
+the answer's last words mean it hears itself and the gate caught it; a `stop_matched` or
+a `turn:listening` right after `spoken` with no `echo_dropped` means the tail leaked
+*inside* the utterance, which the gate cannot see and which is its own DW row. A
+`refused` with "Nothing to talk to yet" in place of 3 means no target was resolved
+(DW-244). Either way, what is recorded in DW-243 is what the ring said, not what this
+section predicts.
+
 ### Reading what the port did
 
 A phone has no console beside it. Settings → Bots on the phone shows **What the voice
@@ -986,10 +1180,12 @@ port did**: the last fifty of a bounded ring of two hundred events the voice por
 `interruption_begun`, `interruption_ended`, `media_reset`, `route_changed` with the
 reason (headphones, a car kit, the speaker), `resumed`, `rolled` (the recogniser's request
 replaced, every 45 s while armed), every turn state as `turn:<state>`, `wake_matched`,
-`spoken`, and the island's own `island:started` / `updated` / `ended` / `refused` with the
-system's refusal as the detail — newest first, each with how long ago (Epic 65, Story
-65.3, AD-192; `keeper-core/src/voice/events.rs:28-68`, `:82-101`;
-`src/components/settings/bots-section.tsx:186-202`, `:233-301`). It is
+`spoken`, `stop_matched` with the words that ended an answer, `echo_dropped` with the
+words the tail gate threw away, `notified` with the lock-screen banner's word or
+`cleared` (Epic 67, AD-208, AD-209, AD-207), and the island's own `island:started` /
+`updated` / `ended` / `refused` with the system's refusal as the detail — newest first,
+each with how long ago (Epic 65, Story 65.3, AD-192; `keeper-core/src/voice/events.rs:32-79`,
+`:86-117`; `src/components/settings/bots-section.tsx:186-202`, `:233-301`). It is
 read on open and every 2 s while open, kept in memory only, and neither written nor sent
 (`egress.md`, *The phone's record and the island add no egress*). It is how every story in
 epic 65 is evidenced on hardware: a refusal at arming appears there with its reason; a

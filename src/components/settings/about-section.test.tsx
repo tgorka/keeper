@@ -389,7 +389,9 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     expect(screen.queryByRole("button", { name: "Check for updates" })).not.toBeInTheDocument();
     // The "On this iPhone" list renders every honesty line.
     expect(screen.getByText("On this iPhone")).toBeInTheDocument();
-    expect(screen.getByText(/syncs and notifies only while it's open/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/syncs and notifies about messages only while it's open/),
+    ).toBeInTheDocument();
     expect(screen.getByText(/mirrors a remote your Mac already syncs/)).toBeInTheDocument();
     expect(screen.getByText(/Nothing is merged on a phone/)).toBeInTheDocument();
     expect(screen.getByText(/the self-hosted bridge runner/)).toBeInTheDocument();

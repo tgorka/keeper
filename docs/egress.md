@@ -165,6 +165,14 @@ reductions are unit-tested beside the git-remote cases in `keeper-core::egress` 
 de-duplicated, ordered after the sync remotes and before the update endpoint, and gone entirely
 when the last provider is removed.
 
+Since Epic 67 (AD-205, AD-211) a *spoken* question reaches this same endpoint from Rust —
+`bots_ipc::send_spoken` runs the one `open_turn` a typed message runs
+(`src-tauri/crates/keeper/src/bots_ipc.rs:1330`, `:1356`), with the same request, the same
+host and nothing new on the wire — and the lock-screen banner that says what was heard is a
+local notification posted by the app process with no trigger and no push
+(`crates/keeper/src/voice_notify.rs:175-193`, `UNUserNotificationCenter` in-process; no APNs,
+no token), so the row above is unchanged and no row is added.
+
 ## Screen recording adds no egress
 
 Screen recording (the macOS recording phase, Epics 16–20) is fully local: the `keeper-rec`

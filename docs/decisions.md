@@ -912,3 +912,142 @@ the client-side fast-forward guard is a rule that looks removable.
   reopens "never a force" or "the credential is a header".
 - **Status / owner:** decided. Owner is the architect; Epic 66, Story 66.5 implements it;
   the hardware proof is Story 66.6's gate.
+
+## D-17 — The turn is Rust's; the screen watches
+
+keeper will finish a hands-free voice turn — the phrase, the question, the send, the
+answer, the speaking, the stop — in the Rust process, with the webview as an observer of
+state it already streams and never as a participant; it will say what it heard and
+answered on the lock screen through a local notification every build can post; it will
+end an answer on a spoken stop word; and it will **not** keep the webview alive to do any
+of this, will **not** move the turn into a web worker, and will **not** ask iOS for a
+background task. Recorded here because the turn was designed with the screen as a
+participant across four epics and nobody noticed — on the Mac the screen is always there
+— and because "just keep the page alive" is the tidy fix that will be proposed the next
+time a webview is found not running.
+
+- **What was measured:** the turn was Rust's until it had heard, and the webview's after.
+  `Turn::perform` treated `Effect::SendText` as a no-op (`voice/mod.rs:561` before
+  `a5e3399`); the send was `BotVoiceMic`'s `onHeard` → `botsChatSend`
+  (`bot-voice-mic.tsx:135-146`, `bots-phone-pane.tsx:587-594`) and the speak was the
+  pane's reaction to the stream's `closed` (`speakIfHeard`, `bot-voice-mic.tsx:116-124`,
+  `bots-pane.tsx:181-183`). On the phone that JavaScript ran only while a Bots
+  conversation was the pushed level (`phone-shell.tsx:990-1009`, `:229-231`), and WebKit
+  keeps the WebContent process runnable only for a visible view, a page that itself
+  plays audio, or a page that itself captures (`WebPageProxy.cpp:3823-3893`); keeper's
+  audio is native, so the page qualified for none. Speech was fine in the background —
+  `.playAndRecord` activated while armed, `duckOthers` while speaking
+  (`voice_ios.rs:1368-1385`, `:1119-1134` at the time), Apple's "obeys the same rules as
+  other audio" — and had simply never been reached from there. The lock screen had one
+  surface the build could not draw (the island, `voice_ipc::push` fanning out to it
+  alone, `voice_ipc.rs:330-333` at the time) and one it had never used: a local
+  notification, delivered at once from any thread with no entitlement. And barge-in
+  threw the word away: `SpeechDetected` carried no text (`voice_ios.rs:1074-1077` at
+  the time), so "stop" stopped the answer and then waited for a question (Epic 67, *What
+  was measured*, 1–4, 2026-09-05; `agent://TurnFlow`, `agent://IosBgSpeech`).
+- **The question:** how does a turn that began with the screen locked *finish* with the
+  screen locked — and who is allowed to know where the question goes when nobody is
+  looking?
+- **Options refused, and why:**
+  - *Keep the webview alive* — a page that plays a silent audio element or holds a
+    `getUserMedia` capture so WebKit's `WebPageProxy` keeps its process runnable: it
+    spends a second audio session and a second microphone claim to keep a renderer
+    awake for a hand-off that is two function calls, it is a behaviour Apple ships and
+    revises without notice (the three-flag rule is one file of WebKit and has moved
+    before), and it would make the phone's own privacy indicators lie about who holds
+    the microphone. Refused for the reason the turn was wrong in the first place: it
+    keeps the screen a participant.
+  - *A web worker*: a worker lives in the same WebContent process the rule suspends;
+    it changes nothing about when JavaScript runs.
+  - *A background task* (`beginBackgroundTask`, `BGProcessingTask`): thirty seconds or
+    the system's discretion, neither of which is "until the answer is spoken", and the
+    app already has the background mode that matters (`audio`) — the process was never
+    the problem, the webview inside it was.
+  - *Guess the target from what is open*: the pane that was open when the phone was
+    locked is not a decision a person made about where a question at three in the
+    morning goes. Refused; a target is chosen on the screen or inferred by one stated
+    rule, or the turn is refused with its remedy (AD-206).
+  - *Barge-in on any speech ends the turn*: FR-403's shape — any speech stops the answer
+    and asks — is what a person interrupting to say more wants; only the stop word ends
+    it (AD-208).
+- **The decision:** `voice_ipc::transition` performs `Effect::SendText` itself by
+  spawning `bots_ipc::send_spoken` off the voice lock (`crates/keeper/src/voice_ipc.rs:267-293`);
+  `send_spoken` resolves the target and the model in core
+  (`keeper-core/src/bots/voice_target.rs:77-101`, `:110`, over `bots.voice_target`, the
+  pinned bots and the conversation list — chosen bot, else the pinned bot most recently
+  talked to, else "Nothing to talk to yet: choose a bot to talk to under Bots.",
+  `NO_TARGET_SENTENCE`, `:32`), opens a Rust `Channel` that re-emits the stream as the
+  app event `keeper://bots-spoken-stream` and runs the one `open_turn` a typed send runs
+  (`bots_ipc.rs:1330-1359`, `:1224`); the driver notes `Sent` and the first token
+  (`:1738`, `:1760`), and the stream's close calls `answer_complete` / `answer_stopped` /
+  `answer_failed` (`:1919-1925`, `:1942-1944` → `voice_ipc.rs:300`, `:324`, `:312`), which
+  drive `AnswerDone` → `Speaking` with `[Speak(text)]` (`turn.rs:238-244`). The webview
+  observes through `listenSpokenStream` (`src/lib/ipc/client.ts:7405`,
+  `src/hooks/use-spoken-stream.ts:25`) and the snapshots it already had; `speakIfHeard`,
+  the `onHeard` hand-off and the `voice_speak` command are gone. On every island-word
+  change while `UIApplication.applicationState` is not `Active` — read on the main
+  thread, never the JS lifecycle — `voice_notify` posts a local notification under the
+  one identifier `keeper.voice`, `.active`, no sound, with `banner::sentence`'s words
+  (`crates/keeper/src/voice_notify.rs:116-136`, `:169-171`, `:175-193`;
+  `keeper-core/src/voice/banner.rs:50-70`), cleared when the turn ends or keeper comes
+  to front (`:196-205`, `:140-142`). `SpeechDetected` carries its transcript; while
+  `Speaking`, `Turn::apply` turns one that matches `bots.stop_phrase` — `parse_stop`,
+  three letters, "stop" by default — into `StopHeard`, and `(Speaking, StopHeard)` is
+  `Idle` with `[StopSpeaking, ReleaseMicrophone]` and the phrase re-armed
+  (`voice/mod.rs:462-491`, `turn.rs:212-214`, `phrase.rs:50`, `:112-114`). The session mode
+  is `voiceChat` explicitly and every utterance's end opens an 800 ms gate in which
+  transcripts are dropped and recorded as `echo_dropped` with their words, before the
+  owed `Silence` is reported (`voice_ios.rs:221`, `:855-867`, `:903-908`, `:1139-1143`,
+  `:1458-1459`). (AD-205…AD-209; FR-473…FR-482; Epic 67, Stories 67.1–67.3;
+  `docs/ios.md`, *A turn that finishes without the screen*; `docs/egress.md`, the
+  provider chapter's last paragraph)
+- **The costs, stated so they are chosen:** the target must be chosen, or it is the bot
+  most recently talked to — never the one on the screen — and with no pinned bot ever
+  talked to a hands-free question is refused; a refusal leaves the turn in `Failed` with
+  its sentence until keeper is next in front (D-13's re-arm), so on a locked phone a
+  no-target refusal ends listening until keeper is opened (DW-244); a button turn no
+  longer fills the composer to be checked before it is sent — Story 62.6's hand-off is
+  gone on both tiers, `BotComposer.heard` with it, and the status reads "Heard —
+  sending it" (`bot-voice-mic.tsx:82`), because Rust cannot tell a button's turn from
+  the phrase's once it performs the send and one turn was the ask; a spoken question
+  opens or continues a conversation the person may not be looking at; the lock screen
+  shows the first 120 characters of what was heard and the first sentence of the answer
+  to anyone who can see the phone; "Thinking" and "Answering" flash as title-only
+  banners between "Heard" and "Answer"; a `Listening stopped` banner stays until keeper
+  is opened; a whole sentence said within 800 ms of an answer's end is dropped with the
+  roll (its words in the ring); and the default stop word is "stop" whatever the
+  listening locale, which a recogniser writing another script never spells that way
+  (DW-245).
+- **The evidence:** `keeper-core/tests/voice_spoken_turn.rs` — a fake port and a fake bot
+  host, never an `AppHandle` or an event listener: `WakeMatched → Heard` yields exactly
+  one `SendText`, one stream on the resolved target and one utterance
+  (`a_heard_question_becomes_one_stream_on_the_target_and_its_answer_is_spoken`, `:147`),
+  a button turn takes the same path (`:220`), no target refuses with the sentence and
+  sends nothing (`:253`), a failed stream ends the turn with its reason (`:297`), a stop
+  abandons and re-arms (`:316`); `bots_ipc.rs:2262` reads the target from a real store
+  and refuses when there is none; `banner.rs:128-256` — every word's sentence, the
+  first-sentence and clipping rules, and in front posts nothing for every word
+  (`:240`); `keeper-core/tests/voice_turn.rs:309-378`, `:912` — the stop word mid-`Speaking`
+  is `Idle` with the device released and the phrase re-armed, another word is today's
+  `Listening`, a Polish stop word matches normalised, "stopped" and "nonstop" do not;
+  frontend: `bot-voice-target.test.tsx`, `bots-section.test.tsx` and
+  `bots-phone-pane.test.tsx` (the picker on both tiers), `use-spoken-stream.test.ts`,
+  `bot-voice-mic.test.tsx` (no `botsChatSend`, no `voiceSpeak`),
+  `src/test/voice-capability.test.ts` (the event name spelled the same in Rust and TS,
+  `SendText` performed in `voice_ipc` and `Speak` driven from `bots_ipc::close`,
+  `voice_speak` gone). On hesperia, 2026-09-05: `cargo check -p keeper --target
+  aarch64-apple-ios` and `cargo check -p keeper --all-targets` clean over the final tree
+  (Story 67.3's report). The run on kalypso with the screen locked — the phrase, a
+  question, the banner, the spoken answer, "stop" mid-answer, and the ring naming
+  `wake_matched`, `turn:heard`, `notified heard`, `turn:sending`, `turn:speaking`,
+  `spoken`, `notified speaking`, `stop_matched` and any `echo_dropped` with timestamps —
+  is Story 67.4's gate (AD-210) and is not yet recorded here; `docs/ios.md`, *What the
+  run on kalypso must show*, is the prediction it is checked against, and DW-243 is
+  where its reading goes.
+- **Revisit triggers:** the island signing on the free team (DW-222), which adds a richer
+  surface beside the banner and removes nothing; a locale whose recogniser cannot hear
+  the stop word at all, which reopens only the default (DW-245); a measured echo the
+  gate does not catch (DW-243), which reopens the mode and the gate, not the ownership.
+  None reopens "the turn is Rust's".
+- **Status / owner:** decided. Owner is the architect; Epic 67, Stories 67.1–67.3
+  implement it; the hardware proof is Story 67.4's gate.
