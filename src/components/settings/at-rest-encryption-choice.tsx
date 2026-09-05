@@ -99,7 +99,7 @@ export function AtRestEncryptionChoice({ onResolved }: AtRestEncryptionChoicePro
   }
 
   return (
-    <div className="flex h-screen items-center justify-center bg-background p-6 text-foreground">
+    <div className="flex h-dvh items-center justify-center bg-background p-6 text-foreground">
       <Card className="w-full max-w-md">
         <CardHeader>
           <CardTitle>{CHOICE_TITLE}</CardTitle>

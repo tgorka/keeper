@@ -43,8 +43,12 @@ pub fn set_enabled(on: bool) {
     }
 }
 
-/// The app-level log file: `~/Library/Logs/keeper/keeper.log` — the standard
-/// macOS per-app log home (surfaces in Console.app's Log Reports).
+/// The app-level log file: `$HOME/Library/Logs/keeper/keeper.log`. On a Mac
+/// that is `~/Library/Logs/keeper/keeper.log`, the standard per-app log home
+/// (surfaces in Console.app's Log Reports); on the phone `$HOME` is the app's
+/// own container, so the file is `<container>/Library/Logs/keeper/keeper.log`.
+/// The About sentence renders this answer (`debug_log_path`) rather than a
+/// literal, so each device names its own file (Story 65.3, AD-192).
 pub fn app_log_path() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)

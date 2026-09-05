@@ -2,12 +2,13 @@
 //! microphone is a port, and every rule is pinned here against a fake port
 //! — the only host this code is ever tested on.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use keeper_core::vm::{VoiceStateVm, VoiceUnavailableVm};
 use keeper_core::voice::{
-    advance, perform, silence_budget, Effect, PhraseRefused, Turn, TurnEvent, TurnState,
-    VoicePlatform, VoicePort, VoiceUnavailable, WakePhrase, DEFAULT_WAKE_PHRASE,
+    advance, perform, should_rearm, silence_budget, Effect, PhraseRefused, Turn, TurnEvent,
+    TurnState, VoicePlatform, VoicePort, VoiceUnavailable, WakePhrase, DEFAULT_WAKE_PHRASE,
     END_OF_UTTERANCE_PAUSE, NOTHING_HEARD_TIMEOUT,
 };
 
@@ -27,6 +28,10 @@ enum Call {
 struct FakePort {
     calls: Mutex<Vec<Call>>,
     refuse_start: Option<VoiceUnavailable>,
+    /// Set when `refuse_start`'s refusal has cleared — the permission was
+    /// granted, the language changed — so the same port that refused now
+    /// answers (Epic 65, AD-190).
+    granted: AtomicBool,
     refuse_speak: Option<VoiceUnavailable>,
     /// Half-duplex when set, so the same fake stands in for either platform.
     half_duplex: bool,
@@ -44,6 +49,7 @@ impl Default for FakePort {
         Self {
             calls: Mutex::new(Vec::new()),
             refuse_start: None,
+            granted: AtomicBool::new(false),
             refuse_speak: None,
             half_duplex: false,
             voices: vec!["en-US".to_owned()],
@@ -60,6 +66,17 @@ impl FakePort {
     fn record(&self, call: Call) {
         self.calls.lock().expect("fake port lock").push(call);
     }
+    fn clear_refusal(&self) {
+        self.granted.store(true, Ordering::SeqCst);
+    }
+    /// The start refusal in force: `refuse_start` until it clears.
+    fn refusal(&self) -> Option<VoiceUnavailable> {
+        if self.granted.load(Ordering::SeqCst) {
+            None
+        } else {
+            self.refuse_start.clone()
+        }
+    }
 }
 
 impl VoicePort for FakePort {
@@ -71,7 +88,7 @@ impl VoicePort for FakePort {
         }
     }
     fn availability(&self) -> Result<(), VoiceUnavailable> {
-        Ok(())
+        self.refusal().map_or(Ok(()), Err)
     }
     fn locales(&self) -> keeper_core::voice::locale::DeviceLocales {
         keeper_core::voice::locale::DeviceLocales::default()
@@ -79,7 +96,7 @@ impl VoicePort for FakePort {
     fn set_locale(&self, _requested: Option<String>) {}
     fn start_listening(&self, wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
         self.record(Call::Start(wake.map(|w| w.as_str().to_owned())));
-        self.refuse_start.clone().map_or(Ok(()), Err)
+        self.refusal().map_or(Ok(()), Err)
     }
     fn stop_listening(&self) {
         self.record(Call::Stop);
@@ -1017,4 +1034,148 @@ fn voice_level_rides_listening_and_heard_only() {
     turn.apply(TurnEvent::SpeechDetected);
     assert_eq!(turn.state(), &listening(""));
     assert_eq!(turn.level(), None, "a fresh listening starts unmeasured");
+}
+
+// ---------------------------------------------------------------------------
+// Epic 65, Story 65.2 (AD-190): the switch persists intent, and the phrase is
+// armed again when the refusal clears.
+// ---------------------------------------------------------------------------
+
+/// The shell's `arm`: set the phrase, carry the effects out, and on a refusal
+/// fail the turn so the device is released and the reason is on the snapshot.
+fn arm(turn: &mut Turn, port: &FakePort, wake: Option<WakePhrase>) -> Vec<Effect> {
+    let effects = turn.set_wake(wake);
+    if let Err(why) = perform(&effects, port, turn.wake()) {
+        return turn.drive(TurnEvent::Failed(why.message(turn.platform())), port);
+    }
+    effects
+}
+
+/// The rule is three facts and one answer: never with the intent off, never
+/// while armed, never while the port still refuses.
+#[test]
+fn voice_should_rearm_only_with_intent_on_not_armed_and_the_refusal_cleared() {
+    assert!(should_rearm(true, false, true));
+    assert!(
+        !should_rearm(false, false, true),
+        "intent off is the one no the person said"
+    );
+    assert!(
+        !should_rearm(true, true, true),
+        "already armed: nothing to do"
+    );
+    assert!(
+        !should_rearm(true, false, false),
+        "still refused: re-trying would loop"
+    );
+    assert!(!should_rearm(false, true, false));
+    assert!(!should_rearm(false, false, false));
+}
+
+/// The owner's phone: the microphone not yet granted, the switch turned on.
+/// The turn keeps the phrase (the intent), fails with the reason, and is
+/// not armed. When the grant comes, arming again — from `Failed`, which used
+/// to record the phrase and open nothing — opens the device for the phrase
+/// and the snapshot says so.
+#[test]
+fn voice_driver_rearms_from_a_refusal_once_it_clears() {
+    let port = FakePort {
+        refuse_start: Some(VoiceUnavailable::NotAuthorized),
+        ..FakePort::default()
+    };
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    let effects = arm(&mut turn, &port, Some(phrase("nixie")));
+    assert_eq!(
+        effects,
+        vec![Effect::ReleaseMicrophone],
+        "the refusal released the device"
+    );
+    assert!(matches!(turn.state(), TurnState::Failed { .. }));
+    assert_eq!(
+        turn.wake().map(WakePhrase::as_str),
+        Some("nixie"),
+        "the intent is kept"
+    );
+    assert!(!turn.armed());
+    assert!(!turn.microphone_open());
+
+    // Still refused: the rule says no, and arming anyway fails the same way.
+    assert!(!should_rearm(
+        true,
+        turn.armed(),
+        port.availability().is_ok()
+    ));
+
+    port.clear_refusal();
+    assert!(should_rearm(
+        true,
+        turn.armed(),
+        port.availability().is_ok()
+    ));
+    let effects = arm(&mut turn, &port, Some(phrase("nixie")));
+    assert_eq!(effects, vec![Effect::OpenMicrophone]);
+    assert_eq!(turn.state(), &TurnState::Idle, "the stale reason is gone");
+    assert!(turn.armed());
+    assert_eq!(
+        turn.vm(),
+        VoiceStateVm::Idle {
+            wake: Some("nixie".to_owned()),
+            listening_for_wake: true,
+        }
+    );
+    assert_eq!(
+        port.calls(),
+        vec![
+            Call::Start(Some("nixie".to_owned())),
+            Call::Stop,
+            Call::Start(Some("nixie".to_owned())),
+        ]
+    );
+    // Armed now: a second foreground, a second grant, changes nothing.
+    assert!(!should_rearm(
+        true,
+        turn.armed(),
+        port.availability().is_ok()
+    ));
+}
+
+/// Turning the switch off from a refusal clears the reason with it: the
+/// resting state is `Idle`, the device released, no phrase held.
+#[test]
+fn voice_driver_clearing_the_phrase_from_a_refusal_rests_idle() {
+    let port = FakePort {
+        refuse_start: Some(VoiceUnavailable::NotAuthorized),
+        ..FakePort::default()
+    };
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    arm(&mut turn, &port, Some(phrase("nixie")));
+    let effects = arm(&mut turn, &port, None);
+    assert_eq!(effects, vec![Effect::ReleaseMicrophone]);
+    assert_eq!(turn.state(), &TurnState::Idle);
+    assert!(turn.wake().is_none());
+    assert!(!turn.armed());
+}
+
+/// A turn in progress with the phrase set is armed in the sense that
+/// matters — its own end re-opens the device — so a foreground or a grant
+/// that lands mid-turn arms nothing and disturbs nothing.
+#[test]
+fn voice_driver_is_armed_while_a_turn_runs_and_not_before_the_phrase_is_set() {
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::MACOS);
+    assert!(!turn.armed(), "no phrase, nothing standing");
+    arm(&mut turn, &port, Some(phrase("nixie")));
+    assert!(turn.armed());
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("what time".to_owned()), &port);
+    assert!(matches!(turn.state(), TurnState::Heard { .. }));
+    assert!(
+        turn.armed(),
+        "mid-turn on a half-duplex Mac, the device released: still standing"
+    );
+    assert!(
+        turn.set_wake(Some(phrase("nixie"))).is_empty(),
+        "mid-turn, only recorded"
+    );
+    assert!(matches!(turn.state(), TurnState::Heard { .. }));
 }

@@ -113,7 +113,8 @@ export function isReducedCapabilityPlatform(state: CapabilitiesState): boolean {
  * React hook wrapping {@link isReducedCapabilityPlatform} over the shared
  * {@link capabilitiesStore}. Drives the "On this iPhone" disclosure and the
  * Archive & Storage backup-exclusion line — the two capability-honest surfaces
- * that render only on the reduced (phone) tier.
+ * that render only on the reduced (phone) tier — and, since Epic 65 (AD-189),
+ * the tier itself: `useShellLayout` reports `phone` from this at every width.
  */
 export function useIsReducedCapabilityPlatform(): boolean {
   return useCapabilitiesStore(isReducedCapabilityPlatform);

@@ -170,6 +170,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
+use keeper_core::voice::events::VoiceEventKind;
 use keeper_core::voice::level::{self, Meter};
 use keeper_core::voice::locale::{self, DeviceLocales};
 use keeper_core::voice::{
@@ -577,6 +578,7 @@ impl Worker {
             Ok(()) => Ok(()),
             Err(error) => {
                 tracing::warn!(%error, "voice: the capture did not start; will retry");
+                crate::voice_log::record(VoiceEventKind::Refused, Some(error.clone()));
                 self.suspend();
                 Ok(())
             }
@@ -740,6 +742,7 @@ impl Worker {
             last_heard,
         ) {
             Ok(recognition) => {
+                crate::voice_log::record(VoiceEventKind::Rolled, None);
                 self.recognition = Some(recognition);
                 self.failed_starts = 0;
                 Ok(())
@@ -805,6 +808,10 @@ impl Worker {
             {
                 // Stopped without a word from the system.
                 tracing::info!("voice: the engine stopped on its own; resuming");
+                crate::voice_log::record(
+                    VoiceEventKind::Resumed,
+                    Some("the engine stopped on its own".to_owned()),
+                );
                 self.resume();
             } else if self.roll_due() {
                 if let Err(error) = self.roll_request() {
@@ -843,6 +850,7 @@ impl Worker {
             Ok(()) => {
                 if self.suspended.take().is_some() {
                     tracing::info!("voice: listening resumed");
+                    crate::voice_log::record(VoiceEventKind::Resumed, None);
                 }
             }
             Err(error) => {
@@ -858,6 +866,7 @@ impl Worker {
     fn roll_failed(&mut self, error: String) {
         if self.failed_starts >= ROLL_FAILURES_TOLERATED {
             tracing::warn!(%error, "voice: recognition keeps failing to start");
+            crate::voice_log::record(VoiceEventKind::Refused, Some(error.clone()));
             self.stop();
             (self.sink)(TurnEvent::Failed(error));
         } else {

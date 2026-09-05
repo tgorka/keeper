@@ -7131,6 +7131,31 @@ pub struct VoiceWakeVm {
     pub on_device_locales: Vec<String>,
 }
 
+/// One thing the voice port did (Epic 65, Story 65.3, AD-192), from
+/// `voice_events`, newest first. A projection of
+/// `keeper_core::voice::events::VoiceEvent`: `kind` is the closed set's
+/// stable string (`armed`, `refused`, `interruption_begun`,
+/// `interruption_ended`, `resumed`, `rolled`, `turn:<state>`,
+/// `wake_matched`, `spoken`, `disarmed`) and `detail` the words that go with
+/// it — a refusal's sentence, a transcript — or `null`. A view of memory: the
+/// ring is bounded, on the device, and never written anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VoiceEventVm {
+    /// The event's position in the ring's history: monotonic, never reused,
+    /// so a row can be keyed on it.
+    #[ts(type = "number")]
+    pub seq: u64,
+    /// When, ms since the Unix epoch (UTC), as the shell's clock said.
+    #[ts(type = "number")]
+    pub at_ms: i64,
+    /// What happened, in the stable string form.
+    pub kind: String,
+    /// The words that go with it, or `null`.
+    pub detail: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

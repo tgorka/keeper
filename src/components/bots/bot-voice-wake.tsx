@@ -46,6 +46,19 @@
  * local "did I turn it on" flag, so a device that refused to open shows no
  * chip.
  *
+ * # The switch is intent; the port's answer is shown beside it (Epic 65, AD-190)
+ *
+ * `voiceWakeSet(enabled, …)` writes what the person chose, whatever the
+ * port said at arming time. Until Epic 65 a refusal — a Polish system
+ * language with no on-device asset, a microphone not yet granted — wrote
+ * the switch OFF and said nothing, so the phrase on the owner's phone was
+ * never armed. Now the refusal is rendered beside the switch as a refusal
+ * (the `unavailable` sentence, or the turn's `failed` reason when the
+ * probe did not predict it) with the switch ON, and `keeper_core::voice::
+ * should_rearm` has Rust arm the phrase again when the refusal clears: a
+ * grant, a language change, keeper back in front, the port's own resume.
+ * Nothing here re-arms; this file only stops saving a "no" nobody said.
+ *
  * # The chip is small, persistent, and not a hover
  *
  * FR-405: visible whenever it listens. A `role="status"` badge beside the
@@ -129,23 +142,31 @@ export function voiceListeningIn(locale: string): string {
 export const VOICE_FOLDED_OFF = "Listening off";
 
 /**
+ * A refusal's first clause: Rust's sentences all open with the fact and
+ * follow it, after a comma, a dash or a semicolon, with the remedy — and the
+ * remedy is what unfolding (or, on the phone, opening the sheet) is for. A
+ * sentence with no such break is carried whole.
+ */
+export function voiceRefusalClause(message: string): string {
+  const clause = /^(.*?)(?:,|;| —)\s/.exec(message);
+  return clause?.[1] ?? message;
+}
+
+/**
  * The one line the folded block says (AD-184).
  *
  * `Listening for "nixie" · en-US` while the switch is on, `Listening off ·
  * en-US` while it is not — the SETTING, from `VoiceWakeVm`, not the turn's
  * live state, which the status line above the composer already shows. The
  * identifier rather than {@link voiceLocaleName}'s long form, because this is
- * a glance and the unfolded picker spells the name. A refusal contributes its
- * first clause: Rust's sentences all open with the fact and follow it, after
- * a comma, a dash or a semicolon, with the remedy — and the remedy is what
- * unfolding is for.
+ * a glance and the unfolded picker spells the name. A refusal contributes
+ * {@link voiceRefusalClause}.
  */
 export function voiceFoldedLine(wake: VoiceWakeVm, unavailable: VoiceUnavailableVm | null): string {
   const armed = wake.enabled ? wakeListeningLabel(wake.phrase) : VOICE_FOLDED_OFF;
   const parts = [armed, wake.locale];
   if (unavailable !== null) {
-    const clause = /^(.*?)(?:,|;| —)\s/.exec(unavailable.message);
-    parts.push(clause?.[1] ?? unavailable.message);
+    parts.push(voiceRefusalClause(unavailable.message));
   }
   return parts.join(" · ");
 }
@@ -197,17 +218,22 @@ export function BotVoiceWake({
     setBusy(true);
     // Switching the phrase on is a deliberate voice act, so it is where the
     // microphone and recogniser are asked for by name (FR-408, 62.6's
-    // `voice_authorize`). A refusal is mirrored — the sentence beside the
-    // switch says what to allow — and the switch is written **off**: a switch
-    // persisted on with nothing able to listen would be the AD-27 lie. The
-    // phrase is kept, so the choice survives a trip to Settings and back.
+    // `voice_authorize`). What is written is the person's choice, whatever
+    // the port answered (Epic 65, AD-190): a refusal is mirrored — the
+    // sentence beside the switch says what to allow — and the switch stays
+    // ON, because "no" was the port's word, not theirs, and keeper arms the
+    // phrase itself once the refusal clears. A grant lifts an earlier
+    // refusal and nothing else (the mic button's rule): a missing on-device
+    // model, read at mount, is still missing.
     const gate = enabled ? voiceAuthorize() : Promise.resolve(null);
     void gate
       .then((unavailable) => {
         if (unavailable !== null) {
           voiceStore.getState().applyAvailability(unavailable);
+        } else if (enabled && voiceStore.getState().unavailable?.kind === "notAuthorized") {
+          voiceStore.getState().applyAvailability(null);
         }
-        return voiceWakeSet(enabled && unavailable === null, draft);
+        return voiceWakeSet(enabled, draft);
       })
       .then((next) => {
         voiceStore.getState().applyWake(next);
@@ -326,13 +352,23 @@ export function BotVoiceWake({
           {refusal}
         </p>
       )}
-      {unavailable !== null && (
+      {unavailable !== null ? (
         // `status`, not `alert`: a permission not yet given or a model not
         // yet downloaded is a state of the phone worth reading, and the
         // sentence says what to do about it.
         <p role="status" className="text-xs">
           {unavailable.message}
         </p>
+      ) : (
+        // The port refused when the phrase was armed, for a reason the
+        // availability probe did not carry: the turn's own reason, Rust's
+        // sentence with its remedy, beside the switch it belongs to
+        // (AD-190). The switch stays on; keeper re-arms when it clears.
+        state?.kind === "failed" && (
+          <p role="status" className="text-xs">
+            {state.reason}
+          </p>
+        )
       )}
       <p className="text-muted-foreground text-xs">{wake.limits}</p>
     </>

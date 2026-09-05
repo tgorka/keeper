@@ -34,14 +34,17 @@
 //! a sentence rather than "command not found" (AD-27, the `sessions_ipc`
 //! twin pattern with the twin folded into the port).
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use keeper_core::registry;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm};
+use keeper_core::voice::events::VoiceEventKind;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 use keeper_core::voice::EventSink;
 use keeper_core::voice::{
-    locale, silence_budget, ConsentPort, Turn, TurnEvent, TurnState, VoicePort, WakePhrase,
+    locale, should_rearm, silence_budget, ConsentPort, Turn, TurnEvent, TurnState, VoicePort,
+    WakePhrase,
 };
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
 use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
@@ -63,6 +66,10 @@ struct Voice {
     watch_serial: u64,
     /// Bumped on every transition; the silence timer checks it before firing.
     generation: u64,
+    /// Where the registry is, kept from [`boot`] for the re-arm hooks
+    /// (Epic 65, AD-190): a lifecycle event and the port's own resume arrive
+    /// with no `State` in hand. `None` only before boot.
+    data_dir: Option<PathBuf>,
 }
 
 /// The single voice state for the process.
@@ -75,6 +82,7 @@ fn voice() -> MutexGuard<'static, Voice> {
             watcher: None,
             watch_serial: 0,
             generation: 0,
+            data_dir: None,
         })
     });
     // A poisoned lock means a transition panicked. The turn is a value the
@@ -236,7 +244,9 @@ fn meter(level: f32) {
 fn transition(event: TurnEvent) {
     let mut voice = voice();
     let port = Arc::clone(&voice.port);
+    let before = VoiceEventKind::turn(voice.turn.state());
     let effects = voice.turn.drive(event, port.as_ref());
+    crate::voice_log::transition(before, voice.turn.state(), &effects);
     tracing::debug!(state = ?voice.turn.state(), ?effects, "voice: transition");
     after_change(&mut voice);
 }
@@ -425,21 +435,23 @@ pub fn voice_stop_speaking() -> Result<(), IpcError> {
     Ok(())
 }
 
-/// Hand the persisted locale choice to the port (Epic 63), so its next
-/// availability probe and request run `keeper_core::voice::locale::choose`
-/// over it. Called once at boot from `lib.rs` — the port is process-wide
-/// and `voice_availability` takes no state — and again by
-/// [`voice_locale_set`] after a change. No decision here: the port asks
-/// core which locale the answer is.
-pub fn load_locale(data_dir: &std::path::Path) {
+/// Once at boot from `lib.rs` — the port is process-wide and
+/// `voice_availability` takes no state. Hands the persisted locale choice
+/// to the port (Epic 63), so its next availability probe and request run
+/// `keeper_core::voice::locale::choose` over it — [`voice_locale_set`] does
+/// the same after a change — and keeps `data_dir` for [`voice_rearm`]. No
+/// decision here: the port asks core which locale the answer is.
+pub fn boot(data_dir: &Path) {
+    let mut voice = voice();
+    voice.data_dir = Some(data_dir.to_owned());
     match registry::get_bots_voice_locale(data_dir) {
         Ok(requested) => {
             tracing::info!(?requested, "voice: locale choice loaded");
-            voice().port.set_locale(requested);
+            voice.port.set_locale(requested);
         }
         Err(error) => {
             tracing::warn!(%error, "voice: could not read bots.voice_locale; choosing for the person");
-            voice().port.set_locale(None);
+            voice.port.set_locale(None);
         }
     }
 }
@@ -486,16 +498,18 @@ pub fn voice_wake_get(state: State<'_, AppState>) -> Result<VoiceWakeVm, IpcErro
 fn arm(voice: &mut Voice, wake: Option<WakePhrase>) {
     let effects = voice.turn.set_wake(wake);
     let port = Arc::clone(&voice.port);
-    if let Err(why) = keeper_core::voice::perform(&effects, port.as_ref(), voice.turn.wake()) {
-        let recovery = voice.turn.drive(
-            TurnEvent::Failed(why.message(&port.platform())),
-            port.as_ref(),
-        );
-        tracing::warn!(
-            ?why,
-            ?recovery,
-            "voice: the port refused to listen for the phrase"
-        );
+    match keeper_core::voice::perform(&effects, port.as_ref(), voice.turn.wake()) {
+        Ok(()) => crate::voice_log::armed(voice.turn.wake()),
+        Err(why) => {
+            let message = why.message(&port.platform());
+            crate::voice_log::record(VoiceEventKind::Refused, Some(message.clone()));
+            let recovery = voice.turn.drive(TurnEvent::Failed(message), port.as_ref());
+            tracing::warn!(
+                ?why,
+                ?recovery,
+                "voice: the port refused to listen for the phrase"
+            );
+        }
     }
     after_change(voice);
 }
@@ -525,8 +539,10 @@ pub fn voice_wake_set(
 /// `keeper_core::voice::locale::choose` whether it can run here — a
 /// language that cannot is recorded and refused, never silently replaced
 /// by one that can, and the refusal names the ones that can. While the
-/// phrase is armed, listening is re-armed so the new language takes effect
-/// on the next request rather than the next launch. Returns the wake VM,
+/// phrase is listening, it is re-armed so the new language takes effect on
+/// the next request rather than the next launch; while it was refused, a
+/// language that can run here is what clears the refusal, and the phrase
+/// is armed again by AD-190's rule ([`rearm_locked`]). Returns the wake VM,
 /// whose `locale` is the one now in force.
 #[tauri::command]
 pub fn voice_locale_set(
@@ -542,9 +558,15 @@ pub fn voice_locale_set(
     registry::set_bots_voice_locale(&data_dir, requested.as_deref()).map_err(to_ipc_error)?;
     let mut voice = voice();
     voice.port.set_locale(requested);
-    let armed = voice.turn.wake().cloned();
-    if armed.is_some() {
-        arm(&mut voice, armed);
+    // Only the device held for the phrase is restarted here. Mid-turn the
+    // new language reaches the request the turn's own end re-arms; a
+    // `set_wake` there would touch nothing but bump the generation, and
+    // orphan the silence clock of the turn in progress.
+    if matches!(voice.turn.state(), TurnState::Idle) && voice.turn.armed() {
+        let wake = voice.turn.wake().cloned();
+        arm(&mut voice, wake);
+    } else {
+        rearm_locked(&mut voice, &data_dir)?;
     }
     let enabled = registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
     let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
@@ -552,10 +574,53 @@ pub fn voice_locale_set(
     wake_vm(&data_dir, enabled, phrase, port.as_ref())
 }
 
+/// Arm the phrase again from the persisted choice when AD-190's rule says
+/// so (Epic 65, Story 65.2): the switch is on, nothing is listening for it,
+/// and the port no longer refuses. The three facts are gathered here — the
+/// registry's `bots.wake_enabled`, [`Turn::armed`], the port's availability
+/// — and `keeper_core::voice::should_rearm` decides. Returns whether an arm
+/// was run; a refused arm is reported through the turn as ever.
+fn rearm_locked(voice: &mut Voice, data_dir: &Path) -> Result<bool, IpcError> {
+    let intent = registry::get_bots_wake_enabled(data_dir).map_err(to_ipc_error)?;
+    let armed = voice.turn.armed();
+    let cleared = voice.port.availability().is_ok();
+    if !should_rearm(intent, armed, cleared) {
+        tracing::debug!(intent, armed, cleared, "voice: not re-arming");
+        return Ok(false);
+    }
+    let phrase = registry::get_bots_wake_phrase(data_dir).map_err(to_ipc_error)?;
+    let parsed = WakePhrase::parse(&phrase).map_err(|why| refused(why.to_string()))?;
+    tracing::info!("voice: the refusal cleared; arming the phrase again");
+    arm(voice, Some(parsed));
+    Ok(true)
+}
+
+/// The re-arm entry point for what arrives with no `State` in hand: keeper
+/// back in front (`lib.rs`, `RunEvent::Resumed` on the phone and the main
+/// window's focus on the desktop) and the port's own resume. Never takes the
+/// lock on the caller's thread — the port's worker would deadlock on its
+/// own `start_listening`, and the event loop should not wait on a probe —
+/// so the work is spawned onto the runtime, the way [`deliver`] does.
+/// Before [`boot`] there is nothing to read, and nothing happens.
+pub fn voice_rearm() {
+    tauri::async_runtime::spawn(async {
+        let mut voice = voice();
+        let Some(data_dir) = voice.data_dir.clone() else {
+            return;
+        };
+        if let Err(error) = rearm_locked(&mut voice, &data_dir) {
+            tracing::warn!(?error, "voice: could not re-arm the phrase");
+        }
+    });
+}
+
 /// Ask for the recogniser and the microphone, by name, once, with the reason
 /// the plist strings give — on this deliberate act and never at launch
 /// (FR-408, AD-171). `None` when both are granted; otherwise why not, in the
-/// sentence the surface shows with its remedy.
+/// sentence the surface shows with its remedy. A grant is one of the four
+/// things that clear a refusal (AD-190), so it is followed by
+/// [`rearm_locked`]: a phrase the person chose while the microphone was
+/// not yet allowed is armed here, without the switch being touched.
 ///
 /// `async` on purpose: a sync command runs on the main thread, and the OS
 /// draws its permission dialog there — the first-boot hang `lib.rs` records
@@ -575,6 +640,12 @@ pub async fn voice_authorize() -> Result<Option<VoiceUnavailableVm>, IpcError> {
         account_id: None,
         retriable: true,
     })?;
-    let platform = voice().port.platform();
+    let mut voice = voice();
+    let platform = voice.port.platform();
+    if verdict.is_ok() {
+        if let Some(data_dir) = voice.data_dir.clone() {
+            rearm_locked(&mut voice, &data_dir)?;
+        }
+    }
     Ok(verdict.err().as_ref().map(|why| why.vm(&platform)))
 }

@@ -38,6 +38,7 @@
 //! the same name on a Mac as on a phone.
 
 pub mod authorization;
+pub mod events;
 pub mod level;
 pub mod locale;
 pub mod phrase;
@@ -305,8 +306,9 @@ pub trait VoicePort: Send + Sync {
 /// phrase, because the switch is a standing choice and a stop ends *this
 /// turn*, not the listening (Story 62.5: someone driving cannot come back
 /// to re-arm it). Only a failure leaves the device released: a port that
-/// refused to open would refuse again, and re-arming would be a loop. The
-/// switch, not a stop, is what turns listening off. **Half-duplex**
+/// refused to open would refuse again, and re-arming would be a loop — it is
+/// tried again by [`should_rearm`] once the refusal has cleared, not before.
+/// The switch, not a stop, is what turns listening off. **Half-duplex**
 /// (AD-175): where [`may_record`] says the device may not be open in the
 /// state the table moved to, the turn does not open it and releases it if
 /// it was — before the `Speak`, so the port never records its own answer.
@@ -380,15 +382,31 @@ impl Turn {
         )
     }
 
+    /// Whether the standing choice is in force (Epic 65, AD-190): a phrase
+    /// is set and either the device is open for it, or a turn is running,
+    /// which re-arms it on its own end. False with no phrase, and false in
+    /// `Idle` or `Failed` with the device released — the two states a port's
+    /// refusal leaves behind, and the only ones [`should_rearm`] acts in.
+    pub fn armed(&self) -> bool {
+        self.wake.is_some()
+            && (self.microphone_open
+                || !matches!(self.state, TurnState::Idle | TurnState::Failed { .. }))
+    }
+
     /// Set or clear the wake phrase.
     ///
     /// While `Idle` the device follows the phrase — set opens it, clear
     /// releases it — because a phrase nobody is listening for is a switch
-    /// that does nothing (AD-27). Mid-turn the phrase is only recorded; the
-    /// turn's own end decides whether to re-arm.
+    /// that does nothing (AD-27). `Failed` is the same resting place with a
+    /// reason attached (the device is already released), so it follows the
+    /// phrase too and moves to `Idle`: that is how a refusal at arming is
+    /// tried again once it clears (AD-190), and how turning the switch off
+    /// takes the stale reason with it. Mid-turn the phrase is only recorded;
+    /// the turn's own end decides whether to re-arm.
     pub fn set_wake(&mut self, wake: Option<WakePhrase>) -> Vec<Effect> {
         self.wake = wake;
-        let effects = if matches!(self.state, TurnState::Idle) {
+        let effects = if matches!(self.state, TurnState::Idle | TurnState::Failed { .. }) {
+            self.state = TurnState::Idle;
             if self.wake.is_some() {
                 vec![Effect::OpenMicrophone]
             } else {
@@ -552,4 +570,19 @@ pub fn perform(
         }
     }
     Ok(())
+}
+
+/// Whether keeper arms the phrase again without being asked (Epic 65,
+/// Story 65.2, AD-190).
+///
+/// `bots.wake_enabled` is the person's `intent`, persisted as chosen even
+/// when the port refused at arming time. A refusal is shown, not saved as
+/// "no" — so when it clears (a grant, a language change, keeper back in
+/// front, the port's own resume) the shell asks this and re-runs the arm.
+/// Three facts, one answer: never with the intent off — that is the one
+/// "no" the person did say — never while [`Turn::armed`] already holds, and
+/// never while the port still refuses, because a refusal re-tried on every
+/// foreground would be the loop the turn's own re-arm rule avoids.
+pub fn should_rearm(intent: bool, armed: bool, refusal_cleared: bool) -> bool {
+    intent && !armed && refusal_cleared
 }

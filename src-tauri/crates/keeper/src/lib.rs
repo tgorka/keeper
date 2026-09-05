@@ -91,6 +91,10 @@ mod voice_macos;
 // Registered on every target — a phone lists them for real, a desktop
 // answers `unsupported` — so the frontend never special-cases the call.
 mod voice_ipc;
+// The voice port's record (Story 65.3, AD-192): the in-memory ring every
+// port event and turn transition feeds, and the command the phone reads
+// it through. Every target, like the commands it records for.
+mod voice_log;
 // Reach (Story 63.5, AD-174/AD-179): the hotkey, tray and deep-link call
 // sites that start a turn while keeper is not in front, and the voice
 // hotkey's commands. Every target, because the deep link is every target's;
@@ -404,8 +408,9 @@ pub fn run() {
                 // The voice recogniser's language (Epic 63): the port is
                 // process-wide and `voice_availability` takes no state, so
                 // the persisted choice reaches it here, once, before any
-                // surface or the tray asks.
-                voice_ipc::load_locale(&data_dir);
+                // surface or the tray asks. The same call keeps the data dir
+                // for the re-arm hooks below (Epic 65, AD-190).
+                voice_ipc::boot(&data_dir);
             }
 
             // Forward every incoming `keeper://` deep link: `keeper://voice/talk`
@@ -873,6 +878,8 @@ pub fn run() {
                 voice_ipc::voice_locale_set,
                 // Story 62.6: the two permission dialogs, on the first deliberate act.
                 voice_ipc::voice_authorize,
+                // Story 65.3: what the port did, newest first, for the phone.
+                voice_log::voice_events,
                 // Story 63.5: the voice hotkey's binding, for Settings.
                 voice_reach::voice_hotkey_get,
                 voice_reach::voice_hotkey_set,
@@ -1351,6 +1358,13 @@ pub fn run() {
                 // the one that fires when the user switches app without hiding
                 // anything. `push_on_blur` decides whether it reaches the network.
                 WindowEvent::Focused(false) => notes_vault::flush(),
+                // Keeper back in front is one of the things that clear a
+                // refusal to listen for the phrase (Epic 65, AD-190): the
+                // person allowed the microphone in System Settings and came
+                // back. The rule is `keeper_core::voice::should_rearm`; an
+                // armed or switched-off phrase costs one probe and nothing
+                // else, and the probe runs off this thread.
+                WindowEvent::Focused(true) => voice_ipc::voice_rearm(),
                 // The voice pill sits on the main window's screen (Story
                 // 64.4): a drag onto another display takes it along. Per
                 // compositor frame, but `follow` returns on one lock while
@@ -1511,6 +1525,13 @@ pub fn run() {
             // so this is deliberately coarse — never exact-message routing (deferred to
             // Epic 11).
             //
+            // The phone came back to the foreground (`willEnterForeground` on
+            // iOS; never at launch, which keeps AD-169's "keeper never arms
+            // itself"): if the phrase is switched on and its refusal has
+            // cleared — the microphone allowed under Settings > keeper, a
+            // language downloaded — it is armed again (Epic 65, AD-190).
+            // The desktop's equivalent is the main window's focus, above.
+            tauri::RunEvent::Resumed => voice_ipc::voice_rearm(),
             // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
             // Linux/Windows), so this arm is gated on macOS specifically rather than on
             // `desktop` — the wider gate does not compile on the Linux desktop target.

@@ -89,6 +89,7 @@ import type {
   VoiceUnavailableVm,
   VoiceWakeVm,
 } from "@/lib/ipc/client";
+import { DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 
 /** Roughly now, so relative timestamps read as "3 min ago" rather than 1970. */
 const NOW = Date.now();
@@ -1051,28 +1052,38 @@ const ANSWERS: Record<string, unknown> = {
   // (`app-shell.tsx`), so every task and paced-work fixture below this line was
   // unreachable in `bun run dev` — the one screen this file exists to make
   // visible on Linux. Now a flag added in Rust breaks the build here instead.
-  capabilities: {
-    trayIcon: true,
-    globalHotkey: true,
-    launchAtLogin: true,
-    inAppUpdater: true,
-    nativeMenuBar: true,
-    bridgeSidecar: true,
-    revealInFileManager: true,
-    recording: true,
-    sync: true,
-    notes: true,
-    sessions: true,
-    // Epic 61: `true`, and this is the trap the comment above names. As `false`
-    // every bots fixture below would be unreachable in `bun run dev` — the
-    // pane, the picker, the composer and the fake stream all sit behind it.
-    bots: true,
-    // Epic 62: the drive half, `desktop && sync` in Rust. `true` here so the
-    // grant bar, the tool rows and the reveal control are reachable in `bun
-    // run dev`; flip to `false` to see the phone's shape of the same pane.
-    botTools: true,
-    overlayTitleBar: true,
-  } satisfies CapabilitiesVm,
+  //
+  // `?platform=phone` on the dev URL answers the iPhone's shape instead (Epic
+  // 65, AD-189): every `cfg!(desktop)` flag false and `bots` true, exactly as
+  // `keeper/src/ipc.rs` computes it there. Since AD-189 that answer — not the
+  // window's width — is what puts the shell in the phone tier, so it is the
+  // only way to look at the phone's landscape shape here, and it is what
+  // `dev/measure-bots.ts --phone` drives.
+  capabilities:
+    new URLSearchParams(window.location.search).get("platform") === "phone"
+      ? ({ ...DEFAULT_CAPABILITIES, bots: true } satisfies CapabilitiesVm)
+      : ({
+          trayIcon: true,
+          globalHotkey: true,
+          launchAtLogin: true,
+          inAppUpdater: true,
+          nativeMenuBar: true,
+          bridgeSidecar: true,
+          revealInFileManager: true,
+          recording: true,
+          sync: true,
+          notes: true,
+          sessions: true,
+          // Epic 61: `true`, and this is the trap the comment above names. As `false`
+          // every bots fixture below would be unreachable in `bun run dev` — the
+          // pane, the picker, the composer and the fake stream all sit behind it.
+          bots: true,
+          // Epic 62: the drive half, `desktop && sync` in Rust. `true` here so the
+          // grant bar, the tool rows and the reveal control are reachable in `bun
+          // run dev`; flip to `false` to see the phone's shape of the same pane.
+          botTools: true,
+          overlayTitleBar: true,
+        } satisfies CapabilitiesVm),
   // ---------------------------------------------------------------------------
   // The two answers that decide WHICH screen boots (`src/App.tsx`
   // `renderContent`). Without them every `bun run dev` stopped at the first-run

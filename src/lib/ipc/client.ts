@@ -338,6 +338,7 @@ export type { UnknownBotGrantVm } from "./gen/UnknownBotGrantVm";
 export type { UnknownTaskVm } from "./gen/UnknownTaskVm";
 export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
+export type { VoiceEventVm } from "./gen/VoiceEventVm";
 export type { VoiceStateVm } from "./gen/VoiceStateVm";
 export type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 export type { VoiceWakeVm } from "./gen/VoiceWakeVm";
@@ -505,6 +506,7 @@ import type { TemplateUpdateResultVm } from "./gen/TemplateUpdateResultVm";
 import type { TimelineBatch } from "./gen/TimelineBatch";
 import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
+import type { VoiceEventVm } from "./gen/VoiceEventVm";
 import type { VoiceStateVm } from "./gen/VoiceStateVm";
 import type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 import type { VoiceWakeVm } from "./gen/VoiceWakeVm";
@@ -2767,6 +2769,16 @@ export async function debugModeGet(): Promise<boolean> {
  */
 export async function debugModeSet(enabled: boolean): Promise<void> {
   await invoke("debug_mode_set", { enabled });
+}
+
+/**
+ * Where the app log lives on this device (Story 65.3, AD-192): the path Rust
+ * writes to, as Rust answers it — `~/Library/Logs/keeper/keeper.log` on the
+ * Mac, the app container's `Library/Logs/keeper/keeper.log` on the phone —
+ * so the About sentence names this device's file rather than a literal.
+ */
+export async function debugLogPath(): Promise<string> {
+  return invoke<string>("debug_log_path");
 }
 
 /** Which stage of an app-driven title-bar drag is being reported (Story 34.3). */
@@ -7309,6 +7321,18 @@ export async function voiceLocaleSet(locale: string | null): Promise<VoiceWakeVm
  */
 export async function voiceAuthorize(): Promise<VoiceUnavailableVm | null> {
   return await invoke<VoiceUnavailableVm | null>("voice_authorize");
+}
+
+/**
+ * What the voice port did, newest first (Epic 65, Story 65.3, FR-448,
+ * FR-449, AD-192): the last `limit` entries of the in-memory ring the shell
+ * feeds with every arm, refusal, interruption, resume, roll and turn
+ * transition. A view of memory on the device — nothing is read from disk
+ * and nothing leaves. Every target answers; a build without a port answers
+ * the turn's own transitions and an otherwise empty ring.
+ */
+export async function voiceEvents(limit: number): Promise<VoiceEventVm[]> {
+  return await invoke<VoiceEventVm[]>("voice_events", { limit });
 }
 
 /**

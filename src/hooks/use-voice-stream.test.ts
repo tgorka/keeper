@@ -124,4 +124,29 @@ describe("useVoiceStream", () => {
     await waitFor(() => expect(voiceStore.getState().wake).toEqual(WAKE));
     expect(voiceStore.getState().unavailable).toBeUndefined();
   });
+
+  it("asks the two facts again when the document comes back into view, and not after unmount (Epic 65, AD-190)", async () => {
+    voiceWatch.mockResolvedValue(1);
+    const { unmount } = renderHook(() => useVoiceStream());
+    await waitFor(() => expect(voiceStore.getState().wake).toEqual(WAKE));
+    expect(voiceAvailability).toHaveBeenCalledTimes(1);
+    // Rust re-armed while the app was behind; the stale refusal must go.
+    voiceStore.getState().applyAvailability({
+      kind: "notAuthorized",
+      message: "keeper is not allowed to use the microphone — allow both under Settings > keeper",
+    });
+    const visibility = vi.spyOn(document, "visibilityState", "get");
+    visibility.mockReturnValue("hidden");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(voiceAvailability).toHaveBeenCalledTimes(1);
+    visibility.mockReturnValue("visible");
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(voiceAvailability).toHaveBeenCalledTimes(2);
+    expect(voiceWakeGet).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(voiceStore.getState().unavailable).toBeNull());
+    unmount();
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(voiceAvailability).toHaveBeenCalledTimes(2);
+    visibility.mockRestore();
+  });
 });

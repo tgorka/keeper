@@ -165,7 +165,7 @@ function App() {
         <div
           role="status"
           aria-label="Loading keeper"
-          className="flex h-screen items-center justify-center bg-background text-foreground"
+          className="flex h-dvh items-center justify-center bg-background text-foreground"
         >
           <span className="sr-only">Loading keeper</span>
         </div>
@@ -191,7 +191,7 @@ function App() {
           <div
             role="status"
             aria-label="Loading keeper"
-            className="flex h-screen items-center justify-center bg-background text-foreground"
+            className="flex h-dvh items-center justify-center bg-background text-foreground"
           >
             <span className="sr-only">Loading keeper</span>
           </div>

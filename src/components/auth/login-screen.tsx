@@ -109,7 +109,7 @@ export function LoginScreen({ addMode = false, onDone }: LoginScreenProps = {}) 
   const addAccount = useAccountsStore((s) => s.addAccount);
 
   return (
-    <div className="flex h-screen items-center justify-center bg-background p-6 text-foreground">
+    <div className="flex h-dvh items-center justify-center bg-background p-6 text-foreground">
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle>{addMode ? "Add an account" : "Sign in to keeper"}</CardTitle>

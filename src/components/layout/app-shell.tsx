@@ -134,23 +134,46 @@ export function AppShell() {
   // — a restore the shell does not mount is a restore no hook-level test can
   // ever see it fail to make (DW-172). `hydratePanels` is idempotent, so
   // React's double-invoked development effects restore once.
+  //
+  // Not on the phone tier (Epic 65, FR-443). All four cookies below are
+  // desktop state — a drawer, a panel strip, a Files tree and surface columns
+  // the stack never mounts — and until AD-189 the desktop frame rendered on a
+  // rotated iPhone, where a press on its drawer or a column fold wrote them,
+  // and the next restore read them back into a phone that had no such
+  // controls. Nothing on the phone tier reads these stores, and nothing on it
+  // can write them: the sidebar is unmounted, the chat list's column is
+  // `enabled: !phone`, and Files, Panels, Tasks and the desktop Bots pane are
+  // desktop-only. So the honest thing is to leave the cookies unread there —
+  // including one an older build's landscape session left behind. On the
+  // desktop the effect runs at mount exactly as before; on a harness window
+  // that crosses 768px it runs on the first frame of the desktop frame, and
+  // each restore's own once-per-document latch keeps that a single read.
   useEffect(() => {
+    if (phone) {
+      return;
+    }
     hydratePanels(document.cookie);
-  }, []);
+  }, [phone]);
   // Restore the fold from the last run (Story 45.20, FR-198), in the same place
   // and for the same reason: the drawer is unmounted on the phone tier and can
   // be unmounted for a whole session, so a restore that lived inside it would
   // silently not happen. Idempotent, like `hydratePanels`.
   useEffect(() => {
+    if (phone) {
+      return;
+    }
     hydrateSidebarFold(document.cookie);
-  }, []);
+  }, [phone]);
   // Restore which folders the Files tree had open (Story 46.3), for the third
   // time and the same reason: `FilesPane` is unmounted by every surface switch,
   // which is exactly the defect — the tree forgot itself whenever you looked at
   // something else. Idempotent, like the two above.
   useEffect(() => {
+    if (phone) {
+      return;
+    }
     hydrateFilesTree(document.cookie);
-  }, []);
+  }, [phone]);
   // Restore which surface COLUMNS were folded (Story 48.1), for the fourth time
   // and the same reason, doubled: the notes rail, the note list, the Files tree
   // and the chat list live on three different primary views, and every one of
@@ -158,8 +181,11 @@ export function AppShell() {
   // be four chances to forget one, and the forgotten one is invisible until
   // somebody switches surfaces twice. Idempotent, like the three above.
   useEffect(() => {
+    if (phone) {
+      return;
+    }
     hydrateColumnFold(document.cookie);
-  }, []);
+  }, [phone]);
   // The user's fold, and how it composes with the viewport's.
   //
   // OR, not "the user wins": below 1080px there is no room for a 260px drawer
@@ -267,7 +293,34 @@ export function AppShell() {
 
   return (
     <TooltipProvider>
-      <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
+      {/* `h-dvh`, not `h-screen` (Epic 65, AD-189): on a phone `100vh` is the
+          LARGEST viewport — the one with the browser chrome retracted — so a
+          root sized by it is taller than what is on screen and its bottom is
+          off it; `100dvh` is the height the viewport has right now, and it
+          follows a rotation, the keyboard's `--kb-inset` aside, and the
+          safe-area insets the phone shell already pads for. On the desktop the
+          two are the same number.
+
+          Measured on the phone rig (`dev/measure-bots.ts --phone` and
+          `--phone-landscape`, hesperia's headless Chrome, iPhone 14 Pro Max
+          metrics, 2026-09-05), the Bots conversation open — where a headless
+          viewport has no dynamic chrome, so the numbers show the TIER and its
+          budget, not the `vh`/`dvh` gap:
+
+            430×932 before  phone tier   transcript 742 of 932px = 79.6%
+            932×430 before  DESKTOP tier transcript  48 of 430px = 11.2%
+                            (a rail, "MENU", a Conversation list column, the
+                            desktop pane's header and voice block; the Talk and
+                            Send controls clipped at the bottom edge)
+            430×932 → 932×430 rotated, before: desktop tier, the open
+                            conversation gone, transcript 24 of 430px = 5.6%
+            430×932 after   phone tier   transcript 742 of 932px = 79.6%
+            932×430 after   phone tier   transcript 240 of 430px = 55.8%
+                            (52px back bar, 37px state line, 102px composer;
+                            bottom edge at 430 = inside the viewport)
+            rotated either way, after: still the phone tier, the same
+                            conversation level still open, 79.6% ⇄ 55.8% */}
+      <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
         {/* One drag band, painted per column (AD-34-2, AD-34-3). It is the single
             element that both makes the window movable and clears the floating
             window controls, which is why no pane reserves an inset of its own. The
@@ -300,9 +353,10 @@ export function AppShell() {
         <VerifyBanner />
         <div className="flex min-h-0 min-w-0 flex-1">
           {phone ? (
-            // Below 768px the single-pane stack replaces the sidebar + panes row
-            // (Story 13.1); the global overlays/dialogs/shortcut hooks below stay
-            // mounted in both arrangements.
+            // The single-pane stack replaces the sidebar + panes row (Story
+            // 13.1) — on a reduced-capability platform at every width, and
+            // elsewhere below 768px (AD-189); the global overlays/dialogs/
+            // shortcut hooks below stay mounted in both arrangements.
             <PhoneShell />
           ) : (
             <>

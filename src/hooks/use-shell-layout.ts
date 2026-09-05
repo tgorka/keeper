@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 
 const PHONE_BREAKPOINT = 768;
 /**
@@ -11,7 +12,25 @@ export const SIDEBAR_COLLAPSE_BREAKPOINT = 1080;
 const DETAIL_FLOAT_BREAKPOINT = 1280;
 
 export interface ShellLayout {
-  /** Single-pane phone stack replaces the three-pane frame below 768px (Story 13.1). */
+  /**
+   * Single-pane phone stack instead of the three-pane frame (Story 13.1).
+   *
+   * True on a reduced-capability platform at EVERY width (Epic 65, AD-189):
+   * an iPhone rotated to 932px is still an iPhone, and the desktop frame it
+   * used to render there was clipped at 430px tall and wrote folds the phone
+   * tier then inherited. Off such a platform the width rule stands — below
+   * 768px the desktop dev harness and a narrow Mac window get the stack, as
+   * they always have.
+   *
+   * Before Rust has answered `capabilities()` the platform is unknown and the
+   * width is the only fact, so the width rule decides alone for those frames.
+   * That is the honest default rather than "phone until told otherwise",
+   * because it is exactly what every build has rendered until now and it
+   * corrects itself the moment the answer lands; in practice the answer is
+   * already in the store when the shell mounts (`App` requests it in the same
+   * effect batch as `session_restore`, which the shell waits on). The reverse
+   * guess would flash the phone stack over every desktop window instead.
+   */
   phone: boolean;
   /** Sidebar collapses to a 48px icon rail below 1080px. */
   sidebarCollapsed: boolean;
@@ -20,6 +39,7 @@ export interface ShellLayout {
 }
 
 export function useShellLayout(): ShellLayout {
+  const reduced = useIsReducedCapabilityPlatform();
   const [layout, setLayout] = React.useState<ShellLayout>(() => {
     // Initialize synchronously from the current viewport so a narrow window
     // does not flash the wide layout for one frame before the effect runs.
@@ -59,5 +79,7 @@ export function useShellLayout(): ShellLayout {
     };
   }, []);
 
-  return layout;
+  // Only the tier is the platform's; the column rules stay the viewport's,
+  // because they only ever matter on the desktop frame.
+  return reduced ? { ...layout, phone: true } : layout;
 }

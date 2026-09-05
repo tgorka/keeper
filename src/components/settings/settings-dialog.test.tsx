@@ -115,6 +115,9 @@ vi.mock("@/lib/ipc/client", () => ({
   egressList: vi.fn(() => Promise.resolve([])),
   debugModeGet: vi.fn(() => Promise.resolve(false)),
   debugModeSet: vi.fn(() => Promise.resolve()),
+  // Story 65.3: where this device's log is, and the voice port's record.
+  debugLogPath: vi.fn(() => Promise.resolve("/Users/alice/Library/Logs/keeper/keeper.log")),
+  voiceEvents: vi.fn(() => Promise.resolve([])),
   verificationCancel: vi.fn(() => Promise.resolve()),
   iosSyncDisclosureShownGet: vi.fn(() => Promise.resolve(true)),
   iosSyncDisclosureShownSet: vi.fn(() => Promise.resolve()),

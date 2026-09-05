@@ -7,7 +7,13 @@ import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useVoiceFacts } from "@/hooks/use-voice-facts";
-import { debugModeGet, debugModeSet, type EgressEndpointVm, egressList } from "@/lib/ipc/client";
+import {
+  debugLogPath,
+  debugModeGet,
+  debugModeSet,
+  type EgressEndpointVm,
+  egressList,
+} from "@/lib/ipc/client";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { useVoiceStore } from "@/lib/stores/voice";
 
@@ -43,9 +49,16 @@ const IOS_DOCS_URL = "https://github.com/tgorka/keeper/blob/main/docs/ios.md";
 /**
  * The honest debug-mode disclosure (Story 22.5, FR-79): names exactly what
  * lands on disk and where, and that it is local-only. Off by default.
+ *
+ * `logPath` is what Rust answers for this device (`debug_log_path`, Story
+ * 65.3, AD-192) — the Mac's `~/Library/Logs/keeper/keeper.log`, the phone's
+ * own container path — never a literal typed here, because the one literal
+ * this sentence used to carry named the Mac's folder on every platform.
+ * `null` is the answer not yet in, and names the file without a folder.
  */
-export const DEBUG_MODE_SENTENCE =
-  "Writes app logs to ~/Library/Logs/keeper/keeper.log and a per-recording events.log beside each session's manifest. Local files only — nothing is uploaded.";
+export function debugModeSentence(logPath: string | null): string {
+  return `Writes app logs to ${logPath ?? "keeper.log"} and a per-recording events.log beside each session's manifest. Local files only — nothing is uploaded.`;
+}
 
 /**
  * The five honesty lines of the reduced-platform (phone tier) "On this iPhone"
@@ -178,6 +191,9 @@ export function AboutSection({ open }: { open: boolean }) {
   // Debug-mode toggle (Story 22.5): `undefined` = still loading.
   const [debugMode, setDebugMode] = useState<boolean | undefined>(undefined);
   const debugWriteId = useRef(0);
+  // Where this device's app log is, as Rust answers it (Story 65.3): `null`
+  // until it has, or when it could not.
+  const [logPath, setLogPath] = useState<string | null>(null);
   // The detected-but-not-yet-installed update, held between the two clicks. Not state:
   // it is not rendered, only consumed by the install step.
   const pendingUpdate = useRef<Update | null>(null);
@@ -227,6 +243,19 @@ export function AboutSection({ open }: { open: boolean }) {
         // A read failure renders the honest default (off) rather than a stuck spinner.
         if (!cancelled) {
           setDebugMode(false);
+        }
+      });
+    void debugLogPath()
+      .then((path) => {
+        if (!cancelled) {
+          setLogPath(path);
+        }
+      })
+      .catch(() => {
+        // Unanswered: the sentence names the file and no folder, never the
+        // Mac's folder on a phone.
+        if (!cancelled) {
+          setLogPath(null);
         }
       });
     void egressList()
@@ -410,7 +439,7 @@ export function AboutSection({ open }: { open: boolean }) {
             onCheckedChange={onDebugModeChange}
           />
         </div>
-        <p className="text-muted-foreground text-xs">{DEBUG_MODE_SENTENCE}</p>
+        <p className="text-muted-foreground text-xs">{debugModeSentence(logPath)}</p>
       </div>
 
       {macVoice && (

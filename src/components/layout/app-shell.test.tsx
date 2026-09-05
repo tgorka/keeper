@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AppShell } from "@/components/layout/app-shell";
 import { SIDEBAR_WIDTH_CLASS } from "@/components/layout/sidebar-pane";
@@ -8,6 +8,7 @@ import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabiliti
 import {
   COLUMN_FOLD_COOKIE,
   columnFoldCookie,
+  columnFoldStore,
   columnsUnfolded,
   resetColumnFoldForTest,
 } from "@/lib/stores/column-fold";
@@ -32,10 +33,20 @@ import {
   resetSidebarFoldForTest,
   SIDEBAR_FOLD_COOKIE,
   sidebarFoldCookie,
+  sidebarFoldStore,
   unfolded,
 } from "@/lib/stores/sidebar-fold";
 
 const beginTitleBarDrag = vi.fn();
+
+/**
+ * A desktop with every gated view off. One desktop-only flag is on so
+ * `isReducedCapabilityPlatform` reads it as a desktop: since Epic 65 (AD-189)
+ * the all-`false` hydrated snapshot IS the phone, and the tier it renders is
+ * the stack — so a test of "the pane is absent when its flag is off" would
+ * otherwise pass for the wrong reason.
+ */
+const DESKTOP_WITHOUT_VIEWS = { ...DEFAULT_CAPABILITIES, trayIcon: true };
 
 // The band's drag path is asserted here as "the app asked for a drag"; what the
 // window layer answers is `titlebar-drag`'s own suite.
@@ -68,9 +79,13 @@ function mockViewportWidth(width: number) {
 }
 
 afterEach(() => {
+  // Unmount BEFORE the stores are reset. The capabilities reset below flips a
+  // still-mounted phone-tier shell back to the desktop frame, whose restore
+  // effects then fire late — after the cookies are cleared and the latches
+  // reset — and latch every store on an empty document. The next test's
+  // restore then finds the latch set and reads nothing.
+  cleanup();
   window.matchMedia = originalMatchMedia;
-  // Detail-open now lives in the shared detail store (Story 13.1); reset it so
-  // one test's open panel never leaks into the next.
   detailStore.setState({ open: false });
   roomsStore.getState().selectRoom(null);
   primaryViewStore.getState().setView("inbox");
@@ -166,6 +181,124 @@ describe("AppShell", () => {
     expect(screen.getByRole("main")).toBeInTheDocument();
   });
 
+  // ── The tier is the platform's (Epic 65, AD-189, FR-441…FR-443) ─────────────
+  it("renders the phone stack on a reduced-capability platform at a landscape width", () => {
+    // The owner's report: an iPhone 14 Pro Max rotated is 932px wide, and the
+    // width rule rendered the desktop frame there at 430px tall.
+    mockViewportWidth(932);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<AppShell />);
+
+    expect(screen.queryByRole("navigation", { name: "Views" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("main")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
+  });
+
+  it("keeps the desktop frame on a desktop at 1440", () => {
+    mockViewportWidth(1440);
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITHOUT_VIEWS);
+    render(<AppShell />);
+
+    expect(screen.getByRole("navigation", { name: "Views" })).toBeInTheDocument();
+    expect(screen.getByRole("main")).toBeInTheDocument();
+  });
+
+  it("sizes the root by the dynamic viewport, not the largest one", () => {
+    // `100vh` on a phone is the viewport with the chrome retracted, which is
+    // taller than the screen; `100dvh` is what is on it now and follows a
+    // rotation. The two agree on the desktop.
+    render(<AppShell />);
+
+    const root = screen.getByRole("navigation", { name: "Views" }).closest(".h-dvh");
+    expect(root).not.toBeNull();
+    expect(document.querySelector(".h-screen")).toBeNull();
+  });
+
+  it("reads none of the desktop cookies on the phone tier", async () => {
+    // Every one of the four restores is desktop state the stack never mounts a
+    // control for. Left over from an older build's landscape session (or from
+    // a desktop profile the harness shares), they must stay unread: a phone
+    // that inherits a folded drawer or a folded chat list has no way to unfold
+    // either.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = sidebarFoldCookie({ menu: true, groups: { spaces: true, networks: true } });
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = columnFoldCookie({ ...columnsUnfolded(), "chat-list": true });
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = filesTreeCookie(new Set([nodeKey("p1", "docs")]));
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = panelsCookie(
+      [
+        {
+          id: "p",
+          target: { kind: "file", profileId: "p1", relativePath: "docs/report.pdf" },
+          replaced: null,
+          folded: false,
+        },
+      ],
+      "p",
+    );
+    mockViewportWidth(932);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(sidebarFoldStore.getState().menu).toBe(false);
+    expect(sidebarFoldStore.getState().groups).toEqual(unfolded().groups);
+    expect(columnFoldStore.getState().columns["chat-list"]).toBe(false);
+    expect(filesTreeStore.getState().expanded.size).toBe(0);
+    expect(panelsStore.getState().panels.every((panel) => panel.target === null)).toBe(true);
+    // And the stack is what rendered: the chat list at level 0, unfolded.
+    expect(screen.getByLabelText("Loading conversations")).toBeInTheDocument();
+  });
+
+  it("restores the desktop cookies once a harness window widens into the desktop frame", async () => {
+    // The one place the tier still changes: a non-reduced platform crossing
+    // 768px. The restore that was held while the stack was up runs on the
+    // first desktop frame, so the fold comes back exactly as the width rule
+    // alone used to restore it at mount.
+    // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
+    document.cookie = sidebarFoldCookie({ menu: true, groups: { spaces: false, networks: false } });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITHOUT_VIEWS);
+    const listeners: Array<() => void> = [];
+    let width = 600;
+    window.matchMedia = vi.fn().mockImplementation((query: string) => {
+      const match = query.match(/max-width:\s*(\d+)px/);
+      const maxWidth = match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+      return {
+        get matches() {
+          return width <= maxWidth;
+        },
+        media: query,
+        onchange: null,
+        addEventListener: (_: string, listener: () => void) => listeners.push(listener),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      };
+    });
+
+    render(<AppShell />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(sidebarFoldStore.getState().menu).toBe(false);
+
+    width = 1440;
+    act(() => {
+      for (const listener of listeners) {
+        listener();
+      }
+    });
+
+    expect(sidebarFoldStore.getState().menu).toBe(true);
+    expect(screen.getByRole("button", { name: "Expand menu" })).toBeInTheDocument();
+  });
+
   // ── Recording view (Story 16.3) ────────────────────────────────────────────
   it("renders the Recording pane for the recording view when the capability is on", () => {
     capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, recording: true });
@@ -180,7 +313,7 @@ describe("AppShell", () => {
   it("does not render the Recording pane when the recording capability is off", () => {
     // A stale "recording" primary-view must never show the pane where recording is
     // unavailable (the flag is off) — no dead surface.
-    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITHOUT_VIEWS);
     primaryViewStore.getState().setView("recording");
     render(<AppShell />);
 
@@ -202,7 +335,7 @@ describe("AppShell", () => {
   it("does not render the Recordings browser when the recording capability is off", () => {
     // A browser over recordings this build cannot make is a puzzle: the surface
     // is ABSENT from the DOM, not empty and not disabled.
-    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITHOUT_VIEWS);
     primaryViewStore.getState().setView("recordings");
     render(<AppShell />);
 
@@ -222,7 +355,7 @@ describe("AppShell", () => {
   it("does not render the Sync pane when the sync capability is off", () => {
     // A stale "sync" primary-view must never show the pane on a machine with no
     // usable `git`, where every command behind it rejects as unsupported.
-    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITHOUT_VIEWS);
     primaryViewStore.getState().setView("sync");
     render(<AppShell />);
 
@@ -245,7 +378,7 @@ describe("AppShell", () => {
   it("does not render the Files pane when the sync capability is off", () => {
     // A stale "files" primary-view must never show a browser over folders this
     // build cannot sync — the same rule the Sync pane above is gated by.
-    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITHOUT_VIEWS);
     primaryViewStore.getState().setView("files");
     render(<AppShell />);
 
@@ -298,7 +431,7 @@ describe("AppShell", () => {
   it("renders no drag band where the platform draws its own title bar", () => {
     // Off macOS the window controls live in a real title bar above the webview, so
     // a band there is empty space under chrome the OS already owns (AD-34-2).
-    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITHOUT_VIEWS);
     render(<AppShell />);
 
     expect(document.querySelectorAll("[data-tauri-drag-region]")).toHaveLength(0);
