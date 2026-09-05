@@ -6,8 +6,10 @@ import { type MouseEvent, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { useVoiceFacts } from "@/hooks/use-voice-facts";
 import { debugModeGet, debugModeSet, type EgressEndpointVm, egressList } from "@/lib/ipc/client";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import { useVoiceStore } from "@/lib/stores/voice";
 
 /**
  * The honest disclosure of what the egress list is and the no-telemetry invariant
@@ -63,6 +65,27 @@ export const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
   "Bots talks to a model but cannot reach the folders you sync — the drive tools live on your Mac.",
   "Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.",
   "Listening stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit; while it listens the microphone indicator stays lit and it uses battery.",
+];
+
+/**
+ * The honesty lines of the desktop tier's "On this Mac" voice disclosure
+ * (Epic 63, Story 63.8, AD-175, AD-178). The Mac has a voice port of its own
+ * now, and the two things a person would assume from the phone's lines are not
+ * true here: there is no `AVAudioSession` on macOS, so keeper cannot lower other
+ * audio, and it releases the microphone while it speaks instead. Project voice:
+ * sentence case, no exclamation marks, honest consequence-naming.
+ *
+ * Present on exactly one condition beyond the tier — `voice_availability`'s
+ * answer is not `unsupported` — read from the voice store, never a capability
+ * flag (AD-179). Mirrored one-to-one into the "On this Mac" list of
+ * `docs/egress.md`; `about-section.test.tsx` reads that file from disk and
+ * fails when the two lists differ. Edit both together or neither.
+ */
+export const MACOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
+  "Speech is recognised on this Mac itself and never sent to a server; a language whose on-device recogniser is not installed is refused, not uploaded.",
+  "The microphone is open only while voice is on — after you press Talk, the hotkey or the tray item, or while it listens for your wake phrase — and the system microphone indicator shows it.",
+  "Nothing is recorded or uploaded; what you said reaches only the model endpoint you configured, as text.",
+  "keeper does not lower other audio while it listens or speaks, because macOS has no audio session that could; it stops listening while it talks instead.",
 ];
 
 /**
@@ -129,6 +152,21 @@ export function AboutSection({ open }: { open: boolean }) {
   // Whether this is the capability-reduced (phone) tier — drives the "On this
   // iPhone" disclosure list below.
   const reducedPlatform = useIsReducedCapabilityPlatform();
+  // The desktop tier is the mirror hydrated and not reduced; `reducedPlatform`
+  // is false before hydration too, so the Mac block needs the `hydrated` term
+  // for the same reason the iPhone one does — never a flash on the wrong tier.
+  const hydrated = useCapabilitiesStore((s) => s.hydrated);
+  // Whether this Mac has a voice port that answers (Story 63.8, AD-179): the
+  // one runtime answer every voice surface reads, never a capability flag.
+  // `undefined` is a question not yet asked, and the disclosure is not drawn
+  // from it; `unsupported` is every build without a port.
+  useVoiceFacts(open);
+  const voiceUnavailable = useVoiceStore((s) => s.unavailable);
+  const macVoice =
+    hydrated &&
+    !reducedPlatform &&
+    voiceUnavailable !== undefined &&
+    voiceUnavailable?.kind !== "unsupported";
   // `undefined` = still loading; `null` = load failed; otherwise the egress list.
   const [endpoints, setEndpoints] = useState<EgressEndpointVm[] | null | undefined>(undefined);
   // The installed app version, read once per open from the bundle metadata
@@ -374,6 +412,19 @@ export function AboutSection({ open }: { open: boolean }) {
         </div>
         <p className="text-muted-foreground text-xs">{DEBUG_MODE_SENTENCE}</p>
       </div>
+
+      {macVoice && (
+        <div className="mt-1 flex flex-col gap-1.5">
+          <p className="font-medium">On this Mac</p>
+          <ul className="flex flex-col gap-1">
+            {MACOS_DISCLOSURE_LINES.map((line) => (
+              <li key={line} className="text-muted-foreground text-xs">
+                {line}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {reducedPlatform && (
         <div className="mt-1 flex flex-col gap-1.5">

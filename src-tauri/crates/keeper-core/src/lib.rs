@@ -47,3 +47,4 @@ pub mod vault_link;
 pub mod verification;
 pub mod vm;
 pub mod voice;
+pub mod voice_reach;

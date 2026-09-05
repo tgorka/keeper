@@ -245,6 +245,10 @@ iOS release hygiene and are checked by hand at release time.
 
 - [ ] **IPA build path exercised (Story 15.3).** Run `bun run verify:ios-ipa` and confirm the
   unsigned IPA export succeeds, following the build recipe in [`docs/ios.md`](ios.md).
+- [ ] **The IPA renders (AD-173).** Run `bash scripts/check-bundle.sh <path/to/keeper.ipa>` on
+  the exported IPA and confirm it exits 0. A `--debug` build signs and installs like a real one
+  and opens to a blank screen; the check refuses it, naming the cause (see
+  [`docs/ios.md`](ios.md#the-build-that-installs-and-shows-nothing---debug)).
 - [ ] **`docs/ios.md` current (Story 15.2).** Confirm [`docs/ios.md`](ios.md) is up to date and
   its `## Limitations` section is still one-to-one with the in-app "On this iPhone" disclosure
   (Settings → About).

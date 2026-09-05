@@ -86,6 +86,7 @@ import type {
   TaskSchedulePreviewVm,
   TaskVm,
   VoiceStateVm,
+  VoiceUnavailableVm,
   VoiceWakeVm,
 } from "@/lib/ipc/client";
 
@@ -2281,6 +2282,9 @@ const BOT_SESSIONS: BotSessionVm[] = [
     updatedMs: NOW - 3_600_000,
     archived: false,
     remoteSessionId: null,
+    // Epic 63: the gateway's word on the session, absent on a local-only row.
+    remoteLastActiveMs: null,
+    remoteSource: null,
   },
   {
     id: "01J8BOTSESSIONBBBBBBBBBBBB",
@@ -2291,6 +2295,10 @@ const BOT_SESSIONS: BotSessionVm[] = [
     updatedMs: NOW - 80_000_000,
     archived: false,
     remoteSessionId: "hermes-9f21",
+    // Epic 63: a session the gateway listed — written through its API door,
+    // last seen moving a while ago, so the list's Remote label has a row.
+    remoteLastActiveMs: NOW - 79_000_000,
+    remoteSource: "api",
   },
   // Archived, so the list's Archived filter and its Unarchive verb have
   // something to act on (Story 61.6). A harness whose archive is always empty
@@ -2304,6 +2312,8 @@ const BOT_SESSIONS: BotSessionVm[] = [
     updatedMs: NOW - 29 * 86_400_000,
     archived: true,
     remoteSessionId: null,
+    remoteLastActiveMs: null,
+    remoteSource: null,
   },
 ];
 
@@ -2365,6 +2375,7 @@ const BOT_CONVERSATIONS: Record<string, BotConversationVm> = {
           "I cannot read your folders yet — no grant is held for this bot, so nothing on the drive was looked at.",
       }),
     ],
+    transcript: "local",
   },
   "01J8BOTSESSIONBBBBBBBBBBBB": {
     session: BOT_SESSIONS[1] as BotSessionVm,
@@ -2386,8 +2397,13 @@ const BOT_CONVERSATIONS: Record<string, BotConversationVm> = {
         finishReason: "failed",
       }),
     ],
+    // Epic 63 (AD-181): this one is read from the gateway, and says so.
+    transcript: "remote",
   },
 };
+
+/** How many follow reads the harness has answered (Story 63.7). */
+let botFollowReads = 0;
 
 /** What the fake stream says, one delta per element. */
 const BOT_FAKE_ANSWER = [
@@ -2665,6 +2681,47 @@ const BOT_AUDIT: BotAuditRowVm[] = [
 let botMessageDetails = false;
 
 /**
+ * Which languages the faked device can recognise on-device (Epic 63): three
+ * states, chosen with `?voice=many|one|none` on the dev URL, because the
+ * surface has to be looked at in each — a list to choose from, a list of one,
+ * and the absence with Rust's refusal explaining it. `many` is the default.
+ * The hesperia probe found exactly four on a stock Mac, none of them Polish.
+ */
+const VOICE_ON_DEVICE_LOCALES: Record<string, string[]> = {
+  many: ["en-ID", "en-PH", "en-SA", "en-US"],
+  one: ["en-US"],
+  none: [],
+};
+const voiceOnDeviceLocales =
+  VOICE_ON_DEVICE_LOCALES[new URLSearchParams(window.location.search).get("voice") ?? "many"] ??
+  VOICE_ON_DEVICE_LOCALES.many;
+/** The faked system language: Polish, the owner's own phone. */
+const VOICE_SYSTEM_LOCALE = "pl-PL";
+
+/** Why the faked device cannot listen, or `null`. The language in force is
+ *  the explicit setting when set, else the system language — in force even
+ *  when refused, which is the owner's case: a Polish phone is never silently
+ *  switched to English; the refusal names the list and the picker beside it
+ *  is how English gets chosen. The sentence is Rust's own shape for the
+ *  iPhone (`keeper_core::voice`; the noun and the download path are the
+ *  platform's). */
+function voiceUnavailable(): VoiceUnavailableVm | null {
+  const locale = voiceWake.locale;
+  if (voiceOnDeviceLocales.includes(locale)) {
+    return null;
+  }
+  const remedy =
+    voiceOnDeviceLocales.length === 0
+      ? `which may add it for ${locale} or for any other language`
+      : `which may add it, or choose a language this iPhone can already run on its own: ${voiceOnDeviceLocales.join(", ")}`;
+  return {
+    kind: "noOnDeviceRecognition",
+    locale,
+    message: `this iPhone has no on-device speech recognition for ${locale}, and keeper never sends your voice to a server — download that language under Settings > General > Keyboard > Dictation Languages, ${remedy}`,
+  };
+}
+
+/**
  * Story 62.5's wake phrase, faked. The switch starts off and the phrase is the
  * shipped default, and both round-trip, because the flow worth looking at is
  * turning listening on and watching the chip appear. `voice_availability`
@@ -2676,6 +2733,9 @@ let voiceWake: VoiceWakeVm = {
   phrase: "nixie",
   limits:
     "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. It stops when you turn it off, when iOS ends the audio session, or when keeper is force-quit. The microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
+  locale: VOICE_SYSTEM_LOCALE,
+  localeChosen: null,
+  onDeviceLocales: voiceOnDeviceLocales,
 };
 /** The one watcher, so `voice_wake_set` can push the new idle snapshot. */
 let voiceWatcher: MockChannel<VoiceStateVm> | null = null;
@@ -2706,6 +2766,36 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       ? BOT_SESSIONS
       : BOT_SESSIONS.filter((session) => !session.archived),
   bots_session_open: (payload) => BOT_CONVERSATIONS[String(payload.sessionId)] ?? null,
+  // Story 63.7: the remote conversation is followed. The first read shows the
+  // other device's question landing with the caption up; the second lands
+  // its answer and stops, so the harness shows both states and never polls
+  // forever.
+  bots_session_follow: (payload) => {
+    const open = BOT_CONVERSATIONS[String(payload.sessionId)];
+    if (open === undefined || open.transcript !== "remote") {
+      return { messages: null, live: false, nextPollMs: null };
+    }
+    botFollowReads += 1;
+    const theirs = botMessage({
+      id: "01J8BOTMSG5",
+      sessionId: open.session.id,
+      seq: open.messages.length,
+      role: "user",
+      content: "And the changelog line for the phone?",
+    });
+    if (botFollowReads % 2 === 1) {
+      return { messages: [...open.messages, theirs], live: true, nextPollMs: 2000 };
+    }
+    const answer = botMessage({
+      id: "01J8BOTMSG6",
+      sessionId: open.session.id,
+      seq: open.messages.length + 1,
+      role: "assistant",
+      content: "Bots on the phone, reachable without an account.",
+      finishReason: "stop",
+    });
+    return { messages: [...open.messages, theirs, answer], live: false, nextPollMs: null };
+  },
   // Story 61.6's four. The search really searches — titles and bodies, the two
   // things Rust matches — because a harness whose filter does nothing teaches
   // the reviewer that the filter does nothing. The three writes answer with a
@@ -2742,6 +2832,9 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
           session,
           latestActivityMs: Math.max(session.updatedMs, newest),
           messageCount: messages.length,
+          // Epic 63 (AD-181): `bots::remote::transcript_source`'s rule — the
+          // conversation's own answer where the mock holds one, else local.
+          transcript: BOT_CONVERSATIONS[session.id]?.transcript ?? "local",
         };
       })
       .sort((a, b) =>
@@ -2970,7 +3063,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     return null;
   },
   // --- Voice (Epic 62, Story 62.5) ----------------------------------------
-  voice_availability: () => null,
+  voice_availability: () => voiceUnavailable(),
   voice_watch: (payload) => {
     voiceWatcher = payload.channel as MockChannel<VoiceStateVm>;
     voiceWatchSerial += 1;
@@ -3000,19 +3093,37 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     voiceWatcher?.onmessage?.(voiceIdle());
     return voiceWake;
   },
+  voice_locale_set: (payload) => {
+    const chosen = typeof payload.locale === "string" ? payload.locale : null;
+    if (chosen !== null && !voiceOnDeviceLocales.includes(chosen)) {
+      throw {
+        code: "internal",
+        message: `${chosen} cannot run on this phone — choose one of the languages listed`,
+        accountId: null,
+        retriable: false,
+      };
+    }
+    voiceWake = { ...voiceWake, localeChosen: chosen, locale: chosen ?? VOICE_SYSTEM_LOCALE };
+    return voiceWake;
+  },
   // --- Voice, the talk mode (Epic 62, Story 62.6) --------------------------
   //
   // A scripted turn so the mic control's three states can be looked at in
   // `bun run dev`: listening with an interim transcript, then heard. What is
   // heard lands in the composer; nothing here sends. `voice_authorize`
-  // answers "granted" — the dialogs are the phone's.
+  // answers "granted" — the dialogs are the phone's. The level (Epic 64,
+  // Story 64.3) rises with the words and falls once they are heard, at the
+  // ~25 Hz Rust bounds it to, so an indicator can be looked at too.
   voice_authorize: () => null,
   voice_start: () => {
     const push = (state: VoiceStateVm) => voiceWatcher?.onmessage?.(state);
-    push({ kind: "listening", heard: "" });
-    setTimeout(() => push({ kind: "listening", heard: "what did I" }), 400);
-    setTimeout(() => push({ kind: "listening", heard: "what did I save yesterday" }), 900);
-    setTimeout(() => push({ kind: "heard", text: "what did I save yesterday" }), 1600);
+    push({ kind: "listening", heard: "", level: null });
+    for (let tick = 1; tick <= 40; tick++) {
+      const heard = tick < 10 ? "" : tick < 22 ? "what did I" : "what did I save yesterday";
+      const level = 0.15 + 0.5 * Math.abs(Math.sin(tick / 3));
+      setTimeout(() => push({ kind: "listening", heard, level }), tick * 40);
+    }
+    setTimeout(() => push({ kind: "heard", text: "what did I save yesterday", level: 0.1 }), 1700);
     return null;
   },
   voice_stop: () => {

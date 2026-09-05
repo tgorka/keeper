@@ -21,7 +21,14 @@ import { useVoiceStream } from "@/hooks/use-voice-stream";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { voiceStore } from "@/lib/stores/voice";
 
-const WAKE: VoiceWakeVm = { enabled: false, phrase: "nixie", limits: "costs" };
+const WAKE: VoiceWakeVm = {
+  enabled: false,
+  phrase: "nixie",
+  limits: "costs",
+  locale: "en-US",
+  localeChosen: null,
+  onDeviceLocales: ["en-US"],
+};
 const LISTENING: VoiceStateVm = { kind: "idle", wake: "nixie", listeningForWake: true };
 
 beforeEach(() => {

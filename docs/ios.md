@@ -242,9 +242,13 @@ iOS 26.6.1, Xcode 26.6):
    Tauri CLI over a local socket and aborts with `failed to build WebSocket client`
    when xcodebuild is driven standalone.
 
-3. **Install and launch with `devicectl`**, since Xcode's Run button is not available:
+3. **Check the IPA, then install and launch with `devicectl`**, since Xcode's Run
+   button is not available. The check is not optional: a `--debug` build passes every
+   step of this sequence and shows nothing on the phone (see
+   [The build that installs and shows nothing](#the-build-that-installs-and-shows-nothing---debug)).
 
    ```sh
+   bash scripts/check-bundle.sh src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
    xcrun devicectl device install app --device <udid> \
      src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
    xcrun devicectl device process launch --device <udid> dev.tgorka.keeper
@@ -260,6 +264,32 @@ iOS 26.6.1, Xcode 26.6):
    `devicectl` has no screenshot verb, and the legacy `idevicescreenshot` service is
    gone on iOS 26 (`Could not start screenshotr service`), so pixels from a physical
    phone need a human or Xcode. Use the simulator for layout measurement.
+
+### The scripted path: `bun run install:ios`
+
+Everything in this section, in that order, is what `scripts/install-ios.sh` does
+(`bun run install:ios [host]`, default host `$KEEPER_MACOS_HOST` or `hesperia`), and it
+is the supported way to put a build on a phone from a Linux workstation. It rsyncs the
+tree, builds inside the Mac's GUI session with `--export-method debugging`, runs
+`scripts/check-bundle.sh`'s check and the designated-requirement check on the IPA
+before the phone sees it, installs and launches with `devicectl`, then prints what it
+read off the bundle — `Speech.framework` in `otool -L`, both usage strings, `UIBackgroundModes`,
+the designated requirement — and, last, the three things only a person at the phone
+can do (permission prompts, dictation language, arming the wake phrase, which is off on
+a fresh install).
+
+It refuses, naming the remedy each time, when: the Mac is unreachable; Xcode, xcodegen,
+cocoapods, bun, the `aarch64-apple-ios` target or an Apple Development identity is
+missing; no iPhone is on the USB bus, or one is but is unpaired, or Developer Mode is
+off; `APPLE_DEVELOPMENT_TEAM` is unset (it prints the team id read off the certificate as
+the line to export); the build hits the Personal Team entitlement wall (the remedy is
+`KEEPER_IOS_FREE_TEAM=1`, which drops the `entitlements:` block from the remote copy of
+`project.yml`, regenerates, and verifies `CODE_SIGN_ENTITLEMENTS` is gone while
+`Speech.framework` is still referenced) or has no provisioning profile
+(`KEEPER_IOS_REGISTER_DEVICE=1` mints one first); the IPA cannot render or is ad-hoc
+signed; or the launch is refused for an untrusted certificate or a lapsed profile.
+`KEEPER_IOS_BUILD_ONLY=1` stops after the gates; `KEEPER_IOS_DEVICE=<udid>` picks the
+phone when several are cabled.
 
 ## The 7-day re-arm ritual
 
@@ -321,6 +351,39 @@ src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
 The exact subdirectory and filename are derived from the product name and export, so
 confirm the precise path from your first build's output. Everything under `build/` is
 excluded by `src-tauri/.gitignore`, so an IPA left at that path is never committed.
+
+### The build that installs and shows nothing (`--debug`)
+
+`bun run tauri ios build --debug --target aarch64` produces an IPA that signs, installs
+and launches like the real one and opens to an almost empty screen. Measured on
+2026-09-03 on kalypso, from the installed `keeper.app`:
+
+```sh
+ls keeper.app/assets                                   # empty: no frontend on disk
+grep -rlo "Listen for a phrase" keeper.app             # 0 hits for every UI string tried
+strings -a keeper.app/keeper | grep -c "localhost:1420"   # 1
+```
+
+A debug profile is a *dev* build to Tauri: the executable embeds no frontend, the
+`assets/` folder resource is copied empty, and the webview is pointed at
+`build.devUrl` — the Vite dev server, which does not run on a phone. Note that the
+third line is not evidence on its own: `tauri.conf.json` is compiled into every keeper
+binary, `devUrl` included, so a correct build matches it too. What a correct build has
+and a `--debug` build lacks is the embedded frontend.
+
+The one-line recipe that avoids it is the one above: `bun run tauri ios build
+--export-method debugging`. The check that refuses the bad one is
+
+```sh
+bash scripts/check-bundle.sh src-tauri/crates/keeper/gen/apple/build/arm64/keeper.ipa
+```
+
+which exits 1 with a sentence naming the cause — empty `assets/`, no `index.html`, or an
+executable that embeds no frontend and carries the dev URL — and the recipe to run
+instead. Run it on every IPA before it goes near a phone or a tester; the install steps
+below and in [Installing from a machine you only reach over ssh](#installing-from-a-machine-you-only-reach-over-ssh)
+are not finished until it passes. The macOS install path runs the same check itself
+(`scripts/build-macos-signed.sh`, dispatched by `bun run install:macos`).
 
 ### What "debugging" export means, and why not "unsigned"
 

@@ -2669,7 +2669,7 @@ version = "0.2.4"
 source = "git+https://github.com/tgorka/gitoxide?branch=keeper%2Fgix-filter-0.33-reap#0ae30235f7b146334a47ad617646c933af97e4fa"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -4144,6 +4144,7 @@ dependencies = [
  "objc2",
  "objc2-avf-audio",
  "objc2-foundation",
+ "objc2-natural-language",
  "objc2-speech",
  "objc2-user-notifications",
  "objc2-web-kit",
@@ -5338,6 +5339,16 @@ checksum = "2a1e6550c4caed348956ce3370c9ffeca70bb1dbed4fa96112e7c6170e074586"
 dependencies = [
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-natural-language"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43f3395c4eda23486f1ca42da8256021a99cf94ebe3cf189bfafeb7e197f8a6d"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

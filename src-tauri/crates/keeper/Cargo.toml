@@ -125,6 +125,20 @@ objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-web-kit = { workspace = true }
 block2 = { workspace = true }
+# The macOS voice port (Epic 63, Story 63.4, AD-175): the same two crates the
+# iOS port uses, at the same versions — `SFSpeechRecognizer` (objc2-speech)
+# and `AVAudioEngine`, `AVAudioApplication`, `AVSpeechSynthesizer`
+# (objc2-avf-audio) — reached only from `voice_macos.rs`, whose audited
+# function-level `#[allow(unsafe_code)]` entries are listed in
+# docs/constraints-and-limitations.md. No `AVAudioSession` is touched: it does
+# not exist on macOS. Every request sets `requiresOnDeviceRecognition`, so
+# voice adds no network destination here either (NFR-53).
+objc2-speech = { workspace = true }
+objc2-avf-audio = { workspace = true }
+# On-device language detection for the answer about to be read aloud (Epic 64,
+# Story 64.2, AD-182, AD-188): `NLLanguageRecognizer`, reached only from
+# `voice_macos.rs`'s audited `detect_language`. No network path.
+objc2-natural-language = { workspace = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 security-framework = { workspace = true }
@@ -146,12 +160,17 @@ objc2-user-notifications = { workspace = true }
 # `voice_ios.rs` — the audited function-level `#[allow(unsafe_code)]` entries
 # listed in docs/constraints-and-limitations.md. System frameworks, so keeper
 # ships no model weights; every request sets `requiresOnDeviceRecognition`, so
-# voice adds no network destination (NFR-50). iOS-only by this target table:
-# desktop and Linux never see either crate, and `verify:ios-ipa`'s tree stays
-# free of anything it forbids. Both `Zlib OR Apache-2.0 OR MIT` (0.3.2) — pass
-# the cargo-deny license firewall. Feature lists on the workspace entries name
-# exactly the classes the port touches. `block2` carries the recogniser's
-# result handler and the audio tap; 0.6.2 is already in the tree for macOS.
+# voice adds no network destination (NFR-50). Apple-only by the two target
+# tables (this one and macOS's above): Linux never sees either crate, and
+# `verify:ios-ipa`'s tree stays free of anything it forbids. Both
+# `Zlib OR Apache-2.0 OR MIT` (0.3.2) — pass the cargo-deny license firewall.
+# Feature lists on the workspace entries name exactly the classes the two
+# ports touch. `block2` carries the recogniser's result handler and the audio
+# tap; 0.6.2 is already in the tree for macOS.
 objc2-speech = { workspace = true }
 objc2-avf-audio = { workspace = true }
+# On-device language detection for the answer about to be read aloud (Epic 64,
+# Story 64.2, AD-182, AD-188): `NLLanguageRecognizer`, reached only from
+# `voice_ios.rs`'s audited `detect_language`. No network path.
+objc2-natural-language = { workspace = true }
 block2 = { workspace = true }

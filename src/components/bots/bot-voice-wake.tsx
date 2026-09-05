@@ -20,14 +20,27 @@
  * is a prompt: the switch stays and the sentence beside it says what to
  * allow (asking by name is 62.6's, FR-408). `noOnDeviceModel` names the
  * language to download and says why keeper will not use a server instead;
- * `noMicrophone` says so. Each sentence is Rust's, rendered from the payload.
+ * `noOnDeviceRecognition` says the language has no on-device asset here and
+ * names the ones that do; `noMicrophone` says so. Each sentence is Rust's,
+ * rendered from the payload.
+ *
+ * # The language (Epic 63)
+ *
+ * Recognition runs on this device and nowhere else, so the language control
+ * offers exactly `VoiceWakeVm.onDeviceLocales` — what this device can run
+ * itself, probed by the port — plus "Choose for me", which is the setting
+ * unset and the system language in force when it can run here. A phone set
+ * to Polish whose only on-device asset is English is the case this exists
+ * for: the control must not offer Polish, and the refusal Rust sends for the
+ * system language sits beside the control that fixes it. An empty list is an
+ * AD-27 absence — no control — and the availability sentence explains.
  *
  * # Nothing here decides
  *
  * The phrase is validated by `keeper_core::voice::WakePhrase::parse` and a
  * refusal is rendered letter for letter from the rejection — never
  * re-validated here, so a phrase the box accepted is a phrase Rust accepted.
- * The limits sentence is `keeper_core::voice::LISTENING_LIMITS`, carried in
+ * The limits sentence is the port's own `VoicePlatform::limits`, carried in
  * `VoiceWakeVm.limits`. Whether the microphone is open is the turn's, read
  * from the streamed snapshot; the chip is a projection of it and never of a
  * local "did I turn it on" flag, so a device that refused to open shows no
@@ -39,18 +52,34 @@
  * switch, present exactly while the snapshot says the microphone is open —
  * for the phrase or for a turn — and announced when it appears. Someone
  * driving glances at it; nobody hovers.
+ *
+ * # Folded to one line in the desktop pane (Epic 64, Story 64.1, AD-184)
+ *
+ * Epic 63 gave the Mac a voice, and this block came with it: 210–260 px of
+ * switch, box, picker, sentence, note and limits above the transcript the
+ * pane exists for. In the Bots pane the block renders through
+ * {@link FoldSection} when the host hands in a `fold`, and folded it is ONE
+ * line — {@link voiceFoldedLine}: whether listening is armed, the phrase and
+ * the language in force, with the refusal's first clause when the port
+ * refuses, so "not allowed" is read without unfolding. One click unfolds to
+ * the whole block; the host owns where that is remembered. Without a `fold`
+ * (Settings → Bots, the phone's sheet) the block is exactly what it was, so
+ * folding removes no path to any control.
  */
-import { Mic } from "lucide-react";
+import { ChevronDown, ChevronRight, Mic } from "lucide-react";
 import { useEffect, useId, useState } from "react";
+import { FoldSection } from "@/components/layout/sidebar-group";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { voiceAuthorize, voiceWakeSet } from "@/lib/ipc/client";
+import type { VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/client";
+import { voiceAuthorize, voiceAvailability, voiceLocaleSet, voiceWakeSet } from "@/lib/ipc/client";
 import { useCapabilitiesStore } from "@/lib/stores/capabilities";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { isListening, useVoiceStore, voiceStore } from "@/lib/stores/voice";
+import { cn } from "@/lib/utils";
 
 /** The switch's label. */
 export const WAKE_SWITCH_LABEL = "Listen for a phrase";
@@ -64,15 +93,88 @@ export function wakeListeningLabel(phrase: string | null): string {
 }
 /** When a write failed for a reason that was not the phrase. */
 const WAKE_WRITE_FAILED = "Could not save the wake phrase.";
+/** The language control's label. */
+export const VOICE_LOCALE_LABEL = "Language";
+/** The option for the setting unset: the system language when it runs here. */
+export const VOICE_LOCALE_AUTO_LABEL = "Choose for me";
+/** What the list is, and is not. */
+export const VOICE_LOCALE_NOTE =
+  "Recognition runs on this device only, so these are the languages it can run itself — not every language the model understands.";
+/** When the language could not be written. */
+const VOICE_LOCALE_WRITE_FAILED = "Could not save the language.";
 
-/** The wake phrase band. Absent, or the switch with its chip and sentence. */
-export function BotVoiceWake() {
+/** English names for the identifiers the port reports; the identifier is
+ *  kept beside the name because it is what the OS's own download list shows. */
+const LOCALE_NAMES = new Intl.DisplayNames(["en"], { type: "language", fallback: "none" });
+
+/** `en-US` → `American English (en-US)`; an identifier no name is known for
+ *  is shown as it is. `_` is the OS's own spelling of the system locale. */
+export function voiceLocaleName(locale: string): string {
+  const tag = locale.replace("_", "-");
+  let name: string | undefined;
+  try {
+    name = LOCALE_NAMES.of(tag);
+  } catch {
+    name = undefined;
+  }
+  return name === undefined || name === tag ? locale : `${name} (${locale})`;
+}
+
+/** The sentence naming the language in force. */
+export function voiceListeningIn(locale: string): string {
+  return `Listens in ${voiceLocaleName(locale)}.`;
+}
+
+/** The folded line while the switch is off. */
+export const VOICE_FOLDED_OFF = "Listening off";
+
+/**
+ * The one line the folded block says (AD-184).
+ *
+ * `Listening for "nixie" · en-US` while the switch is on, `Listening off ·
+ * en-US` while it is not — the SETTING, from `VoiceWakeVm`, not the turn's
+ * live state, which the status line above the composer already shows. The
+ * identifier rather than {@link voiceLocaleName}'s long form, because this is
+ * a glance and the unfolded picker spells the name. A refusal contributes its
+ * first clause: Rust's sentences all open with the fact and follow it, after
+ * a comma, a dash or a semicolon, with the remedy — and the remedy is what
+ * unfolding is for.
+ */
+export function voiceFoldedLine(wake: VoiceWakeVm, unavailable: VoiceUnavailableVm | null): string {
+  const armed = wake.enabled ? wakeListeningLabel(wake.phrase) : VOICE_FOLDED_OFF;
+  const parts = [armed, wake.locale];
+  if (unavailable !== null) {
+    const clause = /^(.*?)(?:,|;| —)\s/.exec(unavailable.message);
+    parts.push(clause?.[1] ?? unavailable.message);
+  }
+  return parts.join(" · ");
+}
+
+/** The id of the region the pane's fold discloses. Unique in the document. */
+const FOLD_REGION_ID = "bots-voice-wake";
+
+/**
+ * The wake phrase band. Absent, or the switch with its chip and sentence.
+ * `className` is the host's frame: the phone's sheet draws the pane band by
+ * default, and Settings → Bots (Story 63.5) hands in its own row spacing,
+ * because the control is one and the frames are two. `fold` is the desktop
+ * pane's: given, the block folds to {@link voiceFoldedLine} and the host says
+ * whether it is folded and where a toggle is remembered.
+ */
+export function BotVoiceWake({
+  className,
+  fold,
+}: {
+  className?: string;
+  fold?: { folded: boolean; onToggle: () => void };
+} = {}) {
   const bots = useCapabilitiesStore((s) => s.capabilities.bots);
   const unavailable = useVoiceStore((s) => s.unavailable);
   const wake = useVoiceStore((s) => s.wake);
   const state = useVoiceStore((s) => s.state);
   const switchId = useId();
   const phraseId = useId();
+  const localeId = useId();
   /** The box's contents: what the person is typing, seeded from what Rust
    *  holds. Reseeded whenever Rust's answer changes, so a save that came
    *  back normalised or a read that arrived late lands in the box. */
@@ -119,14 +221,32 @@ export function BotVoiceWake() {
       .finally(() => setBusy(false));
   };
 
+  const chooseLocale = (locale: string | null) => {
+    setBusy(true);
+    // The locale in force is Rust's answer, and so is whether it can run
+    // here: availability is asked again after the write, because "choose
+    // for me" on a phone whose system language has no on-device asset is
+    // exactly the refusal this control exists to show beside itself.
+    void voiceLocaleSet(locale)
+      .then((next) => {
+        voiceStore.getState().applyWake(next);
+        setRefusal(null);
+        return voiceAvailability();
+      })
+      .then((unavailable) => voiceStore.getState().applyAvailability(unavailable))
+      .catch((raw: unknown) => {
+        setRefusal(syncErrorMessage(raw, VOICE_LOCALE_WRITE_FAILED));
+      })
+      .finally(() => setBusy(false));
+  };
+
+  const localeRefused = unavailable !== null && "locale" in unavailable;
+
   const listening = isListening(state);
   const listeningFor = state?.kind === "idle" ? state.wake : null;
 
-  return (
-    <section
-      aria-label={WAKE_PHRASE_LABEL}
-      className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-2"
-    >
+  const rows = (
+    <>
       <div className="flex items-center gap-2">
         <Label htmlFor={switchId} className="min-w-0 flex-1">
           {WAKE_SWITCH_LABEL}
@@ -170,6 +290,37 @@ export function BotVoiceWake() {
           {WAKE_SAVE_LABEL}
         </Button>
       </form>
+      {wake.onDeviceLocales.length > 0 && (
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-2">
+            <Label htmlFor={localeId} className="min-w-0 flex-1">
+              {VOICE_LOCALE_LABEL}
+            </Label>
+            <select
+              id={localeId}
+              // `""` is the setting unset: a `<select>`'s value is always a
+              // string, and `null` would come back as the word "null".
+              value={wake.localeChosen ?? ""}
+              disabled={busy}
+              onChange={(event) =>
+                chooseLocale(event.target.value === "" ? null : event.target.value)
+              }
+              className="h-9 max-w-64 rounded-md border border-input bg-transparent px-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <option value="">{VOICE_LOCALE_AUTO_LABEL}</option>
+              {wake.onDeviceLocales.map((locale) => (
+                <option key={locale} value={locale}>
+                  {voiceLocaleName(locale)}
+                </option>
+              ))}
+            </select>
+          </div>
+          {/* Not while Rust refuses the language in force: "listens in
+              Polish" beside "Polish has no on-device asset" is the lie. */}
+          {!localeRefused && <p className="text-xs">{voiceListeningIn(wake.locale)}</p>}
+          <p className="text-muted-foreground text-xs">{VOICE_LOCALE_NOTE}</p>
+        </div>
+      )}
       {refusal !== null && (
         <p role="alert" className="text-destructive text-xs">
           {refusal}
@@ -184,6 +335,38 @@ export function BotVoiceWake() {
         </p>
       )}
       <p className="text-muted-foreground text-xs">{wake.limits}</p>
+    </>
+  );
+
+  if (fold !== undefined) {
+    // The pane's band: `shrink-0` whether folded or not, because the
+    // transcript beside it is the one flexible box (Story 61.14's contract),
+    // and `hidden` on the body takes the block out of the column entirely.
+    return (
+      <FoldSection
+        label={voiceFoldedLine(wake, unavailable)}
+        icon={fold.folded ? ChevronRight : ChevronDown}
+        folded={fold.folded}
+        onToggle={fold.onToggle}
+        id={FOLD_REGION_ID}
+        labelClassName="text-sm"
+        className={cn("shrink-0 border-border border-b px-4 py-1", className)}
+        bodyClassName="flex flex-col gap-2 px-2 pt-1 pb-2"
+      >
+        {rows}
+      </FoldSection>
+    );
+  }
+
+  return (
+    <section
+      aria-label={WAKE_PHRASE_LABEL}
+      className={cn(
+        "flex shrink-0 flex-col gap-2",
+        className ?? "border-border border-b px-6 py-2",
+      )}
+    >
+      {rows}
     </section>
   );
 }

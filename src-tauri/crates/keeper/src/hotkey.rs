@@ -259,6 +259,96 @@ pub fn install_capture<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// The voice global-shortcut press handler (Epic 63, Story 63.5, FR-420,
+/// AD-174): ask to talk on `Pressed`.
+///
+/// It never touches the main window and never goes through the webview: the
+/// press lands here, on keeper's own thread, from the OS-level shortcut the
+/// plugin registered (`RegisterEventHotKey` on macOS), which fires whatever
+/// app is frontmost — and [`crate::voice_reach::reach`] drives the turn
+/// straight into `voice_ipc`, the same `WakeMatched` a matched phrase
+/// produces. So a press with keeper hidden opens the microphone exactly as a
+/// press with keeper in front does. A press while a turn is already open is a
+/// no-op (`ReachAsk::Talk`), so a held or repeated chord never restarts one.
+/// Named, not an inline closure, for the same reason as the other handlers:
+/// startup [`install_voice`] and the register/restore paths in
+/// `voice_hotkey_set` share one definition.
+pub(crate) fn on_voice_shortcut_event<R: Runtime>(
+    _app: &AppHandle<R>,
+    _shortcut: &Shortcut,
+    event: ShortcutEvent,
+) {
+    if event.state == ShortcutState::Pressed {
+        crate::voice_reach::reach(keeper_core::voice_reach::ReachAsk::Talk);
+    }
+}
+
+/// The pure register-or-nothing decision for the voice hotkey, identical in
+/// shape to [`capture_shortcut`]: the empty string is the **unset** default,
+/// so keeper registers nothing until a user assigns a chord. Factored out so
+/// the decision is unit-testable without an app.
+pub(crate) fn voice_shortcut(accelerator: &str) -> Option<Shortcut> {
+    if accelerator.is_empty() {
+        return None;
+    }
+    parse(accelerator)
+}
+
+/// Register the persisted voice accelerator with the OS at startup (Story
+/// 63.5). Reads `hotkey.voice` (absent/empty ⇒ unset: register **nothing**),
+/// parses it, and attaches [`on_voice_shortcut_event`].
+///
+/// Gated first on the one runtime answer every voice surface reads (AD-179):
+/// where `voice_availability` says `unsupported` nothing is registered even
+/// if a chord is stored, because a chord that opens no microphone is the dead
+/// control AD-27 forbids — and the Settings row that could have set it is
+/// absent there too. Best-effort exactly like the other three installs.
+pub fn install_voice<R: Runtime>(app: &AppHandle<R>) {
+    if !crate::voice_reach::present() {
+        tracing::debug!("hotkey: voice unsupported in this build; voice hotkey absent");
+        return;
+    }
+    let data_dir = match app.state::<crate::ipc::AppState>().platform.data_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(%error, "hotkey: could not resolve data dir; voice hotkey inactive");
+            return;
+        }
+    };
+    let accelerator = match keeper_core::registry::get_voice_hotkey(&data_dir) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "hotkey: could not read stored voice accelerator; voice hotkey inactive"
+            );
+            return;
+        }
+    };
+    let Some(shortcut) = voice_shortcut(&accelerator) else {
+        if accelerator.is_empty() {
+            tracing::debug!("hotkey: voice hotkey unset; registering nothing");
+        } else {
+            tracing::warn!(
+                accelerator,
+                "hotkey: stored voice accelerator is malformed; voice hotkey inactive"
+            );
+        }
+        return;
+    };
+    match app
+        .global_shortcut()
+        .on_shortcut(shortcut, on_voice_shortcut_event)
+    {
+        Ok(()) => {
+            tracing::info!(accelerator, "hotkey: registered global voice shortcut");
+        }
+        Err(error) => {
+            tracing::warn!(%error, accelerator, "hotkey: OS refused to register voice shortcut");
+        }
+    }
+}
+
 /// Register the persisted-or-default accelerator with the OS at startup (Story 9.4).
 ///
 /// Reads the stored accelerator (absent ⇒ [`DEFAULT_HOTKEY`]), parses it, and attaches
@@ -402,6 +492,21 @@ mod tests {
         assert!(capture_shortcut("Super+Alt+K").is_some());
         assert!(capture_shortcut("Foo+").is_none());
         assert!(capture_shortcut("NotAKey").is_none());
+    }
+
+    #[test]
+    fn voice_shortcut_unset_registers_nothing_and_valid_parses() {
+        // Unset by default (Story 63.5), like the recording and capture chords:
+        // a global chord is the person's to choose, and until they do the tray
+        // item and the deep link are the two reach paths that always work.
+        assert!(
+            voice_shortcut("").is_none(),
+            "unset (empty) must register nothing"
+        );
+        assert!(voice_shortcut("Control+Alt+V").is_some());
+        assert!(voice_shortcut("Super+Shift+Space").is_some());
+        assert!(voice_shortcut("Foo+").is_none());
+        assert!(voice_shortcut("NotAKey").is_none());
     }
 
     #[test]

@@ -78,16 +78,29 @@ mod sync;
 mod sync_ipc;
 #[cfg(desktop)]
 mod tray;
-// The voice port's iOS implementation (Story 62.4, AD-165–AD-167): the only
-// place the Speech and AVFAudio frameworks are reached, and the only voice
-// code that is target-specific. Every other target answers `unsupported`
-// through `voice_ipc`'s absent port, so the command list stays identical.
+// The voice port's platform implementations: iOS (Story 62.4, AD-165–AD-167)
+// and macOS (Story 63.4, AD-175) — the only places the Speech and AVFAudio
+// frameworks are reached, and the only voice code that is target-specific.
+// Every other target answers `unsupported` through `voice_ipc`'s absent
+// port, so the command list stays identical.
 #[cfg(target_os = "ios")]
 mod voice_ios;
+#[cfg(target_os = "macos")]
+mod voice_macos;
 // The voice commands (Story 62.4): a call site over `keeper_core::voice`.
 // Registered on every target — a phone lists them for real, a desktop
 // answers `unsupported` — so the frontend never special-cases the call.
 mod voice_ipc;
+// Reach (Story 63.5, AD-174/AD-179): the hotkey, tray and deep-link call
+// sites that start a turn while keeper is not in front, and the voice
+// hotkey's commands. Every target, because the deep link is every target's;
+// the hotkey commands answer `unsupported` off desktop.
+mod voice_reach;
+// The voice pill (Story 64.4, AD-185): the floating window that shows a
+// turn hearing while keeper is behind another app. Desktop-only, and
+// created only when the port is a real answer — see the module doc.
+#[cfg(desktop)]
+mod voice_window;
 // The zero-egress source-scan audit over the `keeper-rec` sidecar's Swift
 // sources (Story 20.4, FR-76) — test-only; it ships no code.
 #[cfg(test)]
@@ -99,7 +112,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
 #[cfg(desktop)]
 use tauri::WindowEvent;
-use tauri_plugin_deep_link::DeepLinkExt;
 #[cfg(desktop)]
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
@@ -389,20 +401,22 @@ pub fn run() {
                         tracing::error!(%error, "config.json: import failed; file skipped");
                     }
                 }
+                // The voice recogniser's language (Epic 63): the port is
+                // process-wide and `voice_availability` takes no state, so
+                // the persisted choice reaches it here, once, before any
+                // surface or the tray asks.
+                voice_ipc::load_locale(&data_dir);
             }
 
-            // Forward every incoming `keeper://oauth/callback` deep link to the
-            // OAuth-callback registry, which matches it to its in-flight OIDC
-            // flow by the `state` query param (Story 2.2). An unmatched / spurious
-            // callback is ignored inside `resolve`. The registry lives in the
-            // managed `AppState` and is cloned into the `'static` handler.
+            // Forward every incoming `keeper://` deep link: `keeper://voice/talk`
+            // starts a turn (Story 63.5, FR-422) and everything else goes to
+            // the OAuth-callback registry, which matches it to its in-flight
+            // OIDC flow by the `state` query param (Story 2.2). An unmatched /
+            // spurious callback is ignored inside `resolve`. The registry
+            // lives in the managed `AppState` and is cloned into the `'static`
+            // handler.
             let flows = app.state::<ipc::AppState>().oauth_flows.clone();
-            app.deep_link().on_open_url(move |event| {
-                for url in event.urls() {
-                    let handled = flows.resolve(url.as_str());
-                    tracing::debug!(handled, "deep-link: received keeper:// URL");
-                }
-            });
+            voice_reach::install_deep_link(app.handle(), move |url| flows.resolve(url));
 
             // Build + install the native menu bar from the action registry (Story
             // 9.3): standard macOS App/Edit/Window submenus plus one generated
@@ -444,6 +458,23 @@ pub fn run() {
             // and the in-app ⌘⌥K as the two paths that always work.
             #[cfg(desktop)]
             hotkey::install_capture(app.handle());
+
+            // Register the optional OS-global voice hotkey (Story 63.5, FR-420):
+            // a FOURTH independent binding under `hotkey.voice`, unset by
+            // default, and absent — not registered at all — where
+            // `voice_availability` answers `unsupported` (AD-179, AD-27). Its
+            // press handler starts a turn straight from Rust, never touching
+            // the window. Best-effort like the three above.
+            #[cfg(desktop)]
+            hotkey::install_voice(app.handle());
+
+            // Create the voice pill hidden (Story 64.4, AD-185), on the same
+            // gate the voice hotkey reads: a port that answers `unsupported`
+            // never has the window (AD-27, AD-179). Prewarmed like the
+            // capture panel, so the first snapshot of a turn shows a document
+            // that is already mounted.
+            #[cfg(desktop)]
+            voice_window::install(app.handle());
 
             // Give the prewarmed capture window the resizability and size its
             // remembered placement asks for (Story 46.15, FR-192).
@@ -569,6 +600,12 @@ pub fn run() {
                         // change.
                         tray::apply_notes_state(&handle, &notes_ipc::tray_snapshot(&handle));
                         notes_vault::cadence_tick();
+                        // Voice rides the same clock (Story 63.5, FR-421): the
+                        // tray's status line and verb follow Rust's own turn —
+                        // `voice_snapshot`, not the webview's mirror — so the
+                        // label is right while the window is hidden, and
+                        // `apply_voice_state` writes only on a change.
+                        tray::apply_voice_state(&handle, &voice_ipc::voice_snapshot());
                     }
                 });
             }
@@ -785,6 +822,10 @@ pub fn run() {
                 bots_ipc::bots_bots_reorder,
                 bots_ipc::bots_sessions_list,
                 bots_ipc::bots_session_open,
+                // The step-level follow of a session another device is
+                // writing (Story 63.7, AD-177): one history read, never a
+                // second SSE against a run this process did not start.
+                bots_ipc::bots_session_follow,
                 // The list, the archive and the continue verb (Story 61.6,
                 // FR-381, FR-382). `bots_sessions_search` is the queried,
                 // scoped, bounded read the list uses; the three writes each
@@ -828,8 +869,14 @@ pub fn run() {
                 voice_ipc::voice_watch,
                 voice_ipc::voice_unwatch,
                 voice_ipc::voice_wake_get,
+                // Epic 63: the recogniser's language, chosen from what runs on the device.
+                voice_ipc::voice_locale_set,
                 // Story 62.6: the two permission dialogs, on the first deliberate act.
                 voice_ipc::voice_authorize,
+                // Story 63.5: the voice hotkey's binding, for Settings.
+                voice_reach::voice_hotkey_get,
+                voice_reach::voice_hotkey_set,
+                voice_reach::voice_hotkey_clear,
                 ipc::bridge_catalog,
                 ipc::bridge_discover,
                 ipc::bridge_login_start,
@@ -1304,6 +1351,11 @@ pub fn run() {
                 // the one that fires when the user switches app without hiding
                 // anything. `push_on_blur` decides whether it reaches the network.
                 WindowEvent::Focused(false) => notes_vault::flush(),
+                // The voice pill sits on the main window's screen (Story
+                // 64.4): a drag onto another display takes it along. Per
+                // compositor frame, but `follow` returns on one lock while
+                // the pill is hidden, which is nearly always.
+                WindowEvent::Moved(_) => voice_window::follow(window.app_handle()),
                 _ => {}
             }
             return;

@@ -28,6 +28,17 @@
  * 3. A `closed` carrying a `reason` leaves the row `partial`, because that is
  *    what Rust wrote. The caption the pane draws is a projection of the row,
  *    never of a local "did it fail" flag — so a reload shows the same sentence.
+ *
+ * **The following rules (Epic 63, Story 63.7, AD-177).** A conversation whose
+ * transcript is the gateway's may be growing on the other device. `follow` is
+ * what the last `botsSessionFollow` read said — whether a turn is open there
+ * and when to read again — and `applyFollow` replaces the messages with the
+ * merged transcript Rust composed. Two rules keep it from fighting the stream:
+ *
+ * 4. A read that lands while this device is streaming is dropped whole. The
+ *    stream owns the rows on screen; the follow resumes when it closes.
+ * 5. `opened` clears `follow`. The caption that says steps land as they
+ *    complete must never sit under an answer arriving token by token here.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
@@ -35,6 +46,7 @@ import type { BotApprovalAnswer, BotApprovalRequest } from "@/components/bots/bo
 import type {
   BotContextBundleVm,
   BotConversationVm,
+  BotFollowVm,
   BotMessageVm,
   BotProviderVm,
   BotSessionVm,
@@ -42,6 +54,19 @@ import type {
   BotToolCallVm,
   BotVm,
 } from "@/lib/ipc/client";
+
+/**
+ * What the last follow read said (Story 63.7): whether a turn is open on the
+ * other device, and how long until the next read. `null` in the store when
+ * nothing is being followed — a local transcript, a stream running here, or
+ * a session Rust said had gone cold.
+ */
+export interface BotFollow {
+  /** A turn is open on the other device: steps are landing as they complete. */
+  live: boolean;
+  /** Ms until the next read, or `null` when Rust said to stop. */
+  nextPollMs: number | null;
+}
 
 /**
  * One tool call waiting on a person, with the continuation that answers it
@@ -112,6 +137,8 @@ export interface BotsState {
    * the same as none (AD-27).
    */
   contexts: Record<string, BotContextBundleVm>;
+  /** What the last follow read said, or `null` while nothing is followed. */
+  follow: BotFollow | null;
 
   applyProviders: (providers: BotProviderVm[]) => void;
   applyBots: (bots: BotVm[]) => void;
@@ -121,6 +148,14 @@ export interface BotsState {
   openConversation: (conversation: BotConversationVm | null) => void;
   applyStreamEvent: (event: BotStreamEvent) => void;
   setError: (error: string | null) => void;
+  /**
+   * Take one follow read: the merged transcript and what to do next. Returns
+   * whether it was taken — `false` while an answer is streaming here, when
+   * the read is dropped whole (rule 4) and the caller schedules nothing.
+   */
+  applyFollow: (read: BotFollowVm) => boolean;
+  /** The conversation left the screen, or Rust said the session went cold. */
+  stopFollowing: () => void;
 
   /**
    * Whether an answer shows its metadata caption (Story 61.8, FR-384).
@@ -152,6 +187,7 @@ const EMPTY = {
   pendingApproval: null,
   toolRows: {},
   contexts: {},
+  follow: null,
 } as const;
 
 /** The vanilla store instance, created once at module load and shared app-wide. */
@@ -169,11 +205,26 @@ export const botsStore = createStore<BotsState>()((set) => ({
   selectBot: (selectedBotId) => set({ selectedBotId, selectedModel: null }),
   selectModel: (selectedModel) => set({ selectedModel }),
   openConversation: (conversation) =>
-    set({ conversation, streamingId: null, streamingMessageId: null }),
+    set({ conversation, streamingId: null, streamingMessageId: null, follow: null }),
   setError: (error) => set({ error }),
   askApproval: (pendingApproval) => set({ pendingApproval }),
   clearApproval: () => set({ pendingApproval: null }),
   reset: () => set({ ...EMPTY }),
+  applyFollow: (read) => {
+    let taken = false;
+    set((state) => {
+      if (state.streamingId !== null || state.conversation === null) {
+        return {};
+      }
+      taken = true;
+      const follow = { live: read.live, nextPollMs: read.nextPollMs };
+      return read.messages === null
+        ? { follow }
+        : { follow, conversation: { ...state.conversation, messages: read.messages } };
+    });
+    return taken;
+  },
+  stopFollowing: () => set({ follow: null }),
 
   applyStreamEvent: (event) =>
     set((state) => {
@@ -183,17 +234,22 @@ export const botsStore = createStore<BotsState>()((set) => ({
           // Replacing the whole conversation rather than appending into the
           // one on screen is what makes a first send and a follow-up one code
           // path: the shell sent the session it wrote, so this cannot end up
-          // showing a title the store minted itself.
+          // showing a title the store minted itself. The transcript source
+          // (AD-181) is carried: a send into a gateway-read transcript appends
+          // this device's rows to the shared copy, which stays the shared
+          // copy; a fresh conversation was just written here, so it is local.
           const existing = state.conversation;
           const carried =
-            existing !== null && existing.session.id === event.session.id ? existing.messages : [];
+            existing !== null && existing.session.id === event.session.id ? existing : null;
           return {
             conversation: {
               session: event.session,
-              messages: [...carried, event.user, event.assistant],
+              messages: [...(carried?.messages ?? []), event.user, event.assistant],
+              transcript: carried?.transcript ?? "local",
             },
             streamingId: event.subscriptionId,
             streamingMessageId: event.assistant.id,
+            follow: null,
             error: null,
           };
         }
@@ -234,7 +290,7 @@ export const botsStore = createStore<BotsState>()((set) => ({
           }
           return {
             conversation: {
-              session: conversation.session,
+              ...conversation,
               messages: conversation.messages.map((message) =>
                 message.id === event.message.id ? event.message : message,
               ),
@@ -263,7 +319,7 @@ function appendTo(state: BotsState, text: string): BotConversationVm | null {
     return conversation;
   }
   return {
-    session: conversation.session,
+    ...conversation,
     messages: conversation.messages.map((message) =>
       message.id === target ? { ...message, content: message.content + text } : message,
     ),

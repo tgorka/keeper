@@ -25,16 +25,17 @@
  * component actually promises is that it does not intercept those chords. A
  * test that checked for a `"\n"` would be testing jsdom.
  */
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import {
   BOT_COMPOSER_HELP_LABEL,
   BOT_COMPOSER_LABEL,
   BOT_COMPOSER_MENU_LABEL,
-  BOT_COMPOSER_NO_BOT,
+  BOT_COMPOSER_PICKER_ABOVE,
   BOT_COMPOSER_SEND_LABEL,
   BOT_COMPOSER_STOP_LABEL,
   BotComposer,
+  botComposerNoBot,
 } from "@/components/bots/bot-composer";
 import type { BotCommandContext } from "@/components/bots/bot-slash-menu";
 import type { BotCommandPreviewVm, BotCommandRowVm } from "@/lib/ipc/client";
@@ -96,6 +97,7 @@ function mount(
     disabled?: boolean;
     context?: BotCommandContext;
     hostSays?: string;
+    pickerPlace?: string;
   } = {},
 ) {
   const onSend = vi.fn();
@@ -117,6 +119,7 @@ function mount(
       streaming={overrides.streaming ?? false}
       disabled={overrides.disabled ?? false}
       resolveDraft={resolveDraft}
+      pickerPlace={overrides.pickerPlace}
     />,
   );
   const field = screen.getByLabelText(BOT_COMPOSER_LABEL);
@@ -188,8 +191,24 @@ describe("BotComposer keyboard", () => {
    */
   it("says why it cannot send, and still takes typing", () => {
     const { field } = mount({}, { disabled: true });
-    expect(screen.getByText(BOT_COMPOSER_NO_BOT)).toBeInTheDocument();
+    expect(screen.getByText(botComposerNoBot(BOT_COMPOSER_PICKER_ABOVE))).toBeInTheDocument();
     expect(field).not.toBeDisabled();
+  });
+
+  /**
+   * Story 63.1, FR-411: one sentence, and the place in it is the tier's. The
+   * desktop's wording is the literal it always was; a phone, whose picker is
+   * a sheet, names the sheet — "above" there points at a back bar.
+   */
+  it("names where the bot is chosen on this tier, and the Mac wording is unchanged", () => {
+    mount({}, { disabled: true });
+    expect(screen.getByText("Choose a bot above and this will send to it.")).toBeInTheDocument();
+    cleanup();
+    mount({}, { disabled: true, pickerPlace: "in the Bot and model sheet" });
+    expect(
+      screen.getByText("Choose a bot in the Bot and model sheet and this will send to it."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Choose a bot above/)).not.toBeInTheDocument();
   });
 });
 

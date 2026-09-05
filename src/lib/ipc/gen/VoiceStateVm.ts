@@ -8,6 +8,13 @@
  * are the machine's, and `idle` adds what the surface must say about the
  * microphone while no turn runs — which phrase is set, and whether the
  * device is open for it (FR-405: visible whenever it listens).
+ *
+ * Since Epic 64 (Story 64.3, AD-186) the states with the microphone open for
+ * a turn carry `level`: the input level in `0.0..=1.0` as
+ * `keeper_core::voice::level::Meter` smoothed and rate-limited it, or `None`
+ * where the port has not measured one — before the first buffer, and on a
+ * port that has no meter. A snapshot with a level is streamed at most ~25
+ * times a second and only while the level changes.
  */
 export type VoiceStateVm = { "kind": "idle", 
 /**
@@ -21,11 +28,24 @@ listeningForWake: boolean, } | { "kind": "listening",
 /**
  * The interim transcript as it forms (Story 62.6 shows it).
  */
-heard: string, } | { "kind": "heard", 
+heard: string, 
+/**
+ * The input level, `0.0..=1.0`, or `None` where unmeasured.
+ */
+level: number | null, } | { "kind": "heard", 
 /**
  * What was said.
  */
-text: string, } | { "kind": "sending" } | { "kind": "speaking" } | { "kind": "failed", 
+text: string, 
+/**
+ * The input level, `0.0..=1.0`, or `None` where unmeasured.
+ */
+level: number | null, } | { "kind": "sending", 
+/**
+ * Whether the first piece of the answer has arrived: `false` is a
+ * model thinking, `true` one that has begun to answer (AD-186).
+ */
+answering: boolean, } | { "kind": "speaking" } | { "kind": "failed", 
 /**
  * Why, in a sentence.
  */

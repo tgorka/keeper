@@ -47,6 +47,7 @@ use keeper_core::palette::{
 };
 use keeper_core::vm::{
     RecordingDurabilityState, RecordingDurabilityVm, RecordingStatusVm, RecordingUiState,
+    VoiceStateVm,
 };
 use keeper_sync::progress::TraySyncState;
 use tauri::image::Image;
@@ -119,6 +120,14 @@ const NOTE_TITLE_CAP: usize = 40;
 /// The label a recent slot with no note shows.
 const NOTE_EMPTY_SLOT: &str = "\u{2014}";
 
+/// The menu item ids for the voice section (Epic 63, Story 63.5, FR-421,
+/// AD-174). Built into the idle-family menus like the notes section — once,
+/// then only mutated — and only where `voice_availability` says voice exists
+/// (AD-179): on a build that answers `unsupported` neither item is built,
+/// which is the AD-27 absence, never a disabled row.
+const VOICE_STATUS_ID: &str = "tray-voice-status";
+const VOICE_TALK_ID: &str = "tray-voice-talk";
+
 /// What the tray should currently say about notes — composed in Rust, so the
 /// tray, the palette and the window can never word the same fact differently.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -156,6 +165,27 @@ struct NotesItems {
     recent: Vec<MenuItem<Wry>>,
     unread: MenuItem<Wry>,
     labels: TrayNotesLabels,
+}
+
+/// The retained voice menu items (Story 63.5), held so their labels follow
+/// the turn through `set_text` — never `set_menu` (AD-61). The status line
+/// says where the turn is; the verb item says what a click will do, in the
+/// mic control's own words, and its click toggles (start / cancel / stop the
+/// answer) through `voice_reach`.
+#[derive(Clone)]
+struct VoiceItems {
+    status: MenuItem<Wry>,
+    talk: MenuItem<Wry>,
+}
+
+/// The sections an idle-family menu carries that are built once and then
+/// mutated in place: notes (Story 36.7) and voice (Story 63.5). Returned
+/// together from every menu build so a rendering that swaps the menu adopts
+/// both sets of fresh handles in one place.
+#[derive(Clone, Default)]
+struct Sections {
+    notes: Option<NotesItems>,
+    voice: Option<VoiceItems>,
 }
 
 /// The bundled menu-bar glyph shown while a recording is live (Story 18.1;
@@ -389,6 +419,10 @@ struct TrayState {
     /// them back. A `MenuItem` no longer in an installed menu would have the next
     /// tick `set_text` into nothing.
     notes: Option<NotesItems>,
+    /// The voice items of whichever menu is currently installed (Story 63.5),
+    /// on exactly the notes items' terms: `None` while voice is unsupported
+    /// or while a recording or error rendering displaces the section.
+    voice: Option<VoiceItems>,
 }
 
 /// The single tray slot (see [`TrayState`]).
@@ -603,24 +637,63 @@ fn add_notes_section<'a>(
     builder.separator().item(&items.unread).separator()
 }
 
-/// Build the idle tray menu: the notes section, the projected recording verbs,
-/// then "Show keeper" + "Quit" (Story 10.3, Story 36.7, Story 46.16).
+/// Build the voice section's items, or `None` where voice is absent (AD-179:
+/// the one `voice_availability` answer, read once per menu build like the
+/// notes capability). Built once per menu and then only mutated (AD-61). The
+/// words are `keeper_core::voice_reach`'s, composed from the turn's snapshot
+/// at build time so the fresh menu never opens saying something stale.
+fn build_voice_items(app: &AppHandle) -> Option<VoiceItems> {
+    if !crate::voice_reach::present() {
+        return None;
+    }
+    let labels = keeper_core::voice_reach::tray_voice_labels(&crate::voice_ipc::voice_snapshot());
+    Some(VoiceItems {
+        status: menu_item(app, VOICE_STATUS_ID, &labels.status, false)?,
+        talk: menu_item(app, VOICE_TALK_ID, labels.verb, true)?,
+    })
+}
+
+/// Append the voice section to a menu under construction: the status line,
+/// the verb, a separator — below the notes section and above the recording
+/// verbs, and nothing at all where there is no voice.
+fn add_voice_section<'a>(
+    builder: MenuBuilder<'a, Wry, AppHandle>,
+    items: Option<&'a VoiceItems>,
+) -> MenuBuilder<'a, Wry, AppHandle> {
+    let Some(items) = items else {
+        return builder;
+    };
+    builder.items(&[&items.status, &items.talk]).separator()
+}
+
+/// Build both mutated-in-place sections for an idle-family menu.
+fn build_sections(app: &AppHandle) -> Sections {
+    Sections {
+        notes: build_notes_items(app, notes_capability(app)),
+        voice: build_voice_items(app),
+    }
+}
+
+/// Build the idle tray menu: the notes section, the voice section, the
+/// projected recording verbs, then "Show keeper" + "Quit" (Story 10.3, Story
+/// 36.7, Story 46.16, Story 63.5).
 ///
 /// This is the menu the tray is created with, which on Linux is the only menu it
 /// will ever have — and the reason the start verb has to be present here rather
 /// than added on the first tick. On a build that cannot record the projection is
 /// empty and this is the Story 36.7 menu unchanged.
-fn build_idle_menu(app: &AppHandle) -> Option<(Menu<Wry>, Option<NotesItems>)> {
-    let notes = build_notes_items(app, notes_capability(app));
+fn build_idle_menu(app: &AppHandle) -> Option<(Menu<Wry>, Sections)> {
+    let sections = build_sections(app);
     let verbs = build_recording_verbs(app, TrayMenu::Idle)?;
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
-    let builder = add_notes_section(MenuBuilder::new(app), notes.as_ref());
+    let builder = add_notes_section(MenuBuilder::new(app), sections.notes.as_ref());
+    let builder = add_voice_section(builder, sections.voice.as_ref());
     match add_recording_verbs(builder, &verbs)
         .items(&[&show, &quit])
         .build()
     {
-        Ok(menu) => Some((menu, notes)),
+        Ok(menu) => Some((menu, sections)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build tray menu");
             None
@@ -705,8 +778,8 @@ fn build_recording_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuI
 /// too (Story 18.1) — it is registered on the tray, not a menu, so it survives
 /// every `set_menu` swap. Best-effort — on a menu/tray build failure it logs at
 /// `warn` and leaves no tray (the app keeps running).
-fn build_tray(app: &AppHandle) -> Option<(TrayIcon, Option<NotesItems>)> {
-    let (menu, notes) = build_idle_menu(app)?;
+fn build_tray(app: &AppHandle) -> Option<(TrayIcon, Sections)> {
+    let (menu, sections) = build_idle_menu(app)?;
     let mut builder = TrayIconBuilder::new()
         .menu(&menu)
         .show_menu_on_left_click(true)
@@ -729,6 +802,11 @@ fn build_tray(app: &AppHandle) -> Option<(TrayIcon, Option<NotesItems>)> {
             NOTE_CAPTURE_ID => crate::notes_window::show(app),
             NOTE_JOURNAL_ID => crate::notes_ipc::tray_journal_today(app),
             NOTE_UNREAD_ID => crate::notes_ipc::tray_show_unread(app),
+            // The voice section (Story 63.5): the one tray verb that toggles,
+            // because its label names which of start / cancel / stop-the-
+            // answer it will do. Performed in Rust — no webview in the path —
+            // so it works with the window hidden.
+            VOICE_TALK_ID => crate::voice_reach::reach(keeper_core::voice_reach::ReachAsk::Toggle),
             id => {
                 if let Some(slot) = NOTE_RECENT_IDS.iter().position(|recent| *recent == id) {
                     crate::notes_ipc::tray_open_recent(app, slot);
@@ -753,7 +831,7 @@ fn build_tray(app: &AppHandle) -> Option<(TrayIcon, Option<NotesItems>)> {
         }
     }
     match builder.build(app) {
-        Ok(tray) => Some((tray, notes)),
+        Ok(tray) => Some((tray, sections)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build tray icon");
             None
@@ -775,13 +853,14 @@ pub fn set_tray_presence(app: &AppHandle, enabled: bool) {
     let mut guard = tray_guard();
     if enabled {
         // Replace any existing tray so a re-enable never leaks a second icon.
-        *guard = tray.map(|(icon, notes)| TrayState {
+        *guard = tray.map(|(icon, sections)| TrayState {
             icon,
             status_item: None,
             error_rendered: false,
             sync_item: None,
             sync_memo: None,
-            notes,
+            notes: sections.notes,
+            voice: sections.voice,
         });
     } else {
         // Dropping the handle removes the tray icon.
@@ -937,7 +1016,7 @@ pub fn apply_recording_state(app: &AppHandle, snapshot: &RecordingStatusVm) {
 /// the exact prior configuration. Best-effort: a build failure warns (inside
 /// [`build_tray`]) and the next ~1 Hz tick retries.
 fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
-    let Some((icon, notes)) = build_tray(app) else {
+    let Some((icon, sections)) = build_tray(app) else {
         return;
     };
     let stored = {
@@ -949,7 +1028,8 @@ fn force_present(app: &AppHandle, snapshot: &RecordingStatusVm) {
                 error_rendered: false,
                 sync_item: None,
                 sync_memo: None,
-                notes,
+                notes: sections.notes,
+                voice: sections.voice,
             });
             FORCED_PRESENCE.store(true, Ordering::Relaxed);
             true
@@ -1047,7 +1127,7 @@ fn render_error(
 /// is still installed (which would strand it for the app lifetime, since a
 /// terminal state with no `status_item` re-enters neither branch).
 fn restore_idle(app: &AppHandle, tray: &TrayIcon) {
-    let Some((menu, notes)) = build_idle_menu(app) else {
+    let Some((menu, sections)) = build_idle_menu(app) else {
         return;
     };
     if let Err(error) = tray.set_menu(Some(menu)) {
@@ -1059,10 +1139,10 @@ fn restore_idle(app: &AppHandle, tray: &TrayIcon) {
         tracing::warn!("tray: could not restore the idle glyph");
     }
     store_rendered_mode(tray.id(), None, false);
-    // The fresh menu carries fresh notes handles; the labels the last tick
-    // computed are re-applied to them so a restore does not blank the section
-    // until something changes.
-    adopt_notes_items(tray.id(), notes);
+    // The fresh menu carries fresh notes and voice handles; the labels the
+    // last tick computed are re-applied to them so a restore does not blank a
+    // section until something changes.
+    adopt_sections(tray.id(), sections);
 }
 
 /// Store the rendered-mode flags — the recording status-line item and the
@@ -1084,21 +1164,24 @@ fn store_rendered_mode(tray_id: &TrayIconId, item: Option<MenuItem<Wry>>, error_
             state.error_rendered = error_rendered;
             state.sync_item = None;
             state.sync_memo = None;
-            // The recording and error menus carry no notes section, so the held
-            // handles are no longer in any installed menu. The idle restore
-            // re-adopts fresh ones.
+            // The recording and error menus carry no notes or voice section,
+            // so the held handles are no longer in any installed menu. The
+            // idle restore re-adopts fresh ones.
             state.notes = None;
+            state.voice = None;
         }
     }
 }
 
-/// Adopt the notes handles of a freshly installed menu and repaint them from the
-/// last model this process composed.
+/// Adopt the notes and voice handles of a freshly installed menu and repaint
+/// them from the last model this process composed.
 ///
 /// A menu build mints new `MenuItem`s, so the labels the previous tick wrote live
 /// on handles that are no longer on screen. Re-applying the retained model is what
 /// keeps the section correct across an install without a `set_menu` refresh loop.
-fn adopt_notes_items(tray_id: &TrayIconId, notes: Option<NotesItems>) {
+/// The voice items were built from the turn's snapshot a moment ago and need no
+/// repaint; the next tick diffs against the retained memo and writes on a change.
+fn adopt_sections(tray_id: &TrayIconId, sections: Sections) {
     let model = {
         let mut guard = tray_guard();
         let Some(state) = guard.as_mut() else {
@@ -1107,10 +1190,11 @@ fn adopt_notes_items(tray_id: &TrayIconId, notes: Option<NotesItems>) {
         if state.icon.id() != tray_id {
             return;
         }
-        state.notes = notes.clone();
+        state.notes = sections.notes.clone();
+        state.voice = sections.voice;
         notes_model().clone()
     };
-    if let Some(items) = notes {
+    if let Some(items) = sections.notes {
         paint_notes(&items, &model);
     }
 }
@@ -1906,21 +1990,19 @@ fn dwelled(reported: TraySyncState) -> TraySyncState {
 /// syncing, which is most of the time. The recording verbs are here for exactly
 /// the same reason (Story 46.16), in the same slot as in the idle menu, so
 /// "New Recording" neither moves nor disappears when a folder starts syncing.
-fn build_sync_menu(
-    app: &AppHandle,
-    line: &str,
-) -> Option<(Menu<Wry>, MenuItem<Wry>, Option<NotesItems>)> {
-    let notes = build_notes_items(app, notes_capability(app));
+fn build_sync_menu(app: &AppHandle, line: &str) -> Option<(Menu<Wry>, MenuItem<Wry>, Sections)> {
+    let sections = build_sections(app);
     let verbs = build_recording_verbs(app, TrayMenu::Sync)?;
     let status = menu_item(app, SYNC_STATUS_ID, line, false)?;
     let show = menu_item(app, SHOW_ID, "Show keeper", true)?;
     let quit = menu_item(app, QUIT_ID, "Quit", true)?;
-    let builder = add_notes_section(MenuBuilder::new(app), notes.as_ref());
+    let builder = add_notes_section(MenuBuilder::new(app), sections.notes.as_ref());
+    let builder = add_voice_section(builder, sections.voice.as_ref());
     match add_recording_verbs(builder, &verbs)
         .items(&[&status, &show, &quit])
         .build()
     {
-        Ok(menu) => Some((menu, status, notes)),
+        Ok(menu) => Some((menu, status, sections)),
         Err(error) => {
             tracing::warn!(%error, "tray: could not build the sync menu");
             None
@@ -2017,16 +2099,16 @@ pub fn apply_sync_state(app: &AppHandle, state: TraySyncState, line: &str) {
         // First sync tick since the tray went idle: install the menu once. It
         // is built around this line, so no separate text write is owed.
         None => {
-            let Some((menu, item, notes)) = build_sync_menu(app, line) else {
+            let Some((menu, item, sections)) = build_sync_menu(app, line) else {
                 return;
             };
             if let Err(error) = tray.set_menu(Some(menu)) {
                 tracing::warn!(%error, "tray: could not install the sync menu");
                 return;
             }
-            // Fresh menu, fresh notes handles: adopt them and repaint from the
-            // retained model, exactly as the idle restore does.
-            adopt_notes_items(tray.id(), notes);
+            // Fresh menu, fresh notes and voice handles: adopt them and repaint
+            // from the retained model, exactly as the idle restore does.
+            adopt_sections(tray.id(), sections);
             (item, true)
         }
     };
@@ -2100,6 +2182,44 @@ pub fn apply_notes_state(app: &AppHandle, model: &NotesTray) {
     };
     if let Some(items) = items {
         paint_notes(&items, model);
+    }
+}
+
+/// The last voice labels this process pushed, so a tick that would say the
+/// same thing returns without touching the OS (AD-34-1). A module `static`
+/// for the notes model's reason: it outlives the slot, and a tray toggled off
+/// and on comes back saying what the turn says.
+static VOICE_MODEL: Mutex<Option<keeper_core::voice_reach::TrayVoiceLabels>> = Mutex::new(None);
+
+/// Render the voice section from the turn's snapshot (Story 63.5, FR-421).
+///
+/// Called by the same ~1 Hz tick that drives recording, sync and notes, with
+/// `voice_ipc::voice_snapshot()` — Rust's own turn, not anything the webview
+/// mirrored, which is what lets the label follow idle / listening / speaking
+/// while the window is hidden. The notes renderer's two rules hold: never
+/// `set_menu`, and a write happens on a change, never on a tick. With no
+/// voice items (unsupported, or a recording rendering displacing the
+/// section) the memo still moves, so the next adopted menu is diffed against
+/// the truth and not against a label from before the recording.
+pub fn apply_voice_state(app: &AppHandle, snapshot: &VoiceStateVm) {
+    let _ = app;
+    let labels = keeper_core::voice_reach::tray_voice_labels(snapshot);
+    {
+        let mut slot = VOICE_MODEL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.as_ref() == Some(&labels) {
+            return;
+        }
+        *slot = Some(labels.clone());
+    }
+    let items = {
+        let guard = tray_guard();
+        guard.as_ref().and_then(|state| state.voice.clone())
+    };
+    if let Some(items) = items {
+        set_label(&items.status, &labels.status);
+        set_label(&items.talk, labels.verb);
     }
 }
 

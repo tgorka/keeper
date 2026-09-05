@@ -19,10 +19,18 @@
 //!   without a message; a partial transcript never sends at all.
 //! - **A failure releases the device too.** `Failed` is a state, but it is one
 //!   the microphone has already been released from.
+//! - **The port never records its own answer** (AD-175). Whether the device
+//!   may be open while an utterance is read aloud is [`may_record`]'s answer,
+//!   and it depends on the platform: iOS keeps keeper's voice out of the
+//!   transcript, so the microphone stays open for barge-in; macOS has nothing
+//!   that does, so it is released before the `Speak`. The table below is
+//!   platform-free; [`super::Turn`] applies the rule over it.
 //!
 //! [`Silence`]: TurnEvent::Silence
 
 use std::time::Duration;
+
+use super::VoicePlatform;
 
 /// How long `Listening` waits for the first word before giving up.
 ///
@@ -56,8 +64,13 @@ pub enum TurnState {
         text: String,
     },
     /// The message went to the model and the answer is streaming back.
-    Sending,
-    /// The answer is being read aloud; the microphone stays open for barge-in.
+    Sending {
+        /// Whether the first piece of the answer has arrived — the difference
+        /// between a model thinking and one that has started (AD-186).
+        answering: bool,
+    },
+    /// The answer is being read aloud. Whether the microphone is open for
+    /// barge-in meanwhile is [`may_record`]'s answer for the platform.
     Speaking,
     /// The turn ended on an error. The device is already released.
     Failed {
@@ -67,7 +80,7 @@ pub enum TurnState {
 }
 
 /// What happened, as the port, the surface and the conversation report it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TurnEvent {
     /// The trigger: the wake phrase was heard, or the person pressed the mic
     /// control that stands in for it (Story 62.6).
@@ -80,6 +93,10 @@ pub enum TurnEvent {
     Sent,
     /// A piece of the answer arrived.
     AnswerChunk,
+    /// The input level in `0.0..=1.0`, smoothed and rate-limited by the
+    /// port's [`super::level::Meter`]. Not a transition: [`super::Turn`]
+    /// records it for the snapshot and the table ignores it everywhere.
+    Level(f32),
     /// The whole answer arrived — the text to read aloud.
     AnswerDone(String),
     /// The person started speaking (barge-in while `Speaking`).
@@ -156,21 +173,25 @@ pub fn advance(state: TurnState, event: TurnEvent) -> (TurnState, Vec<Effect>) {
         (state @ TurnState::Listening { .. }, _) => (state, Vec::new()),
 
         // -- Heard ------------------------------------------------------------
-        (TurnState::Heard { .. }, Sent) => (TurnState::Sending, Vec::new()),
+        (TurnState::Heard { .. }, Sent) => (TurnState::Sending { answering: false }, Vec::new()),
         // The answer may arrive without a `Sent` in between: `Sending` is a
         // progress marker for the surface, not a gate on the answer.
         (TurnState::Heard { .. }, AnswerDone(text)) => speak_or_end(text, Vec::new()),
         (state @ TurnState::Heard { .. }, _) => (state, Vec::new()),
 
         // -- Sending ----------------------------------------------------------
-        (TurnState::Sending, AnswerChunk) => (TurnState::Sending, Vec::new()),
-        (TurnState::Sending, AnswerDone(text)) => speak_or_end(text, Vec::new()),
-        (TurnState::Sending, _) => (TurnState::Sending, Vec::new()),
+        (TurnState::Sending { .. }, AnswerChunk) => {
+            (TurnState::Sending { answering: true }, Vec::new())
+        }
+        (TurnState::Sending { .. }, AnswerDone(text)) => speak_or_end(text, Vec::new()),
+        (state @ TurnState::Sending { .. }, _) => (state, Vec::new()),
 
         // -- Speaking ---------------------------------------------------------
-        // Barge-in: stop talking before anything else, then listen again. The
-        // microphone is already open; `OpenMicrophone` restarts recognition on
-        // a fresh request so the answer's tail is not transcribed as speech.
+        // Barge-in: stop talking before anything else, then listen again. On
+        // a full-duplex platform the microphone is already open and
+        // `OpenMicrophone` restarts recognition on a fresh request so the
+        // answer's tail is not transcribed as speech; on a half-duplex one it
+        // was released before the speech and this opens it.
         (TurnState::Speaking, SpeechDetected) => (
             TurnState::Listening {
                 heard: String::new(),
@@ -221,5 +242,27 @@ pub fn silence_budget(state: &TurnState) -> Option<Duration> {
         TurnState::Listening { heard } if heard.trim().is_empty() => Some(NOTHING_HEARD_TIMEOUT),
         TurnState::Listening { .. } => Some(END_OF_UTTERANCE_PAUSE),
         _ => None,
+    }
+}
+
+/// AD-175, the half-duplex rule: whether the port may have the microphone
+/// open while the turn is in `state` on `platform`.
+///
+/// `false` in `Failed` everywhere: the turn ended on an error and the
+/// device is already released. `false` in `Speaking` on a platform that is
+/// not [`VoicePlatform::full_duplex`]: nothing there keeps the answer out
+/// of the microphone, so a port that recorded while it spoke would hear
+/// itself, and the first transcript it produced would stop its own speech.
+/// `true` everywhere else, including `Idle` (a wake phrase may hold the
+/// device) and `Speaking` where the OS arbitrates, which is what the iOS
+/// port has always done.
+pub fn may_record(platform: &VoicePlatform, state: &TurnState) -> bool {
+    match state {
+        TurnState::Failed { .. } => false,
+        TurnState::Speaking => platform.full_duplex,
+        TurnState::Idle
+        | TurnState::Listening { .. }
+        | TurnState::Heard { .. }
+        | TurnState::Sending { .. } => true,
     }
 }

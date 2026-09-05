@@ -139,27 +139,143 @@ in the recording frontend (`zero-egress.test.ts`).
 
 ## Voice adds no egress
 
-Talk mode on the phone (Epic 62) turns speech into text, sends that text to the bot as an
-ordinary message, and speaks the answer — and none of the three steps contacts a network host
-the table above does not already name. The message goes to the provider row you typed, exactly
-as a typed message would. Recognition is Apple's on-device recogniser: every request the iOS
-port builds sets `requiresOnDeviceRecognition = true`, and the port checks the recogniser's
-`supportsOnDeviceRecognition` before it builds one. Apple's recogniser will otherwise fall back
-to Apple's servers, and that fallback would be a destination this file does not name — so
-there is no server-fallback path in the code, not a disabled one. Synthesis is the system's own
-voice, which needs nothing from the network. The wake phrase is matched in the same on-device
-transcript and never leaves the device; it is stored as a setting, not sent anywhere.
+Talk mode (Epic 62 on the phone, Epic 63 on the Mac) turns speech into text, sends that text to
+the bot as an ordinary message, and speaks the answer — and none of the three steps contacts a
+network host the table above does not already name. The message goes to the provider row you
+typed, exactly as a typed message would. Recognition is Apple's on-device recogniser: every
+request either port builds sets `requiresOnDeviceRecognition = true`, and the port checks the
+recogniser's `supportsOnDeviceRecognition` before it builds one. Apple's recogniser will
+otherwise fall back to Apple's servers, and that fallback would be a destination this file does
+not name — so there is no server-fallback path in the code, not a disabled one. Synthesis is the
+system's own voice, which needs nothing from the network. The wake phrase is matched in the same
+on-device transcript and never leaves the device; it is stored as a setting, not sent anywhere.
 
-When the phone has no on-device model for its locale, keeper says so — *"on-device speech
-recognition for `pl_PL` is not on this phone — download that language under Settings > General >
-Keyboard > Dictation Languages; keeper never sends your voice to a server"* — and does nothing
-else. That sentence is not a fallback, it is the refusal: the person is told which language to
-download and why keeper will not simply use the network instead. Like the sidecar audit above,
-this is enforced by a source scan rather than asserted: `voice_on_device` in `keeper-core`'s
-tests reads the voice modules of both crates off disk and fails the build if a recognition
-request is ever built without the on-device flag, if the flag is ever set to `false`, or if a
-network API appears in any voice module (NFR-50). The decision is recorded as
-`docs/decisions.md` D-5.
+When the device has no on-device model for its locale, keeper says so — on the phone,
+*"on-device speech recognition for `pl_PL` is not on this phone — download that language under
+Settings > General > Keyboard > Dictation Languages; keeper never sends your voice to a server"*,
+and on the Mac the same sentence naming System Settings > Keyboard > Dictation — and does
+nothing else. A recogniser that cannot run on the device at all (`supportsOnDeviceRecognition`
+false) gets a distinct refusal that says no download will change it
+(`keeper-core/src/voice/mod.rs:110-113`, `:145-147`). That sentence is not a fallback, it is
+the refusal: the person is told which language to download and why keeper will not simply use
+the network instead. Like the sidecar audit above, this is enforced by a source scan rather than
+asserted: `voice_on_device` in `keeper-core`'s tests reads the voice modules of both crates off
+disk — `keeper-core/src/voice/**` and every `voice*.rs` in the shell crate, picked up by prefix
+so a new port cannot be left out (`keeper-core/tests/voice_on_device.rs:38-41`) — and fails the
+build if a recognition request is ever built without the on-device flag, if the flag is ever set
+to `false`, or if a network API appears in any voice module (NFR-50). The decision is recorded
+as `docs/decisions.md` D-5.
+
+### On this Mac
+
+The macOS port (`crates/keeper/src/voice_macos.rs`, Epic 63, Story 63.4) adds no destination
+either, and its position differs from the phone's in two ways worth stating: there is no
+`AVAudioSession` on macOS, so keeper cannot lower other audio while it speaks and releases the
+microphone instead (`voice_macos.rs:29-36`), and the microphone is held open by an App Nap
+activity assertion only for as long as a capture is up (`voice_macos.rs:94-98`, `:1020-1023`,
+`:1050`). Every request it builds sets the on-device flag (`voice_macos.rs:1085-1086`), after
+`supportsOnDeviceRecognition` is checked (`voice_macos.rs:940-941`). Settings → About renders
+the following lines, mirrored one-to-one from `MACOS_DISCLOSURE_LINES` in
+`src/components/settings/about-section.tsx`; `about-section.test.tsx` reads this file from disk
+and fails when the two lists differ. Edit both together or neither.
+
+- Speech is recognised on this Mac itself and never sent to a server; a language whose on-device recogniser is not installed is refused, not uploaded.
+- The microphone is open only while voice is on — after you press Talk, the hotkey or the tray item, or while it listens for your wake phrase — and the system microphone indicator shows it.
+- Nothing is recorded or uploaded; what you said reaches only the model endpoint you configured, as text.
+- keeper does not lower other audio while it listens or speaks, because macOS has no audio session that could; it stops listening while it talks instead.
+
+### A spoken answer's language is decided on the device
+
+Epic 64 (Story 64.2, AD-182, AD-183, AD-188) makes keeper choose a voice for the answer it reads
+aloud, and that choice adds no destination. The answer's dominant language is detected by
+`NaturalLanguage`'s `NLLanguageRecognizer`, a system framework with no network path: the port
+allocates a recogniser, constrains it to the languages this device has voices for plus the
+listening language, hands it the text and reads `dominantLanguage` back
+(`src-tauri/crates/keeper/src/voice_macos.rs:1493-1518`; the same four calls on the phone,
+`voice_ios.rs:1647-1670`). The constraint list is built in the core from the synthesiser's
+own inventory (`keeper-core/src/voice/speech.rs:49-64`), so the text is classified only among
+languages it could be spoken in, and the voice inventory it comes from is
+`AVSpeechSynthesisVoice.speechVoices` read once on the device (`voice_macos.rs:1453-1472`).
+**No answer text leaves the device to be classified.** Which voice speaks is then a pure
+function over (detected, listening, voices) in `speech.rs:66-84`; a language with no voice is
+refused with the download page named (`keeper-core/src/voice/mod.rs:165-168`), never spoken
+in another language's voice and never sent anywhere to be spoken. The binding is
+`objc2-natural-language 0.3.2` (`src-tauri/Cargo.toml:380`), and the on-device source scan
+described above covers it: `voice_on_device` reads `voice_macos.rs` and `voice_ios.rs` off
+disk and fails the build if a network API appears in either.
+
+One request body changes, to a row this file already lists. A turn that began by voice carries
+one extra system sentence to the provider host you typed — *"The person asked this aloud and
+your answer will be read aloud to them. Answer in Polish (pl-PL)."* (`speech.rs:112-117`),
+prepended in `src-tauri/crates/keeper/src/bots_ipc.rs:1155-1168` only when the voice turn is
+the one awaiting this send. A typed turn adds nothing and its body is byte-identical to before,
+which `keeper-core/tests/bots_remote_session.rs:631` asserts through the fake gateway. The sentence
+names the listening language, which is already a setting on that device; it discloses nothing
+the provider did not receive as the question itself.
+
+The audio level (Story 64.3, AD-186) never leaves the process either. The input tap that hands
+every buffer to the recogniser also reads the same buffer's samples and computes an RMS in
+place (`voice_macos.rs:1273-1289`; `voice_ios.rs:1355-1370`); a meter in the core smooths it
+and lets at most one reading through every 40 ms, only when it moved
+(`keeper-core/src/voice/level.rs:52-59`, `:90`). What crosses to the webview is one number in
+`0.0..=1.0` on the existing voice channel — never samples, never a buffer — and nothing is
+recorded or written to disk on the way. The recogniser still receives every buffer unchanged,
+before the meter looks at it.
+
+## One conversation on two devices adds no egress
+
+Epic 63 lets a conversation started on the phone be read and followed on the Mac, and the other
+way round, and it adds **no destination**: every request it makes goes to the Hermes host that
+is already the provider row above (AD-178). What changed is how much of that host keeper reads.
+Stated so the per-release diff of this file can be checked against the code:
+
+| Request | Added by | Purpose |
+| --- | --- | --- |
+| `GET /v1/capabilities` | Story 63.6 (`keeper-core/src/bots/remote.rs:71`, `:179-216`) | Once per provider: does this Hermes keep sessions and honour the continuity header. An endpoint that answers nothing, a non-success status or non-JSON is an endpoint without the feature, and keeper behaves as it did before. Never sent to an Ollama endpoint. |
+| `X-Hermes-Session-Id` on the existing chat request | Story 63.6 (`remote.rs:68`, `:113-118`) | Names the session a turn continues, so two devices land in one Hermes session instead of minting one each. A header on a request this file already lists, not a new request. |
+| `GET /api/sessions` | Story 63.6 (`remote.rs:74`, `:334-348`) | The session list, read when the endpoint said it has one; `keeper.db` alone when it did not. |
+| `GET /api/sessions/{id}/messages` | Story 63.6 on open, re-read by Story 63.7 while a session is live elsewhere (`remote.rs:392-393`; `keeper-core/src/bots/follow.rs:13-22`) | The transcript. Following another device's turn is this same read repeated at 2 s, 5 s, then 15 s intervals and stopped after five quiet minutes (`follow.rs:44-63`); keeper never opens `GET /v1/runs/{id}/events` against a run it did not start, because that queue is destructive and a second reader steals from the first (`follow.rs:7-11`, AD-177). |
+
+### Why the token-by-token mirror is a destination change, and is not built
+
+The owner asked to see the other device's transcript grow word by word. Hermes cannot serve
+that (the queue above), and the only route that can is relaying the live transcript into a
+Matrix room, as one message per turn edited in place with `m.replace` as tokens arrive. **That
+adds no host** — the homeserver is already the first row of the table above — **and it is still
+a change to this file**, because this file is the answer to *where do these bytes go*, and a
+relay changes the answer for transcripts: today a conversation persists on the Hermes host you
+typed and in `keeper.db`; relayed, it also persists on the homeserver, in a room, in every
+device's key backup, and in every server the room is federated to. Under NFR-11 a new place
+transcripts *live* is an architecture-level change even when it is not a new place keeper
+*connects*, so it is recorded here as refused-for-now with its arithmetic, and in the deferral
+ledger as DW-224, rather than attempted quietly.
+
+The arithmetic that makes it a bad trade today, on a default Synapse:
+
+- **Rate.** Synapse's default `rc_message` is `per_second: 0.2, burst_count: 10`
+  (Synapse, "Configuring Synapse", `rc_message`,
+  `https://element-hq.github.io/synapse/latest/usage/configuration/config_documentation.html#rc_message`).
+  Sustained, that is one event every five seconds. A relay editing once per second spends its
+  burst of ten in 10 ÷ (1 − 0.2) = 12.5 seconds and is then throttled to one edit per five
+  seconds with `M_LIMIT_EXCEEDED` between — so a 1 Hz loop degrades after about twelve seconds
+  of a single answer, and every answer longer than that arrives in five-second lurches. Raising
+  the limit is a per-homeserver operator setting, which a client keeper cannot assume and a
+  Beeper account cannot change at all.
+- **Size.** An event is capped at 65536 bytes of canonical JSON (Matrix Client-Server API,
+  "Size limits", `https://spec.matrix.org/latest/client-server-api/#size-limits`), and an
+  `m.replace` edit carries the whole new body in `m.new_content`, not a delta. Each edit
+  re-sends everything said so far, so a transcript approaching the cap stops being editable
+  at all, and the bytes sent grow quadratically with the answer's length.
+- **Cleartext.** In an encrypted room the body is encrypted, but the relation is not:
+  `m.relates_to` on an edit is kept in the cleartext part of the event so the server can
+  aggregate it (Matrix Client-Server API, "Relationships between events",
+  `https://spec.matrix.org/latest/client-server-api/#forming-relationships-between-events`).
+  Every edit therefore tells the homeserver, in the clear, which message is being rewritten and
+  how often — the cadence of the model's output, which is metadata this file would have to
+  disclose as leaving the device.
+
+What ships instead is step-level following on the Hermes host already listed, and the
+interface says "following" rather than "streaming" (Story 63.7, AD-177).
 
 ## The no-telemetry invariant
 

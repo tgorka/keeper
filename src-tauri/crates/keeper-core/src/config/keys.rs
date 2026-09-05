@@ -412,6 +412,16 @@ pub const KEYS: &[KeySpec] = &[
         summary: "The phrase that starts a voice turn, as typed; matched case- and diacritic-insensitively. At least 5 letters, at most 5 words.",
         example: "\"hej keeper\"",
     },
+    KeySpec {
+        key: "bots.voice_locale",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The language the voice recogniser runs in, as a locale identifier. Blank means the system locale when it can run on the device, otherwise the first that can; a language that cannot run here is refused, never silently replaced.",
+        example: "\"en-US\"",
+    },
     // ---- debug -----------------------------------------------------------
     KeySpec {
         key: "debug.mode",
@@ -453,6 +463,16 @@ pub const KEYS: &[KeySpec] = &[
         default: "",
         summary: "The OS-global Quick Capture accelerator; empty means unset.",
         example: "\"Control+Alt+N\"",
+    },
+    KeySpec {
+        key: "hotkey.voice",
+        family: false,
+        scope: Scope::MachineLocal,
+        settable: Settable::MachineFileOnly(HOTKEY_WHY),
+        shape: Shape::Accelerator,
+        default: "",
+        summary: "The OS-global voice accelerator that starts a turn; empty means unset.",
+        example: "\"Control+Alt+V\"",
     },
     // ---- incognito -------------------------------------------------------
     KeySpec {
@@ -1358,6 +1378,7 @@ mod tests {
             "hotkey.global",
             "hotkey.recording",
             "hotkey.capture",
+            "hotkey.voice",
             "recording.destination_dir",
             "recording.destination_profile_id",
             "sync.git_path",

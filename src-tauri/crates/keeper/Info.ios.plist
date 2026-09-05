@@ -21,5 +21,14 @@
 <dict>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>keeper listens through the microphone only while you talk to a model you configured — after you tap Talk or say your wake phrase — and turns your words into text on this phone. Nothing is recorded or uploaded.</string>
+	<!--
+	  Story 63.4 gave the macOS bundle its own speech sentence, and the merge
+	  carried it onto the phone: the installed IPA's prompt read "into text on
+	  this Mac itself" on an iPhone, caught by install-ios.sh's own proof step
+	  (2026-09-04). The same trap as the microphone key above, one epic later.
+	  This string MUST equal the one in `gen/apple/project.yml`.
+	-->
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>keeper turns what you say into text on this phone, using on-device recognition only, so it can send your words to the model you chose. Your voice never leaves the device; keeper refuses server recognition.</string>
 </dict>
 </plist>

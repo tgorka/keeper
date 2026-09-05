@@ -6,14 +6,24 @@
 //! cold install and an upgrade take the same path, and **no JSON blob in a
 //! row** (AD-139).
 //!
-//! # Why keeper's own store is the truth
+//! # Whose record a conversation is
 //!
-//! Hermes keeps real server-side sessions and it is tempting to make them the
-//! record. The epic decided against it for three sourced reasons: compression
-//! mints a *new* continuation session with a renamed title, the stored-response
-//! cache is 100 rows LRU, and Ollama has no session concept at all. So a
-//! session is keeper's, and a Hermes `session_id` is persisted *beside* the row
-//! ([`BotSession::remote_session_id`]) as a reference rather than as identity.
+//! Epic 61 made keeper's own store the record and kept a Hermes `session_id`
+//! beside the row as a reference, for three sourced reasons: compression mints
+//! a *new* continuation session with a renamed title, the stored-response
+//! cache is 100 rows LRU, and Ollama has no session concept at all. Epic 63
+//! (AD-176) keeps the row and changes what the reference means: the Hermes
+//! session id **is the conversation's cross-device identity**. keeper mints it
+//! on the first turn, sends it on every turn, and a second device that lists
+//! the gateway adopts a row carrying the same id
+//! ([`super::remote::reconcile`]), so both devices continue one session
+//! rather than each minting their own. The local row stays: it is this
+//! device's handle for renaming, archiving and deleting, and it is the whole
+//! record wherever the endpoint has no session API (Ollama, an older Hermes).
+//! [`BotSession::remote_last_active_ms`] and [`BotSession::remote_source`] are
+//! what the gateway last said about that session, so a surface can label a
+//! transcript that came from the endpoint with when and where it was written
+//! (AD-181).
 //!
 //! # Every metadata field is its own column
 //!
@@ -161,7 +171,60 @@ fn open(data_dir: &Path) -> Result<Connection, CoreError> {
         [],
     )
     .map_err(|e| CoreError::Internal(format!("could not ensure bot_messages time index: {e}")))?;
+    ensure_remote_activity_columns(&conn)?;
+    // A conversation deleted here whose identity lives on the gateway
+    // (Epic 63, AD-176). Without this row the next list read would adopt the
+    // gateway's copy straight back, and Delete would be an affordance that
+    // lies (AD-27). Keyed by provider so the same id on two gateways is two
+    // facts.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bot_dismissed_remote_sessions(\
+            provider_id TEXT NOT NULL, \
+            remote_session_id TEXT NOT NULL, \
+            dismissed_ms INTEGER NOT NULL, \
+            PRIMARY KEY(provider_id, remote_session_id)\
+        )",
+        [],
+    )
+    .map_err(|e| CoreError::Internal(format!("could not ensure dismissal schema: {e}")))?;
     Ok(conn)
+}
+
+/// Add the two Epic 63 columns to `bot_sessions` where an older install lacks
+/// them (AD-176, AD-181).
+///
+/// Idempotent and non-destructive, `registry::ensure_hue_index_column`'s
+/// shape: the column list is read and `ALTER TABLE … ADD COLUMN` runs only for
+/// a column that is missing, so an install written by an Epic 61 build
+/// upgrades in place with every conversation intact. Both are nullable — a
+/// row the gateway never described has nothing to say here — which is what
+/// the schema comment above requires of any column added after the first
+/// release.
+fn ensure_remote_activity_columns(conn: &Connection) -> Result<(), CoreError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(bot_sessions)")
+        .map_err(|e| CoreError::Internal(format!("could not inspect bot_sessions schema: {e}")))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| CoreError::Internal(format!("could not inspect bot_sessions schema: {e}")))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| CoreError::Internal(format!("could not inspect bot_sessions schema: {e}")))?;
+    for (column, sql) in [
+        (
+            "remote_last_active_ms",
+            "ALTER TABLE bot_sessions ADD COLUMN remote_last_active_ms INTEGER",
+        ),
+        (
+            "remote_source",
+            "ALTER TABLE bot_sessions ADD COLUMN remote_source TEXT",
+        ),
+    ] {
+        if !existing.iter().any(|c| c == column) {
+            conn.execute(sql, [])
+                .map_err(|e| CoreError::Internal(format!("could not add {column} column: {e}")))?;
+        }
+    }
+    Ok(())
 }
 
 /// One conversation with one bot (Story 61.4, FR-381).
@@ -185,9 +248,17 @@ pub struct BotSession {
     pub updated_ms: i64,
     /// Whether it has been archived (reversibly).
     pub archived: bool,
-    /// The remote's own session id, where the far side has one. A reference,
-    /// never the truth — see the module docs.
+    /// The remote's own session id, where the far side has one. Since Epic 63
+    /// this is the conversation's cross-device identity — see the module docs.
     pub remote_session_id: Option<String>,
+    /// When the gateway last saw activity on that session, ms since the Unix
+    /// epoch, as of keeper's last read of it. `None` where keeper never read
+    /// the gateway's list — Ollama, an older Hermes, a session keeper started
+    /// and nobody has listed since.
+    pub remote_last_active_ms: Option<i64>,
+    /// The gateway's `source` for that session — which door wrote it (`api`,
+    /// `cli`, a messenger bridge). `None` on the same terms.
+    pub remote_source: Option<String>,
 }
 
 /// One message of one conversation (Story 61.4, FR-384).
@@ -270,8 +341,8 @@ pub struct MessageClose<'a> {
 
 /// The `SELECT` column list every session read shares, so the column order the
 /// mapper assumes is written exactly once.
-const SESSION_COLUMNS: &str =
-    "id, bot_id, provider_id, title, created_ms, updated_ms, archived, remote_session_id";
+const SESSION_COLUMNS: &str = "id, bot_id, provider_id, title, created_ms, updated_ms, archived, \
+     remote_session_id, remote_last_active_ms, remote_source";
 
 /// The `SELECT` column list every message read shares.
 const MESSAGE_COLUMNS: &str = "id, session_id, seq, role, content, model, provider_id, \
@@ -288,7 +359,8 @@ pub fn insert_session(data_dir: &Path, session: &BotSession) -> Result<(), CoreE
     let conn = open(data_dir)?;
     conn.execute(
         "INSERT INTO bot_sessions(id, bot_id, provider_id, title, created_ms, updated_ms, \
-         archived, remote_session_id) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         archived, remote_session_id, remote_last_active_ms, remote_source) \
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             session.id,
             session.bot_id,
@@ -298,6 +370,8 @@ pub fn insert_session(data_dir: &Path, session: &BotSession) -> Result<(), CoreE
             session.updated_ms,
             i64::from(session.archived),
             session.remote_session_id,
+            session.remote_last_active_ms,
+            session.remote_source,
         ],
     )
     .map_err(|e| CoreError::Internal(format!("could not insert bot session: {e}")))?;
@@ -418,6 +492,57 @@ pub fn set_session_remote_id(
     Ok(changed > 0)
 }
 
+/// Record what the gateway last said about a conversation's remote session
+/// (Epic 63, AD-181). Returns whether a row matched.
+///
+/// Written by [`super::remote::reconcile`] on every list read, so the label a
+/// row carries is the gateway's latest word and not the one from the day the
+/// conversation was adopted. Both `None` is a legitimate write: a gateway that
+/// stopped listing a session has stopped saying anything about it.
+pub fn set_session_remote_activity(
+    data_dir: &Path,
+    session_id: &str,
+    remote_last_active_ms: Option<i64>,
+    remote_source: Option<&str>,
+) -> Result<bool, CoreError> {
+    let conn = open(data_dir)?;
+    let changed = conn
+        .execute(
+            "UPDATE bot_sessions SET remote_last_active_ms = ?2, remote_source = ?3 WHERE id = ?1",
+            rusqlite::params![session_id, remote_last_active_ms, remote_source],
+        )
+        .map_err(|e| CoreError::Internal(format!("could not write remote activity: {e}")))?;
+    Ok(changed > 0)
+}
+
+/// Every conversation of one provider that carries a remote session id
+/// (Epic 63, AD-176).
+///
+/// The join side of [`super::remote::reconcile`]: one read for the whole
+/// provider rather than one per remote row, because a gateway lists up to two
+/// hundred sessions a page and a connection per lookup would be two hundred
+/// opens of `keeper.db` for one refresh of the list.
+pub fn list_sessions_with_remote_id(
+    data_dir: &Path,
+    provider_id: &str,
+) -> Result<Vec<BotSession>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM bot_sessions \
+             WHERE provider_id = ?1 AND remote_session_id IS NOT NULL"
+        ))
+        .map_err(|e| CoreError::Internal(format!("could not prepare remote-id listing: {e}")))?;
+    let rows = stmt
+        .query_map([provider_id], map_session_row)
+        .map_err(|e| CoreError::Internal(format!("could not list remote-id sessions: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| CoreError::Internal(format!("could not read session: {e}")))?);
+    }
+    Ok(out)
+}
+
 /// Stamp a conversation as touched (Story 61.4). Returns whether a row
 /// matched.
 ///
@@ -449,11 +574,24 @@ pub fn touch_session(
 /// One `BEGIN IMMEDIATE` transaction, not two statements: a failure between
 /// them would leave messages whose session is gone, and every one of those
 /// rows would then be a message no surface can reach and no delete can find.
-pub fn delete_session(data_dir: &Path, session_id: &str) -> Result<(), CoreError> {
+///
+/// A row that names a gateway session leaves a dismissal behind
+/// (`bot_dismissed_remote_sessions`), so [`super::remote::reconcile`] does not
+/// adopt the gateway's copy back on the next list read (Epic 63). The
+/// gateway's own copy is untouched — keeper never deletes on a server it does
+/// not own — which is exactly why the dismissal has to be remembered here.
+pub fn delete_session(data_dir: &Path, session_id: &str, now_ms: i64) -> Result<(), CoreError> {
     let conn = open(data_dir)?;
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| CoreError::Internal(format!("could not begin session delete: {e}")))?;
     let outcome = (|| -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_dismissed_remote_sessions\
+             (provider_id, remote_session_id, dismissed_ms) \
+             SELECT provider_id, remote_session_id, ?2 FROM bot_sessions \
+             WHERE id = ?1 AND remote_session_id IS NOT NULL",
+            rusqlite::params![session_id, now_ms],
+        )?;
         conn.execute(
             "DELETE FROM bot_messages WHERE session_id = ?1",
             [session_id],
@@ -474,6 +612,32 @@ pub fn delete_session(data_dir: &Path, session_id: &str) -> Result<(), CoreError
             )))
         }
     }
+}
+
+/// The gateway session ids a person deleted here, per provider (Epic 63).
+///
+/// Read by [`super::remote::reconcile`] before it adopts anything. A
+/// dismissal is forever: the gateway keeps its copy, and a conversation the
+/// person removed from this device coming back on the next refresh is the
+/// defect this table exists to make unreachable.
+pub fn list_dismissed_remote_ids(
+    data_dir: &Path,
+    provider_id: &str,
+) -> Result<Vec<String>, CoreError> {
+    let conn = open(data_dir)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT remote_session_id FROM bot_dismissed_remote_sessions WHERE provider_id = ?1",
+        )
+        .map_err(|e| CoreError::Internal(format!("could not prepare dismissal read: {e}")))?;
+    let rows = stmt
+        .query_map([provider_id], |r| r.get::<_, String>(0))
+        .map_err(|e| CoreError::Internal(format!("could not read dismissals: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| CoreError::Internal(format!("could not read dismissal: {e}")))?);
+    }
+    Ok(out)
 }
 
 /// Append one message and return the `seq` it was given (Story 61.4).
@@ -877,8 +1041,8 @@ pub fn search_sessions(data_dir: &Path, query: &SessionQuery) -> Result<SessionP
         .query_map(bound.as_slice(), |r| {
             Ok(SessionListRow {
                 session: map_session_row(r)?,
-                latest_activity_ms: r.get(8)?,
-                message_count: r.get(9)?,
+                latest_activity_ms: r.get(10)?,
+                message_count: r.get(11)?,
             })
         })
         .map_err(|e| CoreError::Internal(format!("could not search bot sessions: {e}")))?;
@@ -919,6 +1083,8 @@ fn map_session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotSession> {
         updated_ms: r.get(5)?,
         archived: r.get::<_, i64>(6)? != 0,
         remote_session_id: r.get(7)?,
+        remote_last_active_ms: r.get(8)?,
+        remote_source: r.get(9)?,
     })
 }
 
@@ -979,6 +1145,8 @@ mod tests {
             updated_ms,
             archived: false,
             remote_session_id: None,
+            remote_last_active_ms: None,
+            remote_source: None,
         }
     }
 
@@ -1169,10 +1337,10 @@ mod tests {
         insert_session(&dir, &session("s1", 1)).expect("insert");
         append_message(&dir, &message("m1", "s1", "user", "hello")).expect("append");
         append_message(&dir, &message("m2", "s1", "assistant", "hi")).expect("append");
-        delete_session(&dir, "s1").expect("delete");
+        delete_session(&dir, "s1", 1_700_000_000_000).expect("delete");
         assert!(get_session(&dir, "s1").expect("read").is_none());
         assert!(list_messages(&dir, "s1").expect("list").is_empty());
-        delete_session(&dir, "s1").expect("deleting again is a no-op");
+        delete_session(&dir, "s1", 1_700_000_000_000).expect("deleting again is a no-op");
     }
 
     /// Retry replaces rather than appends: the failed row is removed, and the

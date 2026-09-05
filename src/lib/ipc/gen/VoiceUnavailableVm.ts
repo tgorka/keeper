@@ -21,6 +21,14 @@ locale: string,
 /**
  * Which language to download, and where.
  */
+message: string, } | { "kind": "noOnDeviceRecognition", 
+/**
+ * The locale identifier that was asked for, canonical (`pl-PL`).
+ */
+locale: string, 
+/**
+ * The sentence: the two ways out, and the languages that can run.
+ */
 message: string, } | { "kind": "noMicrophone", 
 /**
  * The sentence.
@@ -28,6 +36,14 @@ message: string, } | { "kind": "noMicrophone",
 message: string, } | { "kind": "noRecognizer", 
 /**
  * The sentence, naming the build problem.
+ */
+message: string, } | { "kind": "noVoice", 
+/**
+ * The language subtag the answer was detected in (e.g. `pl`).
+ */
+language: string, 
+/**
+ * The sentence.
  */
 message: string, } | { "kind": "unsupported", 
 /**

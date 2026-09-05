@@ -824,6 +824,35 @@ pub fn set_bots_wake_phrase(data_dir: &Path, phrase: &str) -> Result<(), CoreErr
     set_setting(data_dir, BOTS_WAKE_PHRASE_KEY, phrase)
 }
 
+/// The `settings` key holding the recogniser's language (Epic 63). Absent or
+/// blank = "choose for me": `keeper_core::voice::locale::choose` takes the
+/// system locale when it can run on the device and the first that can
+/// otherwise. Stored as typed (`pl-PL` or `pl_PL`); the comparison that
+/// matters normalises, so the table never needs to.
+const BOTS_VOICE_LOCALE_KEY: &str = "bots.voice_locale";
+
+/// Read the chosen recogniser language (Epic 63). Absent or blank ⇒ `None`,
+/// "choose for me".
+pub fn get_bots_voice_locale(data_dir: &Path) -> Result<Option<String>, CoreError> {
+    Ok(get_setting(data_dir, BOTS_VOICE_LOCALE_KEY)?
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
+}
+
+/// Write the chosen recogniser language (Epic 63): `None` clears the choice
+/// back to "choose for me". Stored trimmed under `bots.voice_locale`; whether
+/// the locale can run here is `keeper_core::voice::locale::choose`'s answer,
+/// given to the caller before this is reached, and a locale that cannot is
+/// still stored — the person's choice is recorded and refused, not silently
+/// replaced.
+pub fn set_bots_voice_locale(data_dir: &Path, locale: Option<&str>) -> Result<(), CoreError> {
+    set_setting(
+        data_dir,
+        BOTS_VOICE_LOCALE_KEY,
+        locale.map(str::trim).unwrap_or_default(),
+    )
+}
+
 /// The boot-time config-override file's name (Story 22.6, FR-80): lives beside
 /// `keeper.db` in the data dir.
 pub const CONFIG_FILE_NAME: &str = "config.json";
@@ -1148,6 +1177,30 @@ pub fn get_capture_hotkey(data_dir: &Path) -> Result<String, CoreError> {
 /// registers with the OS *before* calling this; core only stores it.
 pub fn set_capture_hotkey(data_dir: &Path, accelerator: &str) -> Result<(), CoreError> {
     set_setting(data_dir, HOTKEY_CAPTURE_KEY, accelerator)
+}
+
+/// The `settings` key holding the optional OS-global voice hotkey accelerator
+/// (Epic 63, Story 63.5, FR-420, AD-174). A **fourth, independent** binding
+/// beside summon, recording and capture — it never touches their keys. Stored
+/// as an opaque accelerator string; absent ⇒ the empty string = **unset** (the
+/// shell registers nothing). `keeper-core` never parses it.
+const HOTKEY_VOICE_KEY: &str = "hotkey.voice";
+
+/// Read the OS-global voice hotkey accelerator (Story 63.5). Absent ⇒ the
+/// empty string, meaning **unset by default**, for the capture chord's reason:
+/// a shipped default would be a chord stolen from whatever else the user had
+/// bound to it, and a turn is started by a person, so the chord is theirs to
+/// choose.
+pub fn get_voice_hotkey(data_dir: &Path) -> Result<String, CoreError> {
+    Ok(get_setting(data_dir, HOTKEY_VOICE_KEY)?.unwrap_or_default())
+}
+
+/// Write the OS-global voice hotkey accelerator (Story 63.5). Persists the
+/// opaque accelerator string under `hotkey.voice`; the empty string persists
+/// "unset" (the shell's clear path). The shell validates + registers with the
+/// OS *before* calling this; core only stores it.
+pub fn set_voice_hotkey(data_dir: &Path, accelerator: &str) -> Result<(), CoreError> {
+    set_setting(data_dir, HOTKEY_VOICE_KEY, accelerator)
 }
 
 /// The `settings` key holding the id of the vault the notes surface is currently
@@ -2787,6 +2840,30 @@ mod tests {
     }
 
     #[test]
+    fn voice_hotkey_is_a_fourth_independent_binding() {
+        let dir = temp_dir();
+        // Unset by default, like the recording and capture chords.
+        assert_eq!(get_voice_hotkey(&dir).expect("get absent hotkey"), "");
+        set_voice_hotkey(&dir, "Control+Alt+V").expect("set hotkey");
+        assert_eq!(
+            get_voice_hotkey(&dir).expect("get set hotkey"),
+            "Control+Alt+V"
+        );
+        // The empty string clears it back to unset.
+        set_voice_hotkey(&dir, "").expect("clear hotkey");
+        assert_eq!(get_voice_hotkey(&dir).expect("get cleared hotkey"), "");
+        // None of the other three bindings moved — four keys, four chords.
+        set_voice_hotkey(&dir, "Control+Alt+V").expect("set hotkey again");
+        assert_eq!(get_capture_hotkey(&dir).expect("capture untouched"), "");
+        assert_eq!(get_recording_hotkey(&dir).expect("recording untouched"), "");
+        assert_eq!(
+            get_global_hotkey(&dir).expect("summon untouched"),
+            DEFAULT_GLOBAL_HOTKEY
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn active_vault_is_absent_until_chosen_and_blank_reads_as_absent() {
         let dir = temp_dir();
         assert_eq!(get_active_vault(&dir).expect("get absent vault"), None);
@@ -3981,6 +4058,27 @@ mod tests {
         assert_eq!(
             get_bots_wake_phrase(&dir).expect("read blank"),
             crate::voice::DEFAULT_WAKE_PHRASE
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bots_voice_locale_defaults_to_unset_and_clears_to_unset() {
+        let dir = temp_dir();
+        // Absent ⇒ "choose for me".
+        assert_eq!(get_bots_voice_locale(&dir).expect("read default"), None);
+        set_bots_voice_locale(&dir, Some(" pl_PL ")).expect("write");
+        // Trimmed, otherwise as typed: the comparison normalises, the table
+        // does not.
+        assert_eq!(
+            get_bots_voice_locale(&dir).expect("read back"),
+            Some("pl_PL".to_owned())
+        );
+        set_bots_voice_locale(&dir, None).expect("clear");
+        assert_eq!(get_bots_voice_locale(&dir).expect("read cleared"), None);
+        assert_eq!(
+            get_setting(&dir, "bots.voice_locale").expect("read raw"),
+            Some(String::new())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

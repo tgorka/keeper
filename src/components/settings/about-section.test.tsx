@@ -7,6 +7,13 @@ vi.mock("@/lib/ipc/client", () => ({
   egressList: vi.fn(() => Promise.resolve([])),
   debugModeGet: vi.fn(() => Promise.resolve(false)),
   debugModeSet: vi.fn(() => Promise.resolve()),
+  // The voice facts `useVoiceFacts` reads on open (Story 63.8, AD-179). The
+  // default is every build without a voice port, so the pre-existing
+  // assertions see no "On this Mac" block; the cases that care opt in.
+  voiceAvailability: vi.fn(() =>
+    Promise.resolve({ kind: "unsupported", message: "voice is not available in this build" }),
+  ),
+  voiceWakeGet: vi.fn(() => Promise.reject(new Error("not answered"))),
 }));
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion: vi.fn(() => Promise.resolve("0.0.0-test")),
@@ -25,15 +32,21 @@ import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
-import { AboutSection, IOS_DISCLOSURE_LINES } from "@/components/settings/about-section";
-import { type EgressEndpointVm, egressList } from "@/lib/ipc/client";
+import {
+  AboutSection,
+  IOS_DISCLOSURE_LINES,
+  MACOS_DISCLOSURE_LINES,
+} from "@/components/settings/about-section";
+import { type EgressEndpointVm, egressList, voiceAvailability } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { voiceStore } from "@/lib/stores/voice";
 
 const mockEgress = vi.mocked(egressList);
 const mockCheck = vi.mocked(check);
 const mockRelaunch = vi.mocked(relaunch);
 const mockOpenUrl = vi.mocked(openUrl);
 const mockGetVersion = vi.mocked(getVersion);
+const mockVoiceAvailability = vi.mocked(voiceAvailability);
 
 /** All seven capabilities present = the desktop tier (updater block renders). */
 const DESKTOP_CAPABILITIES = {
@@ -91,6 +104,12 @@ beforeEach(() => {
   mockOpenUrl.mockResolvedValue(undefined);
   mockGetVersion.mockReset();
   mockGetVersion.mockResolvedValue("0.0.0-test");
+  mockVoiceAvailability.mockReset();
+  mockVoiceAvailability.mockResolvedValue({
+    kind: "unsupported",
+    message: "voice is not available in this build",
+  });
+  voiceStore.setState({ state: null, unavailable: undefined, wake: null });
   // Default the mirror to the desktop tier so the software-update block renders for
   // the egress/update-flow assertions; the reduced-platform cases opt in explicitly.
   capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
@@ -402,7 +421,87 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     await waitFor(() => expect(vi.mocked(debugModeSet)).toHaveBeenCalledWith(true));
     expect(toggle).toBeChecked();
   });
+
+  // ── "On this Mac" (Story 63.8, AD-175, AD-179) ────────────────────────────
+  it("desktop with a voice port: shows the 'On this Mac' voice disclosure, every line", async () => {
+    mockVoiceAvailability.mockResolvedValue(null);
+    render(<AboutSection open />);
+
+    expect(await screen.findByText("On this Mac")).toBeInTheDocument();
+    for (const line of MACOS_DISCLOSURE_LINES) {
+      expect(screen.getByText(line)).toBeInTheDocument();
+    }
+    // The disclosure names what the Mac cannot do, not only what it does.
+    expect(screen.getByText(/does not lower other audio/)).toBeInTheDocument();
+    expect(screen.queryByText("On this iPhone")).not.toBeInTheDocument();
+  });
+
+  it("desktop with a refusal that is not 'unsupported' (not authorised): the disclosure still stands", async () => {
+    // A port exists and is refusing for a reason the person can fix; what
+    // keeper will and will not do once it works is the same sentence.
+    mockVoiceAvailability.mockResolvedValue({
+      kind: "notAuthorized",
+      message: "allow the microphone under System Settings",
+    });
+    render(<AboutSection open />);
+
+    expect(await screen.findByText("On this Mac")).toBeInTheDocument();
+  });
+
+  it("desktop without a voice port: no 'On this Mac' block (absent, not disabled)", async () => {
+    // beforeEach already answered `unsupported` — every build without a port.
+    mockEgress.mockResolvedValue(NON_BEEPER_EGRESS);
+    render(<AboutSection open />);
+
+    await waitFor(() => expect(mockVoiceAvailability).toHaveBeenCalled());
+    await waitFor(() => expect(voiceStore.getState().unavailable?.kind).toBe("unsupported"));
+    expect(await screen.findByText("https://matrix.example.org")).toBeInTheDocument();
+    expect(screen.queryByText("On this Mac")).not.toBeInTheDocument();
+  });
+
+  it("does not draw the 'On this Mac' block before voice_availability has answered", async () => {
+    mockVoiceAvailability.mockReturnValue(new Promise<null>(() => {}));
+    mockEgress.mockResolvedValue(NON_BEEPER_EGRESS);
+    render(<AboutSection open />);
+
+    expect(await screen.findByText("https://matrix.example.org")).toBeInTheDocument();
+    expect(screen.queryByText("On this Mac")).not.toBeInTheDocument();
+  });
+
+  it("iOS with a voice port: the phone's disclosure, never the Mac's", async () => {
+    mockVoiceAvailability.mockResolvedValue(null);
+    capabilitiesStore.getState().applySnapshot(DEFAULT_CAPABILITIES);
+    render(<AboutSection open />);
+
+    expect(await screen.findByText("On this iPhone")).toBeInTheDocument();
+    await waitFor(() => expect(voiceStore.getState().unavailable).toBeNull());
+    expect(screen.queryByText("On this Mac")).not.toBeInTheDocument();
+  });
 });
+
+/**
+ * The first bullet run under the heading `headingLine` in `doc`: the list stops
+ * at the first line that is not a bullet after the list has begun, so the prose
+ * below it is not mistaken for one more item. Throws when the heading is absent,
+ * so a renamed section fails the guard rather than passing it vacuously.
+ */
+function firstBulletRun(doc: string, docPath: string, headingLine: string): string[] {
+  const start = doc.indexOf(`${headingLine}\n`);
+  if (start < 0) {
+    throw new Error(`${docPath} has no '${headingLine}' section`);
+  }
+  const lines = doc.slice(start + headingLine.length + 1).split("\n");
+  const first = lines.findIndex((line) => line.startsWith("- "));
+  expect(first).toBeGreaterThanOrEqual(0);
+  const bullets: string[] = [];
+  for (const line of lines.slice(first)) {
+    if (!line.startsWith("- ")) {
+      break;
+    }
+    bullets.push(line.slice(2));
+  }
+  return bullets;
+}
 
 /**
  * `docs/ios.md` says of its Limitations list: "mirrored from `IOS_DISCLOSURE_LINES`
@@ -413,24 +512,7 @@ describe("AboutSection capability gating (Story 13.7)", () => {
 describe("IOS_DISCLOSURE_LINES mirrors docs/ios.md (Story 62.3, FR-400)", () => {
   it("is identical to the Limitations bullet list, in order", () => {
     const doc = readFileSync(resolve(process.cwd(), "docs/ios.md"), "utf8");
-    const section = /^## Limitations\n([\s\S]*?)(?=^## |(?![\s\S]))/m.exec(doc);
-    if (section === null) {
-      throw new Error("docs/ios.md has no '## Limitations' section");
-    }
-    // The first bullet run of the section: the list stops at the first line that
-    // is not a bullet after the list has begun, so the prose below it is not
-    // mistaken for a sixth item.
-    const lines = section[1]?.split("\n") ?? [];
-    const first = lines.findIndex((line) => line.startsWith("- "));
-    expect(first).toBeGreaterThanOrEqual(0);
-    const bullets: string[] = [];
-    for (const line of lines.slice(first)) {
-      if (!line.startsWith("- ")) {
-        break;
-      }
-      bullets.push(line.slice(2));
-    }
-    expect(bullets).toEqual([...IOS_DISCLOSURE_LINES]);
+    expect(firstBulletRun(doc, "docs/ios.md", "## Limitations")).toEqual([...IOS_DISCLOSURE_LINES]);
   });
 
   it("names, in the phone's own disclosure, what Bots does not do there", () => {
@@ -439,5 +521,28 @@ describe("IOS_DISCLOSURE_LINES mirrors docs/ios.md (Story 62.3, FR-400)", () => 
     expect(IOS_DISCLOSURE_LINES.some((line) => /drive tools live on your Mac/.test(line))).toBe(
       true,
     );
+  });
+});
+
+/**
+ * The Mac's lines are the egress claim in the person's own words, so they are
+ * mirrored into `docs/egress.md` — the canonical record every release diffs —
+ * under the same discipline as the phone's (Story 63.8, AD-178).
+ */
+describe("MACOS_DISCLOSURE_LINES mirrors docs/egress.md (Story 63.8)", () => {
+  it("is identical to the 'On this Mac' bullet list, in order", () => {
+    const doc = readFileSync(resolve(process.cwd(), "docs/egress.md"), "utf8");
+    expect(firstBulletRun(doc, "docs/egress.md", "### On this Mac")).toEqual([
+      ...MACOS_DISCLOSURE_LINES,
+    ]);
+  });
+
+  it("says what the Mac cannot do, not only what it does", () => {
+    // AD-175: no `AVAudioSession` on macOS means no ducking, and the person is
+    // told so where they read what this build does with their voice.
+    expect(MACOS_DISCLOSURE_LINES.some((line) => /does not lower other audio/.test(line))).toBe(
+      true,
+    );
+    expect(MACOS_DISCLOSURE_LINES.some((line) => /never sent to a server/.test(line))).toBe(true);
   });
 });

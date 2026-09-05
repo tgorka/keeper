@@ -89,13 +89,18 @@ use keeper_core::bots::tools::{
 // direction, and the staging itself, are `bots_drive_ipc`.
 use keeper_core::bots::deliverable;
 use keeper_core::bots::error::BotsError;
+use keeper_core::bots::follow;
 use keeper_core::bots::grant::Grant;
+use keeper_core::bots::remote::{self, CapabilityCache, SessionCapabilities};
 use keeper_core::bots::{discover, http, session, store, Bot, Endpoint, Provider, ProviderHealth};
 use keeper_core::vm::{
-    BotChatSendReq, BotConversationVm, BotMessageVm, BotModelVm, BotProbeVm, BotProviderSaveReq,
-    BotProviderVm, BotRetryReq, BotSaveReq, BotSessionListVm, BotSessionQueryReq, BotSessionVm,
-    BotStreamEvent, BotVm, IpcError, IpcErrorCode,
+    BotChatSendReq, BotConversationVm, BotFollowVm, BotMessageVm, BotModelVm, BotProbeVm,
+    BotProviderSaveReq, BotProviderVm, BotRetryReq, BotSaveReq, BotSessionListVm,
+    BotSessionQueryReq, BotSessionVm, BotStreamEvent, BotTranscriptSource, BotVm, IpcError,
+    IpcErrorCode,
 };
+// Epic 64's one: the sentence a spoken turn opens with (AD-182).
+use keeper_core::voice::speech;
 // Story 61.9's two, on their own line so the story that owns them is legible.
 use keeper_core::vm::{BotCommandContextReq, BotCommandPreviewVm};
 // Story 61.11's two — the tool row and the context disclosure — likewise.
@@ -246,6 +251,109 @@ fn read_timeout_of(row: &store::ProviderRow) -> Duration {
 }
 
 // ---------------------------------------------------------------------------
+// What each endpoint said about sessions (Epic 63, Story 63.6, AD-176)
+// ---------------------------------------------------------------------------
+
+/// The per-provider capability cache.
+///
+/// One probe of `GET /v1/capabilities` per provider per process, remembered
+/// here and forgotten when the provider is edited, removed or re-tested. The
+/// key and the forgetting rule are `keeper_core::bots::remote::CapabilityCache`'s;
+/// this holds the instance and the lock, `streams()`'s way.
+fn capabilities() -> std::sync::MutexGuard<'static, CapabilityCache> {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<CapabilityCache>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(CapabilityCache::default()));
+    CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What this provider's endpoint can do about sessions, probing once.
+///
+/// The probe is at the gateway root, without a profile prefix, because the
+/// capabilities are the gateway's. An endpoint that answers nothing is
+/// remembered as [`SessionCapabilities::NONE`], which is today's behaviour on
+/// every later call — no header, no list read, no sentence for the user.
+async fn session_caps(state: &AppState, row: &store::ProviderRow) -> SessionCapabilities {
+    let provider = &row.provider;
+    if let Some(caps) = capabilities().get(&provider.id, &provider.base_url) {
+        return caps;
+    }
+    let caps = match (endpoint_of(state, row, None), discover::discovery_client()) {
+        (Ok(endpoint), Ok(client)) => remote::probe_capabilities(&client, &endpoint).await,
+        _ => SessionCapabilities::NONE,
+    };
+    capabilities().remember(&provider.id, &provider.base_url, caps);
+    caps
+}
+
+/// The cached answer for a provider id, or none — for labelling rows without
+/// a round trip.
+fn cached_caps(dir: &Path, provider_id: &str) -> SessionCapabilities {
+    store::get_provider(dir, provider_id)
+        .ok()
+        .flatten()
+        .and_then(|row| capabilities().get(provider_id, &row.provider.base_url))
+        .unwrap_or(SessionCapabilities::NONE)
+}
+
+/// Fold every capable gateway's session list into `keeper.db` (AD-176).
+///
+/// For each provider whose endpoint has a session API, and each pinned bot on
+/// it, read the gateway's list and `remote::reconcile` it: a session started
+/// on another device becomes a row here, carrying the same id, so it can be
+/// opened and continued. Every failure degrades silently to the local list —
+/// a gateway that stopped answering is remembered as having no session API
+/// until the provider is edited or re-tested, so a dead host costs one
+/// connect timeout and not one per refresh.
+async fn reconcile_remote(state: &AppState, dir: &Path) {
+    let Ok(listing) = store::list_providers(dir) else {
+        return;
+    };
+    let now = now_ms();
+    for row in &listing.rows {
+        let caps = session_caps(state, row).await;
+        if !caps.session_api {
+            continue;
+        }
+        let Ok(bots) = store::list_bots_for_provider(dir, &row.provider.id) else {
+            continue;
+        };
+        let Ok(client) = discover::discovery_client() else {
+            return;
+        };
+        for bot in &bots {
+            let Ok(endpoint) = endpoint_of(state, row, Some(&bot.target)) else {
+                continue;
+            };
+            match remote::list_sessions(&client, &endpoint).await {
+                Ok(found) => {
+                    if let Err(error) =
+                        remote::reconcile(dir, &row.provider.id, &bot.id, &found, now)
+                    {
+                        tracing::warn!(%error, "bots: could not fold the gateway's sessions in");
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "bots: gateway session list not read; local list stands");
+                    if matches!(
+                        error,
+                        BotsError::Transport { .. } | BotsError::Timeout { .. }
+                    ) {
+                        capabilities().remember(
+                            &row.provider.id,
+                            &row.provider.base_url,
+                            SessionCapabilities::NONE,
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Providers (FR-369, FR-379)
 // ---------------------------------------------------------------------------
 
@@ -331,6 +439,9 @@ pub fn bots_provider_save(
         keeper_core::bots::delete_provider_token(state.platform.as_ref(), &id)
             .map_err(to_ipc_error)?;
     }
+    // An edit may point at a different gateway; what the old one said about
+    // sessions is not a fact about the new one.
+    capabilities().forget(&id);
     let row = provider_of(&dir, &id)?;
     Ok(BotProviderVm::compose(
         &row,
@@ -361,6 +472,7 @@ pub fn bots_provider_remove(
     // which secrets belonged to this provider.
     let bots = store::list_bots_for_provider(&dir, &provider_id).map_err(to_ipc_error)?;
     store::delete_provider(&dir, &provider_id).map_err(to_ipc_error)?;
+    capabilities().forget(&provider_id);
     keeper_core::bots::delete_provider_token(state.platform.as_ref(), &provider_id)
         .map_err(to_ipc_error)?;
     for bot in &bots {
@@ -389,6 +501,10 @@ pub async fn bots_provider_probe(
 ) -> Result<BotProbeVm, IpcError> {
     let dir = data_dir(&state)?;
     let row = provider_of(&dir, &provider_id)?;
+    // Test is the person asking again, so the session-capability answer is
+    // asked again too on the next list read — the way a gateway that came
+    // back from a dead spell gets its session API noticed.
+    capabilities().forget(&provider_id);
     let endpoint = endpoint_of(&state, &row, None)?;
     let client = http::client(read_timeout_of(&row)).map_err(bots_error)?;
     let probe = discover::health(&client, &endpoint).await;
@@ -548,30 +664,44 @@ pub fn bots_bot_remove(state: State<'_, AppState>, bot_id: String) -> Result<(),
 // Conversations (FR-381, FR-382)
 // ---------------------------------------------------------------------------
 
-/// Every conversation, newest activity first (FR-381).
+/// Every conversation, newest activity first (FR-381), after folding in
+/// every capable gateway's own list (Epic 63, AD-176).
+///
+/// This is the read the pane makes on mount and after every send — its
+/// **revision signal** for the searched list — so it is where the gateway is
+/// asked: a session another device started becomes a row here before the
+/// list that shows it is re-read. A gateway with no session API, or one that
+/// does not answer, changes nothing about the answer; see
+/// [`reconcile_remote`].
 ///
 /// Rejects with: `internal`.
 #[tauri::command]
-pub fn bots_sessions_list(
+pub async fn bots_sessions_list(
     state: State<'_, AppState>,
     include_archived: bool,
 ) -> Result<Vec<BotSessionVm>, IpcError> {
     let dir = data_dir(&state)?;
+    reconcile_remote(&state, &dir).await;
     let rows = session::list_sessions(&dir, include_archived).map_err(to_ipc_error)?;
     Ok(rows.iter().map(BotSessionVm::compose).collect())
 }
 
-/// One conversation and its messages, replayed from keeper's own store
-/// (FR-382).
+/// One conversation and its messages (FR-382; Epic 63, AD-176, AD-181).
 ///
 /// One command rather than two, so a header cannot render one conversation's
-/// title over another's rows for a frame. Nothing is fetched from the remote:
-/// keeper's store is the truth, and a Hermes `session_id` is a reference the
-/// detail may show.
+/// title over another's rows for a frame.
+///
+/// Where the row names a gateway session and the gateway has a session API,
+/// the transcript is **the gateway's** — `GET /api/sessions/{id}/messages`,
+/// which is the one copy both devices write to — and the answer says so
+/// (`transcript: remote`). Where the endpoint keeps no sessions, or where its
+/// history cannot be read right now, the transcript is keeper's own copy and
+/// the answer says that instead. Neither case is an error: a gateway that is
+/// down does not make the local record wrong.
 ///
 /// Rejects with: `internal` (unknown id).
 #[tauri::command]
-pub fn bots_session_open(
+pub async fn bots_session_open(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<BotConversationVm, IpcError> {
@@ -579,11 +709,97 @@ pub fn bots_session_open(
     let row = session::get_session(&dir, &session_id)
         .map_err(to_ipc_error)?
         .ok_or_else(|| no_such("conversation", &session_id))?;
-    let messages = session::list_messages(&dir, &session_id).map_err(to_ipc_error)?;
+    let local = session::list_messages(&dir, &session_id).map_err(to_ipc_error)?;
+    if let Some(found) = remote_history(&state, &dir, &row).await {
+        let messages = follow::merge(&local, &found, &row.id, &row.provider_id, row.updated_ms);
+        return Ok(BotConversationVm {
+            session: BotSessionVm::compose(&row),
+            messages: messages.iter().map(BotMessageVm::compose).collect(),
+            transcript: BotTranscriptSource::Remote,
+        });
+    }
     Ok(BotConversationVm {
         session: BotSessionVm::compose(&row),
-        messages: messages.iter().map(BotMessageVm::compose).collect(),
+        messages: local.iter().map(BotMessageVm::compose).collect(),
+        transcript: BotTranscriptSource::Local,
     })
+}
+
+/// Read the conversation another device may be writing, and say when to read
+/// it again (Epic 63, Story 63.7, FR-425, FR-426, AD-177).
+///
+/// One history read of the route [`bots_session_open`] already uses — never
+/// `GET /v1/runs/{id}/events`, whose queue is destroyed by a second reader —
+/// folded under `keeper_core::bots::follow::merge`'s rule, with
+/// `keeper_core::bots::follow::decide` saying whether the webview should ask
+/// again and after how long. The webview owns the timer, so a conversation
+/// that leaves the screen stops being read the moment it does, and nothing
+/// here outlives the pane.
+///
+/// `owns_turn` is the shell's own answer, not the webview's: a turn this
+/// process is streaming is in [`streams`], and a device that has the stream
+/// does not read the transcript underneath it.
+///
+/// A transcript that could not be read — a local conversation, a gateway that
+/// stopped answering — is [`BotFollowVm::UNREAD`]: what is on screen stands,
+/// and the following stops rather than retrying against a host that is down.
+///
+/// Rejects with: `internal` (unknown id).
+#[tauri::command]
+pub async fn bots_session_follow(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<BotFollowVm, IpcError> {
+    let dir = data_dir(&state)?;
+    let row = session::get_session(&dir, &session_id)
+        .map_err(to_ipc_error)?
+        .ok_or_else(|| no_such("conversation", &session_id))?;
+    let Some(found) = remote_history(&state, &dir, &row).await else {
+        return Ok(BotFollowVm::UNREAD);
+    };
+    let local = session::list_messages(&dir, &session_id).map_err(to_ipc_error)?;
+    let messages = follow::merge(&local, &found, &row.id, &row.provider_id, row.updated_ms);
+    let live = follow::turn_open(&found);
+    let next = follow::decide(&follow::FollowSignals {
+        now_ms: now_ms(),
+        owns_turn: owns_turn(&session_id),
+        turn_open: live,
+        newest_ms: follow::newest_ms(&found),
+        last_active_ms: row.remote_last_active_ms,
+        updated_ms: row.updated_ms,
+    });
+    Ok(BotFollowVm::compose(&messages, live, next))
+}
+
+/// The gateway's history for a conversation, or `None` when keeper reads its
+/// own copy instead.
+///
+/// `None` covers every reason at once — no remote id, no session API, an
+/// unknown bot or provider, a gateway that did not answer — because the caller
+/// has exactly one alternative and it is the same for all of them. The
+/// failure is logged at debug: it is the ordinary state of an endpoint that
+/// lacks the feature, not a fault.
+async fn remote_history(
+    state: &AppState,
+    dir: &Path,
+    row: &session::BotSession,
+) -> Option<Vec<remote::RemoteMessage>> {
+    let remote_id = row.remote_session_id.as_deref()?;
+    let provider = store::get_provider(dir, &row.provider_id).ok().flatten()?;
+    let caps = session_caps(state, &provider).await;
+    if remote::transcript_source(caps, row) != BotTranscriptSource::Remote {
+        return None;
+    }
+    let bot = store::get_bot(dir, &row.bot_id).ok().flatten()?;
+    let endpoint = endpoint_of(state, &provider, Some(&bot.target)).ok()?;
+    let client = discover::discovery_client().ok()?;
+    match remote::fetch_messages(&client, &endpoint, remote_id).await {
+        Ok(found) => Some(found),
+        Err(error) => {
+            tracing::debug!(%error, "bots: gateway transcript not read; replaying keeper's copy");
+            None
+        }
+    }
 }
 
 /// One page of the conversation list, searched, scoped and bounded
@@ -602,7 +818,9 @@ pub fn bots_sessions_search(
 ) -> Result<BotSessionListVm, IpcError> {
     let dir = data_dir(&state)?;
     let page = session::search_sessions(&dir, &req.to_query()).map_err(to_ipc_error)?;
-    Ok(BotSessionListVm::compose(&page))
+    Ok(BotSessionListVm::compose(&page, |provider_id| {
+        cached_caps(&dir, provider_id)
+    }))
 }
 
 /// Rename one conversation (Story 61.6, FR-381).
@@ -653,9 +871,11 @@ pub fn bots_session_archive(
 
 /// Delete one conversation and every message in it (Story 61.6, FR-381).
 ///
-/// **No remote request is made.** keeper's store is the record (AD-154), so a
-/// delete is a local transaction; a Hermes `session_id` beside the row named
-/// something on a server keeper never owned and cannot speak for.
+/// **No remote request is made.** A delete is a local transaction; a Hermes
+/// session id on the row names something on a server keeper never owned and
+/// cannot speak for. What the delete does remember is the dismissal, so the
+/// next list read does not adopt the gateway's copy straight back
+/// (`session::delete_session`, Epic 63).
 ///
 /// It refuses an id that names nothing rather than reporting a delete that
 /// deleted nothing, because the confirmation the user just read named an
@@ -672,7 +892,7 @@ pub fn bots_session_delete(state: State<'_, AppState>, session_id: String) -> Re
     {
         return Err(no_such("conversation", &session_id));
     }
-    session::delete_session(&dir, &session_id).map_err(to_ipc_error)
+    session::delete_session(&dir, &session_id, now_ms()).map_err(to_ipc_error)
 }
 
 /// Re-read one conversation after a write, or refuse.
@@ -698,6 +918,9 @@ fn session_vm(dir: &std::path::Path, session_id: &str) -> Result<BotSessionVm, I
 struct LiveStream {
     cancel: CancelHandle,
     task: tauri::async_runtime::JoinHandle<()>,
+    /// The conversation this answer is arriving into, so
+    /// [`bots_session_follow`] can tell that this device holds the turn.
+    session_id: String,
 }
 
 impl Drop for LiveStream {
@@ -723,6 +946,13 @@ fn streams() -> std::sync::MutexGuard<'static, HashMap<String, LiveStream>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Whether this process is streaming a turn of `session_id` right now
+/// (Story 63.7). A device that has the stream does not read the transcript
+/// underneath it.
+fn owns_turn(session_id: &str) -> bool {
+    streams().values().any(|live| live.session_id == session_id)
+}
+
 /// What one streaming turn needs, resolved before the task is spawned.
 ///
 /// `pub(crate)` with its fields because [`TurnHost::host`] hands it to the
@@ -745,6 +975,12 @@ pub(crate) struct Turn {
     /// The profile an unqualified tool path is relative to, or empty when no
     /// grant names one — `keeper_core::bots::tools::default_profile_id`.
     pub(crate) default_profile_id: String,
+    /// Whether the voice turn heard the question this answer is to (Epic
+    /// 64, AD-182, AD-186): the request carried the answer-in-this-language
+    /// instruction, and the voice turn is told when the request leaves and
+    /// when the first token arrives, so its indicator has a middle. A typed
+    /// turn never touches the voice turn.
+    pub(crate) spoken: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -850,6 +1086,7 @@ struct Armed {
     context: Option<ContextBundle>,
     drive: Box<dyn TurnHost>,
     default_profile_id: String,
+    spoken: bool,
 }
 
 /// Everything about one turn that `keeper-core` decides from the live grants,
@@ -908,13 +1145,26 @@ async fn arm_turn(
     let profile_ids: Vec<&str> = drive.profile_ids.iter().map(String::as_str).collect();
     let default_profile_id = tools::default_profile_id(&grants, &profile_ids).unwrap_or_default();
 
+    // Epic 64, AD-182: a question the voice turn heard is answered aloud,
+    // so the model is asked to answer in the language the person is
+    // speaking — the listening locale in force. Whether this send is that
+    // turn's is the voice turn's own answer (`Turn::awaiting_send`), the
+    // same rule the pane applies before it reads the answer aloud. The
+    // sentence is core's (`speech::answer_instruction`); a typed turn adds
+    // nothing and sends exactly what it sent before.
+    let spoken_in = crate::voice_ipc::spoken_turn(dir);
+    if let Some(listening) = &spoken_in {
+        tracing::info!(%listening, "bots: a spoken turn; asking for the answer in the listening language");
+    }
     let mut prompted = Vec::with_capacity(messages.len() + 1);
-    if let Some(system) = drive
+    let context_prompt = drive
         .context
         .as_ref()
-        .and_then(ContextBundle::system_prompt)
-    {
-        prompted.push(ChatMessage::text(Role::System, system));
+        .and_then(ContextBundle::system_prompt);
+    let instruction = spoken_in.as_deref().map(speech::answer_instruction);
+    let parts = [context_prompt, instruction].into_iter().flatten();
+    if let Some(system) = ChatMessage::instructions(parts) {
+        prompted.push(system);
     }
     prompted.extend(messages);
 
@@ -929,6 +1179,7 @@ async fn arm_turn(
         context: drive.context,
         drive: drive.host,
         default_profile_id,
+        spoken: spoken_in.is_some(),
     }
 }
 
@@ -945,7 +1196,11 @@ async fn arm_turn(
 ///
 /// The whole conversation is replayed to the model from keeper's store, in
 /// order, which is what makes "continue" mean replay rather than a server-side
-/// resume keeper cannot verify.
+/// resume keeper cannot verify. On a Hermes that honours the continuity
+/// header the turn **also** names its session (Epic 63, AD-176): the id the
+/// row holds, or one minted here and written to the row before the request
+/// goes out, so a crash in between leaves an id keeper can find and the far
+/// side has not yet heard — never the reverse.
 ///
 /// Rejects with: `internal` (unknown bot, provider or conversation),
 /// `unsupported` (a request this provider kind refuses),
@@ -964,7 +1219,7 @@ pub async fn bots_chat_send(
 
     // The conversation, created on the first message so a titled conversation
     // can never exist with nothing in it.
-    let session_row = match req.session_id.as_deref() {
+    let mut session_row = match req.session_id.as_deref() {
         Some(id) => session::get_session(&dir, id)
             .map_err(to_ipc_error)?
             .ok_or_else(|| no_such("conversation", id))?,
@@ -978,11 +1233,14 @@ pub async fn bots_chat_send(
                 updated_ms: now,
                 archived: false,
                 remote_session_id: None,
+                remote_last_active_ms: None,
+                remote_source: None,
             };
             session::insert_session(&dir, &created).map_err(to_ipc_error)?;
             created
         }
     };
+    let continuity = adopt_identity(&state, &dir, &row, &mut session_row).await?;
 
     let user = store_message(&dir, &session_row.id, "user", &req.text, None, false, now)?;
     let assistant = store_message(
@@ -1000,7 +1258,8 @@ pub async fn bots_chat_send(
     // Story 61.12: the pasted images of this turn become `data:` content parts
     // on the user message, here and nowhere else.
     let messages = attach_staged_images(&dir, replay(&history, &assistant.id), &req.attachment_ids);
-    let armed = arm_turn(&state, &dir, &row, &bot, &req.model, messages).await;
+    let mut armed = arm_turn(&state, &dir, &row, &bot, &req.model, messages).await;
+    armed.request.session_id = continuity;
     let context = armed.context;
     let turn = Turn {
         dir,
@@ -1013,6 +1272,7 @@ pub async fn bots_chat_send(
         assistant_id: assistant.id.clone(),
         drive: armed.drive,
         default_profile_id: armed.default_profile_id,
+        spoken: armed.spoken,
     };
 
     let subscription_id = new_id();
@@ -1027,6 +1287,29 @@ pub async fn bots_chat_send(
     Ok(spawn_turn(turn, subscription_id, channel))
 }
 
+/// The session id this turn sends, written to the row first (AD-176).
+///
+/// `keeper_core::bots::remote::continuity_id` decides: `None` on an endpoint
+/// that never said it honours the header, the held id where the row has one,
+/// a fresh one otherwise. A fresh id is persisted **before** it is returned,
+/// and `row.remote_session_id` is updated in place so the `Opened` event
+/// carries the identity the request is about to use.
+async fn adopt_identity(
+    state: &AppState,
+    dir: &Path,
+    provider: &store::ProviderRow,
+    row: &mut session::BotSession,
+) -> Result<Option<String>, IpcError> {
+    let caps = session_caps(state, provider).await;
+    let continuity = remote::continuity_id(caps, row.remote_session_id.as_deref(), new_id);
+    if continuity.is_some() && continuity != row.remote_session_id {
+        session::set_session_remote_id(dir, &row.id, continuity.as_deref())
+            .map_err(to_ipc_error)?;
+        row.remote_session_id = continuity.clone();
+    }
+    Ok(continuity)
+}
+
 /// Re-ask the question one assistant row failed to answer (FR-372).
 ///
 /// The failed row is **replaced**, not appended beside: two answers to one
@@ -1038,8 +1321,13 @@ pub async fn bots_chat_send(
 /// last one", so a Retry pressed on a stale render cannot delete a row that
 /// arrived after it was drawn.
 ///
+/// A row that was read from the gateway's transcript rather than written here
+/// (Epic 63, AD-181) cannot be retried from this device: keeper never wrote
+/// it, so there is nothing of its own to replace, and the refusal says so
+/// rather than reporting a message that "does not exist".
+///
 /// Rejects with: `internal` (unknown conversation or message, or a message that
-/// is not an assistant row).
+/// is not an assistant row), `unsupported` (an answer another device holds).
 #[tauri::command]
 pub async fn bots_message_retry(
     state: State<'_, AppState>,
@@ -1047,18 +1335,28 @@ pub async fn bots_message_retry(
     channel: Channel<BotStreamEvent>,
 ) -> Result<String, IpcError> {
     let dir = data_dir(&state)?;
-    let session_row = session::get_session(&dir, &req.session_id)
+    let mut session_row = session::get_session(&dir, &req.session_id)
         .map_err(to_ipc_error)?
         .ok_or_else(|| no_such("conversation", &req.session_id))?;
     let bot = bot_of(&dir, &session_row.bot_id)?;
     let row = provider_of(&dir, &bot.provider_id)?;
     let endpoint = endpoint_of(&state, &row, Some(&bot.target))?;
+    let continuity = adopt_identity(&state, &dir, &row, &mut session_row).await?;
 
     let history = session::list_messages(&dir, &req.session_id).map_err(to_ipc_error)?;
-    let doomed = history
-        .iter()
-        .find(|message| message.id == req.message_id)
-        .ok_or_else(|| no_such("message", &req.message_id))?;
+    let Some(doomed) = history.iter().find(|message| message.id == req.message_id) else {
+        if continuity.is_some() {
+            return Err(IpcError {
+                code: IpcErrorCode::Unsupported,
+                message: "that answer was read from the gateway, not written here; retry it \
+                          from the device that asked, or ask again"
+                    .to_owned(),
+                account_id: None,
+                retriable: false,
+            });
+        }
+        return Err(no_such("message", &req.message_id));
+    };
     if doomed.role != "assistant" {
         return Err(IpcError {
             code: IpcErrorCode::Internal,
@@ -1088,7 +1386,7 @@ pub async fn bots_message_retry(
     session::touch_session(&dir, &req.session_id, now).map_err(to_ipc_error)?;
 
     let replayed = session::list_messages(&dir, &req.session_id).map_err(to_ipc_error)?;
-    let armed = arm_turn(
+    let mut armed = arm_turn(
         &state,
         &dir,
         &row,
@@ -1097,6 +1395,7 @@ pub async fn bots_message_retry(
         replay(&replayed, &assistant.id),
     )
     .await;
+    armed.request.session_id = continuity;
     let context = armed.context;
     let turn = Turn {
         dir,
@@ -1109,6 +1408,7 @@ pub async fn bots_message_retry(
         assistant_id: assistant.id.clone(),
         drive: armed.drive,
         default_profile_id: armed.default_profile_id,
+        spoken: armed.spoken,
     };
 
     let subscription_id = new_id();
@@ -1241,6 +1541,7 @@ fn replay(history: &[session::BotMessage], exclude_id: &str) -> Vec<ChatMessage>
 /// Spawn the driver for one turn and register it under `subscription_id`.
 fn spawn_turn(turn: Turn, subscription_id: String, channel: Channel<BotStreamEvent>) -> String {
     let (cancel, signal) = chat::cancellation();
+    let session_id = turn.session_id.clone();
     let retire = subscription_id.clone();
     let task = tauri::async_runtime::spawn(async move {
         drive(turn, signal, channel).await;
@@ -1248,7 +1549,14 @@ fn spawn_turn(turn: Turn, subscription_id: String, channel: Channel<BotStreamEve
         // task that has already finished — which aborts nothing.
         streams().remove(&retire);
     });
-    streams().insert(subscription_id.clone(), LiveStream { cancel, task });
+    streams().insert(
+        subscription_id.clone(),
+        LiveStream {
+            cancel,
+            task,
+            session_id,
+        },
+    );
     subscription_id
 }
 
@@ -1280,6 +1588,11 @@ async fn drive(turn: Turn, signal: chat::CancelSignal, channel: Channel<BotStrea
         read_timeout: turn.read_timeout,
         ..ChatOptions::default()
     };
+    // AD-186: the voice turn's "thinking" state begins when its request
+    // leaves and ends at the first token; only a turn it heard is told.
+    if turn.spoken {
+        crate::voice_ipc::note_sent();
+    }
 
     // The host is the port's to build, not this file's: `channel` and
     // `signal` are what an approval needs, and they exist only here.
@@ -1299,6 +1612,9 @@ async fn drive(turn: Turn, signal: chat::CancelSignal, channel: Channel<BotStrea
     let mut unflushed = 0usize;
     let mut sink = |event: ToolLoopEvent| match event {
         ToolLoopEvent::Chat(ChatEvent::FirstToken { after_ms }) => {
+            if turn.spoken {
+                crate::voice_ipc::note_answer_chunk();
+            }
             let _ = channel.send(BotStreamEvent::FirstToken { after_ms });
         }
         ToolLoopEvent::Chat(ChatEvent::ContentDelta(text)) => {

@@ -95,7 +95,9 @@ safe binding. Current inventory:
   second entry, which called itself that in its own doc comment before this list said so.
 - iOS voice port (Epic 62, Stories 62.4 and 62.6, FR-401–FR-403, FR-408, NFR-50/NFR-51):
   `SFSpeechRecognizer` (`authorizationStatus`, `requestAuthorization:`, `initWithLocale:`,
-  `supportsOnDeviceRecognition`, `recognitionTaskWithRequest:resultHandler:`),
+  `supportsOnDeviceRecognition`, `isAvailable`, `supportedLocales` — enumerated once and
+  cached, one recogniser per locale, so the person can choose a language that runs on
+  the device (Epic 63), `recognitionTaskWithRequest:resultHandler:`),
   `SFSpeechAudioBufferRecognitionRequest` (`setRequiresOnDeviceRecognition:` — always
   `true`, `appendAudioPCMBuffer:`, `endAudio`), `SFSpeechRecognitionTask cancel`,
   `AVAudioSession` (`sharedInstance`, `isInputAvailable`, `recordPermission`,
@@ -107,16 +109,89 @@ safe binding. Current inventory:
   `AVAudioSessionInterruptionNotification`, `AVAudioSessionMediaServicesWereResetNotification`
   and `AVAudioEngineConfigurationChangeNotification`, `removeObserver:`) via objc2-speech,
   objc2-avf-audio and objc2-foundation, behind `keeper_core::voice::VoicePort` and
-  `keeper_core::voice::ConsentPort` — twenty-two function-level `#[allow(unsafe_code)]`
+  `keeper_core::voice::ConsentPort` — twenty-seven function-level `#[allow(unsafe_code)]`
   fns in `crates/keeper/src/voice_ios.rs`, one per concern (`speech_authorization`,
   `microphone`, `microphone_consent`, `ask_speech`, `ask_microphone`,
-  `on_device_recognizer`, `configure_session`, `set_session_options`, `release_session`,
-  `start_capture`, `stop_capture`, `engine_running`, `start_request`, `end_request`,
-  `read_result`, `observe_session`, `interruption_notice`, `forget_observer`,
-  `new_synthesizer`, `speak_text`, `stop_speech`, `is_speaking`), each with a
-  `// SAFETY:` comment citing the Apple contract it relies on. `start_capture` also
-  carries `#[allow(clippy::arc_with_non_send_sync)]`: the request slot the audio tap
+  `on_device_locales`, `recognizer_for`, `configure_session`, `set_session_options`,
+  `release_session`, `start_capture`, `stop_capture`, `engine_running`, `start_request`,
+  `end_request`, `read_result`, `observe_session`, `interruption_notice`,
+  `forget_observer`, `new_synthesizer`, `voice_languages`, `voice_for_language`,
+  `voice_name`, `detect_language`, `speak_text`, `stop_speech`, `is_speaking`), each
+  with a `// SAFETY:` comment citing the Apple contract it relies on. `start_capture`
+  also carries `#[allow(clippy::arc_with_non_send_sync)]`: the request slot the audio tap
   reads is shared with the audio thread inside a block, which Rust cannot see — the
   SAFETY comment is the argument. No server recognition path exists in the file, and the
   port never prompts on its own: the two permission dialogs are reached only through
   `ConsentPort`, whose timing is decided in `keeper_core::voice::authorization`.
+- macOS voice port (Epic 63, Story 63.4, FR-417–FR-419, FR-408, NFR-53, AD-175):
+  `SFSpeechRecognizer` (`authorizationStatus`, `requestAuthorization:`, `initWithLocale:`,
+  `supportsOnDeviceRecognition`, `isAvailable`, `supportedLocales` — enumerated once and
+  cached (0.41 s for 63 locales on hesperia), refreshed when the person changes
+  `bots.voice_locale`, so the recogniser is built for a locale that runs on this Mac
+  rather than for the system locale (Epic 63; `localeWithLocaleIdentifier:` and
+  `currentLocale` are safe bindings), `recognitionTaskWithRequest:resultHandler:`),
+  `SFSpeechAudioBufferRecognitionRequest` (`setRequiresOnDeviceRecognition:` — always
+  `true`, `appendAudioPCMBuffer:`, `endAudio`), `SFSpeechRecognitionTask cancel`,
+  `AVAudioApplication` (`sharedInstance`, `recordPermission`,
+  `requestRecordPermissionWithCompletionHandler:` — macOS 14+; on 11–13 the class is
+  absent and the port reports the microphone grant as denied, at error level, rather than
+  guess), `AVAudioEngine` (`inputNode`, `inputFormatForBus:` for the no-input-device check,
+  `outputFormatForBus:`, `installTapOnBus:…`, `removeTapOnBus:`, `prepare`,
+  `startAndReturnError:`, `stop`, `isRunning`), `AVSpeechSynthesizer` (`speakUtterance:`,
+  `stopSpeakingAtBoundary:`, `isSpeaking`), `NSNotificationCenter`
+  (`addObserverForName:object:queue:usingBlock:` for
+  `AVAudioEngineConfigurationChangeNotification`, `removeObserver:`) and `NSProcessInfo`
+  (`endActivity:` for the App Nap assertion; `beginActivityWithOptions:reason:` is a safe
+  binding) via objc2-speech, objc2-avf-audio and objc2-foundation, behind
+  `keeper_core::voice::VoicePort` and `keeper_core::voice::ConsentPort` — twenty-two
+  function-level `#[allow(unsafe_code)]` fns in `crates/keeper/src/voice_macos.rs`, one per
+  concern (`speech_authorization`, `microphone_consent`, `ask_speech`, `ask_microphone`,
+  `input_present`, `on_device_locales`, `recognizer_for`, `start_capture`, `stop_capture`,
+  `engine_running`, `start_request`, `end_request`, `read_result`, `forget_observer`,
+  `new_synthesizer`, `voice_languages`, `voice_for_language`, `voice_name`,
+  `detect_language`, `speak_text`, `stop_speech`, `is_speaking`), each with a `// SAFETY:`
+  comment citing the Apple contract it relies on. `start_capture` also carries
+  `#[allow(clippy::arc_with_non_send_sync)]` for the same request slot as the iOS port. No
+  `AVAudioSession` call exists in the file — the class does not exist on macOS — so there
+  is no category, no ducking and no interruption observer; half-duplex is
+  `keeper_core::voice::may_record`'s, and the port never records while it speaks. No
+  server recognition path exists in the file, and the port never prompts on its own.
+  **Not yet compiled where it was written**: the file was authored on a Linux host and
+  gated by `keeper-core`'s platform-neutral voice tests and the on-device source scan;
+  its first `cargo clippy --target aarch64-apple-darwin` and first run are on the Mac.
+- Voice selection and on-device language detection, both ports (Epic 64, Story 64.2,
+  FR-429–FR-432, AD-182, AD-183, AD-188): `AVSpeechSynthesisVoice` (`speechVoices` —
+  enumerated once and cached beside the locales, refreshed when the person changes
+  `bots.voice_locale`; 180 voices on hesperia, one Polish — `language`, `name`, and
+  `voiceWithLanguage:`, whose `nil` is refused as `VoiceUnavailable::NoVoice` naming the
+  language and the platform's voice-download page, never a fall-through to the default
+  voice), `AVSpeechUtterance setVoice:` (set on every utterance; no utterance is spoken
+  without an explicit voice), and `NLLanguageRecognizer` (`new`, `setLanguageConstraints:`
+  — the languages this device has voices for plus the listening one, so the answer is
+  classified only among languages it could be spoken in — `processString:`,
+  `dominantLanguage`) via objc2-avf-audio and objc2-natural-language 0.3.2 (`Zlib OR
+  Apache-2.0 OR MIT`, features `NLLanguage` + `NLLanguageRecognizer`, objc2 ≥ 0.6.2,
+  objc2-foundation ^0.3.2), behind `keeper_core::voice::VoicePort::{voices, listening,
+  detect_language, speak}` — the four fns `voice_languages`, `voice_for_language`,
+  `voice_name`, `detect_language` and the changed `speak_text` in each of
+  `voice_macos.rs` and `voice_ios.rs`, counted in the totals above, each with a
+  `// SAFETY:` comment. `NaturalLanguage` is a system framework with no network path:
+  no answer text leaves the device to be classified, and `docs/egress.md` gains no
+  destination. Which voice is used is `keeper_core::voice::speech::choose_voice`'s
+  decision over (detected, listening, voices) — a pure function with a truth table —
+  and the ports only enumerate, detect and obey (AD-183).
+- The input level, both ports (Epic 64, Story 64.3, FR-433–FR-435, AD-186): `AVAudioPCMBuffer`
+  (`floatChannelData` — `nil` when the buffer is not 32-bit float, checked rather than
+  assumed, `frameLength`, `stride`) read inside the existing tap block of `start_capture`,
+  plus one `std::slice::from_raw_parts` over `frameLength × stride` samples that lives only
+  for the duration of the tap call and is never stored, via objc2-avf-audio — no new
+  `#[allow(unsafe_code)]` fn: the calls sit in the `start_capture` already counted in each
+  port's total (`crates/keeper/src/voice_macos.rs:1273-1282`; `voice_ios.rs:1355-1364`), and
+  the SAFETY comment on that fn carries the buffer contract (`voice_macos.rs:1248-1256`;
+  `voice_ios.rs:1328-1336`). The recogniser receives every buffer, unchanged, before the meter
+  reads it; the RMS goes to `keeper_core::voice::level::Meter`, which decides the scale
+  (−60 dBFS floor), the smoothing (40 ms attack, 250 ms release) and the rate (at most one
+  reading every 40 ms, only on change), so the audio thread sends at most ~25 messages a
+  second and never one per buffer. Only a number in `0.0..=1.0` leaves the tap; no sample
+  does. There is no second tap: `installTapOnBus:` allows one per bus, and the level shares
+  the recogniser's.

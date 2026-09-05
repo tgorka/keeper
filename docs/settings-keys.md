@@ -54,6 +54,8 @@ file-controlled instead, and says which file.
 | | | | | Whether the wake phrase is armed on the phone. Off until chosen: an open microphone is a deliberate act. |
 | `bots.wake_phrase` | user-global | text | `nixie` | `"bots.wake_phrase" = "hej keeper"` |
 | | | | | The phrase that starts a voice turn, as typed; matched case- and diacritic-insensitively. At least 5 letters, at most 5 words. |
+| `bots.voice_locale` | user-global | text | *(absent)* | `"bots.voice_locale" = "en-US"` |
+| | | | | The language the voice recogniser runs in, as a locale identifier. Blank means the system locale when it can run on the device, otherwise the first that can; a language that cannot run here is refused, never silently replaced. |
 | `debug.mode` | user-global | boolean (`1`/`0`) | `0` | `"debug.mode" = true` |
 | | | | | On-disk event and error logging. Read before anything else at boot, so a file can turn it on for the boot that goes wrong. |
 | `incognito.global` | user-global | boolean (`1`/`0`) | `0` | `"incognito.global" = true` |
@@ -101,6 +103,8 @@ These are facts about one computer. A shared file that sets one of them is a nam
 | | | | | The OS-global Start/Stop Recording accelerator; empty means unset. |
 | `hotkey.capture` | machine-local | accelerator | *(absent)* | `"hotkey.capture" = "Control+Alt+N"` |
 | | | | | The OS-global Quick Capture accelerator; empty means unset. |
+| `hotkey.voice` | machine-local | accelerator | *(absent)* | `"hotkey.voice" = "Control+Alt+V"` |
+| | | | | The OS-global voice accelerator that starts a turn; empty means unset. |
 | `notes.active_vault` | machine-local | text | *(absent)* | `"notes.active_vault" = "01J8Z5R0Q9WQ4C3S0PNK7T2A1B"` |
 | | | | | Which notes vault the notes surface is showing, as a sync-profile id. |
 | `recording.destination_dir` | machine-local | absolute path | *(absent)* | `"recording.destination_dir" = "/Users/tgorka/Movies/keeper"` |
@@ -115,6 +119,7 @@ Why each one is refused from a shared file:
 - `hotkey.global` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
 - `hotkey.recording` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
 - `hotkey.capture` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
+- `hotkey.voice` — an OS-global accelerator is registered with this machine's window server, and two machines cannot agree on one that is free on both
 - `notes.active_vault` — it names a row in this machine's sync.db, and the same folder is a different profile id on the other machine
 - `recording.destination_dir` — it is an absolute path, and /Volumes/merope/… does not exist on the other machine
 - `recording.destination_profile_id` — it names a row in this machine's sync.db, and the same folder is a different profile id on the other machine

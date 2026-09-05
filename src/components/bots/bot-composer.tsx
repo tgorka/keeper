@@ -76,8 +76,18 @@ export const BOT_COMPOSER_SEND_LABEL = "Send";
 /** The stop verb, shown in place of Send while an answer is arriving. */
 export const BOT_COMPOSER_STOP_LABEL = "Stop";
 
-/** What the composer says while it has no bot to ask. */
-export const BOT_COMPOSER_NO_BOT = "Choose a bot above and this will send to it.";
+/**
+ * What the composer says while it has no bot to ask. One sentence for both
+ * tiers; `place` is where THIS tier chooses a bot, because the desktop's
+ * picker is a row over the transcript and the phone's is a sheet opened
+ * from the header (Story 63.1, FR-411) — "above" on a phone points at a
+ * back bar.
+ */
+export const botComposerNoBot = (place: string) =>
+  `Choose a bot ${place} and this will send to it.`;
+
+/** Where the desktop chooses a bot: the picker row over the transcript. */
+export const BOT_COMPOSER_PICKER_ABOVE = "above";
 
 /** The command menu's accessible name. */
 export const BOT_COMPOSER_MENU_LABEL = "Commands";
@@ -106,6 +116,7 @@ export function BotComposer({
   resolveDraft = botsCommandPreview,
   heard = null,
   accessory,
+  pickerPlace = BOT_COMPOSER_PICKER_ABOVE,
 }: {
   /** Send the trimmed text. The parent owns the IPC call and the errors. */
   onSend: (text: string) => void;
@@ -171,6 +182,11 @@ export function BotComposer({
    * phone. Rendered between the field and the verb, absent where undefined.
    */
   accessory?: ReactNode;
+  /**
+   * Where a bot is chosen on this tier, as the no-bot caption names it. The
+   * default is the desktop's row above; the phone names its sheet.
+   */
+  pickerPlace?: string;
 }) {
   const [draft, setDraft] = useState("");
   const [preview, setPreview] = useState<BotCommandPreviewVm | null>(null);
@@ -432,7 +448,7 @@ export function BotComposer({
         </p>
       )}
 
-      {disabled && <p className="text-muted-foreground text-xs">{BOT_COMPOSER_NO_BOT}</p>}
+      {disabled && <p className="text-muted-foreground text-xs">{botComposerNoBot(pickerPlace)}</p>}
 
       {/* The field and its verb share one row (Story 61.14): stacked, the
           verb's row was a 40px band of its own under a three-line field, and

@@ -3422,7 +3422,16 @@ reason: Epic 62 ships voice on iOS precisely because Apple's recogniser and synt
   implementation behind the same trait, with its own entitlement and TCC story — and it is not the
   same work as the wake phrase, which still needs a spotter. Revisit when either a
   clearly-licensed KWS model exists or the Mac ships only push-to-talk over the system recogniser.
-status: open
+status: done 2026-09-03
+resolution: collected by epic 63, story 63.4. The "honest first move" this row named is what
+  shipped: `crates/keeper/src/voice_macos.rs`, a second `VoicePort`/`ConsentPort` over macOS's own
+  `SFSpeechRecognizer` with `requiresOnDeviceRecognition = true`, `AVAudioEngine` and
+  `AVSpeechSynthesizer`, behind the same trait and the same turn machine, with the platform
+  vocabulary in `keeper-core/src/voice/platform.rs` (story 63.3). The spotter question dissolved
+  rather than being answered: the Mac matches the wake phrase in the same on-device transcript the
+  recogniser already produces, exactly as the phone does, so no keyword-spotting weights are needed
+  and the licence question this row was about does not arise. What remains is not this row's
+  question — the port has never been compiled or run on a Mac, and that is DW-228.
 
 ### DW-220: The drive tools cannot reach a phone, and the honest route inverts the connection.
 
@@ -3479,6 +3488,253 @@ reason: CI's frontend job (macos-latest, whole suite in parallel) failed this te
   line so the next failure says which of the two happened. Left open rather than papered over with
   a longer timeout: the observed value had already been written, so it was never a value still on
   its way.
+status: open
+
+  **Second member of the same class, 2026-09-03 (epic 63).**
+  `src/components/notes/editor/find-panel.test.tsx` — "shows a query that arrived from somewhere
+  other than these fields" — failed once in a whole-suite run at epic 63's tip, in a file this epic
+  never touched (`git log 687d2aa..HEAD -- .../find-panel*` is empty). Alone it passes 3/3, and the
+  very next whole-suite run was 330 files / 5616 tests green. So the class is not specific to the
+  files-pane restore: it is "a test that passes alone and fails under whole-suite contention", and
+  it has now been seen in two unrelated surfaces. Whoever closes this should treat the shared cause
+  as the target — most likely module-level state or a timer surviving between files under the
+  runner's parallelism — rather than hardening one test at a time.
+
+### DW-224: The other device's transcript grows by steps, not by tokens — and the token route is a destination change.
+
+origin: epic 63, story 63.7 / 63.8, 2026-09-03
+location: `keeper-core/src/bots/follow.rs:7-19` (the rule and why), `docs/egress.md` *Why the
+  token-by-token mirror is a destination change* (the arithmetic), `docs/decisions.md` D-7
+reason: The owner asked to watch a conversation held on the other device grow word by word.
+  Hermes cannot serve that: `GET /v1/runs/{id}/events` is one `asyncio.Queue` per run with a
+  destructive read, so a second subscriber steals events from the first and either side
+  disconnecting pops the queue out from under the survivor; keeper never opens an SSE against a
+  run it did not start (AD-177, proven in `keeper-core/tests/bots_remote_session.rs:1074`). The
+  only route that can carry tokens is relaying the live transcript into a Matrix room as one
+  message edited in place with `m.replace` as tokens arrive. That adds no host — the homeserver
+  is already the first egress row — and is still an architecture-level change under NFR-11,
+  because it makes the homeserver (and every device's key backup, and every federated server) a
+  place transcripts persist. On a default Synapse it is also a bad trade: `rc_message` defaults
+  to 0.2 events/s with a burst of 10, so a 1 Hz edit loop spends its burst in 10 ÷ (1 − 0.2) =
+  12.5 s and is then throttled to one edit every five seconds with `M_LIMIT_EXCEEDED` between;
+  an event is capped at 65536 bytes of canonical JSON and an `m.replace` carries the whole new
+  body in `m.new_content`, so bytes sent grow quadratically with the answer and a long answer
+  stops being editable at all; and `m.relates_to` stays in cleartext in an encrypted room, so the
+  homeserver sees the cadence of the model's output. What ships is step-level following of the
+  history read keeper already makes, at 2 s / 5 s / 15 s as the session quietens, stopped after
+  five cold minutes, with a caption that says "following". Revisit if Hermes serves a fan-out or
+  replayable per-run stream, or if the owner decides the Matrix-bot product question (DW-226),
+  which would move transcripts to the homeserver on purpose rather than as a side effect.
+status: open
+
+### DW-225: An `NSTouchBar` item inside keeper's own window.
+
+origin: epic 63, story 63.5, 2026-09-03
+location: `crates/keeper/src/voice_reach.rs` (the three reach surfaces that exist),
+  `keeper-core/src/voice_reach.rs:4-8`, `:31-37`; `docs/decisions.md` D-6
+reason: Supported by Apple: an app may place its own items in the Touch Bar's app region through
+  `NSTouchBar`, and Tauri exposes the `NSWindow` to do it. But an `NSTouchBar` item is visible
+  only while keeper is the frontmost app — which is the one case the global hotkey and the tray
+  item already cover, and the one case the owner did not ask about ("szczególnie w
+  backgroundzie"). The Control Strip and the Siri button are refused, not deferred (D-6): they
+  need private `DFRFoundation` in a non-sandboxed bundle with library validation disabled, and the
+  apps that do it are unmaintained (Pock `0.9.0-22` pre-release 2021-09-28, MTMR `v0.27.0`
+  2020-11-20) with Pock carrying an open "not working on Macos 26.0" report
+  (`github.com/pock/pock/issues/655`). The supported Touch Bar reach — a Shortcut opening
+  `keeper://voice/talk` from the Quick Actions button — ships. A nicety for a 2016–2021 hardware
+  line; take it only if somebody with a Touch Bar Mac asks for it while keeper is in front.
+status: open
+
+### DW-226: Making Hermes the Matrix bot is a product decision, not a story.
+
+origin: epic 63, 2026-09-03
+location: `keeper-core/src/bots/**` (every conversation rides the `/v1` OpenAI-compatible wire and
+  `/api/sessions`); `docs/decisions.md` D-4 (the endpoint is yours), D-7
+reason: Hermes can run as a Matrix bot in a room both devices already sync. That would give both
+  devices the transcript — every token, live, through the homeserver's ordinary timeline — for
+  almost no keeper code, and it is the cheapest possible answer to the cross-device ask. It is also
+  the largest product change on the table: every conversation moves off the `/v1` API onto Matrix,
+  approvals become reactions, the tool grant and audit row (AD-158) have no place to live, and
+  every transcript persists on the homeserver and in key backup — the exact change `docs/egress.md`
+  refuses to make as a side effect (DW-224). Nothing here is a defect in what shipped; it is a
+  fork in what keeper's Bots surface is. Filed so it is decided by the owner rather than drifted
+  into by whichever story next finds it convenient. No code until that decision is written down.
+status: open
+
+### DW-227: Wake listening with the Mac's lid closed.
+
+origin: epic 63, story 63.4, 2026-09-03
+location: `crates/keeper/src/voice_macos.rs:94-98` (the App Nap assertion and its comment),
+  `docs/decisions.md` D-5 *What the Mac does differently*
+reason: The port holds an `NSProcessInfo` activity (`UserInitiatedAllowingIdleSystemSleep`) only
+  while a capture is up, which keeps App Nap from starving the tap while keeper is not in front.
+  It deliberately does not keep the Mac awake, and no assertion could make a closed MacBook hear
+  anything: closing the lid disconnects the built-in microphone physically, and clamshell mode
+  needs external power plus an external display and still has no built-in microphone. An
+  external USB microphone in clamshell mode is the one arrangement that could work and is
+  untested (DW-228 comes first). Not a defect; recorded so nobody files it as one or writes a
+  `PreventUserIdleSystemSleep` assertion that would keep a laptop hot for nothing.
+status: open
+
+### DW-228: The macOS voice port has never been compiled or run.
+
+origin: epic 63, story 63.4 (written), story 63.8 (recorded), 2026-09-03
+location: `crates/keeper/src/voice_macos.rs` (~1180 lines, seventeen `#[allow(unsafe_code)]`
+  fns), `crates/keeper/src/voice_ipc.rs` (`platform_port`/`platform_consent` selection),
+  `crates/keeper/Info.plist:22-33` (the two usage strings), `docs/constraints-and-limitations.md`
+  *macOS voice port* (already says "not yet compiled where it was written")
+reason: The port was authored on the Linux dev host, where the shell crate cannot be built at all
+  (`docs/project-context.md`, *The shell crate cannot be compiled on the Linux dev host*), and the
+  Mac that would have compiled it — hesperia — was unreachable over ssh for the whole of the
+  session that wrote it. What has been verified: `keeper-core`'s platform-neutral voice tests and
+  the on-device source scan (`keeper-core/tests/voice_on_device.rs`, which picks the file up by
+  prefix) pass on Linux, and a later story read `voice_ipc.rs` and fixed the one call the local
+  gate could not see (`voice_authorize` calling a `From` impl story 63.3 had removed). What has
+  not: whether the file compiles against `objc2-speech`/`objc2-avf-audio`/`objc2-foundation` as
+  pinned, whether clippy at `-D warnings` accepts it, whether `voice_availability` on a real Mac
+  answers with a real availability rather than `unsupported` (FR-417, the story's own acceptance
+  criterion), whether the TCC prompts appear with the Info.plist strings, whether the rolling
+  request (45 s / 1.5 s quiet / 58 s hard) actually rolls, and whether the tray reflects idle /
+  listening / speaking with keeper backgrounded (story 63.5's acceptance). Story 63.4 is therefore
+  **implemented, not finished**; sprint status must not read it as done until this row closes.
+  The next session on a Mac closes it with, in order:
+  1. `bun run check:rust:macos` from the Linux box (or on the Mac: `cd src-tauri && cargo clippy
+     --workspace --all-targets -- -D warnings && cargo nextest run --workspace`) — the first
+     compile of the file; expect objc2 signature mismatches and fix them in the port, never by
+     loosening the on-device scan.
+  2. `bun run install:macos` (`scripts/install-macos.sh`, whose dispatched
+     `scripts/build-macos-signed.sh:94-95` now refuses a bundle `lib/bundle-guard.sh` says cannot
+     render), then open Settings → Bots and confirm the wake switch is drawn — that is
+     `voice_availability` answering something other than `unsupported`.
+  3. Grant the two TCC prompts, press Talk, say a sentence, hear the answer; then background
+     keeper and start a turn from the hotkey and from the tray; then `open keeper://voice/talk`
+     twice and confirm one turn.
+  4. Say nothing for 50 s with listening on and confirm in the log that the request rolled at
+     45 s rather than the recogniser ending the session.
+  5. Record the answers in `docs/constraints-and-limitations.md` (replace "not yet compiled where
+     it was written") and close this row.
+status: open
+
+### DW-229: The voice pill does not appear over another app's full-screen Space.
+
+origin: epic 64, story 64.4 (the limit), story 64.5 (recorded), 2026-09-04
+location: `crates/keeper/src/voice_window.rs` (story 64.4's window; the lifecycle is
+  `crates/keeper/src/notes_window.rs:5-6`), `crates/keeper/tauri.conf.json` (the `voice`
+  window's declaration), `docs/decisions.md` D-11
+reason: The pill is a plain Tauri window — `always_on_top`, `visible_on_all_workspaces`,
+  `focusable(false)`, `focused(false)`, click-through — and a plain `NSWindow` cannot be shown
+  over another app's full-screen window: `always_on_top` is `setLevel(NSFloatingWindowLevel)`
+  only (tao `src/platform_impl/macos/window.rs:288-290`, `:1389-1394`) and
+  `visible_on_all_workspaces` is `CanJoinAllSpaces` (tao `:1537-1546`), neither of which sets
+  `fullScreenAuxiliary`; tao's style mask never includes `NSWindowStyleMaskNonactivatingPanel`
+  (grep of tao for `NonactivatingPanel`: no match). Tauri's answer on the canonical issue is
+  "the standard `NSWindow` can't be displayed over other fullscreen windows, you have to subclass
+  the `NSWindow` to `NSPanel` (tauri-nspanel) and set the right flags" (tauri-apps/tauri#11488,
+  closed not planned as a duplicate of #3326/#9556,
+  `https://github.com/tauri-apps/tauri/issues/11488`). The owner's stated case — Maps, music, a
+  browser in front while he talks — is normal Spaces, which the plain window covers (AD-187).
+  What closing this would cost, as verified 2026-09-04:
+  - **`tauri-nspanel`** (`https://github.com/ahkohd/tauri-nspanel`, 417 stars, single
+    maintainer): a **git dependency** — the README installs from branch `v2.1` by git URL, and
+    whether 2.1.0 is on crates.io could not be verified (the crates.io API answered 403). Its
+    `v2.1/Cargo.toml` (version 2.1.0) depends on `tauri = { version = "2.8.5", features =
+    ["macos-private-api"] }`, so taking it turns on **`macos-private-api` for keeper's whole
+    binary** whether or not keeper uses `transparent` — the flag D-11 refuses. Its `Cargo.toml`
+    has **no `license` field** (GitHub metadata says Apache-2.0, the tree carries `LICENSE_MIT`
+    and `LICENSE_APACHE-2.0`, the README says "MIT or MIT/Apache 2.0 where applicable"); PR #122
+    (2026-08-25, `https://github.com/ahkohd/tauri-nspanel/pull/122`) adds `license = "MIT OR
+    Apache-2.0"` because `cargo-deny` warns `no-license-field`, and keeper's licence firewall
+    trips until it merges. Maintenance is alive but low-cadence: `v2.1` commits 2026-08-19
+    (README), 2026-03-15 (renovate), 2025-09-21 (docs). Two open defects matter here: **#120**
+    (2026-07-22) — `style_mask(StyleMask::empty().nonactivating_panel())` aborts with a
+    non-unwinding panic on macOS 13.7 / tauri 2.11.5, avoided by OR-ing the bit into the
+    existing mask; **#119** (2026-07-11) — closing a panel aborts with "Rust cannot catch foreign
+    exceptions" on macOS 26/27, avoided by never closing the panel, which is the hide/show
+    lifecycle keeper already uses. Its own fullscreen example warns never to call `maximize()`
+    or `fullscreen()` on such a panel and to deny `core:window:internal-toggle-maximize`.
+  - **An in-house `NSPanel` subclass** over `objc2-app-kit` (keeper already links `objc2 0.6`,
+    `objc2-foundation 0.3` and `block2` on macOS; `objc2-app-kit` is not yet a direct
+    dependency): roughly forty lines setting `nonactivatingPanel` + `fullScreenAuxiliary` +
+    `canJoinAllSpaces` + `hidesOnDeactivate = NO` — the last because an `NSPanel` hides when its
+    app deactivates by default (Apple, *How Panels Work*,
+    `https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/WinPanel/Concepts/UsingPanels.html`),
+    which is the opposite of the owner's case — and reusing the same pill webview. Blind code
+    in a signed build, with the same never-close rule, and a new `#[allow(unsafe_code)]` row.
+  Every external source above was read 2026-09-04 (the epic's research pass, VoiceFeedback
+  lane, §2). Take the in-house subclass over the git dependency if this is ever taken at all;
+  take neither until someone reports the pill missing over a full-screen app they actually
+  talk into.
+status: open
+
+### DW-230: A waveform in the pill, rather than a level.
+
+origin: epic 64, *What stays out*, 2026-09-04
+location: `keeper-core/src/voice/level.rs:1-35` (what the level is and why it is one number),
+  the pill's meter (story 64.4), `docs/decisions.md` D-11
+reason: The owner named superwhisper, whose recording window draws a live waveform as a
+  diagnostic — "if the waveform stays static, check your input device" (Superwhisper,
+  *Recording Window*, `https://superwhisper.com/docs/get-started/interface-rec-window`, read
+  2026-09-04). A level answers that same question — is sound arriving — with one smoothed
+  number at ≤ 25 Hz, only on change (`level.rs:52-59`). A waveform is a canvas redrawn at
+  ~30 Hz from sample history that would have to cross IPC, which is decoration at the price of
+  the one thing AD-186 refused: audio data leaving the tap. superwhisper's own changelog lists
+  two rounds of "massive performance improvements for Recording Window waveform" (1.40.x,
+  2.14.0, `https://superwhisper.com/changelog`, read 2026-09-04), which is the cost stated by the
+  people who pay it. Not built. Revisit only if the level proves unreadable on the real Mac —
+  the epic's screenshot is the evidence either way.
+status: open
+
+### DW-231: Speech streamed token by token; synthesis waits for the whole answer.
+
+origin: epic 64, *What stays out*, 2026-09-04
+location: `keeper-core/src/voice/turn.rs:183-186` (`AnswerChunk` keeps the turn in `Sending`;
+  `AnswerDone` carries the whole text to the utterance), `crates/keeper/src/voice_macos.rs:1524-1534`
+  (`speak_text` takes one string and one voice), `keeper-core/src/voice/speech.rs:66-84`
+reason: A turn now passes through `Sending` while tokens arrive (story 64.3), so the pill can say
+  "thinking" — but the answer is spoken only when it is whole, as it was before. Speaking as
+  tokens arrive would need the language decision (D-9) made on a prefix that may not yet have a
+  dominant language, a sentence boundary found in streaming text, and one utterance queued per
+  segment with the voice re-chosen per segment — and on the Mac, where half-duplex releases the
+  microphone before every utterance (`may_record`, D-5), it would open and close the capture on
+  every segment. The latency it would save is the model's generation time, which a
+  "thinking" state now shows instead of hiding. Not built; revisit if the owner's answers are
+  routinely long enough that waiting reads as a stall even with the state visible.
+status: open
+
+### DW-232: Choosing a named voice rather than a language.
+
+origin: epic 64, *What stays out*, 2026-09-04
+location: `crates/keeper/src/voice_macos.rs:1474-1484` (`voice_for_language`, the system's
+  default voice for a language), `voice_ios.rs` (the same), `keeper-core/src/voice/speech.rs`
+  (the decision is over languages, not voices), `docs/decisions.md` D-9
+reason: D-9 chooses the language and takes the system's default voice for it
+  (`+[AVSpeechSynthesisVoice voiceWithLanguage:]`); a person cannot pick Samantha over Zosia,
+  or an enhanced voice over a compact one, from keeper. The inventory to offer exists
+  (`speechVoices` lists 180 on the owner's Mac, each with `name`, `identifier`, `quality`), so
+  this is a setting and a picker, plus a rule in the core for what happens when the named voice
+  is not the language the answer is in — which is the exact confusion D-9 was written to end.
+  The system's own choice is changeable in System Settings > Accessibility > Spoken Content,
+  which is where the refusal sentence already sends people
+  (`keeper-core/src/voice/platform.rs:84`). Not built; take it only with the rule written first.
+status: open
+
+### DW-233: Whether VoiceOver speaks a live region inside a window that can never become key.
+
+origin: epic 64, story 64.4 (the pill), 2026-09-04
+location: the pill document (story 64.4's `voice.html` / `src/voice-main.tsx`), `docs/decisions.md`
+  D-11; the existing announcements in the main window's voice surface
+reason: Apple's guidance is to tell VoiceOver when visible content changes and to hide the
+  purely decorative (HIG *VoiceOver*,
+  `https://developer.apple.com/design/human-interface-guidelines/voiceover`, read 2026-09-04),
+  so the pill's level meter is decorative and its state word is the labelled element. What is
+  **unverified** is whether an `aria-live` region inside a `WKWebView` that sits in a window with
+  `canBecomeKeyWindow == NO` is spoken by VoiceOver at all — VoiceOver follows keyboard focus and
+  the key window, and this window is designed never to be either. Nothing in Apple's
+  documentation or Tauri's says one way or the other (the epic's research pass, VoiceFeedback
+  lane, *Not established*). If it is not spoken, the announcement belongs in the main window,
+  which already renders the same `VoiceStateVm` and is where a VoiceOver user is. Verify on
+  hesperia with VoiceOver on and a voice turn started from the hotkey while another app is in
+  front; record the answer here and, if it is "no", move the live region rather than duplicate it.
 status: open
 
 - source_spec: none

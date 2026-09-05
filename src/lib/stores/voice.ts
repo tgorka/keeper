@@ -7,7 +7,7 @@
  * switch with its phrase and the sentence about what listening costs. Every
  * write goes through an IPC command and comes back as a fresh read — the
  * phrase is validated by `keeper_core::voice::WakePhrase::parse`, never here,
- * and the limits sentence is `keeper_core::voice::LISTENING_LIMITS`, never
+ * and the limits sentence is the port's own `VoicePlatform::limits`, never
  * retyped here.
  *
  * **One store, one stream.** The wake control (this story) and the talk-mode
@@ -20,6 +20,13 @@
  * `state === null` means no snapshot has arrived yet, which the surface
  * treats as idle-and-not-listening: a chip that lit up before Rust said so
  * would be the indicator lying in the direction that matters.
+ *
+ * Since Epic 64 (Story 64.3, AD-186) a `listening` or `heard` snapshot may
+ * carry `level`, the input level Rust measured, smoothed and rate-limited —
+ * at most ~25 snapshots a second while it moves, none while it does not.
+ * {@link voiceLevel} reads it; a component that does not draw the level
+ * should select `state.kind` rather than `state`, so it is not re-rendered
+ * for a number it does not show.
  */
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
@@ -70,4 +77,17 @@ export function isListening(state: VoiceStateVm | null): boolean {
     return false;
   }
   return state.kind === "listening" || (state.kind === "idle" && state.listeningForWake);
+}
+
+/**
+ * The input level to draw, `0..1`, or `null` where there is none: before
+ * any snapshot, in every state with the microphone released, and on a port
+ * that has no meter (iOS this epic). `null` is absence — the meter is not
+ * drawn — never zero, which would be a measured silence (AD-27).
+ */
+export function voiceLevel(state: VoiceStateVm | null): number | null {
+  if (state?.kind === "listening" || state?.kind === "heard") {
+    return state.level;
+  }
+  return null;
 }

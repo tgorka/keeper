@@ -27,7 +27,8 @@
 //!
 //! # Every target
 //!
-//! Only iOS has a port ([`crate::voice_ios`]); every other target holds
+//! iOS has a port ([`crate::voice_ios`]) and so does macOS
+//! ([`crate::voice_macos`], Story 63.4); every other target holds
 //! [`AbsentPort`], whose every answer is [`VoiceUnavailable::Unsupported`],
 //! so the command list is identical everywhere and a desktop that asks gets
 //! a sentence rather than "command not found" (AD-27, the `sessions_ipc`
@@ -37,13 +38,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use keeper_core::registry;
 use keeper_core::vm::{IpcError, IpcErrorCode, VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm};
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 use keeper_core::voice::EventSink;
-#[cfg(not(target_os = "ios"))]
-use keeper_core::voice::VoiceUnavailable;
 use keeper_core::voice::{
-    silence_budget, ConsentPort, Turn, TurnEvent, VoicePort, WakePhrase, LISTENING_LIMITS,
+    locale, silence_budget, ConsentPort, Turn, TurnEvent, TurnState, VoicePort, WakePhrase,
 };
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+use keeper_core::voice::{VoicePlatform, VoiceUnavailable};
 use tauri::ipc::Channel;
 use tauri::State;
 
@@ -67,9 +68,10 @@ struct Voice {
 /// The single voice state for the process.
 fn voice() -> MutexGuard<'static, Voice> {
     static VOICE: std::sync::LazyLock<Mutex<Voice>> = std::sync::LazyLock::new(|| {
+        let port = platform_port();
         Mutex::new(Voice {
-            turn: Turn::new(),
-            port: platform_port(),
+            turn: Turn::new(port.platform()),
+            port,
             watcher: None,
             watch_serial: 0,
             generation: 0,
@@ -105,38 +107,82 @@ fn platform_consent() -> Arc<dyn ConsentPort> {
     ios_port()
 }
 
+/// The one macOS port (Story 63.4): the same worker answers as [`VoicePort`]
+/// and as [`ConsentPort`], for the same reason as on iOS — a permission
+/// dialog and a capture never race on two threads.
+#[cfg(target_os = "macos")]
+fn macos_port() -> Arc<crate::voice_macos::MacVoicePort> {
+    static PORT: std::sync::LazyLock<Arc<crate::voice_macos::MacVoicePort>> =
+        std::sync::LazyLock::new(|| Arc::new(crate::voice_macos::MacVoicePort::new(sink())));
+    Arc::clone(&PORT)
+}
+
 /// The port for this target.
-#[cfg(not(target_os = "ios"))]
+#[cfg(target_os = "macos")]
+fn platform_port() -> Arc<dyn VoicePort> {
+    macos_port()
+}
+
+/// The consent half for this target (FR-408).
+#[cfg(target_os = "macos")]
+fn platform_consent() -> Arc<dyn ConsentPort> {
+    macos_port()
+}
+
+/// The port for this target.
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 fn platform_port() -> Arc<dyn VoicePort> {
     Arc::new(AbsentPort)
 }
 
 /// The consent half for this target: nothing to ask for.
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 fn platform_consent() -> Arc<dyn ConsentPort> {
     Arc::new(AbsentPort)
 }
 
-/// The port every target but iOS holds: honest, non-panicking, unsupported.
-#[cfg(not(target_os = "ios"))]
+/// The port every target without one holds: honest, non-panicking,
+/// unsupported.
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 struct AbsentPort;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 impl VoicePort for AbsentPort {
+    /// No platform to name: this port covers every target without one, and
+    /// its one sentence names no device.
+    fn platform(&self) -> VoicePlatform {
+        VoicePlatform::ABSENT
+    }
     fn availability(&self) -> Result<(), VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
     }
+    /// No recogniser, so no locale runs and no system locale is worth
+    /// naming: the surface this feeds is absent on this target (AD-179).
+    fn locales(&self) -> locale::DeviceLocales {
+        locale::DeviceLocales::default()
+    }
+    fn set_locale(&self, _requested: Option<String>) {}
     fn start_listening(&self, _wake: Option<&WakePhrase>) -> Result<(), VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
     }
     fn stop_listening(&self) {}
-    fn speak(&self, _text: &str) -> Result<(), VoiceUnavailable> {
+    /// No synthesiser, so no voice and no language to speak in.
+    fn voices(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn listening(&self) -> String {
+        String::new()
+    }
+    fn detect_language(&self, _text: &str, _constraints: &[String]) -> Option<String> {
+        None
+    }
+    fn speak(&self, _text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
     }
     fn stop_speaking(&self) {}
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 impl ConsentPort for AbsentPort {
     fn consent(&self) -> Result<keeper_core::voice::Consent, VoiceUnavailable> {
         Err(VoiceUnavailable::Unsupported)
@@ -148,18 +194,42 @@ impl ConsentPort for AbsentPort {
 
 /// Where the port delivers what it heard: off the framework thread, onto the
 /// runtime, into [`transition`].
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 fn sink() -> EventSink {
     Arc::new(deliver)
 }
 
 /// Hand a port event to the turn without taking the lock on the caller's
 /// thread.
-#[cfg(target_os = "ios")]
+///
+/// A [`TurnEvent::Level`] arrives at most ~25 times a second — the port's
+/// `keeper_core::voice::level::Meter` is the limiter, so one spawned task
+/// per reading is the whole cost here and no coalescing is needed. Every
+/// other event is a transition.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 fn deliver(event: TurnEvent) {
     tauri::async_runtime::spawn(async move {
-        transition(event);
+        match event {
+            TurnEvent::Level(level) => meter(level),
+            event => transition(event),
+        }
     });
+}
+
+/// Record one level reading and stream the snapshot if it changed.
+///
+/// Not a transition: the generation is not bumped and the silence clock is
+/// not touched. A level that moved would otherwise re-arm the
+/// end-of-utterance pause on every reading, and a room with any noise in it
+/// would never let a sentence end.
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn meter(level: f32) {
+    let mut voice = voice();
+    let before = voice.turn.level();
+    voice.turn.apply(TurnEvent::Level(level));
+    if voice.turn.level() != before {
+        push(&mut voice);
+    }
 }
 
 /// Apply one event, stream the snapshot, and arm the silence clock.
@@ -169,6 +239,54 @@ fn transition(event: TurnEvent) {
     let effects = voice.turn.drive(event, port.as_ref());
     tracing::debug!(state = ?voice.turn.state(), ?effects, "voice: transition");
     after_change(&mut voice);
+}
+
+/// The request for what the turn heard has left (Story 64.3, AD-186): the
+/// bots adapter calls this as it spawns a turn's driver, whatever started
+/// that turn. Only a turn in `Heard` moves — to `Sending` — so a typed
+/// message leaving while no voice turn runs is nothing here, and nothing is
+/// streamed or re-armed for it.
+pub fn note_sent() {
+    let awaiting = matches!(voice().turn.state(), TurnState::Heard { .. });
+    if awaiting {
+        transition(TurnEvent::Sent);
+    }
+}
+
+/// The first token of the answer arrived (Story 64.3, AD-186): the bots
+/// adapter calls this on the stream's first delta. Only a turn in `Sending`
+/// that has not yet seen one moves, so a stream that is not the voice
+/// turn's costs a lock and nothing else.
+pub fn note_answer_chunk() {
+    let thinking = matches!(
+        voice().turn.state(),
+        TurnState::Sending { answering: false }
+    );
+    if thinking {
+        transition(TurnEvent::AnswerChunk);
+    }
+}
+
+/// The language a send made right now is asked in, when it belongs to a
+/// voice turn (Epic 64, AD-182): the listening locale in force —
+/// `wake_vm`'s own expression — while `Turn::awaiting_send`, otherwise
+/// `None`. The bots adapter reads it to decide whether the per-turn
+/// instruction goes on the request; the rule is the turn's, read once.
+pub fn spoken_turn(data_dir: &std::path::Path) -> Option<String> {
+    let port = {
+        let voice = voice();
+        if !voice.turn.awaiting_send() {
+            return None;
+        }
+        Arc::clone(&voice.port)
+    };
+    let chosen = registry::get_bots_voice_locale(data_dir)
+        .map_err(|error| {
+            tracing::warn!(%error, "voice: could not read bots.voice_locale for the spoken turn");
+        })
+        .ok()?;
+    let locale::DeviceLocales { system, on_device } = port.locales();
+    Some(locale::in_force(chosen.as_deref(), &system, &on_device))
 }
 
 /// What every change does once the turn has moved: bump the generation,
@@ -190,13 +308,28 @@ fn after_change(state: &mut Voice) {
 
 /// Stream the current snapshot to the watcher, dropping a watcher whose
 /// webview has gone.
+///
+/// Since Story 64.4 the pill window sees every snapshot first
+/// (`voice_window::observe`) — a Rust-side fan-out rather than a second
+/// registration, because the watcher slot is one deep on purpose and a
+/// second `voice_watch` would evict the pane. `observe` only queues onto
+/// the main thread, so it is safe under this lock.
 fn push(voice: &mut Voice) {
     let snapshot = voice.turn.vm();
+    #[cfg(desktop)]
+    crate::voice_window::observe(&snapshot);
     if let Some(channel) = &voice.watcher {
         if channel.send(snapshot).is_err() {
             voice.watcher = None;
         }
     }
+}
+
+/// The turn's current snapshot, for a surface that lives in Rust — the tray
+/// item's tick (Story 63.5) reads it the way `ipc::recording_snapshot` is
+/// read. No decision here; the same projection the watcher streams.
+pub fn voice_snapshot() -> VoiceStateVm {
+    voice().turn.vm()
 }
 
 /// A phrase refusal is the person's input, so it says what to type instead
@@ -223,10 +356,10 @@ pub fn voice_availability() -> Result<Option<VoiceUnavailableVm>, IpcError> {
     let port = Arc::clone(&voice().port);
     let refusal = port.availability().err();
     match &refusal {
-        Some(why) => tracing::info!(%why, "voice: unavailable"),
+        Some(why) => tracing::info!(?why, "voice: unavailable"),
         None => tracing::info!("voice: available"),
     }
-    Ok(refusal.as_ref().map(VoiceUnavailableVm::from))
+    Ok(refusal.as_ref().map(|why| why.vm(&port.platform())))
 }
 
 /// Register `channel` as the watcher and return its id.
@@ -292,17 +425,79 @@ pub fn voice_stop_speaking() -> Result<(), IpcError> {
     Ok(())
 }
 
+/// Hand the persisted locale choice to the port (Epic 63), so its next
+/// availability probe and request run `keeper_core::voice::locale::choose`
+/// over it. Called once at boot from `lib.rs` — the port is process-wide
+/// and `voice_availability` takes no state — and again by
+/// [`voice_locale_set`] after a change. No decision here: the port asks
+/// core which locale the answer is.
+pub fn load_locale(data_dir: &std::path::Path) {
+    match registry::get_bots_voice_locale(data_dir) {
+        Ok(requested) => {
+            tracing::info!(?requested, "voice: locale choice loaded");
+            voice().port.set_locale(requested);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "voice: could not read bots.voice_locale; choosing for the person");
+            voice().port.set_locale(None);
+        }
+    }
+}
+
+/// The wake VM as persisted plus what the port knows about locales: the
+/// one in force is core's answer, the list is the port's cache.
+fn wake_vm(
+    data_dir: &std::path::Path,
+    enabled: bool,
+    phrase: String,
+    port: &dyn VoicePort,
+) -> Result<VoiceWakeVm, IpcError> {
+    let locale_chosen = registry::get_bots_voice_locale(data_dir).map_err(to_ipc_error)?;
+    let locale::DeviceLocales { system, on_device } = port.locales();
+    Ok(VoiceWakeVm {
+        enabled,
+        phrase,
+        // The port's own platform, not one const for every target: a Mac was
+        // showing iOS's sentence under its switch (screenshot, 2026-09-04).
+        limits: port.platform().limits.to_owned(),
+        locale: locale::in_force(locale_chosen.as_deref(), &system, &on_device),
+        locale_chosen,
+        on_device_locales: on_device,
+    })
+}
+
 /// The wake switch and phrase as persisted (FR-404, FR-405), with the
-/// sentence about what listening costs (FR-406). Reads only: whether the
-/// device is open is the turn's, streamed over the watcher.
+/// sentence about what listening costs (FR-406) and the recogniser's
+/// language (Epic 63). Reads only: whether the device is open is the
+/// turn's, streamed over the watcher.
 #[tauri::command]
 pub fn voice_wake_get(state: State<'_, AppState>) -> Result<VoiceWakeVm, IpcError> {
     let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
-    Ok(VoiceWakeVm {
-        enabled: registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?,
-        phrase: registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?,
-        limits: LISTENING_LIMITS.to_owned(),
-    })
+    let enabled = registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
+    let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
+    let port = Arc::clone(&voice().port);
+    wake_vm(&data_dir, enabled, phrase, port.as_ref())
+}
+
+/// Arm or disarm the turn for `wake` and carry the effects out on the port.
+/// A port that refuses to open for the phrase is reported through the turn,
+/// which releases whatever was half-opened; the choice itself stays
+/// recorded.
+fn arm(voice: &mut Voice, wake: Option<WakePhrase>) {
+    let effects = voice.turn.set_wake(wake);
+    let port = Arc::clone(&voice.port);
+    if let Err(why) = keeper_core::voice::perform(&effects, port.as_ref(), voice.turn.wake()) {
+        let recovery = voice.turn.drive(
+            TurnEvent::Failed(why.message(&port.platform())),
+            port.as_ref(),
+        );
+        tracing::warn!(
+            ?why,
+            ?recovery,
+            "voice: the port refused to listen for the phrase"
+        );
+    }
+    after_change(voice);
 }
 
 /// Set the wake switch and phrase (FR-404, FR-405): validate the phrase with
@@ -320,22 +515,41 @@ pub fn voice_wake_set(
     registry::set_bots_wake_phrase(&data_dir, phrase.trim()).map_err(to_ipc_error)?;
     registry::set_bots_wake_enabled(&data_dir, enabled).map_err(to_ipc_error)?;
     let mut voice = voice();
-    let effects = voice.turn.set_wake(enabled.then_some(parsed));
+    arm(&mut voice, enabled.then_some(parsed));
     let port = Arc::clone(&voice.port);
-    if let Err(why) = keeper_core::voice::perform(&effects, port.as_ref(), voice.turn.wake()) {
-        // The choice is recorded; the device refused to open for it. Say so
-        // through the turn, which releases whatever was half-opened.
-        let recovery = voice
-            .turn
-            .drive(TurnEvent::Failed(why.to_string()), port.as_ref());
-        tracing::warn!(%why, ?recovery, "voice: the port refused to listen for the phrase");
+    wake_vm(&data_dir, enabled, phrase.trim().to_owned(), port.as_ref())
+}
+
+/// Choose the recogniser's language (Epic 63): `None` is "choose for me".
+/// Persisted as given and handed to the port, which asks
+/// `keeper_core::voice::locale::choose` whether it can run here — a
+/// language that cannot is recorded and refused, never silently replaced
+/// by one that can, and the refusal names the ones that can. While the
+/// phrase is armed, listening is re-armed so the new language takes effect
+/// on the next request rather than the next launch. Returns the wake VM,
+/// whose `locale` is the one now in force.
+#[tauri::command]
+pub fn voice_locale_set(
+    state: State<'_, AppState>,
+    locale: Option<String>,
+) -> Result<VoiceWakeVm, IpcError> {
+    let data_dir = state.platform.data_dir().map_err(to_ipc_error)?;
+    let requested = locale
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned);
+    registry::set_bots_voice_locale(&data_dir, requested.as_deref()).map_err(to_ipc_error)?;
+    let mut voice = voice();
+    voice.port.set_locale(requested);
+    let armed = voice.turn.wake().cloned();
+    if armed.is_some() {
+        arm(&mut voice, armed);
     }
-    after_change(&mut voice);
-    Ok(VoiceWakeVm {
-        enabled,
-        phrase: phrase.trim().to_owned(),
-        limits: LISTENING_LIMITS.to_owned(),
-    })
+    let enabled = registry::get_bots_wake_enabled(&data_dir).map_err(to_ipc_error)?;
+    let phrase = registry::get_bots_wake_phrase(&data_dir).map_err(to_ipc_error)?;
+    let port = Arc::clone(&voice.port);
+    wake_vm(&data_dir, enabled, phrase, port.as_ref())
 }
 
 /// Ask for the recogniser and the microphone, by name, once, with the reason
@@ -361,5 +575,6 @@ pub async fn voice_authorize() -> Result<Option<VoiceUnavailableVm>, IpcError> {
         account_id: None,
         retriable: true,
     })?;
-    Ok(verdict.err().as_ref().map(VoiceUnavailableVm::from))
+    let platform = voice().port.platform();
+    Ok(verdict.err().as_ref().map(|why| why.vm(&platform)))
 }

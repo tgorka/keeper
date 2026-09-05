@@ -166,30 +166,42 @@ first proposed as a convenience, and the refusal has to be findable before the p
 
 ## D-5 — Voice is the system's, on the device, armed by a person
 
-keeper will listen for a phrase and talk to a model on the phone — speech becomes text on the
-device, the text is sent to the bot as an ordinary message, and the answer is spoken — and it will
-**not** ship a model of its own, send a voice anywhere, or start its own microphone. Recorded here
-because each of those three is the first thing proposed when voice is "almost working", and the
-epic that built this got one of them wrong in its first draft; the corrected reasoning has to be
-findable before it is re-argued.
+keeper will listen for a phrase and talk to a model on the phone and on the Mac — speech becomes
+text on the device, the text is sent to the bot as an ordinary message, and the answer is spoken —
+and it will **not** ship a model of its own, send a voice anywhere, or start its own microphone.
+Recorded here because each of those three is the first thing proposed when voice is "almost
+working", and the epic that built this got one of them wrong in its first draft; the corrected
+reasoning has to be findable before it is re-argued.
 
 - **What is built:** a turn is a state machine in `keeper_core::voice` — `Idle → Listening →
   Heard → Sending → Speaking → Idle`, abandonable from every state so the microphone is released,
-  with a bounded silence timeout — tested on the dev host against a fake port. The iOS half of the
-  shell crate is one port implementation over `SFSpeechRecognizer`, `AVAudioEngine`,
-  `AVAudioSession` and `AVSpeechSynthesizer`, and it decides nothing. The wake phrase is validated
-  by `keeper-core` (one word is allowed, the default is `nixie`, a letter floor refuses something
-  too short to be safe), off until a person switches it on, and shown as a live chip whenever it
-  listens. (AD-165…AD-171; Epic 62, stories 62.4–62.6)
+  with a bounded silence timeout — tested on the dev host against a fake port. Two ports implement
+  it in the shell crate and decide nothing: the iOS half over `SFSpeechRecognizer`,
+  `AVAudioEngine`, `AVAudioSession` and `AVSpeechSynthesizer` (`crates/keeper/src/voice_ios.rs`),
+  and the macOS half over the same recogniser, engine and synthesiser without an audio session
+  (`crates/keeper/src/voice_macos.rs`, Epic 63, Story 63.4). Each names its platform through
+  `keeper_core::voice::VoicePlatform` (`keeper-core/src/voice/platform.rs:29-32`, `:51`, `:65`),
+  so every refusal sentence is composed once and says "this phone" or "this Mac", and the rule
+  "may the port record right now" is `keeper_core::voice::may_record`
+  (`keeper-core/src/voice/turn.rs:249-252`): false while an utterance speaks on a half-duplex
+  platform, which the Mac is. The wake phrase is validated by `keeper-core` (one word is allowed,
+  the default is `nixie`, a letter floor refuses something too short to be safe), off until a
+  person switches it on, and shown as a live chip whenever it listens. (AD-165…AD-171, AD-175;
+  Epic 62, stories 62.4–62.6; Epic 63, stories 63.3–63.4)
 - **Why no bundled model weights, ever:** Apple's recogniser and synthesiser are system frameworks,
-  so keeper ships no weights at all — and that is the whole reason voice exists on iOS while it
-  stays deferred on the Mac. Epic 61 deferred voice because every permissive desktop stack needs
-  pretrained keyword-spotting and ASR weights whose dataset terms the code's Apache-2.0 licence
-  does not imply, and that is still true there: nothing with clear weight provenance exists for
-  desktop wake-word spotting, and macOS's own `SFSpeechRecognizer` is a separate port with its own
-  entitlement story. The desktop half stays deferred as DW-219. (`objc2-speech` and
-  `objc2-avf-audio`, both `Zlib OR Apache-2.0 OR MIT`; D-4, *Why voice and the wake word are Epic
-  62*; Epic 62, *Why this is possible now*)
+  so keeper ships no weights at all — and that is the whole reason voice exists on both Apple
+  platforms and on neither of the others. Epic 61 deferred voice because every permissive desktop
+  stack needs pretrained keyword-spotting and ASR weights whose dataset terms the code's
+  Apache-2.0 licence does not imply, and that is still true for Linux and Windows: nothing with
+  clear weight provenance exists for desktop wake-word spotting. What Epic 62 recorded as the
+  Mac's own open question (DW-219: "macOS's own `SFSpeechRecognizer` is a separate port with its
+  own entitlement story") Epic 63 collected: the Mac spots the phrase in the same on-device
+  transcript it already produces, so no spotter and no weights are needed there either, and the
+  entitlement story is two usage strings in `crates/keeper/Info.plist:22-33`. The port exists and
+  passes every test that runs on the dev host; it has not yet been compiled or run on a Mac, and
+  that gap is DW-228, worded as a gap. (`objc2-speech` and `objc2-avf-audio`, both `Zlib OR
+  Apache-2.0 OR MIT`; D-4, *Why voice and the wake word are Epic 62*; Epic 62, *Why this is
+  possible now*; Epic 63, Story 63.4)
 - **Why on-device recognition only, with no server fallback:** `docs/egress.md` claims to be the
   record of every network destination keeper contacts, and NFR-11 rests on that claim. Apple's
   recogniser will fall back to Apple's servers unless told not to, and that fallback would be a
@@ -213,17 +225,299 @@ findable before it is re-argued.
   hide. All of that is one `const` in `keeper-core`, rendered beside the switch and nowhere else.
   (AD-168, AD-169; FR-404…FR-406; Apple DTS, `developer.apple.com/forums/thread/120038`; Epic 62,
   *What the phone cannot have*, corrected 2026-09-03)
+- **What the Mac does differently, named rather than discovered:** `AVAudioSession` does not exist
+  on macOS, so the two things the iOS port leans on — `.playAndRecord` and `duckOthers` — have no
+  counterpart. Half-duplex therefore lives in `keeper-core` (`may_record` is false while the Mac
+  speaks, and the turn releases the microphone before every utterance) and keeper does not lower
+  other audio on the Mac; both are said in Settings → About, in `docs/egress.md` *On this Mac*, and
+  nowhere else. Armed listening on the Mac is a foreground app's capture kept alive by an App Nap
+  activity assertion held only while a capture is up (`voice_macos.rs:94-98`); a closed lid
+  disconnects the microphone physically and no assertion changes that (DW-227). The three ways to
+  reach a turn while keeper is not in front are D-6's. (AD-175; Epic 63, Story 63.4)
 - **What App Review has to say about any of this: nothing.** The epic's first draft weighed App
   Store Guideline 2.5.4 against background listening and rejected the feature partly on that
   ground. That was wrong: keeper on iPhone is a free-Personal-Team sideload (D-1, `docs/ios.md`),
   never TestFlight or the App Store, so no review guideline governs this build. What governs it is
   what iOS itself permits and refuses, and that is the list above. (Epic 62, *What the phone cannot
   have*)
-- **Revisit triggers:** a permissive desktop wake-word stack with weight provenance somebody can
-  actually establish (DW-219 — a macOS port is a second port implementation, not a change to the
-  state machine); a Live Activity for the listening state, which needs a widget extension and its
-  own signing story on a free Personal Team (DW-222). None of them reopens the second paragraph: a
-  server fallback is not a revisit, it is a new row in `docs/egress.md` that this decision refuses
-  to write.
+- **Revisit triggers:** a Live Activity for the listening state, which needs a widget extension
+  and its own signing story on a free Personal Team (DW-222); the macOS port's first compile and
+  first run on a Mac (DW-228), which may move sentences but not this decision. None of them
+  reopens the second paragraph: a server fallback is not a revisit, it is a new row in
+  `docs/egress.md` that this decision refuses to write.
 - **Status / owner:** decided. Owner is the architect; Epic 62 implements the turn machine, the iOS
-  port, the phrase and the surface; the Mac half stays deferred under DW-219.
+  port, the phrase and the surface; Epic 63 implements the platform vocabulary, the macOS port and
+  its reach (DW-219 collected).
+
+## D-6 — The Siri button stays Siri's; keeper's reach on the Mac is the hotkey, the tray and a Shortcut
+
+keeper will start a voice turn on the Mac while it is not the frontmost app — from a global
+hotkey, from a menu-bar tray item, and from a `keeper://voice/talk` link a Shortcut can open —
+and it will **not** put itself on the Touch Bar's Control Strip or replace the Siri button there.
+Recorded here because the owner asked for exactly that, the refusal rests on facts about macOS
+rather than on effort, and the same request will be made again the next time someone holds a
+Touch Bar Mac.
+
+- **What is built:** an OS-global accelerator under `hotkey.voice`, unset by default, registered
+  only where `voice_availability` does not answer `unsupported`
+  (`crates/keeper/src/hotkey.rs:297-301`; `keeper-core/src/config/keys.rs:457-461`); a tray row
+  that shows idle / listening / speaking and starts or stops a turn; a Settings → Bots voice
+  section holding the wake switch and phrase; and the deep link, whose grammar and idempotence are
+  `keeper-core`'s (`keeper-core/src/voice_reach.rs:4-8`, `:37`, `:83-87`) — one event asks at most
+  once however many `keeper://voice/talk` URLs it carries, and the ask is idempotent against an
+  open turn. All four are absent, never disabled, where there is no port. (AD-174, AD-179; FR-420,
+  FR-421, FR-422; Epic 63, Story 63.5)
+- **Why the Control Strip is out of reach:** it is system-supplied and accepts no third-party
+  items; Apple's `NSTouchBar` API places items only in the app region, and only while the app is
+  frontmost (Apple, *NSTouchBar*, `https://developer.apple.com/documentation/appkit/nstouchbar`;
+  Apple HIG, *Touch Bar*, `https://developer.apple.com/design/human-interface-guidelines/touch-bar`;
+  Epic 63, research pass on the Touch Bar, 2026-09-03). The apps that do put
+  themselves there — Pock, MTMR, BetterTouchTool — reach it through the private `DFRFoundation`
+  framework (`DFRElementSetControlStripPresenceForIdentifier`, `NSTouchBarItem.addSystemTrayItem`),
+  which needs a non-sandboxed bundle with library validation disabled. Pock's newest release is
+  the `0.9.0-22` pre-release of 2021-09-28 and MTMR's is `v0.27.0` of 2020-11-20, and Pock carries
+  an open bug "not working on Macos 26.0 (25A354)" filed 2026-07-24
+  (`https://github.com/pock/pock/releases`, `https://github.com/Toxblh/MTMR/releases`,
+  `https://github.com/pock/pock/issues/655`, all read 2026-09-03). A signed, notarised,
+  Apache-2.0 app the owner installs from a release does not ship a private-framework call that
+  macOS may refuse next year, and keeper will not weaken its hardened runtime to make one work.
+- **Why an `NSTouchBar` item inside keeper's own window is deferred, not built:** it is
+  supported, and it is visible only while keeper is frontmost — which is the one case the hotkey
+  and the tray already cover, and the one case the owner did not ask about (he wanted voice
+  "especially in the background"). A nicety, recorded as DW-225.
+- **The supported route to the Touch Bar:** the Touch Bar's own Quick Actions button lists
+  Shortcuts the user pins, and a Shortcut that opens `keeper://voice/talk` starts a turn from
+  there. That is the Touch Bar reach keeper offers, and Settings names it.
+- **Revisit triggers:** Apple documenting a third-party Control Strip API; a Mac that still has a
+  Touch Bar shipping with a macOS keeper supports (the last was 2021's, so the trigger shrinks
+  yearly). Neither reopens the private-framework route.
+- **Status / owner:** decided. Owner is the architect; Epic 63, Story 63.5 implements the reach.
+
+## D-7 — Following another device's conversation is step-level, never token-level
+
+keeper will show a conversation held on the other device growing on this one — the user turn as
+it is sent, each tool call as it starts, each assistant message as it lands — and it will **not**
+pretend to stream it. Recorded here because the owner asked for the transcript word by word, the
+refusal is forced by a mechanism in Hermes rather than chosen, and the one route around it
+changes where transcripts live.
+
+- **What is built:** one conversation identity, Hermes's own `session.id`, sent on every turn as
+  `X-Hermes-Session-Id` so two devices land in one session instead of minting one each
+  (`keeper-core/src/bots/remote.rs:6-12`, `:68`); a session list that reads `GET /api/sessions`
+  when `GET /v1/capabilities` says the endpoint has one and `keeper.db` alone when it does not; a
+  row read from Hermes labelled as remote, with which device wrote it and when it was last active;
+  a dismissal tombstone so a session deleted here is never adopted back (`remote.rs:425-448`);
+  and following, which is the history read `GET /api/sessions/{id}/messages` repeated at 2 s, 5 s
+  and 15 s as the session quietens, stopped after five cold minutes, and merged under one rule: a
+  turn this device sent is shown as this device wrote it, every other turn as the gateway holds
+  it (`keeper-core/src/bots/follow.rs:13-39`, `:44-63`). The interface says "following", not
+  "streaming", in one sentence (`src/components/bots/bot-conversation.tsx:185-188`). (AD-176,
+  AD-177, AD-181; FR-423…FR-426; Epic 63, stories 63.6–63.7)
+- **The mechanism that forces step-level:** `GET /v1/runs/{id}/events` is one `asyncio.Queue`
+  per run with a destructive read. A second subscriber steals events from the first, and either
+  side disconnecting pops the queue out from under the survivor. So keeper **never opens an SSE
+  against a run it did not start**, and a test against a fake gateway that would answer the
+  route proves the path is never requested
+  (`keeper-core/tests/bots_remote_session.rs:1074`,
+  `keeper_never_opens_the_run_events_stream_of_a_run_it_did_not_start`; `follow.rs:7-11`; Epic
+  63, research pass on Hermes session transports, 2026-09-03). What Hermes does persist is
+  step-granular — the user turn at turn start, the assistant's tool-call block before the tools
+  run, the final text before the loop exits — and that is what the other device reads.
+- **Why the route around it is not taken:** relaying the live transcript into a Matrix room via
+  `m.replace` edits would add no host and would still make the homeserver a place transcripts
+  persist, which `docs/egress.md` records as an architecture-level change under NFR-11 with its
+  arithmetic: Synapse's default `rc_message` of 0.2 events per second with a burst of 10 throttles
+  a 1 Hz edit loop after about twelve seconds; an event is capped at 65536 bytes and an edit
+  carries the whole new body; `m.relates_to` stays in cleartext in an encrypted room.
+  (`docs/egress.md`, *Why the token-by-token mirror is a destination change*; DW-224)
+- **Why Hermes is not made the Matrix bot:** it would give both devices the transcript for almost
+  no keeper code, and it moves every conversation off the `/v1` API onto Matrix, turns approvals
+  into reactions, and puts transcripts on the homeserver. That is a product decision, not a story;
+  recorded as DW-226 so it is decided rather than drifted into.
+- **Revisit triggers:** Hermes serving a fan-out or replayable event stream per run; the owner
+  deciding the Matrix-bot product question. Neither reopens the first paragraph without also
+  reopening `docs/egress.md`.
+- **Status / owner:** decided. Owner is the architect; Epic 63, stories 63.6–63.7 implement it.
+
+## D-8 — Voice is a runtime answer, not a capability flag
+
+keeper will decide whether every voice surface exists — the wake switch, the tray row, the
+hotkey, the Settings section, the About disclosure — from one runtime question,
+`voice_availability`, and it will **not** add a `voice` field to `CapabilitiesVm`. Recorded here
+because a capability flag is the obvious shape (every other tier-telling surface has one) and it
+would be wrong for this one.
+
+- **What is built:** `voice_availability` answers `null` when voice works and otherwise one of
+  `notAuthorized`, `noOnDeviceModel`, `noOnDeviceRecognition`, `noMicrophone`, `noRecognizer`,
+  `unsupported` with the sentence to show (`src/lib/ipc/gen/VoiceUnavailableVm.ts`). Every surface
+  reads that answer from one store — `unsupported` is every build without a port and renders the
+  surface away; any other refusal renders the surface with its sentence and remedy; an unanswered
+  question renders nothing, so absence is never decided from a question not yet asked
+  (`src/hooks/use-voice-facts.ts`, `src/lib/stores/voice.ts:31-34`). `CapabilitiesVm` gained no
+  field. (AD-179; Epic 63, Story 63.5)
+- **Why not a flag:** a capability is `cfg!`-shaped — it says what the build *can* do and never
+  changes while the app runs. Voice on a Mac changes: Dictation is turned on, a language is
+  downloaded, a microphone is unplugged, a permission is granted in System Settings. A flag would
+  either be true for a Mac that cannot listen right now (a dead control, AD-27) or would have to
+  be recomputed on every probe, at which point it is the runtime answer under another name, with
+  two callers who can disagree. One probe governs every surface.
+- **Revisit triggers:** none foreseen. A third platform with a port reads the same answer.
+- **Status / owner:** decided. Owner is the architect; Epic 63, Story 63.5 implements it.
+
+## D-9 — A spoken answer is spoken in a language this device has a voice for, and the model is told which
+
+keeper will read an answer aloud in the voice of the language the answer is written in, when
+this device has such a voice, and will ask the model — on a turn that began by voice — to answer
+in the language the person is speaking; it will **not** read text in the voice of another
+language, bundle a language model to tell which language a text is in, or send the text
+anywhere to find out. Recorded here because the first Mac voice read a Polish answer in an
+English voice and the owner could not understand it, because the fix rests on a measured fact
+about Apple's inventories that is easy to forget, and because the obvious shortcut — "just use
+the listening language" — is wrong in a way that only shows up with a bilingual model.
+
+- **The measured fact this rests on:** recognition and synthesis are different inventories.
+  On the owner's Mac, `SFSpeechRecognizer.supportedLocales` lists 63 locales, of which **four**
+  support on-device recognition, all of them English; `AVSpeechSynthesisVoice.speechVoices`
+  lists **180** voices, one of them Polish (`crates/keeper/src/voice_macos.rs:1161-1162`,
+  `:1453-1456`; `keeper-core/src/voice/speech.rs:4-9`; Epic 64, *Facts this epic stands on*,
+  probed on hesperia 2026-09-04). So the listening language does not bound the speaking
+  language: a person listening in English whose bot answers in Polish *can* hear Polish, and
+  before this epic nothing chose a voice at all — the utterance was built with no `setVoice:`,
+  so the system default spoke.
+- **What is built:** two halves. *Before the turn*, a voice-originated request carries one
+  system sentence — *"The person asked this aloud and your answer will be read aloud to them.
+  Answer in Polish (pl-PL)."* — naming the listening language (`speech.rs:108-117`, prepended
+  in `crates/keeper/src/bots_ipc.rs:1148-1168`); a typed turn's body is byte for byte what it
+  was (`keeper-core/tests/bots_remote_session.rs:631`). *After the answer*, the port detects the
+  text's dominant language on-device with `NLLanguageRecognizer`, constrained to the languages
+  this device has voices for plus the listening one (`speech.rs:49-64`; `voice_macos.rs:1493-
+  1518`), and `speech::choose_voice` answers which language to speak in (`speech.rs:66-84`): a
+  detected language with a voice gets that voice, the listening locale's own where the languages
+  agree; an undetermined text gets the listening language's voice; a detected language with no
+  voice is `VoiceUnavailable::NoVoice`, which names the language and the platform's voice
+  download page and leaves the answer on the screen (`keeper-core/src/voice/mod.rs:127-130`,
+  `:165-168`; `keeper-core/src/voice/platform.rs:69`, `:84`). Every utterance is given its voice
+  explicitly (`voice_macos.rs:1524-1533`; `voice_ios.rs:1673-1682`) and the chosen language and
+  voice name are logged, so "utterance voice pl-PL" can be read from the console. (AD-182,
+  AD-183, AD-188; FR-429…FR-432; Epic 64, Story 64.2)
+- **Why the decision is the core's and the detector is the port's:** `choose_voice` is a pure
+  function over (detected, listening, voices) with a truth table in its tests, and the port only
+  enumerates, detects and obeys. That keeps the rule testable on the dev host, where the shell
+  crate does not compile, and keeps `keeper-core` free of a platform `cfg`, a model weight or a
+  network. (AD-183; `speech.rs:38-44`)
+- **Why `NaturalLanguage` and not a Rust crate:** `objc2-natural-language 0.3.2` (`Zlib OR
+  Apache-2.0 OR MIT`, `src-tauri/Cargo.toml:380`) binds a system framework that is on-device
+  and has no network path, so `docs/egress.md` gains a paragraph and no destination. The Rust
+  candidates were rejected on provenance: `whatlang`'s corpus terms are unverified and
+  `lingua`'s models derive from a CC BY-NC corpus, which D-5's "no bundled weights" already
+  refuses. (AD-188; Epic 64, *Facts this epic stands on*)
+- **Why a missing voice is a refusal and not a fallback:** a wrong voice is exactly the failure
+  this epic opens with, and AD-27 says absence, never a dead control. The answer stays on the
+  screen, which the person can act on, and the sentence names where a voice is downloaded.
+- **What is not chosen:** a *named* voice (Samantha, Zosia). The language is chosen and the
+  system's default voice for it is used (`voiceWithLanguage:`); picking among a language's
+  voices is DW-232.
+- **Revisit triggers:** a platform whose synthesiser lists voices by something other than a
+  BCP-47 language tag; the owner wanting a specific voice (DW-232). Neither reopens the first
+  paragraph.
+- **Status / owner:** decided. Owner is the architect; Epic 64, Story 64.2 implements it.
+
+## D-10 — The voice block in the Bots pane is folded by default, and folded it is one line
+
+keeper will show the desktop Bots pane's voice block — switch, phrase, language, the "Listens
+in…" sentence, the note, the limits paragraph — folded to a single truthful line by default,
+unfolded by one click that is remembered, and it will **not** remove any of those controls from
+the pane or from Settings → Bots. Recorded here because the block did not exist on the Mac before
+Epic 63 gave it a voice, so the epic that made the Mac talk also took the transcript's space,
+and because "everything starts open" is the default someone will propose again.
+
+- **What was measured:** with `dev/measure-bots.ts` on Chrome at 1440×900 over the dev shell,
+  whose fixture is the owner's own case (a Polish system language with English-only on-device
+  assets, so the refusal is on screen): before, the block was **223 px** and the transcript
+  **259 px of the 872 px pane — 29.7 %**; folded, the block is a **39 px** line and the
+  transcript **444 px — 50.9 %**. Unfolded by the person the block is 257 px and the transcript
+  226 px (25.9 %) — the disclosure row is what the unfold costs, and unfolding is their choice.
+  Every number is a `getBoundingClientRect` height (`src/components/bots/bots-pane.tsx:71-79`;
+  `dev/measure-bots.ts:31-32`). (Epic 64, Story 64.1, measured on hesperia 2026-09-04)
+- **What is built:** the folded line says what matters while a conversation is on screen —
+  `Listening for "nixie" · en-US`, or `Listening off`, with the refusal's first clause when the
+  port refuses (`src/components/bots/bot-voice-wake.tsx:128-146`, `voiceFoldedLine`). The fold
+  is the repo's cookie-persisted fold idiom with its own cookie, `keeper_bots_pane_fold`,
+  folded by default (`src/lib/stores/bots-pane-fold.ts:39`, `:63-65`) — not a key in the column
+  fold's set, for the reason that file's header gives: the block is a band inside the transcript
+  level, not a column. The layout contract test still pins exactly one `flex-1` child in the
+  transcript level (`src/components/bots/bots-pane.test.tsx:628-636`, `:740-743`). Settings →
+  Bots keeps the unfolded block, so folding removes no path to any
+  control. (AD-184; FR-427, FR-428; Epic 64, Story 64.1)
+- **Why folded by default:** the surface's one job is the transcript, and a default is a claim
+  about what the surface is for. The notes rail's Files section is the precedent for a band
+  that starts closed (`bots-pane-fold.ts:15-23`). A person who wants the block open opens it
+  once and it stays open.
+- **Why measured before and after, with the pane's own rig:** jsdom computes no layout, so a
+  fold that "should" free space is unverifiable in the suite; the number is read from a real
+  engine at the owner's viewport or it is not claimed. The rig is checked in beside the pane so
+  the next band that folds is measured the same way.
+- **Revisit triggers:** a second band in the pane folding (the store's `BOTS_PANE_BANDS` is a
+  closed set of one); a pane taller than the block makes the fold moot, which no laptop is.
+- **Status / owner:** decided. Owner is the architect; Epic 64, Story 64.1 implements it.
+
+## D-11 — Hearing is shown by a floating window that can never become key, and it does not go over a full-screen Space
+
+keeper will show that it hears — the turn's state, a level meter, the words as they arrive — in
+a small, prewarmed, undecorated window that floats above other apps on every normal Space,
+never becomes key, never activates keeper, and cannot be clicked; and it will **not** make that
+window transparent, and will **not** — yet — make it appear over another app's full-screen
+Space. Recorded here because the two refusals rest on facts about Tauri and macOS rather than
+on taste, and both will be asked for again the first time the pill looks like a rectangle or
+fails to show over a full-screen browser.
+
+- **What is built:** a window of about 220×40 pt (AD-185) on the lifecycle `notes_window.rs` established for
+  quick-capture — declared in `tauri.conf.json`, created hidden at boot, never destroyed, only
+  shown and hidden (`crates/keeper/src/notes_window.rs:5-6`; the quick-capture declaration is
+  `crates/keeper/tauri.conf.json:31-44`) — with `always_on_top`, `visible_on_all_workspaces`,
+  `focusable(false)`, `focused(false)` and `set_ignore_cursor_events(true)`, so it floats over
+  the app the person is talking into and cannot take a click. It exists only on the desktop,
+  only when `voice_availability` is a real answer (D-8), and only while the turn is not
+  idle-and-unarmed. It draws the state, a level the core's meter computes from the input tap's
+  RMS and lets through at most every 40 ms and only on change (Story 64.3, AD-186;
+  `keeper-core/src/voice/level.rs:52-59`, `:90`), and the heard words; under `prefers-reduced-motion`
+  the meter is a static fill. The window module is Story 64.4's `crates/keeper/src/voice_window.rs`.
+  (AD-185, AD-186; FR-436…FR-439, NFR-54; Epic 64, Story 64.4)
+- **Why never key, and why click-through rather than merely unfocusable:** tao implements
+  `focusable(false)` by overriding `canBecomeKeyWindow`/`canBecomeMainWindow`, which keeps the
+  window from becoming key but does not stop a click on it from activating keeper — only
+  `NSWindowStyleMaskNonactivatingPanel` does that, and tao's style mask never includes it. A
+  click-through window cannot be clicked, so it cannot activate anything. (tao
+  `src/platform_impl/macos/window.rs:414-431`, `:686-693`, `:966-969`, read 2026-09-04;
+  Apple, `NSWindow.StyleMask.nonactivatingPanel`,
+  `https://developer.apple.com/documentation/appkit/nswindow/stylemask-swift.struct/nonactivatingpanel`,
+  accessed 2026-09-04)
+- **Why not transparent:** `transparent(true)` on macOS requires Tauri's `macos-private-api`
+  feature, enabled under `tauri > macOSPrivateApi`, and Tauri's own configuration documentation
+  warns that using private APIs on macOS prevents App Store acceptance (tauri-utils
+  `crates/tauri-utils/src/config.rs:2039-2042`,
+  `https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/src/config.rs`,
+  accessed 2026-09-04). keeper enables neither — `tauri.conf.json` has no `macOSPrivateApi` and
+  no Cargo manifest names the feature — and will not turn on a private-API flag for a rounded
+  corner. The pill is opaque.
+- **Why not over a full-screen Space, and what it would cost:** a plain `NSWindow` cannot be
+  displayed over another app's full-screen window; `always_on_top` is
+  `NSFloatingWindowLevel` only and does not set `fullScreenAuxiliary`, and
+  `visible_on_all_workspaces` joins normal Spaces only. The route is an `NSPanel` subclass —
+  `nonactivatingPanel` + `fullScreenAuxiliary` + `canJoinAllSpaces` + `hidesOnDeactivate = NO`
+  (the last because an `NSPanel` hides when its app deactivates by default, which is the
+  opposite of what the owner's case needs) — which `tauri-nspanel` provides at the price of a
+  git dependency from a single maintainer whose `v2.1` branch turns on `macos-private-api` as a
+  hard feature of tauri, whose `Cargo.toml` has no `license` field so keeper's licence firewall
+  trips, and whose open defects abort the process on a style-mask call and on close. The owner's
+  stated case — Maps, music, a browser in front — is normal Spaces, which the native builder
+  covers. Deferred as DW-229 with the numbers. (AD-187; tauri-apps/tauri#11488, closed not
+  planned, `https://github.com/tauri-apps/tauri/issues/11488`; Apple, *How Panels Work*,
+  `https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/WinPanel/Concepts/UsingPanels.html`;
+  both accessed 2026-09-04)
+- **Revisit triggers:** `tauri-nspanel` publishing a licence field and closing its style-mask
+  and close aborts (DW-229); Tauri growing a non-activating or full-screen-auxiliary option in
+  its own builder, which would make the panel subclass unnecessary; keeper ever enabling
+  `macOSPrivateApi` for a reason of its own, which would reopen only the transparency clause.
+- **Status / owner:** decided. Owner is the architect; Epic 64, Story 64.4 implements the window,
+  Story 64.5 records the limit.

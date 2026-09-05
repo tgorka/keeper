@@ -132,6 +132,9 @@ objc2-foundation = { version = "0.3", features = [
     "NSDictionary",
     "NSObject",
     "block2",
+    # The macOS voice port (Story 63.4) holds an `NSProcessInfo` activity while a
+    # capture is up, so App Nap does not starve the tap.
+    "NSProcessInfo",
 ] }
 # iOS app-icon badge (Story 14.3 fix, FR-62): safe `UNUserNotificationCenter::setBadgeCount`
 # binding (block2 feature for the optional completion handler). Already resolved in the lock
@@ -326,12 +329,13 @@ flate2 = "1"
 # direct edge on `keeper-core` adds no package to the tree and drags in neither
 # tauri nor gix. MIT OR Apache-2.0 — passes `cargo deny check`.
 unicode-normalization = "0.1"
-# The iPhone's speech recogniser and synthesiser (Epic 62, Story 62.4, AD-166,
-# AD-167). System frameworks: keeper ships no model weights, and the on-device
-# recogniser is the only one asked for (`requiresOnDeviceRecognition`), so
-# voice adds no network destination (NFR-50). Consumed by the `keeper` crate
-# under its iOS-only target table — never on desktop, never on Linux. The
-# feature lists name exactly the surfaces `voice_ios.rs` touches. Both are
+# The speech recogniser and synthesiser on Apple platforms (Epic 62, Story
+# 62.4, AD-166, AD-167; Epic 63, Story 63.4, AD-175). System frameworks: keeper
+# ships no model weights, and the on-device recogniser is the only one asked
+# for (`requiresOnDeviceRecognition`), so voice adds no network destination
+# (NFR-50, NFR-53). Consumed by the `keeper` crate under its iOS and macOS
+# target tables — never on Linux. The feature lists name exactly the surfaces
+# `voice_ios.rs` and `voice_macos.rs` touch. Both are
 # `Zlib OR Apache-2.0 OR MIT` — pass the cargo-deny license firewall.
 objc2-speech = { version = "0.3.2", default-features = false, features = [
     "std",
@@ -345,6 +349,10 @@ objc2-speech = { version = "0.3.2", default-features = false, features = [
 ] }
 objc2-avf-audio = { version = "0.3.2", default-features = false, features = [
     "std",
+    # The microphone grant on macOS 14+ (`recordPermission`,
+    # `requestRecordPermissionWithCompletionHandler:`), where there is no
+    # `AVAudioSession` to read it from. Unused by the iOS port.
+    "AVAudioApplication",
     "AVAudioBuffer",
     "AVAudioEngine",
     "AVAudioFormat",
@@ -357,5 +365,21 @@ objc2-avf-audio = { version = "0.3.2", default-features = false, features = [
     "AVSpeechSynthesis",
     "bitflags",
     "block2",
+] }
+# On-device language detection for the answer a voice turn will read aloud
+# (Epic 64, Story 64.2, AD-182, AD-188): `NLLanguageRecognizer`, constrained to
+# the languages this device has synthesiser voices for, so a Polish answer on
+# an English-listening Mac is spoken by the Polish voice rather than the
+# default English one. A system framework — no model weights shipped, no
+# network path, no new destination in `docs/egress.md`. Consumed by the
+# `keeper` crate under its iOS and macOS target tables only. Chosen over the
+# Rust detectors: `whatlang`'s corpus terms are unverified and `lingua`'s
+# models derive from a CC BY-NC corpus. `Zlib OR Apache-2.0 OR MIT` — passes
+# the cargo-deny license firewall. objc2 ≥ 0.6.2 and objc2-foundation ^0.3.2,
+# both already resolved in the lock.
+objc2-natural-language = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NLLanguage",
+    "NLLanguageRecognizer",
 ] }
 

@@ -2,13 +2,16 @@
 
 /**
  * One conversation with one bot, as the session list and the pane header
- * render it (Story 61.4, FR-381).
+ * render it (Story 61.4, FR-381; Epic 63, AD-176, AD-181).
  *
- * keeper's own record and not the remote's: `remoteSessionId` is a
- * *reference* the Hermes detail may show, and the epic's second decision says
- * why it can never be the truth — compression mints a successor session with a
- * renamed title, the stored-response cache is 100 rows LRU, and Ollama has no
- * session concept at all.
+ * keeper's own row, carrying the conversation's cross-device identity:
+ * `remoteSessionId` is the Hermes session id keeper mints on the first turn
+ * and sends on every turn, and the id a second device adopts when it lists
+ * the gateway — so both devices continue one session (AD-176). It is `null`
+ * where the endpoint keeps no server-side conversation (Ollama, an older
+ * Hermes), and there the row is the whole record. `remoteLastActiveMs` and
+ * `remoteSource` are what the gateway last said about that session, for the
+ * label AD-181 requires on a transcript read from the endpoint.
  */
 export type BotSessionVm = { 
 /**
@@ -40,6 +43,18 @@ updatedMs: number,
  */
 archived: boolean, 
 /**
- * The remote's own session id where the far side has one, else `null`.
+ * The Hermes session id this conversation is, where the endpoint keeps
+ * sessions; else `null`. The join key for every cross-device read.
  */
-remoteSessionId: string | null, };
+remoteSessionId: string | null, 
+/**
+ * When the gateway last saw activity on that session, ms since the Unix
+ * epoch, as of keeper's last list read; `null` where keeper never read
+ * one.
+ */
+remoteLastActiveMs: number | null, 
+/**
+ * Which door wrote it on the gateway's side (`api`, `cli`, a bridge), as
+ * the gateway spells it; `null` where it said nothing.
+ */
+remoteSource: string | null, };

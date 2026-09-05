@@ -25,9 +25,17 @@
  *   Hermes endpoint with its key and a profile-addressed bot go through the
  *   same form and the same probe vocabulary with the capability mirror at the
  *   phone tier, and nothing in this section is gated on the drive half.
+ * - **The wake switch lives here on the Mac** (Epic 63, Story 63.5, AD-179):
+ *   present on `voice_availability`'s answer alone — absent for `unsupported`,
+ *   drawn for a real availability — with no capability flag consulted.
+ * - **The language control is reached through Settings on the phone tier**
+ *   (Epic 63): the same section, the phone's capability mirror, and the list
+ *   the device reported — so a Polish phone with English assets can pick
+ *   English here as well as in the sheet.
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { VOICE_LOCALE_LABEL, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
 import {
   BOTS_ADD_BOT_LABEL,
   BOTS_ADD_PROVIDER_LABEL,
@@ -55,6 +63,7 @@ import type {
   BotVm,
 } from "@/lib/ipc/client";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
+import { voiceStore } from "@/lib/stores/voice";
 
 const botsProvidersList = vi.fn();
 const botsBotsList = vi.fn();
@@ -64,6 +73,8 @@ const botsProviderProbe = vi.fn();
 const botsBotProbe = vi.fn();
 const botsBotSave = vi.fn();
 const botsBotRemove = vi.fn();
+const voiceAvailability = vi.fn();
+const voiceWakeGet = vi.fn();
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
@@ -77,6 +88,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     botsBotProbe: (providerId: string, target: string) => botsBotProbe(providerId, target),
     botsBotSave: (req: unknown) => botsBotSave(req),
     botsBotRemove: (id: string) => botsBotRemove(id),
+    voiceAvailability: () => voiceAvailability(),
+    voiceWakeGet: () => voiceWakeGet(),
   };
 });
 
@@ -132,10 +145,27 @@ beforeEach(() => {
     presence: "exists",
     reason: null,
   } satisfies BotProbeVm);
+  // Every build without a voice port: the wake control renders itself away.
+  voiceAvailability.mockResolvedValue({
+    kind: "unsupported",
+    message: "voice is not available in this build",
+  });
+  voiceWakeGet.mockResolvedValue({
+    enabled: false,
+    phrase: "hey nixie",
+    limits: "limits",
+    locale: "en-US",
+    localeChosen: null,
+    onDeviceLocales: ["en-US"],
+  });
+  voiceStore.setState({ state: null, unavailable: undefined, wake: null });
+  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
 });
 
 afterEach(() => {
   vi.clearAllMocks();
+  voiceStore.setState({ state: null, unavailable: undefined, wake: null });
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
 });
 
 describe("BotsSection", () => {
@@ -146,6 +176,42 @@ describe("BotsSection", () => {
     // No rows read yet, so the honest state is the empty one rather than a
     // list that appears to arrive by itself.
     expect(screen.getByText(BOTS_SECTION_EMPTY)).toBeInTheDocument();
+  });
+
+  it("shows no wake switch while voice_availability answers unsupported (Story 63.5)", async () => {
+    render(<BotsSection open />);
+    await waitFor(() => expect(voiceAvailability).toHaveBeenCalled());
+    await waitFor(() => expect(voiceStore.getState().unavailable?.kind).toBe("unsupported"));
+    // Absent, not disabled (AD-27).
+    expect(screen.queryByRole("switch", { name: WAKE_SWITCH_LABEL })).not.toBeInTheDocument();
+  });
+
+  it("draws the wake switch and phrase on a real availability, from the runtime answer alone", async () => {
+    voiceAvailability.mockResolvedValue(null);
+    render(<BotsSection open />);
+    // The capability mirror carries no voice field; the section asked
+    // `voice_availability` and the control drew itself from the answer.
+    expect(await screen.findByRole("switch", { name: WAKE_SWITCH_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: WAKE_SWITCH_LABEL })).not.toBeChecked();
+    expect(screen.getByDisplayValue("hey nixie")).toBeInTheDocument();
+    // Nothing was streamed: Settings reads the facts and opens no watcher.
+    expect(voiceStore.getState().state).toBeNull();
+  });
+
+  it("reaches the language control through Settings on the phone tier (Epic 63)", async () => {
+    voiceAvailability.mockResolvedValue(null);
+    // The phone's mirror: it can talk to a model and cannot reach the drive.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    render(<BotsSection open />);
+    const control = await screen.findByRole("combobox", { name: VOICE_LOCALE_LABEL });
+    expect(control).toHaveValue("");
+    expect(screen.getByRole("option", { name: /en-US/ })).toBeInTheDocument();
+  });
+
+  it("does not draw the wake switch before voice_availability has answered", () => {
+    voiceAvailability.mockReturnValue(new Promise<null>(() => {}));
+    render(<BotsSection open />);
+    expect(screen.queryByRole("switch", { name: WAKE_SWITCH_LABEL })).not.toBeInTheDocument();
   });
 
   it("lists an endpoint by HOST and discloses that it is private", async () => {

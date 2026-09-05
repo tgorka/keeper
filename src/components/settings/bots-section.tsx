@@ -54,8 +54,21 @@
  * here reads the platform; the section is the same on both tiers, and the
  * grants live in their own section, gated on `botTools`, so no drive control
  * is rendered here to disable.
+ *
+ * # Voice, on the Mac (Epic 63, Story 63.5, AD-179)
+ *
+ * The wake switch and its phrase — {@link BotVoiceWake}, the same control the
+ * phone's picker sheet mounts — sit at the top of this section, because on the
+ * Mac there is no sheet and this was the one place a person could not turn
+ * the phrase on. Its presence is `voice_availability`'s answer and nothing
+ * else: the control renders itself away where the answer is `unsupported`
+ * (every build without a voice port), so this section never gates it and
+ * never shows a switch that could not listen (AD-27). The facts are read
+ * here through {@link useVoiceFacts} rather than a stream, because Settings
+ * is a dialog over whatever pane is open.
  */
 import { useCallback, useEffect, useState } from "react";
+import { BotVoiceWake } from "@/components/bots/bot-voice-wake";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -69,6 +82,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { useVoiceFacts } from "@/hooks/use-voice-facts";
 import type { BotProbeVm, BotProviderVm, BotVm, ProviderKind } from "@/lib/ipc/client";
 import {
   botsBotProbe,
@@ -179,6 +193,10 @@ export function BotsSection({ open }: { open: boolean }) {
     name: string;
   } | null>(null);
 
+  // The voice facts, so the wake control above the endpoints can decide
+  // whether it exists and what it shows (Story 63.5).
+  useVoiceFacts(open);
+
   // A `useCallback` with no dependencies — it closes over nothing but the state
   // setters, which React guarantees are stable — so the effect below can name
   // it as a real dependency rather than suppress the lint. A plain function
@@ -275,6 +293,7 @@ export function BotsSection({ open }: { open: boolean }) {
         </div>
       </div>
       <p className="text-muted-foreground">{BOTS_SECTION_NOTE}</p>
+      <BotVoiceWake className="border-border border-b pb-2" />
 
       {error !== null && (
         <p role="alert" className="text-destructive">

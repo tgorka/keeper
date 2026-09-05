@@ -14,9 +14,23 @@
 	  Story 19.3 (FR-69, AD-36): the Microphone TCC usage string shown when keeper
 	  (via its keeper-rec child sidecar) requests access — lazily, only when the
 	  user enables the mic source. Same honest local-only framing.
+	  Story 63.4 (FR-417, AD-175): the same grant also covers the voice port's
+	  capture, so the string names both uses in one sentence — the recording
+	  clause is unchanged, and the voice clause says where the audio goes
+	  (a recogniser on this Mac; never a server).
 	-->
 	<key>NSMicrophoneUsageDescription</key>
-	<string>keeper records your microphone only when you enable it for a recording. Everything is saved locally on this Mac. Nothing uploads.</string>
+	<string>keeper records your microphone only when you enable it for a recording, and listens to it only when you turn voice on. Everything is saved locally on this Mac. Nothing uploads.</string>
+	<!--
+	  Story 63.4 (FR-417, NFR-53, AD-175): the Speech Recognition TCC usage string
+	  shown when the voice port asks for the recogniser (FR-408: on the first
+	  deliberate voice act, never at launch). Required alongside the microphone
+	  string, or macOS terminates the app on first use. Recognition is on-device
+	  only — every request sets requiresOnDeviceRecognition — so the sentence can
+	  say so.
+	-->
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>keeper turns what you say into text on this Mac itself, only while voice is on. Your voice never leaves this Mac. Nothing uploads.</string>
 	<!--
 	  Story 20.1 (FR-70, AD-36): the Camera TCC usage string shown when keeper
 	  (via its keeper-rec child sidecar) requests access — lazily, only when the

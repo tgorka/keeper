@@ -78,6 +78,40 @@ vi.mock("@/lib/ipc/client", () => ({
       conflict: null,
     }),
   ),
+  // The voice reach row (Story 63.5) exists on `voice_availability`'s answer
+  // alone. `unsupported` is the default here — every build without a voice
+  // port — so every pre-existing Shortcuts assertion is untouched; the cases
+  // that care opt in with a real availability.
+  voiceAvailability: vi.fn(() =>
+    Promise.resolve({ kind: "unsupported", message: "voice is not available in this build" }),
+  ),
+  voiceWakeGet: vi.fn(() =>
+    Promise.resolve({ enabled: false, phrase: "hey nixie", limits: "limits" }),
+  ),
+  voiceHotkeyGet: vi.fn(() =>
+    Promise.resolve({
+      accelerator: "",
+      isDefault: true,
+      active: false,
+      conflict: null,
+    }),
+  ),
+  voiceHotkeySet: vi.fn(() =>
+    Promise.resolve({
+      accelerator: "Control+Alt+V",
+      isDefault: false,
+      active: true,
+      conflict: null,
+    }),
+  ),
+  voiceHotkeyClear: vi.fn(() =>
+    Promise.resolve({
+      accelerator: "",
+      isDefault: true,
+      active: false,
+      conflict: null,
+    }),
+  ),
   egressList: vi.fn(() => Promise.resolve([])),
   debugModeGet: vi.fn(() => Promise.resolve(false)),
   debugModeSet: vi.fn(() => Promise.resolve()),
@@ -147,7 +181,11 @@ import {
   BADGE_NOT_LIVE_SENTENCE,
   NO_BACKGROUND_SYNC_SENTENCE,
 } from "@/components/settings/no-background-sync-disclosure";
-import { SettingsDialog } from "@/components/settings/settings-dialog";
+import {
+  SettingsDialog,
+  VOICE_SHORTCUT_LABEL,
+  VOICE_SHORTCUT_NOTE,
+} from "@/components/settings/settings-dialog";
 import { SYNC_GIT_TITLE } from "@/components/settings/sync-git-row";
 import { SYNC_SECTION_SENTENCE, SYNC_SECTION_TITLE } from "@/components/settings/sync-section";
 import type { AccountVm } from "@/lib/ipc/client";
@@ -172,6 +210,10 @@ import {
   syncGitStatus,
   syncProfiles,
   undoSendWindow,
+  voiceAvailability,
+  voiceHotkeyClear,
+  voiceHotkeyGet,
+  voiceHotkeySet,
 } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
@@ -180,6 +222,7 @@ import { keyBackupStore } from "@/lib/stores/key-backup";
 import { notesVaultsStore, resetNotesVaultsStoreForTest } from "@/lib/stores/notes-vaults";
 import { resetSyncStoreForTest } from "@/lib/stores/sync";
 import { verificationStore } from "@/lib/stores/verification";
+import { voiceStore } from "@/lib/stores/voice";
 import { wizardStore } from "@/lib/stores/wizard";
 
 const mockPosture = vi.mocked(encryptionPosture);
@@ -201,6 +244,10 @@ const mockOpenAppSettings = vi.mocked(iosOpenAppSettings);
 const mockBadgeModeSet = vi.mocked(dockBadgeModeSet);
 const mockSyncProfiles = vi.mocked(syncProfiles);
 const mockGitStatus = vi.mocked(syncGitStatus);
+const mockVoiceAvailability = vi.mocked(voiceAvailability);
+const mockVoiceHotkeyGet = vi.mocked(voiceHotkeyGet);
+const mockVoiceHotkeySet = vi.mocked(voiceHotkeySet);
+const mockVoiceHotkeyClear = vi.mocked(voiceHotkeyClear);
 
 const DEFAULT_HOTKEY_VM: HotkeyVm = {
   accelerator: "Control+Alt+Space",
@@ -315,6 +362,23 @@ beforeEach(() => {
   // Shortcuts section, the Launch-at-login / Keep-in-menu-bar rows) render for the
   // existing assertions; the reduced-platform cases opt in explicitly.
   capabilitiesStore.getState().applySnapshot(DESKTOP_CAPABILITIES);
+  mockVoiceAvailability.mockClear();
+  mockVoiceAvailability.mockResolvedValue({
+    kind: "unsupported",
+    message: "voice is not available in this build",
+  });
+  mockVoiceHotkeyGet.mockClear();
+  mockVoiceHotkeySet.mockClear();
+  mockVoiceHotkeyClear.mockClear();
+  mockVoiceHotkeyGet.mockResolvedValue(UNSET_RECORDING_HOTKEY_VM);
+  mockVoiceHotkeySet.mockResolvedValue({
+    accelerator: "Control+Alt+V",
+    isDefault: false,
+    active: true,
+    conflict: null,
+  });
+  mockVoiceHotkeyClear.mockResolvedValue(UNSET_RECORDING_HOTKEY_VM);
+  voiceStore.setState({ state: null, unavailable: undefined, wake: null });
 });
 
 afterEach(() => {
@@ -325,6 +389,7 @@ afterEach(() => {
   verificationStore.setState({ flow: null, modalOpen: false, activeAccountId: null });
   capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
   resetSyncStoreForTest();
+  voiceStore.setState({ state: null, unavailable: undefined, wake: null });
 });
 
 describe("SettingsDialog", () => {
@@ -665,7 +730,7 @@ describe("SettingsDialog", () => {
     // Unset by default: the row renders with "Not set" and a disabled Clear.
     expect(await screen.findByText("Start / stop recording")).toBeInTheDocument();
     expect(await screen.findByText("Not set")).toBeInTheDocument();
-    expect(await screen.findByRole("button", { name: "Clear" })).toBeDisabled();
+    expect(await screen.findByRole("button", { name: "Clear recording shortcut" })).toBeDisabled();
 
     // Capture ⌃⌥R and assign it via recordingHotkeySet.
     fireEvent.click(screen.getByRole("button", { name: "Change recording shortcut" }));
@@ -679,7 +744,7 @@ describe("SettingsDialog", () => {
     });
     // The new binding renders as glyphs and Clear becomes available.
     expect(await screen.findByText("⌃⌥R")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Clear" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Clear recording shortcut" })).toBeEnabled();
   });
 
   it("clears the recording hotkey back to 'Not set' via recordingHotkeyClear", async () => {
@@ -694,7 +759,7 @@ describe("SettingsDialog", () => {
     render(<SettingsDialog open onOpenChange={() => {}} />);
 
     expect(await screen.findByText("⌃⌥R")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear recording shortcut" }));
 
     await waitFor(() => {
       expect(mockRecordingHotkeyClear).toHaveBeenCalledTimes(1);
@@ -714,6 +779,55 @@ describe("SettingsDialog", () => {
     render(<SettingsDialog open onOpenChange={() => {}} />);
 
     expect(await screen.findByText("Conflicts with the Summon keeper hotkey.")).toBeInTheDocument();
+  });
+
+  // ── Voice hotkey row (Story 63.5, AD-179) ──────────────────────────────────
+  it("renders no voice row while voice_availability answers unsupported, and never asks for the chord", async () => {
+    mockPosture.mockResolvedValue(false);
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText("Summon keeper")).toBeInTheDocument();
+    await waitFor(() => expect(mockVoiceAvailability).toHaveBeenCalled());
+    // Absent, not disabled (AD-27): no label, no note, no read of a binding
+    // nothing could press.
+    expect(screen.queryByText(VOICE_SHORTCUT_LABEL)).not.toBeInTheDocument();
+    expect(screen.queryByText(VOICE_SHORTCUT_NOTE)).not.toBeInTheDocument();
+    expect(mockVoiceHotkeyGet).not.toHaveBeenCalled();
+  });
+
+  it("renders the voice row on a real availability — with no capability flag consulted — and assigns a chord", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockVoiceAvailability.mockResolvedValue(null);
+    // The desktop tier from beforeEach carries no voice field at all: the
+    // row's presence is the runtime answer's (AD-179).
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(VOICE_SHORTCUT_LABEL)).toBeInTheDocument();
+    expect(screen.getByText(VOICE_SHORTCUT_NOTE)).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Clear voice shortcut" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Change voice shortcut" }));
+    const capture = await screen.findByRole("button", {
+      name: `Press a shortcut for ${VOICE_SHORTCUT_LABEL} (Esc to cancel)`,
+    });
+    fireEvent.keyDown(capture, { code: "KeyV", key: "v", ctrlKey: true, altKey: true });
+
+    await waitFor(() => {
+      expect(mockVoiceHotkeySet).toHaveBeenCalledWith("Control+Alt+V");
+    });
+    expect(await screen.findByText("⌃⌥V")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear voice shortcut" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear voice shortcut" }));
+    await waitFor(() => expect(mockVoiceHotkeyClear).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps the voice row for a refusal that is a state, not absence", async () => {
+    mockPosture.mockResolvedValue(false);
+    mockVoiceAvailability.mockResolvedValue({ kind: "notAuthorized", message: "allow it" });
+    render(<SettingsDialog open onOpenChange={() => {}} />);
+
+    expect(await screen.findByText(VOICE_SHORTCUT_LABEL)).toBeInTheDocument();
   });
 
   // ── Capability gating (Story 13.7) ─────────────────────────────────────────

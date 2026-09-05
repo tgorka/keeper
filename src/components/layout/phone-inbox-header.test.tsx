@@ -4,6 +4,7 @@ import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
 import type { AccountVm, BridgeHealthSnapshot } from "@/lib/ipc/client";
 import { accountsStore } from "@/lib/stores/accounts";
 import { bridgeHealthStore } from "@/lib/stores/bridge-health";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { draftsStore } from "@/lib/stores/drafts";
 import { leadingDrawerStore } from "@/lib/stores/leading-drawer";
 import { newChatStore } from "@/lib/stores/new-chat";
@@ -43,6 +44,7 @@ beforeEach(() => {
   leadingDrawerStore.getState().close();
   searchSurfaceStore.setState({ isOpen: false, scope: "chats", chatLock: null });
   newChatStore.setState({ isOpen: false });
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
 });
 
 afterEach(() => {
@@ -153,5 +155,23 @@ describe("PhoneInboxHeader", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "New chat" }));
     expect(newChatStore.getState().isOpen).toBe(true);
+  });
+
+  /**
+   * Story 63.1, FR-410: one direct way into Bots that is not the drawer. The
+   * button pushes the shell's existing level 1 through the same view store
+   * the drawer's row uses — no tab bar, no second level — and is absent, not
+   * disabled, where the build cannot talk to a model (AD-27).
+   */
+  it("reaches Bots directly, without the drawer, only where the capability is on", () => {
+    const { rerender } = render(<PhoneInboxHeader />);
+    expect(screen.queryByRole("button", { name: "Bots" })).not.toBeInTheDocument();
+
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    rerender(<PhoneInboxHeader />);
+    fireEvent.click(screen.getByRole("button", { name: "Bots" }));
+    expect(primaryViewStore.getState().view).toBe("bots");
+    expect(leadingDrawerStore.getState().isOpen).toBe(false);
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
   });
 });
