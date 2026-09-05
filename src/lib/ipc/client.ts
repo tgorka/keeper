@@ -3381,6 +3381,25 @@ export async function syncOpenEntry(id: string, subpath: string): Promise<void> 
 }
 
 /**
+ * Hand one file inside a synced folder to the OS share sheet — the phone's
+ * reveal (Story 66.3, FR-466, AD-200).
+ *
+ * Addressed like {@link syncOpenEntry}: a profile id and a profile-relative
+ * `subpath` the listing produced, re-resolved in Rust through the same
+ * containment rule (`share_ios::share_target`), never a path. Offered only
+ * where `CapabilitiesVm.shareOut` is true; a desktop answers `unsupported`
+ * with a sentence naming Finder. A virtual entry is materialized by the caller
+ * first ({@link syncMaterializeEntry}) — sharing a pointer would hand the
+ * sheet the pointer's text.
+ *
+ * Rejects with: `unsupported`, `internal` (no such profile, a subpath that
+ * escapes the root, a folder, a file no longer on disk).
+ */
+export async function shareOut(id: string, subpath: string): Promise<void> {
+  await invoke<void>("share_out", { id, subpath });
+}
+
+/**
  * Read one file inside a synced folder as editable text (FR-179, AD-65, Story
  * 45.6).
  *

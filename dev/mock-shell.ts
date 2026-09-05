@@ -63,6 +63,7 @@ import type {
   BotStreamEvent,
   BotVm,
   CapabilitiesVm,
+  DocumentVm,
   FileSizeVm,
   FilesEntrySyncVm,
   FilesEntryVm,
@@ -85,6 +86,7 @@ import type {
   TaskSaveReq,
   TaskSchedulePreviewVm,
   TaskVm,
+  TextFileVm,
   VoiceStateVm,
   VoiceUnavailableVm,
   VoiceWakeVm,
@@ -1061,7 +1063,18 @@ const ANSWERS: Record<string, unknown> = {
   // `dev/measure-bots.ts --phone` drives.
   capabilities:
     new URLSearchParams(window.location.search).get("platform") === "phone"
-      ? ({ ...DEFAULT_CAPABILITIES, bots: true } satisfies CapabilitiesVm)
+      ? // Epic 66: the folder links on the phone (`sync`, AD-198), share-out
+        // is its reveal (`shareOut`, Story 66.3, AD-200) and notes ride the
+        // folder (`notes`, Story 66.4) — the three flags `ipc.rs` now computes
+        // true on iOS, so the Files and Notes rows and the capture sheet are
+        // reachable in the phone rig (`dev/measure-files.ts`).
+        ({
+          ...DEFAULT_CAPABILITIES,
+          bots: true,
+          sync: true,
+          shareOut: true,
+          notes: true,
+        } satisfies CapabilitiesVm)
       : ({
           trayIcon: true,
           globalHotkey: true,
@@ -1070,6 +1083,8 @@ const ANSWERS: Record<string, unknown> = {
           nativeMenuBar: true,
           bridgeSidecar: true,
           revealInFileManager: true,
+          // Story 66.3: the phone's reveal, and false on every desktop.
+          shareOut: false,
           recording: true,
           sync: true,
           notes: true,
@@ -3873,6 +3888,33 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       write: { writable: true, reason: null, caveat: null, caveatShort: null },
     };
   },
+  // A file opened from the listing (Story 45.6's text reader, Story 45.8's
+  // document reader). Answered so the phone's Files surface (Story 66.3) can
+  // be looked at full-screen here — and measured by `dev/measure-files.ts` —
+  // rather than stopping on the fallback's `null`, which the viewer renders as
+  // a thrown property read. One markdown body for every text path, one
+  // page-count probe for every document; the `keeper-file://` bytes behind a
+  // PDF's `<embed>` are not served here, so the frame draws its facts over an
+  // empty plugin.
+  sync_read_text: (payload): TextFileVm => ({
+    text: `# ${String(payload.subpath ?? "file")}\n\nA note read from the folder keeper syncs, over the mock shell.\n\n- one item\n- another, with a [[wikilink]]\n\n> A quotation, because a body with only headings measures nothing.\n`,
+    sizeBytes: 3_380,
+    sizeLabel: "3.4 kB",
+    oversize: false,
+    binary: false,
+    detail: null,
+  }),
+  sync_read_document: (): DocumentVm => ({
+    format: "pdf",
+    sizeBytes: 8_400_000,
+    sizeLabel: "8.4 MB",
+    detail: null,
+    truncated: false,
+    pdf: { version: "1.7", pageCount: 12, encrypted: false, servable: true },
+    words: null,
+    slides: null,
+    sheets: null,
+  }),
   /**
    * The path plugin's directory lookup, which is not one of the app's own
    * commands and is the only non-`keeper` invoke any screen makes (Story 59.8).

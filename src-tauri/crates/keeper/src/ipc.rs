@@ -1429,6 +1429,11 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         native_menu_bar: cfg!(desktop),
         bridge_sidecar: cfg!(desktop),
         reveal_in_file_manager: cfg!(desktop),
+        // Share-out (Story 66.3, AD-200) is the phone's reveal: a file handed to
+        // `UIActivityViewController` from `share_ios.rs`. `target_os = "ios"`
+        // rather than `mobile` because the presentation is UIKit's — an Android
+        // build earns the flag with its own intent, not by inheriting this one.
+        share_out: cfg!(target_os = "ios"),
         // Screen recording (Story 16.3) is desktop macOS ≥ 13.0 only — a runtime
         // OS-version probe in the shell adapter (AD-35), not a bare `cfg!(desktop)`.
         // Any detection failure defaults to `false` (safe-hide).
@@ -1446,14 +1451,15 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // needs the app to supply its own drag region and traffic-light clearance.
         overlay_title_bar: cfg!(all(desktop, target_os = "macos")),
         // Notes (Story 35.2, FR-122, AD-54): a vault IS a synced folder, so notes
-        // cannot be available where folder sync is not. `sync && desktop` — which
-        // on iOS is `false` twice over, and the whole surface is then absent
-        // rather than disabled (AD-27).
+        // cannot be available where folder sync is not. `sync` on every target
+        // since Epic 66 (AD-200) — see `notes_available`.
         notes: notes_available(&state),
         // Sessions (FR-223, AD-107): the same construction as notes — a sessions
-        // root IS a synced folder plus a flag, so the capability is exactly the
-        // notes capability's condition, computed once and shared.
-        sessions: notes_available(&state),
+        // root IS a synced folder plus a flag — and on the Mac only (Epic 66,
+        // AD-201): the board is forty commands and its own epic, so the phone
+        // says so in the disclosure rather than rendering a board it cannot
+        // drive.
+        sessions: mac_folder_capability_of(&git_report(&state), cfg!(desktop)),
         // Bots (Epic 61, FR-378; Epic 62, FR-396): `cfg!(desktop) ||
         // cfg!(mobile)`, i.e. true on every target that has a pane to put it
         // in, and **deliberately not** `notes_available`. Every other surface
@@ -1490,9 +1496,10 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
         // folders, so a desktop whose `git` the engine refuses has no folder to
         // grant into. Where this is `false` the grant bar, the audit list,
         // the tool rows and the reveal control are absent, not disabled
-        // (AD-27). Computed as `notes_available` because it is the same
-        // condition, and stated separately because it is not the same fact.
-        bot_tools: notes_available(&state),
+        // (AD-27). `desktop && sync`, stated with the `cfg!` spelled out since
+        // Epic 66 flipped `notes_available` on for the phone (AD-201, AD-162):
+        // the tools spawn and read a drive the phone does not have.
+        bot_tools: mac_folder_capability_of(&git_report(&state), cfg!(desktop)),
     })
 }
 
@@ -1501,8 +1508,28 @@ pub fn capabilities(state: State<'_, AppState>) -> Result<CapabilitiesVm, IpcErr
 /// Derived from the same `git` resolution `CapabilitiesVm.sync` reports, because a
 /// vault is a folder keeper syncs: a machine whose `git` the engine refuses has no
 /// sync surface and must not get a notes surface over an engine that never opened.
+///
+/// `sync` on every target since Epic 66 (Story 66.4, AD-200): the folder is on
+/// the phone now, and notes are the desktop's readers in the phone's stack. The
+/// `cfg!(desktop)` that used to sit in front is gone; the git-ok gate stays,
+/// which on a phone is the engine's own answer (`engine: gix`, AD-198). What
+/// stays desktop-only is decided by name below — sessions and the drive half
+/// of Bots (AD-201) — and by the window-bound notes commands staying in the
+/// desktop's extra handler list.
 pub(crate) fn notes_available(state: &AppState) -> bool {
-    cfg!(desktop) && git_report(state).state == SyncGitState::Ok
+    notes_capability_of(&git_report(state))
+}
+
+/// The notes gate over a git report, pure: `sync`, on every tier.
+fn notes_capability_of(report: &SyncGitVm) -> bool {
+    report.state == SyncGitState::Ok
+}
+
+/// The gate for what rides the folder but stays on the Mac (AD-201): the
+/// sessions board and the drive half of Bots. `desktop && sync`, with the tier
+/// a parameter so the phone's shape can be asserted from any host.
+fn mac_folder_capability_of(report: &SyncGitVm, desktop: bool) -> bool {
+    desktop && notes_capability_of(report)
 }
 
 /// The same answer for a caller that holds an app handle rather than the state —
@@ -1526,9 +1553,12 @@ pub fn notes_capability(app: &tauri::AppHandle) -> bool {
 /// `unsupported` rather than an `invoke` rejection the frontend would have to
 /// special-case.
 ///
-/// The rest of the notes surface is absent on iOS by construction rather than by
-/// stub: `CapabilitiesVm.notes` is `false` there, so no notes surface renders and
-/// nothing calls the other commands (FR-122).
+/// Since Epic 66 (Story 66.4, AD-200) the notes surface itself IS on the phone
+/// — the list, the reader and the editor — and quick capture is a sheet in the
+/// phone's stack rather than a window. These three twins stay because the
+/// frontend's window verbs are absent on the reduced tier, not because the
+/// surface is: a build that reached one anyway gets a sentence, never a
+/// window it cannot open.
 #[cfg(not(desktop))]
 #[tauri::command]
 pub fn notes_capture_show() -> Result<(), IpcError> {
@@ -11174,6 +11204,37 @@ mod tests {
     #[test]
     fn now_ms_is_positive() {
         assert!(now_ms() > 0);
+    }
+
+    /// Epic 66, Story 66.4 (AD-200, AD-201): the phone's git report — `Ok`
+    /// with `engine: gix` — turns notes on, and leaves sessions and the drive
+    /// half of Bots on the Mac; a desktop whose git the engine refuses has
+    /// none of the three.
+    #[test]
+    fn the_phone_shaped_report_opens_notes_and_keeps_sessions_on_the_mac() {
+        let phone = SyncGitVm {
+            state: SyncGitState::Ok,
+            engine: SyncGitEngine::Gix,
+            summary: None,
+            problem: None,
+            configured_path: None,
+        };
+        assert!(notes_capability_of(&phone));
+        assert!(
+            !mac_folder_capability_of(&phone, false),
+            "sessions stay on the Mac"
+        );
+        assert!(mac_folder_capability_of(&phone, true));
+
+        let refused = SyncGitVm {
+            state: SyncGitState::Missing,
+            engine: SyncGitEngine::Git,
+            summary: None,
+            problem: Some("no git".to_owned()),
+            configured_path: None,
+        };
+        assert!(!notes_capability_of(&refused));
+        assert!(!mac_folder_capability_of(&refused, true));
     }
 
     #[test]

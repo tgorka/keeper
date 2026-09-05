@@ -29,6 +29,7 @@ export const DEFAULT_CAPABILITIES: CapabilitiesVm = Object.freeze({
   nativeMenuBar: false,
   bridgeSidecar: false,
   revealInFileManager: false,
+  shareOut: false,
   recording: false,
   sync: false,
   notes: false,
@@ -86,13 +87,22 @@ export function useCapabilitiesStore<T>(selector: (state: CapabilitiesState) => 
  * into a desktop the moment `capabilities()` answered.
  *
  * The drive half of the Bots surface, `botTools`, is `desktop && sync` and
- * stays in the fold. A flag belongs here only when the Rust side computes it
- * as true on both tiers; that is the whole membership rule.
+ * stays in the fold. A flag belongs here only when the Rust side does NOT
+ * compute it as `cfg!(desktop)`-shaped — true on both tiers, or true on the
+ * phone alone; that is the whole membership rule.
+ *
+ * **`shareOut` is true on the phone ONLY (Story 66.3, AD-200)**: it is the
+ * phone's answer to `revealInFileManager`, the one flag in the VM whose truth
+ * is inverted against the rest. Folded in, a phone that can share would read
+ * as a desktop the moment `capabilities()` answered — the exact failure the
+ * `sync`/`notes` paragraph names, from the other direction. The Files surface
+ * offers Reveal or Share by reading the two flags themselves, never the tier.
  */
 const TIER_NEUTRAL_FLAGS: Partial<Record<keyof CapabilitiesVm, true>> = {
   bots: true,
   sync: true,
   notes: true,
+  shareOut: true,
 };
 
 /**

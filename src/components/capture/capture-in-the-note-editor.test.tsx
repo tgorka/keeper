@@ -168,7 +168,11 @@ beforeEach(() => {
   resetNotesVaultsStoreForTest();
   resetPanelsStoreForTest();
   resetCaptureWindowsStoreForTest();
-  capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true });
+  // `nativeMenuBar` says desktop: since Story 66.4 `notes` alone no longer does,
+  // and a capture WINDOW is the desktop tier's.
+  capabilitiesStore
+    .getState()
+    .applySnapshot({ ...DEFAULT_CAPABILITIES, notes: true, nativeMenuBar: true });
   notesCaptureOpen.mockResolvedValue(undefined);
   notesCaptureWindows.mockResolvedValue([]);
   notesOpen.mockImplementation(async (_vaultId, noteId, onBatch) => {

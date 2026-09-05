@@ -68,6 +68,11 @@ mod sessions_exec;
 mod sessions_ipc;
 #[cfg(desktop)]
 mod sessions_root;
+// Share out (Story 66.3, AD-200): the phone's reveal. The containment half
+// compiles everywhere and is tested on Linux; the `UIActivityViewController`
+// half is `cfg(target_os = "ios")` inside, and a desktop answers `unsupported`
+// with a sentence naming Finder.
+mod share_ios;
 // Folder sync (Epic 29): the engine wiring and its command surface, on every
 // target since Epic 66 (AD-198). What the phone does differently — no
 // supervisor, no watcher, a sync on open, on foreground and on pull-to-refresh
@@ -684,10 +689,7 @@ pub fn run() {
                 sync::start_supervisor(std::sync::Arc::clone(&state.platform));
             }
             #[cfg(not(desktop))]
-            {
-                let state = app.state::<ipc::AppState>();
-                sync::phone_sync_all(std::sync::Arc::clone(&state.platform), "open");
-            }
+            sync::phone_sync_all(app.handle(), "open");
 
             // AD-101's phase two: the one fact about the layer stack that
             // could not be checked until the engine existed.
@@ -756,7 +758,13 @@ pub fn run() {
             // and there is nothing to subscribe to before it exists; a machine
             // with no usable `git` has no engine, therefore no vaults, and this
             // returns quietly — `CapabilitiesVm.notes` is already false there.
-            #[cfg(desktop)]
+            //
+            // On every target since Epic 66 (Story 66.4, AD-200): the phone's
+            // engine opened synchronously in `phone_sync_all` above, so the
+            // registry sees it here; a vault whose clone has not landed yet is
+            // adopted by `notes_vault::phone_synced` when the pass ends. The
+            // tap subscribes to a watcher the phone never arms — the phone's
+            // index is refreshed after each sync pass instead.
             notes_vault::start(app.handle());
 
             // Build the sessions-root registry beside it (Phase 7, AD-107/108):
@@ -1120,6 +1128,10 @@ pub fn run() {
                 // it is here rather than with the write commands below: it needs no
                 // vault and refuses nothing for being outside one.
                 sync_ipc::sync_export_entry,
+                // Share out (Story 66.3, AD-200): the phone's reveal, addressed like
+                // `sync_open_entry` and refused on a desktop with a sentence naming
+                // Finder. Registered everywhere so the handler list is one list.
+                share_ios::share_out,
                 // And the write half (Story 45.3, AD-89, which retired AD-75). Every
                 // one of these goes through `notes_vault`'s single writer and refuses
                 // anything outside a notes vault; the decisions are in
@@ -1566,10 +1578,7 @@ pub fn run() {
                 // NFR-57): no supervisor ticks here, so this and
                 // pull-to-refresh are the only times a remote change arrives.
                 #[cfg(not(desktop))]
-                {
-                    let state = app_handle.state::<ipc::AppState>();
-                    sync::phone_sync_all(std::sync::Arc::clone(&state.platform), "foreground");
-                }
+                sync::phone_sync_all(app_handle, "foreground");
             }
             // `RunEvent::Reopen` is an Apple-platform variant (there is no dock on
             // Linux/Windows), so this arm is gated on macOS specifically rather than on

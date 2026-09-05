@@ -14,6 +14,8 @@ const desktopCapabilities: CapabilitiesVm = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  // Story 66.3: the phone's reveal; false on every desktop fixture.
+  shareOut: false,
   recording: true,
   sync: true,
   notes: true,
@@ -39,6 +41,8 @@ describe("capabilitiesStore", () => {
       nativeMenuBar: false,
       bridgeSidecar: false,
       revealInFileManager: false,
+      // Story 66.3: the phone's reveal; false on every desktop fixture.
+      shareOut: false,
       recording: false,
       sync: false,
       notes: false,
@@ -86,12 +90,14 @@ describe("isReducedCapabilityPlatform", () => {
     // Derived from the VM's own keys so a capability added later is exercised
     // automatically: the hand-written list had already drifted past `sync`.
     // `bots`, `sync` and `notes` are the flags true on every tier (Epic 62,
-    // FR-396; Epic 66, AD-198/AD-200), so they are the flags that must NOT
-    // flip the verdict; the cases below own them.
+    // FR-396; Epic 66, AD-198/AD-200), and `shareOut` is true on the phone
+    // alone (Story 66.3) — so they are the flags that must NOT flip the
+    // verdict; the cases below own them.
     const neutral: Partial<Record<keyof CapabilitiesVm, true>> = {
       bots: true,
       sync: true,
       notes: true,
+      shareOut: true,
     };
     const flags = (Object.keys(DEFAULT_CAPABILITIES) as Array<keyof CapabilitiesVm>).filter(
       (flag) => neutral[flag] !== true,
@@ -119,6 +125,16 @@ describe("isReducedCapabilityPlatform", () => {
     capabilitiesStore
       .getState()
       .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true });
+    expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
+  });
+
+  it("a phone that can share out (`shareOut` true, the inverted flag) IS still reduced", () => {
+    // Story 66.3 (AD-200): `shareOut` is the phone's reveal, true on iOS
+    // only. A phone-only truth folded in as tier-telling would flip the
+    // phone to the desktop tier the moment it could share.
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, shareOut: true });
     expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
   });
 

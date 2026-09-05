@@ -57,23 +57,26 @@
  *
  * # The gate
  *
- * `capabilities.notes`, which is `sync && desktop` computed in Rust (AD-27).
- * That is the same flag `use-notes-shortcut.ts` gates the in-app capture chord
- * on, so this item is present exactly where ⌘⌥K is — one answer to "can this
- * build open a capture window" rather than two. Deliberately **not**
- * `revealInFileManager`, which answers whether a file manager exists and
- * nothing about whether a window can.
+ * `capabilities.notes` — the same flag `use-notes-shortcut.ts` gates the in-app
+ * capture chord on, so this item is present exactly where ⌘⌥K is — AND the
+ * tier: since Story 66.4 `notes` is true on the phone too, and a phone has no
+ * second window to open a note in (`notes_capture_open` is a window verb the
+ * phone's handler list does not carry). Absent there, never disabled (AD-27);
+ * the phone's capture is the sheet, reached from its own headers. Deliberately
+ * **not** `revealInFileManager`, which answers whether a file manager exists
+ * and nothing about whether a window can.
  */
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { openNoteAsCapture } from "@/hooks/use-notes-actions";
-import { useCapabilitiesStore } from "@/lib/stores/capabilities";
+import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 
 /** The item's label, kept verbatim so a test and a user agree. */
 export const CAPTURE_NOTE_LABEL = "Open in a capture window";
 
 export function CaptureNoteItem({ vaultId, noteId }: { vaultId: string; noteId: string }) {
   const notes = useCapabilitiesStore((state) => state.capabilities.notes);
-  if (!notes) {
+  const reduced = useIsReducedCapabilityPlatform();
+  if (!notes || reduced) {
     return null;
   }
   return (

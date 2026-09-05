@@ -67,6 +67,8 @@ const DESKTOP_CAPABILITIES = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  // Story 66.3: the phone's reveal; false on every desktop fixture.
+  shareOut: false,
   recording: false,
   sync: false,
   notes: false,
@@ -388,8 +390,10 @@ describe("AboutSection capability gating (Story 13.7)", () => {
     // The "On this iPhone" list renders every honesty line.
     expect(screen.getByText("On this iPhone")).toBeInTheDocument();
     expect(screen.getByText(/syncs and notifies only while it's open/)).toBeInTheDocument();
-    expect(screen.getByText(/No self-hosted bridge runner/)).toBeInTheDocument();
-    expect(screen.getByText("No global summon hotkey.")).toBeInTheDocument();
+    expect(screen.getByText(/mirrors a remote your Mac already syncs/)).toBeInTheDocument();
+    expect(screen.getByText(/Nothing is merged on a phone/)).toBeInTheDocument();
+    expect(screen.getByText(/the self-hosted bridge runner/)).toBeInTheDocument();
+    expect(screen.getByText(/the global summon hotkey/)).toBeInTheDocument();
     expect(screen.getByText(/signature renews every 7 days/)).toBeInTheDocument();
     expect(screen.getByText(/the drive tools live on your Mac/)).toBeInTheDocument();
     for (const line of IOS_DISCLOSURE_LINES) {

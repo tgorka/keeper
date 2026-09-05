@@ -727,3 +727,188 @@ lapses.
   "Swift where Swift is the only door".
 - **Status / owner:** decided. Owner is the architect; Epic 65, Story 65.5 implements it; the
   hardware proof is Story 65.6's gate.
+
+## D-15 — The folder on the phone is a mirror, the remote is the hub, the phone never merges
+
+keeper will give the phone a folder: a profile that is a remote URL plus a credential in
+the keychain, cloned by gitoxide into the app container, fully virtual by default, fetched
+and fast-forwarded on open, on foreground and on pull-to-refresh; and it will **not** merge
+on the phone, will **not** make the Mac serve the phone, and will **not** link a second git
+implementation to get there. Recorded here because the phone lived eight epics without the
+folder on a belief nobody had measured, because "just merge like the Mac does" is the tidy
+rule that will be proposed the first time a divergence sentence is read, and because the
+inverted route was deferred once already (DW-220) and would be re-proposed as the obvious
+shortcut.
+
+- **What was measured:** `keeper-sync` sat in the desktop-only target table of
+  `crates/keeper/Cargo.toml` from Epic 29 on the belief that gitoxide had no place in an
+  iOS bundle, and `cargo check -p keeper-sync --target aarch64-apple-ios` passed on
+  hesperia in 25 s (2026-09-05, Epic 66, *What was measured*, 3). The crate was never
+  excluded because it could not compile — only because nobody had linked it. What the
+  phone genuinely cannot do is spawn: iOS denies `posix_spawn` to third-party apps
+  (Apple DTS, Developer Forums thread 747499, cited by Epic 66's research pass,
+  2026-09-05), and `git/cli.rs` is the one module in the workspace that spawns `git`, for
+  exactly the four things gitoxide lacks — push, worktree mutation, sparse-checkout
+  patterns, gc (gitoxide issue #306, closed NOT_PLANNED 2026-07-22). Fetch, clone, commit,
+  ancestry, the LFS batch client and the pointer model were already in-process.
+- **The question:** how does a phone that cannot run `git` carry a folder the Mac syncs
+  with `git` — and what happens when the two histories disagree?
+- **Options refused, and why:**
+  - *The Mac serves the phone* (DW-220's inverted route, Epic 61's DW-215 for Hermes):
+    keeper serving files or MCP to something that reaches them inverts the direction of
+    every connection this app makes, turns a client-only app into a server with its own
+    threat model, needs the Mac awake and reachable, and adds a device-to-device
+    destination `docs/egress.md` would have to name. Refused for the reason it was
+    deferred; the remote the Mac already pushes to is a hub that exists, is reachable
+    from anywhere, and is already disclosed.
+  - *A merge on the phone* (`-X theirs` with the conflict copies, as `do_pull` does on the
+    Mac, `engine.rs:6171-6190`): the Mac's reconcile is a `git merge` — one of the CLI
+    verbs — so it would have to be rewritten over gitoxide's merge machinery, with the
+    conflict-copy contract (AD-43) reproduced exactly, and it would run on a battery, off
+    the foreground, with no supervisor to retry and no person watching. A merge that can
+    write a conflict copy is a decision, and the phone is the wrong device to take it on
+    silently. Divergence on a phone is also rare by construction: the phone writes notes
+    and captures and pushes each commit at once (D-16), so the ordinary case is a
+    fast-forward in both directions.
+  - *libgit2* (`git2`), which has push, merge and worktrees: a second git implementation
+    beside gitoxide, a C library with its own TLS and ssh stacks to audit for AD-53, a
+    second LFS story, and a second place every refusal would have to be worded. gitoxide
+    already carries fetch, clone, commit and the filter pipeline keeper forked
+    (`docs/upstream/gitoxide-filter-process-leak.md`); what it lacked for the phone was
+    one wire protocol, which D-16 writes in nine hundred lines.
+  - *Sparse or materialised by default*: sparse-checkout patterns are a CLI verb, and a
+    materialising clone would pull every LFS object onto a phone over the air on first
+    sync. Fully virtual is the only default that is honest without a filter driver — a
+    driver is a process — and it is what Epic 56 built pointers to be (D-2).
+- **The decision:** the phone mirrors a profile the Mac already syncs; the remote is the
+  hub and the two devices never talk to each other. A profile on the phone is a remote
+  URL, a branch, a name and a credential (`sync_set_credential`, the keychain under
+  `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, `crates/keeper/src/ipc.rs:841-849`),
+  and its folder is `<app data dir>/sync/<profile id>`, assigned by Rust and excluded from
+  backup (`crates/keeper/src/sync_ipc.rs:1313-1355`). It is fully virtual by default
+  (`SyncProfile::make_fully_virtual`, `keeper-sync/src/profile/mod.rs:1024`, `:1076-1080`;
+  applied at `sync_ipc.rs:1284-1288`), and an open materialises through the batch client.
+  The engine is gitoxide alone: `GitEngine::HOST` is `Gix` on iOS
+  (`keeper-sync/src/git/cli.rs:118-122`), every shim verb refuses before `Command::new` with
+  a sentence naming the phone and the in-process route (`cli.rs:157-184`), and
+  `git_report` answers `state: ok, engine: gix` so `CapabilitiesVm.sync` is true there
+  (`ipc.rs:1704-1713`). The phone syncs on open, on `RunEvent::Resumed` and on
+  pull-to-refresh and at no other time (`crates/keeper/src/lib.rs:686-690`, `:1565-1572`;
+  `sync.rs:600-654`, NFR-57). The apply step is `Engine::apply_in_process`
+  (`engine.rs:6112-6169`): the remote's tip already in our history means nothing to do;
+  ours in the remote's means a fast-forward by `git::repo::fast_forward`
+  (`git/repo.rs:2448-2482`, worktree then index then reference); neither means the pass
+  ends with `phone_divergence_sentence` — *"this phone has N commits the remote does not;
+  push them, or reset this copy — nothing is merged on a phone"* (`engine.rs:719-725`) —
+  recorded beside the profile and shown as its status. (AD-198, AD-199; FR-460…FR-463,
+  NFR-57; Epic 66, Story 66.2; `docs/ios.md`, *The folder on the phone*)
+- **The costs, stated so they are chosen:** a divergence needs a person and a Mac — the
+  phone can only name it; a worktree lane and a profile with subpaths refuse on the phone
+  at their first sync (the `cli.rs` sentences); nothing repacks on the phone, so the Mac
+  keeps the folder's objects bounded; a folder converges only while keeper is in front,
+  so a note written on the Mac arrives on the phone the next time keeper opens, not
+  before; a fully virtual folder means the first open of every large file is a fetch, so
+  the phone is a reader of what it has asked for and not an offline copy of everything;
+  and an `ssh://` remote is not refused at the sheet yet (DW-241).
+- **The evidence:** `a_phone_clones_and_fast_forwards_with_gitoxide` and
+  `a_phone_names_a_divergence_and_merges_nothing` (`engine.rs:25697`, `:25773` — two bare
+  repositories, a git-driven "Mac" and a Gix engine; the second asserts the sentence, the
+  count and an untouched worktree), `a_fully_virtual_profile_keeps_every_path_away_until_opened`
+  (`:25841`), the three boundary tests in `cli.rs` that assert every refusal without
+  spawning, and on hesperia `cargo check -p keeper --target aarch64-apple-ios` with
+  `keeper-sync` and `gix` in the iOS closure and the five desktop plugins absent
+  (2026-09-05, Story 66.2's report). The run on kalypso against the owner's real remote is
+  Story 66.2's acceptance and is not yet recorded here.
+- **Revisit triggers:** gitoxide growing a merge that reproduces AD-43's conflict-copy
+  contract, which reopens only the merge clause and only with a person-in-front rule;
+  Apple permitting third-party `posix_spawn` (none announced); a second phone-shaped
+  device that needs the Mac reachable for something the remote cannot carry, which
+  reopens DW-220 rather than this decision. None reopens "the remote is the hub".
+- **Status / owner:** decided. Owner is the architect; Epic 66, Story 66.2 implements it.
+
+## D-16 — A push keeper does itself
+
+keeper will push a phone's commits by speaking `git-receive-pack` over smart HTTP itself —
+one `GET` for the advertisement, one `POST` with a single ref update and a pack written by
+`gix-pack` — and it will **not** force, will **not** talk to the LFS endpoint from that
+code, will **not** carry the credential anywhere but a header, and will **not** replace
+`git push` on the desktop. Recorded here because "just add a push to gitoxide" and "just
+shell out on the phone too" are both dead ends someone will walk into again, and because
+the client-side fast-forward guard is a rule that looks removable.
+
+- **The question:** gitoxide has no push and will not grow one (issue #306, closed
+  NOT_PLANNED 2026-07-22); the phone may not spawn `git` (D-15). How does a note written
+  on the phone reach the remote?
+- **Options refused, and why:**
+  - *Wait for upstream*: closed as not planned; there is nothing to wait for.
+  - *A push through the Mac* (DW-220's inverted route again): the phone would hand its
+    commits to a Mac that must be awake and reachable, and the Mac would push them under
+    its own credential — a device-to-device destination, a second identity on the
+    commit's journey, and every refusal now two hops away from the person who wrote the
+    note.
+  - *libgit2 for push alone*: a whole second git implementation for one verb (D-15).
+  - *A server-side guard only*: `git push` relies on `receive-pack`'s `non-fast-forward`
+    and the desktop keeps doing so; but a phone whose history the remote has moved past
+    would then upload a whole pack to be told no, over the air, on every sync until a
+    person noticed. The guard belongs before the first byte.
+  - *Deltas and thin packs*: a smaller pack for a large history, at the price of the
+    delta machinery and a negotiation the receiver must support. A note or a captured
+    file on a phone is a handful of objects; the trade is wrong for this caller and is
+    recorded as left out, not as a defect.
+- **The decision:** `keeper_sync::git::push_http::push` (`keeper-sync/src/git/push_http.rs:127`):
+  `GET …/info/refs?service=git-receive-pack` (protocol v0, no `Git-Protocol` header),
+  the advertisement parsed for the ref's tip and the capability words; a client-side
+  fast-forward guard that refuses as `SyncError::Diverged` — naming both ids and which of
+  the two shapes it is, a tip never fetched or a rewritten history, because the remedies
+  differ — before a pack is built (`:289-328`, AD-50); a pack of every object reachable
+  from the local tip and not from the remote's, found the way `pack-objects --revs` finds
+  them (`gix-pack`'s `TreeAdditionsComparedToAncestor`, plain base entries, v2, SHA-1
+  trailer — `src-tauri/Cargo.toml:285` is the one new workspace edge, the `generate`
+  feature gix leaves off); one `POST …/git-receive-pack` whose body is `old new
+  refs/heads/<lane>` with `report-status` and `side-band-64k` requested only when
+  advertised, then a flush, then the pack; the status table 401 → `Auth`, 403 →
+  `Forbidden`, 404 → the two-reasons `Config` sentence, 5xx → `Network` (`:472-490`); the
+  side-band demuxed and `report-status` parsed, an `ng` or a fatal becoming *"`<host>`
+  refused the push: …"* unless it classifies as a divergence first, and a report naming
+  the ref neither `ok` nor `ng` an error rather than a claimed success (`:186-237`). The
+  credential is RFC 7617 Basic through `lfs::batch::sensitive_auth` (`:454-461`, AD-53),
+  userinfo is stripped from the URL before use (`:434-440`), and every server line passes
+  `scrub_userinfo` (`:204-207`, NFR-26). The phone calls it from one seam,
+  `Engine::push_after_commit` (`engine.rs:6547-6572`), on the Gix arm of `push_once` only
+  (`:6518-6538`) — the desktop's arm still spawns `git push` (`:6539-6541`, AD-41) — and
+  behind the same gate the desktop's `do_push` keeps: no push while an LFS upload is
+  outstanding (`:6679-6689`), so a pointer never lands ahead of its object, and nothing
+  is sent when the remote already holds every commit here (`:6709-6714`). Pointers travel
+  in the pack as their pointer text; the module never talks to the LFS endpoint. (AD-202;
+  FR-470, FR-471; Epic 66, Story 66.5; `docs/ios.md`, *A push keeper does itself*;
+  `docs/egress.md`, *The phone reaches the same remote*)
+- **The costs:** bandwidth on a long history (base objects only — no deltas, no thin
+  pack); one ref per call and never a deletion; no `push-options`, no atomic multi-ref,
+  no signed push; a 401 is `Auth` and not a refresh loop; a redirect that changes host is
+  reported under the original host's name; and `Diverged` carries the folder's directory
+  name as its label, which on a phone is the container path's last segment rather than
+  the profile's name (Story 66.5's report, open question 1).
+- **The evidence:** `crates/keeper-sync/tests/push_http.rs` — a loopback HTTP/1.1 listener
+  running the real `git receive-pack --stateless-rpc` on Linux, hermetic
+  (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM`, a fixed identity and clock, after
+  the dev box's global `core.hooksPath` silently replaced the fixture's hook on the first
+  run): a first push to an empty bare and a second commit read back as `ok refs/heads/lane`
+  and visible in `git log`; an up-to-date push making no `POST`; an amended history and an
+  unrelated root both refused with the `POST` count unchanged
+  (`a_non_fast_forward_is_refused_before_a_pack_is_sent`, `tests/push_http.rs:325`); an
+  LFS pointer blob byte-identical via `git cat-file` plus `git fsck --strict`; a
+  pre-receive hook whose stderr carried `http://bob:hunter2@…` reaching the caller as
+  `http://***@forge.invalid/rules` with none of the secrets; a wrong credential answered
+  as `Auth` without the token in the text. Fourteen tests, and the guard proven by
+  mutation: with `fast_forward_guard` made non-fatal the refusal test fails on a second
+  `POST` and passes again once restored (Story 66.5's report, 2026-09-05). The run on
+  kalypso against the owner's real remote — a capture from the phone appearing on the
+  remote and on the Mac after its next sync — is Story 66.4/66.5's acceptance and is not
+  yet recorded here.
+- **Revisit triggers:** gitoxide shipping a push (which reopens only the transport, under
+  the same client-side guard); a forge that refuses protocol v0 `receive-pack` (none
+  known — `--stateless-rpc` speaks v0 and `receive-pack` has no v2); a phone use that
+  writes more than a note or a capture per commit, which reopens the delta clause. None
+  reopens "never a force" or "the credential is a header".
+- **Status / owner:** decided. Owner is the architect; Epic 66, Story 66.5 implements it;
+  the hardware proof is Story 66.6's gate.

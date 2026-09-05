@@ -140,6 +140,24 @@ objc2-foundation = { version = "0.3", features = [
 # binding (block2 feature for the optional completion handler). Already resolved in the lock
 # transitively; MIT — passes the cargo-deny license firewall.
 objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "block2"] }
+# The share sheet (Story 66.3, AD-200): `UIActivityViewController` presented
+# from the window's `UIViewController`, reached only from `share_ios.rs`. Already
+# in the tree — wry and tao pull it for the webview's own view controller — so
+# this is a direct name for a crate that was going to be compiled either way;
+# the feature list names exactly the classes the one presenting function
+# touches (the popover controller for the iPad anchor). `Zlib OR Apache-2.0 OR
+# MIT` (0.3.2) — passes the cargo-deny license firewall.
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "UIResponder",
+    "UIView",
+    "UIViewController",
+    "UIActivity",
+    "UIActivityViewController",
+    "UIPresentationController",
+    "UIPopoverPresentationController",
+] }
 # Account registry + opaque account ids (both already present transitively via matrix-sdk).
 ulid = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }

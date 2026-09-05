@@ -1219,7 +1219,7 @@ fn sessions_subfolder(req: &SyncProfileReq) -> Option<String> {
         .map(|raw| raw.trim().to_owned())
 }
 
-fn engine_of(state: &AppState) -> Result<Arc<keeper_sync::engine::Engine>, IpcError> {
+pub(crate) fn engine_of(state: &AppState) -> Result<Arc<keeper_sync::engine::Engine>, IpcError> {
     crate::sync::engine(Arc::clone(&state.platform)).map_err(|err| sync_ipc_error(&err))
 }
 
@@ -1477,6 +1477,7 @@ fn outcome_line(outcome: &SyncOutcome) -> String {
 /// (AD-199) where the Sync surface reads it.
 #[tauri::command]
 pub async fn sync_folder_now(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     id: String,
 ) -> Result<SyncOutcomeVm, IpcError> {
@@ -1485,6 +1486,12 @@ pub async fn sync_folder_now(
         .sync_once_recording(&id, SyncSource::Manual)
         .await
         .map_err(|e| sync_ipc_error(&e))?;
+    // The phone's notes index has no watcher to learn what the pull wrote
+    // (Story 66.4); the desktop's tap already saw every path.
+    #[cfg(not(desktop))]
+    crate::notes_vault::phone_synced(&app);
+    #[cfg(desktop)]
+    let _ = app;
     Ok(SyncOutcomeVm {
         committed: outcome.committed.is_some(),
         pushed: outcome.pushed,
@@ -2613,7 +2620,10 @@ pub async fn sync_tasks_forget(
 ///
 /// Pure over the list so the refusal of an id nothing stored is testable
 /// without an engine behind it — the property [`sync_open_path`] leans on.
-fn find_profile<'a>(profiles: &'a [SyncProfile], id: &str) -> Result<&'a SyncProfile, IpcError> {
+pub(crate) fn find_profile<'a>(
+    profiles: &'a [SyncProfile],
+    id: &str,
+) -> Result<&'a SyncProfile, IpcError> {
     profiles
         .iter()
         .find(|p| p.id == id)
@@ -2747,7 +2757,7 @@ pub async fn sync_rescan(state: tauri::State<'_, AppState>, id: String) -> Resul
 /// settings for a volume that is merely unplugged. Non-retriable, because
 /// nothing changes until someone plugs the media back in or moves the folder
 /// back.
-fn open_failure(message: String) -> IpcError {
+pub(crate) fn open_failure(message: String) -> IpcError {
     IpcError {
         code: IpcErrorCode::Internal,
         message,
@@ -3474,7 +3484,7 @@ fn sync_mark(status: &browse::EntrySyncStatus, engine_failure: Option<&str>) -> 
 /// re-pointing the profile would be the wrong advice — so it is named by its
 /// own relative path, and by the profile's NAME rather than its absolute path,
 /// which keeps a home-directory name out of a surface people screenshot.
-fn missing_sentence(profile: &SyncProfile, subpath: &str) -> String {
+pub(crate) fn missing_sentence(profile: &SyncProfile, subpath: &str) -> String {
     if subpath.is_empty() {
         return unavailable_sentence(profile);
     }

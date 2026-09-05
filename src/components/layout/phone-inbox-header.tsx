@@ -24,12 +24,14 @@
  * two taps and a discovery away. It pushes the SAME level 1 the drawer's row
  * does (AD-31: one level visible, no second column, no tab bar).
  */
-import { Bot, Pencil, Search, Users } from "lucide-react";
+import { Bot, NotebookPen, Pencil, Search, Users } from "lucide-react";
 import type { Ref } from "react";
 import { BOTS_PANE_TITLE } from "@/components/bots/bots-pane";
+import { NOTES_PHONE_CAPTURE_LABEL } from "@/components/notes/notes-phone-pane";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Lamp } from "@/components/ui/lamp";
+import { showCapture } from "@/hooks/use-notes-actions";
 import { accountHueVar } from "@/lib/account-hue";
 import { initials } from "@/lib/account-initials";
 import { BRIDGE_HEALTH_LABEL, BRIDGE_HEALTH_LAMP } from "@/lib/bridges";
@@ -65,6 +67,8 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
   // The Bots view (Story 63.1): present only where this build can talk to a
   // model, the same gate the drawer's row and the shell's level read.
   const bots = useCapabilitiesStore((s) => s.capabilities.bots);
+  // Quick capture (Story 66.4): present only where a vault can exist.
+  const notes = useCapabilitiesStore((s) => s.capabilities.notes);
   // A lamp inside a button with an explicit `aria-label` is mute: the label
   // replaces the contents rather than joining them. So the health rides the
   // button's own name, and the lamp beside it carries the shape.
@@ -141,6 +145,22 @@ export function PhoneInboxHeader({ drawerButtonRef, magnifierRef }: PhoneInboxHe
             className="size-11 shrink-0"
           >
             <Bot aria-hidden="true" />
+          </Button>
+        )}
+        {/* Quick capture (Epic 66, Story 66.4, AD-200): the phone's twin of the
+            desktop's hotkey, one tap from the Inbox because a thought arrives
+            while reading messages more often than while reading notes. The
+            sheet, not a window; present exactly where a vault can exist. */}
+        {notes && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            aria-label={NOTES_PHONE_CAPTURE_LABEL}
+            onClick={() => void showCapture()}
+            className="size-11 shrink-0"
+          >
+            <NotebookPen aria-hidden="true" />
           </Button>
         )}
         <Button

@@ -61,25 +61,29 @@ export function debugModeSentence(logPath: string | null): string {
 }
 
 /**
- * The five honesty lines of the reduced-platform (phone tier) "On this iPhone"
- * disclosure (Story 13.7; the fifth from Epic 62, Story 62.3, FR-400). Project
- * voice: sentence case, no exclamation marks, honest consequence-naming. Each
- * names a desktop-only affordance the phone lacks.
+ * The eight honesty lines of the reduced-platform (phone tier) "On this iPhone"
+ * disclosure (Story 13.7; rewritten by Epic 66, Story 66.6, AD-204, after the
+ * phone gained the folder). Project voice: sentence case, no exclamation marks,
+ * honest consequence-naming. Each names a fact a person can act on: what the
+ * phone does differently, and what stays on the Mac (AD-201, AD-203).
  *
  * Mirrored one-to-one into the Limitations list of `docs/ios.md`, which the
  * disclosure links to; `about-section.test.tsx` reads that file from disk and
- * fails when the two lists differ. Edit both together or neither. The seventh
+ * fails when the two lists differ. Edit both together or neither. The eighth
  * line is, byte for byte, `VoicePlatform::IOS.limits` in
  * `keeper-core/src/voice/platform.rs` (Epic 65, Story 65.4, AD-193): the
  * sentence read here before switching listening on is the sentence shown
- * beside the switch.
+ * beside the switch. The third line's fact is `phone_divergence_sentence` in
+ * `keeper-sync/src/engine.rs` (AD-199), worded for a list rather than a status
+ * row.
  */
 export const IOS_DISCLOSURE_LINES: ReadonlyArray<string> = [
   "keeper syncs and notifies only while it's open; background notifications await a future decision.",
-  "No self-hosted bridge runner — manage your own bridges from your Mac.",
-  "No global summon hotkey.",
+  "A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.",
+  "Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.",
+  "Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.",
+  "What stays on your Mac: the self-hosted bridge runner, the sessions board, tasks, screen recording and the global summon hotkey; Bots talks to a model here, but the drive tools live on your Mac.",
   "Updates arrive by reinstalling keeper; its signature renews every 7 days.",
-  "Bots talks to a model but cannot reach the folders you sync — the drive tools live on your Mac.",
   "Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.",
   "Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.",
 ];

@@ -354,7 +354,9 @@ describe("delete", () => {
     // flag on.
     // `sync` alone no longer tells the tier (a folder is on the phone since epic 66);
     // the tier is told by what the OS refuses, so a desktop flag names the Mac.
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, nativeMenuBar: true });
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, nativeMenuBar: true });
     mount();
     let menu = await openMenu("What changed in the drive");
     fireEvent.click(within(menu).getByRole("menuitem", { name: BOT_SESSION_DELETE_LABEL }));

@@ -613,8 +613,17 @@ pub fn repoint_engine(platform: Arc<dyn Platform>) {
 /// records one. Best-effort and spawned: nothing here blocks the launch or
 /// the foreground transition, and a folder that refuses does not stop the
 /// next one.
+///
+/// Takes the app handle rather than the platform because the notes registry
+/// is told when the pass ends (`notes_vault::phone_synced`, Story 66.4): a
+/// clone that just landed is a vault from then on, and a fast-forward that
+/// just wrote notes reaches the index — there is no watcher on a phone to
+/// announce either.
 #[cfg(not(desktop))]
-pub fn phone_sync_all(platform: Arc<dyn Platform>, when: &'static str) {
+pub fn phone_sync_all(app: &tauri::AppHandle, when: &'static str) {
+    use tauri::Manager as _;
+
+    let platform = Arc::clone(&app.state::<crate::ipc::AppState>().platform);
     let engine = match engine(platform) {
         Ok(engine) => engine,
         Err(err) => {
@@ -622,6 +631,7 @@ pub fn phone_sync_all(platform: Arc<dyn Platform>, when: &'static str) {
             return;
         }
     };
+    let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let profiles = match engine.list_profiles() {
             Ok(profiles) => profiles,
@@ -650,6 +660,7 @@ pub fn phone_sync_all(platform: Arc<dyn Platform>, when: &'static str) {
                 }
             }
         }
+        crate::notes_vault::phone_synced(&app);
     });
 }
 

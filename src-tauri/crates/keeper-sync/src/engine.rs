@@ -4135,6 +4135,66 @@ impl Engine {
         Ok(primed)
     }
 
+    /// Declare every added, modified or untracked file in this profile's
+    /// working tree settled, so the next commit pass stages it without the
+    /// settle window (Epic 66, Story 66.4, AD-198).
+    ///
+    /// # The warrant
+    ///
+    /// Tier 2 of the stability gate waits for a *writer* to let go of a file,
+    /// and it can only guess at that by watching the bytes hold still. On a
+    /// phone there is nothing to guess: the profile lives in the app's own
+    /// container, which no other process can reach, and every byte in it was
+    /// put there by this process — a note the editor saved, a capture the
+    /// sheet filed — through a temp-and-rename that has returned by the time
+    /// anything calls this. The writer is the caller. That is the same warrant
+    /// [`Self::note_finished_path`] takes from the recorder, and the same
+    /// mechanism ([`StabilityGate::prime_stable`]) the rename escape hatch
+    /// uses: an entry backdated past the ceiling, cleared on the next verdict.
+    ///
+    /// Why the whole tree rather than one named path: a save is one file, but
+    /// a rename is two and a template update is many, and the notes layer
+    /// announces a write per vault rather than per path. Asking the status
+    /// walk is cheaper than threading paths through nine callers, and on a
+    /// phone-sized folder the walk is milliseconds.
+    ///
+    /// **Desktop callers have no business here.** A Mac's folder has other
+    /// writers — Obsidian, an agent, a `cp` — and the gate exists for them;
+    /// a desktop save waits its window out like everything else. The engine
+    /// refuses rather than trusts: on [`GitEngine::Binary`] this primes
+    /// nothing and says so, so a caller cannot widen the warrant by mistake.
+    ///
+    /// Returns how many paths were primed. Deletions need no priming — a path
+    /// with no file has nothing to sample and is admitted unconditionally.
+    pub fn prime_worktree_changes(&self, profile_id: &str) -> Result<usize> {
+        if self.git.engine() != GitEngine::Gix {
+            return Err(SyncError::Config(
+                "only a phone may declare its own working tree settled: on a desktop the \
+                 folder has other writers, and the settle window is what waits for them"
+                    .to_owned(),
+            ));
+        }
+        let Some(profile) = self.with_db(|conn| db::get_profile(conn, profile_id))? else {
+            return Err(SyncError::Config(format!(
+                "no such sync profile: {profile_id}"
+            )));
+        };
+        let repo = self.open_repo(&profile)?;
+        let status = git::repo::status_paths(&repo)?;
+        drop(repo);
+        let changed: Vec<PathBuf> = status
+            .added
+            .iter()
+            .chain(&status.modified)
+            .chain(&status.untracked)
+            .map(|rela| profile.local_path.join(rela))
+            // A nested repository arrives as one directory entry; the commit
+            // path cannot stage it and the gate has nothing to sample.
+            .filter(|absolute| absolute.is_file())
+            .collect();
+        self.prime_moved_paths(profile_id, &changed)
+    }
+
     /// Apply one producer's assertion that `path` is finished (Story 41.4,
     /// FR-134, NFR-31).
     ///
@@ -25833,6 +25893,80 @@ mod tests {
                 .expect("answered in-process"),
             "the phone reads its own history without a binary"
         );
+    }
+
+    /// A note the phone wrote commits on the very next pass: the phone
+    /// declares its own container settled (Story 66.4), and the clock never
+    /// moves. A desktop engine is refused the same declaration.
+    #[tokio::test]
+    async fn a_phone_commits_its_own_write_without_a_settle_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let Some(mac) = Mac::publish_into(dir.path(), &remote) else {
+            return;
+        };
+        mac.write("notes/one.md", b"one\n");
+        let first = mac.commit_and_push("first");
+        let (platform, engine, p) = phone(dir.path(), &remote);
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("clone");
+        assert_eq!(phone_head(&p), Some(first));
+
+        // The control: without the declaration a fresh write is held, as it
+        // is on the desktop.
+        std::fs::write(p.local_path.join("notes/one.md"), b"one, edited\n").expect("write");
+        std::fs::write(p.local_path.join("notes/captured.md"), b"captured\n").expect("write");
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass opens the episode"),
+            0,
+            "the gate holds a write it has only just seen"
+        );
+
+        let before = platform.now_ms();
+        assert_eq!(
+            engine
+                .prime_worktree_changes(&p.id)
+                .expect("a phone declares its container settled"),
+            2,
+            "the edit and the new note"
+        );
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the next pass commits"),
+            2
+        );
+        assert_eq!(platform.now_ms(), before, "no clock moved");
+        let head = phone_head(&p).expect("a commit");
+        assert_ne!(head, first);
+        let log = git::history::file_log(&p.local_path, "notes/captured.md", 5).expect("log");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].id, head.to_hex().to_string());
+
+        // Nothing left to prime once it is committed.
+        assert_eq!(engine.prime_worktree_changes(&p.id).expect("nothing"), 0);
+
+        // A desktop is refused: its folder has other writers.
+        let desktop_dir = tempfile::tempdir().expect("tempdir");
+        let desktop_platform = Arc::new(TestPlatform::new(desktop_dir.path()));
+        let Ok(desktop) = Engine::open(Arc::clone(&desktop_platform) as Arc<dyn SyncPlatform>)
+        else {
+            return;
+        };
+        let dp = adoptable(desktop_dir.path());
+        desktop.upsert_profile(&dp).expect("upsert");
+        let err = desktop
+            .prime_worktree_changes(&dp.id)
+            .expect_err("a desktop may not skip the window");
+        assert!(matches!(err, SyncError::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("only a phone"));
     }
 
     /// The phone-shaped profile: everything may stay a pointer, and the mode

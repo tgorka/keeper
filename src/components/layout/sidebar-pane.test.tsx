@@ -512,14 +512,16 @@ describe("SidebarPane as the phone drawer (Story 66.1, AD-197, AD-27)", () => {
       .getAllByRole("button")
       .map((button) => button.textContent)
       .filter((label) => sidebarViews(PHONE_WITH_FOLDER).some((entry) => entry.label === label));
-    // Files rides the same `sync` flag on the desktop, but the phone has no
-    // Files surface yet (66.3), so its row is absent rather than dead.
+    // Files rides the same `sync` flag on the desktop and, since Story 66.3,
+    // lands on the phone too; Notes waits for its surface (66.4) and is absent
+    // rather than dead until then.
     expect(labels).toEqual([
       "Chats",
       "Archive",
       "Approvals",
       "Bridges",
       "Sync",
+      "Files",
       "Bots",
       "Settings",
     ]);

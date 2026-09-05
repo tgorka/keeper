@@ -3436,17 +3436,39 @@ resolution: collected by epic 63, story 63.4. The "honest first move" this row n
   and the licence question this row was about does not arise. What remains is not this row's
   question — the port has never been compiled or run on a Mac, and that is DW-228.
 
-### DW-220: The drive tools cannot reach a phone, and the honest route inverts the connection.
+### DW-220: The drive half of Bots is still desktop-only, and since epic 66 that is a choice, not a linking fact.
 
-origin: epic 62, 2026-09-03
-location: `crates/keeper/src/bots_drive_ipc.rs` (`#[cfg(desktop)]`), `keeper-sync/src/bots_fs.rs`
-reason: `keeper-sync` is not a dependency of the shell crate on iOS or Android, so the grant, the
-  audit and the seven filesystem verbs cannot exist there — `CapabilitiesVm.botTools` is false on a
-  phone and the affordances are absent rather than disabled. The route that would work is the one
-  Epic 61 already recorded for Hermes (DW-215): keeper *serving* MCP to something that can reach
-  the files, which inverts the direction of the connection and needs its own threat model. Filed
-  together because they are one decision taken twice.
-status: open
+origin: epic 62, 2026-09-03; re-scoped by epic 66, story 66.6, 2026-09-05
+location: `crates/keeper/src/lib.rs:22-29` (`bots_drive_ipc` and `bots_tools`, both still
+  `#[cfg(desktop)]`), `crates/keeper/src/ipc.rs:1482-1495` (`bot_tools: notes_available(&state)`,
+  whose comment still says the desktop half "is a linking fact rather than a design choice"),
+  `keeper-sync/src/bots_fs.rs`, `src/components/bots/bot-empty-state.tsx:74-75` (the
+  "drive tools live on your Mac" sentence), `docs/ios.md` *Limitations* (fifth item)
+reason: As filed, the wall was that `keeper-sync` was not a dependency of the shell crate on iOS,
+  so the grant, the audit and the seven filesystem verbs could not exist there, and the honest
+  route was the inverted one (keeper *serving* MCP to something that can reach the files, DW-215).
+  Epic 66 measured the premise false: `keeper-sync` links on the phone
+  (`crates/keeper/Cargo.toml:26-32`; `cargo check -p keeper-sync --target aarch64-apple-ios`,
+  hesperia, 2026-09-05), the phone has a folder (D-15), and `keeper_sync::bots_fs` compiles
+  there. The inverted route is now refused outright (D-15: the remote is the hub, the Mac is
+  never a server), so that half of this row is closed. What remains is the Bots drive half
+  itself: `bots_drive_ipc` / `bots_tools` are `#[cfg(desktop)]` by inertia, `botTools` is
+  `notes_available` (which 66.4 flips to `sync` on every target for notes — the flag would then
+  be true on a phone with nothing behind it unless the gate is kept desktop-only on purpose),
+  and the empty-state sentence and the disclosure's fifth item both say the drive tools live on
+  the Mac. Why it stays desktop for now: a grant names a synced profile and the seven verbs
+  read and write inside it; on a fully virtual folder every read of an LFS path is a
+  materialisation over the air, a bot's `list`/`read` loop would fetch whatever it touched,
+  and the audit's deliverable-path reveal has no file manager to open into (`sync_open_path`
+  refuses on the phone, `sync_ipc.rs:2800`). What would flip it: drop the two `cfg(desktop)`
+  gates and register the `bots_drive_ipc::*` commands in the shared handler list, keep
+  `botTools` on a gate that is honest on the phone, decide what a tool read of a *virtual*
+  path does (refuse with the pointer's size, or materialise under a per-call budget — the
+  question Epic 56's `ContentRefusal` already words for a person), and replace the
+  deliverable reveal with the share sheet 66.3 builds. Then the sentence in
+  `bot-empty-state.tsx` and the fifth disclosure line come out together (the byte-identical
+  guard in `about-section.test.tsx` holds them to `docs/ios.md`).
+status: open (re-scoped)
 
 ### DW-221: Ollama on the phone is neither built nor blocked.
 
@@ -3793,6 +3815,9 @@ reason: Story 65.1 made a reduced-capability platform the phone tier in every or
   means for the hotkey tier), not a breakpoint. Do not reintroduce a width rule on a reduced
   platform to get there: that is the defect 65.1 removed. Take it, if at all, as a third tier
   named by the platform.
+note: 2026-09-05, epic 66, story 66.6 — untouched by epic 66. Every surface the epic adds to
+  the phone stack (Approvals, Bridges, Sync, Files, Notes) is a level in the single-pane stack,
+  so an iPad gets them one at a time too; nothing here reintroduces a width rule.
 status: open
 
 ### DW-235: Push-updated Live Activities.
@@ -3831,6 +3856,143 @@ reason: Accepting a call suspends the app (Apple, *Audio Session Programming Gui
   Live Activity button (App Intents) that re-arms from the Lock Screen without opening keeper —
   which still runs in the app process and may hit the same rule. Take either only with a
   kalypso measurement of the post-call reactivation first; the ring (AD-192) is the instrument.
+status: open
+
+### DW-237: The sessions board on the phone.
+
+origin: epic 66, AD-201, story 66.6 (recorded), 2026-09-05
+location: `crates/keeper/src/sessions_ipc.rs:41-44` and every `unsupported()` twin below it,
+  `crates/keeper/src/lib.rs:66-70` (`sessions_root`, `sessions_exec` — `#[cfg(desktop)]`),
+  `crates/keeper/src/ipc.rs:1456` (`sessions: notes_available(&state)`),
+  `src/components/layout/sidebar-pane.tsx:272` (the row rides the `sessions` flag),
+  `src/components/sessions/**` (the desktop pane), `docs/ios.md` *Limitations* (fifth item)
+reason: A sessions root is a synced folder plus a flag (AD-107), and the phone has synced folders
+  now (D-15), so the board *could* follow the notes reader onto the phone the way 66.4 takes
+  Notes there: `sessions_root` is a registry over the profile list, and reading a session's
+  tree, refs and detail is the same `browse::resolve` the Files pane uses. It stays on the Mac
+  by decision (AD-201) because it is forty-odd commands (`sessions_ipc.rs`, `sessions_roots`
+  through `sessions_search_cancel`), each with a mobile twin that answers `unsupported`, plus
+  the lifecycle executor (`sessions_exec.rs`, plans with a journal beside them, one at a time
+  per zone) — its own epic, not a story in this one. The disclosure's fifth line names it.
+  Take it as: the read-only half first (roots, list, detail, tree, refs, search) through the
+  phone stack, the executor and the space editors after, and `sessions` on a gate that is
+  honest on the phone rather than `notes_available` inherited.
+status: open
+
+### DW-238: Tasks on the phone — and the reason is not the one the epic gave.
+
+origin: epic 66, AD-201, story 66.6 (recorded), 2026-09-05
+location: `keeper-sync/src/tasks.rs:148-173` (the closed `TaskKind` — `Sync`, `Release`,
+  `Verify`; "a shell string would name a verb nobody in this tree wrote"),
+  `keeper-core/src/tasks.rs:95` (`HOST_SENTENCE_APP`: "keeper runs this — only while keeper is
+  running"), `crates/keeper/src/sync.rs:600-616` (no supervisor and no watcher on the phone),
+  `src/components/layout/sidebar-pane.tsx:276` (the Tasks row rides `sessions`),
+  `src/components/layout/tasks-pane.tsx`, `docs/ios.md` *Limitations* (fifth item)
+reason: AD-201 says tasks stay on the Mac because "tasks run user commands and iOS spawns
+  nothing". The first half is not true of the code: `TaskKind` is a closed vocabulary of
+  keeper's own verbs and there is no shell-string kind, deliberately
+  (`keeper-sync/src/tasks.rs:148-161`; `ARCHITECTURE-SCHEDULED-TASKS.md` `## Deferred`), so
+  nothing a task does today spawns a process. The real wall is the host: a schedule needs a
+  process that is awake to see the due time, the Mac's host sentence is already "only while
+  keeper is running", and a phone process is suspended the moment it leaves the foreground
+  (NFR-57) — the app would be a host for minutes at a time and every scheduled row would read
+  *Unhosted* the rest of the day, which is the enabled-and-quiet shape AD-137 exists to
+  forbid. The spawn wall (Apple DTS, Developer Forums thread 747499: iOS denies `posix_spawn`
+  to third-party apps) applies only if the deferred shell-string kind ever lands, and then it
+  is a refusal sentence at the boundary like every other phone spawn (D-15), not a reason to
+  keep the surface off. What would put tasks on the phone honestly: a `TaskHostKind` for
+  "runs on the next open" (a due task fires from `phone_sync_all`'s pass, the way the release
+  sweep already rides a sync's success edge), the row saying so in `task_host`'s voice, and
+  no pretence of a schedule. Until then the Tasks row is absent on the phone because it rides
+  `sessions` (DW-237), and the disclosure's fifth line names it. Correct AD-201's wording when
+  the epic file is next touched.
+status: open
+
+### DW-239: An audio memo on the phone.
+
+origin: epic 66, AD-203, *What stays out*, story 66.6 (recorded), 2026-09-05
+location: `crates/keeper/src/ipc.rs:1435` (`recording: macos_version::recording_supported()`),
+  `crates/keeper/src/recorder.rs` (the `keeper-rec` sidecar, macOS screen+audio),
+  `crates/keeper/src/voice_ios.rs` (the phone already opens the microphone under
+  `.playAndRecord` for talk mode), `docs/ios.md` *Limitations* (fifth item), `docs/egress.md`
+  *Screen recording adds no egress*
+reason: Screen recording is the Mac's: ScreenCaptureKit, a sidecar process, a destination
+  folder — no iOS concept below iOS 27, no sidecar on a phone, and the disclosure says so.
+  What a phone *can* do is record the microphone into a file in a synced folder, which is a
+  different feature with a different name — an audio memo — and not "screen recording with
+  the screen removed": no session manifest, no events.log, no `keeper-recording://` embed
+  (that scheme is desktop-only, `lib.rs:64-65`), and a new place bytes land that `docs/egress.md`
+  would state adds nothing. The voice port already holds the audio session and the
+  interruption handling a memo needs (DW-236's rules apply to it unchanged). Refused in this
+  epic so the Mac's recording model is not bent around a phone; take it, if at all, as its own
+  story with its own sentence.
+status: open
+
+### DW-240: A share-in extension.
+
+origin: epic 66, *What was measured*, 4, and *What stays out*, story 66.6 (recorded), 2026-09-05
+location: `src-tauri/crates/keeper/gen/apple/project.yml` (the `KeeperIsland` target is the one
+  extension the project declares), `docs/ios.md` *Live Activity* (the free team's costs),
+  `docs/decisions.md` D-14 (the second App ID), DW-222 (the island's install, not yet recorded)
+reason: Sharing *out* of keeper is a `UIActivityViewController` from the app process and 66.3
+  builds it. Sharing *into* keeper — a file or a URL from another app's share sheet — is a
+  share extension: a second app-extension target, a third bundle id beside the app's and the
+  island's, Swift (`NSExtensionPrincipalClass`), and an App Group if the extension is to hand
+  bytes to the app's container rather than only to a URL scheme. Epic 65 already paid for one
+  extension and measured the first wall: a second App ID counts against the free team's budget
+  of roughly ten per seven days, both profiles lapse and are re-signed together, and hesperia's
+  Xcode holds no Apple ID, so no new App ID can be minted from the build host today (Epic 66,
+  *What was measured*, 4, citing AD-194's lesson; `docs/ios.md`, *Live Activity*, costs 1–2).
+  DW-222 has not yet recorded whether even the island's profile minted on the free team, so a
+  third App ID is not a cost to take before the second is proven. What is possible without an
+  extension and is not built either: a custom URL scheme the app already registers for deep
+  links (`tauri-plugin-deep-link`), which takes a URL, not a file. Take this after DW-222
+  closes, with the same install-script proofs (`.appex` in the bundle, the profile minted or
+  the exact refusal).
+status: open
+
+### DW-241: An `ssh://` remote on a phone profile is not refused at the sheet.
+
+origin: epic 66, story 66.2 (found), story 66.6 (recorded), 2026-09-05
+location: `crates/keeper/src/sync_ipc.rs:990-1051` (`parse_req` — checks direction, lane and
+  LFS mode, never the remote's scheme), `keeper-sync/src/lfs/ssh.rs:325` (`Command::new(ssh)`
+  for `git-lfs-authenticate`) and `:296-297` ("`ssh` is taken from `PATH`, which is where
+  gitoxide's own ssh transport finds it"), `src/components/sync/add-folder-form.tsx` (the
+  phone shape of the sheet, Story 66.1), `docs/ios.md` *Reachable on the phone, failing at
+  run time*
+reason: The phone's engine is gitoxide over HTTPS (`blocking-http-transport-reqwest-rust-tls`,
+  `src-tauri/Cargo.toml:199`); an `ssh://` or `git@host:` remote needs an `ssh` process for
+  the transport and a second one for `git-lfs-authenticate`, and a phone spawns nothing.
+  Today a phone profile that names one saves cleanly and fails at its first sync with the
+  spawn's own error — an `io` failure naming `ssh` — recorded beside the profile with no next
+  step, which is a refusal without a sentence (AD-198 forbids exactly that). This is a 66.2
+  seam: the refusal belongs where the profile is parsed, `parse_req` or the phone-shaped
+  request beside it (`sync_ipc.rs:1327`), as one sentence — "this is a phone: keeper reaches a
+  remote over HTTPS here; an ssh remote needs an ssh process, which a phone cannot run — use
+  the https URL of the same repository and a token" — and, if the sheet can know the tier, the
+  same sentence under the URL field before save. `keeper_core::egress::remote_host` already
+  parses every remote form git accepts, so the scheme test is one call.
+status: open
+
+### DW-242: The freedesktop trash path lands under the app container on a phone.
+
+origin: epic 66, story 66.2 (found), story 66.6 (recorded), 2026-09-05
+location: `keeper-sync/src/files_write.rs:926-930` (the home trash: `$XDG_DATA_HOME/Trash`,
+  defaulting to `$HOME/.local/share/Trash`), `:968-981` (`trash_unmanaged` — `Finder` on macOS,
+  `Freedesktop` everywhere else), `crates/keeper/src/sync_ipc.rs:4721` (`sync_delete_entries`,
+  the caller for a non-vault path), `docs/ios.md` *Reachable on the phone, failing at run time*
+reason: The trash target is chosen by "macOS or not", and iOS is "not", so deleting a
+  non-vault file from a synced folder on the phone would write a `.trashinfo` and move the
+  bytes into `$HOME/.local/share/Trash` under the app's own container — a directory no file
+  manager will ever show, that the container's backup exclusion does not cover, and that
+  nothing prunes. NFR-30 ("never an `unlink`") is honoured in letter and not in spirit: the
+  file is recoverable by nobody. Nothing on the phone reaches it today — 66.3's Files surface
+  offers no delete — so this is a seam, not a defect a person can meet. Decide before a delete
+  exists on the phone: either a `TrashTarget::Container` that keeps the freedesktop layout under
+  `<app data dir>/Trash` and gets a "Recently deleted" row in the Files pane that can put a
+  file back, or a refusal sentence for delete on the phone ("this is a phone: there is no
+  trash to put this in — delete it on the Mac"). Either way the choice is a `SyncPlatform`
+  fact, not an `if cfg!(target_os = "macos")`.
 status: open
 
 - source_spec: none

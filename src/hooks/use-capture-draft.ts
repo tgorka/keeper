@@ -98,7 +98,16 @@ export interface UseCaptureDraft {
   dismiss: () => void;
 }
 
-export function useCaptureDraft(captureKey: string): UseCaptureDraft {
+/**
+ * `hide` is what puts the page away once it is saved: the desktop's
+ * `notes_capture_hide` (a window verb) by default, and the phone's sheet close
+ * where quick capture is a sheet in the stack (Story 66.4, AD-200). One hook,
+ * one order — save, then hide, then re-arm — on both tiers.
+ */
+export function useCaptureDraft(
+  captureKey: string,
+  hide: () => Promise<void> = notesCaptureHide,
+): UseCaptureDraft {
   const [draft, setDraft] = useState<ResolvedDraft | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [windowError, setWindowError] = useState<string | null>(null);
@@ -175,7 +184,7 @@ export function useCaptureDraft(captureKey: string): UseCaptureDraft {
       }
       setWindowError(null);
       try {
-        await notesCaptureHide();
+        await hide();
       } catch (failure: unknown) {
         // Said rather than swallowed, and the page is kept: a window that would
         // not hide is a window problem, and throwing the note away over it
@@ -186,7 +195,7 @@ export function useCaptureDraft(captureKey: string): UseCaptureDraft {
       // live note with no round trip in front of the first keystroke.
       await resolve();
     })();
-  }, [held, resolve]);
+  }, [held, resolve, hide]);
 
   return {
     note: draft?.note ?? null,

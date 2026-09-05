@@ -44,6 +44,22 @@ bridgeSidecar: boolean,
  */
 revealInFileManager: boolean, 
 /**
+ * Share-out — handing a file to the OS share sheet — exists on this
+ * platform (Story 66.3, AD-200): `true` only on iOS, where
+ * `UIActivityViewController` is the phone's reveal. Computed in the shell
+ * like every other flag here (AD-26).
+ *
+ * **Inverted against every other flag in this struct, on purpose.** The
+ * others are true on the desktop and false on the phone; this one is the
+ * phone's answer to [`Self::reveal_in_file_manager`], and a surface offers
+ * exactly one of the two — Reveal where the desktop flag is on, Share
+ * where this one is — each absent rather than disabled where its flag is
+ * off (AD-27). The frontend's tier fold (`isReducedCapabilityPlatform`)
+ * therefore leaves it out by name: a phone-only truth must not read as a
+ * desktop.
+ */
+shareOut: boolean, 
+/**
  * Screen recording (Story 16.3) exists on this platform: `true` only on
  * desktop macOS ≥ 13.0 (the system-audio floor), `false` on older macOS,
  * every non-macOS desktop, and iOS. Computed in the shell from a runtime

@@ -27,8 +27,8 @@ describe("phone surfaces (Story 66.1, AD-197, AD-27)", () => {
       settings: "settings",
       bots: "bots",
       sync: "sync",
-      // Not yet on the phone: 66.3 (files) and 66.4 (notes) add theirs here.
-      files: null,
+      // Story 66.3: Files rides `sync`. Not yet on the phone: 66.4 adds notes.
+      files: "files",
       notes: null,
       recording: null,
       recordings: null,
@@ -46,6 +46,7 @@ describe("phone surfaces (Story 66.1, AD-197, AD-27)", () => {
   it("keeps a gated surface absent where its capability is off", () => {
     expect(phoneSurfaceFor("bots", DEFAULT_CAPABILITIES)).toBeNull();
     expect(phoneSurfaceFor("sync", DEFAULT_CAPABILITIES)).toBeNull();
+    expect(phoneSurfaceFor("files", DEFAULT_CAPABILITIES)).toBeNull();
     expect(phoneSurfaceFor("approval", DEFAULT_CAPABILITIES)).toBe("approval");
   });
 
@@ -54,7 +55,7 @@ describe("phone surfaces (Story 66.1, AD-197, AD-27)", () => {
     // is reachable from a row under the capabilities that gate it.
     const allOn = capabilityShapes()[1];
     const rows = sidebarViews(allOn).map((entry) => entry.view);
-    const surfaces: PhoneSurface[] = ["approval", "bridges", "settings", "bots", "sync"];
+    const surfaces: PhoneSurface[] = ["approval", "bridges", "settings", "bots", "sync", "files"];
     for (const view of surfaces) {
       expect(phoneSurfaceFor(view, allOn), view).toBe(view);
       expect(rows, view).toContain(view);

@@ -17,7 +17,8 @@ It covers, in reading order:
 8. [Building a shareable IPA](#building-a-shareable-ipa)
 9. [Sharing a build without Xcode](#sharing-a-build-without-xcode)
 10. [Verifying the core compiles for iOS](#verifying-the-core-compiles-for-ios)
-11. [Limitations](#limitations)
+11. [The folder on the phone](#the-folder-on-the-phone)
+12. [Limitations](#limitations)
 
 All shell commands are run from the repository root unless stated otherwise.
 
@@ -506,17 +507,236 @@ aarch64-apple-ios` in `.github/workflows/ci.yml`); it does not build, sign, or r
 device app — signing and on-device install remain a local, human-driven flow as
 documented above.
 
+## The folder on the phone
+
+Until Epic 66 the phone had no folder, so everything the folder carries — Files, Notes,
+the drive half of Bots — was absent by one construction. This section is what a folder on
+the phone *is* now (AD-198, AD-199, AD-202; [decisions.md](decisions.md) D-15 and D-16),
+stated with the line that decides each fact, so the next reader checks the code rather
+than this prose.
+
+### What a profile on the phone is
+
+A profile on the phone is a remote URL, a branch, a name and a credential — nothing
+else. The sheet is the desktop's add-folder form with the phone's shape: on the reduced
+tier the folder field, the pickers, Direction, the recordings and sessions switches and
+the whole Advanced disclosure are absent, the access-token field is first-order, and a
+save no longer requires a path (`src/components/sync/add-folder-form.tsx:1617`,
+`:1651-1664`, `:2296-2297`; Story 66.1), so it sends `localPath: ""`. Rust assigns the
+folder: `<app data dir>/sync/<profile id>`, created there and excluded from backup like
+the rest of the container (`src-tauri/crates/keeper/src/sync_ipc.rs:1313-1355`,
+`phone_shaped_request`; `IosPlatform::exclude_from_backup`, `crates/keeper/src/ipc.rs:948`)
+— a clone is a mirror of a remote that already holds it, and iCloud copying it twice a
+day would be the phone's biggest upload. The credential goes to the keychain through the
+same `sync_set_credential` the desktop uses, pinned to
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (`ipc.rs:841-849`), and reaches gix
+only through its programmatic `set_credentials` callback
+(`src-tauri/crates/keeper-sync/src/git/fetch.rs:9-14`, `:140`; AD-53): never a helper,
+never a process argument, never a URL.
+
+**The remote is the hub, never the Mac.** The phone mirrors a profile the Mac already
+syncs; the two devices never talk to each other, and DW-220's inverted route — the Mac
+serving the phone — is refused for the reason it was deferred (D-15).
+
+### Fully virtual by default, and why
+
+A new profile on the phone gets `virtual_patterns = ["**"]` before it is stored
+(`sync_ipc.rs:1284-1288`; `SyncProfile::make_fully_virtual`,
+`src-tauri/crates/keeper-sync/src/profile/mod.rs:1024`, `:1076-1080` — only when no
+pattern is set, so an edit keeps what was chosen). Every LFS-tracked file is therefore
+the committed pointer, byte for byte (D-2), until it is opened; `lfs_mode` stays
+`Materialize`, so an open brings the bytes through the batch client
+(`sync_materialize_entry`, `sync_ipc.rs:3600`) and a second open reads them without a
+fetch. The reason is not taste but a process: `filter.lfs.process` is a filter *driver*,
+a child process git spawns, and a phone spawns nothing — so the Gix arm of
+`Engine::open_with_engine` registers no driver at all
+(`src-tauri/crates/keeper-sync/src/engine.rs:1371`, `:1408-1409`), and a folder whose
+pointers stayed pointers is the only shape that is honest without one.
+
+### Which engine answers, and what it refuses
+
+`GitEngine::HOST` is `Gix` when the target is iOS and `Binary` everywhere else
+(`src-tauri/crates/keeper-sync/src/git/cli.rs:118-122`); `Engine::open` takes
+`GitCli::phone()` on that arm — no `git` resolved, no probe, no version floor
+(`engine.rs:1353-1372`) — and `git_report` answers `state: ok, engine: gix` with no
+version, which is what makes `CapabilitiesVm.sync` true on the phone
+(`crates/keeper/src/ipc.rs:1704-1713`; `sync_git_path_set` refuses there with *"this is
+a phone: keeper syncs with its own engine here and drives no git binary, so there is
+none to point it at"*, `:1792-1794`).
+
+`git/cli.rs` is the one module in the workspace that spawns `git`, and on the phone every
+verb on it refuses **before** `Command::new`, with one sentence naming the phone and the
+route keeper takes instead (`cli.rs:157-184`, `phone_refusal`; the boundary tests are
+beside it):
+
+| Verb | The sentence |
+| --- | --- |
+| push | this is a phone: keeper pushes with its own engine here, never through a git binary |
+| checkout (`merge`, `switch`, `symbolic-ref`, `rev-parse`) | this is a phone: keeper checks out with its own engine here, and a history it cannot fast-forward is named rather than merged |
+| history (`merge-base`, `--is-ancestor`, `diff --name-only`) | this is a phone: keeper reads history with its own engine here |
+| worktree (`add`, `remove`, `prune`) | this is a phone: a review lane needs a linked worktree, which only a git binary can make — run this lane on the Mac |
+| sparse-checkout (`set`, `disable`) | this is a phone: a folder here is fully virtual rather than sparse, so subpaths are not applied |
+| gc | this is a phone: keeper does not repack here; the Mac keeps this folder's objects bounded |
+| `--version` | this is a phone: there is no git binary to probe, and keeper does not need one |
+
+The first three are routes the engine takes itself — fetch and clone (`git/fetch.rs`),
+commit (`git/commit.rs`), a fast-forward checkout and ancestry
+(`git/repo.rs:2391`, `:2411`, `:2478`) and the push below — so a person never meets those
+sentences. The last four are walls: a worktree lane and a profile with subpaths are
+refused at their first sync, and the Mac keeps the objects bounded.
+
+Two Files commands refuse on the phone too, because the thing they would hand a file to
+does not exist there (AD-203): `sync_open_path` — *"this is a phone: there is no file
+manager to open a folder in"* (`sync_ipc.rs:2800`) — and `sync_open_entry` — *"this is
+a phone: there is no application to hand `<path>` to — share it out instead"*
+(`:3521`). `revealInFileManager` is false there, so nothing offers the first; the second
+is what a share sheet replaces **[pending 66.3:** cite `src/components/files/**`,
+`crates/keeper/src/share_ios.rs` and the `shareOut` capability**]**.
+
+### When it syncs
+
+A phone runs no supervisor and arms no watcher: there is no 1 Hz tick to drain a journal
+on a battery, and iOS suspends the process the moment it leaves the foreground (NFR-57).
+The folder converges at three moments and no other — on open (`crates/keeper/src/lib.rs:686-690`),
+on `RunEvent::Resumed` (`lib.rs:1565-1572`) and on pull-to-refresh (`sync_folder_now`,
+`sync_ipc.rs:1479`) — every one of them through `Engine::sync_once_recording`
+(`engine.rs:8722`), so a failure lands beside the profile where the Sync surface reads
+it, exactly as the desktop's tick records one (`crates/keeper/src/sync.rs:600-654`,
+`phone_sync_all`). Best-effort and spawned: nothing here blocks the launch or the
+foreground transition.
+
+### Fast-forward only, and the divergence sentence
+
+The phone's apply step is `Engine::apply_in_process` (`engine.rs:6112-6169`), decided by
+ancestry rather than by the fetch's single `fast_forward` bit, because that bit is false
+both when this copy is *ahead* of the remote and when the two have diverged, and only
+the second is a problem. Three shapes:
+
+1. The remote's tip is already in this copy's history: nothing to apply; the push leg
+   publishes what the phone has.
+2. This copy's tip is in the remote's history: a fast-forward, written by
+   `git::repo::fast_forward` (`git/repo.rs:2448-2482`) — worktree, then index, then the
+   reference, and the reference last on purpose, so a kill mid-way leaves the branch
+   where it was rather than `HEAD` naming a tree the index does not hold. A path that
+   still carries an unseen local change is git's own refusal, answered as a transient
+   error so the next pass tries again once the commit has taken it.
+3. Neither. **There is no merge on a phone.** The pass ends as a permanent error whose
+   sentence is composed in one place (`engine.rs:713-725`, `phone_divergence_sentence`):
+
+   > this phone has N commit(s) the remote does not; push them, or reset this copy — nothing is merged on a phone
+
+   `N` is `git::repo::commits_ahead` (`repo.rs:2411`). It is recorded beside the profile
+   by `record_failure` (`engine.rs:5064`) and rendered by the Sync surface as the folder's
+   *Needs attention* status with the sentence under it
+   (`src/components/layout/sync-pane.tsx:1055-1057`, `:1239-1242`). The Mac merges; the
+   phone only ever says so. The Rust proof is
+   `a_phone_names_a_divergence_and_merges_nothing` — two bare repositories, a
+   git-driven "Mac" and a Gix engine — beside `a_phone_clones_and_fast_forwards_with_gitoxide`
+   in `engine.rs`'s tests (Story 66.2).
+
+### A push keeper does itself
+
+gitoxide has no push and will not grow one (upstream #306, closed NOT_PLANNED
+2026-07-22), and the phone may not spawn `git`, so `keeper-sync` speaks the wire protocol
+itself: `src-tauri/crates/keeper-sync/src/git/push_http.rs` (Story 66.5, AD-202, D-16).
+One `GET …/info/refs?service=git-receive-pack` for the advertisement, one
+`POST …/git-receive-pack` carrying `old new refs/heads/<lane>` with `report-status` and
+`side-band-64k` (only the capabilities the server advertised), and a pack of every object
+reachable from the local tip and not from the remote's, written by `gix-pack` as plain
+base entries — no deltas, no thin pack (`push_http.rs:1-50`, the module's own account of
+the trade). The phone's commit calls it from one seam, `Engine::push_after_commit`
+(`engine.rs:6547-6572`), reached from `push_once` only on the Gix arm (`:6518-6538`;
+the desktop still spawns `git push`, `:6539-6541`, AD-41), after the same gate the desktop
+applies: a push is refused while any LFS upload is outstanding (`:6679-6689`,
+`SyncError::LfsUploadPending`) so a pointer never travels ahead of its object, and a
+phone that holds nothing the remote lacks sends nothing (`:6709-6714`).
+
+What is refused, in the words the person reads:
+
+- **Before a byte is sent** (AD-50 at the client, `push_http.rs:289-328`,
+  `fast_forward_guard`): a remote tip this copy has never fetched —
+  *"the remote's `<lane>` is at `<id>`, which this copy has never fetched; local `<lane>`
+  is at `<id>` — fetch first, keeper never force-pushes a lane"* (`:307`) — and a
+  rewritten history — *"non-fast-forward: the remote's `<lane>` is at `<id>` and local
+  `<lane>` at `<id>` does not descend from it — keeper never force-pushes a lane"*
+  (`:323`). Both are `SyncError::Diverged`, and the integration test counts the
+  server's `POST`s to prove no pack left the phone
+  (`crates/keeper-sync/tests/push_http.rs`, the loopback `git receive-pack --stateless-rpc`).
+- **From the status line** (`:472-490`, `check_status`): 401 is `Auth` for the host,
+  403 `Forbidden`, 404 *"`<host>` has no repository at that URL, or it is not visible to
+  these credentials"* (forges answer 404 for both and the wire does not say which), 5xx
+  `Network`.
+- **From the server's report**: an `ng` line or a side-band fatal becomes *"`<host>`
+  refused the push: `<the server's lines>`"* unless the text classifies as a divergence
+  first (`:209-228`); a report that names the ref neither `ok` nor `ng` is *"`<host>`
+  answered the push without a status for `<ref>`"* rather than a claimed success
+  (`:229-237`). Every server line — the hook's stderr included — passes through
+  `scrub_userinfo` before it becomes an error (`:204-207`, NFR-26); the test's
+  pre-receive hook prints a token and asserts it never reaches the caller.
+
+The credential is one `Authorization: Basic` header built through the same sensitive
+path the LFS client uses (`:454-461`, `batch::sensitive_auth`), and the request URL never
+carries userinfo: a URL that arrives with `user:token@` is stripped before use
+(`:434-440`). This is the one new network *request shape* the phone makes; the host it
+reaches is a row `egress.md` already lists.
+
+### Reachable on the phone, failing at run time
+
+Wave A's report named what compiles for the phone and would fail there if reached, so
+it is written here rather than discovered. None of these has a surface on the phone
+today; each is a seam a later story must either refuse with a sentence or leave
+unreachable:
+
+- **An `ssh://` remote.** `lfs/ssh.rs` runs `git-lfs-authenticate` by spawning `ssh`
+  (`src-tauri/crates/keeper-sync/src/lfs/ssh.rs:325`), and gitoxide's own ssh transport
+  is a spawned `ssh` too (`:296-297`). Nothing refuses an ssh remote when a phone profile
+  is saved (`sync_ipc.rs:990-1051`, `parse_req`, checks direction, lane and LFS mode and
+  not the scheme), so the first sync fails on the spawn and the failure is recorded as an
+  error with no next step. DW-241.
+- **Release.** `SyncPlatform::open_file_state` answers `Unknown` on iOS, so
+  `sync_release_entry` (`sync_ipc.rs:3663-3680`) and the TTL sweep refuse — by design
+  (AD-125); a phone that cannot ask "is this file open" does not release.
+- **Trash outside a vault.** `files_write::trash_unmanaged`
+  (`src-tauri/crates/keeper-sync/src/files_write.rs:968-981`) falls to the freedesktop.org
+  home trash off `$HOME` (`:926-930`) everywhere but macOS, which on a phone is a
+  directory under the app container — reachable through `sync_delete_entries` for a
+  non-vault path. DW-242.
+- **Export and copy.** `sync_export_entry` and the `copy_*` commands compile and run,
+  and the phone has no destination picker; the frontend never offers them (the copy
+  card is absent on the reduced tier, `src/components/layout/sync-pane.tsx:897-900`).
+- **A worktree lane, or subpaths.** Refused at the first sync by the `cli.rs` sentences
+  above; the phone form offers neither.
+- **`openfiles::raise`.** `setrlimit` is best-effort; a refusal only logs.
+
+### Files and Notes on the phone
+
+**[pending 66.3:** the Files pane as a phone surface — browse, open text/markdown/media/PDF
+through `keeper-file://`, materialise on first open, share out through
+`UIActivityViewController` where the desktop reveals in Finder; cite
+`src/components/files/**`, the `files` arm of `src/lib/phone-surfaces.ts` and
+`src/components/layout/phone-shell.tsx`, `crates/keeper/src/share_ios.rs`, the `shareOut`
+flag in `crates/keeper/src/ipc.rs` and `keeper-core/src/vm.rs`, and the 430×932 measure.**]**
+
+**[pending 66.4:** Notes on the phone — list, search, rendered read, the editor, quick
+capture as a sheet beside `src/capture-main.tsx`; a save is a gix commit and the push
+above; cite `src/components/notes/**`, `src/components/capture/**`, the `notes` arm of
+`phone-surfaces.ts`, `notes_available` in `crates/keeper/src/ipc.rs` (the `cfg!(desktop)`
+gate dropped, the git-ok gate kept on the desktop), and the phone parts of
+`notes_ipc.rs` / `notes_vault.rs`.**]**
+
 ## Limitations
 
 On a free Personal Team, keeper on iPhone is deliberately narrower than the desktop
-build. These are the same seven points keeper shows in-app under **Settings → About →
-"On this iPhone"**:
+build. These are the same eight points keeper shows in-app under **Settings → About →
+"On this iPhone"** (rewritten by Epic 66, Story 66.6, AD-204, when the phone gained the
+folder):
 
 - keeper syncs and notifies only while it's open; background notifications await a future decision.
-- No self-hosted bridge runner — manage your own bridges from your Mac.
-- No global summon hotkey.
+- A folder you add here mirrors a remote your Mac already syncs and lives inside keeper's own container: every large file stays a pointer until you open it, and it syncs only when keeper opens, comes back in front or you pull to refresh — nothing watches the folder on a battery.
+- Nothing is merged on a phone: a history this copy cannot fast-forward is named — how many commits this phone has that the remote does not — and you push them or reset this copy; the Mac merges.
+- Notes are a synced folder, so they are here too: list, search, read and edit them, and a save is a commit that keeper pushes from this phone with its own engine — there is no git on a phone.
+- What stays on your Mac: the self-hosted bridge runner, the sessions board, tasks, screen recording and the global summon hotkey; Bots talks to a model here, but the drive tools live on your Mac.
 - Updates arrive by reinstalling keeper; its signature renews every 7 days.
-- Bots talks to a model but cannot reach the folders you sync — the drive tools live on your Mac.
 - Listening for the wake phrase starts in keeper, and then keeps working with another app in front and with the screen locked; speech is recognised on this phone and never sent to a server.
 - Turn listening on while keeper is in front and it keeps listening when another app is in front or the screen is locked. Siri or an app that takes the microphone pauses it and keeper resumes on its own; a phone call ends it until you open keeper again. It stops when you turn it off or when keeper is force-quit. The orange microphone indicator stays on the whole time and cannot be hidden, and listening uses battery.
 
@@ -525,11 +745,6 @@ build. These are the same seven points keeper shows in-app under **Settings → 
 > the in-app "On this iPhone" disclosure links here, so the two must stay identical.
 > Edit both together or neither; `about-section.test.tsx` reads this list from disk
 > and fails when they differ.
-
-The fourth item is the [7-day re-arm ritual](#the-7-day-re-arm-ritual) above:
-"reinstalling keeper" is exactly the weekly `bun run tauri ios dev` re-sign (or an
-AltServer auto-refresh), and it is how updates reach the phone — there is no
-in-app updater on the phone tier.
 
 On the first item, the canonical in-app wording spells out the sync consequence:
 "On iPhone, keeper syncs and notifies only while open. Close it and messages wait on
@@ -540,17 +755,59 @@ count while keeper is closed; it reflects what keeper knew when it was last open
 The "future decision" the first item names is recorded in [decisions.md](decisions.md) D-1 —
 the deferred paid Apple Developer Program that would unlock APNs push and the NSE.
 
-The fifth item is Epic 62. The Bots surface exists on the phone — endpoints and
-bots are added, tested, edited and removed there through the same `keeper-core`
-grammar the desktop uses, and a conversation streams the same way — but
-`keeper-sync` is not a dependency of the shell crate on iOS, so the drive half
-(grants, the audit, deliverable paths, image staging) is desktop-only by
-construction. On the phone those controls are absent, not disabled: the pane says
-once, in its empty state, that the drive tools live on your Mac. The scope is
-Hermes because that is what was asked for; an Ollama endpoint a phone can reach is
-the same wire and is neither built for nor blocked.
+The second and third items are [The folder on the phone](#the-folder-on-the-phone)
+above, Epic 66 (AD-198, AD-199; D-15). "Mirrors a remote your Mac already syncs" is the
+hub rule: the phone and the Mac never talk to each other, the remote is the only
+meeting point. "Inside keeper's own container" is `<app data dir>/sync/<profile id>`,
+excluded from backup (`sync_ipc.rs:1313-1355`). "Every large file stays a pointer until
+you open it" is the `**` virtual pattern a new phone profile gets
+(`sync_ipc.rs:1284-1288`) and the batch client an open goes through. "Only when keeper
+opens, comes back in front or you pull to refresh" is `phone_sync_all` on `setup` and
+`RunEvent::Resumed` plus `sync_folder_now` (`lib.rs:686-690`, `:1565-1572`), and
+"nothing watches the folder" is the absence of a supervisor and a watcher on the phone
+(`sync.rs:600-616`). The third item is `phone_divergence_sentence` (`engine.rs:719-725`)
+in the list's voice: the status row shows the engine's own sentence with the count.
 
-The sixth and seventh items are talk mode, also Epic 62. keeper turns speech into
+The fourth item is Epic 66's Notes on the phone (AD-200; `CapabilitiesVm.notes` is `sync`
+on every target). **[pending 66.4:** one paragraph naming the surfaces and the save →
+commit → push path, citing `src/components/notes/**`, `src/components/capture/**` and
+`notes_available` in `crates/keeper/src/ipc.rs`.**]** "There is no git on a phone" is
+literal: `GitEngine::HOST` is `Gix` on iOS (`cli.rs:118-122`) and the push is
+`push_http` (D-16).
+
+The fifth item is AD-201 and AD-203 in one line, each clause a fact with a gate behind
+it. The bridge runner: `bridges-pane.tsx` gates the runner on `bridgeSidecar`, which is
+`cfg!(desktop)` (`ipc.rs:1430`); discovery, provisioning and health are on the phone since
+Story 66.1. The sessions board: the sessions commands have `unsupported` twins on the
+phone (`crates/keeper/src/sessions_ipc.rs:41-44` and every twin below it) and
+`sessions_root` / `sessions_exec` are `#[cfg(desktop)]` (`lib.rs:66-70`) — it reads a
+synced folder and could follow the notes reader, but it is forty commands and its own
+epic (DW-237). Tasks: a task is one of keeper's own verbs and never a shell string
+(`keeper-sync/src/tasks.rs:148-161`, the closed `TaskKind`), so the wall is not a spawn;
+it is that a schedule needs a host that is awake, and a phone process is suspended the
+moment it leaves the foreground (NFR-57) — `keeper runs this — only while keeper is
+running` (`keeper-core/src/tasks.rs:95`) is already the Mac's sentence, and on a phone it
+would be true for minutes at a time (DW-238). Screen recording: `recording` is
+`macos_version::recording_supported()` (`ipc.rs:1435`), false off macOS; an audio memo
+on the phone is a different feature (DW-239). The summon hotkey: `hotkey.rs` is
+`#[cfg(desktop)]` (`lib.rs:41-42`) and `globalHotkey` is `cfg!(desktop)` (`ipc.rs:1426`),
+because iOS has no global hotkey. The drive tools: Bots exists on the phone — endpoints
+and bots are added, tested, edited and removed there through the same `keeper-core`
+grammar the desktop uses, and a conversation streams the same way — but the drive half
+(grants, the audit, deliverable paths, image staging) is `bots_drive_ipc` / `bots_tools`,
+still `#[cfg(desktop)]` (`lib.rs:22-29`) and `botTools` still `notes_available`
+(`ipc.rs:1495`). Since Epic 66 that is a choice rather than a linking fact — the phone
+has the folder now — and DW-220 says what would flip it. On the phone those controls are
+absent, not disabled: the pane says once, in its empty state, that the drive tools live
+on your Mac. The scope is Hermes because that is what was asked for; an Ollama endpoint
+a phone can reach is the same wire and is neither built for nor blocked (DW-221).
+
+The sixth item is the [7-day re-arm ritual](#the-7-day-re-arm-ritual) above:
+"reinstalling keeper" is exactly the weekly `bun run tauri ios dev` re-sign (or an
+AltServer auto-refresh), and it is how updates reach the phone — there is no
+in-app updater on the phone tier.
+
+The seventh and eighth items are talk mode, Epic 62. keeper turns speech into
 text, sends it to the bot as an ordinary message and speaks the answer; a wake phrase
 (`nixie` by default, yours to change) starts a turn hands-free once listening is
 switched on. What iOS forbids is *starting* the microphone from the background, so
@@ -565,7 +822,7 @@ trip — because `egress.md` names every destination keeper contacts and Apple's
 servers are not on it. The full reasoning, including why this is possible on the phone
 while voice stays deferred on the Mac, is [decisions.md](decisions.md) D-5.
 
-The seventh item is, byte for byte, the limits sentence the port shows beside the
+The eighth item is, byte for byte, the limits sentence the port shows beside the
 switch — `VoicePlatform::IOS.limits`, `keeper-core/src/voice/platform.rs:82` — rewritten
 in epic 65 (Story 65.4, AD-193) to name what ends an armed session by behaviour rather
 than "when iOS ends the audio session". Each clause is one of Apple's documented

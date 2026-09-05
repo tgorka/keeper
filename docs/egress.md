@@ -82,6 +82,45 @@ remote form git accepts — `https`, `ssh`, `git`, the scp-like `git@host:path` 
 `file:`, and bare paths — including the cases that must yield no entry and the cases that
 must not leak a username or token.
 
+### The phone reaches the same remote, and nothing else new
+
+Since Epic 66 (AD-198, AD-204) the phone has a folder, so the sync-remote row above is
+reached from a second device. It is the **same destination class, from a second device,
+and no new row**: a profile on the phone names a remote host and, through it, the LFS
+endpoint that server's batch API answers with — exactly what the Mac's profile for the same
+remote already discloses. What the phone does on the wire, stated so this file can be
+checked against the code:
+
+| Request | Made by | Purpose |
+| --- | --- | --- |
+| gitoxide fetch and clone over HTTPS | `src-tauri/crates/keeper-sync/src/git/fetch.rs` (the `blocking-http-transport-reqwest-rust-tls` transport, `src-tauri/Cargo.toml:199`) | The mirror: a clone into the app container, then a fetch on open, on foreground and on pull-to-refresh (`crates/keeper/src/sync.rs:600-654`). No watcher, no supervisor, no tick. |
+| `GET …/info/refs?service=git-receive-pack`, then `POST …/git-receive-pack` | `src-tauri/crates/keeper-sync/src/git/push_http.rs:127` (Story 66.5, AD-202) | The phone's push — keeper speaks `receive-pack` itself, because there is no `git` on a phone and gitoxide has no push. One pack of the objects the remote lacks; refused client-side before any byte leaves unless the remote's tip is in this copy's history (`:289-328`, AD-50). |
+| The LFS batch API and the object URLs it returns | `src-tauri/crates/keeper-sync/src/lfs/batch.rs`, `lfs/hydrate.rs` | Materialising a pointer on open, and uploading the objects a phone commit stages before its push may run (`engine.rs:6679-6689`). The endpoint is derived from the remote as on the Mac; a `.lfsconfig` `lfs.url` outranks it, as the daemon row above says. |
+
+The credential is a header and never a URL, on every one of those requests. gitoxide gets
+it through its programmatic `set_credentials` callback (`fetch.rs:9-14`, `:140`), so it never
+reaches a helper, an argument list or `~/.git-credentials`; `push_http` builds one
+`Authorization: Basic` value through the same sensitive-header path the LFS client uses
+(`push_http.rs:454-461`, `lfs/batch.rs:422`) and strips userinfo from the URL before the
+request is made (`push_http.rs:434-440`); the LFS client sends its `Authorization` the same
+way. Every server line a push answers with — an `ng`, a hook's stderr — passes through
+`scrub_userinfo` before it becomes an error the person can read (`push_http.rs:204-207`;
+NFR-26). The secret itself lives in the phone's keychain under
+`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (`crates/keeper/src/ipc.rs:841-849`).
+
+The live list on the phone is derived the same way as the Mac's: `sync_remote_urls` reads
+every profile's remote on every target since Epic 66 (`crates/keeper/src/ipc.rs:10976-10993`)
+and `egress::remote_host` reduces it to the host — so a folder added on the phone appears
+under Settings → About on the phone on the next open, as a host, with no cache and no
+hand-written row.
+
+What the phone does **not** reach, because the code for it is either absent or refuses
+there: no `ssh` (`lfs/ssh.rs:325` and gitoxide's ssh transport both spawn one, and a phone
+spawns nothing — an `ssh://` remote fails at its first sync, DW-241); no `git-lfs-authenticate`
+for the same reason; none of the daemon's rows (`keeper-syncd` does not exist on the phone);
+no `git` credential helper. The phone and the Mac never contact each other — the remote is
+the only meeting point (D-15) — so this section adds no device-to-device destination either.
+
 ## An AI provider is a destination you typed, disclosed as a host
 
 The Bots surface (⌘9, Epic 61) talks to a model over the OpenAI-compatible wire, and a model

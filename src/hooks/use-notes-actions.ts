@@ -28,6 +28,7 @@
  * there is no optimistic overlay to get out of step.
  */
 import { useCallback } from "react";
+import { isPhoneTier } from "@/hooks/use-shell-layout";
 import type { NoteCreateVm, NoteRefVm, NoteRowVm, NoteSpaceFieldVm } from "@/lib/ipc/client";
 import {
   notesCaptureShow,
@@ -39,6 +40,7 @@ import {
   notesSetFlag,
   notesSpaceSave,
 } from "@/lib/ipc/client";
+import { captureSheetStore } from "@/lib/stores/capture-sheet";
 import { openCaptureWindow } from "@/lib/stores/capture-windows";
 import type { TagChip } from "@/lib/stores/notes-filters";
 import { noteQueryFor, notesFiltersStore } from "@/lib/stores/notes-filters";
@@ -108,8 +110,20 @@ export async function openJournalToday(): Promise<NoteRefVm | null> {
   return ref;
 }
 
-/** Show the quick-capture panel — the in-app twin of the global hotkey. */
+/**
+ * Show quick capture — the in-app twin of the global hotkey.
+ *
+ * The desktop's panel is a window; the phone's is a sheet in the stack (Epic
+ * 66, Story 66.4, AD-200). Decided here, at dispatch, so the palette's
+ * `notes-capture`, the ⌘⌥K chord and every header button land on one surface
+ * per tier — the DW-111 shape `open-search` took. The tier is read the way
+ * `isPhoneTier` reads it, never the user agent.
+ */
 export async function showCapture(): Promise<void> {
+  if (isPhoneTier()) {
+    captureSheetStore.getState().open();
+    return;
+  }
   await notesCaptureShow();
 }
 

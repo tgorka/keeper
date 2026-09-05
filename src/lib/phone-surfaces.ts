@@ -26,12 +26,23 @@ import type { CapabilitiesVm } from "@/lib/ipc/client";
 import type { PrimaryView } from "@/lib/stores/primary-view";
 
 /** The full-screen level-1 surfaces the phone stack renders. */
-export type PhoneSurface = "bots" | "settings" | "approval" | "bridges" | "sync";
+export type PhoneSurface =
+  | "bots"
+  | "settings"
+  | "approval"
+  | "bridges"
+  | "sync"
+  | "files"
+  | "notes";
 
 /**
  * The surface a view opens on the phone, or `null` where the phone has none
- * for it. Capability-gated where the desktop is (`bots`, `sync`): absent,
- * never a dead level, where the build cannot do the thing.
+ * for it. Capability-gated where the desktop is (`bots`, `sync`, `files`,
+ * `notes`): absent, never a dead level, where the build cannot do the thing.
+ * Files rides `sync` exactly as the desktop's nav entry does (Story 66.3,
+ * AD-200): where no folder can be synced there is nothing to browse. Notes
+ * rides `notes`, which since Story 66.4 is `sync` on every tier — a vault is
+ * a synced folder, and the phone has the folder now.
  */
 export function phoneSurfaceFor(
   view: PrimaryView,
@@ -42,6 +53,10 @@ export function phoneSurfaceFor(
       return capabilities.bots ? "bots" : null;
     case "sync":
       return capabilities.sync ? "sync" : null;
+    case "files":
+      return capabilities.sync ? "files" : null;
+    case "notes":
+      return capabilities.notes ? "notes" : null;
     case "approval":
     case "bridges":
     case "settings":

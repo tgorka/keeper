@@ -25,6 +25,8 @@ const DESKTOP_CAPABILITIES = {
   nativeMenuBar: true,
   bridgeSidecar: true,
   revealInFileManager: true,
+  // Story 66.3: the phone's reveal; false on every desktop fixture.
+  shareOut: false,
   recording: false,
   sync: false,
   notes: false,

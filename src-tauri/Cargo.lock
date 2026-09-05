@@ -4148,6 +4148,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-natural-language",
  "objc2-speech",
+ "objc2-ui-kit",
  "objc2-user-notifications",
  "objc2-web-kit",
  "percent-encoding",
