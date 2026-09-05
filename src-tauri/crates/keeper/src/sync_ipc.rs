@@ -3090,8 +3090,10 @@ async fn browse_marks_for(
             // stands — so it is logged rather than raised.
             let virtual_paths = if refresh_virtual {
                 let engine = Arc::clone(&engine);
-                let id = id.clone();
-                match tokio::task::spawn_blocking(move || engine.lfs_files(&id)).await {
+                // A second clone: the closure takes one by value and the
+                // `tracing` calls below still name the folder.
+                let walked = id.clone();
+                match tokio::task::spawn_blocking(move || engine.lfs_files(&walked)).await {
                     Ok(Ok(files)) => Some(browse::VirtualView::from_lfs_files(&files)),
                     Ok(Err(error)) => {
                         tracing::warn!(profile = id, %error, "files: could not read which paths are virtual");
@@ -5218,22 +5220,41 @@ mod tests {
     /// expansion. On a folder of tens of thousands of files on a busy drive
     /// that is minutes of an empty pane, and the pane's own refresh asked for
     /// it once per open directory.
+    ///
+    /// The decision itself lives in `keeper_sync::browse::MarksCache`, which
+    /// is where its own unit tests are; these two assert that THIS module
+    /// drives it with the windows it was built for — a fresh answer served, a
+    /// stale one served while a walk runs, and nothing invented when there is
+    /// nothing to serve.
     #[test]
     fn a_fresh_answer_is_served_and_a_stale_one_starts_a_walk() {
-        let view = browse::PendingView::Unavailable;
-        let fresh = MarkSlot {
-            answered: Some((Instant::now(), view.clone())),
-            walking: false,
+        let mut cache = browse::MarksCache::new(Duration::from_secs(3), Duration::from_secs(3));
+        let now = Instant::now();
+
+        // Nothing answered yet: the first listing walks.
+        let browse::MarksPlan::Walk { generation, .. } = cache.plan("p", now) else {
+            panic!("the first listing must walk");
         };
-        assert_eq!(fresh.plan(Duration::from_secs(3)), MarkPlan::Serve(view));
+        assert!(cache.finish(
+            "p",
+            generation,
+            Some(browse::PendingView::Known(Default::default())),
+            Some(browse::VirtualView::none()),
+            now
+        ));
 
-        // The same answer, now older than the window it is good for.
-        assert_eq!(fresh.plan(Duration::from_nanos(1)), MarkPlan::Walk);
+        // Inside the window the answer stands, and it is not marked stale.
+        match cache.plan("p", now) {
+            browse::MarksPlan::Serve(answer) => assert!(!answer.stale),
+            other => panic!("a fresh answer must be served, got {other:?}"),
+        }
 
-        assert_eq!(
-            MarkSlot::default().plan(Duration::from_secs(3)),
-            MarkPlan::Walk
-        );
+        // Past it, the next listing walks again — and the previous answer is
+        // still what it serves in the meantime (the test below).
+        assert!(matches!(
+            cache.plan("p", now + Duration::from_secs(4)),
+            browse::MarksPlan::Walk { .. }
+        ));
     }
 
     /// One walk at a time per folder: a second reads the same tree off the same
@@ -5241,26 +5262,40 @@ mod tests {
     /// directories ten whole-repository walks at once.
     #[test]
     fn a_walk_in_progress_serves_what_there_is_rather_than_starting_another() {
-        let stale = browse::PendingView::Known(Default::default());
-        let walking_with_answer = MarkSlot {
-            answered: Some((Instant::now(), stale.clone())),
-            walking: true,
-        };
-        // Stale but usable: a mark a few seconds old beats no mark at all.
-        assert_eq!(
-            walking_with_answer.plan(Duration::from_nanos(1)),
-            MarkPlan::ServeWhileWalking(Some(stale))
-        );
+        let mut cache = browse::MarksCache::new(Duration::from_secs(3), Duration::from_secs(3));
+        let now = Instant::now();
 
-        let walking_first_time = MarkSlot {
-            answered: None,
-            walking: true,
+        // A walk in flight with nothing ever answered: the listing says so
+        // rather than calling every entry clean (AD-220's one `Unavailable`).
+        let browse::MarksPlan::Walk { generation, .. } = cache.plan("p", now) else {
+            panic!("the first listing must walk");
         };
-        assert_eq!(
-            walking_first_time.plan(Duration::from_secs(3)),
-            MarkPlan::ServeWhileWalking(None),
-            "and with nothing to serve it says so, rather than calling every entry clean"
-        );
+        assert!(matches!(cache.plan("p", now), browse::MarksPlan::Wait));
+
+        assert!(cache.finish(
+            "p",
+            generation,
+            Some(browse::PendingView::Known(Default::default())),
+            Some(browse::VirtualView::none()),
+            now
+        ));
+
+        // Now past the window: the next listing starts a walk, and a listing
+        // arriving while it runs is served the old answer MARKED STALE — the
+        // whole point of Story 69.2, because the alternative was every row
+        // reading "Sync state unknown".
+        let later = now + Duration::from_secs(4);
+        assert!(matches!(
+            cache.plan("p", later),
+            browse::MarksPlan::Walk { .. }
+        ));
+        match cache.plan("p", later) {
+            browse::MarksPlan::Serve(answer) => assert!(
+                answer.stale,
+                "an answer served while a walk runs must say it is the previous one"
+            ),
+            other => panic!("a stale answer must still be served, got {other:?}"),
+        }
     }
 
     /// AD-34-9, mechanized. The old `parse_req` rebuilt the profile from
