@@ -2422,6 +2422,21 @@ pub async fn sync_task_save(
     } else {
         req.id.clone()
     };
+    // The bot fields this door cannot write, read off the row it is about to
+    // replace so a save preserves them (see the fields below). A listing read
+    // that fails is not a reason to refuse the save: no row to preserve from
+    // is the same answer as no row.
+    let baseline_bot = engine
+        .tasks()
+        .ok()
+        .and_then(|listing| {
+            listing
+                .tasks
+                .into_iter()
+                .find(|task| task.id == id)
+                .map(|task| (task.bot_id, task.prompt_subpath, task.model))
+        })
+        .unwrap_or((None, None, None));
     let platform = crate::sync::sync_platform(Arc::clone(&state.platform));
     let row = keeper_sync::db::TaskRow {
         id: id.clone(),
@@ -2447,6 +2462,15 @@ pub async fn sync_task_save(
         // Bounding it here would be a second copy of the rule and would leave the
         // CLI's door unguarded.
         missed_delay_ms: req.missed_delay_ms,
+        // Story 69.4's three, preserved rather than written: this door is the
+        // app's form, which does not offer the `bot` kind (`NEVER_OFFERED` in
+        // `keeper_sync::tasks` says why), so `TaskSaveReq` carries no bot
+        // fields and a save must not blank the ones a `keeper-syncd tasks set
+        // --kind bot` row already holds. Pausing a bot task from the Tasks
+        // pane would otherwise forget which bot it asked.
+        bot_id: baseline_bot.0,
+        prompt_subpath: baseline_bot.1,
+        model: baseline_bot.2,
     };
     // The one caller that passes a baseline, and the reason the parameter
     // exists: this form seeded its six values once, so every field it is about
