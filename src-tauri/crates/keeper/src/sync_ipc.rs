@@ -2426,16 +2426,17 @@ pub async fn sync_task_save(
     // replace so a save preserves them (see the fields below). A listing read
     // that fails is not a reason to refuse the save: no row to preserve from
     // is the same answer as no row.
+    // A failed read is a fault to report, not a fact to invent (the rule
+    // `sync_tasks` states and `task-host-tick.test.ts` guards): a save that
+    // silently treated an unreadable listing as "no bot fields" would blank
+    // them.
     let baseline_bot = engine
         .tasks()
-        .ok()
-        .and_then(|listing| {
-            listing
-                .tasks
-                .into_iter()
-                .find(|task| task.id == id)
-                .map(|task| (task.bot_id, task.prompt_subpath, task.model))
-        })
+        .map_err(|err| sync_ipc_error(&err))?
+        .tasks
+        .into_iter()
+        .find(|task| task.id == id)
+        .map(|task| (task.bot_id, task.prompt_subpath, task.model))
         .unwrap_or((None, None, None));
     let platform = crate::sync::sync_platform(Arc::clone(&state.platform));
     let row = keeper_sync::db::TaskRow {

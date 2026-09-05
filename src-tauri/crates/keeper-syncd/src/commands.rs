@@ -688,6 +688,22 @@ pub struct TaskSetArgs {
     /// `manual` when you did not. On update it keeps its stored value.
     #[arg(long, value_enum)]
     pub mode: Option<TaskModeArg>,
+    /// Which bot a `bot` task asks (its id, as `bots list` prints it).
+    ///
+    /// Kept when the flag is absent, like `--schedule` and `--description`:
+    /// editing a bot task's window must not forget which bot it asks.
+    #[arg(long, value_name = "ID")]
+    pub bot: Option<String>,
+    /// The prompt file a `bot` task sends, relative to the folder's root —
+    /// `<zone>/<session>/prompts/NN-slug.md`. Its whole text after the
+    /// frontmatter is the prompt.
+    #[arg(long, value_name = "SUBPATH")]
+    pub prompt: Option<String>,
+    /// The model to ask as. Absent leaves the choice to the runner's rule: the
+    /// conversation's last model, then the provider's own default, then the
+    /// first offered model that can chat.
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
     /// What to do about a window that fell due while nobody was home:
     /// `run-now`, `delay` or `skip`.
     ///
@@ -881,6 +897,10 @@ pub enum TaskKindArg {
     /// Re-check stored content against its recorded digests. Reads only, asks
     /// no network, and takes no per-folder reservation.
     Verify,
+    /// Ask a bot the prompt in one markdown file under the folder's sessions,
+    /// and record what it answered. Needs `--bot` and `--prompt`; runs only on
+    /// a host with a bot runner, which today is the keeper app.
+    Bot,
 }
 
 /// `--mode`'s vocabulary, which is [`TaskMode`]'s and nothing more.
@@ -956,6 +976,7 @@ impl From<TaskKindArg> for TaskKind {
             TaskKindArg::Sync => Self::Sync,
             TaskKindArg::Release => Self::Release,
             TaskKindArg::Verify => Self::Verify,
+            TaskKindArg::Bot => Self::Bot,
         }
     }
 }
@@ -4011,7 +4032,7 @@ fn cmd_task_set(
         (None, None) => {
             return Err(SyncError::Config(format!(
                 "task `{}` does not exist yet, so a new one must name its kind: \
-                 pass --kind sync or --kind release",
+                 pass --kind sync, --kind release, --kind verify or --kind bot",
                 args.task
             ))
             .into());
@@ -4103,7 +4124,36 @@ fn cmd_task_set(
         on_missed,
         description,
         missed_delay_ms,
+        // Story 69.4's three, with `description`'s keep-when-absent shape and
+        // no way to clear them: a bot task without a bot or a prompt is a row
+        // that can only fail, so the flags that name them are additive only.
+        // Changing one is `--bot`/`--prompt` again; a task that should ask
+        // something else entirely is a different task.
+        bot_id: args
+            .bot
+            .clone()
+            .or_else(|| existing.and_then(|row| row.bot_id.clone())),
+        prompt_subpath: args
+            .prompt
+            .clone()
+            .or_else(|| existing.and_then(|row| row.prompt_subpath.clone())),
+        model: args
+            .model
+            .clone()
+            .or_else(|| existing.and_then(|row| row.model.clone())),
     };
+    if row.kind == keeper_sync::tasks::TaskKind::Bot
+        && (row.bot_id.is_none() || row.prompt_subpath.is_none())
+    {
+        // Refused here rather than at the first run, where the answer would be
+        // a failed run in a history instead of a sentence at the keyboard.
+        return Err(SyncError::Config(format!(
+            "task `{}` is a bot task, so it needs a bot and a prompt file: \
+             pass --bot <id> --prompt <subpath>",
+            args.task
+        ))
+        .into());
+    }
     engine.save_task(&row, None)?;
     report_task(printer, engine, now_ms, &row.id)
 }
@@ -6116,6 +6166,9 @@ mod tests {
             on_missed: TaskMissedPolicy::RunNow,
             description: None,
             missed_delay_ms: None,
+            bot_id: None,
+            prompt_subpath: None,
+            model: None,
         }
     }
 
@@ -6147,6 +6200,9 @@ mod tests {
             on_missed: None,
             missed_delay: None,
             no_missed_delay: false,
+            bot: None,
+            prompt: None,
+            model: None,
             description: None,
             no_description: false,
         }
