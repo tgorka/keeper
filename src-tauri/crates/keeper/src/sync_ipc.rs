@@ -11,7 +11,7 @@
 //! `IpcError` envelope the frontend already understands.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use keeper_core::tasks::{
@@ -3116,7 +3116,7 @@ async fn browse_marks_for(
             // Whatever landed, the cache now holds the freshest answer there
             // is; the pane re-lists and reads it. A window that is gone makes
             // the emit fail, which is not the walk's problem.
-            let _ = app.emit(FILES_MARKS_EVENT, id.clone());
+            let _ = tauri::Emitter::emit(&app, FILES_MARKS_EVENT, id.clone());
             (id, failure)
         })
     };

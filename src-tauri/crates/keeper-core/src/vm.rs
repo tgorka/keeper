@@ -4484,6 +4484,16 @@ pub struct FilesListingVm {
     /// Whether the listing was cut short at the shell's cap. `false` for every
     /// state that has no entries — there was nothing to cut.
     pub truncated: bool,
+    /// Whether the sync marks on these rows are the previous walk's answer,
+    /// kept because this one was not finished in time (Story 69.2, AD-220).
+    ///
+    /// `false` says the marks are this listing's own. `true` is not a fault:
+    /// the rows are the last thing the engine could stand behind, the pane
+    /// says so quietly, and the fresh marks arrive on the walk's own event
+    /// rather than on a press. The state that was here before this field was
+    /// every row reading "Sync state unknown" on a folder too big to walk in
+    /// three seconds — a careful mark that hid the one fact the row was for.
+    pub stale: bool,
     /// Whether keeper may create a file in the directory that was listed, and
     /// why not (Story 45.3, FR-176, AD-89).
     ///
@@ -9254,6 +9264,7 @@ mod tests {
             entries: Some(Vec::new()),
             detail: None,
             truncated: false,
+            stale: false,
             write: FilesWriteVm::allowed(),
         };
         let json = serde_json::to_string(&empty).expect("serialize empty listing");

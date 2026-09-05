@@ -193,6 +193,7 @@ function listing(subpath: string, entries: FilesEntryVm[]): FilesListingVm {
     entries,
     detail: null,
     truncated: false,
+    stale: false,
     write: { writable: true, reason: null, caveat: null, caveatShort: null },
   };
 }
@@ -587,6 +588,7 @@ describe("Files on the phone — the pane", () => {
       entries: null,
       detail: "tgdrive is not on this phone yet; it clones on the next sync.",
       truncated: false,
+      stale: false,
       write: { writable: false, reason: "not listed", caveat: null, caveatShort: null },
     });
     render(<FilesPhonePane />);

@@ -155,6 +155,7 @@ function listed(subpath: string, entries: FilesEntryVm[]): FilesListingVm {
     entries,
     detail: null,
     truncated: false,
+    stale: false,
   };
 }
 
@@ -395,6 +396,7 @@ describe("the panel strip", () => {
       entries: null,
       detail: DRIVE_IS_OUT,
       truncated: false,
+      stale: false,
     } satisfies FilesListingVm);
     panelsStore
       .getState()
@@ -429,6 +431,7 @@ describe("the panel strip", () => {
       entries: [],
       detail: "That folder is not on disk any more.",
       truncated: false,
+      stale: false,
     } as unknown as FilesListingVm);
     panelsStore
       .getState()

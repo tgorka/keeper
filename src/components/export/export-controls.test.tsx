@@ -139,6 +139,7 @@ function listed(subpath: string, entries: FilesEntryVm[]): FilesListingVm {
     entries,
     detail: null,
     truncated: false,
+    stale: false,
   };
 }
 

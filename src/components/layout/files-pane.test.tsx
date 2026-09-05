@@ -314,6 +314,7 @@ function listed(
     entries,
     detail,
     truncated: detail !== null,
+    stale: false,
     write,
   };
 }
@@ -330,6 +331,7 @@ function notListed(
     entries: null,
     detail,
     truncated: false,
+    stale: false,
     // A folder keeper could not read is not a folder keeper will write into.
     write: { writable: false, reason: detail, caveat: null, caveatShort: null },
   };

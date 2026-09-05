@@ -3895,6 +3895,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       entries: subpath === "" ? ENTRIES : (CHILDREN[subpath] ?? []),
       detail: null,
       truncated: false,
+      stale: false,
       write: { writable: true, reason: null, caveat: null, caveatShort: null },
     };
   },
