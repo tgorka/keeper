@@ -110,7 +110,6 @@ pub struct AppState {
     /// Live and recently-finished one-time copy jobs (Epic 33). A copy is a
     /// job rather than a relationship, so it lives here in app memory and
     /// never reaches `profiles` or the sync journal.
-    #[cfg(desktop)]
     pub copies: Arc<crate::copy_ipc::CopyRegistry>,
     /// Live `bbctl` self-hosted-bridge runs (Story 6.7). Maps each `sessionId` to
     /// its driver-task abort handle, keyed also by `(accountId, networkId)` so a
@@ -487,7 +486,6 @@ impl AppState {
             oauth_flows: Arc::new(OAuthFlowRegistry::new()),
             beeper_flows: Arc::new(BeeperFlowRegistry::new()),
             exports: Arc::new(ExportRegistry::default()),
-            #[cfg(desktop)]
             copies: Arc::new(crate::copy_ipc::CopyRegistry::default()),
             bbctl_runs: Arc::new(BbctlRunRegistry::default()),
             paused_at: Mutex::new(None),
@@ -1638,8 +1636,9 @@ pub fn sync_tray_snapshot(
 #[ts(export)]
 #[serde(rename_all = "camelCase")]
 pub enum SyncGitState {
-    /// This build has no folder sync at all (iOS). The report renders nothing —
-    /// telling a phone user about a git version floor would be noise.
+    /// This build has no folder sync at all. Since Epic 66 no shipping target
+    /// answers this — a phone answers `Ok` with `engine: gix` — and it stays
+    /// in the wire contract for a target that has not earned the folder yet.
     Unsupported,
     /// A binary cleared the floor. `CapabilitiesVm.sync` is `true` exactly here.
     Ok,
@@ -1650,6 +1649,20 @@ pub enum SyncGitState {
     Unusable,
     /// It runs and reports a version below the floor.
     TooOld,
+}
+
+/// Which engine drives the folder here (Epic 66, AD-198).
+///
+/// `git` where a binary was resolved and the shim spawns it; `gix` on a phone,
+/// where nothing is spawned and the four things the shim exists for are refused
+/// by sentence. The frontend may read it — a phone renders no version floor —
+/// and must not gate on it: `state` is the capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncGitEngine {
+    Git,
+    Gix,
 }
 
 /// The resolved `git`, or why there isn't one — Settings → Sync's report.
@@ -1663,8 +1676,11 @@ pub enum SyncGitState {
 #[serde(rename_all = "camelCase")]
 pub struct SyncGitVm {
     pub state: SyncGitState,
+    /// `git` on a desktop, `gix` on a phone — see [`SyncGitEngine`].
+    pub engine: SyncGitEngine,
     /// `git 2.52 at /opt/homebrew/bin/git (clears the 2.42 floor)` when one was
     /// chosen. Worded as `keeper-syncd doctor` words it — one fact, one spelling.
+    /// `None` on a phone: there is no binary and no floor to report.
     pub summary: Option<String>,
     /// Why nothing was chosen, naming every candidate that was tried and what
     /// to do about it. `None` when a binary was chosen.
@@ -1679,60 +1695,66 @@ pub struct SyncGitVm {
 ///
 /// Deliberately engine-free: the whole point is that it answers on exactly the
 /// machines where the engine will not open.
+///
+/// A phone answers a phone-shaped report (Epic 66, AD-198): `Ok`, `engine:
+/// gix`, no summary, no problem, no configured path. Nothing is resolved and
+/// nothing spawned — iOS refuses `posix_spawn`, so a search would only report
+/// every candidate as unusable — and `CapabilitiesVm.sync` follows the same
+/// `state == Ok` rule it always did, which is what makes the Sync surface
+/// appear on the phone. Decided by `GitEngine::HOST`, the same constant
+/// `Engine::open` decides by, so the report and the engine cannot disagree.
 fn git_report(state: &AppState) -> SyncGitVm {
-    #[cfg(desktop)]
-    {
-        use keeper_sync::GitReject;
+    use keeper_sync::git::cli::GitEngine;
+    use keeper_sync::GitReject;
 
-        let platform = state.platform.as_ref();
-        let resolution = crate::sync::git_resolution(platform);
-        let rejected = resolution.rejected();
-        let vm_state = if resolution.chosen().is_some() {
-            SyncGitState::Ok
-        } else if rejected
-            .iter()
-            .any(|r| matches!(r.cause, GitReject::TooOld { .. }))
-        {
-            // Ranked, not first-wins: "you have git, upgrade it" is the most
-            // actionable thing to say when a search met several kinds of failure.
-            SyncGitState::TooOld
-        } else if rejected.iter().any(|r| {
-            matches!(
-                r.cause,
-                GitReject::Unusable { .. } | GitReject::NotExecutable
-            )
-        }) {
-            SyncGitState::Unusable
-        } else {
-            SyncGitState::Missing
-        };
-        SyncGitVm {
-            state: vm_state,
-            summary: resolution.summary(),
-            problem: match resolution.chosen() {
-                Some(_) => None,
-                None => Some(resolution.refusal()),
-            },
-            configured_path: crate::sync::configured_git_path(platform),
-        }
-    }
-    #[cfg(not(desktop))]
-    {
-        let _ = state;
-        SyncGitVm {
-            state: SyncGitState::Unsupported,
+    if GitEngine::HOST == GitEngine::Gix {
+        return SyncGitVm {
+            state: SyncGitState::Ok,
+            engine: SyncGitEngine::Gix,
             summary: None,
             problem: None,
             configured_path: None,
-        }
+        };
+    }
+
+    let platform = state.platform.as_ref();
+    let resolution = crate::sync::git_resolution(platform);
+    let rejected = resolution.rejected();
+    let vm_state = if resolution.chosen().is_some() {
+        SyncGitState::Ok
+    } else if rejected
+        .iter()
+        .any(|r| matches!(r.cause, GitReject::TooOld { .. }))
+    {
+        // Ranked, not first-wins: "you have git, upgrade it" is the most
+        // actionable thing to say when a search met several kinds of failure.
+        SyncGitState::TooOld
+    } else if rejected.iter().any(|r| {
+        matches!(
+            r.cause,
+            GitReject::Unusable { .. } | GitReject::NotExecutable
+        )
+    }) {
+        SyncGitState::Unusable
+    } else {
+        SyncGitState::Missing
+    };
+    SyncGitVm {
+        state: vm_state,
+        engine: SyncGitEngine::Git,
+        summary: resolution.summary(),
+        problem: match resolution.chosen() {
+            Some(_) => None,
+            None => Some(resolution.refusal()),
+        },
+        configured_path: crate::sync::configured_git_path(platform),
     }
 }
 
 /// The `git` report Settings → Sync renders.
 ///
-/// Registered on every platform (unlike the rest of the sync surface) so the
-/// frontend can ask one question and get `unsupported` on a phone instead of an
-/// `invoke` rejection it would have to special-case.
+/// Registered on every platform: the report is what tells a desktop user their
+/// `git` is unusable, and a phone answers `Ok` with `engine: gix` (Epic 66).
 #[tauri::command]
 pub fn sync_git_status(state: State<'_, AppState>) -> Result<SyncGitVm, IpcError> {
     Ok(git_report(&state))
@@ -1767,7 +1789,9 @@ pub fn sync_git_path_set(state: State<'_, AppState>, path: String) -> Result<Syn
         let _ = (state, path);
         Err(IpcError {
             code: IpcErrorCode::Unsupported,
-            message: "folder sync is not available on this platform".to_owned(),
+            message: "this is a phone: keeper syncs with its own engine here and drives no git \
+                      binary, so there is none to point it at"
+                .to_owned(),
             account_id: None,
             retriable: false,
         })
@@ -1807,12 +1831,11 @@ pub fn config_layers() -> Result<ConfigLayersVm, IpcError> {
     // shell is the only crate that can see a folder tier's faults and the app
     // layers' faults at the same time. A user does not care which crate
     // noticed; one list.
-    #[cfg(desktop)]
+    // On every target since Epic 66: the folder tier is installed on a phone too.
     let vm = vm.with_folder_faults(
         keeper_sync::profile::folder_faults()
             .iter()
-            // Fully qualified rather than imported: the only use is inside this
-            // `cfg`, and an import would be an unused-import warning on iOS.
+            // Fully qualified rather than imported, for the one use it has.
             .map(|fault| keeper_core::vm::ConfigFaultVm::folder(&fault.path, fault.message.clone()))
             .collect(),
     );
@@ -10950,7 +10973,8 @@ pub async fn session_restore(state: State<'_, AppState>) -> Result<Vec<AccountVm
 /// and we cannot say what it reaches. Returning a short list would present a partial
 /// disclosure as a complete one, the single thing this surface must never do, so the
 /// error propagates and Settings → About says it could not load the list.
-#[cfg(desktop)]
+/// On every target since Epic 66 (AD-204): a phone contacts the sync remote
+/// host too, and the disclosure moves with the truth.
 fn sync_remote_urls(state: &AppState) -> Result<Vec<String>, IpcError> {
     let engine = match crate::sync::engine(Arc::clone(&state.platform)) {
         Ok(engine) => engine,
@@ -10967,16 +10991,6 @@ fn sync_remote_urls(state: &AppState) -> Result<Vec<String>, IpcError> {
         Err(error) => return Err(crate::sync_ipc::sync_ipc_error(&error)),
     };
     Ok(profiles.into_iter().map(|p| p.remote_url).collect())
-}
-
-/// Mobile twin of [`sync_remote_urls`]: iOS links no folder-sync engine at all
-/// (`crate::sync` is `#[cfg(desktop)]` because `keeper-sync` must never reach that
-/// target), so there is no remote to disclose and the empty list is the whole truth
-/// — the same "iOS adds no new egress endpoints" claim `docs/egress.md` makes.
-#[cfg(not(desktop))]
-fn sync_remote_urls(state: &AppState) -> Result<Vec<String>, IpcError> {
-    let _ = state;
-    Ok(Vec::new())
 }
 
 /// Report the live set of network destinations keeper contacts (Story 11.2,

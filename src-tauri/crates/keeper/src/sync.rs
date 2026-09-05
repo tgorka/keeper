@@ -159,6 +159,10 @@ impl SyncPlatform for ShellSyncPlatform {
         fs4::available_space(path).ok()
     }
 
+    /// The `git` binary the shim drives — asked only by a `GitEngine::Binary`
+    /// engine. A phone's engine (`GitEngine::Gix`, decided by the target in
+    /// `Engine::open`) never calls this; were it to, the resolver's refusal
+    /// would be the honest answer, because a phone has no binary to name.
     fn git_program(&self) -> SyncResult<PathBuf> {
         git_resolution(self.platform.as_ref()).program()
     }
@@ -591,6 +595,62 @@ pub fn repoint_engine(platform: Arc<dyn Platform>) {
     if git_resolution(platform.as_ref()).chosen().is_some() {
         start_supervisor(platform);
     }
+}
+
+/// Sync every enabled folder once, now — the phone's cadence (Epic 66,
+/// AD-198, NFR-57).
+///
+/// A phone runs no supervisor and arms no watcher: there is no 1 Hz tick to
+/// drain a journal on a battery, and iOS suspends the process the moment it
+/// leaves the foreground anyway. So the folder converges at three moments,
+/// each of them one call here or to `sync_folder_now`: on open (`setup`), on
+/// foreground (`RunEvent::Resumed`) and on pull-to-refresh. `when` names
+/// which, for the log.
+///
+/// Every profile is driven through `Engine::sync_once_recording`, so a
+/// failure — the divergence sentence above all (AD-199) — lands beside the
+/// profile where the Sync surface reads it, exactly as the desktop's tick
+/// records one. Best-effort and spawned: nothing here blocks the launch or
+/// the foreground transition, and a folder that refuses does not stop the
+/// next one.
+#[cfg(not(desktop))]
+pub fn phone_sync_all(platform: Arc<dyn Platform>, when: &'static str) {
+    let engine = match engine(platform) {
+        Ok(engine) => engine,
+        Err(err) => {
+            tracing::warn!(%err, when, "sync: the phone's engine did not open");
+            return;
+        }
+    };
+    tauri::async_runtime::spawn(async move {
+        let profiles = match engine.list_profiles() {
+            Ok(profiles) => profiles,
+            Err(err) => {
+                tracing::warn!(%err, when, "sync: could not list the phone's folders");
+                return;
+            }
+        };
+        for profile in profiles.into_iter().filter(|p| p.enabled) {
+            match engine
+                .sync_once_recording(&profile.id, keeper_sync::provenance::SyncSource::Manual)
+                .await
+            {
+                Ok(outcome) => tracing::info!(
+                    profile = profile.name,
+                    when,
+                    pulled = outcome.pulled,
+                    pushed = outcome.pushed,
+                    files = outcome.files_changed,
+                    "sync: the phone synced a folder"
+                ),
+                // Recorded beside the profile already; the log line is for the
+                // person reading `debug_log_tail`.
+                Err(err) => {
+                    tracing::warn!(profile = profile.name, when, %err, "sync: a folder refused")
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]

@@ -38,7 +38,10 @@ use crate::credential::{challenge_accepts_basic, AccessToken};
 use crate::db::{self, ActivityKind, ActivityRow, DeviceIdentity, WorkKind, WorkState};
 use crate::error::{Result, Retriability, SyncError};
 use crate::exclude::ExcludeSet;
-use crate::git::{self, cli::GitCli};
+use crate::git::{
+    self,
+    cli::{GitCli, GitEngine},
+};
 use crate::lfs;
 use crate::platform::SyncPlatform;
 use crate::profile::{LfsMode, ProfileState, PushPolicy, SyncDirection, SyncLane, SyncProfile};
@@ -707,6 +710,20 @@ struct SweepFailure {
 /// never raises a notification for something that fixed itself.
 const TRANSIENT_FAILURES_BEFORE_WARNING: u32 = 3;
 
+/// The sentence a phone's profile carries when its history cannot be
+/// fast-forwarded (AD-199).
+///
+/// Composed in one place so the status row, the notification and the test
+/// cannot word it three ways. `ahead` is what [`git::repo::commits_ahead`]
+/// counted: the commits this copy holds that the remote does not.
+pub fn phone_divergence_sentence(ahead: usize) -> String {
+    let commits = if ahead == 1 { "commit" } else { "commits" };
+    format!(
+        "this phone has {ahead} {commits} the remote does not; push them, or reset this copy — \
+         nothing is merged on a phone"
+    )
+}
+
 /// How long a profile waits before trying to arm a watcher again.
 ///
 /// A watcher fails for reasons that do not fix themselves in a second — an
@@ -1288,8 +1305,24 @@ impl Engine {
     ///
     /// A missing `git` is fatal here rather than at first use: AD-41 makes it a
     /// declared prerequisite, and discovering it mid-push would leave a profile
-    /// half-applied.
+    /// half-applied. On a phone there is no `git` to probe and none is needed —
+    /// see [`Self::open_with_engine`], which this calls with the engine the
+    /// target decides.
     pub fn open(platform: Arc<dyn SyncPlatform>) -> Result<Self> {
+        Self::open_with_engine(platform, GitEngine::HOST)
+    }
+
+    /// [`Self::open`] with the git engine chosen by the caller (Epic 66,
+    /// AD-198).
+    ///
+    /// `GitEngine::Gix` is the phone: no binary is resolved or probed, every
+    /// shim verb refuses with a sentence, the fetch-and-apply leg goes through
+    /// gitoxide, and no LFS filter is registered in the repositories it opens
+    /// — a filter driver is a process, and a phone cannot spawn one, so the
+    /// pointers a full-virtual folder holds are checked out as the pointer text
+    /// they are. Public so the Linux suite can open a phone-shaped engine over
+    /// two bare repositories and drive the branch a Mac never takes.
+    pub fn open_with_engine(platform: Arc<dyn SyncPlatform>, engine: GitEngine) -> Result<Self> {
         // Before anything opens a repository. A Finder-launched macOS app
         // inherits launchd's 256 descriptors, and gitoxide's object store maps
         // one file per object it reads — a checkout of a few hundred exhausts
@@ -1317,20 +1350,26 @@ impl Engine {
         let now = platform.now_ms();
         db::recover_running(&conn, now)?;
 
-        let program = platform.git_program()?;
-        let git = GitCli::new(program);
-        let capabilities = git.capabilities()?;
-        if !capabilities.meets_floor() {
-            return Err(SyncError::GitMissing {
-                reason: format!(
-                    "git {}.{} is too old; {}.{} or newer is required for cone sparse-checkout",
-                    capabilities.major,
-                    capabilities.minor,
-                    crate::git::cli::MIN_GIT_MAJOR,
-                    crate::git::cli::MIN_GIT_MINOR
-                ),
-            });
-        }
+        let git = match engine {
+            GitEngine::Binary => {
+                let program = platform.git_program()?;
+                let git = GitCli::new(program);
+                let capabilities = git.capabilities()?;
+                if !capabilities.meets_floor() {
+                    return Err(SyncError::GitMissing {
+                        reason: format!(
+                            "git {}.{} is too old; {}.{} or newer is required for cone sparse-checkout",
+                            capabilities.major,
+                            capabilities.minor,
+                            crate::git::cli::MIN_GIT_MAJOR,
+                            crate::git::cli::MIN_GIT_MINOR
+                        ),
+                    });
+                }
+                git
+            }
+            GitEngine::Gix => GitCli::phone(),
+        };
 
         // Timeouts live in `crate::http`, and the reason they are not inline
         // here is that their absence was invisible: a client built without them
@@ -1362,15 +1401,22 @@ impl Engine {
             next_release_ms: Mutex::new(HashMap::new()),
             release_cursor: Mutex::new(HashMap::new()),
             // `current_exe` is the daemon in a CLI run and the app binary in a
-            // desktop run; both understand `lfs clean|smudge`.
-            filter_program: std::env::current_exe().ok(),
+            // desktop run; both understand `lfs clean|smudge`. A phone
+            // registers no filter at all: the driver would be a process, and
+            // iOS refuses to spawn one (AD-198).
+            filter_program: match engine {
+                GitEngine::Binary => std::env::current_exe().ok(),
+                GitEngine::Gix => None,
+            },
             // ...but "whatever executable linked the engine" understands the
             // long-running protocol only if it says so, and a `process` driver
             // that cannot be launched wedges the folder rather than degrading
-            // (DW-140). Asked once, here, rather than per repository open.
-            filter_serves_process: std::env::current_exe()
-                .ok()
-                .is_some_and(|exe| lfs::filter::serves_process(&exe)),
+            // (DW-140). Asked once, here, rather than per repository open —
+            // and never on a phone, where asking would itself be a spawn.
+            filter_serves_process: engine == GitEngine::Binary
+                && std::env::current_exe()
+                    .ok()
+                    .is_some_and(|exe| lfs::filter::serves_process(&exe)),
             sinks: Mutex::new(Vec::new()),
             next_sink: AtomicU64::new(1),
             interrupt: Arc::new(AtomicBool::new(false)),
@@ -5919,9 +5965,17 @@ impl Engine {
         // A fetch only moves `refs/remotes/origin/<branch>`; without an apply
         // step the working tree stays behind and the next push is rejected as
         // non-fast-forward. gitoxide implements no merge/reset/checkout
-        // workflow, so this goes through the shim (AD-41).
+        // workflow, so on a desktop this goes through the shim (AD-41). A phone
+        // has no shim to go through and takes the in-process route (AD-198):
+        // a fast-forward is a gitoxide checkout, and anything else is named
+        // and left alone — there is no merge on a phone (AD-199).
         self.publish(self.progress(&profile, SyncPhase::Applying));
         let tracking = format!("refs/remotes/origin/{}", profile.branch);
+        if self.git.engine() == GitEngine::Gix {
+            return self
+                .apply_in_process(&profile, remote_id, outcome.local_id, outcome.fast_forward)
+                .await;
+        }
         let git = self.git.clone();
         let repo_path = profile.local_path.clone();
 
@@ -6053,6 +6107,65 @@ impl Engine {
             self.with_db(|conn| db::record_activity(conn, &profile.id, now, &rows))?;
         }
         Ok(converged)
+    }
+
+    /// The phone's apply step (AD-198, AD-199): fast-forward by gitoxide, or
+    /// name the divergence and touch nothing.
+    ///
+    /// Three shapes, decided by ancestry rather than by the fetch's single
+    /// `fast_forward` bit, for the reason [`Self::do_pull`] gives: the bit is
+    /// false both when this copy is *ahead* of the remote and when the two
+    /// have genuinely diverged, and only the second is a problem.
+    ///
+    /// * The remote's tip is already in our history: nothing to apply; the
+    ///   push leg (66.5's `push_http`, when linked) publishes what we have.
+    /// * Our tip is in the remote's history: a fast-forward, written by
+    ///   [`git::repo::fast_forward`].
+    /// * Neither: divergence. **There is no merge on a phone.** The sentence
+    ///   counts the commits this copy holds that the remote does not and names
+    ///   the two ways out — push them, or reset this copy — and the pass ends
+    ///   as a permanent error, which [`Self::record_failure`] puts beside the
+    ///   profile. The Mac merges; the phone only ever says so.
+    async fn apply_in_process(
+        &self,
+        profile: &SyncProfile,
+        remote_id: gix::ObjectId,
+        local_id: Option<gix::ObjectId>,
+        fast_forward: bool,
+    ) -> Result<Converged> {
+        let repo_path = profile.local_path.clone();
+        let removable = profile.removable;
+        let interrupt = Arc::clone(&self.interrupt);
+        let name = profile.name.clone();
+        tokio::task::spawn_blocking(move || -> Result<Converged> {
+            let repo = git::repo::open(&repo_path, removable)?;
+            let Some(local_id) = local_id else {
+                // An unborn branch adopts the remote wholesale: a fast-forward
+                // from nothing.
+                git::repo::fast_forward(&repo, remote_id, &interrupt)?;
+                return Ok(Converged::default());
+            };
+            if git::repo::is_ancestor(&repo, remote_id, local_id)? {
+                return Ok(Converged::default());
+            }
+            if fast_forward && git::repo::is_ancestor(&repo, local_id, remote_id)? {
+                let moved = git::repo::fast_forward(&repo, remote_id, &interrupt)?;
+                tracing::info!(
+                    profile = name,
+                    written = moved.written,
+                    removed = moved.removed,
+                    "fast-forwarded the phone's copy with gitoxide"
+                );
+                return Ok(Converged::default());
+            }
+            let ahead = git::repo::commits_ahead(&repo, local_id, remote_id)?;
+            Err(SyncError::Diverged {
+                profile: name,
+                reason: phone_divergence_sentence(ahead),
+            })
+        })
+        .await
+        .map_err(|err| SyncError::Journal(format!("apply task failed: {err}")))?
     }
 
     /// Converge a diverged branch without asking anyone (AD-43).
@@ -6390,23 +6503,72 @@ impl Engine {
     /// driving. It is handed to the commit so the rows it records can name the
     /// work that will publish them (Story 34.16).
     /// Push once, as the profile's own credential.
+    ///
+    /// A desktop pushes through the shim (AD-41); a phone through
+    /// [`Self::push_after_commit`], keeper's own engine (AD-202).
     fn push_once(
         &self,
         profile: &SyncProfile,
         refspec: &str,
-    ) -> impl std::future::Future<Output = Result<()>> + Send {
+    ) -> impl Future<Output = Result<()>> + Send {
         let git = self.git.clone();
         let repo_path = profile.local_path.clone();
         let refspec = refspec.to_owned();
         let credential = self.credential(profile);
+        let phone = (self.git.engine() == GitEngine::Gix).then(|| {
+            (
+                self.http.clone(),
+                profile.remote_url.clone(),
+                profile.branch.clone(),
+                profile.name.clone(),
+            )
+        });
         async move {
             let credential = credential?;
+            if let Some((http, remote_url, branch, name)) = phone {
+                return Self::push_after_commit(
+                    &http,
+                    &repo_path,
+                    &remote_url,
+                    &branch,
+                    &name,
+                    credential.as_ref(),
+                )
+                .await;
+            }
             tokio::task::spawn_blocking(move || {
                 git.push(&repo_path, "origin", &refspec, credential.as_ref())
             })
             .await
             .map_err(|err| SyncError::Journal(format!("push task failed: {err}")))?
         }
+    }
+
+    /// The phone's push (AD-202): `refs/heads/<branch>` to the same name on
+    /// the remote, over HTTP, with the credential injected programmatically
+    /// (AD-53) and never a force (AD-50 — `push_http` refuses client-side
+    /// unless the remote's tip is in this copy's history).
+    ///
+    /// Named as its own seam rather than inlined in [`Self::push_once`] so the
+    /// one place a phone publishes is one function: what a commit on a phone
+    /// does next is this, and nothing else.
+    async fn push_after_commit(
+        http: &reqwest::Client,
+        repo_path: &Path,
+        remote_url: &str,
+        branch: &str,
+        profile_name: &str,
+        credential: Option<&git::fetch::Credential>,
+    ) -> Result<()> {
+        let report = git::push_http::push(http, repo_path, remote_url, branch, credential).await?;
+        tracing::info!(
+            profile = profile_name,
+            branch,
+            updated = report.updated,
+            objects = report.objects,
+            "pushed the phone's commits with keeper's own engine"
+        );
+        Ok(())
     }
 
     /// What a refused push means for *this* profile (DW-207).
@@ -6540,6 +6702,17 @@ impl Engine {
             return Ok(());
         }
         drop(repo);
+        // A phone asks its own history first (AD-198): the desktop's `git
+        // push` is a cheap no-op against an up-to-date remote, but the phone's
+        // push is a discovery round trip on a battery (NFR-57), and a copy that
+        // holds nothing the remote lacks owes it none.
+        if self.git.engine() == GitEngine::Gix && !self.has_unpushed_commits(profile)? {
+            tracing::debug!(
+                profile = profile.name,
+                "the remote already holds every commit here, so the phone pushes nothing"
+            );
+            return Ok(());
+        }
 
         // A push with nothing freshly committed is republishing commits whose
         // file count is not known without diffing the remote, and spending a
@@ -8536,6 +8709,29 @@ impl Engine {
             .ok_or_else(|| {
                 SyncError::Journal(format!("task {id} ran, but its run was not recorded"))
             })
+    }
+
+    /// [`Self::sync_once`], with a failure recorded beside the profile the way
+    /// the supervisor's tick records one (Epic 66, NFR-57).
+    ///
+    /// A phone has no supervisor: it syncs on open, on foreground and on
+    /// pull-to-refresh, each of them one call to this. Without the record the
+    /// divergence sentence (AD-199) would reach only the caller of the moment
+    /// and never the profile's own status row, which is where a person looks.
+    /// The success path is `sync_once`'s own, which already clears the state.
+    pub async fn sync_once_recording(&self, id: &str, source: SyncSource) -> Result<SyncOutcome> {
+        match self.sync_once(id, source).await {
+            Ok(outcome) => {
+                Self::lock(&self.transient_failures).remove(id);
+                Ok(outcome)
+            }
+            Err(err) => {
+                if let Ok(Some(profile)) = self.with_db(|conn| db::get_profile(conn, id)) {
+                    self.record_failure(&profile, &err);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Run one complete sync for a profile, ignoring the schedule.
@@ -12304,6 +12500,19 @@ impl Engine {
     /// remote side to compare against.
     fn has_unpushed_commits(&self, profile: &SyncProfile) -> Result<bool> {
         let tracking = format!("refs/remotes/origin/{}", profile.branch);
+        if self.git.engine() == GitEngine::Gix {
+            // The phone reads its own history (AD-198). The same two
+            // unanswerable shapes as below — unborn, or nothing fetched yet —
+            // get the same answer.
+            let repo = git::repo::open_read_only(&profile.local_path, profile.removable)?;
+            let (Some(head), Some(remote)) = (
+                git::repo::head_commit_id(&repo)?,
+                git::repo::resolve_reference(&repo, &tracking)?,
+            ) else {
+                return Ok(false);
+            };
+            return git::repo::is_ancestor(&repo, head, remote).map(|contained| !contained);
+        }
         match self.git.is_ancestor(&profile.local_path, "HEAD", &tracking) {
             Ok(contained) => Ok(!contained),
             // An unborn branch or an absent tracking ref makes the question
@@ -25384,6 +25593,279 @@ mod tests {
             before + 1,
             "the ordinary tick of an ordinary folder walks once"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The folder on the phone (Epic 66, Story 66.2, AD-198, AD-199)
+    // -----------------------------------------------------------------------
+    //
+    // Driven through a phone-shaped engine (`GitEngine::Gix`) against a bare
+    // repository a "Mac" — plain `git`, the only process these tests spawn —
+    // publishes into. The phone itself never spawns: every shim verb on its
+    // handle refuses (`cli::tests`), so a fetch, a fast-forward or a commit
+    // that reached one would fail these tests with the refusal sentence.
+
+    /// The "Mac": a working clone driven by plain `git`.
+    struct Mac {
+        work: PathBuf,
+    }
+
+    impl Mac {
+        /// Returns `None` where no `git` is on `PATH`, the convention every
+        /// other fixture in this module follows.
+        fn publish_into(dir: &Path, remote: &Path) -> Option<Self> {
+            let work = dir.join("mac");
+            std::fs::create_dir_all(&work).ok()?;
+            let mac = Self { work };
+            if !mac.try_git(&["init", "-q", "-b", "main"]) {
+                return None;
+            }
+            mac.git(&["remote", "add", "origin", &remote.to_string_lossy()]);
+            mac.git(&["config", "user.email", "mac@keeper.invalid"]);
+            mac.git(&["config", "user.name", "mac"]);
+            Some(mac)
+        }
+
+        fn try_git(&self, args: &[&str]) -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&self.work)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+
+        fn git(&self, args: &[&str]) {
+            assert!(
+                self.try_git(args),
+                "git {args:?} in {}",
+                self.work.display()
+            );
+        }
+
+        fn write(&self, rela: &str, bytes: &[u8]) {
+            let path = self.work.join(rela);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("parent");
+            }
+            std::fs::write(path, bytes).expect("write");
+        }
+
+        fn commit_and_push(&self, subject: &str) -> gix::ObjectId {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-qm", subject]);
+            self.git(&["push", "-q", "origin", "main"]);
+            self.head()
+        }
+
+        fn head(&self) -> gix::ObjectId {
+            let repo = gix::open(&self.work).expect("open the mac's clone");
+            repo.head_id().expect("a commit").detach()
+        }
+    }
+
+    /// A phone-shaped engine and a profile pointing at `remote`, not yet
+    /// cloned — the state the phone's profile sheet leaves behind.
+    fn phone(dir: &Path, remote: &Path) -> (Arc<TestPlatform>, Engine, SyncProfile) {
+        let platform = Arc::new(TestPlatform::new(dir));
+        let engine = Engine::open_with_engine(
+            Arc::clone(&platform) as Arc<dyn SyncPlatform>,
+            GitEngine::Gix,
+        )
+        .expect("a phone opens with no git binary at all");
+        let mut p = SyncProfile::new(
+            "01JPHONEPROFILE",
+            "phone",
+            dir.join("phone"),
+            remote.to_string_lossy().into_owned(),
+        );
+        p.make_fully_virtual();
+        engine.upsert_profile(&p).expect("upsert");
+        (platform, engine, p)
+    }
+
+    fn phone_head(p: &SyncProfile) -> Option<gix::ObjectId> {
+        let repo = gix::open(&p.local_path).expect("open the phone's copy");
+        git::repo::head_commit_id(&repo).expect("HEAD")
+    }
+
+    /// A phone opens with no binary, clones by gitoxide, and follows the Mac
+    /// by fast-forward: files added, changed and removed on the Mac land on
+    /// the phone, nothing is merged, and `HEAD` is the remote's tip.
+    #[tokio::test]
+    async fn a_phone_clones_and_fast_forwards_with_gitoxide() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let Some(mac) = Mac::publish_into(dir.path(), &remote) else {
+            return;
+        };
+        mac.write("README.md", b"hello\n");
+        mac.write("notes/one.md", b"one\n");
+        mac.write("notes/gone.md", b"soon gone\n");
+        let first = mac.commit_and_push("first");
+
+        let (_platform, engine, p) = phone(dir.path(), &remote);
+        assert_eq!(engine.git.engine(), GitEngine::Gix);
+        let outcome = engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("the first sync clones");
+        assert!(outcome.pulled);
+        assert_eq!(phone_head(&p), Some(first), "the clone is at the Mac's tip");
+        assert_eq!(
+            std::fs::read(p.local_path.join("notes/one.md")).expect("checked out"),
+            b"one\n"
+        );
+        let config = std::fs::read_to_string(p.local_path.join(".git/config")).expect("config");
+        assert!(
+            !config.contains("filter \"lfs\""),
+            "a phone registers no filter driver — a driver is a process:\n{config}"
+        );
+
+        // The Mac moves on: one file changed, one added, one removed.
+        mac.write("notes/one.md", b"one, revised\n");
+        mac.write("notes/two.md", b"two\n");
+        std::fs::remove_file(mac.work.join("notes/gone.md")).expect("remove");
+        let second = mac.commit_and_push("second");
+
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("a fast-forward applies");
+        assert_eq!(phone_head(&p), Some(second), "HEAD followed the remote");
+        assert_eq!(
+            std::fs::read(p.local_path.join("notes/one.md")).expect("rewritten"),
+            b"one, revised\n"
+        );
+        assert_eq!(
+            std::fs::read(p.local_path.join("notes/two.md")).expect("added"),
+            b"two\n"
+        );
+        assert!(
+            !p.local_path.join("notes/gone.md").exists(),
+            "a path the remote deleted is gone from the phone"
+        );
+        let repo = gix::open(&p.local_path).expect("open");
+        assert!(
+            !git::repo::is_dirty(&repo).expect("dirty check"),
+            "index and worktree agree with the new HEAD"
+        );
+        let status = engine.status(&p.id).expect("a status");
+        assert_eq!(status.error, None);
+        assert_eq!(status.state, ProfileState::Watching);
+
+        // Nothing new: the pass is a no-op, not a refusal.
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("an up-to-date phone syncs cleanly");
+        assert_eq!(phone_head(&p), Some(second));
+    }
+
+    /// A phone holding a commit the remote lacks, against a remote that also
+    /// moved: the sentence, and nothing else — no merge, no conflict copy,
+    /// `HEAD` and the worktree exactly where they were (AD-199).
+    #[tokio::test]
+    async fn a_phone_names_a_divergence_and_merges_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let Some(mac) = Mac::publish_into(dir.path(), &remote) else {
+            return;
+        };
+        mac.write("README.md", b"hello\n");
+        let first = mac.commit_and_push("first");
+        let (platform, engine, p) = phone(dir.path(), &remote);
+        engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect("clone");
+        assert_eq!(phone_head(&p), Some(first));
+
+        // The phone writes a note and commits it with its own engine (what a
+        // 66.4 save does), while the Mac publishes something else.
+        std::fs::write(p.local_path.join("captured.md"), b"from the phone\n").expect("write");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        let local = phone_head(&p).expect("a local commit");
+        assert_ne!(local, first);
+        mac.write("README.md", b"hello from the mac\n");
+        let moved = mac.commit_and_push("mac moved on");
+
+        let err = engine
+            .sync_once_recording(&p.id, SyncSource::Manual)
+            .await
+            .expect_err("a history the phone cannot fast-forward is refused");
+        let SyncError::Diverged { profile, reason } = &err else {
+            panic!("a divergence, got {err:?}");
+        };
+        assert_eq!(profile, "phone");
+        assert_eq!(reason, &phone_divergence_sentence(1));
+        assert!(reason.contains("this phone has 1 commit the remote does not"));
+        assert!(reason.contains("push them, or reset this copy"));
+
+        assert_eq!(phone_head(&p), Some(local), "nothing moved HEAD");
+        assert_ne!(phone_head(&p), Some(moved));
+        assert_eq!(
+            std::fs::read(p.local_path.join("README.md")).expect("still ours"),
+            b"hello\n",
+            "the worktree is untouched"
+        );
+        let copies: Vec<_> = std::fs::read_dir(&p.local_path)
+            .expect("list")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".sync-conflict-"))
+            .collect();
+        assert!(copies.is_empty(), "a phone writes no conflict copies");
+
+        // And the sentence is beside the profile, where a person looks.
+        let status = engine.status(&p.id).expect("a status");
+        assert_eq!(status.state, ProfileState::NeedsAttention);
+        assert_eq!(status.error.as_deref(), Some(err.to_string().as_str()));
+        assert!(
+            engine
+                .has_unpushed_commits(&p)
+                .expect("answered in-process"),
+            "the phone reads its own history without a binary"
+        );
+    }
+
+    /// The phone-shaped profile: everything may stay a pointer, and the mode
+    /// stays the one under which an open materializes.
+    #[test]
+    fn a_fully_virtual_profile_keeps_every_path_away_until_opened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut p = adoptable(dir.path());
+        p.make_fully_virtual();
+        assert_eq!(p.lfs_mode, LfsMode::Materialize);
+        p.validate()
+            .expect("the phone's default is a saveable profile");
+        let policy = lfs::virtual_policy::VirtualPolicy::compile(&p).expect("compiles");
+        assert_eq!(
+            policy.tier(),
+            lfs::virtual_policy::VirtualPolicyTier::Profile
+        );
+        for (path, size) in [
+            ("a.mp4", 10_000_000),
+            ("deep/inside/x.bin", 1),
+            ("README.md", 0),
+        ] {
+            assert_eq!(
+                policy.resolve(Path::new(path), size),
+                lfs::virtual_policy::Virtualization::Virtual,
+                "{path}"
+            );
+        }
+        // A profile that already names patterns is left alone.
+        let mut chosen = adoptable(dir.path());
+        chosen.virtual_patterns = vec!["media/**".to_owned()];
+        chosen.make_fully_virtual();
+        assert_eq!(chosen.virtual_patterns, vec!["media/**".to_owned()]);
     }
 }
 

@@ -45,6 +45,10 @@ base64 = { workspace = true }
 # quoting is mandatory and why this crate rather than a hand-rolled decoder.
 # Adds no new crate: gix-attributes already depends on it.
 gix-quote = { workspace = true }
+# The pack writer behind `git::push_http` (Story 66.5, AD-202): `generate` is
+# the feature `gix` leaves off, and the phone cannot spawn `git push`. See the
+# workspace manifest. Adds no new crate.
+gix-pack = { workspace = true }
 # The folder tier: `<folder>/.keeper/keeper.toml` and its `keeper.<host>.toml`
 # sibling, read at profile-load time (`profile::folder`, AD-99/AD-100). Adds no
 # new crate — `keeper-syncd` already resolves it for the daemon's own

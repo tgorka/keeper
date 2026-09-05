@@ -2085,6 +2085,25 @@ describe("SyncPane copy files once", () => {
   });
 });
 
+describe("SyncPane on the phone (Story 66.1, AD-198)", () => {
+  it("lists the folder and offers the add form, with no copy card", async () => {
+    // The phone's tier: the folder can sync (Epic 66) and nothing the OS
+    // refuses is on. The one-time copy is `copy_ipc`, a desktop command, so
+    // its card is absent rather than a Copy that fails.
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true });
+    await renderPane();
+    expect(screen.getByText("tgdrive")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: SYNC_ADD_TITLE })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: SYNC_NOW_LABEL })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: COPY_SUBMIT_LABEL })).toBeNull();
+    expect(screen.queryByRole("button", { name: COPY_PICK_SOURCE_FOLDER_LABEL })).toBeNull();
+    // No reveal on a platform with no file manager: the path is inert text.
+    expect(screen.queryByRole("button", { name: SYNC_OPEN_PATH_LABEL })).toBeNull();
+  });
+});
+
 describe("sync pane projections", () => {
   it("reports a wait as elapsed time, coarsely, and never below zero", () => {
     expect(formatSyncWaited(NOW - 30_000, NOW)).toBe("under a minute");

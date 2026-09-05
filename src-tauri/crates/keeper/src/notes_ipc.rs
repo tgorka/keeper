@@ -54,14 +54,19 @@ use keeper_core::notes::{
     attach, counts, csv, naming, order, query, search, seed, sort, tags, templates, widget,
     NotesError,
 };
+#[cfg(desktop)]
+use keeper_core::vm::ExportReceiptVm;
 use keeper_core::vm::{
-    ExportReceiptVm, IpcError, IpcErrorCode, RecordingNoteTargetKind, TagVocabularyEntryVm,
-    TagVocabularyVm,
+    IpcError, IpcErrorCode, RecordingNoteTargetKind, TagVocabularyEntryVm, TagVocabularyVm,
 };
 use keeper_sync::browse;
 use keeper_sync::profile::{NotesCadence, NotesConfig};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Emitter, Manager, State};
+// `Emitter` and `Manager` serve the window and tray halves, which are
+// `#[cfg(desktop)]` below; on a phone the import would be unused.
+use tauri::{AppHandle, State};
+#[cfg(desktop)]
+use tauri::{Emitter, Manager};
 
 use crate::ipc::AppState;
 use crate::notes_vault::{self, HeadRevision, Vault, ATTACHMENTS_DIR};

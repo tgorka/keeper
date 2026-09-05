@@ -38,6 +38,7 @@ import {
   SYNC_AUTHOR_LABEL,
   SYNC_BRANCH_LABEL,
   SYNC_CHOOSE_FOLDER_LABEL,
+  SYNC_DIRECTION_LABEL,
   SYNC_EDIT_SUBMIT_LABEL,
   SYNC_EDIT_TITLE,
   SYNC_EXCLUDES_LABEL,
@@ -55,6 +56,7 @@ import {
   SYNC_RELEASE_TTL_LABEL,
   SYNC_REMOTE_URL_LABEL,
   SYNC_REMOVABLE_LABEL,
+  SYNC_SESSIONS_LABEL,
   SYNC_SETTLE_LABEL,
   SYNC_SUBJECT_LABEL,
   SYNC_SUBPATHS_LABEL,
@@ -92,6 +94,7 @@ import {
   syncSetCredential,
   syncStatuses,
 } from "@/lib/ipc/client";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { resetSyncStoreForTest, SYNC_RECORDINGS_SUBFOLDER_LABEL } from "@/lib/stores/sync";
 import { resetSyncDetailStoreForTest, syncDetailStore } from "@/lib/stores/sync-detail";
 
@@ -1572,5 +1575,72 @@ describe("AddFolderForm choosing a home directory (Story 59.8)", () => {
     // The engine binds a profile to its folder, so nothing here can move it.
     expect(screen.queryByRole("textbox", { name: SYNC_FOLDER_LABEL })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: SYNC_HOME_FOLDER_LABEL })).not.toBeInTheDocument();
+  });
+});
+
+describe("AddFolderForm on the phone (Story 66.1, AD-199)", () => {
+  /** The reduced tier a phone hydrates to once its folder links (Epic 66). */
+  function arrangePhone() {
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+  }
+
+  afterEach(() => {
+    capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
+  });
+
+  it("is name, remote, branch and credential — no folder, direction or Advanced", () => {
+    arrangePhone();
+    render(<AddFolderForm />);
+    expect(screen.getByLabelText(SYNC_NAME_LABEL)).toBeInTheDocument();
+    expect(screen.getByLabelText(SYNC_REMOTE_URL_LABEL)).toBeInTheDocument();
+    expect(screen.getByLabelText(SYNC_BRANCH_LABEL)).toBeInTheDocument();
+    // The credential is a first-order field here, not a knob behind Advanced.
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
+    expect(screen.getByText(SYNC_TOKEN_NOTE)).toBeInTheDocument();
+    // Absent, never disabled (AD-27): the phone has no folder to pick, no
+    // direction to choose, no watcher to tune, no recorder and no sessions.
+    expect(screen.queryByLabelText(SYNC_FOLDER_LABEL)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: SYNC_CHOOSE_FOLDER_LABEL })).toBeNull();
+    expect(screen.queryByRole("button", { name: SYNC_HOME_FOLDER_LABEL })).toBeNull();
+    expect(screen.queryByText(SYNC_DIRECTION_LABEL)).not.toBeInTheDocument();
+    expect(screen.queryByTestId(SYNC_ADVANCED_TOGGLE_TESTID)).toBeNull();
+    expect(screen.queryByLabelText(SYNC_RECORDINGS_LABEL)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(SYNC_SESSIONS_LABEL)).not.toBeInTheDocument();
+  });
+
+  it("saves with an empty path — Rust assigns the container — and stores the credential", async () => {
+    arrangePhone();
+    mockSave.mockResolvedValue(profileVm({ id: "p7", localPath: "/var/mobile/.../sync/p7" }));
+    mockSetCredential.mockResolvedValue(undefined);
+    const onSaved = vi.fn();
+    render(<AddFolderForm onSaved={onSaved} />);
+    fireEvent.change(screen.getByLabelText(SYNC_NAME_LABEL), { target: { value: "notes" } });
+    fireEvent.change(screen.getByLabelText(SYNC_REMOTE_URL_LABEL), {
+      target: { value: "https://github.com/alice/notes.git" },
+    });
+    fireEvent.change(screen.getByLabelText(SYNC_TOKEN_LABEL), { target: { value: "tok" } });
+    // Enabled with no folder chosen: the folder is not this form's to choose here.
+    const submit = screen.getByRole("button", { name: SYNC_ADD_SUBMIT_LABEL });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    await waitFor(() => expect(mockSave).toHaveBeenCalledTimes(1));
+    expect(mockSave.mock.calls[0][0]).toMatchObject({
+      id: null,
+      name: "notes",
+      localPath: "",
+      remoteUrl: "https://github.com/alice/notes.git",
+    });
+    await waitFor(() => expect(mockSetCredential).toHaveBeenCalledWith("p7", "tok"));
+    await waitFor(() => expect(onSaved).toHaveBeenCalledWith(expect.anything(), true));
+  });
+
+  it("editing shows no folder line and no fixed-path note", async () => {
+    arrangePhone();
+    const profile = profileVm({ localPath: "/var/mobile/.../sync/p2" });
+    render(<AddFolderForm profile={profile} />);
+    await waitFor(() => expect(mockGetCredential).toHaveBeenCalledWith("p2"));
+    expect(screen.queryByTestId(SYNC_FORM_PATH_TESTID)).toBeNull();
+    expect(screen.queryByText(SYNC_PATH_FIXED_NOTE)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(SYNC_TOKEN_LABEL)).toBeInTheDocument();
   });
 });

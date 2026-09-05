@@ -48,6 +48,13 @@ const beginTitleBarDrag = vi.fn();
  */
 const DESKTOP_WITHOUT_VIEWS = { ...DEFAULT_CAPABILITIES, trayIcon: true };
 
+/**
+ * A desktop that can sync. `sync` alone stopped telling the tiers apart in
+ * Epic 66 (a phone can sync too), so the fixture carries the same kind of
+ * desktop-only flag as above or the shell renders the phone stack.
+ */
+const DESKTOP_WITH_SYNC = { ...DESKTOP_WITHOUT_VIEWS, sync: true };
+
 // The band's drag path is asserted here as "the app asked for a drag"; what the
 // window layer answers is `titlebar-drag`'s own suite.
 vi.mock("@/lib/titlebar-drag", () => ({
@@ -344,7 +351,7 @@ describe("AppShell", () => {
 
   // ── Sync view (Story 32.5) ─────────────────────────────────────────────────
   it("renders the Sync pane for the sync view when the capability is on", () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITH_SYNC);
     primaryViewStore.getState().setView("sync");
     render(<AppShell />);
 
@@ -364,7 +371,7 @@ describe("AppShell", () => {
 
   // ── Files view (Story 43.8) ────────────────────────────────────────────────
   it("renders the Files pane for the files view when the sync capability is on", () => {
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITH_SYNC);
     primaryViewStore.getState().setView("files");
     render(<AppShell />);
 
@@ -577,7 +584,7 @@ describe("AppShell", () => {
       ],
       "p",
     );
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITH_SYNC);
     primaryViewStore.getState().setView("files");
 
     render(<AppShell />);
@@ -606,7 +613,7 @@ describe("AppShell", () => {
   it("restores the folders the Files tree last had open", async () => {
     // biome-ignore lint/suspicious/noDocumentCookie: arranging cookie state is this test's subject
     document.cookie = filesTreeCookie(new Set([nodeKey("p1", ""), nodeKey("p1", "docs")]));
-    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, sync: true });
+    capabilitiesStore.getState().applySnapshot(DESKTOP_WITH_SYNC);
     primaryViewStore.getState().setView("files");
 
     render(<AppShell />);

@@ -96,17 +96,135 @@ impl GitCapabilities {
     }
 }
 
-/// A typed handle onto one `git` binary.
+/// Which engine drives the verbs this module exists for (Epic 66, AD-198).
+///
+/// A desktop has a `git` binary and the shim spawns it. A phone has none —
+/// iOS denies `posix_spawn` to third-party apps, so `Command::spawn` can only
+/// ever return `Err` there — and keeper does what it can in-process with
+/// gitoxide (fetch, fast-forward checkout, commit, its own push over HTTP) and
+/// refuses the rest with a sentence. The variant is decided by the target at
+/// compile time ([`GitEngine::HOST`]) and can be *set* by a test, which is what
+/// lets the Linux suite cover the phone's branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitEngine {
+    /// A `git` binary the host resolved; every verb spawns it.
+    Binary,
+    /// gitoxide alone. Nothing here spawns; the four verbs refuse by name.
+    Gix,
+}
+
+impl GitEngine {
+    /// The engine this build runs: gitoxide on a phone, a binary elsewhere.
+    pub const HOST: GitEngine = if cfg!(target_os = "ios") {
+        GitEngine::Gix
+    } else {
+        GitEngine::Binary
+    };
+
+    /// The word `SyncGitVm.engine` carries.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Binary => "git",
+            Self::Gix => "gix",
+        }
+    }
+}
+
+/// One of the things the shim is asked to do, for the phone's refusal.
+///
+/// Coarser than the subcommand list on purpose: the sentence names the
+/// in-process route keeper takes instead, and several subcommands share one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    /// `git push`.
+    Push,
+    /// `merge`, `switch`, `symbolic-ref`, `rev-parse`: moving or reading
+    /// `HEAD` and the working tree.
+    Checkout,
+    /// `merge-base`, `merge-base --is-ancestor`, `diff --name-only`: reading
+    /// history.
+    History,
+    /// `worktree add|remove|prune`.
+    Worktree,
+    /// `sparse-checkout set|disable`.
+    Sparse,
+    /// `gc`.
+    Gc,
+    /// `git --version`.
+    Probe,
+}
+
+/// The sentence a phone answers a shim verb with (AD-198).
+///
+/// Each names the device and the route keeper takes instead, or why there is
+/// none — a refusal without a next step is a support ticket. Pure, so the
+/// boundary test can assert every sentence without spawning anything.
+pub fn phone_refusal(verb: Verb) -> String {
+    let sentence = match verb {
+        Verb::Push => {
+            "this is a phone: keeper pushes with its own engine here, never through a git binary"
+        }
+        Verb::Checkout => {
+            "this is a phone: keeper checks out with its own engine here, and a history it cannot \
+             fast-forward is named rather than merged"
+        }
+        Verb::History => "this is a phone: keeper reads history with its own engine here",
+        Verb::Worktree => {
+            "this is a phone: a review lane needs a linked worktree, which only a git binary can \
+             make — run this lane on the Mac"
+        }
+        Verb::Sparse => {
+            "this is a phone: a folder here is fully virtual rather than sparse, so subpaths are \
+             not applied"
+        }
+        Verb::Gc => "this is a phone: keeper does not repack here; the Mac keeps this folder's objects bounded",
+        Verb::Probe => "this is a phone: there is no git binary to probe, and keeper does not need one",
+    };
+    sentence.to_owned()
+}
+
+/// A typed handle onto one `git` binary — or, on a phone, onto the refusal.
 #[derive(Debug, Clone)]
 pub struct GitCli {
     program: PathBuf,
+    engine: GitEngine,
 }
 
 impl GitCli {
     /// Bind to the binary the host resolved through
     /// [`SyncPlatform::git_program`](crate::platform::SyncPlatform::git_program).
     pub fn new(program: PathBuf) -> Self {
-        Self { program }
+        Self {
+            program,
+            engine: GitEngine::Binary,
+        }
+    }
+
+    /// The phone's handle: no binary, every verb refused before a spawn.
+    pub fn phone() -> Self {
+        Self {
+            program: PathBuf::new(),
+            engine: GitEngine::Gix,
+        }
+    }
+
+    /// Which engine this handle drives.
+    pub fn engine(&self) -> GitEngine {
+        self.engine
+    }
+
+    /// The one gate every verb passes before [`capture`] is reached.
+    ///
+    /// Checked on the handle rather than on `cfg!` so a test on the Linux box
+    /// can build a phone handle and read the sentence back, which is the only
+    /// way the phone's branch is ever asserted on a machine that has `git`.
+    fn refuse_on_phone(&self, verb: Verb) -> Result<()> {
+        match self.engine {
+            GitEngine::Binary => Ok(()),
+            GitEngine::Gix => Err(SyncError::GitMissing {
+                reason: phone_refusal(verb),
+            }),
+        }
     }
 
     /// The binary this handle drives.
@@ -116,6 +234,7 @@ impl GitCli {
 
     /// Version and floor check for this binary — what `doctor` reports.
     pub fn capabilities(&self) -> Result<GitCapabilities> {
+        self.refuse_on_phone(Verb::Probe)?;
         probe(&self.program)
     }
 
@@ -140,36 +259,42 @@ impl GitCli {
         refspec: &str,
         credential: Option<&Credential>,
     ) -> Result<()> {
+        self.refuse_on_phone(Verb::Push)?;
         self.run_as("push", repo, &push_args(remote, refspec, false), credential)
             .map(drop)
     }
 
     /// Materialize a linked worktree at `path` on a new branch (AD-50).
     pub fn worktree_add(&self, repo: &Path, path: &Path, branch: &str) -> Result<()> {
+        self.refuse_on_phone(Verb::Worktree)?;
         self.run("worktree add", repo, &worktree_add_args(path, branch)?)
             .map(drop)
     }
 
     /// Remove a linked worktree.
     pub fn worktree_remove(&self, repo: &Path, path: &Path) -> Result<()> {
+        self.refuse_on_phone(Verb::Worktree)?;
         self.run("worktree remove", repo, &worktree_remove_args(path)?)
             .map(drop)
     }
 
     /// Drop administrative records for worktrees whose directory is gone.
     pub fn worktree_prune(&self, repo: &Path) -> Result<()> {
+        self.refuse_on_phone(Verb::Worktree)?;
         self.run("worktree prune", repo, &worktree_prune_args())
             .map(drop)
     }
 
     /// Restrict the checkout to `subpaths` in cone mode (AD-47).
     pub fn sparse_set(&self, repo: &Path, subpaths: &[String]) -> Result<()> {
+        self.refuse_on_phone(Verb::Sparse)?;
         self.run("sparse-checkout set", repo, &sparse_set_args(subpaths)?)
             .map(drop)
     }
 
     /// Return to a full checkout.
     pub fn sparse_disable(&self, repo: &Path) -> Result<()> {
+        self.refuse_on_phone(Verb::Sparse)?;
         self.run("sparse-checkout disable", repo, &sparse_disable_args())
             .map(drop)
     }
@@ -178,6 +303,7 @@ impl GitCli {
     /// no maintenance path at all, so this is the only thing keeping a
     /// long-lived profile's object store bounded.
     pub fn gc(&self, repo: &Path) -> Result<()> {
+        self.refuse_on_phone(Verb::Gc)?;
         self.run("gc", repo, &gc_args()).map(drop)
     }
 
@@ -191,6 +317,7 @@ impl GitCli {
     /// fail loudly so the caller runs the conflict-copy path instead of
     /// silently creating a merge commit nobody asked for.
     pub fn merge_ff_only(&self, repo: &Path, reference: &str) -> Result<()> {
+        self.refuse_on_phone(Verb::Checkout)?;
         self.run("merge --ff-only", repo, &merge_ff_only_args(reference)?)
             .map(drop)
     }
@@ -202,6 +329,7 @@ impl GitCli {
     /// path has been preserved as a conflict copy (AD-43), so "theirs wins" is
     /// a naming decision, not a data-loss one.
     pub fn merge_theirs(&self, repo: &Path, reference: &str, message: &str) -> Result<()> {
+        self.refuse_on_phone(Verb::Checkout)?;
         self.run(
             "merge -X theirs",
             repo,
@@ -212,6 +340,7 @@ impl GitCli {
 
     /// The merge base of two commits, used to work out which side changed what.
     pub fn merge_base(&self, repo: &Path, a: &str, b: &str) -> Result<String> {
+        self.refuse_on_phone(Verb::History)?;
         let out = self.run("merge-base", repo, &merge_base_args(a, b)?)?;
         Ok(out.trim().to_owned())
     }
@@ -223,6 +352,7 @@ impl GitCli {
     /// gitoxide implements no `switch`/`checkout` workflow, so this is the
     /// shim's job.
     pub fn ensure_branch(&self, repo: &Path, branch: &str) -> Result<()> {
+        self.refuse_on_phone(Verb::Checkout)?;
         let exists = self
             .run("rev-parse --verify", repo, &rev_parse_verify_args(branch)?)
             .is_ok();
@@ -232,6 +362,7 @@ impl GitCli {
 
     /// The branch HEAD currently points at, or `None` when detached.
     pub fn current_branch(&self, repo: &Path) -> Result<Option<String>> {
+        self.refuse_on_phone(Verb::Checkout)?;
         let out = self.run(
             "symbolic-ref",
             repo,
@@ -264,6 +395,7 @@ impl GitCli {
     /// `git merge-base --is-ancestor` answers with its exit status: 0 yes,
     /// 1 no. Only 1 is a real "no" — any other failure is propagated.
     pub fn is_ancestor(&self, repo: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+        self.refuse_on_phone(Verb::History)?;
         // Exit 1 is this command's ANSWER, not a failure, so it must not go
         // through the warn-logging path — the supervisor asks on every tick and
         // would otherwise fill the log with warnings about nothing.
@@ -291,6 +423,7 @@ impl GitCli {
 
     /// Paths that differ between two commits, repository-relative.
     pub fn diff_names(&self, repo: &Path, from: &str, to: &str) -> Result<Vec<PathBuf>> {
+        self.refuse_on_phone(Verb::History)?;
         let out = self.run("diff --name-only", repo, &diff_names_args(from, to)?)?;
         Ok(out
             .lines()
@@ -1062,7 +1195,7 @@ pub(crate) fn one_line(text: &str) -> String {
 }
 
 /// Name a repository directory for an error message.
-fn repo_label(repo: &Path) -> String {
+pub(crate) fn repo_label(repo: &Path) -> String {
     repo.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| repo.display().to_string())
@@ -1574,5 +1707,124 @@ mod tests {
         let err = probe(Path::new("/nonexistent/keeper-sync/git")).expect_err("must fail");
         assert_eq!(err.code(), "gitMissing");
         assert!(err.needs_user_action());
+    }
+
+    /// The phone's branch, asserted on a machine that has `git` (AD-198).
+    ///
+    /// Every verb is driven against a directory that is NOT a repository and
+    /// against a program that does not exist: were a spawn to happen it would
+    /// fail with git's own `not a git repository` or the shim's `does not
+    /// exist or is not executable`, and the assertion on the sentence would
+    /// fail with it. So the sentences below prove the refusal came first.
+    #[test]
+    fn a_phone_refuses_every_verb_before_spawning() {
+        let phone = GitCli::phone();
+        assert_eq!(phone.engine(), GitEngine::Gix);
+        let nowhere = Path::new("/nonexistent/keeper-sync/phone-repo");
+        let sentence = |result: std::result::Result<(), SyncError>| -> String {
+            match result.expect_err("a phone refuses") {
+                SyncError::GitMissing { reason } => reason,
+                other => panic!("a refusal is `GitMissing`, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            sentence(phone.push(nowhere, "origin", "refs/heads/main:refs/heads/main", None)),
+            phone_refusal(Verb::Push)
+        );
+        assert_eq!(
+            sentence(phone.merge_ff_only(nowhere, "refs/remotes/origin/main")),
+            phone_refusal(Verb::Checkout)
+        );
+        assert_eq!(
+            sentence(phone.merge_theirs(nowhere, "refs/remotes/origin/main", "m")),
+            phone_refusal(Verb::Checkout)
+        );
+        assert_eq!(
+            sentence(phone.ensure_branch(nowhere, "lane")),
+            phone_refusal(Verb::Checkout)
+        );
+        assert_eq!(
+            sentence(phone.current_branch(nowhere).map(drop)),
+            phone_refusal(Verb::Checkout)
+        );
+        assert_eq!(
+            sentence(phone.is_ancestor(nowhere, "a", "b").map(drop)),
+            phone_refusal(Verb::History)
+        );
+        assert_eq!(
+            sentence(phone.merge_base(nowhere, "a", "b").map(drop)),
+            phone_refusal(Verb::History)
+        );
+        assert_eq!(
+            sentence(phone.diff_names(nowhere, "a", "b").map(drop)),
+            phone_refusal(Verb::History)
+        );
+        assert_eq!(
+            sentence(phone.worktree_add(nowhere, Path::new("/tmp/lane"), "lane")),
+            phone_refusal(Verb::Worktree)
+        );
+        assert_eq!(
+            sentence(phone.worktree_remove(nowhere, Path::new("/tmp/lane"))),
+            phone_refusal(Verb::Worktree)
+        );
+        assert_eq!(
+            sentence(phone.worktree_prune(nowhere)),
+            phone_refusal(Verb::Worktree)
+        );
+        assert_eq!(
+            sentence(phone.sparse_set(nowhere, &["notes".to_owned()])),
+            phone_refusal(Verb::Sparse)
+        );
+        assert_eq!(
+            sentence(phone.sparse_disable(nowhere)),
+            phone_refusal(Verb::Sparse)
+        );
+        assert_eq!(sentence(phone.gc(nowhere)), phone_refusal(Verb::Gc));
+        assert_eq!(
+            sentence(phone.capabilities().map(drop)),
+            phone_refusal(Verb::Probe)
+        );
+    }
+
+    /// Each sentence names the device and either the in-process route or the
+    /// reason there is none — the AD-27 shape of a refusal.
+    #[test]
+    fn every_phone_refusal_names_the_phone_and_a_next_step() {
+        for verb in [
+            Verb::Push,
+            Verb::Checkout,
+            Verb::History,
+            Verb::Worktree,
+            Verb::Sparse,
+            Verb::Gc,
+            Verb::Probe,
+        ] {
+            let sentence = phone_refusal(verb);
+            assert!(
+                sentence.starts_with("this is a phone:"),
+                "{verb:?}: {sentence}"
+            );
+            assert!(
+                sentence.contains("own engine")
+                    || sentence.contains("Mac")
+                    || sentence.contains("not"),
+                "{verb:?} names no route and no reason: {sentence}"
+            );
+        }
+        assert!(phone_refusal(Verb::Push).contains("pushes with its own engine"));
+    }
+
+    #[test]
+    fn the_host_engine_is_the_binary_off_the_phone() {
+        // This suite never runs on iOS; the constant is the one place the
+        // target decides, and everything else reads it off the handle.
+        assert_eq!(GitEngine::HOST, GitEngine::Binary);
+        assert_eq!(GitEngine::Binary.name(), "git");
+        assert_eq!(GitEngine::Gix.name(), "gix");
+        assert_eq!(
+            GitCli::new(PathBuf::from("/usr/bin/git")).engine(),
+            GitEngine::Binary
+        );
     }
 }

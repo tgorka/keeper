@@ -80,6 +80,7 @@ import type { SyncProfileVm } from "@/lib/ipc/client";
 // The notes flag is the exception — it DOES change what the vault mirror holds,
 // so it is followed by a refresh of that mirror.
 import { syncClearCredential, syncGetCredential, syncSetCredential } from "@/lib/ipc/client";
+import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import {
   ensureNotesVaultsHydrated,
   notesVaultsStore,
@@ -1198,6 +1199,13 @@ export function AddFolderForm({
    */
   const [tokenVisible, setTokenVisible] = useState(false);
   /**
+   * Story 66.1: the same form is the phone's profile sheet (AD-199). What the
+   * phone cannot choose — the folder, the direction, a watcher's windows, the
+   * recorder and sessions flags — is absent from it by the tier the
+   * capabilities report, never a control that fails on tap (AD-27).
+   */
+  const reducedCapability = useIsReducedCapabilityPlatform();
+  /**
    * This machine's home directory, or `null` while it is unknown (Story 59.8).
    *
    * Read from the shell rather than composed here, and read once per open: it
@@ -1603,8 +1611,11 @@ export function AddFolderForm({
     }
   };
 
+  // The phone needs no folder: Rust assigns the container (AD-199).
   const incomplete =
-    form.name.trim() === "" || form.localPath === "" || form.remoteUrl.trim() === "";
+    form.name.trim() === "" ||
+    (!reducedCapability && form.localPath === "") ||
+    form.remoteUrl.trim() === "";
 
   return (
     <form
@@ -1633,7 +1644,11 @@ export function AddFolderForm({
           one, since a native directory dialog has no way to say "the folder I
           mean is the one I can name". The box holds what was typed; the line
           under it says where that lands. */}
-      {editing ? (
+      {/* The phone has no folder to pick (AD-199): `sync_profile_save` on iOS
+          takes an empty path and assigns the app container itself, and the
+          answered profile carries the path it chose. Both shapes are absent
+          on the reduced tier. */}
+      {!reducedCapability && editing ? (
         <div className="flex items-center justify-between gap-2">
           <div className="flex min-w-0 flex-col gap-0.5">
             <Label>{SYNC_FOLDER_LABEL}</Label>
@@ -1646,7 +1661,7 @@ export function AddFolderForm({
             </p>
           </div>
         </div>
-      ) : (
+      ) : !reducedCapability ? (
         <>
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-path`}>{SYNC_FOLDER_LABEL}</Label>
@@ -1705,7 +1720,7 @@ export function AddFolderForm({
             </div>
           </div>
         </>
-      )}
+      ) : null}
       {/* Said in both modes, because it is a claim about what is being synced
           rather than about the press: somebody opening the form of a folder
           that already IS home needs it at least as much as somebody about to
@@ -1715,7 +1730,9 @@ export function AddFolderForm({
           this is not one: home is a legal folder and the save will go through.
           */}
       {homeChosen && <p className="text-foreground text-xs">{SYNC_HOME_FOLDER_WARNING}</p>}
-      {editing && <p className="text-muted-foreground text-xs">{SYNC_PATH_FIXED_NOTE}</p>}
+      {editing && !reducedCapability && (
+        <p className="text-muted-foreground text-xs">{SYNC_PATH_FIXED_NOTE}</p>
+      )}
       <div className="flex items-center justify-between gap-2">
         <Label htmlFor={`${fieldId}-remote`}>{SYNC_REMOTE_URL_LABEL}</Label>
         <Input
@@ -1739,31 +1756,36 @@ export function AddFolderForm({
       {folderOwned.has("branch") && (
         <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("branch")}</p>
       )}
-      <div className="flex items-center justify-between gap-2">
-        <Label id={`${fieldId}-direction-label`}>{SYNC_DIRECTION_LABEL}</Label>
-        <Select
-          value={form.direction}
-          disabled={disabled || saving}
-          onValueChange={(value) =>
-            setForm((live) => ({ ...live, direction: value as SyncDirection }))
-          }
-        >
-          <SelectTrigger
-            className="w-40"
-            data-testid={SYNC_DIRECTION_SELECT_TESTID}
-            aria-labelledby={`${fieldId}-direction-label`}
+      {/* Direction is the desktop's too: the phone mirrors (AD-199) — it fetches
+          and fast-forwards, and pushes what it commits — so there is nothing
+          to choose. */}
+      {!reducedCapability && (
+        <div className="flex items-center justify-between gap-2">
+          <Label id={`${fieldId}-direction-label`}>{SYNC_DIRECTION_LABEL}</Label>
+          <Select
+            value={form.direction}
+            disabled={disabled || saving}
+            onValueChange={(value) =>
+              setForm((live) => ({ ...live, direction: value as SyncDirection }))
+            }
           >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {Object.entries(DIRECTION_LABELS).map(([value, label]) => (
-              <SelectItem key={value} value={value}>
-                {label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+            <SelectTrigger
+              className="w-40"
+              data-testid={SYNC_DIRECTION_SELECT_TESTID}
+              aria-labelledby={`${fieldId}-direction-label`}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {Object.entries(DIRECTION_LABELS).map(([value, label]) => (
+                <SelectItem key={value} value={value}>
+                  {label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
       {/* The notes flag (FR-94, AD-54). Above Advanced rather than inside it:
           it is the whole of what makes a folder a vault, and burying the one
           decision the feature needs behind a disclosure would be the "vault
@@ -1815,110 +1837,127 @@ export function AddFolderForm({
           </ul>
         </>
       )}
-      {/* The recordings flag (AD-66). Beside the notes flag, above Advanced, for
-          the same reason: it is the whole of what makes a folder a recording
-          destination, and it is the one control Stories 41.1 and 41.2 were
-          waiting on. */}
-      <div className="flex items-center justify-between gap-2">
-        <Label htmlFor={`${fieldId}-recordings`}>{SYNC_RECORDINGS_LABEL}</Label>
-        <Switch
-          id={`${fieldId}-recordings`}
-          checked={form.recordings}
-          disabled={disabled || saving || folderOwned.has("recordings")}
-          onCheckedChange={(checked) => setForm((live) => ({ ...live, recordings: checked }))}
-        />
-      </div>
-      <p className="text-muted-foreground text-xs">{SYNC_RECORDINGS_NOTE}</p>
-      {folderOwned.has("recordings") && (
-        <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("recordings")}</p>
-      )}
-      {form.recordings && (
+      {/* The recordings and sessions flags: desktop concerns (a recorder that
+          spawns a sidecar, a board over a folder of command runs — AD-201,
+          AD-203), so they are absent on the reduced tier rather than switches
+          that flag a folder for a feature the phone has no surface for. */}
+      {!reducedCapability && (
         <>
+          {/* The recordings flag (AD-66). Beside the notes flag, above Advanced, for
+              the same reason: it is the whole of what makes a folder a recording
+              destination, and it is the one control Stories 41.1 and 41.2 were
+              waiting on. */}
           <div className="flex items-center justify-between gap-2">
-            <Label htmlFor={`${fieldId}-recordings-subfolder`}>
-              {SYNC_RECORDINGS_SUBFOLDER_LABEL}
-            </Label>
-            <Input
-              id={`${fieldId}-recordings-subfolder`}
-              className="w-56"
-              value={form.recordingsSubfolder}
-              disabled={disabled || saving}
-              onChange={(event) =>
-                setForm((live) => ({ ...live, recordingsSubfolder: event.target.value }))
-              }
+            <Label htmlFor={`${fieldId}-recordings`}>{SYNC_RECORDINGS_LABEL}</Label>
+            <Switch
+              id={`${fieldId}-recordings`}
+              checked={form.recordings}
+              disabled={disabled || saving || folderOwned.has("recordings")}
+              onCheckedChange={(checked) => setForm((live) => ({ ...live, recordings: checked }))}
             />
           </div>
-          {/* Only while adding, where the box starts empty because no stored
-              profile has told this form what keeper would pick. */}
-          {!editing && (
-            <p className="text-muted-foreground text-xs">{SYNC_RECORDINGS_SUBFOLDER_NOTE}</p>
+          <p className="text-muted-foreground text-xs">{SYNC_RECORDINGS_NOTE}</p>
+          {folderOwned.has("recordings") && (
+            <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("recordings")}</p>
           )}
-          {/* The resolved root, and only ever of what the box actually holds. An
-              emptied box on an edit form previews nothing rather than the stored
-              value it no longer says — that save is about to be refused, and a
-              preview of a path it will not write would be the form disagreeing
-              with itself. */}
-          {form.localPath !== "" && form.recordingsSubfolder.trim() !== "" && (
-            <p className="truncate font-mono text-muted-foreground text-xs">
-              {`${form.localPath}/${form.recordingsSubfolder.trim()}`}
-            </p>
+          {form.recordings && (
+            <>
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor={`${fieldId}-recordings-subfolder`}>
+                  {SYNC_RECORDINGS_SUBFOLDER_LABEL}
+                </Label>
+                <Input
+                  id={`${fieldId}-recordings-subfolder`}
+                  className="w-56"
+                  value={form.recordingsSubfolder}
+                  disabled={disabled || saving}
+                  onChange={(event) =>
+                    setForm((live) => ({ ...live, recordingsSubfolder: event.target.value }))
+                  }
+                />
+              </div>
+              {/* Only while adding, where the box starts empty because no stored
+                  profile has told this form what keeper would pick. */}
+              {!editing && (
+                <p className="text-muted-foreground text-xs">{SYNC_RECORDINGS_SUBFOLDER_NOTE}</p>
+              )}
+              {/* The resolved root, and only ever of what the box actually holds. An
+                  emptied box on an edit form previews nothing rather than the stored
+                  value it no longer says — that save is about to be refused, and a
+                  preview of a path it will not write would be the form disagreeing
+                  with itself. */}
+              {form.localPath !== "" && form.recordingsSubfolder.trim() !== "" && (
+                <p className="truncate font-mono text-muted-foreground text-xs">
+                  {`${form.localPath}/${form.recordingsSubfolder.trim()}`}
+                </p>
+              )}
+            </>
+          )}
+          {/* The sessions flag (FR-222, AD-107). Third in the "this folder also
+              holds X" row, on the recordings control's exact shape. */}
+          <div className="flex items-center justify-between gap-2">
+            <Label htmlFor={`${fieldId}-sessions`}>{SYNC_SESSIONS_LABEL}</Label>
+            <Switch
+              id={`${fieldId}-sessions`}
+              checked={form.sessions}
+              disabled={disabled || saving || folderOwned.has("sessions")}
+              onCheckedChange={(checked) => setForm((live) => ({ ...live, sessions: checked }))}
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_NOTE}</p>
+          {folderOwned.has("sessions") && (
+            <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("sessions")}</p>
+          )}
+          {form.sessions && (
+            <>
+              <div className="flex items-center justify-between gap-2">
+                <Label htmlFor={`${fieldId}-sessions-subfolder`}>
+                  {SYNC_SESSIONS_SUBFOLDER_LABEL}
+                </Label>
+                <Input
+                  id={`${fieldId}-sessions-subfolder`}
+                  className="w-56"
+                  value={form.sessionsSubfolder}
+                  disabled={disabled || saving}
+                  onChange={(event) =>
+                    setForm((live) => ({ ...live, sessionsSubfolder: event.target.value }))
+                  }
+                />
+              </div>
+              {/* Only while adding, for the recordings reason: no stored profile has
+                  told this form what keeper would pick. */}
+              {!editing && (
+                <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_SUBFOLDER_NOTE}</p>
+              )}
+              {form.localPath !== "" && form.sessionsSubfolder.trim() !== "" && (
+                <p className="truncate font-mono text-muted-foreground text-xs">
+                  {`${form.localPath}/${form.sessionsSubfolder.trim()}`}
+                </p>
+              )}
+            </>
           )}
         </>
       )}
-      {/* The sessions flag (FR-222, AD-107). Third in the "this folder also
-          holds X" row, on the recordings control's exact shape. */}
-      <div className="flex items-center justify-between gap-2">
-        <Label htmlFor={`${fieldId}-sessions`}>{SYNC_SESSIONS_LABEL}</Label>
-        <Switch
-          id={`${fieldId}-sessions`}
-          checked={form.sessions}
-          disabled={disabled || saving || folderOwned.has("sessions")}
-          onCheckedChange={(checked) => setForm((live) => ({ ...live, sessions: checked }))}
-        />
-      </div>
-      <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_NOTE}</p>
-      {folderOwned.has("sessions") && (
-        <p className="text-muted-foreground text-xs">{syncFolderOwnedNote("sessions")}</p>
+      {/* Advanced is the desktop's: settle and poll windows belong to a
+          watcher the phone does not run (AD-198), the LFS and virtual knobs
+          are forced full-virtual there (AD-199), and the rest configure a
+          folder the phone did not choose. Absent on the reduced tier, not
+          disabled (AD-27). */}
+      {!reducedCapability && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="w-fit justify-start gap-1 px-1"
+          data-testid={SYNC_ADVANCED_TOGGLE_TESTID}
+          aria-expanded={expanded}
+          onClick={() => setExpanded((shown) => !shown)}
+        >
+          {expanded ? <ChevronDown aria-hidden /> : <ChevronRight aria-hidden />}
+          {SYNC_ADVANCED_LABEL}
+        </Button>
       )}
-      {form.sessions && (
-        <>
-          <div className="flex items-center justify-between gap-2">
-            <Label htmlFor={`${fieldId}-sessions-subfolder`}>{SYNC_SESSIONS_SUBFOLDER_LABEL}</Label>
-            <Input
-              id={`${fieldId}-sessions-subfolder`}
-              className="w-56"
-              value={form.sessionsSubfolder}
-              disabled={disabled || saving}
-              onChange={(event) =>
-                setForm((live) => ({ ...live, sessionsSubfolder: event.target.value }))
-              }
-            />
-          </div>
-          {/* Only while adding, for the recordings reason: no stored profile has
-              told this form what keeper would pick. */}
-          {!editing && (
-            <p className="text-muted-foreground text-xs">{SYNC_SESSIONS_SUBFOLDER_NOTE}</p>
-          )}
-          {form.localPath !== "" && form.sessionsSubfolder.trim() !== "" && (
-            <p className="truncate font-mono text-muted-foreground text-xs">
-              {`${form.localPath}/${form.sessionsSubfolder.trim()}`}
-            </p>
-          )}
-        </>
-      )}
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        className="w-fit justify-start gap-1 px-1"
-        data-testid={SYNC_ADVANCED_TOGGLE_TESTID}
-        aria-expanded={expanded}
-        onClick={() => setExpanded((shown) => !shown)}
-      >
-        {expanded ? <ChevronDown aria-hidden /> : <ChevronRight aria-hidden />}
-        {SYNC_ADVANCED_LABEL}
-      </Button>
-      {expanded && (
+      {expanded && !reducedCapability && (
         <div className="flex flex-col gap-2 pl-1">
           <div className="flex items-center justify-between gap-2">
             <Label id={`${fieldId}-lfs-label`}>{SYNC_LFS_MODE_LABEL}</Label>
@@ -2249,6 +2288,13 @@ export function AddFolderForm({
             />
           </div>
           <p className="text-muted-foreground text-xs">{SYNC_AUTHOR_NOTE}</p>
+        </div>
+      )}
+      {/* The credential: last inside Advanced on the desktop, and a first-order
+          field on the phone (Story 66.1, AD-199), where a profile IS a remote
+          URL plus a credential and there is no disclosure to open. */}
+      {(expanded || reducedCapability) && (
+        <div className={cn("flex flex-col gap-2", !reducedCapability && "pl-1")}>
           <div className="flex items-center justify-between gap-2">
             <Label htmlFor={`${fieldId}-token`}>{SYNC_TOKEN_LABEL}</Label>
             <div className="flex w-56 items-center gap-1">

@@ -85,10 +85,16 @@ describe("isReducedCapabilityPlatform", () => {
   it("a single tier-telling flag (hydrated) is NOT reduced — every flag must be absent", () => {
     // Derived from the VM's own keys so a capability added later is exercised
     // automatically: the hand-written list had already drifted past `sync`.
-    // `bots` is the one flag true on every tier (Epic 62, FR-396), so it is the
-    // one flag that must NOT flip the verdict; the case below owns it.
+    // `bots`, `sync` and `notes` are the flags true on every tier (Epic 62,
+    // FR-396; Epic 66, AD-198/AD-200), so they are the flags that must NOT
+    // flip the verdict; the cases below own them.
+    const neutral: Partial<Record<keyof CapabilitiesVm, true>> = {
+      bots: true,
+      sync: true,
+      notes: true,
+    };
     const flags = (Object.keys(DEFAULT_CAPABILITIES) as Array<keyof CapabilitiesVm>).filter(
-      (flag) => flag !== "bots",
+      (flag) => neutral[flag] !== true,
     );
     for (const flag of flags) {
       capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, [flag]: true });
@@ -102,6 +108,17 @@ describe("isReducedCapabilityPlatform", () => {
     // "On this iPhone" disclosure, the backup-exclusion line and the offline
     // pill would all vanish the moment the pane existed.
     capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true });
+    expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
+  });
+
+  it("a phone with a folder on it (`sync`, `notes`, `bots` true) IS still reduced", () => {
+    // Epic 66 links `keeper-sync` on iOS (AD-198) and notes ride the folder
+    // (AD-200). The tier is told by what the OS refuses — tray, hotkey, menu
+    // bar, updater, sidecar, reveal — not by whether a folder can sync; the
+    // first phone that could sync must not read as a desktop.
+    capabilitiesStore
+      .getState()
+      .applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true, notes: true });
     expect(isReducedCapabilityPlatform(capabilitiesStore.getState())).toBe(true);
   });
 

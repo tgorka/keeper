@@ -139,6 +139,7 @@ vi.mock("@/lib/ipc/client", () => ({
       state: "unsupported",
       summary: null,
       problem: null,
+      engine: "git",
       configuredPath: null,
     }),
   ),
@@ -354,6 +355,7 @@ beforeEach(() => {
     state: "unsupported",
     summary: null,
     problem: null,
+    engine: "git",
     configuredPath: null,
   });
   accountsStore.getState().clear();
@@ -1045,6 +1047,7 @@ describe("SettingsDialog git report placement", () => {
       state: "tooOld",
       summary: null,
       problem: "/usr/local/bin/git is 2.23, below the 2.42 floor",
+      engine: "git",
       configuredPath: null,
     });
   });

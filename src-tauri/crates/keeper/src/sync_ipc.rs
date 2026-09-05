@@ -1278,15 +1278,26 @@ pub async fn sync_profile_save(
             .find(|p| p.id == id),
         None => None,
     };
-    let profile = parse_req(&req, prior.as_ref())?;
+    #[cfg(not(desktop))]
+    let req = phone_shaped_request(&state, req, prior.as_ref())?;
+    let mut profile = parse_req(&req, prior.as_ref())?;
+    // The phone's default (AD-199): fully virtual, every LFS path a pointer
+    // until it is opened. On a new profile only — an edit keeps what is set.
+    if cfg!(not(desktop)) && prior.is_none() {
+        profile.make_fully_virtual();
+    }
     engine
         .upsert_profile(&profile)
         .map_err(|e| sync_ipc_error(&e))?;
     // The sessions flag rides this save (FR-222), and the root registry is a
     // filter over the profile list (AD-107) — so the registry re-reads here,
     // the same move `notes_vault_flag` makes for vaults. Idempotent and cheap
-    // when nothing sessions-shaped changed.
+    // when nothing sessions-shaped changed. Desktop: the sessions board stays
+    // on the Mac (AD-201).
+    #[cfg(desktop)]
     crate::sessions_root::refresh(&app);
+    #[cfg(not(desktop))]
+    let _ = app;
     // Best effort, and that word is load-bearing: the row is already committed,
     // so a failure here is a failed READ of work that succeeded. Reporting it as
     // an error would make an add whose write landed look like an add that did
@@ -1296,6 +1307,51 @@ pub async fn sync_profile_save(
     // folder-owned keys the write stripped.
     let answer = profile_by_id(&state, &profile.id).unwrap_or(profile);
     Ok(SyncProfileVm::from(&answer))
+}
+
+/// The subfolder of the app container the phone's folders live under.
+#[cfg(not(desktop))]
+const PHONE_FOLDERS_DIR: &str = "sync";
+
+/// Give a phone's profile its folder (Epic 66, AD-199).
+///
+/// A phone has no folder picker and no home directory a person could name, so
+/// the sheet sends `localPath: ""` and the container decides: `<app data
+/// dir>/sync/<profile id>`, created here and excluded from backup like the
+/// rest of the container — a clone is a mirror of a remote that already holds
+/// it, and iCloud copying it twice a day would be the phone's biggest upload.
+/// An edit that names its path already keeps it; an edit that sends `""`
+/// keeps the stored one, so a form cannot move a folder by leaving the field
+/// blank.
+#[cfg(not(desktop))]
+fn phone_shaped_request(
+    state: &tauri::State<'_, AppState>,
+    mut req: SyncProfileReq,
+    prior: Option<&SyncProfile>,
+) -> Result<SyncProfileReq, IpcError> {
+    if !req.local_path.trim().is_empty() {
+        return Ok(req);
+    }
+    if let Some(prior) = prior {
+        req.local_path = prior.local_path.to_string_lossy().into_owned();
+        return Ok(req);
+    }
+    let id = req.id.clone().unwrap_or_else(new_ulid);
+    let data_dir = state
+        .platform
+        .data_dir()
+        .map_err(|err| sync_ipc_error(&SyncError::Config(format!("no data directory: {err}"))))?;
+    let folder = data_dir.join(PHONE_FOLDERS_DIR).join(&id);
+    std::fs::create_dir_all(&folder)
+        .map_err(|err| sync_ipc_error(&SyncError::io("create the phone's folder", &folder, err)))?;
+    if let Err(err) = state.platform.exclude_from_backup(&folder) {
+        // Best effort, like every other exclusion: the container itself is
+        // already excluded, so this only fails to say twice what is true.
+        tracing::warn!(path = %folder.display(), %err, "sync: could not exclude the folder from backup");
+    }
+    req.id = Some(id);
+    req.local_path = folder.to_string_lossy().into_owned();
+    Ok(req)
 }
 
 /// Forget a profile. The folder and its repository are left on disk untouched —
@@ -1413,6 +1469,12 @@ fn outcome_line(outcome: &SyncOutcome) -> String {
 /// Named `sync_folder_now` rather than `sync_now`: the latter is already the
 /// Matrix sync kick, and two unrelated operations sharing a command name is
 /// how a caller ends up invoking the wrong one.
+///
+/// The phone's pull-to-refresh (Epic 66, NFR-57), and the desktop's "Sync
+/// now". `sync_once_recording` rather than `sync_once`, so a failure lands in
+/// the profile's own status row as well as in this call's answer: on a phone
+/// nothing else — no supervisor tick — would ever put the divergence sentence
+/// (AD-199) where the Sync surface reads it.
 #[tauri::command]
 pub async fn sync_folder_now(
     state: tauri::State<'_, AppState>,
@@ -1420,7 +1482,7 @@ pub async fn sync_folder_now(
 ) -> Result<SyncOutcomeVm, IpcError> {
     let engine = engine_of(&state)?;
     let outcome = engine
-        .sync_once(&id, SyncSource::Manual)
+        .sync_once_recording(&id, SyncSource::Manual)
         .await
         .map_err(|e| sync_ipc_error(&e))?;
     Ok(SyncOutcomeVm {
@@ -2729,21 +2791,33 @@ fn unavailable_sentence(profile: &SyncProfile) -> String {
 /// is not attached, the file manager refused).
 #[tauri::command]
 pub async fn sync_open_path(state: tauri::State<'_, AppState>, id: String) -> Result<(), IpcError> {
-    let engine = engine_of(&state)?;
-    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
-    let profile = find_profile(&profiles, &id)?;
-    // Checked before the reveal, not left to it: the plugin fails the same way
-    // whether the volume is out or the folder was deleted, and on some platforms
-    // it succeeds at showing an empty window instead.
-    if !profile.local_path.is_dir() {
-        return Err(open_failure(unavailable_sentence(profile)));
+    // A phone has no file manager to reveal in (AD-203); `revealInFileManager`
+    // is false there, so nothing offers this.
+    #[cfg(not(desktop))]
+    {
+        let _ = (state, id);
+        return Err(open_failure(
+            "this is a phone: there is no file manager to open a folder in".to_owned(),
+        ));
     }
-    tauri_plugin_opener::reveal_item_in_dir(&profile.local_path).map_err(|e| {
-        open_failure(format!(
-            "could not open {} in the file manager: {e}",
-            profile.local_path.display()
-        ))
-    })
+    #[cfg(desktop)]
+    {
+        let engine = engine_of(&state)?;
+        let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+        let profile = find_profile(&profiles, &id)?;
+        // Checked before the reveal, not left to it: the plugin fails the same
+        // way whether the volume is out or the folder was deleted, and on some
+        // platforms it succeeds at showing an empty window instead.
+        if !profile.local_path.is_dir() {
+            return Err(open_failure(unavailable_sentence(profile)));
+        }
+        tauri_plugin_opener::reveal_item_in_dir(&profile.local_path).map_err(|e| {
+            open_failure(format!(
+                "could not open {} in the file manager: {e}",
+                profile.local_path.display()
+            ))
+        })
+    }
 }
 
 /// One streamed progress update (Story 29.1, AD-51).
@@ -3438,22 +3512,34 @@ pub async fn sync_open_entry(
     id: String,
     subpath: String,
 ) -> Result<(), IpcError> {
-    let engine = engine_of(&state)?;
-    let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
-    let profile = find_profile(&profiles, &id)?;
-    let resolved = browse::resolve(&profile.local_path, &subpath)
-        .map_err(|refusal| open_failure(refusal.to_string()))?
-        .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
-    // A use keeper can observe, so the release clock for this path moves
-    // (Story 56.5, AD-126). Best-effort by signature and no policy here: the
-    // engine owns every rule, because a rule in this crate is one nobody can
-    // exercise on Linux.
-    engine.note_use(&id, &subpath);
-    tauri_plugin_opener::open_path(&resolved, None::<&str>).map_err(|error| {
-        open_failure(format!(
-            "could not open {subpath} with the system's default application: {error}"
-        ))
-    })
+    // The phone has no default-application opener for a file inside the
+    // container; 66.3 hands a file to the share sheet instead (AD-200).
+    #[cfg(not(desktop))]
+    {
+        let _ = (&state, &id);
+        return Err(open_failure(format!(
+            "this is a phone: there is no application to hand {subpath} to — share it out instead"
+        )));
+    }
+    #[cfg(desktop)]
+    {
+        let engine = engine_of(&state)?;
+        let profiles = engine.list_profiles().map_err(|e| sync_ipc_error(&e))?;
+        let profile = find_profile(&profiles, &id)?;
+        let resolved = browse::resolve(&profile.local_path, &subpath)
+            .map_err(|refusal| open_failure(refusal.to_string()))?
+            .ok_or_else(|| open_failure(missing_sentence(profile, &subpath)))?;
+        // A use keeper can observe, so the release clock for this path moves
+        // (Story 56.5, AD-126). Best-effort by signature and no policy here: the
+        // engine owns every rule, because a rule in this crate is one nobody can
+        // exercise on Linux.
+        engine.note_use(&id, &subpath);
+        tauri_plugin_opener::open_path(&resolved, None::<&str>).map_err(|error| {
+            open_failure(format!(
+                "could not open {subpath} with the system's default application: {error}"
+            ))
+        })
+    }
 }
 
 /// Ask for one virtual path's content (Story 56.3, FR-338).
@@ -4123,6 +4209,7 @@ fn routable_profile(state: &tauri::State<'_, AppState>, id: &str) -> Result<Sync
 // visible to the crate and to nobody else.
 
 /// The profile behind one sessions root.
+#[cfg(desktop)]
 pub(crate) fn sessions_profile(
     state: &tauri::State<'_, AppState>,
     root_id: &str,
@@ -4132,6 +4219,7 @@ pub(crate) fn sessions_profile(
 
 /// The live vault and the write scope over it — including the AD-113 fence,
 /// which is what the tree renders its read-only lock from.
+#[cfg(desktop)]
 pub(crate) fn sessions_scope(
     profile: &SyncProfile,
 ) -> (Option<crate::notes_vault::Vault>, WriteScope<'_>) {
@@ -4140,6 +4228,7 @@ pub(crate) fn sessions_scope(
 
 /// One `Engine::pending` answer for the whole tree, the engine's own words on
 /// failure.
+#[cfg(desktop)]
 pub(crate) async fn sessions_pending(
     state: &tauri::State<'_, AppState>,
     root_id: &str,
@@ -4160,6 +4249,7 @@ pub(crate) async fn sessions_pending(
 /// matters is that there is exactly one function wording these states, so a
 /// session file the Files pane calls excluded is called excluded here in the
 /// same words.
+#[cfg(desktop)]
 pub(crate) fn sessions_sync_mark(
     status: &browse::EntrySyncStatus,
     engine_failure: Option<&str>,
@@ -4407,6 +4497,7 @@ pub async fn sync_write_frontmatter(
 ) -> Result<String, IpcError> {
     // Scoped to this function: nothing else in this module emits, and the
     // module deliberately spells every other `tauri::` name in full.
+    #[cfg(desktop)]
     use tauri::Emitter as _;
 
     let profile = routable_profile(&state, &id)?;
@@ -4486,9 +4577,13 @@ pub async fn sync_write_frontmatter(
     // Only for a profile that holds a sessions zone. A tag written in an
     // ordinary synced folder changes no space, and an event nobody is listening
     // for is still a re-read for every open board.
+    // A phone has no sessions board to tell (AD-201).
+    #[cfg(desktop)]
     if profile.sessions.is_some() {
         let _ = app.emit(crate::sessions_root::SESSIONS_CHANGED_EVENT, id);
     }
+    #[cfg(not(desktop))]
+    let _ = (app, id);
     Ok(landed)
 }
 

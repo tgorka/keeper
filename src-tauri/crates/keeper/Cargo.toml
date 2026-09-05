@@ -22,6 +22,14 @@ tauri-build = { workspace = true }
 
 [dependencies]
 keeper-core = { path = "../keeper-core" }
+# Folder sync (Epic 29, AD-40) — on every target since Epic 66 (AD-198).
+# It sat in the desktop-only table below for eight epics on the belief that
+# gitoxide had no place in an iOS bundle; `cargo check -p keeper-sync --target
+# aarch64-apple-ios` passes (hesperia, 2026-09-05), and what the phone cannot
+# do — spawn the `git` binary — is refused by sentence at the one boundary
+# that spawns (`keeper_sync::git::cli`). The engine is tauri-free, so this
+# edge goes one way only.
+keeper-sync = { path = "../keeper-sync" }
 tauri = { workspace = true }
 tauri-plugin-opener = { workspace = true }
 tauri-plugin-deep-link = { workspace = true }
@@ -75,10 +83,6 @@ tempfile = { workspace = true }
 # them. Cargo target tables only understand real target cfgs (never tauri-build's
 # injected `desktop`/`mobile`), hence the explicit target_os list.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-# Folder sync (Epic 29, AD-40). Desktop only: gitoxide plus a filesystem
-# watcher have no place in the iOS bundle, and `CapabilitiesVm.sync` is false
-# there anyway. The engine is tauri-free, so this edge goes one way only.
-keeper-sync = { path = "../keeper-sync" }
 # The desktop-only `tray-icon` tauri feature backing the opt-in menu-bar presence
 # (Story 10.3, FR-53) plus `image-png`, which unlocks `Image::from_bytes` for the
 # bundled record-dot tray icon (Story 18.1). Merges into the base `tauri` dep on

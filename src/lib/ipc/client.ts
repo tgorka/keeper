@@ -293,6 +293,7 @@ export type { SpaceVm } from "./gen/SpaceVm";
 export type { SyncActivityVm } from "./gen/SyncActivityVm";
 export type { SyncDeviceVm } from "./gen/SyncDeviceVm";
 export type { SyncFootprintVm } from "./gen/SyncFootprintVm";
+export type { SyncGitEngine } from "./gen/SyncGitEngine";
 export type { SyncGitState } from "./gen/SyncGitState";
 export type { SyncGitVm } from "./gen/SyncGitVm";
 export type { SyncListSettingsVm } from "./gen/SyncListSettingsVm";

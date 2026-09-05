@@ -438,6 +438,34 @@ The check has two layers:
   after a build, scan the unstripped Rust staticlib under `gen/apple/Externals/`. With no
   IPA present the scan is skipped and the graph result governs the outcome.
 
+**What the seam no longer excludes (Epic 66, AD-198).** `keeper-sync` links on iOS
+since Epic 66: it sat in the desktop-only target table for eight epics on the belief
+that gitoxide had no place in the phone bundle, and `cargo check -p keeper-sync
+--target aarch64-apple-ios` passed on hesperia in 25 s (2026-09-05) — nobody had
+linked it. The phone build now carries the sync engine, the `sync_*`, `copy_*`,
+`sessions_*` and notes commands, and the `keeper-note://` and `keeper-file://`
+schemes. What stays desktop-only, and why:
+
+- The five plugins above (tray, hotkey, autostart, updater, process): no iOS concept.
+- `bots_drive_ipc` / `bots_tools` (the drive half of Bots), `notes_window` (the
+  quick-capture window), `sessions_root` / `sessions_exec` (the sessions board and
+  the tasks runner — AD-201: iOS spawns nothing), `hotkey`, `menu`, `tray`,
+  `voice_window`, `recording_protocol`, `pdf_export` (macOS WebKit).
+- Inside `keeper-sync`, `git/cli.rs` is the one module that spawns a process. On
+  iOS every verb on it refuses **before** `Command::new` with one sentence naming
+  the phone and the in-process route (`GitEngine::Gix`, `GitCli::phone()`); the
+  engine reaches those routes itself — fetch, fast-forward checkout, commit and
+  push are gitoxide and `git::push_http` — and never asks for a binary
+  (`Engine::open_with_engine`). `git_report` answers `state: ok, engine: gix` with no
+  version, which is what makes `CapabilitiesVm.sync` true on the phone.
+- No LFS filter driver is registered in a phone's repositories (a driver is a
+  process), no supervisor loop runs and no watcher is armed: the phone syncs on
+  open, on `RunEvent::Resumed` and on pull-to-refresh (`sync_folder_now`), and its
+  profiles are fully virtual by default (AD-199).
+
+The Linux dev host still cannot compile the `keeper` crate at all, so this seam is
+proven only by the iOS `cargo check` on a Mac and by CI.
+
 ## Sharing a build without Xcode
 
 Once you have the IPA from [Building a shareable IPA](#building-a-shareable-ipa), you

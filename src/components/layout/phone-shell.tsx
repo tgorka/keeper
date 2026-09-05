@@ -40,6 +40,19 @@
  * to whatever view was under it. Back, edge-swipe and Escape pop these
  * levels through the same `onBack`; the Bots surface adds no navigation of
  * its own (`bots-phone-pane.tsx`).
+ *
+ * Story 66.1 (FR-457…FR-459, AD-197) makes Approvals, Bridges and Sync the
+ * same kind of level: `src/lib/phone-surfaces.ts` is the table of views the
+ * stack renders, and every setter of `primaryViewStore` that already exists —
+ * the drawer rows, the Inbox header's Approvals chip, the palette's
+ * `open-approval`/`open-bridges`, the ⌘3/⌘4 chords, a bridge notification —
+ * lands here without knowing the phone exists, because the level is derived
+ * from the store rather than routed to. The chords are therefore *routed the
+ * same way* rather than withheld on the phone tier: the registry pattern
+ * (`use-approval-shortcut.ts`, `use-bridges-shortcut.ts`) sets the view and
+ * nothing else, and a hardware keyboard on an iPad-sized phone gets the
+ * surface it asked for. What the phone has no surface for is absent from the
+ * drawer (`SidebarPane` filters by the same table), never a dead row.
  */
 import { RefreshCw, WifiOff } from "lucide-react";
 import {
@@ -53,7 +66,9 @@ import {
   useRef,
   useState,
 } from "react";
+import { ApprovalPane } from "@/components/approval/approval-pane";
 import { BotsPhoneConversation, BotsPhoneList } from "@/components/bots/bots-phone-pane";
+import { BridgesPane } from "@/components/layout/bridges-pane";
 import { ChatListPane } from "@/components/layout/chat-list-pane";
 import { ConversationPane } from "@/components/layout/conversation-pane";
 import { DetailPanel } from "@/components/layout/detail-panel";
@@ -68,11 +83,13 @@ import { PhoneInboxHeader } from "@/components/layout/phone-inbox-header";
 import { PhoneSearchSurface } from "@/components/layout/phone-search-surface";
 import { SettingsPane } from "@/components/layout/settings-pane";
 import { OFFLINE_PILL_TEXT } from "@/components/layout/sidebar-pane";
+import { SyncPane } from "@/components/layout/sync-pane";
 import { useKeyboardInset } from "@/hooks/use-keyboard-inset";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import { useShellLayout } from "@/hooks/use-shell-layout";
 import { useStaleResumePill } from "@/hooks/use-stale-resume-pill";
 import { syncNow } from "@/lib/ipc/client";
+import { phoneSurfaceFor } from "@/lib/phone-surfaces";
 import { accountStatusStore, useShellOffline } from "@/lib/stores/account-status";
 import { useCapabilitiesStore, useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
 import { detailStore, useDetailStore } from "@/lib/stores/detail-ui";
@@ -261,14 +278,14 @@ export function PhoneShell() {
   const { phone } = useShellLayout();
   useKeyboardInset({ enabled: phone });
 
-  // Story 62.2: the view levels. With no room selected, the Bots view (only
-  // where the capability is on — absent, never a dead level) or the Settings
-  // view occupies level 1, and an open Bots conversation level 2. A selected
-  // room outranks both: a notification tap must land on the Room.
+  // Story 62.2 / 66.1: the view levels. With no room selected, a view the
+  // phone has a surface for occupies level 1 (`phoneSurfaceFor` is the table;
+  // Bots and Sync only where their capability is on — absent, never a dead
+  // level), and an open Bots conversation level 2. A selected room outranks
+  // them all: a notification tap must land on the Room.
   const view = usePrimaryView();
-  const botsCapability = useCapabilitiesStore((s) => s.capabilities.bots);
-  const surface: "bots" | "settings" | null =
-    view === "bots" && botsCapability ? "bots" : view === "settings" ? "settings" : null;
+  const capabilities = useCapabilitiesStore((s) => s.capabilities);
+  const surface = phoneSurfaceFor(view, capabilities);
   // Whether the Bots conversation is pushed over its list. Shell state rather
   // than a store field because only this stack has two views to choose from —
   // the desktop pane shows both at once — and it resets whenever the surface
@@ -887,10 +904,13 @@ export function PhoneShell() {
           <DetailPanel />
         </div>
       </StackLevel>
-      {/* Story 62.2 — the view levels, occupying levels 1 and 2 only while no
-          room is selected (the room levels above are closed then, so the two
-          families never share a level). Bots is the list, then the
-          conversation; Settings is the same pane the desktop renders. */}
+      {/* Story 62.2 / 66.1 — the view levels, occupying levels 1 and 2 only
+          while no room is selected (the room levels above are closed then, so
+          the two families never share a level). Bots is the list, then the
+          conversation; Approvals, Bridges, Sync and Settings are the same
+          panes the desktop renders, under one "Back to Inbox" bar. A new
+          surface (66.3 `files`, 66.4 `notes`) is one more `PhoneSurface`
+          member, one arm in `phoneSurfaceFor`, and one branch here. */}
       <StackLevel
         levelIndex={1}
         open={surfaceOpen}
@@ -909,7 +929,7 @@ export function PhoneShell() {
             backRef={surfaceBack1Ref}
             onOpen={() => setBotConversationOpen(true)}
           />
-        ) : shownSurface === "settings" ? (
+        ) : shownSurface !== null ? (
           <>
             <PhoneBackBar
               backLabel={PHONE_BACK_TO_INBOX}
@@ -918,7 +938,19 @@ export function PhoneShell() {
               backRef={surfaceBack1Ref}
             />
             <div className="flex min-h-0 min-w-0 flex-1">
-              <SettingsPane />
+              {shownSurface === "settings" ? (
+                <SettingsPane />
+              ) : shownSurface === "approval" ? (
+                <ApprovalPane />
+              ) : shownSurface === "bridges" ? (
+                <BridgesPane />
+              ) : shownSurface === "sync" ? (
+                <SyncPane />
+              ) : (
+                // Exhaustive: a `PhoneSurface` member with no pane here is a
+                // type error, not a blank level.
+                (shownSurface satisfies never)
+              )}
             </div>
           </>
         ) : null}

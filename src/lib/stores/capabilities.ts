@@ -74,12 +74,25 @@ export function useCapabilitiesStore<T>(selector: (state: CapabilitiesState) => 
  * nothing about which build this is. Folding it in would make the phone read
  * as a desktop the moment the pane existed, which would silently drop the
  * "On this iPhone" disclosure, the backup-exclusion line and the offline pill.
- * The drive half of the same surface, `botTools`, is `desktop && sync` and
+ *
+ * **`sync` and `notes` are true on the phone too (Epic 66, AD-198, AD-200)**:
+ * `keeper-sync` links on iOS and clones, fetches and fast-forwards with its
+ * own engine, and a vault is a folder keeper syncs, so a folder on the phone
+ * carries notes with it. The tier is told by what the OS *refuses* — a tray,
+ * a global hotkey, a menu bar, an updater, a sidecar process, a Finder reveal
+ * — never by what a folder can do. Before this epic the two flags happened to
+ * be `cfg!(desktop)`-shaped only because nobody had linked the crate on the
+ * phone; leaving them in the fold would turn the first phone that could sync
+ * into a desktop the moment `capabilities()` answered.
+ *
+ * The drive half of the Bots surface, `botTools`, is `desktop && sync` and
  * stays in the fold. A flag belongs here only when the Rust side computes it
  * as true on both tiers; that is the whole membership rule.
  */
 const TIER_NEUTRAL_FLAGS: Partial<Record<keyof CapabilitiesVm, true>> = {
   bots: true,
+  sync: true,
+  notes: true,
 };
 
 /**

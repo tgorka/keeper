@@ -8,8 +8,13 @@ vi.mock("@/lib/ipc/client", () => ({
   searchArchive: (filter: unknown) => searchArchive(filter),
 }));
 
-import { SearchPanel } from "@/components/search/search-panel";
+import {
+  SEARCH_OFFLINE_DEVICE_SENTENCE,
+  SEARCH_OFFLINE_MAC_SENTENCE,
+  SearchPanel,
+} from "@/components/search/search-panel";
 import { accountsStore } from "@/lib/stores/accounts";
+import { capabilitiesStore, DEFAULT_CAPABILITIES } from "@/lib/stores/capabilities";
 import { networksStore } from "@/lib/stores/networks";
 import { roomsStore } from "@/lib/stores/rooms";
 
@@ -57,6 +62,7 @@ beforeEach(() => {
   roomsStore.setState({ rooms: [], selected: null, focusEvent: null });
   accountsStore.setState({ accounts: [] });
   networksStore.setState({ networks: [] });
+  capabilitiesStore.setState({ capabilities: DEFAULT_CAPABILITIES, hydrated: false });
 });
 
 afterEach(() => {
@@ -70,10 +76,21 @@ async function type(text: string) {
 }
 
 describe("SearchPanel", () => {
-  it("shows the honest header and offline note", () => {
+  it("shows the honest header and offline note, naming the Mac on the desktop tier", () => {
     render(<SearchPanel active scope="global" chatLock={null} onClose={vi.fn()} />);
     expect(screen.getByText("Searching your local archive")).toBeInTheDocument();
-    expect(screen.getByText(/works fully offline/i)).toBeInTheDocument();
+    expect(screen.getByText(SEARCH_OFFLINE_MAC_SENTENCE)).toBeInTheDocument();
+    expect(screen.queryByText(SEARCH_OFFLINE_DEVICE_SENTENCE)).not.toBeInTheDocument();
+  });
+
+  it("never says 'on this Mac' on the reduced-capability tier (DW-112, Story 66.1)", () => {
+    // The phone is not a Mac. The panel is shared byte-for-byte with the desktop
+    // overlay, so the phone gets the device-neutral sentence rather than a
+    // guessed model name.
+    capabilitiesStore.getState().applySnapshot({ ...DEFAULT_CAPABILITIES, bots: true, sync: true });
+    render(<SearchPanel active scope="global" chatLock={null} onClose={vi.fn()} />);
+    expect(screen.getByText(SEARCH_OFFLINE_DEVICE_SENTENCE)).toBeInTheDocument();
+    expect(screen.queryByText(/on this Mac/)).not.toBeInTheDocument();
   });
 
   it("debounces a query into searchArchive and renders grouped results", async () => {

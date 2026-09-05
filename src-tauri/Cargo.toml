@@ -274,6 +274,15 @@ base64 = "0.22"
 # own read-back are one copy of one crate rather than two builds of 0.7.2 from
 # two sources.
 gix-quote = { git = "https://github.com/tgorka/gitoxide", branch = "keeper/gix-filter-0.33-reap" }
+# The pack writer behind the phone's push (Story 66.5, AD-202). `gix` pulls
+# `gix-pack` with `default-features = false`, which leaves out `generate` — the
+# feature that turns a set of object ids into a v2 pack (`data::output`). The
+# phone has no `git` binary to run `git push`, so `keeper-sync::git::push_http`
+# writes the pack itself and hands it to `git-receive-pack` over HTTP. Adds no
+# new crate: `gix-pack` is already in the lock through `gix-odb`, and `generate`
+# only enables `gix-traverse`/`gix-diff` edges that `gix` resolves anyway. Same
+# git source as `gix` for the same reason `gix-quote` gives above.
+gix-pack = { git = "https://github.com/tgorka/gitoxide", branch = "keeper/gix-filter-0.33-reap", default-features = false, features = ["generate"] }
 # ---------------------------------------------------------------------------
 # Document rendering (Story 45.8, FR-181, FR-182). Consumed by `keeper-core`
 # only: DOCX, PPTX and XLSX are a ZIP of XML, so keeper parses them in Rust and

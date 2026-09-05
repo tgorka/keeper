@@ -922,7 +922,8 @@ resolution: Won't fix. The premise holds (ExportOptions.plist hard-codes method=
 origin: spec-13-1-phone-layout-tier-and-navigation-stack.md, 2026-07-11
 location: src/components/layout/phone-shell.tsx (does not read usePrimaryView; renders ChatListPane only) + src/components/layout/app-shell.tsx (phone branch replaces SidebarPane with PhoneShell)
 reason: Intended staging, not a 13.1 defect. Epic 13 sequences the sidebar's contents into the **leading drawer** delivered by Story 13.3 (the drawer renders "the entire desktop sidebar verbatim inside a leading Sheet" — primary views, SPACES/NETWORKS, account switcher, sync/offline status), and the Inbox header status cluster (13.3) surfaces the offline/approval state. On an actual iPhone at 13.1 these states are also not reachable: ⌘3/⌘4 need a hardware keyboard and the native menu bar is desktop-only (`nativeMenuBar` capability false on iOS), so `primaryView` never leaves `inbox`/`archive`. Both reviewers flagged the absence as "silently dropped functionality"; it is real but owned by 13.3. Revisit when implementing Story 13.3 (leading drawer + Inbox header status cluster) — ensure bridges/approval routing and offline/Settings/account access land there, and that the phone tier honors `primaryView` for the drawer-selected full-surface panes.
-status: open
+status: closed 2026-09-05
+resolution: Story 66.1 (AD-197). `PhoneShell` derives its level-1 surface from `primaryViewStore` through `src/lib/phone-surfaces.ts:36` (`phoneSurfaceFor`: approval, bridges, sync, bots, settings) and renders `ApprovalPane`/`BridgesPane`/`SyncPane` under one back bar (`src/components/layout/phone-shell.tsx:288`, `:909-936`); the drawer keeps only the rows the stack can land (`src/components/layout/sidebar-pane.tsx:310`), so ⌘3/⌘4, the palette's `open-approval`/`open-bridges`, the Inbox header chip and a bridge notification all reach a surface with no phone branch of their own (`src/components/command-palette/actions.ts:17-28`). The registry-vs-surfaces guard: `src/components/layout/phone-shell.test.tsx` "every drawer row on the phone lands on a level" and `src/lib/phone-surfaces.test.ts`.
 
 ### DW-109: `detailStore.open` is never reset when the room selection changes or clears, so a room (re)selected while detail is open computes level 2 and lands directly on the Detail overlay, skipping the Room level.
 
@@ -942,14 +943,16 @@ resolution: Verified already fixed by Story 13.2 — the phone stack now manages
 origin: spec-13-4-merged-full-screen-search-surface.md, 2026-07-11
 location: src/components/command-palette/actions.ts ("open-search": () => searchStore.getState().open("global")) + app-shell.tsx mounts <SearchOverlay/> in both tiers, so on phone the desktop dialog opens.
 reason: Not a 13.4 defect and explicitly out of scope: Story 13.4's contract forbids new palette actions and changes to the desktop `searchStore` wiring, and reuses the shared action registry verbatim (so parity is structural). `open-search` is not a "dead" entry (the app-shell-mounted `SearchOverlay` does open), but on phone it presents a desktop centered dialog — a second visual language wart. Per-platform action routing/capability-gating is Story 13.7's domain (capability-gated surfaces + "On this iPhone"); the clean fix is to make `open-search` route to `searchSurfaceStore.open()` on the phone tier (or gate/reroute via capabilities). Revisit with Story 13.7.
-status: open
+status: closed 2026-09-05
+resolution: Story 66.1 (DW-111). `open-search` reads the tier at dispatch — `isPhoneTier()` (`src/hooks/use-shell-layout.ts:52`) — and opens `searchSurfaceStore` on the phone, `searchStore` on the desktop (`src/components/command-palette/actions.ts:192-195`); tested in `src/components/command-palette/actions.test.ts` "open-search on the phone tier".
 
 ### DW-112: The reused message-search offline header reads "Search works fully offline against your local archive on this Mac." verbatim on the iPhone Messages scope, where "on this Mac" is factually wrong device copy.
 
 origin: spec-13-4-merged-full-screen-search-surface.md, 2026-07-11
 location: src/components/search/search-panel.tsx (~line 266, hardcoded "on this Mac") — reused verbatim by src/components/layout/phone-search-surface.tsx (Messages scope).
 reason: The shared `SearchPanel` was extracted verbatim from the desktop overlay to keep byte-for-byte desktop behavior; its honest-offline copy is Mac-specific. Making it platform-aware ("On this iPhone" / "on this device") is Story 13.7's capability-honest-disclosure domain ("On this iPhone" disclosure states foreground-only sync, no bbctl, etc., and owns the phone's platform-honest strings); changing it in 13.4 would alter shared desktop copy or introduce a platform check outside this story's scope. Low consequence (functionally correct; only the platform noun is wrong). Revisit with Story 13.7.
-status: open
+status: closed 2026-09-05
+resolution: Story 66.1 (DW-112). `SearchPanel` names the device by the tier: `SEARCH_OFFLINE_MAC_SENTENCE` where `!isReducedCapabilityPlatform`, the device-neutral `SEARCH_OFFLINE_DEVICE_SENTENCE` on the phone (`src/components/search/search-panel.tsx:52-55`, `:303`); tested in `src/components/search/search-panel.test.tsx` "never says 'on this Mac' on the reduced-capability tier".
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-13-5-safe-areas-and-the-keyboard-avoiding-composer.md`
   summary: On the phone timeline, the keyboard-resize bottom-pin ResizeObserver and the batch history-prepend layout effect both write scrollTop with no coordination, so a keyboard open/resize coinciding with an inbound history prepend can produce an occasional scroll jump.

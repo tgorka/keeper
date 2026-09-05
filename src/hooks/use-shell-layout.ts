@@ -1,5 +1,9 @@
 import * as React from "react";
-import { useIsReducedCapabilityPlatform } from "@/lib/stores/capabilities";
+import {
+  capabilitiesStore,
+  isReducedCapabilityPlatform,
+  useIsReducedCapabilityPlatform,
+} from "@/lib/stores/capabilities";
 
 const PHONE_BREAKPOINT = 768;
 /**
@@ -36,6 +40,21 @@ export interface ShellLayout {
   sidebarCollapsed: boolean;
   /** Detail panel opens as a Sheet (instead of pinned) below 1280px. */
   detailFloating: boolean;
+}
+
+/**
+ * The phone-tier rule as one imperative read, for a caller with no render to
+ * subscribe in (the palette's action map): the same two facts
+ * {@link useShellLayout} folds — a reduced-capability platform at any width,
+ * or a viewport below the breakpoint — read at the moment of the call.
+ */
+export function isPhoneTier(): boolean {
+  return (
+    isReducedCapabilityPlatform(capabilitiesStore.getState()) ||
+    (typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia(`(max-width: ${PHONE_BREAKPOINT - 1}px)`).matches)
+  );
 }
 
 export function useShellLayout(): ShellLayout {
