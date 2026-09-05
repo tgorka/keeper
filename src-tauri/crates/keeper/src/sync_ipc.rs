@@ -11,7 +11,7 @@
 //! `IpcError` envelope the frontend already understands.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use keeper_core::tasks::{
@@ -3763,6 +3763,11 @@ pub async fn sync_materialize_entry(
     // that may copy gigabytes can hold it without holding `state`.
     let engine = engine_of(&state)?;
     let asked = subpath.clone();
+    // This verb changes what the marks say, and the pane re-lists the moment it
+    // returns: without expiring the slot the folder count would be up to
+    // `BROWSE_VIRTUAL_TTL` old and the row the person just fetched would still
+    // read "not fetched" (Story 69.2).
+    browse_marks_forget(&id);
     let keep_for = keeper_sync::lfs::hydrate::KeepFor::from_ms(keep_for_ms);
     let done =
         tokio::task::spawn_blocking(move || engine.materialize_entry(&id, &subpath, keep_for))
@@ -3835,6 +3840,9 @@ pub async fn sync_release_entry(
     subpath: String,
 ) -> Result<(), IpcError> {
     let engine = engine_of(&state)?;
+    // A release changes what the marks say: expire the slot so the
+    // re-list that follows walks instead of serving a count from before it.
+    browse_marks_forget(&id);
     match engine.dehydrate_entry(&id, &subpath).await {
         Ok(released) => {
             tracing::info!(
@@ -3889,6 +3897,9 @@ pub async fn sync_pin_entry(
     pinned: bool,
 ) -> Result<(), IpcError> {
     let engine = engine_of(&state)?;
+    // A pin changes what the marks say: expire the slot so the
+    // re-list that follows walks instead of serving a count from before it.
+    browse_marks_forget(&id);
     let asked = subpath.clone();
     let done = tokio::task::spawn_blocking(move || engine.pin_entry(&id, &subpath, pinned))
         .await
