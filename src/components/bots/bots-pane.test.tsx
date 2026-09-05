@@ -39,7 +39,9 @@ import {
 import { BOT_CONTEXT_TITLE } from "@/components/bots/bot-context-note";
 import { BOTS_EMPTY_COPY } from "@/components/bots/bot-empty-state";
 import { GRANT_ADD_LABEL, GRANT_NONE_HELD } from "@/components/bots/bot-grant-bar";
+import { LISTENING_TOGGLE_LABEL } from "@/components/bots/bot-listening-toggle";
 import { BOT_PARTIAL_CAPTION, BOT_RETRY_LABEL } from "@/components/bots/bot-message";
+import { BOT_META_TOGGLE_LABEL } from "@/components/bots/bot-message-meta";
 import { BOT_SESSION_NEW_LABEL } from "@/components/bots/bot-session-list";
 import { voiceFoldedLine, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
 import {
@@ -78,6 +80,8 @@ const botsGrantsList = vi.fn();
  *  the block is absent in every test that is not about it. */
 const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceWakeGet = vi.fn<() => Promise<VoiceWakeVm>>();
+/** The listening switch's one command (Epic 68, AD-218). */
+const voiceWakeToggle = vi.fn<() => Promise<VoiceWakeVm>>();
 /** The event sink the pane handed to `botsChatSend`, so the test can drive the
  *  stream exactly as Rust would. */
 let sink: ((event: BotStreamEvent) => void) | null = null;
@@ -120,6 +124,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     },
     voiceAvailability: () => voiceAvailability(),
     voiceWakeGet: () => voiceWakeGet(),
+    voiceWakeToggle: () => voiceWakeToggle(),
+    voiceTargetSpeeds: () => Promise.resolve([]),
     voiceWatch: () => Promise.reject(new Error("not used")),
     voiceUnwatch: () => Promise.resolve(),
   };
@@ -771,5 +777,66 @@ describe("the Bots pane's voice block folds (Story 64.1)", () => {
       "aria-expanded",
       "true",
     );
+  });
+});
+
+/**
+ * Listening in the pane header (Epic 68, Story 68.4, AD-218): a chip beside
+ * the metadata chip whose text is the state, flipping the switch through
+ * the one command every menu calls — absent where voice is unsupported
+ * (AD-27), like the band.
+ */
+describe("the Bots pane header's listening chip (Epic 68, AD-218)", () => {
+  const WAKE: VoiceWakeVm = {
+    enabled: false,
+    phrase: "hey nixie",
+    limits: "Listening uses the microphone.",
+    locale: "en-US",
+    localeChosen: null,
+    onDeviceLocales: ["en-US"],
+    stopPhrase: "stop",
+    voiceTarget: null,
+  };
+
+  beforeEach(() => {
+    voiceWakeToggle.mockReset();
+    voiceAvailability.mockResolvedValue(null);
+    voiceWakeGet.mockResolvedValue(WAKE);
+  });
+
+  it("sits in the header beside the metadata chip and names the state", async () => {
+    render(<BotsPane />);
+    const chip = await screen.findByRole("button", { name: LISTENING_TOGGLE_LABEL });
+    expect(chip).toHaveTextContent("Listening off");
+    expect(chip).toHaveAttribute("aria-pressed", "false");
+    const header = chip.closest("header");
+    expect(header).not.toBeNull();
+    expect(
+      within(header as HTMLElement).getByRole("button", { name: BOT_META_TOGGLE_LABEL }),
+    ).toBeInTheDocument();
+  });
+
+  it("flips through voice_wake_toggle and shows what Rust stored", async () => {
+    voiceWakeToggle.mockResolvedValue({ ...WAKE, enabled: true });
+    render(<BotsPane />);
+    fireEvent.click(await screen.findByRole("button", { name: LISTENING_TOGGLE_LABEL }));
+    await waitFor(() => expect(voiceWakeToggle).toHaveBeenCalledTimes(1));
+    const chip = await screen.findByRole("button", { name: LISTENING_TOGGLE_LABEL });
+    await waitFor(() => expect(chip).toHaveTextContent("Listening on · hey nixie"));
+    expect(chip).toHaveAttribute("aria-pressed", "true");
+    // Availability is read again after the flip: a refusal the port answered
+    // on switching on is shown beside the switch.
+    await waitFor(() => expect(voiceAvailability).toHaveBeenCalledTimes(2));
+  });
+
+  it("is absent where voice is unsupported", async () => {
+    voiceAvailability.mockResolvedValue({
+      kind: "unsupported",
+      message: "voice is not available in this build",
+    });
+    render(<BotsPane />);
+    await waitFor(() => expect(voiceAvailability).toHaveBeenCalled());
+    await screen.findByRole("button", { name: BOT_META_TOGGLE_LABEL });
+    expect(screen.queryByRole("button", { name: LISTENING_TOGGLE_LABEL })).toBeNull();
   });
 });

@@ -134,6 +134,7 @@ import { useWindowedRows } from "@/components/ui/window-list";
 import { useLongPress } from "@/hooks/use-long-press";
 import { SURFACE_COLUMNS } from "@/lib/column-widths";
 import { countLabel, ITEMS } from "@/lib/count-label";
+import { formatFileSize } from "@/lib/file-size";
 import { formatDraftAge, formatReleaseIn, formatReleaseSpoken } from "@/lib/format-time";
 import type {
   FilesDeletePlanVm,
@@ -303,20 +304,50 @@ export const FILES_CANCEL_LABEL = "Cancel";
  * The three state verbs (Story 56.9, FR-343): what a row does about the content
  * behind it, as against what it does with the file it names.
  *
- * One word each, and the word the epic's own vocabulary already uses — the CLI
- * spells them `keeper-syncd materialize`, `release` and `pin`, `sync_mark`'s
- * sentences say "materializing" about the state between the first two, and a
- * surface that invented "Download" / "Free up space" / "Keep offline" here would
- * give the owner two vocabularies for one epic. `Release` and not `Dehydrate`:
- * the command is `dehydrate_entry`, and that is a word about a mechanism rather
- * than about what the person gets.
+ * One word each. `Release` and `Pin` are the epic's own vocabulary — the CLI
+ * spells them `keeper-syncd release` and `pin`. The first was `Materialize`,
+ * the CLI's word, until Story 69.1 (AD-219): the owner went looking for "a
+ * button to fetch locally" and did not recognise the verb he was offered, and a
+ * word a person has to be taught is not a label. `Fetch` is what he said; the
+ * IPC name (`sync_materialize_entry`), the CLI verb and `sync_mark`'s
+ * "materializing" stay as they are, because those are keeper's names for the
+ * mechanism and this is the person's name for the act. `Release` and not
+ * `Dehydrate`, for the same reason in the other direction.
  */
-export const FILES_MATERIALIZE_LABEL = "Materialize";
+export const FILES_FETCH_LABEL = "Fetch";
 export const FILES_RELEASE_LABEL = "Release";
 export const FILES_PIN_LABEL = "Pin";
 
 /**
- * How long the person can ask Materialize to keep one path's content for (story
+ * What a folder row says about the content beneath it that is not here (Story
+ * 69.1, AD-219, FR-498): `3 not fetched · 1.2 GB`.
+ *
+ * The count and the size are both Rust's — `FilesEntryVm.virtualChildren` is
+ * the whole subtree's count off the index inventory, and `virtualSize.label` is
+ * `format_file_size`'s rendering of their pointers' sizes — so this composes
+ * two finished facts and divides nothing. A folder with nothing away says
+ * nothing at all rather than `0 not fetched`: the absence is the ordinary case
+ * and a zero on every folder would be noise the eye learns to skip past,
+ * exactly where the one that matters would then hide.
+ */
+export function filesNotFetchedSentence(count: number, sizeLabel: string | null): string {
+  const heads = `${count} not fetched`;
+  return sizeLabel === null ? heads : `${heads} · ${sizeLabel}`;
+}
+
+/** The line on screen while a folder-level Fetch is asking for each file. */
+export function filesFetchingSentence(index: number, total: number, name: string): string {
+  return `Fetching ${index} of ${total}: ${name}`;
+}
+
+/** Test id for the folder row's not-fetched cell. */
+export const FILES_NOT_FETCHED_SLOT = "files-not-fetched";
+
+/** Test id for the folder-level Fetch progress line. */
+export const FILES_FETCHING_TESTID = "files-fetching";
+
+/**
+ * How long the person can ask Fetch to keep one path's content for (story
  * 56.17, FR-341).
  *
  * **Four fixed choices and not a picker.** The owner asked for the choice to be
@@ -350,7 +381,7 @@ export const FILES_PIN_LABEL = "Pin";
  * the numbers: a suite holding its own copy of `28_800_000` would go on passing
  * after this list changed.
  */
-export const FILES_MATERIALIZE_DURATIONS: readonly {
+export const FILES_FETCH_DURATIONS: readonly {
   readonly id: string;
   readonly label: string;
   /** Milliseconds, or `0` for indefinitely. Never `undefined`: the omission is
@@ -1457,6 +1488,76 @@ export function FilesPane() {
     [load],
   );
 
+  /**
+   * The sentence on screen while a folder-level Fetch is issuing its requests
+   * (Story 69.1, AD-219). `null` when none is.
+   */
+  const [fetching, setFetching] = useState<string | null>(null);
+
+  /**
+   * Fetch every virtual entry beneath one folder (Story 69.1, AD-219, FR-498).
+   *
+   * **A loop over the existing verb, not a new engine verb.** `materialize_entry`
+   * is per path and queues; a folder verb in the engine would be a new door, a
+   * new refusal shape and a new CLI mirror, for a request the pane can spell as
+   * "each of these, in turn" — through the same command the row's own Fetch
+   * sends, so every refusal is one Rust already words and the row marks are the
+   * feedback exactly as they are for one file.
+   *
+   * **The walk descends only where the count says there is something.**
+   * `virtualChildren` on a folder row is the whole subtree's count, read off
+   * the index inventory, so a subfolder carrying `0` is skipped unread — on a
+   * 155k-entry folder with a dozen pointers, this is a dozen listings, not the
+   * tree. The paths come from `sync_browse`'s own answer and are echoed back;
+   * nothing is composed here (AD-65).
+   *
+   * **Requests are issued one at a time and the sentence counts them.** The
+   * command returns once the transfer is queued, so the loop is fast and the
+   * progress it reports is "asked for", not "arrived" — which the row marks
+   * (`materializing`) then say per file. Serial, because the engine takes a
+   * per-profile reservation and a burst of parallel requests would answer
+   * `Busy` to all but one. One refusal stops the loop: the sentence reaches the
+   * pane's one alert through {@link runRowVerb}, and the paths already asked
+   * for stay asked for.
+   *
+   * `keepForMs` is the same third argument the row's submenu sends, so a folder
+   * can be fetched "for 8 hours" as one file can.
+   */
+  const fetchFolder = useCallback(
+    async (profileId: string, subpath: string, keepForMs?: number): Promise<void> => {
+      const away: FilesEntryVm[] = [];
+      const pending = [subpath];
+      while (pending.length > 0) {
+        const folder = pending.shift() as string;
+        const listing = await syncBrowse(profileId, folder);
+        for (const child of listing.entries ?? []) {
+          if (child.kind === "folder") {
+            if (child.virtualChildren > 0) {
+              pending.push(child.relativePath);
+            }
+          } else if (child.sync.status === "virtual") {
+            away.push(child);
+          }
+        }
+      }
+      try {
+        for (const [index, child] of away.entries()) {
+          setFetching(filesFetchingSentence(index + 1, away.length, child.name));
+          await syncMaterializeEntry(profileId, child.relativePath, keepForMs);
+        }
+      } finally {
+        setFetching(null);
+      }
+      // The folder's own listing, where it is open: `runRowVerb` re-reads the
+      // PARENT so this row's count moves, and the rows under it are the other
+      // half of the feedback.
+      if (expanded.has(nodeKey(profileId, subpath))) {
+        load(profileId, subpath);
+      }
+    },
+    [expanded, load],
+  );
+
   // Only enabled profiles are browsable. A paused folder is one keeper is not
   // watching, and listing it would imply otherwise.
   const enabled = useMemo(() => (profiles ?? []).filter((p) => p.enabled), [profiles]);
@@ -2326,11 +2427,95 @@ export function FilesPane() {
      * to one is the Sync pane's business. Everything else has at least Copy
      * path — the row's own text, which is worth having on a clipboard whatever
      * else the platform will or will not do.
+     *
+     * **The order is the promotion rule (Story 69.1, AD-219, FR-497).** The
+     * cluster paints a PREFIX of this list, so where a verb sits is whether a
+     * person at the shipped 360px column ever sees it. Story 56.9 APPENDED the
+     * state verbs after Copy path so that no existing row's cluster moved, and
+     * the owner's report is what that bought: Fetch was fourth on a virtual
+     * file, the default column promotes three, and the one verb that row
+     * exists for was in a menu he did not open. So:
+     *
+     * 1. `Fetch` — first, where the content is away. The row is ABOUT the
+     *    content not being here, and the verb that changes that outranks the
+     *    verbs that act on a file that is here; Open on a pointer now fetches
+     *    too (AD-223), but a button that says so is the deliverable. On a
+     *    folder it is the same verb over everything beneath, and a folder has
+     *    no Open to outrank.
+     * 2. `Open` — a file's primary verb once the content is here.
+     * 3. `Release`, `Pin` — the state verbs of content that IS here. After Open,
+     *    because opening is what a person came to a fetched file to do; before
+     *    Reveal and Copy path, because those act on the NAME and these on the
+     *    bytes, and at 320px a materialized row's two verbs are now Open and
+     *    Release rather than Open and Reveal in Finder.
+     * 4. `Reveal in Finder`, `Copy path` — about the name, one click away in
+     *    the menu at every width, which is what the whole budget is licensed
+     *    by.
+     *
+     * Fetch and Release/Pin never share a row, so this one list states both
+     * halves of AD-219 without a branch: at 360px a virtual file paints Fetch,
+     * Open, Reveal; a materialized file whose countdown cell is painted
+     * promotes one verb, Open, and the cell IS its state; a materialized file
+     * without a countdown paints Open, Release, Pin. A plain file and a
+     * `materializing` row are exactly where they were.
      */
     const actions: readonly FilesRowAction[] =
       entry === null
         ? []
         : [
+            // Each state verb's glyph is chosen so no verb repeats the sync mark
+            // drawn on the same row — `sync-status-mark` spends Check, Clock,
+            // Ban, Cloud, ArrowDownToLine, HardDrive, CircleDashed and
+            // CircleAlert — two identical marks in one row read as one mark
+            // drawn twice. So Fetch is `Download` and not `ArrowDownToLine`, the
+            // mark a materializing row already carries.
+            //
+            // A `materializing` row offers none of them, because the work it
+            // would ask for is already in flight: the only honest verb there
+            // would be a cancel, and Story 56.9 was not asked for one.
+            //
+            // **Fetch is the one verb with options** (story 56.17): the same
+            // request, narrowed to a duration the person names. `onSelect` sends
+            // no duration, because that is what a promoted icon can honestly
+            // mean and what this verb has meant since 56.3; the four choices
+            // ride along in `options` and only the menu reads them. Each goes
+            // through `runRowVerb` exactly as the default does, so a refusal
+            // reaches the pane's one alert and two presses in one burst still do
+            // not overlap.
+            //
+            // On a FOLDER (Story 69.1, FR-498) the same verb, the same options
+            // and the same id, over every virtual entry beneath — offered only
+            // where Rust's count says there is one, so a folder with nothing
+            // away has no dead control (AD-27). See {@link fetchFolder}.
+            ...(entry.sync.status === "virtual" || (node.isFolder && entry.virtualChildren > 0)
+              ? [
+                  {
+                    id: "materialize",
+                    label: FILES_FETCH_LABEL,
+                    icon: Download,
+                    onSelect: () =>
+                      runRowVerb(node, () =>
+                        node.isFolder
+                          ? fetchFolder(node.profileId, entry.relativePath)
+                          : syncMaterializeEntry(node.profileId, entry.relativePath),
+                      ),
+                    options: FILES_FETCH_DURATIONS.map((choice) => ({
+                      id: choice.id,
+                      label: choice.label,
+                      onSelect: () =>
+                        runRowVerb(node, () =>
+                          node.isFolder
+                            ? fetchFolder(node.profileId, entry.relativePath, choice.keepForMs)
+                            : syncMaterializeEntry(
+                                node.profileId,
+                                entry.relativePath,
+                                choice.keepForMs,
+                              ),
+                        ),
+                    })),
+                  },
+                ]
+              : []),
             // A file's primary verb, and the one that leaves keeper. Absent on a
             // folder, whose own gesture is expand/collapse.
             ...(node.isFolder
@@ -2345,83 +2530,6 @@ export function FilesPane() {
                     },
                   },
                 ]),
-            // `FolderSearch` and not `FolderOpen`, which is the glyph
-            // `properties-panel` gives this same verb. There the glyph decorates
-            // a menu item that also spells the words; here it IS the control, on
-            // a row whose own leading glyph is `FolderOpen` for every expanded
-            // folder in the tree — two identical marks in one row read as one
-            // mark drawn twice, which is half of what the owner photographed.
-            ...(canReveal
-              ? [
-                  {
-                    id: "reveal",
-                    label: FILES_REVEAL_LABEL,
-                    icon: FolderSearch,
-                    onSelect: () => {
-                      void revealPath(entry.absolutePath).catch(() => undefined);
-                    },
-                  },
-                ]
-              : []),
-            {
-              id: "copy",
-              // The confirmation is the label and the glyph together, because the
-              // control has no words on it to change: a tick says the press
-              // landed, and the name says so to everyone who cannot see it.
-              label: copied === entry.absolutePath ? FILES_COPIED_LABEL : FILES_COPY_PATH_LABEL,
-              icon: copied === entry.absolutePath ? Check : Copy,
-              onSelect: () => copyPath(entry.absolutePath),
-            },
-            // The three STATE verbs (Story 56.9, FR-343), and they are APPENDED
-            // rather than inserted: the cluster shows a PREFIX of this list, so a
-            // verb added above `copy` would reorder every existing row's promoted
-            // controls at every width. Nothing before this point moved.
-            //
-            // Each glyph is chosen so no verb repeats the sync mark drawn on the
-            // same row — `sync-status-mark` spends Check, Clock, Ban, Cloud,
-            // ArrowDownToLine, HardDrive, CircleDashed and CircleAlert — which is
-            // the duplication the `reveal` comment above warns about: two
-            // identical marks in one row read as one mark drawn twice. So
-            // Materialize is `Download` and not `ArrowDownToLine`, the mark a
-            // materializing row already carries.
-            //
-            // A `materializing` row offers none of them, because the work it
-            // would ask for is already in flight: the only honest verb there
-            // would be a cancel, and Story 56.9 was not asked for one.
-            //
-            // **And it is the one verb with options** (story 56.17): the same
-            // request, narrowed to a duration the person names. `onSelect` here
-            // is untouched and still sends no duration, because that is what a
-            // promoted icon can honestly mean and what this verb has meant since
-            // 56.3; the four choices ride along in `options` and only the menu
-            // reads them. Each goes through `runRowVerb` exactly as the default
-            // does, so a refusal reaches the pane's one alert and two presses in
-            // one burst still do not overlap.
-            ...(entry.sync.status === "virtual"
-              ? [
-                  {
-                    id: "materialize",
-                    label: FILES_MATERIALIZE_LABEL,
-                    icon: Download,
-                    onSelect: () =>
-                      runRowVerb(node, () =>
-                        syncMaterializeEntry(node.profileId, entry.relativePath),
-                      ),
-                    options: FILES_MATERIALIZE_DURATIONS.map((choice) => ({
-                      id: choice.id,
-                      label: choice.label,
-                      onSelect: () =>
-                        runRowVerb(node, () =>
-                          syncMaterializeEntry(
-                            node.profileId,
-                            entry.relativePath,
-                            choice.keepForMs,
-                          ),
-                        ),
-                    })),
-                  },
-                ]
-              : []),
             // Release before Pin, because releasing is what a person came to this
             // row to do and pinning is how they say "not this one".
             //
@@ -2435,7 +2543,7 @@ export function FilesPane() {
             //
             // Withheld, not disabled: the pane's standing convention for a verb
             // whose target cannot accept it (the `reveal` and create controls
-            // above), and the reason is not lost by hiding it — the release cell
+            // below), and the reason is not lost by hiding it — the release cell
             // on this very row draws the word and speaks Rust's sentence for it,
             // which is a better explanation than a disabled button's tooltip.
             ...(entry.sync.status === "materialized" &&
@@ -2474,6 +2582,33 @@ export function FilesPane() {
                   },
                 ]
               : []),
+            // `FolderSearch` and not `FolderOpen`, which is the glyph
+            // `properties-panel` gives this same verb. There the glyph decorates
+            // a menu item that also spells the words; here it IS the control, on
+            // a row whose own leading glyph is `FolderOpen` for every expanded
+            // folder in the tree — two identical marks in one row read as one
+            // mark drawn twice, which is half of what the owner photographed.
+            ...(canReveal
+              ? [
+                  {
+                    id: "reveal",
+                    label: FILES_REVEAL_LABEL,
+                    icon: FolderSearch,
+                    onSelect: () => {
+                      void revealPath(entry.absolutePath).catch(() => undefined);
+                    },
+                  },
+                ]
+              : []),
+            {
+              id: "copy",
+              // The confirmation is the label and the glyph together, because the
+              // control has no words on it to change: a tick says the press
+              // landed, and the name says so to everyone who cannot see it.
+              label: copied === entry.absolutePath ? FILES_COPIED_LABEL : FILES_COPY_PATH_LABEL,
+              icon: copied === entry.absolutePath ? Check : Copy,
+              onSelect: () => copyPath(entry.absolutePath),
+            },
           ];
     // How this row spends what it has left: which of its two yielding cells are
     // painted, and what the verb cluster gets afterwards. One call, declared
@@ -2643,6 +2778,25 @@ export function FilesPane() {
             className="shrink-0 font-mono text-muted-foreground text-xs"
           >
             {entry.size.label}
+          </span>
+        )}
+        {/* What is beneath this folder and not here (Story 69.1, AD-219).
+
+            Where a file's size goes, because on a folder row that place is
+            empty and this is the same kind of fact: how much of this row is
+            bytes somewhere else. Zero renders nothing — see
+            {@link filesNotFetchedSentence} for why a zero on every folder
+            would hide the one that matters. */}
+        {entry != null && entry.virtualChildren > 0 && (
+          <span
+            data-slot={FILES_NOT_FETCHED_SLOT}
+            title={`${entry.virtualBytes} bytes are not on this device. ${FILES_SIZE_BASE_NOTE}`}
+            className="shrink-0 font-mono text-muted-foreground text-xs"
+          >
+            {filesNotFetchedSentence(
+              entry.virtualChildren,
+              entry.virtualBytes > 0 ? formatFileSize(entry.virtualBytes) : null,
+            )}
           </span>
         )}
         {/* When this file was last written (Story 56.7, FR-340).
@@ -2978,6 +3132,21 @@ export function FilesPane() {
             which is what a paragraph is for. */}
         <header className="flex shrink-0 flex-col gap-2 border-border border-b px-6 py-4">
           <div className="flex items-center justify-end gap-2">
+            {/* What a folder-level Fetch is doing right now (Story 69.1,
+              AD-219). The header, not the row: the loop walks the folder's
+              children and the row it started from is the one thing on screen
+              that does not move, so a line under it would jump with every
+              request. `role="status"` for the selection count's reason — the
+              text changes under the reader's own press. */}
+            {fetching !== null && (
+              <span
+                role="status"
+                data-testid={FILES_FETCHING_TESTID}
+                className="mr-auto truncate text-muted-foreground text-xs"
+              >
+                {fetching}
+              </span>
+            )}
             {/* Delete acts on the SELECTION, which is why the count lives here
               rather than a Delete button living on every row (Story 45.3).
               A per-row button cannot answer "and the other four", and the

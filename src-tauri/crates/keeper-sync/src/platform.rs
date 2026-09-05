@@ -11,7 +11,10 @@
 //! paths and the OS keyring. A third, `TestPlatform`, lives here so unit tests
 //! never touch the real keychain or the real clock.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::error::{Result, SyncError};
 
@@ -278,6 +281,122 @@ fn open_file_state_under_proc(proc_root: &Path, path: &Path) -> OpenFileState {
     }
 }
 
+/// What one bot task hands its runner (Epic 69, Story 69.4, AD-224).
+///
+/// Everything the engine knows about the run, and nothing it does not: the
+/// engine has already resolved `prompt_subpath` inside the profile's folder
+/// through `browse::resolve` — the same containment every other path in this
+/// crate goes through (AD-65) — and read the file. It has **not** parsed it:
+/// markdown and frontmatter are `keeper-core`'s, and this crate is
+/// `keeper-core`-free (AD-40), so `prompt_text` is the file's whole text and
+/// the runner takes the body after the fence and the title out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotTaskSpec {
+    /// The task row's id, for the runner's own records and logs.
+    pub task_id: String,
+    /// The profile the prompt lives in — a sessions root *is* a profile.
+    pub profile_id: String,
+    /// The bot to ask, as stored on the row.
+    pub bot_id: String,
+    /// The model to send as, or `None` for the runner's own default rule (the
+    /// conversation's, then the provider's, then the first offered).
+    pub model: Option<String>,
+    /// The prompt file, profile-relative, as stored on the row.
+    pub prompt_subpath: String,
+    /// The prompt file's text, frontmatter included.
+    pub prompt_text: String,
+}
+
+/// What one bot run produced (Epic 69, Story 69.4; written into the session
+/// by Story 69.5).
+///
+/// Complete on purpose: the run log Story 69.5 writes has six sections —
+/// Prompt / Answer / Tool calls / Warnings / Errors / Result (outcome,
+/// duration, tokens, finish reason) — and every one of them is a field here,
+/// so the writer composes a file from a record and never has to go back to
+/// the stream. Today the engine folds it into the one-line `task_runs.detail`
+/// ([`crate::engine::Engine`]'s `bot_run_detail`), and that line is what the
+/// Tasks pane shows until the log exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotRunRecord {
+    /// How the run ended, in the task vocabulary: `Ok` for an answer that
+    /// finished, `Failed` for a stream that broke or was stopped, and the
+    /// runner's to choose between `Deferred` and `Failed` for a provider it
+    /// could not reach.
+    pub outcome: crate::tasks::TaskOutcome,
+    /// The answer as stored — the whole turn's prose, every round of a
+    /// tool-using turn included. Empty when nothing arrived.
+    pub answer: String,
+    /// How many tool calls the turn made.
+    pub tool_calls: u32,
+    /// Things worth a person's eye that did not stop the run: a model that
+    /// answered under a different name, a refused tool call, a truncated
+    /// answer.
+    pub warnings: Vec<String>,
+    /// Why it failed, when it did — the stream's own credential-free
+    /// sentences, in order.
+    pub errors: Vec<String>,
+    /// Prompt tokens where the endpoint reported them.
+    pub prompt_tokens: Option<u32>,
+    /// Completion tokens where the endpoint reported them.
+    pub completion_tokens: Option<u32>,
+    /// Milliseconds from the request leaving to the stream closing.
+    pub ms: u64,
+    /// The provider's finish reason, in its own word, where it gave one.
+    pub finish_reason: Option<String>,
+    /// The model that answered, where the server named it; else the one
+    /// requested.
+    pub model: Option<String>,
+}
+
+impl BotRunRecord {
+    /// A run that never reached a provider, with the one sentence that says
+    /// why. `Failed`, no answer, no tokens, no time.
+    pub fn failed(error: impl Into<String>) -> Self {
+        Self {
+            outcome: crate::tasks::TaskOutcome::Failed,
+            answer: String::new(),
+            tool_calls: 0,
+            warnings: Vec::new(),
+            errors: vec![error.into()],
+            prompt_tokens: None,
+            completion_tokens: None,
+            ms: 0,
+            finish_reason: None,
+            model: None,
+        }
+    }
+}
+
+/// The future a [`BotTaskRunner`] answers with.
+pub type BotRunFuture = Pin<Box<dyn Future<Output = BotRunRecord> + Send>>;
+
+/// The one door through which a bot task reaches a bot (AD-224).
+///
+/// `keeper-sync` is `keeper-core`-free (AD-40), so the engine cannot call
+/// `keeper_core::bots::chat`; the desktop shell implements this over its own
+/// `open_turn` — the same code path a typed or spoken message takes, with an
+/// explicit **task** origin so a run never speaks — and hands it to the engine
+/// through [`SyncPlatform::bot_task_runner`]. Object-safe and boxed for the
+/// reason [`SyncPlatform`] is: the engine holds it as `Arc<dyn …>`.
+///
+/// A runner **always** answers with a record, never an error: a refusal is a
+/// `Failed` record whose `errors` carry the sentence, so the task history has
+/// one shape for every way a run can end.
+pub trait BotTaskRunner: Send + Sync + std::fmt::Debug {
+    /// Run one prompt against one bot and report what happened.
+    fn run(&self, spec: BotTaskSpec) -> BotRunFuture;
+}
+
+/// The sentence a host with no [`BotTaskRunner`] records for a requested bot
+/// run — `keeper-syncd`, and every other host that is not the desktop app.
+///
+/// One constant so the daemon's `tasks run` and the engine's arm cannot word
+/// it twice. It names the host that *can*, because the row is real and the
+/// person reading the refusal is about to go and find it.
+pub const NO_BOT_RUNNER_SENTENCE: &str =
+    "this host cannot run a bot task; the keeper app on the Mac runs it";
+
 /// Everything the engine needs from the outside world.
 ///
 /// Object-safe on purpose: the engine holds `Arc<dyn SyncPlatform>` so a
@@ -305,6 +424,24 @@ pub trait SyncPlatform: Send + Sync {
     /// Raise a user-visible notification. Best-effort by contract: a host with
     /// no notifier returns `Ok(())` rather than failing a sync.
     fn notify(&self, title: &str, body: &str);
+
+    /// The door a bot task reaches its bot through, or `None` on a host that
+    /// has none (Epic 69, Story 69.4, AD-224).
+    ///
+    /// Provided rather than required, and the default is the **refusing**
+    /// answer, on [`Self::open_file_state`]'s argument: a host must opt in. The
+    /// desktop app is the one host that can — it links `keeper-core` and owns
+    /// the bots' credentials — and it overrides this; `keeper-syncd` and the
+    /// phone inherit `None`, so the engine's tick never claims a `bot` row
+    /// there and a requested run records [`NO_BOT_RUNNER_SENTENCE`]. A host
+    /// that has not thought about whether it can talk to a model must not
+    /// find itself doing so because a default said yes.
+    ///
+    /// Asked per run, not cached: the desktop's answer depends on an app handle
+    /// installed at setup, and a runner built before that would hold nothing.
+    fn bot_task_runner(&self) -> Option<Arc<dyn BotTaskRunner>> {
+        None
+    }
 
     /// Wall-clock milliseconds since the Unix epoch.
     ///
@@ -542,6 +679,9 @@ pub struct TestPlatform {
     free_space: Option<u64>,
     git: Option<PathBuf>,
     open_file_state: std::sync::Mutex<OpenFileState>,
+    /// The bot runner a test injects, or `None` for the trait's own default —
+    /// which is what every host but the desktop app answers.
+    bot_task_runner: std::sync::Mutex<Option<Arc<dyn BotTaskRunner>>>,
 }
 
 impl TestPlatform {
@@ -561,6 +701,7 @@ impl TestPlatform {
             // `dehydrate_entry` unreachable, and the refusal has its own test
             // that sets this deliberately.
             open_file_state: std::sync::Mutex::new(OpenFileState::Closed),
+            bot_task_runner: std::sync::Mutex::new(None),
         }
     }
 
@@ -610,6 +751,17 @@ impl TestPlatform {
         *Self::lock(&self.open_file_state) = state;
     }
 
+    /// Give the test machine a bot runner, or take it away again with `None`.
+    ///
+    /// Settable while the engine holds this platform, for
+    /// [`Self::set_open_file_state`]'s reason: the interesting case is one
+    /// engine whose host gains or loses the door, not two engines. `None` is
+    /// the trait's own default and every host's but the desktop app's, so
+    /// the refusing answer is assertable through this platform too.
+    pub fn set_bot_task_runner(&self, runner: Option<Arc<dyn BotTaskRunner>>) {
+        *Self::lock(&self.bot_task_runner) = runner;
+    }
+
     /// Poison-tolerant lock: a panicking test must not cascade into every other
     /// assertion in the same process.
     fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -640,6 +792,10 @@ impl SyncPlatform for TestPlatform {
 
     fn notify(&self, title: &str, body: &str) {
         Self::lock(&self.notifications).push((title.to_owned(), body.to_owned()));
+    }
+
+    fn bot_task_runner(&self) -> Option<Arc<dyn BotTaskRunner>> {
+        Self::lock(&self.bot_task_runner).clone()
     }
 
     fn now_ms(&self) -> i64 {

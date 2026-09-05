@@ -13,12 +13,22 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use keeper_core::vm::{IpcError, VoiceEventVm};
-use keeper_core::voice::events::{VoiceEventKind, VoiceEvents};
+use keeper_core::voice::events::{self, VoiceEventKind, VoiceEvents};
 use keeper_core::voice::{Effect, TurnEvent, TurnState, WakePhrase};
 
 /// The one ring for the process. Every target: a desktop with no port
 /// records the turn's transitions and refusals all the same.
 static EVENTS: Mutex<VoiceEvents> = Mutex::new(VoiceEvents::new());
+
+/// Now, in milliseconds since the Unix epoch — the clock every row here is
+/// stamped with, and the one `voice_ipc` stamps the turn's wait with
+/// (AD-215), so the ring and the snapshot never disagree about a moment.
+pub fn now_ms() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
 
 /// Record one thing the port did, now. Never blocks on anything but the
 /// ring's own lock, so it is safe from the port's worker and from under
@@ -26,14 +36,10 @@ static EVENTS: Mutex<VoiceEvents> = Mutex::new(VoiceEvents::new());
 /// diagnostic that refused to record after a panic elsewhere would be the
 /// one record nobody could read.
 pub fn record(kind: VoiceEventKind, detail: Option<String>) {
-    let at_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(since) => i64::try_from(since.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    };
     EVENTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(at_ms, kind, detail);
+        .push(now_ms(), kind, detail);
 }
 
 /// What a turn transition amounted to, recorded from `voice_ipc::transition`:
@@ -44,8 +50,16 @@ pub fn record(kind: VoiceEventKind, detail: Option<String>) {
 /// event the port sent was a transcript and the match is `Turn`'s; the stop
 /// match that took a speaking turn straight to `Idle`, with the words that
 /// matched (Epic 67, AD-208 — the same reasoning: the port sent a
-/// barge-in, `Turn` decided it was the stop phrase); and the answer handed
-/// to the synthesiser.
+/// barge-in, `Turn` decided it was the stop phrase); the manual stop that
+/// ended an open turn, with the state it left as the detail (Epic 68,
+/// AD-212 — `abandoned: speaking` followed by `turn:idle` is the button,
+/// the tray, the hotkey or the deep link cutting an answer, and the
+/// `wake_matched` after it is the phrase working again); the answer
+/// handed to the synthesiser; and, since Epic 68 (AD-214), every sentence
+/// queued behind it with its first words, and the close of the answer —
+/// `spoken`, `enqueued`…, `answer_closed`, then the synthesiser's own
+/// `turn:idle` is one answer read to its end; `abandoned` in between is
+/// the person cutting it.
 pub fn transition(
     before: VoiceEventKind,
     event: &TurnEvent,
@@ -63,6 +77,11 @@ pub fn transition(
             record(VoiceEventKind::StopMatched, Some(words.clone()));
         }
     }
+    if matches!(event, TurnEvent::Abandoned) && before != VoiceEventKind::turn(&TurnState::Idle) {
+        if let VoiceEventKind::Turn(left) = before {
+            record(VoiceEventKind::Abandoned, Some(left.to_owned()));
+        }
+    }
     if after != before {
         let detail = match state {
             TurnState::Failed { reason } => Some(reason.clone()),
@@ -71,11 +90,22 @@ pub fn transition(
         };
         record(after, detail);
     }
-    if effects
-        .iter()
-        .any(|effect| matches!(effect, Effect::Speak(_)))
+    for effect in effects {
+        match effect {
+            Effect::Speak(_) => record(VoiceEventKind::Spoken, None),
+            Effect::Enqueue(text) => {
+                record(VoiceEventKind::Enqueued, Some(events::first_words(text)));
+            }
+            _ => {}
+        }
+    }
+    // The close of an answer being read: while it goes on playing, or when
+    // the close itself ended the turn because the queue had already drained.
+    if matches!(event, TurnEvent::AnswerDone(_))
+        && (matches!(state, TurnState::Speaking)
+            || before == VoiceEventKind::turn(&TurnState::Speaking))
     {
-        record(VoiceEventKind::Spoken, None);
+        record(VoiceEventKind::AnswerClosed, None);
     }
 }
 

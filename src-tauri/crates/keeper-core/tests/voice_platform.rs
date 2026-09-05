@@ -1,8 +1,10 @@
-//! Story 63.3 (FR-415, FR-416, AD-175): the voice port's platform-neutral
-//! half knows two platforms. The sentences are written once and filled with
-//! the platform's nouns; the half-duplex rule is a pure function the turn
-//! honours; and the iOS wording is pinned letter for letter so a change to
-//! it has to be deliberate.
+//! Story 63.3 (FR-415, FR-416, AD-175) and Story 68.2 (AD-213): the voice
+//! port's platform-neutral half knows two platforms. The sentences are
+//! written once and filled with the platform's nouns; the duplex rule is a
+//! pure function the turn honours — both Apple ports keep their own voice
+//! out through the input node's voice processing, and only the absent port
+//! is half duplex; and the iOS wording is pinned letter for letter so a
+//! change to it has to be deliberate.
 
 use std::sync::Mutex;
 
@@ -21,6 +23,7 @@ enum Call {
     Start,
     Stop,
     Speak(String),
+    Enqueue(String),
     StopSpeaking,
 }
 
@@ -75,6 +78,10 @@ impl VoicePort for FakePort {
         self.record(Call::Speak(text.to_owned()));
         Ok(())
     }
+    fn enqueue(&self, text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
+        self.record(Call::Enqueue(text.to_owned()));
+        Ok(())
+    }
     fn stop_speaking(&self) {
         self.record(Call::StopSpeaking);
     }
@@ -106,25 +113,27 @@ fn every_state() -> Vec<TurnState> {
 }
 
 // ---------------------------------------------------------------------------
-// The half-duplex rule (AD-175).
+// The duplex rule (AD-175, revised by AD-213).
 // ---------------------------------------------------------------------------
 
 /// The truth table: every state on every platform. The only cell that
 /// differs between platforms is `Speaking`, and it is the whole point — a
-/// Mac speaking while armed must not be recording.
+/// port with nothing to keep its voice out must not record while it
+/// speaks, and since AD-213 that is the absent port alone: the Mac has the
+/// same voice processing the phone has.
 #[test]
 fn voice_may_record_truth_table_covers_every_state() {
     for state in every_state() {
-        let expected_ios = !matches!(state, TurnState::Failed { .. });
-        let expected_half_duplex = expected_ios && !matches!(state, TurnState::Speaking);
+        let expected_full_duplex = !matches!(state, TurnState::Failed { .. });
+        let expected_half_duplex = expected_full_duplex && !matches!(state, TurnState::Speaking);
         assert_eq!(
             may_record(&VoicePlatform::IOS, &state),
-            expected_ios,
+            expected_full_duplex,
             "iOS, {state:?}"
         );
         assert_eq!(
             may_record(&VoicePlatform::MACOS, &state),
-            expected_half_duplex,
+            expected_full_duplex,
             "macOS, {state:?}"
         );
         assert_eq!(
@@ -135,7 +144,7 @@ fn voice_may_record_truth_table_covers_every_state() {
     }
     // Read through a slice rather than asserted directly: these fields are consts, and
     // clippy refuses both a bare `assert!` on a constant and an `assert_eq!(_, true)`.
-    // The fact is still pinned — full duplex is iOS's alone.
+    // The fact is still pinned — both Apple platforms are full duplex, the absent port is not.
     let duplex: Vec<bool> = [
         VoicePlatform::IOS,
         VoicePlatform::MACOS,
@@ -144,9 +153,30 @@ fn voice_may_record_truth_table_covers_every_state() {
     .iter()
     .map(|platform| platform.full_duplex)
     .collect();
-    assert_eq!(duplex, vec![true, false, false], "only iOS is full duplex");
-    assert!(!may_record(&VoicePlatform::MACOS, &TurnState::Speaking));
+    assert_eq!(
+        duplex,
+        vec![true, true, false],
+        "iOS and macOS are full duplex; the absent port is not"
+    );
+    assert!(!may_record(&VoicePlatform::ABSENT, &TurnState::Speaking));
+    assert!(may_record(&VoicePlatform::MACOS, &TurnState::Speaking));
     assert!(may_record(&VoicePlatform::IOS, &TurnState::Speaking));
+}
+
+/// The sentence a Mac shows beside the switch when voice processing was
+/// refused on its input (AD-213): it names the device, says the word does
+/// nothing while the Mac speaks, and says the manual stops still do.
+#[test]
+fn voice_half_duplex_sentence_names_the_device_and_keeps_the_button() {
+    let sentence = VoicePlatform::MACOS.half_duplex_sentence("BlackHole 2ch");
+    assert!(sentence.contains("BlackHole 2ch"), "{sentence}");
+    assert!(sentence.contains("this Mac"), "{sentence}");
+    assert!(sentence.contains("stop word"), "{sentence}");
+    assert!(
+        sentence.contains("the button, the hotkey and the tray still stop an answer"),
+        "{sentence}"
+    );
+    assert!(!sentence.contains("this phone"), "{sentence}");
 }
 
 /// On iOS the rule agrees with what the port has always done: for every
@@ -208,8 +238,8 @@ fn voice_may_record_agrees_with_the_ios_port_in_every_state() {
 /// itself, and the phrase is listened for again once the answer ends.
 #[test]
 fn voice_half_duplex_turn_releases_the_armed_microphone_before_speaking() {
-    let port = FakePort::on(VoicePlatform::MACOS);
-    let mut turn = Turn::new(VoicePlatform::MACOS);
+    let port = FakePort::on(VoicePlatform::ABSENT);
+    let mut turn = Turn::new(VoicePlatform::ABSENT);
     turn.set_wake(Some(phrase()));
     assert!(turn.microphone_open());
 
@@ -224,7 +254,7 @@ fn voice_half_duplex_turn_releases_the_armed_microphone_before_speaking() {
     assert_eq!(turn.state(), &TurnState::Speaking);
     assert!(
         !turn.microphone_open(),
-        "a Mac does not record its own answer"
+        "a half-duplex port does not record its own answer"
     );
 
     let effects = turn.drive(TurnEvent::Silence, &port);
@@ -253,8 +283,8 @@ fn voice_half_duplex_turn_releases_the_armed_microphone_before_speaking() {
 /// speak.
 #[test]
 fn voice_half_duplex_turn_never_records_while_speaking() {
-    let port = FakePort::on(VoicePlatform::MACOS);
-    let mut turn = Turn::new(VoicePlatform::MACOS);
+    let port = FakePort::on(VoicePlatform::ABSENT);
+    let mut turn = Turn::new(VoicePlatform::ABSENT);
     turn.drive(TurnEvent::WakeMatched, &port);
     turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
     turn.drive(TurnEvent::Sent, &port);
@@ -286,7 +316,7 @@ fn voice_half_duplex_turn_never_records_while_speaking() {
 /// report speech — and only then opens the device to listen.
 #[test]
 fn voice_half_duplex_barge_in_still_stops_speech_before_listening() {
-    let mut turn = Turn::new(VoicePlatform::MACOS);
+    let mut turn = Turn::new(VoicePlatform::ABSENT);
     turn.apply(TurnEvent::AnswerDone("long".to_owned()));
     let effects = turn.apply(TurnEvent::SpeechDetected("hey".to_owned()));
     assert_eq!(effects, vec![Effect::StopSpeaking, Effect::OpenMicrophone]);
@@ -534,6 +564,9 @@ fn voice_turn_failure_reason_uses_the_turn_platform() {
             None
         }
         fn speak(&self, _text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
+            Ok(())
+        }
+        fn enqueue(&self, _text: &str, _language: &str) -> Result<(), VoiceUnavailable> {
             Ok(())
         }
         fn stop_speaking(&self) {}

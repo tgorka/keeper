@@ -1251,6 +1251,21 @@ development_status:
   67-3-stop-and-an-ear-that-does-not-hear-itself: backlog
   67-4-the-record-and-the-gates: backlog
 
+  # Epic 68 — an answer you can stop, and a wait you can see (2026-09-05)
+  68-1-a-stop-that-stops: backlog
+  68-2-the-mac-keeps-its-ear-open: backlog
+  68-3-the-first-sentence-spoken-when-it-arrives-the-wait-counted: backlog
+  68-4-a-bot-you-choose-with-numbers-a-model-that-can-chat-and-listening-in-the-menu: backlog
+  68-5-the-record-and-the-gates: backlog
+
+  # Epic 69 — the file you can fetch, and the task a bot can run (2026-09-05)
+  69-1-the-verb-you-can-find: backlog
+  69-2-marks-that-stay-known-and-a-clone-that-finishes: backlog
+  69-3-release-on-every-platform: backlog
+  69-4-a-task-a-bot-can-run: backlog
+  69-5-the-record-in-the-session: backlog
+  69-6-the-record-and-the-gates: backlog
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5

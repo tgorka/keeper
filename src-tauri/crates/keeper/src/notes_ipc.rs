@@ -1389,6 +1389,7 @@ pub async fn notes_gallery(
                 &excludes,
                 &browse::PendingView::Unavailable,
                 &browse::MaterializedView::none(),
+                &browse::VirtualView::none(),
             )
         })
         .await

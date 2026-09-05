@@ -27,10 +27,85 @@
  * {@link voiceLevel} reads it; a component that does not draw the level
  * should select `state.kind` rather than `state`, so it is not re-rendered
  * for a number it does not show.
+ *
+ * Since Epic 68 (Story 68.3, AD-215) a `sending` snapshot carries the wait
+ * — whom the question went to and when the request left, as Rust's clock
+ * stamped it — and an `idle` one how long the last answer's first token
+ * took. The words every surface says about it are {@link voiceWaitWord}
+ * and {@link voiceLastWaitLine}; the count is {@link useVoiceClock}'s, a
+ * 1 s interval that reads the wall clock against Rust's `sentAtMs` — never
+ * a counter of its own, so a pane that mounts mid-wait shows the true
+ * seconds, and two surfaces never disagree.
  */
+import { useEffect, useState } from "react";
 import { useStore } from "zustand";
 import { createStore } from "zustand/vanilla";
 import type { VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/client";
+
+/** The state word once the first piece of the answer has arrived (AD-186). */
+export const VOICE_ANSWERING_WORD = "Answering";
+
+/**
+ * The line while the model has said nothing yet (AD-215): whose seconds
+ * they are, and how many so far — `Waiting for nixie · 12 s`, or
+ * `Waiting · 12 s` when Rust has not named the bot. Whole seconds, never
+ * negative: a clock that ran backwards is not a negative wait.
+ */
+export function voiceWaitingLine(bot: string | null | undefined, elapsedMs: number): string {
+  const seconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  return bot ? `Waiting for ${bot} · ${seconds} s` : `Waiting · ${seconds} s`;
+}
+
+/** After the turn (AD-215): how long the first word took — `first word after 28 s`. */
+export function voiceFirstWordLine(waitMs: number): string {
+  return `first word after ${Math.max(0, Math.floor(waitMs / 1000))} s`;
+}
+
+/**
+ * The word a `sending` snapshot earns at `nowMs`: {@link VOICE_ANSWERING_WORD}
+ * once the first token is in, the counting {@link voiceWaitingLine} while
+ * Rust has stamped when the request left, or `null` when it has not — the
+ * caller's own "Sending" word then, as before the wait was counted.
+ */
+export function voiceWaitWord(state: VoiceStateVm | null, nowMs: number): string | null {
+  if (state?.kind !== "sending") {
+    return null;
+  }
+  if (state.answering) {
+    return VOICE_ANSWERING_WORD;
+  }
+  if (state.sentAtMs == null) {
+    return null;
+  }
+  return voiceWaitingLine(state.bot, nowMs - state.sentAtMs);
+}
+
+/** The after-the-turn line an `idle` snapshot carries, or `null` before a turn has answered. */
+export function voiceLastWaitLine(state: VoiceStateVm | null): string | null {
+  if (state?.kind !== "idle" || state.lastWaitMs == null) {
+    return null;
+  }
+  return voiceFirstWordLine(state.lastWaitMs);
+}
+
+/**
+ * The wall clock, re-read once a second while `state` is a wait being
+ * counted (`sending`, no first token yet, `sentAtMs` stamped) and left
+ * alone otherwise — so the interval exists only while a line is counting.
+ */
+export function useVoiceClock(state: VoiceStateVm | null): number {
+  const counting = state?.kind === "sending" && !state.answering && state.sentAtMs != null;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!counting) {
+      return;
+    }
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [counting]);
+  return now;
+}
 
 export interface VoiceState {
   /** The turn's latest snapshot, exactly as streamed; `null` before the first. */

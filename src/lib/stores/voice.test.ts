@@ -4,7 +4,14 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import type { VoiceStateVm } from "@/lib/ipc/client";
-import { isListening, voiceLevel, voiceStore } from "@/lib/stores/voice";
+import {
+  isListening,
+  VOICE_ANSWERING_WORD,
+  voiceLastWaitLine,
+  voiceLevel,
+  voiceStore,
+  voiceWaitWord,
+} from "@/lib/stores/voice";
 
 const WAKE = {
   enabled: false,
@@ -63,6 +70,56 @@ describe("voiceLevel", () => {
     expect(voiceLevel({ kind: "sending", answering: false })).toBeNull();
     expect(voiceLevel({ kind: "speaking" })).toBeNull();
     expect(voiceLevel({ kind: "failed", reason: "x" })).toBeNull();
+  });
+});
+
+describe("the counted wait (AD-215)", () => {
+  const sentAtMs = 1_700_000_000_000;
+
+  it("counts whole seconds from Rust's sentAtMs and names the bot", () => {
+    const waiting: VoiceStateVm = { kind: "sending", answering: false, bot: "nixie", sentAtMs };
+    expect(voiceWaitWord(waiting, sentAtMs)).toBe("Waiting for nixie · 0 s");
+    expect(voiceWaitWord(waiting, sentAtMs + 12_400)).toBe("Waiting for nixie · 12 s");
+    // A bot Rust did not name is not invented.
+    expect(voiceWaitWord({ kind: "sending", answering: false, sentAtMs }, sentAtMs + 3_000)).toBe(
+      "Waiting · 3 s",
+    );
+    // A wall clock behind Rust's stamp is not a negative wait.
+    expect(voiceWaitWord(waiting, sentAtMs - 5_000)).toBe("Waiting for nixie · 0 s");
+  });
+
+  it("says Answering once the first token is in, and nothing when Rust stamped nothing", () => {
+    expect(
+      voiceWaitWord(
+        {
+          kind: "sending",
+          answering: true,
+          bot: "nixie",
+          sentAtMs,
+          firstTokenMs: sentAtMs + 28_550,
+        },
+        sentAtMs + 40_000,
+      ),
+    ).toBe(VOICE_ANSWERING_WORD);
+    expect(voiceWaitWord({ kind: "sending", answering: false }, sentAtMs)).toBeNull();
+    expect(voiceWaitWord({ kind: "speaking" }, sentAtMs)).toBeNull();
+    expect(voiceWaitWord(null, sentAtMs)).toBeNull();
+  });
+
+  it("says how long the last first word took only once a turn has answered", () => {
+    expect(
+      voiceLastWaitLine({
+        kind: "idle",
+        wake: "nixie",
+        listeningForWake: true,
+        lastWaitMs: 28_550,
+      }),
+    ).toBe("first word after 28 s");
+    expect(voiceLastWaitLine({ kind: "idle", wake: null, listeningForWake: false })).toBeNull();
+    expect(
+      voiceLastWaitLine({ kind: "idle", wake: null, listeningForWake: false, lastWaitMs: null }),
+    ).toBeNull();
+    expect(voiceLastWaitLine({ kind: "speaking" })).toBeNull();
   });
 });
 

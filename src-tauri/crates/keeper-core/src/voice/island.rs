@@ -111,8 +111,12 @@ pub fn word(state: &VoiceStateVm) -> Option<Word> {
         } => Some(Word::Armed),
         VoiceStateVm::Listening { .. } => Some(Word::Listening),
         VoiceStateVm::Heard { .. } => Some(Word::Heard),
-        VoiceStateVm::Sending { answering: false } => Some(Word::Thinking),
-        VoiceStateVm::Sending { answering: true } => Some(Word::Answering),
+        VoiceStateVm::Sending {
+            answering: false, ..
+        } => Some(Word::Thinking),
+        VoiceStateVm::Sending {
+            answering: true, ..
+        } => Some(Word::Answering),
         VoiceStateVm::Speaking => Some(Word::Speaking),
         VoiceStateVm::Failed { .. } => Some(Word::Failed),
     }
@@ -157,6 +161,16 @@ mod tests {
         VoiceStateVm::Idle {
             wake: Some("nixie".to_owned()),
             listening_for_wake: armed,
+            last_wait_ms: None,
+        }
+    }
+
+    fn sending(answering: bool) -> VoiceStateVm {
+        VoiceStateVm::Sending {
+            answering,
+            bot: None,
+            sent_at_ms: None,
+            first_token_ms: None,
         }
     }
 
@@ -185,14 +199,8 @@ mod tests {
             }),
             Some(Word::Heard)
         );
-        assert_eq!(
-            word(&VoiceStateVm::Sending { answering: false }),
-            Some(Word::Thinking)
-        );
-        assert_eq!(
-            word(&VoiceStateVm::Sending { answering: true }),
-            Some(Word::Answering)
-        );
+        assert_eq!(word(&sending(false)), Some(Word::Thinking));
+        assert_eq!(word(&sending(true)), Some(Word::Answering));
         assert_eq!(word(&VoiceStateVm::Speaking), Some(Word::Speaking));
         assert_eq!(word(&failed()), Some(Word::Failed));
     }
@@ -229,17 +237,11 @@ mod tests {
             Step::Update(Word::Heard)
         );
         assert_eq!(
-            step(
-                Some(Word::Heard),
-                &VoiceStateVm::Sending { answering: false }
-            ),
+            step(Some(Word::Heard), &sending(false)),
             Step::Update(Word::Thinking)
         );
         assert_eq!(
-            step(
-                Some(Word::Thinking),
-                &VoiceStateVm::Sending { answering: true }
-            ),
+            step(Some(Word::Thinking), &sending(true)),
             Step::Update(Word::Answering)
         );
         assert_eq!(

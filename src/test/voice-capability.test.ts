@@ -138,7 +138,10 @@ describe("the spoken turn (Epic 67, AD-205)", () => {
   it("performs SendText in the shell and drives Speak from the stream's close", () => {
     expect(VOICE_IPC_RS).toMatch(/Effect::SendText\(text\) => Some\(text\)/);
     expect(VOICE_IPC_RS).toContain("crate::bots_ipc::send_spoken(&app, text).await");
-    expect(BOTS_IPC_RS).toContain("crate::voice_ipc::answer_complete(content.to_owned())");
+    // Since epic 68 (AD-214) the close hands the segmenter's REST to the turn; the
+    // sentences before it were spoken as they arrived through `answer_sentence`.
+    expect(BOTS_IPC_RS).toContain("crate::voice_ipc::answer_complete(rest)");
+    expect(BOTS_IPC_RS).toContain("crate::voice_ipc::answer_sentence(");
     // The command the webview used to speak with is gone on both sides.
     expect(LIB_RS).not.toContain("voice_ipc::voice_speak");
     expect(CLIENT_TS).not.toContain('"voice_speak"');

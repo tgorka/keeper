@@ -12,6 +12,10 @@
  *    no longer pinned shows as the unset option, the way Rust treats it.
  * 4. **Absent with nothing to choose** — no pinned bot, no control (AD-27);
  *    a failed write shows the sentence.
+ * 5. **The numbers beside the names** (Epic 68, AD-216) — an option reads
+ *    "Butler · first word ~25 s" from `voice_target_speeds`'s median, a bot
+ *    with no median reads its name alone, and a failed read leaves the
+ *    names.
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -19,18 +23,21 @@ import {
   BotVoiceTarget,
   VOICE_TARGET_LABEL,
   VOICE_TARGET_RECENT_LABEL,
+  voiceTargetOptionLabel,
 } from "@/components/bots/bot-voice-target";
-import type { BotVm, VoiceWakeVm } from "@/lib/ipc/client";
+import type { BotVm, VoiceTargetSpeedVm, VoiceWakeVm } from "@/lib/ipc/client";
 import { voiceStore } from "@/lib/stores/voice";
 
 const botsBotsList = vi.fn<() => Promise<BotVm[]>>();
 const voiceTargetSet = vi.fn<(botId: string | null) => Promise<VoiceWakeVm>>();
+const voiceTargetSpeeds = vi.fn<() => Promise<VoiceTargetSpeedVm[]>>();
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
   return {
     ...actual,
     botsBotsList: () => botsBotsList(),
     voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
+    voiceTargetSpeeds: () => voiceTargetSpeeds(),
   };
 });
 
@@ -64,7 +71,9 @@ const BOTS = [bot("a", "Archivist"), bot("b", "Butler")];
 beforeEach(() => {
   botsBotsList.mockReset();
   voiceTargetSet.mockReset();
+  voiceTargetSpeeds.mockReset();
   botsBotsList.mockResolvedValue(BOTS);
+  voiceTargetSpeeds.mockResolvedValue([]);
   voiceStore.setState({ state: null, unavailable: null, wake: WAKE });
 });
 
@@ -130,5 +139,40 @@ describe("BotVoiceTarget", () => {
     await screen.findByRole("alert");
     expect(screen.getByRole("alert")).toHaveTextContent("the settings table is read-only");
     expect(control).toHaveValue("");
+  });
+
+  it("shows each bot's first-token median beside its name (AD-216)", async () => {
+    voiceTargetSpeeds.mockResolvedValue([
+      { botId: "a", firstTokenMedianMs: null },
+      { botId: "b", firstTokenMedianMs: 25_400 },
+    ]);
+    render(<BotVoiceTarget />);
+    await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    await waitFor(() =>
+      expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+        VOICE_TARGET_RECENT_LABEL,
+        "Archivist",
+        "Butler · first word ~25 s",
+      ]),
+    );
+  });
+
+  it("keeps the names when the speeds could not be read", async () => {
+    voiceTargetSpeeds.mockRejectedValue(new Error("no store"));
+    render(<BotVoiceTarget />);
+    await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    await waitFor(() => expect(voiceTargetSpeeds).toHaveBeenCalledTimes(1));
+    expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual([
+      VOICE_TARGET_RECENT_LABEL,
+      "Archivist",
+      "Butler",
+    ]);
+  });
+
+  it("rounds the median to whole seconds and never says zero", () => {
+    expect(voiceTargetOptionLabel("nixie", 28_550)).toBe("nixie · first word ~29 s");
+    expect(voiceTargetOptionLabel("ollama", 1_900)).toBe("ollama · first word ~2 s");
+    expect(voiceTargetOptionLabel("ollama", 240)).toBe("ollama · first word ~1 s");
+    expect(voiceTargetOptionLabel("new", null)).toBe("new");
   });
 });

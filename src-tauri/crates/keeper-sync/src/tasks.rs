@@ -218,6 +218,36 @@ pub enum TaskKind {
     /// went fine: *"1000 paths checked, 0 bad, 1000 virtual in 1 folders"* is
     /// the answer to a question `sync` and `release` cannot be asked.
     Verify,
+    /// One turn of a bot over a prompt file kept in a session's `prompts/`
+    /// folder (Epic 69, Story 69.4, AD-224, FR-506…FR-509).
+    ///
+    /// **The fourth kind, and the first that names a target.** The row carries
+    /// three nullable columns for it — `bot_id`, `prompt_subpath` (profile-
+    /// relative, `<zone>/<session>/prompts/NN-slug.md`) and `model` — saved
+    /// through the same doors, listed and run by the same tick, leased and
+    /// capped like the other three. A bot task is always folder-scoped, because
+    /// the prompt is a file in that folder; a host-wide row of this kind is a
+    /// misconfiguration the arm reports.
+    ///
+    /// **Why this is not the `exec` the `## Deferred` entry refuses**, item by
+    /// item against the bill above. It spawns nothing: the verb is a chat turn
+    /// keeper already runs from the Bots pane. Its only egress is a provider a
+    /// person configured and Settings → About already discloses, so the
+    /// release workflow's egress diff shows exactly what it always showed. It
+    /// is bounded without a new clock (AD-62): the provider silence budget, the
+    /// tool loop's round ceiling and the one-hour lease already exist. And
+    /// capturing what was said is the feature rather than the gap — the runner
+    /// hands back a [`crate::platform::BotRunRecord`], and Story 69.5 writes it
+    /// into the session. `update` still has no variant.
+    ///
+    /// **This crate cannot run it alone** (AD-40): `keeper-sync` is
+    /// `keeper-core`-free, so the engine reaches the bot through
+    /// [`crate::platform::SyncPlatform::bot_task_runner`], a port that defaults
+    /// to `None`. A host with no runner — `keeper-syncd`, the phone — lists the
+    /// row, never claims it on its tick, and answers a requested run with the
+    /// host sentence (NFR-43's shape, one rung up: the kind is *known* here,
+    /// and still not this host's to run).
+    Bot,
 }
 
 impl TaskKind {
@@ -228,6 +258,7 @@ impl TaskKind {
             Self::Sync => "sync",
             Self::Release => "release",
             Self::Verify => "verify",
+            Self::Bot => "bot",
         }
     }
 
@@ -238,6 +269,7 @@ impl TaskKind {
             "sync" => Some(Self::Sync),
             "release" => Some(Self::Release),
             "verify" => Some(Self::Verify),
+            "bot" => Some(Self::Bot),
             _ => None,
         }
     }
@@ -1739,6 +1771,9 @@ mod tests {
             // hand-written row would most plausibly try is a verb-looking
             // string this build does not own.
             "exec", "run",
+            // Story 69.4's near-misses: the fourth kind is `bot`, and neither
+            // its plural nor the word for what it runs is a kind.
+            "Bot", "bots", "prompt", "chat",
         ] {
             assert_eq!(
                 TaskKind::from_stored(value),
@@ -1757,13 +1792,22 @@ mod tests {
         // exactly one word, and that `update` is still nothing this build can
         // name after it.
         assert_eq!(TaskKind::from_stored("verify"), Some(TaskKind::Verify));
+        // Story 69.4's kind, on the same argument: a *fourth* variant widened
+        // the vocabulary by exactly one word — `bot`, keeper's own verb — and
+        // `exec` is still nothing this build can name after it.
+        assert_eq!(TaskKind::from_stored("bot"), Some(TaskKind::Bot));
     }
 
     /// The on-disk spellings are the compatibility surface, so every one of
     /// them must survive a round trip through the reader that parses it.
     #[test]
     fn every_stored_spelling_round_trips() {
-        for kind in [TaskKind::Sync, TaskKind::Release, TaskKind::Verify] {
+        for kind in [
+            TaskKind::Sync,
+            TaskKind::Release,
+            TaskKind::Verify,
+            TaskKind::Bot,
+        ] {
             assert_eq!(TaskKind::from_stored(kind.as_str()), Some(kind));
         }
         for mode in [TaskMode::Off, TaskMode::Manual, TaskMode::Scheduled] {
@@ -2113,11 +2157,19 @@ mod tests {
         ///
         /// A silent omission is exactly the state this test exists to catch, so
         /// a guard that could be satisfied by editing a list would be a guard
-        /// with a back door. Empty today: every kind `from_stored` accepts is
-        /// one a person may reasonably schedule. `update` is not a
-        /// counter-example — `from_stored` refuses it, so it never enters this
-        /// comparison in the first place.
-        const NEVER_OFFERED: [&str; 0] = [];
+        /// with a back door. `update` is not a counter-example —
+        /// `from_stored` refuses it, so it never enters this comparison in the
+        /// first place.
+        ///
+        /// `bot` (Story 69.4, AD-224) is here for a reason with a date on it:
+        /// the engine runs it, `keeper-syncd` can schedule it, and the form
+        /// cannot offer it yet because a bot task needs three fields the form
+        /// has no controls for — the bot, the prompt file and the model — and a
+        /// kind offered without them would create rows that always fail. It
+        /// leaves this list the moment the form grows them; until then a person
+        /// creates one with `keeper-syncd tasks set --kind bot`, and the row is
+        /// listed and run everywhere like any other.
+        const NEVER_OFFERED: [&str; 1] = ["bot"];
 
         // An exemption for a spelling nothing accepts is an exemption that
         // exempts nothing, and the day somebody misspells one here the kind it

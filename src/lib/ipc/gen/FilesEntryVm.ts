@@ -142,4 +142,31 @@ folderRole: FilesFolderRoleVm | null,
  * never offer an action that will fail. The pane renders the reason where
  * the action would have been.
  */
-write: FilesWriteVm, };
+write: FilesWriteVm, 
+/**
+ * How many entries beneath this **directory** are virtual — content that
+ * is not fetched (Story 69.2, AD-219).
+ *
+ * `0` for a file, and `0` for a directory whose marks walk did not read
+ * the inventory, which is why the folder row says "N not fetched" only
+ * when N is non-zero: a zero is "nothing to fetch, or nothing known" and
+ * the row must not claim the first when it means the second.
+ *
+ * The count is the reason a folder can carry a Fetch verb at all. Without
+ * it the pane would have to walk every child to know whether the verb
+ * applies, which is the walk this listing exists to avoid.
+ */
+virtualChildren: number, 
+/**
+ * The bytes those children would bring down, from their pointers' own
+ * `size` (Story 69.2).
+ *
+ * The pointer states the object's size, so this is exact rather than an
+ * estimate — the one number a person needs before pressing Fetch on a
+ * folder over a phone connection. `0` wherever
+ * [`Self::virtual_children`] is.
+ *
+ * `number` for [`FileSizeVm::bytes`]'s reason: a folder of pointers is
+ * bytes, not a bigint, and every other size on this wire is a number.
+ */
+virtualBytes: number, };

@@ -256,6 +256,8 @@ function browseEntry(name: string, isDir: boolean, size: FileSizeVm | null): Fil
     // keeper itself put here and none of these rows is that. The two rows that
     // are get one below.
     release: null,
+    virtualChildren: 0,
+    virtualBytes: 0,
     // Writable, because the write path — New file, Delete, and the header's
     // count that gates them — is exactly what a viewing aid has to be able to
     // show. A refusal is a different fixture and this is not it.
@@ -3173,10 +3175,6 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     voiceWatcher?.onmessage?.(voiceIdle());
     return null;
   },
-  voice_stop_speaking: () => {
-    voiceWatcher?.onmessage?.(voiceIdle());
-    return null;
-  },
   // Story 61.9's registry, faked. See `mockCommandPreview` for why it is crude.
   bots_command_preview: (payload) => mockCommandPreview(String(payload.draft ?? "")),
   // --- Tasks (Epic 57, Story 57.6) ---------------------------------------
@@ -3897,6 +3895,7 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       entries: subpath === "" ? ENTRIES : (CHILDREN[subpath] ?? []),
       detail: null,
       truncated: false,
+      stale: false,
       write: { writable: true, reason: null, caveat: null, caveatShort: null },
     };
   },

@@ -103,6 +103,8 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceWakeGet: () => voiceWakeGet(),
     voiceEvents: (limit: number) => voiceEvents(limit),
     voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
+    // Epic 68 (AD-216): the picker reads each bot's first-token median too.
+    voiceTargetSpeeds: () => Promise.resolve([]),
   };
 });
 

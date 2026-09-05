@@ -341,6 +341,7 @@ export type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 export type { VerificationPhase } from "./gen/VerificationPhase";
 export type { VoiceEventVm } from "./gen/VoiceEventVm";
 export type { VoiceStateVm } from "./gen/VoiceStateVm";
+export type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
 export type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 export type { VoiceWakeVm } from "./gen/VoiceWakeVm";
 export type { WidgetKind } from "./gen/WidgetKind";
@@ -509,6 +510,7 @@ import type { TypingBatch } from "./gen/TypingBatch";
 import type { VerificationFlowVm } from "./gen/VerificationFlowVm";
 import type { VoiceEventVm } from "./gen/VoiceEventVm";
 import type { VoiceStateVm } from "./gen/VoiceStateVm";
+import type { VoiceTargetSpeedVm } from "./gen/VoiceTargetSpeedVm";
 import type { VoiceUnavailableVm } from "./gen/VoiceUnavailableVm";
 import type { VoiceWakeVm } from "./gen/VoiceWakeVm";
 import type { WidgetKind } from "./gen/WidgetKind";
@@ -7332,6 +7334,34 @@ export async function voiceTargetSet(botId: string | null): Promise<VoiceWakeVm>
 }
 
 /**
+ * Flip the wake switch (Epic 68, Story 68.4, AD-218): the one command the
+ * palette, the native Bots menu, the pane headers on both tiers and the tray
+ * call. Rust reads the stored switch, asks for the recogniser and the
+ * microphone by name when it is switching on (the pane's own rule), writes
+ * the person's choice whatever the port answered (AD-190) and arms or
+ * disarms the phrase — `voice_wake_set`'s path with the stored phrases. The
+ * fresh {@link VoiceWakeVm} is the state the surfaces render.
+ *
+ * Rejects with: `internal`.
+ */
+export async function voiceWakeToggle(): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_wake_toggle");
+}
+
+/**
+ * How fast each pinned bot starts answering (Epic 68, Story 68.4, AD-216),
+ * one row per pinned bot in the pinned order: the median milliseconds to
+ * the first token over the bot's last ten answers, or `null` with fewer
+ * than three measured. Read from `bot_messages.ttft_ms`, already stored per
+ * answer — nothing is measured for this and nothing leaves the device.
+ *
+ * Rejects with: `internal`.
+ */
+export async function voiceTargetSpeeds(): Promise<VoiceTargetSpeedVm[]> {
+  return await invoke<VoiceTargetSpeedVm[]>("voice_target_speeds");
+}
+
+/**
  * Choose the language the recogniser listens in (Epic 63): one of
  * `VoiceWakeVm.onDeviceLocales`, or `null` to persist "choose for me" —
  * the system language when it can run on this device, otherwise a refusal
@@ -7384,8 +7414,10 @@ export async function voiceStart(): Promise<void> {
 }
 
 /**
- * Abandon the turn, whatever state it is in (NFR-51): the microphone is
- * released and nothing heard is sent.
+ * The one manual stop (NFR-51, AD-212): abandon the turn, whatever state it
+ * is in. While listening, the microphone is released and nothing heard is
+ * sent; while the answer is read aloud, the voice is cut mid-word first.
+ * Either way a switched-on wake phrase is re-armed by Rust.
  */
 export async function voiceStop(): Promise<void> {
   await invoke<void>("voice_stop");
@@ -7408,9 +7440,4 @@ export async function listenSpokenStream(
   return await listen<BotStreamEvent>(BOTS_SPOKEN_STREAM_EVENT, (event) => {
     onEvent(event.payload);
   });
-}
-
-/** Stop reading aloud; the turn ends as if the utterance had finished. */
-export async function voiceStopSpeaking(): Promise<void> {
-  await invoke<void>("voice_stop_speaking");
 }

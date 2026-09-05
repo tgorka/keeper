@@ -438,6 +438,7 @@ mod tests {
         VoiceStateVm::Idle {
             wake: Some("nixie".to_owned()),
             listening_for_wake: armed,
+            last_wait_ms: None,
         }
     }
 
@@ -460,7 +461,12 @@ mod tests {
             Face::Shown
         );
         assert_eq!(
-            face(&VoiceStateVm::Sending { answering: false }),
+            face(&VoiceStateVm::Sending {
+                answering: false,
+                bot: None,
+                sent_at_ms: None,
+                first_token_ms: None,
+            }),
             Face::Shown
         );
         assert_eq!(face(&VoiceStateVm::Speaking), Face::Shown);

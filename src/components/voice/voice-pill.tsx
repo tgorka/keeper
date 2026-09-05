@@ -11,10 +11,13 @@
  *
  * # The three things it draws
  *
- * - **The state**, as the lamp's shape and a word: Listening, Heard,
- *   Thinking (`sending` before the first token), Answering (after it),
- *   Speaking, or the failure sentence. `aria-live="polite"` on the word, so
- *   a reader hears the turn move without being interrupted by it.
+ * - **The state**, as the lamp's shape and a word: Listening, Heard, the
+ *   counted wait ("Waiting for nixie · 12 s", from Rust's `sentAtMs` once
+ *   a second — AD-215; "Thinking" only when nothing was stamped), Answering
+ *   (after the first token), Speaking, or the failure sentence.
+ *   `aria-live="polite"` on the word, so a reader hears the turn move
+ *   without being interrupted by it. The armed glance after a turn says
+ *   how long the answer's first word took, in the words' slot.
  * - **The words**, in one line, ellipsised at the *start*: the newest words
  *   are the ones that say "it is still hearing me", so they stay visible and
  *   the sentence's beginning is what gives way. Done with `dir="rtl"` on the
@@ -35,14 +38,14 @@
 import { Lamp, type LampState } from "@/components/ui/lamp";
 import { useReducedMotion } from "@/hooks/use-reduced-motion";
 import type { VoiceStateVm } from "@/lib/ipc/client";
-import { voiceLevel } from "@/lib/stores/voice";
+import { useVoiceClock, voiceLastWaitLine, voiceLevel, voiceWaitWord } from "@/lib/stores/voice";
 import { cn } from "@/lib/utils";
 
 /** The state word while the microphone is open for a turn. */
 export const PILL_LISTENING = "Listening";
 /** The state word once the transcript is final. */
 export const PILL_HEARD = "Heard";
-/** The state word while the model has said nothing yet. */
+/** The state word while the model has said nothing yet and Rust has not stamped when the request left (AD-215 counts it otherwise). */
 export const PILL_THINKING = "Thinking";
 /** The state word once the first piece of the answer has arrived. */
 export const PILL_ANSWERING = "Answering";
@@ -70,15 +73,19 @@ export function pillLamp(state: VoiceStateVm | null): LampState {
   }
 }
 
-/** The state word for a snapshot, or `null` while there is nothing to say. */
-export function pillWord(state: VoiceStateVm | null): string | null {
+/**
+ * The state word for a snapshot at `nowMs`, or `null` while there is
+ * nothing to say. While the model has said nothing yet the word is the
+ * counted wait — "Waiting for nixie · 12 s" (AD-215).
+ */
+export function pillWord(state: VoiceStateVm | null, nowMs: number = Date.now()): string | null {
   switch (state?.kind) {
     case "listening":
       return PILL_LISTENING;
     case "heard":
       return PILL_HEARD;
     case "sending":
-      return state.answering ? PILL_ANSWERING : PILL_THINKING;
+      return voiceWaitWord(state, nowMs) ?? PILL_THINKING;
     case "speaking":
       return PILL_SPEAKING;
     case "failed":
@@ -90,13 +97,19 @@ export function pillWord(state: VoiceStateVm | null): string | null {
   }
 }
 
-/** The words as they arrive, or `""` in a state that has none to show. */
+/**
+ * The words as they arrive, or `""` in a state that has none to show. The
+ * armed glance after a turn carries how long its first word took (AD-215),
+ * in the words' muted slot beside the phrase.
+ */
 export function pillWords(state: VoiceStateVm | null): string {
   switch (state?.kind) {
     case "listening":
       return state.heard;
     case "heard":
       return state.text;
+    case "idle":
+      return state.listeningForWake ? (voiceLastWaitLine(state) ?? "") : "";
     default:
       return "";
   }
@@ -104,7 +117,8 @@ export function pillWords(state: VoiceStateVm | null): string {
 
 export function VoicePill({ state }: { state: VoiceStateVm | null }) {
   const reduced = useReducedMotion();
-  const word = pillWord(state);
+  const now = useVoiceClock(state);
+  const word = pillWord(state, now);
   const words = pillWords(state);
   const level = voiceLevel(state);
   const failed = state?.kind === "failed";

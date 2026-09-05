@@ -1924,13 +1924,34 @@ A task's `kind` is one of keeper's own verbs, never a shell string:
 | `sync` | one full sync pass over the named folder, or over every enabled folder when the task is host-wide — the same `sync --once` body, taking the same per-folder reservation |
 | `release` | one release sweep over the named folder, or over every enabled folder — the same body §9 describes, with every one of its refusals |
 | `verify` | one verification pass over the named folder, or over every enabled folder — the same body `keeper-syncd verify` runs, reading only: no worktree file is written, no object is added to the store, and no network is asked |
+| `bot` | one question, asked of one bot: the prompt is the text of a markdown file under the named folder — `<zone>/<session>/prompts/NN-slug.md`, resolved through the same containment every other path in the crate goes through — and the answer's opening, its tool calls, its tokens and its duration are the run's detail. Reads one file, writes none, and reaches exactly the provider that bot names (already disclosed under Settings → Bots). |
 
-All three reuse the existing implementation rather than gaining a second one,
+`sync`, `release` and `verify` reuse the existing implementation rather than gaining a second one,
 which is what makes "a task is not a privileged caller" true rather than
 promised: a `release` task refuses exactly where `dehydrate` refuses, hashes the
 actual bytes the same way, asks the server the same per-object question at the
 moment of the deletion, and honours the pin, the per-file deadline and both
 budgets.
+
+`bot` reuses the app's own chat path for the same reason, through a port: this
+crate is `keeper-core`-free, so the engine asks the shell to run the turn and
+records what came back. A host with no bot runner — `keeper-syncd` today —
+lists the task, refuses the run with "this host cannot run a bot task; the
+keeper app on the Mac runs it", and leaves the window for the host that has
+one. The app's own task form does not offer the kind yet: it needs a bot, a
+prompt file and a model, and a kind offered without controls for them would
+create rows that can only fail. Until it grows them, a bot task is created
+here:
+
+```
+keeper-syncd tasks set nightly-digest --kind bot --profile drive \
+  --bot 01M1HDCJBAWFGF19X2ZB0H90VK \
+  --prompt 60-sessions/active/2026-09-05-digest/prompts/10-summarise.md \
+  --schedule '0 7 * * *'
+```
+
+A prompt that is still a pointer (its content not fetched) is refused with what
+to do about it rather than sent as 130 bytes of `oid sha256:…`.
 
 `verify` is the one kind that takes **no per-folder reservation**, and that is
 deliberate rather than an omission: it writes nothing, so there is no second

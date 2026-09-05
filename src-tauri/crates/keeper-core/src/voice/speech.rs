@@ -127,6 +127,113 @@ pub fn describe(tag: &str) -> String {
     }
 }
 
+/// The fewest characters a sentence needs before the detector's answer for
+/// it outweighs the answer's first choice of voice (Epic 68, AD-214).
+///
+/// A detector reads a short sentence — "Yes.", "3.5 euros." — as whatever
+/// language shares its few words, and an answer whose voice flipped on each
+/// of those would be DW-231's objection realised. Forty characters is a
+/// clause with a verb in it, which is about where an on-device detector
+/// stops guessing.
+pub const CONFIDENT_CHARS: usize = 40;
+
+/// Whether `detected` — the detector's answer for `sentence` — is confident
+/// enough to change the voice mid-answer: the detector answered at all,
+/// and the sentence is at least [`CONFIDENT_CHARS`] long. `Some` is the
+/// language to choose the voice for; `None` keeps the answer's first
+/// choice. Pure, so the rule is here and not in a port.
+pub fn confident<'a>(detected: Option<&'a str>, sentence: &str) -> Option<&'a str> {
+    let detected = detected.map(str::trim).filter(|d| !d.is_empty())?;
+    (sentence.trim().chars().count() >= CONFIDENT_CHARS).then_some(detected)
+}
+
+/// The marks that end a sentence when they end a word.
+const SENTENCE_MARKS: [char; 3] = ['.', '!', '?'];
+
+/// An answer cut into sentences as it streams (Epic 68, Story 68.3, AD-214).
+///
+/// Fed chunk by chunk, it yields every sentence the text so far has
+/// closed, in order, and holds the tail — the words after the last
+/// boundary — until the next chunk closes it or [`Segmenter::flush`] says
+/// the stream is over. The boundary rule is the lock-screen banner's
+/// (`banner::first_sentence`, which now asks this type): a `.`, `!` or `?`
+/// ends a sentence when it ends a word — the character after the run of
+/// marks is whitespace — and a line break ends one too, because a markdown
+/// heading or a list item is read as its own breath. A dot inside a number
+/// (`3.5`) is followed by a digit and closes nothing; an abbreviation's
+/// (`e.g. this`) is followed by a space and does, which is the same
+/// treatment the banner gives it: a sentence read a beat early is a small
+/// price, and no rule short of a dictionary tells `e.g.` from `etc.` at
+/// the end of a sentence.
+///
+/// A mark at the very end of the buffered text closes nothing yet: the next
+/// chunk may begin with the digit that makes it a number. Only `flush`
+/// treats the end of the text as the end of a word.
+#[derive(Debug, Default)]
+pub struct Segmenter {
+    tail: String,
+}
+
+impl Segmenter {
+    /// An empty segmenter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed `chunk` and take every sentence it closed, trimmed, in order.
+    /// Blank sentences — a run of line breaks — are not sentences.
+    pub fn push(&mut self, chunk: &str) -> Vec<String> {
+        self.tail.push_str(chunk);
+        let mut sentences = Vec::new();
+        while let Some(end) = boundary(&self.tail) {
+            let rest = self.tail.split_off(end);
+            let sentence = std::mem::replace(&mut self.tail, rest);
+            let sentence = sentence.trim();
+            if !sentence.is_empty() {
+                sentences.push(sentence.to_owned());
+            }
+        }
+        sentences
+    }
+
+    /// The stream is over: the tail, trimmed, when there is one.
+    pub fn flush(&mut self) -> Option<String> {
+        let tail = std::mem::take(&mut self.tail);
+        let tail = tail.trim();
+        (!tail.is_empty()).then(|| tail.to_owned())
+    }
+}
+
+/// The byte index just past the first sentence `text` has closed — past its
+/// run of marks, or past its line break — or `None` while none is closed.
+fn boundary(text: &str) -> Option<usize> {
+    let mut chars = text.char_indices().peekable();
+    while let Some((index, mark)) = chars.next() {
+        if mark == '\n' {
+            return Some(index + 1);
+        }
+        if !SENTENCE_MARKS.contains(&mark) {
+            continue;
+        }
+        // The whole run of marks: `?!`, `...`.
+        let mut end = index + mark.len_utf8();
+        while let Some(&(next_index, next)) = chars.peek() {
+            if SENTENCE_MARKS.contains(&next) {
+                end = next_index + next.len_utf8();
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        // A run at the end of the text is not yet known to end a word.
+        match text[end..].chars().next() {
+            Some(after) if after.is_whitespace() => return Some(end),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The English name of a language subtag, for the languages Apple's
 /// dictation and synthesiser inventories cover. Not a locale database: a
 /// subtag missing here is still named by its tag.
@@ -297,5 +404,89 @@ mod tests {
         );
         assert!(answer_instruction("pl_PL").ends_with("Answer in Polish (pl-PL)."));
         assert!(answer_instruction("xx-XX").ends_with("Answer in the language tagged xx-XX."));
+    }
+
+    // -- The segmenter (Epic 68, AD-214) ------------------------------------
+
+    fn feed(chunks: &[&str]) -> (Vec<String>, Option<String>) {
+        let mut segmenter = Segmenter::new();
+        let mut sentences = Vec::new();
+        for chunk in chunks {
+            sentences.extend(segmenter.push(chunk));
+        }
+        let rest = segmenter.flush();
+        (sentences, rest)
+    }
+
+    /// A sentence split across chunks is yielded once, whole, when its
+    /// boundary arrives; the rest waits.
+    #[test]
+    fn a_sentence_split_across_chunks_is_yielded_once_it_closes() {
+        let mut segmenter = Segmenter::new();
+        assert_eq!(segmenter.push("Tomorrow is"), Vec::<String>::new());
+        assert_eq!(segmenter.push(" sunny."), Vec::<String>::new());
+        assert_eq!(
+            segmenter.push(" Expect 24 degrees. And"),
+            vec![
+                "Tomorrow is sunny.".to_owned(),
+                "Expect 24 degrees.".to_owned()
+            ]
+        );
+        assert_eq!(segmenter.flush(), Some("And".to_owned()));
+        assert_eq!(segmenter.flush(), None);
+    }
+
+    /// A dot inside a number closes nothing — including when the chunk ends
+    /// on the dot and the digit is in the next one.
+    #[test]
+    fn a_dot_in_a_number_does_not_end_a_sentence() {
+        let (sentences, rest) = feed(&["It costs 3", ".", "5 euros in Berlin. More", " soon."]);
+        assert_eq!(sentences, list(&["It costs 3.5 euros in Berlin."]));
+        // The last mark closes nothing until the stream is over: the next
+        // chunk could have been a digit.
+        assert_eq!(rest, Some("More soon.".to_owned()));
+    }
+
+    /// Abbreviations are treated as the banner treats them: `e.g.` ends a
+    /// sentence, and the words after it are the next one.
+    #[test]
+    fn abbreviations_end_a_sentence_as_the_banner_has_it() {
+        let (sentences, rest) = feed(&["Use a fruit, e.g. an apple. Done!"]);
+        assert_eq!(sentences, list(&["Use a fruit, e.g.", "an apple."]));
+        assert_eq!(rest, Some("Done!".to_owned()));
+    }
+
+    /// A run of marks is one boundary; a line break is a boundary too, and
+    /// blank lines are not sentences.
+    #[test]
+    fn mark_runs_and_line_breaks_are_boundaries() {
+        let (sentences, rest) = feed(&["Really?! Yes.\nThree things\n\n- one\n- two"]);
+        assert_eq!(
+            sentences,
+            list(&["Really?!", "Yes.", "Three things", "- one"])
+        );
+        assert_eq!(rest, Some("- two".to_owned()));
+    }
+
+    /// A stream that ends mid-sentence: nothing is yielded early, and the
+    /// flush hands the tail over. Nothing at all yields nothing.
+    #[test]
+    fn a_stream_ending_mid_sentence_is_held_until_the_flush() {
+        let (sentences, rest) = feed(&["No terminator", " at all"]);
+        assert_eq!(sentences, Vec::<String>::new());
+        assert_eq!(rest, Some("No terminator at all".to_owned()));
+        assert_eq!(feed(&["", "  \n"]), (Vec::new(), None));
+    }
+
+    /// A detected language changes the voice mid-answer only on a sentence
+    /// long enough to be sure about; a short one keeps the first choice.
+    #[test]
+    fn confidence_needs_a_detection_and_a_long_enough_sentence() {
+        let long = "Jutro będzie słonecznie i ciepło, około dwudziestu stopni.";
+        assert!(long.chars().count() >= CONFIDENT_CHARS);
+        assert_eq!(confident(Some("pl"), long), Some("pl"));
+        assert_eq!(confident(Some("pl"), "Tak."), None);
+        assert_eq!(confident(None, long), None);
+        assert_eq!(confident(Some(" "), long), None);
     }
 }

@@ -46,7 +46,7 @@
 use std::sync::{Mutex, OnceLock};
 
 use keeper_core::vm::VoiceStateVm;
-use keeper_core::voice::banner::{sentence, should_post, Banner};
+use keeper_core::voice::banner::{first_word, sentence, should_post, waiting, Banner};
 use keeper_core::voice::events::VoiceEventKind;
 use keeper_core::voice::island::{word, Word};
 use keeper_core::voice::Effect;
@@ -121,10 +121,33 @@ pub fn observe(snapshot: &VoiceStateVm) {
             return;
         }
         state.showing = next;
+        // AD-215: the wait, composed once per word — `Thinking` is posted
+        // once, so the count is the seconds so far at that moment, and
+        // `Answering` says how long the first word took. The dedupe above
+        // is what keeps a counting line from re-posting every second.
+        let wait = match snapshot {
+            VoiceStateVm::Sending {
+                answering: false,
+                bot,
+                sent_at_ms: Some(sent),
+                ..
+            } => Some(waiting(
+                bot.as_deref(),
+                crate::voice_log::now_ms().saturating_sub(*sent),
+            )),
+            VoiceStateVm::Sending {
+                answering: true,
+                sent_at_ms: Some(sent),
+                first_token_ms: Some(first),
+                ..
+            } => Some(first_word(first.saturating_sub(*sent))),
+            _ => None,
+        };
         let detail = match snapshot {
             VoiceStateVm::Heard { text, .. } => text.as_str(),
             VoiceStateVm::Failed { reason } => reason.as_str(),
             VoiceStateVm::Speaking => state.answer.as_str(),
+            VoiceStateVm::Sending { .. } => wait.as_deref().unwrap_or(""),
             _ => "",
         };
         next.and_then(|next| sentence(next, detail).map(|banner| (next, banner)))

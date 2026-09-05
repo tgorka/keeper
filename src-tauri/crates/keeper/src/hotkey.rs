@@ -268,8 +268,9 @@ pub fn install_capture<R: Runtime>(app: &AppHandle<R>) {
 /// app is frontmost — and [`crate::voice_reach::reach`] drives the turn
 /// straight into `voice_ipc`, the same `WakeMatched` a matched phrase
 /// produces. So a press with keeper hidden opens the microphone exactly as a
-/// press with keeper in front does. A press while a turn is already open is a
-/// no-op (`ReachAsk::Talk`), so a held or repeated chord never restarts one.
+/// press with keeper in front does. A press while a turn is listening or
+/// sending is a no-op (`ReachAsk::Talk`), so a held or repeated chord never
+/// restarts one; a press while the answer is read aloud stops it (AD-212).
 /// Named, not an inline closure, for the same reason as the other handlers:
 /// startup [`install_voice`] and the register/restore paths in
 /// `voice_hotkey_set` share one definition.

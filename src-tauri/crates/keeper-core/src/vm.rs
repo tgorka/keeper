@@ -4276,6 +4276,30 @@ pub struct FilesEntryVm {
     /// never offer an action that will fail. The pane renders the reason where
     /// the action would have been.
     pub write: FilesWriteVm,
+    /// How many entries beneath this **directory** are virtual — content that
+    /// is not fetched (Story 69.2, AD-219).
+    ///
+    /// `0` for a file, and `0` for a directory whose marks walk did not read
+    /// the inventory, which is why the folder row says "N not fetched" only
+    /// when N is non-zero: a zero is "nothing to fetch, or nothing known" and
+    /// the row must not claim the first when it means the second.
+    ///
+    /// The count is the reason a folder can carry a Fetch verb at all. Without
+    /// it the pane would have to walk every child to know whether the verb
+    /// applies, which is the walk this listing exists to avoid.
+    pub virtual_children: u32,
+    /// The bytes those children would bring down, from their pointers' own
+    /// `size` (Story 69.2).
+    ///
+    /// The pointer states the object's size, so this is exact rather than an
+    /// estimate — the one number a person needs before pressing Fetch on a
+    /// folder over a phone connection. `0` wherever
+    /// [`Self::virtual_children`] is.
+    ///
+    /// `number` for [`FileSizeVm::bytes`]'s reason: a folder of pointers is
+    /// bytes, not a bigint, and every other size on this wire is a number.
+    #[ts(type = "number")]
+    pub virtual_bytes: u64,
 }
 
 /// Everything [`FilesEntryVm::new`] needs, named at the call site.
@@ -4313,6 +4337,12 @@ pub struct FilesEntryFacts<'a> {
     pub roles: FilesFolderRoles<'a>,
     /// The location verdict `keeper_sync::files_write` already reached.
     pub write: FilesWriteVm,
+    /// How many entries beneath a **directory** are virtual, from the marks
+    /// walk's own inventory. A file's caller passes `0`; the constructor
+    /// discards a file's the way it discards a directory's size.
+    pub virtual_children: u32,
+    /// The bytes those children would bring down. `0` with the count.
+    pub virtual_bytes: u64,
 }
 
 impl FilesEntryVm {
@@ -4372,6 +4402,8 @@ impl FilesEntryVm {
             release,
             roles,
             write,
+            virtual_children,
+            virtual_bytes,
         } = facts;
         let kind = if is_dir {
             RecordingNoteTargetKind::Folder
@@ -4407,6 +4439,12 @@ impl FilesEntryVm {
             relative_path,
             sync,
             write,
+            // Dropped for a file for the release deadline's reason inverted: a
+            // file IS the thing that can be fetched, and its own status
+            // already says so — a count on a file row would be a second,
+            // weaker way to say `Virtual` and the two could disagree.
+            virtual_children: if is_dir { virtual_children } else { 0 },
+            virtual_bytes: if is_dir { virtual_bytes } else { 0 },
         }
     }
 }
@@ -4446,6 +4484,16 @@ pub struct FilesListingVm {
     /// Whether the listing was cut short at the shell's cap. `false` for every
     /// state that has no entries — there was nothing to cut.
     pub truncated: bool,
+    /// Whether the sync marks on these rows are the previous walk's answer,
+    /// kept because this one was not finished in time (Story 69.2, AD-220).
+    ///
+    /// `false` says the marks are this listing's own. `true` is not a fault:
+    /// the rows are the last thing the engine could stand behind, the pane
+    /// says so quietly, and the fresh marks arrive on the walk's own event
+    /// rather than on a press. The state that was here before this field was
+    /// every row reading "Sync state unknown" on a folder too big to walk in
+    /// three seconds — a careful mark that hid the one fact the row was for.
+    pub stale: bool,
     /// Whether keeper may create a file in the directory that was listed, and
     /// why not (Story 45.3, FR-176, AD-89).
     ///
@@ -7001,6 +7049,15 @@ impl BotDeliverableVm {
 /// where the port has not measured one — before the first buffer, and on a
 /// port that has no meter. A snapshot with a level is streamed at most ~25
 /// times a second and only while the level changes.
+///
+/// Since Epic 68 (Story 68.3, AD-215) `sending` carries the wait — whom the
+/// question went to, when the request left and when its first token came,
+/// as the shell's clock stamped them — and `idle` carries how long the
+/// last answer's first token took. The surface counts from `sentAtMs`
+/// against its own clock; the numbers themselves are Rust's. Each is
+/// optional on the wire because each is genuinely absent at times: before
+/// the shell stamped the request, before the first token, before any turn
+/// has answered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "kind",
@@ -7015,6 +7072,10 @@ pub enum VoiceStateVm {
         wake: Option<String>,
         /// Whether the microphone is open, waiting for the phrase.
         listening_for_wake: bool,
+        /// How long the last answer's first token took, in milliseconds —
+        /// "first word after 28 s" — or `None` before a turn has answered.
+        #[ts(optional, type = "number | null")]
+        last_wait_ms: Option<i64>,
     },
     /// The microphone is open and the recogniser is transcribing.
     Listening {
@@ -7035,6 +7096,18 @@ pub enum VoiceStateVm {
         /// Whether the first piece of the answer has arrived: `false` is a
         /// model thinking, `true` one that has begun to answer (AD-186).
         answering: bool,
+        /// The bot the question went to, by its display name — "Waiting
+        /// for nixie" — or `None` before the shell stamped the request.
+        #[ts(optional = nullable)]
+        bot: Option<String>,
+        /// When the request left, milliseconds since the Unix epoch, or
+        /// `None` before the shell stamped it.
+        #[ts(optional, type = "number | null")]
+        sent_at_ms: Option<i64>,
+        /// When the first token came, milliseconds since the Unix epoch, or
+        /// `None` while the model is still thinking.
+        #[ts(optional, type = "number | null")]
+        first_token_ms: Option<i64>,
     },
     /// The answer is being read aloud.
     Speaking,
@@ -7150,6 +7223,25 @@ pub struct VoiceWakeVm {
     /// `bots.voice_target` as stored — the id of the pinned bot a spoken
     /// turn goes to; `None` means "the pinned bot most recently talked to".
     pub voice_target: Option<String>,
+}
+
+/// How fast a pinned bot starts answering (Epic 68, Story 68.4, AD-216),
+/// one per pinned bot, from `voice_target_speeds`. Read beside the voice
+/// target picker, so choosing a bot to talk to is a choice made with
+/// numbers: `bot_messages` already holds `ttft_ms` per answer, and this is
+/// `keeper_core::bots::voice_target::median_first_token` over the bot's
+/// last ten. Nothing is measured that is not already stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct VoiceTargetSpeedVm {
+    /// The pinned bot's id.
+    pub bot_id: String,
+    /// The median milliseconds to the first token over the bot's last ten
+    /// answers, or `None` with fewer than three measured answers — the picker
+    /// shows nothing rather than a number one slow answer made.
+    #[ts(type = "number | null")]
+    pub first_token_median_ms: Option<u64>,
 }
 
 /// One thing the voice port did (Epic 65, Story 65.3, AD-192), from
@@ -9130,6 +9222,8 @@ mod tests {
                 release: None,
                 roles: FilesFolderRoles::default(),
                 write: FilesWriteVm::allowed(),
+                virtual_children: 0,
+                virtual_bytes: 0,
             });
             assert_eq!(entry.kind, expected, "{name}");
         }
@@ -9152,6 +9246,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(entry.kind, RecordingNoteTargetKind::Folder);
     }
@@ -9168,6 +9264,7 @@ mod tests {
             entries: Some(Vec::new()),
             detail: None,
             truncated: false,
+            stale: false,
             write: FilesWriteVm::allowed(),
         };
         let json = serde_json::to_string(&empty).expect("serialize empty listing");
@@ -9623,6 +9720,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         let json = serde_json::to_string(&entry).expect("serialize files entry");
         assert!(
@@ -9690,6 +9789,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(entry.size, None, "a folder's size is absent, never zero");
         let json = serde_json::to_string(&entry).expect("serialize");
@@ -9741,6 +9842,8 @@ mod tests {
                 release: Some(offered.clone()),
                 roles: FilesFolderRoles::default(),
                 write: FilesWriteVm::allowed(),
+                virtual_children: 0,
+                virtual_bytes: 0,
             })
             .release
         };
@@ -9782,6 +9885,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(unknown.size, None);
         let empty = FilesEntryVm::new(FilesEntryFacts {
@@ -9796,6 +9901,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(
             empty.size.as_ref().map(|size| size.label.as_str()),
@@ -9831,6 +9938,8 @@ mod tests {
                 release: None,
                 roles,
                 write: FilesWriteVm::allowed(),
+                virtual_children: 0,
+                virtual_bytes: 0,
             })
             .folder_role
         };
@@ -9863,6 +9972,8 @@ mod tests {
             release: None,
             roles: FilesFolderRoles::default(),
             write: FilesWriteVm::allowed(),
+            virtual_children: 0,
+            virtual_bytes: 0,
         });
         assert_eq!(unconfigured.folder_role, None);
     }

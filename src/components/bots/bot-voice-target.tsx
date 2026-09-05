@@ -17,11 +17,19 @@
  * choose and the control is absent (AD-27): the turn's own refusal — "choose
  * a bot to talk to under Bots" — is the sentence that says what to do, and a
  * select with one dead option would say it worse.
+ *
+ * Each option carries the bot's speed (Epic 68, AD-216): the median time to
+ * its first token over its last ten answers, `voice_target_speeds`, so
+ * choosing a fast bot for voice is a choice made with numbers — "nixie ·
+ * first word ~25 s". A bot with fewer than three measured answers shows its
+ * name alone; the median is Rust's (`median_first_token`), never computed
+ * here, and a read that fails leaves every option nameless of speed rather
+ * than absent.
  */
 import { useEffect, useId, useState } from "react";
 import { Label } from "@/components/ui/label";
-import type { BotVm } from "@/lib/ipc/client";
-import { botsBotsList, voiceTargetSet } from "@/lib/ipc/client";
+import type { BotVm, VoiceTargetSpeedVm } from "@/lib/ipc/client";
+import { botsBotsList, voiceTargetSet, voiceTargetSpeeds } from "@/lib/ipc/client";
 import { syncErrorMessage } from "@/lib/stores/sync";
 import { useVoiceStore, voiceStore } from "@/lib/stores/voice";
 
@@ -36,6 +44,20 @@ export const VOICE_TARGET_NOTE =
 const VOICE_TARGET_WRITE_FAILED = "Could not save who to speak to.";
 
 /**
+ * The option's words: the name, then — when Rust has a median — the wait
+ * for its first word in whole seconds, `~` because it is a median, not a
+ * promise. Under a second reads "~1 s" rather than "~0 s": the number says
+ * "fast", and zero would say "instant", which nothing measured.
+ */
+export function voiceTargetOptionLabel(name: string, firstTokenMedianMs: number | null): string {
+  if (firstTokenMedianMs === null) {
+    return name;
+  }
+  const seconds = Math.max(1, Math.round(firstTokenMedianMs / 1000));
+  return `${name} · first word ~${seconds} s`;
+}
+
+/**
  * The picker. Renders nothing until the wake facts and the bots are read, and
  * nothing at all with no pinned bot.
  */
@@ -43,6 +65,7 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
   const wake = useVoiceStore((s) => s.wake);
   const selectId = useId();
   const [bots, setBots] = useState<BotVm[] | null>(null);
+  const [speeds, setSpeeds] = useState<VoiceTargetSpeedVm[]>([]);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -60,6 +83,15 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
         if (!cancelled) {
           setBots([]);
         }
+      });
+    void voiceTargetSpeeds()
+      .then((read) => {
+        if (!cancelled) {
+          setSpeeds(read);
+        }
+      })
+      .catch(() => {
+        // No numbers: the names still choose. Nothing to say beside them.
       });
     return () => {
       cancelled = true;
@@ -106,7 +138,10 @@ export function BotVoiceTarget({ className }: { className?: string } = {}) {
           <option value="">{VOICE_TARGET_RECENT_LABEL}</option>
           {bots.map((bot) => (
             <option key={bot.id} value={bot.id}>
-              {bot.name}
+              {voiceTargetOptionLabel(
+                bot.name,
+                speeds.find((speed) => speed.botId === bot.id)?.firstTokenMedianMs ?? null,
+              )}
             </option>
           ))}
         </select>
