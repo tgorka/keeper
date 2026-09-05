@@ -3615,6 +3615,128 @@ reason: The port was authored on the Linux dev host, where the shell crate canno
      it was written") and close this row.
 status: open
 
+### DW-229: The voice pill does not appear over another app's full-screen Space.
+
+origin: epic 64, story 64.4 (the limit), story 64.5 (recorded), 2026-09-04
+location: `crates/keeper/src/voice_window.rs` (story 64.4's window; the lifecycle is
+  `crates/keeper/src/notes_window.rs:5-6`), `crates/keeper/tauri.conf.json` (the `voice`
+  window's declaration), `docs/decisions.md` D-11
+reason: The pill is a plain Tauri window — `always_on_top`, `visible_on_all_workspaces`,
+  `focusable(false)`, `focused(false)`, click-through — and a plain `NSWindow` cannot be shown
+  over another app's full-screen window: `always_on_top` is `setLevel(NSFloatingWindowLevel)`
+  only (tao `src/platform_impl/macos/window.rs:288-290`, `:1389-1394`) and
+  `visible_on_all_workspaces` is `CanJoinAllSpaces` (tao `:1537-1546`), neither of which sets
+  `fullScreenAuxiliary`; tao's style mask never includes `NSWindowStyleMaskNonactivatingPanel`
+  (grep of tao for `NonactivatingPanel`: no match). Tauri's answer on the canonical issue is
+  "the standard `NSWindow` can't be displayed over other fullscreen windows, you have to subclass
+  the `NSWindow` to `NSPanel` (tauri-nspanel) and set the right flags" (tauri-apps/tauri#11488,
+  closed not planned as a duplicate of #3326/#9556,
+  `https://github.com/tauri-apps/tauri/issues/11488`). The owner's stated case — Maps, music, a
+  browser in front while he talks — is normal Spaces, which the plain window covers (AD-187).
+  What closing this would cost, as verified 2026-09-04:
+  - **`tauri-nspanel`** (`https://github.com/ahkohd/tauri-nspanel`, 417 stars, single
+    maintainer): a **git dependency** — the README installs from branch `v2.1` by git URL, and
+    whether 2.1.0 is on crates.io could not be verified (the crates.io API answered 403). Its
+    `v2.1/Cargo.toml` (version 2.1.0) depends on `tauri = { version = "2.8.5", features =
+    ["macos-private-api"] }`, so taking it turns on **`macos-private-api` for keeper's whole
+    binary** whether or not keeper uses `transparent` — the flag D-11 refuses. Its `Cargo.toml`
+    has **no `license` field** (GitHub metadata says Apache-2.0, the tree carries `LICENSE_MIT`
+    and `LICENSE_APACHE-2.0`, the README says "MIT or MIT/Apache 2.0 where applicable"); PR #122
+    (2026-08-25, `https://github.com/ahkohd/tauri-nspanel/pull/122`) adds `license = "MIT OR
+    Apache-2.0"` because `cargo-deny` warns `no-license-field`, and keeper's licence firewall
+    trips until it merges. Maintenance is alive but low-cadence: `v2.1` commits 2026-08-19
+    (README), 2026-03-15 (renovate), 2025-09-21 (docs). Two open defects matter here: **#120**
+    (2026-07-22) — `style_mask(StyleMask::empty().nonactivating_panel())` aborts with a
+    non-unwinding panic on macOS 13.7 / tauri 2.11.5, avoided by OR-ing the bit into the
+    existing mask; **#119** (2026-07-11) — closing a panel aborts with "Rust cannot catch foreign
+    exceptions" on macOS 26/27, avoided by never closing the panel, which is the hide/show
+    lifecycle keeper already uses. Its own fullscreen example warns never to call `maximize()`
+    or `fullscreen()` on such a panel and to deny `core:window:internal-toggle-maximize`.
+  - **An in-house `NSPanel` subclass** over `objc2-app-kit` (keeper already links `objc2 0.6`,
+    `objc2-foundation 0.3` and `block2` on macOS; `objc2-app-kit` is not yet a direct
+    dependency): roughly forty lines setting `nonactivatingPanel` + `fullScreenAuxiliary` +
+    `canJoinAllSpaces` + `hidesOnDeactivate = NO` — the last because an `NSPanel` hides when its
+    app deactivates by default (Apple, *How Panels Work*,
+    `https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/WinPanel/Concepts/UsingPanels.html`),
+    which is the opposite of the owner's case — and reusing the same pill webview. Blind code
+    in a signed build, with the same never-close rule, and a new `#[allow(unsafe_code)]` row.
+  Every external source above was read 2026-09-04 (the epic's research pass, VoiceFeedback
+  lane, §2). Take the in-house subclass over the git dependency if this is ever taken at all;
+  take neither until someone reports the pill missing over a full-screen app they actually
+  talk into.
+status: open
+
+### DW-230: A waveform in the pill, rather than a level.
+
+origin: epic 64, *What stays out*, 2026-09-04
+location: `keeper-core/src/voice/level.rs:1-35` (what the level is and why it is one number),
+  the pill's meter (story 64.4), `docs/decisions.md` D-11
+reason: The owner named superwhisper, whose recording window draws a live waveform as a
+  diagnostic — "if the waveform stays static, check your input device" (Superwhisper,
+  *Recording Window*, `https://superwhisper.com/docs/get-started/interface-rec-window`, read
+  2026-09-04). A level answers that same question — is sound arriving — with one smoothed
+  number at ≤ 25 Hz, only on change (`level.rs:52-59`). A waveform is a canvas redrawn at
+  ~30 Hz from sample history that would have to cross IPC, which is decoration at the price of
+  the one thing AD-186 refused: audio data leaving the tap. superwhisper's own changelog lists
+  two rounds of "massive performance improvements for Recording Window waveform" (1.40.x,
+  2.14.0, `https://superwhisper.com/changelog`, read 2026-09-04), which is the cost stated by the
+  people who pay it. Not built. Revisit only if the level proves unreadable on the real Mac —
+  the epic's screenshot is the evidence either way.
+status: open
+
+### DW-231: Speech streamed token by token; synthesis waits for the whole answer.
+
+origin: epic 64, *What stays out*, 2026-09-04
+location: `keeper-core/src/voice/turn.rs:183-186` (`AnswerChunk` keeps the turn in `Sending`;
+  `AnswerDone` carries the whole text to the utterance), `crates/keeper/src/voice_macos.rs:1524-1534`
+  (`speak_text` takes one string and one voice), `keeper-core/src/voice/speech.rs:66-84`
+reason: A turn now passes through `Sending` while tokens arrive (story 64.3), so the pill can say
+  "thinking" — but the answer is spoken only when it is whole, as it was before. Speaking as
+  tokens arrive would need the language decision (D-9) made on a prefix that may not yet have a
+  dominant language, a sentence boundary found in streaming text, and one utterance queued per
+  segment with the voice re-chosen per segment — and on the Mac, where half-duplex releases the
+  microphone before every utterance (`may_record`, D-5), it would open and close the capture on
+  every segment. The latency it would save is the model's generation time, which a
+  "thinking" state now shows instead of hiding. Not built; revisit if the owner's answers are
+  routinely long enough that waiting reads as a stall even with the state visible.
+status: open
+
+### DW-232: Choosing a named voice rather than a language.
+
+origin: epic 64, *What stays out*, 2026-09-04
+location: `crates/keeper/src/voice_macos.rs:1474-1484` (`voice_for_language`, the system's
+  default voice for a language), `voice_ios.rs` (the same), `keeper-core/src/voice/speech.rs`
+  (the decision is over languages, not voices), `docs/decisions.md` D-9
+reason: D-9 chooses the language and takes the system's default voice for it
+  (`+[AVSpeechSynthesisVoice voiceWithLanguage:]`); a person cannot pick Samantha over Zosia,
+  or an enhanced voice over a compact one, from keeper. The inventory to offer exists
+  (`speechVoices` lists 180 on the owner's Mac, each with `name`, `identifier`, `quality`), so
+  this is a setting and a picker, plus a rule in the core for what happens when the named voice
+  is not the language the answer is in — which is the exact confusion D-9 was written to end.
+  The system's own choice is changeable in System Settings > Accessibility > Spoken Content,
+  which is where the refusal sentence already sends people
+  (`keeper-core/src/voice/platform.rs:84`). Not built; take it only with the rule written first.
+status: open
+
+### DW-233: Whether VoiceOver speaks a live region inside a window that can never become key.
+
+origin: epic 64, story 64.4 (the pill), 2026-09-04
+location: the pill document (story 64.4's `voice.html` / `src/voice-main.tsx`), `docs/decisions.md`
+  D-11; the existing announcements in the main window's voice surface
+reason: Apple's guidance is to tell VoiceOver when visible content changes and to hide the
+  purely decorative (HIG *VoiceOver*,
+  `https://developer.apple.com/design/human-interface-guidelines/voiceover`, read 2026-09-04),
+  so the pill's level meter is decorative and its state word is the labelled element. What is
+  **unverified** is whether an `aria-live` region inside a `WKWebView` that sits in a window with
+  `canBecomeKeyWindow == NO` is spoken by VoiceOver at all — VoiceOver follows keyboard focus and
+  the key window, and this window is designed never to be either. Nothing in Apple's
+  documentation or Tauri's says one way or the other (the epic's research pass, VoiceFeedback
+  lane, *Not established*). If it is not spoken, the announcement belongs in the main window,
+  which already renders the same `VoiceStateVm` and is where a VoiceOver user is. Verify on
+  hesperia with VoiceOver on and a voice turn started from the hotkey while another app is in
+  front; record the answer here and, if it is "no", move the live region rather than duplicate it.
+status: open
+
 - source_spec: none
   summary: Restyle the note editor's Find/Replace bar so it matches the app's UI instead of rendering as unstyled inputs and buttons.
   evidence: Split from a four-goal intent (note pane truncation, find bar, toolbar additions, file embedding). Independently shippable: pure presentation inside the editor chrome, no shared contract.

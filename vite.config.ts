@@ -38,17 +38,21 @@ export default defineConfig(async () => ({
     },
   },
 
-  // Two entry points, not one (AD-60). `index.html` is the app; `capture.html`
-  // is the quick-capture panel's own document, loaded by the statically
-  // declared `quick-capture` window. Keeping them separate is what keeps the
-  // NFR-27 budget honest: the capture bundle imports neither the editor nor
-  // mermaid, so the panel paints without touching either lazy chunk.
+  // Four entry points, not one (AD-60, AD-185). `index.html` is the app;
+  // `capture.html` is the quick-capture panel's own document, loaded by the
+  // statically declared `quick-capture` window; `voice.html` is the voice
+  // pill's, loaded by the window `voice_window.rs` creates when voice is a
+  // real answer. Keeping them separate is what keeps the NFR-27 budget honest:
+  // the capture bundle imports neither the editor nor mermaid, so the panel
+  // paints without touching either lazy chunk, and the pill imports one
+  // component and one listener.
   build: {
     rollupOptions: {
       input: {
         main: path.resolve(__dirname, "index.html"),
         capture: path.resolve(__dirname, "capture.html"),
         print: path.resolve(__dirname, "print.html"),
+        voice: path.resolve(__dirname, "voice.html"),
       },
     },
   },

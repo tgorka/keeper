@@ -180,3 +180,18 @@ safe binding. Current inventory:
   destination. Which voice is used is `keeper_core::voice::speech::choose_voice`'s
   decision over (detected, listening, voices) — a pure function with a truth table —
   and the ports only enumerate, detect and obey (AD-183).
+- The input level, both ports (Epic 64, Story 64.3, FR-433–FR-435, AD-186): `AVAudioPCMBuffer`
+  (`floatChannelData` — `nil` when the buffer is not 32-bit float, checked rather than
+  assumed, `frameLength`, `stride`) read inside the existing tap block of `start_capture`,
+  plus one `std::slice::from_raw_parts` over `frameLength × stride` samples that lives only
+  for the duration of the tap call and is never stored, via objc2-avf-audio — no new
+  `#[allow(unsafe_code)]` fn: the calls sit in the `start_capture` already counted in each
+  port's total (`crates/keeper/src/voice_macos.rs:1273-1282`; `voice_ios.rs:1355-1364`), and
+  the SAFETY comment on that fn carries the buffer contract (`voice_macos.rs:1248-1256`;
+  `voice_ios.rs:1328-1336`). The recogniser receives every buffer, unchanged, before the meter
+  reads it; the RMS goes to `keeper_core::voice::level::Meter`, which decides the scale
+  (−60 dBFS floor), the smoothing (40 ms attack, 250 ms release) and the rate (at most one
+  reading every 40 ms, only on change), so the audio thread sends at most ~25 messages a
+  second and never one per buffer. Only a number in `0.0..=1.0` leaves the tap; no sample
+  does. There is no second tap: `installTapOnBus:` allows one per bus, and the level shares
+  the recogniser's.

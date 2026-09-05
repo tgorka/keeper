@@ -363,3 +363,161 @@ would be wrong for this one.
   two callers who can disagree. One probe governs every surface.
 - **Revisit triggers:** none foreseen. A third platform with a port reads the same answer.
 - **Status / owner:** decided. Owner is the architect; Epic 63, Story 63.5 implements it.
+
+## D-9 — A spoken answer is spoken in a language this device has a voice for, and the model is told which
+
+keeper will read an answer aloud in the voice of the language the answer is written in, when
+this device has such a voice, and will ask the model — on a turn that began by voice — to answer
+in the language the person is speaking; it will **not** read text in the voice of another
+language, bundle a language model to tell which language a text is in, or send the text
+anywhere to find out. Recorded here because the first Mac voice read a Polish answer in an
+English voice and the owner could not understand it, because the fix rests on a measured fact
+about Apple's inventories that is easy to forget, and because the obvious shortcut — "just use
+the listening language" — is wrong in a way that only shows up with a bilingual model.
+
+- **The measured fact this rests on:** recognition and synthesis are different inventories.
+  On the owner's Mac, `SFSpeechRecognizer.supportedLocales` lists 63 locales, of which **four**
+  support on-device recognition, all of them English; `AVSpeechSynthesisVoice.speechVoices`
+  lists **180** voices, one of them Polish (`crates/keeper/src/voice_macos.rs:1161-1162`,
+  `:1453-1456`; `keeper-core/src/voice/speech.rs:4-9`; Epic 64, *Facts this epic stands on*,
+  probed on hesperia 2026-09-04). So the listening language does not bound the speaking
+  language: a person listening in English whose bot answers in Polish *can* hear Polish, and
+  before this epic nothing chose a voice at all — the utterance was built with no `setVoice:`,
+  so the system default spoke.
+- **What is built:** two halves. *Before the turn*, a voice-originated request carries one
+  system sentence — *"The person asked this aloud and your answer will be read aloud to them.
+  Answer in Polish (pl-PL)."* — naming the listening language (`speech.rs:108-117`, prepended
+  in `crates/keeper/src/bots_ipc.rs:1148-1168`); a typed turn's body is byte for byte what it
+  was (`keeper-core/tests/bots_remote_session.rs:631`). *After the answer*, the port detects the
+  text's dominant language on-device with `NLLanguageRecognizer`, constrained to the languages
+  this device has voices for plus the listening one (`speech.rs:49-64`; `voice_macos.rs:1493-
+  1518`), and `speech::choose_voice` answers which language to speak in (`speech.rs:66-84`): a
+  detected language with a voice gets that voice, the listening locale's own where the languages
+  agree; an undetermined text gets the listening language's voice; a detected language with no
+  voice is `VoiceUnavailable::NoVoice`, which names the language and the platform's voice
+  download page and leaves the answer on the screen (`keeper-core/src/voice/mod.rs:127-130`,
+  `:165-168`; `keeper-core/src/voice/platform.rs:69`, `:84`). Every utterance is given its voice
+  explicitly (`voice_macos.rs:1524-1533`; `voice_ios.rs:1673-1682`) and the chosen language and
+  voice name are logged, so "utterance voice pl-PL" can be read from the console. (AD-182,
+  AD-183, AD-188; FR-429…FR-432; Epic 64, Story 64.2)
+- **Why the decision is the core's and the detector is the port's:** `choose_voice` is a pure
+  function over (detected, listening, voices) with a truth table in its tests, and the port only
+  enumerates, detects and obeys. That keeps the rule testable on the dev host, where the shell
+  crate does not compile, and keeps `keeper-core` free of a platform `cfg`, a model weight or a
+  network. (AD-183; `speech.rs:38-44`)
+- **Why `NaturalLanguage` and not a Rust crate:** `objc2-natural-language 0.3.2` (`Zlib OR
+  Apache-2.0 OR MIT`, `src-tauri/Cargo.toml:380`) binds a system framework that is on-device
+  and has no network path, so `docs/egress.md` gains a paragraph and no destination. The Rust
+  candidates were rejected on provenance: `whatlang`'s corpus terms are unverified and
+  `lingua`'s models derive from a CC BY-NC corpus, which D-5's "no bundled weights" already
+  refuses. (AD-188; Epic 64, *Facts this epic stands on*)
+- **Why a missing voice is a refusal and not a fallback:** a wrong voice is exactly the failure
+  this epic opens with, and AD-27 says absence, never a dead control. The answer stays on the
+  screen, which the person can act on, and the sentence names where a voice is downloaded.
+- **What is not chosen:** a *named* voice (Samantha, Zosia). The language is chosen and the
+  system's default voice for it is used (`voiceWithLanguage:`); picking among a language's
+  voices is DW-232.
+- **Revisit triggers:** a platform whose synthesiser lists voices by something other than a
+  BCP-47 language tag; the owner wanting a specific voice (DW-232). Neither reopens the first
+  paragraph.
+- **Status / owner:** decided. Owner is the architect; Epic 64, Story 64.2 implements it.
+
+## D-10 — The voice block in the Bots pane is folded by default, and folded it is one line
+
+keeper will show the desktop Bots pane's voice block — switch, phrase, language, the "Listens
+in…" sentence, the note, the limits paragraph — folded to a single truthful line by default,
+unfolded by one click that is remembered, and it will **not** remove any of those controls from
+the pane or from Settings → Bots. Recorded here because the block did not exist on the Mac before
+Epic 63 gave it a voice, so the epic that made the Mac talk also took the transcript's space,
+and because "everything starts open" is the default someone will propose again.
+
+- **What was measured:** with `dev/measure-bots.ts` on Chrome at 1440×900 over the dev shell,
+  whose fixture is the owner's own case (a Polish system language with English-only on-device
+  assets, so the refusal is on screen): before, the block was **223 px** and the transcript
+  **259 px of the 872 px pane — 29.7 %**; folded, the block is a **39 px** line and the
+  transcript **444 px — 50.9 %**. Unfolded by the person the block is 257 px and the transcript
+  226 px (25.9 %) — the disclosure row is what the unfold costs, and unfolding is their choice.
+  Every number is a `getBoundingClientRect` height (`src/components/bots/bots-pane.tsx:71-79`;
+  `dev/measure-bots.ts:31-32`). (Epic 64, Story 64.1, measured on hesperia 2026-09-04)
+- **What is built:** the folded line says what matters while a conversation is on screen —
+  `Listening for "nixie" · en-US`, or `Listening off`, with the refusal's first clause when the
+  port refuses (`src/components/bots/bot-voice-wake.tsx:128-146`, `voiceFoldedLine`). The fold
+  is the repo's cookie-persisted fold idiom with its own cookie, `keeper_bots_pane_fold`,
+  folded by default (`src/lib/stores/bots-pane-fold.ts:39`, `:63-65`) — not a key in the column
+  fold's set, for the reason that file's header gives: the block is a band inside the transcript
+  level, not a column. The layout contract test still pins exactly one `flex-1` child in the
+  transcript level (`src/components/bots/bots-pane.test.tsx:628-636`, `:740-743`). Settings →
+  Bots keeps the unfolded block, so folding removes no path to any
+  control. (AD-184; FR-427, FR-428; Epic 64, Story 64.1)
+- **Why folded by default:** the surface's one job is the transcript, and a default is a claim
+  about what the surface is for. The notes rail's Files section is the precedent for a band
+  that starts closed (`bots-pane-fold.ts:15-23`). A person who wants the block open opens it
+  once and it stays open.
+- **Why measured before and after, with the pane's own rig:** jsdom computes no layout, so a
+  fold that "should" free space is unverifiable in the suite; the number is read from a real
+  engine at the owner's viewport or it is not claimed. The rig is checked in beside the pane so
+  the next band that folds is measured the same way.
+- **Revisit triggers:** a second band in the pane folding (the store's `BOTS_PANE_BANDS` is a
+  closed set of one); a pane taller than the block makes the fold moot, which no laptop is.
+- **Status / owner:** decided. Owner is the architect; Epic 64, Story 64.1 implements it.
+
+## D-11 — Hearing is shown by a floating window that can never become key, and it does not go over a full-screen Space
+
+keeper will show that it hears — the turn's state, a level meter, the words as they arrive — in
+a small, prewarmed, undecorated window that floats above other apps on every normal Space,
+never becomes key, never activates keeper, and cannot be clicked; and it will **not** make that
+window transparent, and will **not** — yet — make it appear over another app's full-screen
+Space. Recorded here because the two refusals rest on facts about Tauri and macOS rather than
+on taste, and both will be asked for again the first time the pill looks like a rectangle or
+fails to show over a full-screen browser.
+
+- **What is built:** a window of about 220×40 pt (AD-185) on the lifecycle `notes_window.rs` established for
+  quick-capture — declared in `tauri.conf.json`, created hidden at boot, never destroyed, only
+  shown and hidden (`crates/keeper/src/notes_window.rs:5-6`; the quick-capture declaration is
+  `crates/keeper/tauri.conf.json:31-44`) — with `always_on_top`, `visible_on_all_workspaces`,
+  `focusable(false)`, `focused(false)` and `set_ignore_cursor_events(true)`, so it floats over
+  the app the person is talking into and cannot take a click. It exists only on the desktop,
+  only when `voice_availability` is a real answer (D-8), and only while the turn is not
+  idle-and-unarmed. It draws the state, a level the core's meter computes from the input tap's
+  RMS and lets through at most every 40 ms and only on change (Story 64.3, AD-186;
+  `keeper-core/src/voice/level.rs:52-59`, `:90`), and the heard words; under `prefers-reduced-motion`
+  the meter is a static fill. The window module is Story 64.4's `crates/keeper/src/voice_window.rs`.
+  (AD-185, AD-186; FR-436…FR-439, NFR-54; Epic 64, Story 64.4)
+- **Why never key, and why click-through rather than merely unfocusable:** tao implements
+  `focusable(false)` by overriding `canBecomeKeyWindow`/`canBecomeMainWindow`, which keeps the
+  window from becoming key but does not stop a click on it from activating keeper — only
+  `NSWindowStyleMaskNonactivatingPanel` does that, and tao's style mask never includes it. A
+  click-through window cannot be clicked, so it cannot activate anything. (tao
+  `src/platform_impl/macos/window.rs:414-431`, `:686-693`, `:966-969`, read 2026-09-04;
+  Apple, `NSWindow.StyleMask.nonactivatingPanel`,
+  `https://developer.apple.com/documentation/appkit/nswindow/stylemask-swift.struct/nonactivatingpanel`,
+  accessed 2026-09-04)
+- **Why not transparent:** `transparent(true)` on macOS requires Tauri's `macos-private-api`
+  feature, enabled under `tauri > macOSPrivateApi`, and Tauri's own configuration documentation
+  warns that using private APIs on macOS prevents App Store acceptance (tauri-utils
+  `crates/tauri-utils/src/config.rs:2039-2042`,
+  `https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/src/config.rs`,
+  accessed 2026-09-04). keeper enables neither — `tauri.conf.json` has no `macOSPrivateApi` and
+  no Cargo manifest names the feature — and will not turn on a private-API flag for a rounded
+  corner. The pill is opaque.
+- **Why not over a full-screen Space, and what it would cost:** a plain `NSWindow` cannot be
+  displayed over another app's full-screen window; `always_on_top` is
+  `NSFloatingWindowLevel` only and does not set `fullScreenAuxiliary`, and
+  `visible_on_all_workspaces` joins normal Spaces only. The route is an `NSPanel` subclass —
+  `nonactivatingPanel` + `fullScreenAuxiliary` + `canJoinAllSpaces` + `hidesOnDeactivate = NO`
+  (the last because an `NSPanel` hides when its app deactivates by default, which is the
+  opposite of what the owner's case needs) — which `tauri-nspanel` provides at the price of a
+  git dependency from a single maintainer whose `v2.1` branch turns on `macos-private-api` as a
+  hard feature of tauri, whose `Cargo.toml` has no `license` field so keeper's licence firewall
+  trips, and whose open defects abort the process on a style-mask call and on close. The owner's
+  stated case — Maps, music, a browser in front — is normal Spaces, which the native builder
+  covers. Deferred as DW-229 with the numbers. (AD-187; tauri-apps/tauri#11488, closed not
+  planned, `https://github.com/tauri-apps/tauri/issues/11488`; Apple, *How Panels Work*,
+  `https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/WinPanel/Concepts/UsingPanels.html`;
+  both accessed 2026-09-04)
+- **Revisit triggers:** `tauri-nspanel` publishing a licence field and closing its style-mask
+  and close aborts (DW-229); Tauri growing a non-activating or full-screen-auxiliary option in
+  its own builder, which would make the panel subclass unnecessary; keeper ever enabling
+  `macOSPrivateApi` for a reason of its own, which would reopen only the transparency clause.
+- **Status / owner:** decided. Owner is the architect; Epic 64, Story 64.4 implements the window,
+  Story 64.5 records the limit.

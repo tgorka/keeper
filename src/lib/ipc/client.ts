@@ -7239,6 +7239,26 @@ export async function voiceUnwatch(id: number): Promise<void> {
 }
 
 /**
+ * The Tauri event the shell emits to the voice pill window with every
+ * {@link VoiceStateVm} snapshot (Story 64.4, AD-185) — `voice_ipc::push`'s
+ * fan-out, so the pill sees exactly what the pane's channel sees without a
+ * second `voice_watch` registration evicting the pane's.
+ *
+ * Emitted to that one window only; the main window never receives it and
+ * keeps its channel.
+ */
+export const VOICE_STATE_EVENT = "keeper://voice-state";
+
+/** Subscribe to the pill's snapshot event. Resolves with an unlisten function. */
+export async function listenVoiceState(
+  onState: (state: VoiceStateVm) => void,
+): Promise<() => void> {
+  return await listen<VoiceStateVm>(VOICE_STATE_EVENT, (event) => {
+    onState(event.payload);
+  });
+}
+
+/**
  * The wake switch and phrase as persisted (`bots.wake_enabled`,
  * `bots.wake_phrase`), plus the sentence about what listening costs on this
  * phone — decided once per platform in `VoicePlatform::limits` and rendered

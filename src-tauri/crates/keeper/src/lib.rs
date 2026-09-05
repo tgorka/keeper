@@ -96,6 +96,11 @@ mod voice_ipc;
 // hotkey's commands. Every target, because the deep link is every target's;
 // the hotkey commands answer `unsupported` off desktop.
 mod voice_reach;
+// The voice pill (Story 64.4, AD-185): the floating window that shows a
+// turn hearing while keeper is behind another app. Desktop-only, and
+// created only when the port is a real answer — see the module doc.
+#[cfg(desktop)]
+mod voice_window;
 // The zero-egress source-scan audit over the `keeper-rec` sidecar's Swift
 // sources (Story 20.4, FR-76) — test-only; it ships no code.
 #[cfg(test)]
@@ -462,6 +467,14 @@ pub fn run() {
             // the window. Best-effort like the three above.
             #[cfg(desktop)]
             hotkey::install_voice(app.handle());
+
+            // Create the voice pill hidden (Story 64.4, AD-185), on the same
+            // gate the voice hotkey reads: a port that answers `unsupported`
+            // never has the window (AD-27, AD-179). Prewarmed like the
+            // capture panel, so the first snapshot of a turn shows a document
+            // that is already mounted.
+            #[cfg(desktop)]
+            voice_window::install(app.handle());
 
             // Give the prewarmed capture window the resizability and size its
             // remembered placement asks for (Story 46.15, FR-192).
@@ -1338,6 +1351,11 @@ pub fn run() {
                 // the one that fires when the user switches app without hiding
                 // anything. `push_on_blur` decides whether it reaches the network.
                 WindowEvent::Focused(false) => notes_vault::flush(),
+                // The voice pill sits on the main window's screen (Story
+                // 64.4): a drag onto another display takes it along. Per
+                // compositor frame, but `follow` returns on one lock while
+                // the pill is hidden, which is nearly always.
+                WindowEvent::Moved(_) => voice_window::follow(window.app_handle()),
                 _ => {}
             }
             return;

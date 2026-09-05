@@ -184,6 +184,44 @@ and fails when the two lists differ. Edit both together or neither.
 - Nothing is recorded or uploaded; what you said reaches only the model endpoint you configured, as text.
 - keeper does not lower other audio while it listens or speaks, because macOS has no audio session that could; it stops listening while it talks instead.
 
+### A spoken answer's language is decided on the device
+
+Epic 64 (Story 64.2, AD-182, AD-183, AD-188) makes keeper choose a voice for the answer it reads
+aloud, and that choice adds no destination. The answer's dominant language is detected by
+`NaturalLanguage`'s `NLLanguageRecognizer`, a system framework with no network path: the port
+allocates a recogniser, constrains it to the languages this device has voices for plus the
+listening language, hands it the text and reads `dominantLanguage` back
+(`src-tauri/crates/keeper/src/voice_macos.rs:1493-1518`; the same four calls on the phone,
+`voice_ios.rs:1647-1670`). The constraint list is built in the core from the synthesiser's
+own inventory (`keeper-core/src/voice/speech.rs:49-64`), so the text is classified only among
+languages it could be spoken in, and the voice inventory it comes from is
+`AVSpeechSynthesisVoice.speechVoices` read once on the device (`voice_macos.rs:1453-1472`).
+**No answer text leaves the device to be classified.** Which voice speaks is then a pure
+function over (detected, listening, voices) in `speech.rs:66-84`; a language with no voice is
+refused with the download page named (`keeper-core/src/voice/mod.rs:165-168`), never spoken
+in another language's voice and never sent anywhere to be spoken. The binding is
+`objc2-natural-language 0.3.2` (`src-tauri/Cargo.toml:380`), and the on-device source scan
+described above covers it: `voice_on_device` reads `voice_macos.rs` and `voice_ios.rs` off
+disk and fails the build if a network API appears in either.
+
+One request body changes, to a row this file already lists. A turn that began by voice carries
+one extra system sentence to the provider host you typed — *"The person asked this aloud and
+your answer will be read aloud to them. Answer in Polish (pl-PL)."* (`speech.rs:112-117`),
+prepended in `src-tauri/crates/keeper/src/bots_ipc.rs:1155-1168` only when the voice turn is
+the one awaiting this send. A typed turn adds nothing and its body is byte-identical to before,
+which `keeper-core/tests/bots_remote_session.rs:631` asserts through the fake gateway. The sentence
+names the listening language, which is already a setting on that device; it discloses nothing
+the provider did not receive as the question itself.
+
+The audio level (Story 64.3, AD-186) never leaves the process either. The input tap that hands
+every buffer to the recogniser also reads the same buffer's samples and computes an RMS in
+place (`voice_macos.rs:1273-1289`; `voice_ios.rs:1355-1370`); a meter in the core smooths it
+and lets at most one reading through every 40 ms, only when it moved
+(`keeper-core/src/voice/level.rs:52-59`, `:90`). What crosses to the webview is one number in
+`0.0..=1.0` on the existing voice channel — never samples, never a buffer — and nothing is
+recorded or written to disk on the way. The recogniser still receives every buffer unchanged,
+before the meter looks at it.
+
 ## One conversation on two devices adds no egress
 
 Epic 63 lets a conversation started on the phone be read and followed on the Mac, and the other

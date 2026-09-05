@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "voice",
+  "description": "Least-privilege capability for the voice pill window (Story 64.4, AD-185). Every capability file in this app is window-scoped and a window with no file of its own can invoke NOTHING — it renders and sits inert, which looks like a frontend bug and is not, so this file exists the moment the window does. The grant is `core:default` and nothing else: the document listens for the one event Rust emits to it (`keeper://voice-state`) and invokes no command. It needs no window permission above all — the pill is placed by Rust, cannot take focus and is click-through, and a webview that could show, move or focus itself could undo every one of those. The label is `voice`, built by `voice_window.rs`, and `src/test/voice-capability.test.ts` pins the two spellings to each other.",
+  "windows": ["voice"],
+  "platforms": ["macOS", "windows", "linux"],
+  "permissions": ["core:default"]
+}
