@@ -35,6 +35,7 @@
  */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { VOICE_TARGET_LABEL, VOICE_TARGET_RECENT_LABEL } from "@/components/bots/bot-voice-target";
 import { VOICE_LOCALE_LABEL, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
 import {
   BOTS_ADD_BOT_LABEL,
@@ -84,6 +85,7 @@ const botsBotRemove = vi.fn();
 const voiceAvailability = vi.fn();
 const voiceWakeGet = vi.fn();
 const voiceEvents = vi.fn();
+const voiceTargetSet = vi.fn();
 
 vi.mock("@/lib/ipc/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/ipc/client")>();
@@ -100,6 +102,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceAvailability: () => voiceAvailability(),
     voiceWakeGet: () => voiceWakeGet(),
     voiceEvents: (limit: number) => voiceEvents(limit),
+    voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
   };
 });
 
@@ -167,7 +170,10 @@ beforeEach(() => {
     locale: "en-US",
     localeChosen: null,
     onDeviceLocales: ["en-US"],
+    stopPhrase: "stop",
+    voiceTarget: null,
   });
+  voiceTargetSet.mockReset();
   // The ring is empty unless a case fills it; the default tier here is the
   // phone's, so the block reads on every open.
   voiceEvents.mockResolvedValue([]);
@@ -219,6 +225,30 @@ describe("BotsSection", () => {
     const control = await screen.findByRole("combobox", { name: VOICE_LOCALE_LABEL });
     expect(control).toHaveValue("");
     expect(screen.getByRole("option", { name: /en-US/ })).toBeInTheDocument();
+  });
+
+  it("offers the pinned bots as who a spoken turn speaks to, unset as most recently talked to (Epic 67, AD-206)", async () => {
+    voiceAvailability.mockResolvedValue(null);
+    render(<BotsSection open />);
+    const control = await screen.findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    expect(control).toHaveValue("");
+    expect(screen.getByRole("option", { name: VOICE_TARGET_RECENT_LABEL })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Llama" })).toBeInTheDocument();
+
+    voiceTargetSet.mockResolvedValue({
+      enabled: false,
+      phrase: "hey nixie",
+      limits: "limits",
+      locale: "en-US",
+      localeChosen: null,
+      onDeviceLocales: ["en-US"],
+      stopPhrase: "stop",
+      voiceTarget: "bot-1",
+    });
+    fireEvent.change(control, { target: { value: "bot-1" } });
+    await waitFor(() => expect(voiceTargetSet).toHaveBeenCalledWith("bot-1"));
+    // What Rust stored is what the control shows.
+    await waitFor(() => expect(control).toHaveValue("bot-1"));
   });
 
   it("does not draw the wake switch before voice_availability has answered", () => {

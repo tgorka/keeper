@@ -35,6 +35,15 @@
  * system language sits beside the control that fixes it. An empty list is an
  * AD-27 absence — no control — and the availability sentence explains.
  *
+ * # The stop word (Epic 67, Story 67.3, AD-208)
+ *
+ * One line under the phrase: the word that ends an answer when it is said
+ * while keeper is speaking — `VoiceWakeVm.stopPhrase`, "stop" on a fresh
+ * install. Saved through the same `voiceWakeSet` as the phrase, validated by
+ * `keeper_core::voice::WakePhrase::parse_stop`, and matched by Rust on the
+ * barge-in transcript; nothing here listens. Any other speech mid-answer
+ * still asks a question (FR-403).
+ *
  * # Nothing here decides
  *
  * The phrase is validated by `keeper_core::voice::WakePhrase::parse` and a
@@ -81,6 +90,7 @@
  */
 import { ChevronDown, ChevronRight, Mic } from "lucide-react";
 import { useEffect, useId, useState } from "react";
+import { BotVoiceTarget } from "@/components/bots/bot-voice-target";
 import { FoldSection } from "@/components/layout/sidebar-group";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -100,6 +110,12 @@ export const WAKE_SWITCH_LABEL = "Listen for a phrase";
 export const WAKE_PHRASE_LABEL = "Wake phrase";
 /** The save control beside the box. */
 export const WAKE_SAVE_LABEL = "Save phrase";
+/** The stop word box's label (Epic 67, AD-208). */
+export const STOP_PHRASE_LABEL = "Stop word";
+/** The save control beside the stop word. */
+export const STOP_SAVE_LABEL = "Save stop word";
+/** What the stop word does, in one sentence. */
+export const STOP_PHRASE_NOTE = "Said while keeper is answering, it ends the answer.";
 /** The chip while the microphone is open for the phrase. */
 export function wakeListeningLabel(phrase: string | null): string {
   return phrase === null ? "Listening" : `Listening for "${phrase}"`;
@@ -195,20 +211,28 @@ export function BotVoiceWake({
   const state = useVoiceStore((s) => s.state);
   const switchId = useId();
   const phraseId = useId();
+  const stopId = useId();
   const localeId = useId();
-  /** The box's contents: what the person is typing, seeded from what Rust
+  /** The boxes' contents: what the person is typing, seeded from what Rust
    *  holds. Reseeded whenever Rust's answer changes, so a save that came
    *  back normalised or a read that arrived late lands in the box. */
   const [draft, setDraft] = useState("");
+  const [stopDraft, setStopDraft] = useState("");
   const [refusal, setRefusal] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const held = wake?.phrase ?? null;
+  const heldStop = wake?.stopPhrase ?? null;
   useEffect(() => {
     if (held !== null) {
       setDraft(held);
     }
   }, [held]);
+  useEffect(() => {
+    if (heldStop !== null) {
+      setStopDraft(heldStop);
+    }
+  }, [heldStop]);
 
   if (!bots || unavailable === undefined || unavailable?.kind === "unsupported" || wake === null) {
     return null;
@@ -233,7 +257,7 @@ export function BotVoiceWake({
         } else if (enabled && voiceStore.getState().unavailable?.kind === "notAuthorized") {
           voiceStore.getState().applyAvailability(null);
         }
-        return voiceWakeSet(enabled, draft);
+        return voiceWakeSet(enabled, draft, stopDraft);
       })
       .then((next) => {
         voiceStore.getState().applyWake(next);
@@ -316,6 +340,30 @@ export function BotVoiceWake({
           {WAKE_SAVE_LABEL}
         </Button>
       </form>
+      <form
+        className="flex items-center gap-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          save(wake.enabled);
+        }}
+      >
+        <Label htmlFor={stopId} className="shrink-0">
+          {STOP_PHRASE_LABEL}
+        </Label>
+        <Input
+          id={stopId}
+          value={stopDraft}
+          disabled={busy}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          onChange={(event) => setStopDraft(event.target.value)}
+        />
+        <Button type="submit" variant="outline" size="sm" disabled={busy || stopDraft === heldStop}>
+          {STOP_SAVE_LABEL}
+        </Button>
+      </form>
+      <p className="text-muted-foreground text-xs">{STOP_PHRASE_NOTE}</p>
       {wake.onDeviceLocales.length > 0 && (
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-2">
@@ -347,6 +395,7 @@ export function BotVoiceWake({
           <p className="text-muted-foreground text-xs">{VOICE_LOCALE_NOTE}</p>
         </div>
       )}
+      <BotVoiceTarget />
       {refusal !== null && (
         <p role="alert" className="text-destructive text-xs">
           {refusal}

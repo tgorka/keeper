@@ -28,6 +28,8 @@ const WAKE: VoiceWakeVm = {
   locale: "en-US",
   localeChosen: null,
   onDeviceLocales: ["en-US"],
+  stopPhrase: "stop",
+  voiceTarget: null,
 };
 const LISTENING: VoiceStateVm = { kind: "idle", wake: "nixie", listeningForWake: true };
 

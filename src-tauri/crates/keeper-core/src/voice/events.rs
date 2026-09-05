@@ -59,6 +59,19 @@ pub enum VoiceEventKind {
     WakeMatched,
     /// An answer was handed to the synthesiser.
     Spoken,
+    /// The stop phrase was heard mid-answer and ended the turn (Epic 67,
+    /// Story 67.3, AD-208). The words that matched are the detail.
+    StopMatched,
+    /// A transcript arrived inside the port's settle window after its own
+    /// voice ended and was dropped rather than heard (AD-209). The words
+    /// are the detail: on hardware they are the measurement of whether the
+    /// app hears its own tail, and what it heard.
+    EchoDropped,
+    /// A lock-screen banner was posted for this state word while keeper
+    /// was not in front, or cleared (`cleared`) when the turn ended or
+    /// keeper came to front (Epic 67, Story 67.2, AD-207). The word or
+    /// `cleared` is the detail.
+    Notified,
     /// The Live Activity on the phone (Epic 65, Story 65.5, AD-194) did
     /// this — `started`, `updated`, `ended`, `refused` — with the state
     /// word or the system's refusal as the detail. The island is the only
@@ -96,6 +109,9 @@ impl VoiceEventKind {
             Self::Turn(state) => format!("turn:{state}"),
             Self::WakeMatched => "wake_matched".to_owned(),
             Self::Spoken => "spoken".to_owned(),
+            Self::StopMatched => "stop_matched".to_owned(),
+            Self::EchoDropped => "echo_dropped".to_owned(),
+            Self::Notified => "notified".to_owned(),
             Self::Island(what) => format!("island:{what}"),
         }
     }
@@ -265,6 +281,9 @@ mod tests {
         assert_eq!(VoiceEventKind::Rolled.as_str(), "rolled");
         assert_eq!(VoiceEventKind::WakeMatched.as_str(), "wake_matched");
         assert_eq!(VoiceEventKind::Spoken.as_str(), "spoken");
+        assert_eq!(VoiceEventKind::StopMatched.as_str(), "stop_matched");
+        assert_eq!(VoiceEventKind::EchoDropped.as_str(), "echo_dropped");
+        assert_eq!(VoiceEventKind::Notified.as_str(), "notified");
         assert_eq!(VoiceEventKind::Island("refused").as_str(), "island:refused");
         assert_eq!(
             VoiceEventKind::turn(&TurnState::Listening {

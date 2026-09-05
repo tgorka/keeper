@@ -36,6 +36,7 @@ import { GRANT_ADD_LABEL, GRANT_NONE_HELD } from "@/components/bots/bot-grant-ba
 import { BOT_PICKER_BOT_LABEL } from "@/components/bots/bot-picker";
 import { BOT_PINS_LABEL } from "@/components/bots/bot-pins-strip";
 import { BOT_SESSION_NEW_LABEL } from "@/components/bots/bot-session-list";
+import { VOICE_TARGET_LABEL, VOICE_TARGET_RECENT_LABEL } from "@/components/bots/bot-voice-target";
 import { VOICE_LOCALE_LABEL, WAKE_SWITCH_LABEL } from "@/components/bots/bot-voice-wake";
 import { BOTS_PANE_TITLE } from "@/components/bots/bots-pane";
 import {
@@ -73,6 +74,7 @@ const botsDeliverablePaths = vi.fn();
 const botsSessionOpen = vi.fn();
 const voiceAvailability = vi.fn<() => Promise<VoiceUnavailableVm | null>>();
 const voiceWakeGet = vi.fn<() => Promise<VoiceWakeVm>>();
+const voiceTargetSet = vi.fn<(botId: string | null) => Promise<VoiceWakeVm>>();
 /** The event sink the level handed to `botsChatSend`, driven as Rust would. */
 let sink: ((event: BotStreamEvent) => void) | null = null;
 
@@ -142,6 +144,7 @@ vi.mock("@/lib/ipc/client", async (importOriginal) => {
     voiceWatch: () => Promise.resolve(1),
     voiceUnwatch: () => Promise.resolve(),
     voiceWakeGet: () => voiceWakeGet(),
+    voiceTargetSet: (botId: string | null) => voiceTargetSet(botId),
   };
 });
 
@@ -434,6 +437,8 @@ describe("the Bots view on the phone stack", () => {
       locale: "en-US",
       localeChosen: null,
       onDeviceLocales: ["en-US"],
+      stopPhrase: "stop",
+      voiceTarget: null,
     });
     render(<PhoneShell />);
     await openBots();
@@ -443,6 +448,43 @@ describe("the Bots view on the phone stack", () => {
     const control = await within(sheet).findByRole("combobox", { name: VOICE_LOCALE_LABEL });
     expect(control).toHaveValue("");
     expect(within(control).getAllByRole("option")).toHaveLength(2);
+  });
+
+  /**
+   * Epic 67, AD-206: who a spoken turn speaks to is chosen in the same sheet,
+   * from the pinned bots, with "most recently talked to" as the unset state —
+   * never inferred from the conversation that happens to be open.
+   */
+  it("reaches the spoken-turn target through the Bot and model sheet", async () => {
+    voiceAvailability.mockResolvedValue(null);
+    const wake: VoiceWakeVm = {
+      enabled: true,
+      phrase: "nixie",
+      limits: "limits",
+      locale: "en-US",
+      localeChosen: null,
+      onDeviceLocales: ["en-US"],
+      stopPhrase: "stop",
+      voiceTarget: null,
+    };
+    voiceWakeGet.mockResolvedValue(wake);
+    voiceTargetSet.mockImplementation((botId) => Promise.resolve({ ...wake, voiceTarget: botId }));
+    render(<PhoneShell />);
+    await openBots();
+    await openConversation();
+    fireEvent.click(screen.getByRole("button", { name: BOTS_PHONE_PICKER_LABEL }));
+    const sheet = await screen.findByRole("dialog", { name: BOTS_PHONE_PICKER_LABEL });
+    const control = await within(sheet).findByRole("combobox", { name: VOICE_TARGET_LABEL });
+    expect(control).toHaveValue("");
+    expect(
+      within(control).getByRole("option", { name: VOICE_TARGET_RECENT_LABEL }),
+    ).toBeInTheDocument();
+    expect(within(control).getByRole("option", { name: BOT.name })).toBeInTheDocument();
+
+    fireEvent.change(control, { target: { value: BOT.id } });
+    await waitFor(() => expect(voiceTargetSet).toHaveBeenCalledWith(BOT.id));
+    await waitFor(() => expect(control).toHaveValue(BOT.id));
+    expect(voiceStore.getState().wake?.voiceTarget).toBe(BOT.id);
   });
 
   /**
@@ -582,6 +624,8 @@ describe("the ear on the phone's face (Story 65.2, AD-191)", () => {
     locale: "en-US",
     localeChosen: null,
     onDeviceLocales: ["en-US"],
+    stopPhrase: "stop",
+    voiceTarget: null,
   };
   const WAKE_OFF: VoiceWakeVm = { ...WAKE_ON, enabled: false };
   const NOT_AUTHORIZED: VoiceUnavailableVm = {

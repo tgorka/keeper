@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use keeper_core::vm::{VoiceStateVm, VoiceUnavailableVm};
 use keeper_core::voice::{
     advance, perform, should_rearm, silence_budget, Effect, PhraseRefused, Turn, TurnEvent,
-    TurnState, VoicePlatform, VoicePort, VoiceUnavailable, WakePhrase, DEFAULT_WAKE_PHRASE,
-    END_OF_UTTERANCE_PAUSE, NOTHING_HEARD_TIMEOUT,
+    TurnState, VoicePlatform, VoicePort, VoiceUnavailable, WakePhrase, DEFAULT_STOP_PHRASE,
+    DEFAULT_WAKE_PHRASE, END_OF_UTTERANCE_PAUSE, NOTHING_HEARD_TIMEOUT,
 };
 
 // ---------------------------------------------------------------------------
@@ -272,7 +272,7 @@ fn voice_silence_budget_is_bounded_and_only_while_listening() {
 /// anything else, and the turn is listening again.
 #[test]
 fn voice_barge_in_stops_speaking_before_anything_else() {
-    let (next, effects) = advance(TurnState::Speaking, TurnEvent::SpeechDetected);
+    let (next, effects) = advance(TurnState::Speaking, TurnEvent::SpeechDetected("hey".into()));
     assert_eq!(next, listening(""));
     assert_eq!(effects.first(), Some(&Effect::StopSpeaking));
     assert!(
@@ -281,8 +281,8 @@ fn voice_barge_in_stops_speaking_before_anything_else() {
     );
 }
 
-/// `SpeechDetected` anywhere but `Speaking` is nothing — there is nothing to
-/// interrupt.
+/// `SpeechDetected` and `StopHeard` anywhere but `Speaking` are nothing —
+/// there is nothing to interrupt.
 #[test]
 fn voice_speech_detected_outside_speaking_is_ignored() {
     for state in [
@@ -291,11 +291,100 @@ fn voice_speech_detected_outside_speaking_is_ignored() {
         heard("a"),
         TurnState::Sending { answering: true },
     ] {
-        let before = state.clone();
-        let (next, effects) = advance(state, TurnEvent::SpeechDetected);
-        assert_eq!(next, before);
-        assert!(effects.is_empty());
+        for event in [
+            TurnEvent::SpeechDetected("stop".to_owned()),
+            TurnEvent::StopHeard,
+        ] {
+            let before = state.clone();
+            let (next, effects) = advance(state.clone(), event);
+            assert_eq!(next, before);
+            assert!(effects.is_empty());
+        }
     }
+}
+
+/// The stop phrase mid-answer (AD-208): the synthesiser is stopped first,
+/// the device is released, and no question follows.
+#[test]
+fn voice_stop_heard_ends_the_turn() {
+    let (next, effects) = advance(TurnState::Speaking, TurnEvent::StopHeard);
+    assert_eq!(next, TurnState::Idle);
+    assert_eq!(
+        effects,
+        vec![Effect::StopSpeaking, Effect::ReleaseMicrophone]
+    );
+}
+
+/// `Turn` makes `StopHeard` out of a barge-in whose words contain the stop
+/// phrase, and re-arms the wake phrase the way every other end does; a
+/// barge-in with other words keeps FR-403's shape and listens again.
+#[test]
+fn voice_turn_matches_the_stop_phrase_only_while_speaking() {
+    let port = FakePort::default();
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.set_wake(Some(phrase("hej keeper")));
+    turn.set_stop(Some(stop_phrase(DEFAULT_STOP_PHRASE)));
+    assert_eq!(turn.stop_phrase().map(WakePhrase::as_str), Some("stop"));
+
+    // "stop" while idle is noise like any other word: nothing happens.
+    assert!(turn
+        .drive(TurnEvent::PartialHeard("stop".to_owned()), &port)
+        .is_empty());
+    assert_eq!(turn.state(), &TurnState::Idle);
+
+    turn.drive(TurnEvent::WakeMatched, &port);
+    turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
+    turn.drive(TurnEvent::AnswerDone("a long answer".to_owned()), &port);
+    // Another word mid-answer: today's barge-in.
+    let effects = turn.drive(TurnEvent::SpeechDetected("wait, what".to_owned()), &port);
+    assert_eq!(effects, vec![Effect::StopSpeaking, Effect::OpenMicrophone]);
+    assert_eq!(turn.state(), &listening(""));
+
+    turn.drive(TurnEvent::FinalHeard("again".to_owned()), &port);
+    turn.drive(TurnEvent::AnswerDone("another answer".to_owned()), &port);
+    // The stop word, as the recogniser writes it: capitalised, punctuated.
+    let effects = turn.drive(TurnEvent::SpeechDetected("Stop.".to_owned()), &port);
+    assert_eq!(
+        effects,
+        vec![
+            Effect::StopSpeaking,
+            Effect::ReleaseMicrophone,
+            Effect::OpenMicrophone
+        ],
+        "stopped, released for the turn, re-armed for the phrase"
+    );
+    assert_eq!(turn.state(), &TurnState::Idle);
+    assert!(turn.armed());
+    assert_eq!(
+        port.calls().last(),
+        Some(&Call::Start(Some("hej keeper".to_owned())))
+    );
+}
+
+/// With no stop phrase set, every barge-in asks a question — the shape
+/// before Epic 67.
+#[test]
+fn voice_turn_without_a_stop_phrase_treats_stop_as_a_question() {
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.apply(TurnEvent::AnswerDone("noon".to_owned()));
+    let effects = turn.apply(TurnEvent::SpeechDetected("stop".to_owned()));
+    assert_eq!(effects, vec![Effect::StopSpeaking, Effect::OpenMicrophone]);
+    assert_eq!(turn.state(), &listening(""));
+}
+
+/// A Polish stop word, set from `bots.stop_phrase`, matches what the
+/// recogniser writes with its diacritics and its full stop.
+#[test]
+fn voice_turn_matches_a_polish_stop_phrase() {
+    let mut turn = Turn::new(VoicePlatform::IOS);
+    turn.set_stop(Some(stop_phrase("przestań")));
+    turn.apply(TurnEvent::AnswerDone("długa odpowiedź".to_owned()));
+    let effects = turn.apply(TurnEvent::SpeechDetected("Przestań.".to_owned()));
+    assert_eq!(
+        effects,
+        vec![Effect::StopSpeaking, Effect::ReleaseMicrophone]
+    );
+    assert_eq!(turn.state(), &TurnState::Idle);
 }
 
 /// A `FinalHeard("")` does not send an empty message: the turn ends and the
@@ -395,6 +484,10 @@ fn voice_failed_turn_restarts_on_trigger() {
 
 fn phrase(raw: &str) -> WakePhrase {
     WakePhrase::parse(raw).expect("test phrase parses")
+}
+
+fn stop_phrase(raw: &str) -> WakePhrase {
+    WakePhrase::parse_stop(raw).expect("test stop phrase parses")
 }
 
 /// A transcript that contains the phrase while idle starts a turn; the
@@ -606,7 +699,7 @@ fn voice_driver_orders_port_calls_for_barge_in() {
     turn.drive(TurnEvent::WakeMatched, &port);
     turn.drive(TurnEvent::FinalHeard("hi".to_owned()), &port);
     turn.drive(TurnEvent::AnswerDone("a long answer".to_owned()), &port);
-    turn.drive(TurnEvent::SpeechDetected, &port);
+    turn.drive(TurnEvent::SpeechDetected("hang on".to_owned()), &port);
     assert_eq!(
         port.calls(),
         vec![
@@ -797,6 +890,7 @@ fn voice_phrase_refuses_too_few_letters() {
         refused,
         PhraseRefused::TooShort {
             letters: 4,
+            minimum: 5,
             normalised: "ok go".to_owned()
         }
     );
@@ -809,6 +903,34 @@ fn voice_phrase_refuses_too_few_letters() {
     }
     // Exactly the minimum is accepted.
     assert!(WakePhrase::parse("ok gog").is_ok());
+}
+
+/// The stop phrase's rule is shorter (AD-208): "stop" — four letters, which
+/// the wake rule refuses — is the default and must parse; two letters do
+/// not; matching normalises the way the wake phrase does.
+#[test]
+fn voice_stop_phrase_parses_short_words_and_matches_normalised() {
+    assert!(WakePhrase::parse(DEFAULT_STOP_PHRASE).is_err());
+    let stop = stop_phrase(DEFAULT_STOP_PHRASE);
+    assert_eq!(stop.as_str(), "stop");
+    for heard in ["Stop.", "stop", "STOP,", "okay stop now", "Stop!"] {
+        assert!(stop.matches(heard), "{heard:?}");
+    }
+    for heard in ["stopped", "nonstop", "", "sto"] {
+        assert!(!stop.matches(heard), "{heard:?}");
+    }
+    assert_eq!(stop_phrase("Przestań").as_str(), "przestan");
+    let refused = WakePhrase::parse_stop("no").expect_err("two letters is refused");
+    assert_eq!(
+        refused,
+        PhraseRefused::TooShort {
+            letters: 2,
+            minimum: 3,
+            normalised: "no".to_owned()
+        }
+    );
+    assert!(refused.to_string().contains("at least 3 letters"));
+    assert_eq!(WakePhrase::parse_stop("  "), Err(PhraseRefused::Empty));
 }
 
 #[test]
@@ -827,6 +949,7 @@ fn voice_phrase_counts_letters_not_words() {
         WakePhrase::parse("a b"),
         Err(PhraseRefused::TooShort {
             letters: 2,
+            minimum: 5,
             normalised: "a b".to_owned()
         })
     );
@@ -1052,7 +1175,7 @@ fn voice_level_rides_listening_and_heard_only() {
     assert_eq!(turn.level(), None, "a late reading is dropped");
 
     turn.apply(TurnEvent::AnswerDone("noon".to_owned()));
-    turn.apply(TurnEvent::SpeechDetected);
+    turn.apply(TurnEvent::SpeechDetected("wait".to_owned()));
     assert_eq!(turn.state(), &listening(""));
     assert_eq!(turn.level(), None, "a fresh listening starts unmeasured");
 }

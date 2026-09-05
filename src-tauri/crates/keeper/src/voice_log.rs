@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use keeper_core::vm::{IpcError, VoiceEventVm};
 use keeper_core::voice::events::{VoiceEventKind, VoiceEvents};
-use keeper_core::voice::{Effect, TurnState, WakePhrase};
+use keeper_core::voice::{Effect, TurnEvent, TurnState, WakePhrase};
 
 /// The one ring for the process. Every target: a desktop with no port
 /// records the turn's transitions and refusals all the same.
@@ -41,14 +41,27 @@ pub fn record(kind: VoiceEventKind, detail: Option<String>) {
 /// leaves it in `Listening` is not a move, or the ring would be nothing but
 /// partials — with the failure's reason or the final transcript as the
 /// detail; the wake match that took an idle turn into `Listening`, since the
-/// event the port sent was a transcript and the match is `Turn`'s; and the
-/// answer handed to the synthesiser.
-pub fn transition(before: VoiceEventKind, state: &TurnState, effects: &[Effect]) {
+/// event the port sent was a transcript and the match is `Turn`'s; the stop
+/// match that took a speaking turn straight to `Idle`, with the words that
+/// matched (Epic 67, AD-208 — the same reasoning: the port sent a
+/// barge-in, `Turn` decided it was the stop phrase); and the answer handed
+/// to the synthesiser.
+pub fn transition(
+    before: VoiceEventKind,
+    event: &TurnEvent,
+    state: &TurnState,
+    effects: &[Effect],
+) {
     let after = VoiceEventKind::turn(state);
     if before == VoiceEventKind::turn(&TurnState::Idle)
         && matches!(state, TurnState::Listening { .. })
     {
         record(VoiceEventKind::WakeMatched, None);
+    }
+    if before == VoiceEventKind::turn(&TurnState::Speaking) && matches!(state, TurnState::Idle) {
+        if let TurnEvent::SpeechDetected(words) = event {
+            record(VoiceEventKind::StopMatched, Some(words.clone()));
+        }
     }
     if after != before {
         let detail = match state {

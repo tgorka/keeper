@@ -7115,9 +7115,10 @@ pub enum VoiceUnavailableVm {
     },
 }
 
-/// The wake phrase's switch and words (Epic 62, Story 62.5, FR-404–FR-406)
-/// and the recogniser's language (Epic 63), from `voice_wake_get` and back
-/// from `voice_wake_set` and `voice_locale_set`.
+/// The wake phrase's switch and words (Epic 62, Story 62.5, FR-404–FR-406),
+/// the recogniser's language (Epic 63), the stop phrase (Epic 67, AD-208)
+/// and the bot a spoken turn goes to (Epic 67, AD-206), from `voice_wake_get`
+/// and back from `voice_wake_set`, `voice_locale_set` and `voice_target_set`.
 ///
 /// `limits` is the port's own `VoicePlatform::limits` carried to the surface
 /// rather than retyped there: the sentence beside the switch is decided once,
@@ -7143,6 +7144,12 @@ pub struct VoiceWakeVm {
     /// Every locale this device can recognise on its own, sorted by
     /// identifier; empty when none can.
     pub on_device_locales: Vec<String>,
+    /// The word that ends a spoken answer, as typed (`bots.stop_phrase`);
+    /// never blank.
+    pub stop_phrase: String,
+    /// `bots.voice_target` as stored — the id of the pinned bot a spoken
+    /// turn goes to; `None` means "the pinned bot most recently talked to".
+    pub voice_target: Option<String>,
 }
 
 /// One thing the voice port did (Epic 65, Story 65.3, AD-192), from

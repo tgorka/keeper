@@ -1,5 +1,5 @@
-//! The wake phrase (FR-404, AD-168): what a person typed, made safe to match
-//! against what a recogniser heard.
+//! The wake phrase (FR-404, AD-168) and the stop phrase (FR-480, AD-208):
+//! what a person typed, made safe to match against what a recogniser heard.
 //!
 //! Two decisions live here and nowhere else. **What counts as the same
 //! phrase**: a recogniser writes "Hej, Keeper." and a person typed "hej keeper",
@@ -10,6 +10,12 @@
 //! person whose phone starts a turn every time somebody says "go" would turn
 //! the feature off and be right to. So [`WakePhrase::parse`] refuses with a
 //! sentence that says what to type instead.
+//!
+//! The stop phrase is the same type parsed by a shorter rule
+//! ([`WakePhrase::parse_stop`], [`STOP_MIN_LETTERS`]): it is matched only
+//! while keeper is speaking, so a false match costs the rest of an answer
+//! rather than an open microphone in someone's car, and the word people say
+//! to stop something — "stop", four letters — must be allowed.
 //!
 //! Matching is whole-word: the phrase may sit anywhere in a sentence, but a
 //! transcript that merely contains the phrase inside a longer word ("hej
@@ -36,6 +42,13 @@ pub const MIN_WORDS: usize = 1;
 /// is where "nixie" sits and where a phrase stops being an everyday word.
 pub const MIN_LETTERS: usize = 5;
 
+/// The fewest letters a stop phrase may have. Three: "stop" and "przestań"
+/// pass, and the two-letter words a recogniser mishears in a quiet room
+/// ("no", "ok") do not — a two-letter stop word would end answers on the
+/// tail of the answer itself (AD-209 measures that tail; it does not trust
+/// it to be silent).
+pub const STOP_MIN_LETTERS: usize = 3;
+
 /// The most words a phrase may have. Above this it is a sentence, which is
 /// hard to say the same way twice and harder for a recogniser to hear whole.
 pub const MAX_WORDS: usize = 5;
@@ -54,13 +67,16 @@ pub enum PhraseRefused {
         /// How many words were typed.
         words: usize,
     },
-    /// Fewer than [`MIN_LETTERS`] letters across all words.
+    /// Fewer than `minimum` letters across all words — [`MIN_LETTERS`] for
+    /// a wake phrase, [`STOP_MIN_LETTERS`] for a stop phrase.
     #[error(
-        "use at least {MIN_LETTERS} letters in total — \"{normalised}\" is too short for the recogniser to tell from noise"
+        "use at least {minimum} letters in total — \"{normalised}\" is too short for the recogniser to tell from noise"
     )]
     TooShort {
         /// How many letters were counted.
         letters: usize,
+        /// How many the rule asked for.
+        minimum: usize,
         /// The phrase as it would have been matched.
         normalised: String,
     },
@@ -74,18 +90,30 @@ pub enum PhraseRefused {
     },
 }
 
-/// A validated, normalised wake phrase.
+/// A validated, normalised phrase — the wake phrase, or the stop phrase.
 ///
-/// Constructed only through [`WakePhrase::parse`], so holding one means the
-/// phrase passed the length rules and is already in matching form. The inner
-/// string is the normalised phrase — what [`WakePhrase::as_str`] returns and
-/// what the surface shows back to the person as "listening for …".
+/// Constructed only through [`WakePhrase::parse`] or
+/// [`WakePhrase::parse_stop`], so holding one means the phrase passed its
+/// length rules and is already in matching form. The inner string is the
+/// normalised phrase — what [`WakePhrase::as_str`] returns and what the
+/// surface shows back to the person as "listening for …".
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WakePhrase(String);
 
 impl WakePhrase {
-    /// Normalise `raw` and check it against the length rules.
+    /// Normalise `raw` and check it against the wake phrase's length rules.
     pub fn parse(raw: &str) -> Result<Self, PhraseRefused> {
+        Self::parse_at_least(raw, MIN_LETTERS)
+    }
+
+    /// Normalise `raw` and check it against the stop phrase's length rules
+    /// (AD-208): the same words-and-letters shape, [`STOP_MIN_LETTERS`]
+    /// letters instead of [`MIN_LETTERS`].
+    pub fn parse_stop(raw: &str) -> Result<Self, PhraseRefused> {
+        Self::parse_at_least(raw, STOP_MIN_LETTERS)
+    }
+
+    fn parse_at_least(raw: &str, min_letters: usize) -> Result<Self, PhraseRefused> {
         let normalised = normalise(raw);
         if normalised.is_empty() {
             return Err(PhraseRefused::Empty);
@@ -98,9 +126,10 @@ impl WakePhrase {
             return Err(PhraseRefused::TooManyWords { words });
         }
         let letters = normalised.chars().filter(|c| *c != ' ').count();
-        if letters < MIN_LETTERS {
+        if letters < min_letters {
             return Err(PhraseRefused::TooShort {
                 letters,
+                minimum: min_letters,
                 normalised,
             });
         }

@@ -93,8 +93,12 @@ mod voice_ios;
 // it mirrors; the decision is `keeper_core::voice::island`.
 #[cfg(target_os = "ios")]
 mod voice_island;
+// The lock-screen banner (Story 67.2, AD-207): the local notification every
+// free-team build has; decision in keeper_core::voice::banner.
 #[cfg(target_os = "macos")]
 mod voice_macos;
+#[cfg(target_os = "ios")]
+mod voice_notify;
 // The voice commands (Story 62.4): a call site over `keeper_core::voice`.
 // Registered on every target — a phone lists them for real, a desktop
 // answers `unsupported` — so the frontend never special-cases the call.
@@ -416,8 +420,9 @@ pub fn run() {
                 // process-wide and `voice_availability` takes no state, so
                 // the persisted choice reaches it here, once, before any
                 // surface or the tray asks. The same call keeps the data dir
-                // for the re-arm hooks below (Epic 65, AD-190).
-                voice_ipc::boot(&data_dir);
+                // for the re-arm hooks below (Epic 65, AD-190) and the app
+                // handle for the spoken send (Epic 67, AD-205).
+                voice_ipc::boot(app.handle(), &data_dir);
             }
 
             // Forward every incoming `keeper://` deep link: `keeper://voice/talk`
@@ -543,6 +548,8 @@ pub fn run() {
             // request notification permission best-effort. A permission failure only
             // means the OS will drop notifications — it never blocks startup.
             ipc::set_notify_app_handle(app.handle().clone());
+            #[cfg(target_os = "ios")]
+            voice_notify::install(app.handle());
 
             // Store the app handle for the desktop dock-badge port (Story 10.3) so
             // `Platform::set_badge_count` can drive the main window's OS dock badge from
@@ -887,9 +894,10 @@ pub fn run() {
                 voice_ipc::voice_availability,
                 voice_ipc::voice_start,
                 voice_ipc::voice_stop,
-                voice_ipc::voice_speak,
                 voice_ipc::voice_stop_speaking,
                 voice_ipc::voice_wake_set,
+                // Epic 67 (AD-206): the bot a spoken turn goes to.
+                voice_ipc::voice_target_set,
                 // Story 62.5: the watcher without a turn, and the persisted phrase.
                 voice_ipc::voice_watch,
                 voice_ipc::voice_unwatch,
@@ -1574,6 +1582,8 @@ pub fn run() {
                 // requested now.
                 #[cfg(target_os = "ios")]
                 voice_island::resumed();
+                #[cfg(target_os = "ios")]
+                voice_notify::resumed();
                 // The folder on the phone syncs on foreground (Epic 66,
                 // NFR-57): no supervisor ticks here, so this and
                 // pull-to-refresh are the only times a remote change arrives.

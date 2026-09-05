@@ -40,6 +40,7 @@ pub mod sse;
 pub mod store;
 pub mod tools;
 pub mod url;
+pub mod voice_target;
 
 pub use url::{parse_base_url, parse_bot_target, BaseUrl, BaseUrlError, BotTargetError};
 

@@ -138,8 +138,16 @@ objc2-foundation = { version = "0.3", features = [
 ] }
 # iOS app-icon badge (Story 14.3 fix, FR-62): safe `UNUserNotificationCenter::setBadgeCount`
 # binding (block2 feature for the optional completion handler). Already resolved in the lock
-# transitively; MIT — passes the cargo-deny license firewall.
-objc2-user-notifications = { version = "0.3", features = ["UNUserNotificationCenter", "block2"] }
+# transitively; MIT — passes the cargo-deny license firewall. The lock-screen banner
+# (Story 67.2, AD-207) adds the content, request and (nil) trigger classes a local
+# notification is built from, reached only from `voice_notify.rs`; every binding is safe.
+objc2-user-notifications = { version = "0.3", features = [
+    "UNUserNotificationCenter",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationTrigger",
+    "block2",
+] }
 # The share sheet (Story 66.3, AD-200): `UIActivityViewController` presented
 # from the window's `UIViewController`, reached only from `share_ios.rs`. Already
 # in the tree — wry and tao pull it for the webview's own view controller — so
@@ -157,6 +165,10 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
     "UIActivityViewController",
     "UIPresentationController",
     "UIPopoverPresentationController",
+    # `UIApplication.applicationState`, read on the main thread by the
+    # lock-screen banner (Story 67.2, AD-207) — the one true "is keeper in
+    # front" the JS lifecycle cannot give from the background.
+    "UIApplication",
 ] }
 # Account registry + opaque account ids (both already present transitively via matrix-sdk).
 ulid = "1"

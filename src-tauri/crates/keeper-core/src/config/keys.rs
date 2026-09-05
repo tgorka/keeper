@@ -422,6 +422,26 @@ pub const KEYS: &[KeySpec] = &[
         summary: "The language the voice recogniser runs in, as a locale identifier. Blank means the system locale when it can run on the device, otherwise the first that can; a language that cannot run here is refused, never silently replaced.",
         example: "\"en-US\"",
     },
+    KeySpec {
+        key: "bots.voice_target",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "",
+        summary: "The id of the pinned bot a spoken turn goes to. Blank means the pinned bot most recently talked to; with none, the turn is refused and says so.",
+        example: "\"01ARZ3NDEKTSV4RRFFQ69G5FAV\"",
+    },
+    KeySpec {
+        key: "bots.stop_phrase",
+        family: false,
+        scope: Scope::UserGlobal,
+        settable: Settable::AnyLayer,
+        shape: Shape::Text,
+        default: "stop",
+        summary: "The word that ends a spoken answer, as typed; matched case- and diacritic-insensitively while the answer is read aloud.",
+        example: "\"stop\"",
+    },
     // ---- debug -----------------------------------------------------------
     KeySpec {
         key: "debug.mode",

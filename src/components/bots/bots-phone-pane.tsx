@@ -65,7 +65,7 @@
  * composition simply never mounts the grant bar or the paste hook. A
  * slash-command that would point at the bar answers with a sentence instead.
  */
-import { type Ref, useEffect, useRef, useState } from "react";
+import { type Ref, useEffect, useState } from "react";
 import { BotComposer } from "@/components/bots/bot-composer";
 import { BotConversation } from "@/components/bots/bot-conversation";
 import { BOTS_NO_DRIVE_HERE_SENTENCE, BotEmptyState } from "@/components/bots/bot-empty-state";
@@ -99,6 +99,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { useSpokenStream } from "@/hooks/use-spoken-stream";
 import { useVoiceStream } from "@/hooks/use-voice-stream";
 import type { VoiceStateVm, VoiceUnavailableVm, VoiceWakeVm } from "@/lib/ipc/client";
 import {
@@ -331,6 +332,17 @@ export function BotsPhoneList({
     void refresh();
   }, []);
 
+  // Epic 67 (AD-205): a turn the voice heard is sent and spoken by Rust. This
+  // level stays mounted under the conversation, so it is where the spoken
+  // stream is observed: the store applies each event as it applies the
+  // conversation level's own, and the list is re-read when the answer closes.
+  useSpokenStream((event) => {
+    onStreamEvent(event);
+    if (event.kind === "closed") {
+      void refresh();
+    }
+  });
+
   const open = (sessionId: string) => {
     void botsSessionOpen(sessionId)
       .then((read) => {
@@ -416,10 +428,6 @@ export function BotsPhoneConversation({
   const streamingMessageId = useBotsStore((s) => s.streamingMessageId);
   const error = useBotsStore((s) => s.error);
   const [pickerOpen, setPickerOpen] = useState(false);
-  // Story 62.6: the transcript waiting in the composer, with a sequence so
-  // hearing the same words twice is still two hand-offs.
-  const [heard, setHeard] = useState<{ text: string; seq: number } | null>(null);
-  const heardSeq = useRef(0);
 
   const providerList = providers ?? [];
   const botList = bots ?? [];
@@ -579,20 +587,10 @@ export function BotsPhoneConversation({
       <BotComposer
         onSend={send}
         onStop={stop}
-        // Talk mode (Story 62.6): what a button-started turn heard lands here
-        // as the draft; a phrase-started turn goes as said.
-        heard={heard}
-        accessory={
-          <BotVoiceMic
-            onHeard={(text, origin) => {
-              if (origin === "phrase") {
-                send(text);
-                return;
-              }
-              setHeard({ text, seq: heardSeq.current++ });
-            }}
-          />
-        }
+        // Talk mode (Story 62.6; Epic 67, AD-205): the button starts a turn,
+        // and what it hears is sent by Rust to the bot chosen under Bots —
+        // the composer never receives it.
+        accessory={<BotVoiceMic />}
         streaming={streamingId !== null}
         disabled={selectedBotId === null || selectedModel === null}
         pickerPlace={BOTS_PHONE_PICKER_PLACE}

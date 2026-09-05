@@ -56,6 +56,10 @@ file-controlled instead, and says which file.
 | | | | | The phrase that starts a voice turn, as typed; matched case- and diacritic-insensitively. At least 5 letters, at most 5 words. |
 | `bots.voice_locale` | user-global | text | *(absent)* | `"bots.voice_locale" = "en-US"` |
 | | | | | The language the voice recogniser runs in, as a locale identifier. Blank means the system locale when it can run on the device, otherwise the first that can; a language that cannot run here is refused, never silently replaced. |
+| `bots.voice_target` | user-global | text | *(absent)* | `"bots.voice_target" = "01ARZ3NDEKTSV4RRFFQ69G5FAV"` |
+| | | | | The id of the pinned bot a spoken turn goes to. Blank means the pinned bot most recently talked to; with none, the turn is refused and says so. |
+| `bots.stop_phrase` | user-global | text | `stop` | `"bots.stop_phrase" = "stop"` |
+| | | | | The word that ends a spoken answer, as typed; matched case- and diacritic-insensitively while the answer is read aloud. |
 | `debug.mode` | user-global | boolean (`1`/`0`) | `0` | `"debug.mode" = true` |
 | | | | | On-disk event and error logging. Read before anything else at boot, so a file can turn it on for the boot that goes wrong. |
 | `incognito.global` | user-global | boolean (`1`/`0`) | `0` | `"incognito.global" = true` |

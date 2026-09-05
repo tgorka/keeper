@@ -114,7 +114,6 @@ export function BotComposer({
   pasteContext = null,
   onPaste,
   resolveDraft = botsCommandPreview,
-  heard = null,
   accessory,
   pickerPlace = BOT_COMPOSER_PICKER_ABOVE,
 }: {
@@ -168,15 +167,6 @@ export function BotComposer({
       modelTools: boolean | null;
     },
   ) => Promise<BotCommandPreviewVm>;
-  /**
-   * What talk mode heard (Story 62.6, FR-407): lands in the field as the
-   * draft, where it can be read and edited before it goes, and is sent only
-   * by the same Enter or Send as typed text. `seq` distinguishes hearing the
-   * same words twice from nothing new: each turn bumps it. A transcriber
-   * that sent what it mis-heard would be worse than one that asks, so this
-   * component never sends on its own account.
-   */
-  heard?: { text: string; seq: number } | null;
   /**
    * A control that shares the field's row — the talk-mode microphone on a
    * phone. Rendered between the field and the verb, absent where undefined.
@@ -237,16 +227,6 @@ export function BotComposer({
       live = false;
     };
   }, [draft, resolve]);
-
-  // A heard transcript replaces the draft rather than appending: the field
-  // is where it is checked, and a half-typed line under it would be two
-  // messages nobody meant. Editing after that is ordinary typing.
-  useEffect(() => {
-    if (heard !== null) {
-      setDraft(heard.text);
-      setRefusal(null);
-    }
-  }, [heard]);
 
   const token = slashToken(draft);
   const rows = preview === null ? [] : preview.rows;

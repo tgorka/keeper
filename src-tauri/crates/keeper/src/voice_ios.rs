@@ -91,9 +91,14 @@
 //! docs), so the answer sits over a quieter Maps prompt rather than a paused
 //! one, and the volume comes back the moment the utterance ends. Bluetooth
 //! HFP and A2DP are both allowed so a car kit is a route; the speaker is the
-//! default when nothing else is. The mode stays `.default`: `.voiceChat`
-//! would route to the receiver, and `.voicePrompt` is for playback-only
-//! sessions.
+//! default when nothing else is. The mode is `.voiceChat`, set explicitly
+//! (Epic 67, AD-209): Apple's `AVAudioSession.Mode.voiceChat` page says it
+//! is the mode the voice-processing unit is tuned for, and that a session
+//! using voice processing without a chat mode gets `voiceChat` set
+//! implicitly anyway — so what was written here as `.default` was never the
+//! mode in force, and a field report measured `.default` + `defaultToSpeaker`
+//! as the pair that silently defeats echo cancellation. `defaultToSpeaker`
+//! stays, so the answer is on the speaker and not the receiver.
 //!
 //! # Stale results are not failures
 //!
@@ -102,16 +107,20 @@
 //! that is no longer current is dropped — so a roll, a stop and the restart
 //! inside `speak` never surface as `Failed`.
 //!
-//! # Barge-in (FR-403)
+//! # Barge-in (FR-403) and the stop word (Epic 67, AD-208, AD-209)
 //!
 //! `speak` rolls to a fresh request before the utterance begins and raises a
 //! `speaking` flag; while it is up, any non-empty transcript is
-//! `SpeechDetected` rather than `PartialHeard`. Echo cancellation
-//! (`setVoiceProcessingEnabled`) is what keeps the app's own voice out of
-//! that transcript. The synthesiser's end is polled from the worker loop
-//! rather than through an `AVSpeechSynthesizerDelegate`, which would need an
-//! Objective-C subclass declared from Rust — more blind code than a 250 ms
-//! poll is worth.
+//! `SpeechDetected` with its words rather than `PartialHeard`, and the turn
+//! decides whether the words were the stop phrase or a question. Voice
+//! processing (`setVoiceProcessingEnabled`) is what keeps most of the app's
+//! own voice out of that transcript; what it lets through is measured, not
+//! assumed: for [`TAIL_GATE`] after every utterance ends the port drops
+//! every transcript, records each as `echo_dropped` with its words, and
+//! only then tells the turn `Silence`. The synthesiser's end is polled from
+//! the worker loop rather than through an `AVSpeechSynthesizerDelegate`,
+//! which would need an Objective-C subclass declared from Rust — more blind
+//! code than a 250 ms poll is worth.
 //!
 //! # Which voice (Epic 64, Story 64.2, AD-182, AD-188)
 //!
@@ -175,7 +184,7 @@ use objc2_avf_audio::{
     AVAudioSessionInterruptionNotification, AVAudioSessionInterruptionOptionKey,
     AVAudioSessionInterruptionOptions, AVAudioSessionInterruptionType,
     AVAudioSessionInterruptionTypeKey, AVAudioSessionMediaServicesWereResetNotification,
-    AVAudioSessionModeDefault, AVAudioSessionRecordPermission,
+    AVAudioSessionModeVoiceChat, AVAudioSessionRecordPermission,
     AVAudioSessionRouteChangeNotification, AVAudioSessionRouteChangeReason,
     AVAudioSessionRouteChangeReasonKey, AVAudioSessionSetActiveOptions, AVAudioTime,
     AVSpeechBoundary, AVSpeechSynthesisVoice, AVSpeechSynthesizer, AVSpeechUtterance,
@@ -197,6 +206,19 @@ const SPEAK_POLL: Duration = Duration::from_millis(250);
 /// `isSpeaking` before its silence counts as the utterance ending — the
 /// queue-to-speaking gap on a cold voice.
 const SPEAK_GRACE: Duration = Duration::from_millis(500);
+
+/// How long after an utterance ends the port keeps its ears shut (Epic 67,
+/// AD-209): every transcript that arrives inside the gate is dropped and
+/// recorded as `echo_dropped` with its words, and the turn is told
+/// `Silence` only once the gate has passed. Voice processing subtracts the
+/// output from the input; it does not cancel it (Apple engineer, forum
+/// 665706), and a 2026 field report on iOS 18 measured the residual tail of
+/// a synthesised utterance being transcribed as speech in a quiet room,
+/// with ~800 ms — not 300 — the gate that stopped it
+/// (barock.dev/2026/04/22/why-your-ios-voice-agent-still-hears-itself).
+/// The number is that report's; the ring on kalypso is what says whether
+/// this phone needs it.
+const TAIL_GATE: Duration = Duration::from_millis(800);
 
 /// Frames per tap buffer: ~64 ms at 16 kHz, the recogniser's native rate.
 const TAP_FRAMES: u32 = 1024;
@@ -468,6 +490,13 @@ struct Worker {
     speaking: Arc<AtomicBool>,
     /// When the current utterance was handed to the synthesiser.
     speaking_since: Option<Instant>,
+    /// Milliseconds since the worker's epoch until which the ears are shut
+    /// (AD-209): set to the end of the last utterance plus [`TAIL_GATE`],
+    /// read by the result handler. Zero before the first utterance.
+    gate_until: Arc<AtomicU64>,
+    /// When the turn is owed the `Silence` for an utterance that ended on
+    /// its own — the end of its gate. `None` while nothing is owed.
+    silence_due: Option<Instant>,
     /// When the system took the capture away, for the retry clock; `None`
     /// while capturing or not wanted.
     suspended: Option<Instant>,
@@ -506,6 +535,8 @@ impl Worker {
             current: Arc::new(AtomicU64::new(0)),
             speaking: Arc::new(AtomicBool::new(false)),
             speaking_since: None,
+            gate_until: Arc::new(AtomicU64::new(0)),
+            silence_due: None,
             suspended: None,
             failed_starts: 0,
             failed_resumes: 0,
@@ -802,6 +833,8 @@ impl Worker {
             }
         }
         let synthesizer = self.synthesizer.get_or_insert_with(new_synthesizer);
+        // A new utterance: whatever the last one still owed is moot.
+        self.silence_due = None;
         self.speaking.store(true, Ordering::SeqCst);
         self.speaking_since = Some(Instant::now());
         speak_text(synthesizer, text, &voice);
@@ -815,11 +848,17 @@ impl Worker {
         self.speech_over();
     }
 
-    /// The utterance is over, one way or another: flag down, others back
-    /// to full volume.
+    /// The utterance is over, one way or another: the ears shut for
+    /// [`TAIL_GATE`] (AD-209) — before the flag comes down, so no transcript
+    /// slips between the two as a `PartialHeard` — then flag down, others
+    /// back to full volume.
     fn speech_over(&mut self) {
+        let gate_ms = u64::try_from(TAIL_GATE.as_millis()).unwrap_or(u64::MAX);
+        self.gate_until
+            .store(self.millis().saturating_add(gate_ms), Ordering::SeqCst);
         self.speaking.store(false, Ordering::SeqCst);
         self.speaking_since = None;
+        self.silence_due = None;
         if self.capture.is_some() {
             if let Err(error) = set_session_options(ARMED) {
                 tracing::debug!(%error, "voice: others did not un-duck");
@@ -827,7 +866,8 @@ impl Worker {
         }
     }
 
-    /// Between commands: the retry clock, the roll clock, the synthesiser.
+    /// Between commands: the retry clock, the roll clock, the synthesiser,
+    /// the gate.
     fn tick(&mut self) {
         if self.wanted.is_some() {
             if let Some(since) = self.suspended {
@@ -853,6 +893,18 @@ impl Worker {
             }
         }
         self.watch_speech_end();
+        self.settle_silence();
+    }
+
+    /// The `Silence` owed for an utterance that ended on its own is
+    /// reported once its gate has passed (AD-209): the turn's end re-arms
+    /// the phrase on a fresh request, and that request must not open on
+    /// the tail of the answer.
+    fn settle_silence(&mut self) {
+        if self.silence_due.is_some_and(|due| Instant::now() >= due) {
+            self.silence_due = None;
+            (self.sink)(TurnEvent::Silence);
+        }
     }
 
     /// Whether the current request has run long enough to be replaced.
@@ -1024,7 +1076,8 @@ impl Worker {
         }
     }
 
-    /// While an utterance is out, notice it ending and say so once.
+    /// While an utterance is out, notice it ending; the turn hears of it
+    /// once, after the gate ([`Worker::settle_silence`]).
     fn watch_speech_end(&mut self) {
         let Some(since) = self.speaking_since else {
             return;
@@ -1038,7 +1091,7 @@ impl Worker {
             .is_some_and(|synthesizer| is_speaking(synthesizer));
         if !still {
             self.speech_over();
-            (self.sink)(TurnEvent::Silence);
+            self.silence_due = Some(Instant::now() + TAIL_GATE);
         }
     }
 
@@ -1047,8 +1100,15 @@ impl Worker {
     }
 
     /// The block the recogniser calls with each result. Captures the serial
-    /// it belongs to, the current-serial cell, the speaking flag, the sink
-    /// and the worker's inbox — all `Send`, none of them a framework object.
+    /// it belongs to, the current-serial cell, the speaking flag, the gate,
+    /// the sink and the worker's inbox — all `Send`, none of them a
+    /// framework object.
+    ///
+    /// A transcript while the flag is up is barge-in, with its words (the
+    /// turn tells the stop phrase from a question, AD-208). A transcript
+    /// inside the gate after an utterance is the port hearing its own tail,
+    /// or a person talking into it; either way it is dropped and recorded
+    /// with its words (AD-209), so the ring on hardware is the measurement.
     fn result_handler(
         &self,
         serial: u64,
@@ -1056,6 +1116,7 @@ impl Worker {
     ) -> RcBlock<dyn Fn(*mut SFSpeechRecognitionResult, *mut NSError)> {
         let current = Arc::clone(&self.current);
         let speaking = Arc::clone(&self.speaking);
+        let gate_until = Arc::clone(&self.gate_until);
         let sink = Arc::clone(&self.sink);
         let commands = self.commands.clone();
         let epoch = self.epoch;
@@ -1066,14 +1127,19 @@ impl Worker {
                 }
                 match read_result(result, error) {
                     Ok(Some((text, is_final))) => {
-                        if !text.trim().is_empty() {
-                            let now =
-                                u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let now = u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let heard_something = !text.trim().is_empty();
+                        if heard_something {
                             last_heard.store(now, Ordering::SeqCst);
                         }
                         if speaking.load(Ordering::SeqCst) {
-                            if !text.trim().is_empty() {
-                                sink(TurnEvent::SpeechDetected);
+                            if heard_something {
+                                sink(TurnEvent::SpeechDetected(text));
+                            }
+                        } else if now < gate_until.load(Ordering::SeqCst) {
+                            if heard_something {
+                                tracing::info!(%text, "voice: transcript inside the tail gate dropped");
+                                crate::voice_log::record(VoiceEventKind::EchoDropped, Some(text));
                             }
                         } else if is_final {
                             sink(TurnEvent::FinalHeard(text));
@@ -1362,12 +1428,24 @@ fn recognizer_for(locale: &NSLocale) -> Recognizer {
     Recognizer::Ready(recognizer)
 }
 
-/// Put the shared session in `.playAndRecord` with `options` and activate
-/// it.
+/// Put the shared session in `.playAndRecord`, `.voiceChat`, with `options`
+/// and activate it.
+///
+/// The mode is `.voiceChat`, explicitly, in both places the category is
+/// set (AD-209). Apple, `AVAudioSession.Mode.voiceChat`: the mode "for
+/// voice-over-IP (VoIP) apps that use the voice-processing I/O audio unit";
+/// an app that enables voice processing "without explicitly setting its
+/// mode to a chat variant" has `voiceChat` set implicitly, and an app in a
+/// chat mode that does not use voice processing gets no echo cancellation.
+/// Writing `.default` here while VPIO is on was writing a mode that was not
+/// in force; writing `.voiceChat` is the same session, stated. It is set on
+/// the options change too, because `setCategory:mode:options:` writes all
+/// three, and a mode that flipped back to `.default` while ducking would be
+/// the silent defeat the field report measured.
 #[allow(unsafe_code)]
 fn configure_session(options: AVAudioSessionCategoryOptions) -> Result<(), String> {
     // SAFETY: `AVAudioSessionCategoryPlayAndRecord` and
-    // `AVAudioSessionModeDefault` are Apple's process-lifetime extern
+    // `AVAudioSessionModeVoiceChat` are Apple's process-lifetime extern
     // `NSString` constants; reading them carries no other obligation, and a
     // nil (which no iOS ships) is answered rather than dereferenced.
     // `setCategory:mode:options:error:` and `setActive:error:` take the
@@ -1377,7 +1455,8 @@ fn configure_session(options: AVAudioSessionCategoryOptions) -> Result<(), Strin
     let session = unsafe { AVAudioSession::sharedInstance() };
     let category = unsafe { AVAudioSessionCategoryPlayAndRecord }
         .ok_or("AVAudioSessionCategoryPlayAndRecord is nil")?;
-    let mode = unsafe { AVAudioSessionModeDefault }.ok_or("AVAudioSessionModeDefault is nil")?;
+    let mode =
+        unsafe { AVAudioSessionModeVoiceChat }.ok_or("AVAudioSessionModeVoiceChat is nil")?;
     unsafe { session.setCategory_mode_options_error(category, mode, options) }
         .map_err(|error| error.localizedDescription().to_string())?;
     unsafe { session.setActive_error(true) }
@@ -1385,7 +1464,8 @@ fn configure_session(options: AVAudioSessionCategoryOptions) -> Result<(), Strin
 }
 
 /// Change the active session's options without deactivating it: ducking on
-/// for an utterance, off after.
+/// for an utterance, off after. The mode stays `.voiceChat` (see
+/// [`configure_session`]).
 #[allow(unsafe_code)]
 fn set_session_options(options: AVAudioSessionCategoryOptions) -> Result<(), String> {
     // SAFETY: as in `configure_session`, minus activation. Apple allows
@@ -1395,7 +1475,8 @@ fn set_session_options(options: AVAudioSessionCategoryOptions) -> Result<(), Str
     let session = unsafe { AVAudioSession::sharedInstance() };
     let category = unsafe { AVAudioSessionCategoryPlayAndRecord }
         .ok_or("AVAudioSessionCategoryPlayAndRecord is nil")?;
-    let mode = unsafe { AVAudioSessionModeDefault }.ok_or("AVAudioSessionModeDefault is nil")?;
+    let mode =
+        unsafe { AVAudioSessionModeVoiceChat }.ok_or("AVAudioSessionModeVoiceChat is nil")?;
     unsafe { session.setCategory_mode_options_error(category, mode, options) }
         .map_err(|error| error.localizedDescription().to_string())
 }

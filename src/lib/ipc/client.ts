@@ -7303,15 +7303,32 @@ export async function voiceWakeGet(): Promise<VoiceWakeVm> {
 }
 
 /**
- * Set the wake switch and phrase (FR-404, FR-405). The phrase is validated by
- * `WakePhrase::parse` in Rust — never here — and a refusal rejects with the
+ * Set the wake switch, phrase and stop phrase (FR-404, FR-405; Epic 67,
+ * AD-208). Both phrases are validated in Rust — `WakePhrase::parse` and
+ * `WakePhrase::parse_stop` — never here, and a refusal rejects with the
  * sentence saying what to type instead, with nothing persisted. On success
- * both are persisted and the turn is armed (or disarmed).
+ * all three are persisted and the turn is armed (or disarmed).
  *
  * Rejects with: `internal` (the refusal, with its sentence).
  */
-export async function voiceWakeSet(enabled: boolean, phrase: string): Promise<VoiceWakeVm> {
-  return await invoke<VoiceWakeVm>("voice_wake_set", { enabled, phrase });
+export async function voiceWakeSet(
+  enabled: boolean,
+  phrase: string,
+  stopPhrase: string,
+): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_wake_set", { enabled, phrase, stopPhrase });
+}
+
+/**
+ * Choose the bot a spoken turn goes to (Epic 67, AD-206): a pinned bot's id,
+ * or `null` for "the pinned bot most recently talked to". Which bot a turn
+ * actually reaches is decided in `keeper_core::bots::voice_target` at send
+ * time, never here; the fresh {@link VoiceWakeVm} says what was stored.
+ *
+ * Rejects with: `internal`.
+ */
+export async function voiceTargetSet(botId: string | null): Promise<VoiceWakeVm> {
+  return await invoke<VoiceWakeVm>("voice_target_set", { botId });
 }
 
 /**
@@ -7375,13 +7392,22 @@ export async function voiceStop(): Promise<void> {
 }
 
 /**
- * Read `text` aloud (FR-403). From a turn that heard something this is the
- * answer to what was heard; from idle it is the answer to something typed.
- * Speech detected while it plays stops it first (barge-in), decided in
- * `keeper_core::voice`.
+ * The Tauri event the shell forwards a spoken turn's stream on (Epic 67,
+ * AD-205): the turn heard a question and Rust opened the stream itself, with
+ * no pane channel to hand it, so every {@link BotStreamEvent} of that answer
+ * arrives here instead — `opened`, the deltas, `closed` — for a pane that is
+ * mounted to apply exactly as it applies its own channel's. The answer is
+ * read aloud by Rust whether or not anything listens.
  */
-export async function voiceSpeak(text: string): Promise<void> {
-  await invoke<void>("voice_speak", { text });
+export const BOTS_SPOKEN_STREAM_EVENT = "keeper://bots-spoken-stream";
+
+/** Subscribe to the spoken turn's stream events. Resolves with an unlisten function. */
+export async function listenSpokenStream(
+  onEvent: (event: BotStreamEvent) => void,
+): Promise<() => void> {
+  return await listen<BotStreamEvent>(BOTS_SPOKEN_STREAM_EVENT, (event) => {
+    onEvent(event.payload);
+  });
 }
 
 /** Stop reading aloud; the turn ends as if the utterance had finished. */

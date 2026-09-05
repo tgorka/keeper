@@ -38,6 +38,7 @@
 //! the same name on a Mac as on a phone.
 
 pub mod authorization;
+pub mod banner;
 pub mod events;
 pub mod island;
 pub mod level;
@@ -62,6 +63,11 @@ use crate::vm::{VoiceStateVm, VoiceUnavailableVm};
 /// The phrase a fresh install listens for once the switch is turned on. One
 /// word, on purpose — see [`phrase::MIN_WORDS`].
 pub const DEFAULT_WAKE_PHRASE: &str = "nixie";
+
+/// The word that ends an answer mid-sentence (AD-208), on a fresh install.
+/// One word in every listening locale keeper offers, so on-device
+/// recognition — which takes no vocabulary hints — hears it whole.
+pub const DEFAULT_STOP_PHRASE: &str = "stop";
 
 /// Why the port cannot listen or speak right now.
 ///
@@ -223,11 +229,12 @@ pub type EventSink = Arc<dyn Fn(TurnEvent) + Send + Sync>;
 ///
 /// A port reports back through the [`EventSink`] it was constructed with:
 /// [`TurnEvent::PartialHeard`] and [`TurnEvent::FinalHeard`] from
-/// recognition, [`TurnEvent::SpeechDetected`] when a new transcript starts
-/// while it is speaking, [`TurnEvent::Silence`] when an utterance it was
-/// speaking ends, [`TurnEvent::Failed`] when the OS fails it. It never emits
-/// `WakeMatched` — matching is [`Turn`]'s — and never runs a silence clock;
-/// that is the shell's, budgeted by [`silence_budget`].
+/// recognition, [`TurnEvent::SpeechDetected`] with the transcript when a
+/// new one starts while it is speaking, [`TurnEvent::Silence`] when an
+/// utterance it was speaking ends, [`TurnEvent::Failed`] when the OS fails
+/// it. It never emits `WakeMatched` or `StopHeard` — matching is
+/// [`Turn`]'s — and never runs a silence clock; that is the shell's,
+/// budgeted by [`silence_budget`].
 pub trait VoicePort: Send + Sync {
     /// The platform this port runs on: the nouns its refusals name and
     /// whether the OS keeps its own voice out of the transcript.
@@ -295,35 +302,41 @@ pub trait VoicePort: Send + Sync {
     fn stop_speaking(&self);
 }
 
-/// The turn the shell holds: the machine's state plus the wake phrase, and
-/// the three rules that sit between an event and the table.
+/// The turn the shell holds: the machine's state plus the wake and stop
+/// phrases, and the four rules that sit between an event and the table.
 ///
 /// **Matching**: while `Idle` with a phrase set, a transcript that contains
 /// the phrase becomes [`TurnEvent::WakeMatched`]; every other transcript in
-/// `Idle` is noise and is ignored. **Re-arming**: when a turn ends — on its
-/// own (silence, an empty transcript, an empty answer, the spoken answer
-/// ending) or because the person stopped it — and a phrase is set, the
-/// microphone is released for the turn (NFR-51) and opened again for the
-/// phrase, because the switch is a standing choice and a stop ends *this
-/// turn*, not the listening (Story 62.5: someone driving cannot come back
-/// to re-arm it). Only a failure leaves the device released: a port that
-/// refused to open would refuse again, and re-arming would be a loop — it is
-/// tried again by [`should_rearm`] once the refusal has cleared, not before.
-/// The switch, not a stop, is what turns listening off. **Half-duplex**
-/// (AD-175): where [`may_record`] says the device may not be open in the
-/// state the table moved to, the turn does not open it and releases it if
-/// it was — before the `Speak`, so the port never records its own answer.
-/// On iOS the rule allows every state the table opens the device in, so
-/// nothing there changes. **Level** (Story 64.3, AD-186): a
-/// [`TurnEvent::Level`] is not a transition. It is recorded while the device
-/// is open for a turn — `Listening` and `Heard` — and cleared when the turn
-/// moves anywhere else, so a snapshot never carries a level from a
-/// microphone that is closed.
+/// `Idle` is noise and is ignored. **Stopping** (AD-208): while `Speaking`
+/// with a stop phrase set, a barge-in whose words contain it becomes
+/// [`TurnEvent::StopHeard`] and ends the turn; any other barge-in keeps
+/// FR-403's shape and asks a new question. **Re-arming**: when a turn ends
+/// — on its own (silence, an empty transcript, an empty answer, the spoken
+/// answer ending) or because the person stopped it, by the button or by the
+/// word — and a phrase is set, the microphone is released for the turn
+/// (NFR-51) and opened again for the phrase, because the switch is a
+/// standing choice and a stop ends *this turn*, not the listening (Story
+/// 62.5: someone driving cannot come back to re-arm it). Only a failure
+/// leaves the device released: a port that refused to open would refuse
+/// again, and re-arming would be a loop — it is tried again by
+/// [`should_rearm`] once the refusal has cleared, not before. The switch,
+/// not a stop, is what turns listening off. **Half-duplex** (AD-175): where
+/// [`may_record`] says the device may not be open in the state the table
+/// moved to, the turn does not open it and releases it if it was — before
+/// the `Speak`, so the port never records its own answer. On iOS the rule
+/// allows every state the table opens the device in, so nothing there
+/// changes. **Level** (Story 64.3, AD-186): a [`TurnEvent::Level`] is not a
+/// transition. It is recorded while the device is open for a turn —
+/// `Listening` and `Heard` — and cleared when the turn moves anywhere else,
+/// so a snapshot never carries a level from a microphone that is closed.
 #[derive(Debug)]
 pub struct Turn {
     platform: VoicePlatform,
     state: TurnState,
     wake: Option<WakePhrase>,
+    /// The word that ends an answer (AD-208). Recorded, never armed: it is
+    /// matched on the barge-in transcript the port already delivers.
+    stop: Option<WakePhrase>,
     /// Whether the last effect touching the device opened it. What the
     /// surface's "listening for the phrase" indicator reads.
     microphone_open: bool,
@@ -340,6 +353,7 @@ impl Turn {
             platform,
             state: TurnState::Idle,
             wake: None,
+            stop: None,
             microphone_open: false,
             level: None,
         }
@@ -358,6 +372,19 @@ impl Turn {
     /// The phrase set, if any.
     pub fn wake(&self) -> Option<&WakePhrase> {
         self.wake.as_ref()
+    }
+
+    /// The stop phrase set, if any.
+    pub fn stop_phrase(&self) -> Option<&WakePhrase> {
+        self.stop.as_ref()
+    }
+
+    /// Set or clear the stop phrase (AD-208). No effects: the word is
+    /// matched on transcripts the device already delivers while speaking,
+    /// so nothing opens or closes for it. `None` means any barge-in asks a
+    /// question, as before Epic 67.
+    pub fn set_stop(&mut self, stop: Option<WakePhrase>) {
+        self.stop = stop;
     }
 
     /// Whether the microphone is open right now, per the effects handed out.
@@ -432,12 +459,18 @@ impl Turn {
             }
             return Vec::new();
         }
-        let event = match (&self.state, &self.wake, &event) {
+        let event = match (&self.state, &self.wake, &self.stop, &event) {
             (
                 TurnState::Idle,
                 Some(wake),
+                _,
                 TurnEvent::PartialHeard(t) | TurnEvent::FinalHeard(t),
             ) if wake.matches(t) => TurnEvent::WakeMatched,
+            (TurnState::Speaking, _, Some(stop), TurnEvent::SpeechDetected(t))
+                if stop.matches(t) =>
+            {
+                TurnEvent::StopHeard
+            }
             _ => event,
         };
         let turn_ended = matches!(
@@ -446,6 +479,7 @@ impl Turn {
                 | TurnEvent::FinalHeard(_)
                 | TurnEvent::AnswerDone(_)
                 | TurnEvent::Abandoned
+                | TurnEvent::StopHeard
         );
         let (next, mut effects) = advance(std::mem::take(&mut self.state), event);
         if matches!(next, TurnState::Idle)

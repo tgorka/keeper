@@ -35,6 +35,10 @@ const LIB_RS = file("src-tauri/crates/keeper/src/lib.rs");
 const CLIENT_TS = file("src/lib/ipc/client.ts");
 const VITE_CONFIG = file("vite.config.ts");
 const VOICE_MAIN = file("src/voice-main.tsx");
+const BOTS_IPC_RS = file("src-tauri/crates/keeper/src/bots_ipc.rs");
+const BOT_VOICE_MIC_TSX = file("src/components/bots/bot-voice-mic.tsx");
+const BOT_VOICE_WAKE_TSX = file("src/components/bots/bot-voice-wake.tsx");
+const BOT_VOICE_TARGET_TSX = file("src/components/bots/bot-voice-target.tsx");
 
 const capability = JSON.parse(file("src-tauri/crates/keeper/capabilities/voice.json")) as {
   windows: string[];
@@ -114,5 +118,36 @@ describe("the voice pill window", () => {
     expect(document).toBeDefined();
     expect(VITE_CONFIG).toContain(`path.resolve(__dirname, "${document}")`);
     expect(file(document ?? "")).toContain('src="/src/voice-main.tsx"');
+  });
+});
+
+/**
+ * Epic 67 (AD-205): the hands-free turn is Rust's from the phrase to the
+ * last word. The shell performs `SendText` and drives `Speak`; the webview
+ * observes the stream through one forwarded event and drives nothing.
+ */
+describe("the spoken turn (Epic 67, AD-205)", () => {
+  it("forwards the spoken stream under one event name, emitted in Rust and listened for in client.ts", () => {
+    const emitted = /pub const SPOKEN_STREAM_EVENT: &str = "([^"]+)";/.exec(BOTS_IPC_RS)?.[1];
+    const listened = /export const BOTS_SPOKEN_STREAM_EVENT = "([^"]+)";/.exec(CLIENT_TS)?.[1];
+    expect(emitted).toBeDefined();
+    expect(listened).toBe(emitted);
+    expect(BOTS_IPC_RS).toContain("emit(SPOKEN_STREAM_EVENT, &event)");
+  });
+
+  it("performs SendText in the shell and drives Speak from the stream's close", () => {
+    expect(VOICE_IPC_RS).toMatch(/Effect::SendText\(text\) => Some\(text\)/);
+    expect(VOICE_IPC_RS).toContain("crate::bots_ipc::send_spoken(&app, text).await");
+    expect(BOTS_IPC_RS).toContain("crate::voice_ipc::answer_complete(content.to_owned())");
+    // The command the webview used to speak with is gone on both sides.
+    expect(LIB_RS).not.toContain("voice_ipc::voice_speak");
+    expect(CLIENT_TS).not.toContain('"voice_speak"');
+  });
+
+  it("has no voice component that sends a message or reads an answer aloud", () => {
+    for (const source of [BOT_VOICE_MIC_TSX, BOT_VOICE_WAKE_TSX, BOT_VOICE_TARGET_TSX]) {
+      expect(source).not.toContain("botsChatSend");
+      expect(source).not.toContain("voiceSpeak");
+    }
   });
 });

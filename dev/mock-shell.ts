@@ -2762,6 +2762,8 @@ let voiceWake: VoiceWakeVm = {
   locale: VOICE_SYSTEM_LOCALE,
   localeChosen: null,
   onDeviceLocales: voiceOnDeviceLocales,
+  stopPhrase: "stop",
+  voiceTarget: null,
 };
 /** The one watcher, so `voice_wake_set` can push the new idle snapshot. */
 let voiceWatcher: MockChannel<VoiceStateVm> | null = null;
@@ -3115,7 +3117,8 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
         retriable: false,
       };
     }
-    voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase };
+    const stopPhrase = String(payload.stopPhrase ?? "stop").trim();
+    voiceWake = { ...voiceWake, enabled: payload.enabled === true, phrase, stopPhrase };
     voiceWatcher?.onmessage?.(voiceIdle());
     return voiceWake;
   },
@@ -3132,14 +3135,24 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
     voiceWake = { ...voiceWake, localeChosen: chosen, locale: chosen ?? VOICE_SYSTEM_LOCALE };
     return voiceWake;
   },
-  // --- Voice, the talk mode (Epic 62, Story 62.6) --------------------------
+  // Epic 67 (AD-206): who a spoken turn goes to. Any string is a bot id here;
+  // whether it names a pinned bot is Rust's business at send time.
+  voice_target_set: (payload) => {
+    voiceWake = {
+      ...voiceWake,
+      voiceTarget: typeof payload.botId === "string" && payload.botId !== "" ? payload.botId : null,
+    };
+    return voiceWake;
+  },
+  // --- Voice, the talk mode (Epic 62, Story 62.6; Epic 67, AD-205) ---------
   //
-  // A scripted turn so the mic control's three states can be looked at in
-  // `bun run dev`: listening with an interim transcript, then heard. What is
-  // heard lands in the composer; nothing here sends. `voice_authorize`
-  // answers "granted" — the dialogs are the phone's. The level (Epic 64,
-  // Story 64.3) rises with the words and falls once they are heard, at the
-  // ~25 Hz Rust bounds it to, so an indicator can be looked at too.
+  // A scripted turn so the mic control's states can be looked at in
+  // `bun run dev`: listening with an interim transcript, heard, then — since
+  // Epic 67 the send and the speak are Rust's — sending and speaking, back
+  // to idle. Nothing here opens a stream. `voice_authorize` answers "granted"
+  // — the dialogs are the phone's. The level (Epic 64, Story 64.3) rises
+  // with the words and falls once they are heard, at the ~25 Hz Rust bounds
+  // it to, so an indicator can be looked at too.
   voice_authorize: () => null,
   voice_start: () => {
     const push = (state: VoiceStateVm) => voiceWatcher?.onmessage?.(state);
@@ -3150,15 +3163,14 @@ const HANDLERS: Record<string, (payload: Record<string, unknown>) => unknown> = 
       setTimeout(() => push({ kind: "listening", heard, level }), tick * 40);
     }
     setTimeout(() => push({ kind: "heard", text: "what did I save yesterday", level: 0.1 }), 1700);
+    setTimeout(() => push({ kind: "sending", answering: false }), 2200);
+    setTimeout(() => push({ kind: "sending", answering: true }), 3000);
+    setTimeout(() => push({ kind: "speaking" }), 4000);
+    setTimeout(() => push(voiceIdle()), 6500);
     return null;
   },
   voice_stop: () => {
     voiceWatcher?.onmessage?.(voiceIdle());
-    return null;
-  },
-  voice_speak: () => {
-    voiceWatcher?.onmessage?.({ kind: "speaking" });
-    setTimeout(() => voiceWatcher?.onmessage?.(voiceIdle()), 2500);
     return null;
   },
   voice_stop_speaking: () => {
