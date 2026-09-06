@@ -10,28 +10,46 @@
 //! builds from an rsync'd copy of the tree that has no `.git`, which is stated
 //! in that script's own header. An honest `"unknown"` beats a lie, and the
 //! timestamp below identifies the build even when the commit cannot.
+//!
+//! **The caller may state it, and then it is believed.** A build directory on
+//! another machine can hold a `.git` from an older rsync — hesperia's did, and
+//! on 2026-09-05 a freshly installed build of `4cce07c19538` logged
+//! `220f8bde27d2-dirty`, which is worse than `unknown`: it sends the next
+//! reader to a diff that is not the one running. The install scripts export
+//! `KEEPER_BUILD_SHA` from the repository they rsynced FROM, and this script
+//! prefers it over any local `git` answer.
 
 use std::process::Command;
 
 fn main() {
-    let sha = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .output()
+    let sha = std::env::var("KEEPER_BUILD_SHA")
         .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-        .filter(|sha| !sha.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned());
+        .map(|stated| stated.trim().to_owned())
+        .filter(|stated| !stated.is_empty())
+        .unwrap_or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "--short=12", "HEAD"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+                .filter(|sha| !sha.is_empty())
+                .unwrap_or_else(|| "unknown".to_owned())
+        });
+    // A stated sha carries its own `-dirty` (the scripts append it), so the
+    // local probe below must not add a second one.
+    let stated = std::env::var("KEEPER_BUILD_SHA").is_ok_and(|value| !value.trim().is_empty());
     // Dirty is worth knowing: a build from a modified tree is not the commit it
     // names, and a log that claimed it was would send the next person to the
     // wrong diff.
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=no"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| !out.stdout.is_empty())
-        .unwrap_or(false);
+    let dirty = !stated
+        && Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| !out.stdout.is_empty())
+            .unwrap_or(false);
     println!(
         "cargo:rustc-env=KEEPER_BUILD_SHA={sha}{}",
         if dirty { "-dirty" } else { "" }
