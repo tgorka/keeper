@@ -153,9 +153,15 @@ keeper_gui_sh() {
   # ("Expected \" but found unknown token"). Writing the pipeline into $runner
   # leaves `do script` holding only letters, digits and slashes, which cannot
   # be misread by either layer.
+  # `caffeinate -i` HERE and not only around the ssh command: the build runs in
+  # Terminal.app and outlives the ssh session, so an assertion held by the ssh
+  # side dies exactly when it is most needed. Measured on hesperia 2026-09-06:
+  # two iOS builds died at "Timeout, server hesperia not responding" twenty
+  # minutes in, with the Terminal-side build unprotected and the Mac idle from
+  # the login session's point of view.
   cat >"$runner" <<RUNNER
 #!/bin/bash
-bash "$payload" 2>&1 | tee "$log"
+caffeinate -i bash "$payload" 2>&1 | tee "$log"
 echo "\${PIPESTATUS[0]}" > "$status"
 RUNNER
 
