@@ -60,6 +60,10 @@ if [ -n "$BUILD_SHA" ] && [ -n "$(git -C "$(dirname "$0")/.." status --porcelain
   BUILD_SHA="$BUILD_SHA-dirty"
 fi
 REMOTE_ENV="$REMOTE_ENV KEEPER_BUILD_SHA=\"$BUILD_SHA\""
+# And as a file inside the tree that is about to be rsynced, because the env
+# does not survive every hop of the iOS build (build.rs says which). Gitignored
+# there, so it never reaches a commit.
+printf '%s' "$BUILD_SHA" > "$(dirname "$0")/../src-tauri/crates/keeper/build-sha.txt"
 
 # `caffeinate -i` because a release build outlasts the idle-sleep timer, and a
 # laptop that sleeps mid-build drops the ssh connection and takes the build

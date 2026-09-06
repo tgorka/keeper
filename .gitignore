@@ -49,3 +49,6 @@ tools/keeper-rec/.build/
 # test binary invoked directly from src-tauri/). The real bindings live in
 # src/lib/ipc/gen; a second copy is duplicate generated output, never a source.
 src-tauri/bindings/
+
+# The commit an install states for the build it is about to make (build.rs).
+src-tauri/crates/keeper/build-sha.txt

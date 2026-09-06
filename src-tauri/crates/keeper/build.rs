@@ -22,8 +22,21 @@
 use std::process::Command;
 
 fn main() {
-    let sha = std::env::var("KEEPER_BUILD_SHA")
+    // A FILE beside this script, not only an environment variable: the iOS
+    // build reaches `cargo` through an Xcode build phase dispatched into a GUI
+    // login session, and an export that survives every hop of that is not
+    // something this script can verify. Measured on hesperia 2026-09-06: with
+    // `KEEPER_BUILD_SHA` exported into the payload, the macOS build took it and
+    // the iOS bundle still carried the stale probe. A file in the rsynced tree
+    // is immune to env plumbing, and `rerun-if-changed` below makes a new sha
+    // rebuild this script's output.
+    println!("cargo:rerun-if-changed=build-sha.txt");
+    println!("cargo:rerun-if-env-changed=KEEPER_BUILD_SHA");
+    let stated_sha = std::fs::read_to_string("build-sha.txt")
         .ok()
+        .or_else(|| std::env::var("KEEPER_BUILD_SHA").ok());
+    let sha = stated_sha
+        .clone()
         .map(|stated| stated.trim().to_owned())
         .filter(|stated| !stated.is_empty())
         .unwrap_or_else(|| {
@@ -38,7 +51,7 @@ fn main() {
         });
     // A stated sha carries its own `-dirty` (the scripts append it), so the
     // local probe below must not add a second one.
-    let stated = std::env::var("KEEPER_BUILD_SHA").is_ok_and(|value| !value.trim().is_empty());
+    let stated = stated_sha.is_some_and(|value| !value.trim().is_empty());
     // Dirty is worth knowing: a build from a modified tree is not the commit it
     // names, and a log that claimed it was would send the next person to the
     // wrong diff.

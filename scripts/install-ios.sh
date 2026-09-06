@@ -97,6 +97,10 @@ if [ -n "$BUILD_SHA" ] && [ -n "$(git -C "$(dirname "$0")/.." status --porcelain
   BUILD_SHA="$BUILD_SHA-dirty"
 fi
 REMOTE_ENV="$REMOTE_ENV KEEPER_BUILD_SHA=\"$BUILD_SHA\""
+# And as a file inside the tree that is about to be rsynced, because the env
+# does not survive every hop of the iOS build (build.rs says which). Gitignored
+# there, so it never reaches a commit.
+printf '%s' "$BUILD_SHA" > "$(dirname "$0")/../src-tauri/crates/keeper/build-sha.txt"
 
 # A connect timeout because the whole point of the first check is to say
 # quickly that the Mac is not there; ssh's own default waits two minutes.
