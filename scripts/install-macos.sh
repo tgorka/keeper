@@ -49,6 +49,21 @@ fail() { printf '\033[31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 # `bun` lives in ~/.bun/bin, which a non-interactive ssh shell does not have on
 # its PATH; and debug info in a release bundle is a gigabyte that buys nothing.
 REMOTE_ENV='export PATH="$HOME/.bun/bin:$HOME/.cargo/bin:$PATH" CARGO_PROFILE_RELEASE_DEBUG=0'
+# The commit the rsynced source came FROM, stated rather than probed. The build
+# directory on the Mac can hold a `.git` from an older rsync — hesperia's did,
+# and on 2026-09-05 a freshly installed build of 4cce07c19538 logged
+# 220f8bde27d2-dirty, which sends the next reader to a diff that is not the one
+# running. `crates/keeper/build.rs` prefers this over its own `git` answer, and
+# an empty value leaves it to probe as before.
+BUILD_SHA="$(git -C "$(dirname "$0")/.." rev-parse --short=12 HEAD 2>/dev/null || true)"
+if [ -n "$BUILD_SHA" ] && [ -n "$(git -C "$(dirname "$0")/.." status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+  BUILD_SHA="$BUILD_SHA-dirty"
+fi
+REMOTE_ENV="$REMOTE_ENV KEEPER_BUILD_SHA=\"$BUILD_SHA\""
+# And as a file inside the tree that is about to be rsynced, because the env
+# does not survive every hop of the iOS build (build.rs says which). Gitignored
+# there, so it never reaches a commit.
+printf '%s' "$BUILD_SHA" > "$(dirname "$0")/../src-tauri/crates/keeper/build-sha.txt"
 
 # `caffeinate -i` because a release build outlasts the idle-sleep timer, and a
 # laptop that sleeps mid-build drops the ssh connection and takes the build
