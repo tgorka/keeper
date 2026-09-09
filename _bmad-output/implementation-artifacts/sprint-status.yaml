@@ -1266,6 +1266,16 @@ development_status:
   69-5-the-record-in-the-session: backlog
   69-6-the-record-and-the-gates: backlog
 
+  # Epic 70 — a pass that costs what changed, and a folder that says when it is cut off (2026-09-09)
+  70-1-a-walk-that-costs-what-changed: in-progress
+  70-2-offline-is-a-word-the-folder-reaches: in-progress
+  70-3-a-merge-that-does-not-finish-is-undone-and-the-matrix-decides: in-progress
+  70-4-what-must-never-become-a-pointer-and-what-must-never-be-pruned: in-progress
+  70-5-the-gate-keeps-its-promises: in-progress
+  70-6-one-folder-does-not-stall-another-and-a-pass-does-its-own-work: backlog
+  70-7-both-stores-are-maintained-and-a-countdown-that-cannot-end-says-so: backlog
+  70-8-the-record-and-the-gates: backlog
+
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
   # Nine stories, nine PRs on main, #161..#169 bottom to top. 52.4 and 52.5
