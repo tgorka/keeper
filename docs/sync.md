@@ -101,13 +101,20 @@ left mid-flight is returned to the queue at the next start.
 
 1. If the profile is on removable media, confirm the volume is attached. If it
    is not, **stop here** — see §6.
-2. Fetch from the remote (skipped when offline; the work is queued).
-3. Apply what fast-forwards. Where local and remote both changed, resolve
-   without asking (§5).
-4. Scan the working tree, discard anything excluded, and hold anything that is
-   not demonstrably complete (§4).
-5. Stage what settled, route oversized files through LFS (§8), and commit with
-   provenance trailers (§10).
+2. Scan the working tree — only the paths the watcher named since the last
+   pass, unless something (an overflow, a rescan, the first pass of a run, a
+   degraded watcher, the fifteen-minute untracked sweep) means the whole tree
+   is owed — discard anything excluded, and hold anything that is not
+   demonstrably complete (§4).
+3. Stage what settled, route oversized files through LFS (§8), and commit with
+   provenance trailers (§10). The commit comes **first**: a merge meets a clean
+   tree, and a pass that cannot reach the remote still records what changed.
+4. Fetch from the remote — on its own five-minute clock, or at once when this
+   pass committed something or a wake named a path; skipped when offline (the
+   work is queued).
+5. Apply what fast-forwards. Where local and remote both changed, resolve
+   without asking (§5). A merge that cannot finish is undone before the pass
+   returns; keeper never leaves `MERGE_HEAD` behind.
 6. Transfer any LFS objects the commit queued.
 7. Push — but **only** once step 6 has nothing outstanding. A commit *this* pass
    made, whose pointers name objects the remote does not have yet, is held back
@@ -115,7 +122,9 @@ left mid-flight is returned to the queue at the next start.
    tracked that way, which §8 spells out.
 
 Local git — staging, committing, reading status — **never** requires the
-network. Only fetch, push and LFS transfers do.
+network. Only fetch, push and LFS transfers do. Profiles are ticked
+concurrently, and the walk, the first checkout and the prune plan run off the
+async worker, so one folder's long pass does not hold another's.
 
 ---
 
@@ -274,11 +283,13 @@ with no error at all.
 A profile with `direction = pushOnly` and `lane = worktree` is designed for
 autonomous agents.
 
-Keeper creates a linked worktree on a generated branch `keeper/<profile>/<id>`.
-The agent writes only there. Keeper commits with `Keeper-Source: bot` provenance
-and pushes **that branch only** — never the base branch, and **never a
-force-push**. The handoff to a human is a pull request, whose number and URL are
-recorded and surfaced.
+Keeper switches the profile's checkout to a generated branch
+`keeper/<profile>/<id>` (`git switch -c`; it is a branch in the profile's own
+working tree, **not** a linked worktree — the `git worktree` verbs exist in the
+shim and are not used). The agent writes there. Keeper commits with
+`Keeper-Source: bot` provenance and pushes **that branch only** — never the
+base branch, and **never a force-push**. The handoff to a human is a pull
+request, whose number and URL are recorded and surfaced.
 
 If the lane's remote branch has diverged, keeper stops and warns rather than
 resolving. That is deliberate: the whole point of a lane is that a human decides.
@@ -1405,8 +1416,18 @@ fresh process has an empty pool, which fits. Accumulated backoff does not
 (67 MB, 62 threads, four sockets after an hour). If the decay outlives this, the
 cause is elsewhere — and a 20 s window is still the better default.
 
-All three live in `keeper_sync::http`, which is the only place a client is
-built.
+All three live in `keeper_sync::http`, which serves the LFS batch and transfer
+legs, the forge API and the phone's push. Two legs are **not** that client and
+are bounded separately: the git **fetch** runs on gitoxide's own transport,
+whose connect timeout keeper sets to the same 15 s and whose silence keeper
+bounds with a ten-minute deadline around the whole fetch (a stalled fetch is
+interrupted and classified as a network failure); and the desktop **push** is
+the `git` binary, which every keeper invocation runs with a ten-minute deadline
+and `http.lowSpeedLimit=1000 / http.lowSpeedTime=60`, so a transfer that drops
+below 1 kB/s for a minute fails the way an LFS stall does. A folder whose fetch
+fails for a network reason — a refused connection, a timed-out connect, a
+dead peer — is `Offline`, logged once when it enters that state and once when
+it leaves, and an offline folder does not walk its tree until a unit is due.
 
 ---
 
@@ -2961,31 +2982,35 @@ Linux).
 
 ## 18. Current implementation status
 
-This document describes the designed behaviour. As of 2026-08-25 the engine and
-the `keeper-syncd` daemon implement and verify §§1–8, §10, §11 and §13 against
-real git remotes, including a full LFS round trip (upload, peer clone, download,
-materialize) against a local LFS server and the review-lane airlock. Virtual
-files (§9) are real and exercised end to end: the excuse the policy gives
-`verify`, the `ls-files` inventory, `materialize` on demand, the four row states
-with the sentences and glyphs that carry them, `pin`/`unpin`, and the release
-deadline a materialized row counts down. A counting row needs an unpinned row, a
-non-zero `releaseTtlMs`, content the remote is known to hold — for bytes this
-clone authored, a `synced_at_ms` that is not NULL — and a folder that authorizes
-that path to stay away: `lfsMode = pointerOnly`, or the default `materialize`
-with the folder's own policy resolving the path to virtual, a bare
-`virtualOverBytes` floor included since story 56.16. A row whose folder keeps it
-answers with a word and no instant instead. **Tasks (§14) are real** as of
+This document describes the designed behaviour. As of 2026-09-09 the engine and
+the `keeper-syncd` daemon implement §§1–8, §10, §11 and §13, and prove them
+with tests that drive real `git` against `file://` remotes — including a full
+LFS round trip (upload, peer clone, download, materialize) against an
+in-process LFS server, the conflict matrix of §5 (`tests/conflict_matrix.rs`,
+every case ending with rc 0 and no `MERGE_HEAD`), and the offline transitions
+of §11 against real sockets. **What is not proven in the repository:** a run
+against a live Forgejo (story 31-4, still open) and the review-lane pull
+request, which has no automated test. Virtual files (§9) are real and exercised
+end to end: the excuse the policy gives `verify`, the `ls-files` inventory,
+`materialize` on demand, the row states with the sentences and glyphs that
+carry them, `pin`/`unpin`, and the release deadline a materialized row counts
+down. A counting row needs an unpinned row, a non-zero `releaseTtlMs`, content
+the remote is known to hold — for bytes this clone authored, a `synced_at_ms`
+that is not NULL — and a folder that authorizes that path to stay away:
+`lfsMode = pointerOnly`, or the default `materialize` with the folder's own
+policy resolving the path to virtual, a bare `virtualOverBytes` floor included
+since story 56.16. A row whose folder keeps it answers with a word and no
+instant instead; a row on a machine that cannot see open files answers
+**Held** and names the platform (Epic 70). **Tasks (§14) are real** as of
 2026-08-31 — the record, the dialect, the due-gate on each host's existing tick,
 the seven CLI verbs with their exit taxonomy, the release task's three modes, the
 sync task's governance over a folder's own pacing, the three-way missed-window
 policy with a recorded outcome for the two settings that decline a window, the
 ⌘8 view (create, edit, forget, the run report, the run history, and the
-read-only *Paced* rows) and the systemd timer pair — with the platform limits
-§14 states rather than a gap here. Two parts are not reachable everywhere:
+read-only *Paced* rows), the systemd timer pair, and since Epic 70 the `gc`
+kind, seeded weekly for every desktop folder. Two parts are not reachable
+everywhere:
 
-- **§12 progress and warnings.** These are engine-side and correct — the tray
-  decision, the status line and the warning onset logic are implemented and
-  tested — but the desktop app surfaces that render them are not wired up.
 - **Releasing content (§9), on macOS and Windows.** `dehydrate` and the release
   sweep are implemented, covered by tests, and **live on Linux**: the daemon and
   the desktop app there both answer the open-file question from `/proc` by inode
@@ -2995,9 +3020,10 @@ read-only *Paced* rows) and the systemd timer pair — with the platform limits
   authorizes, a bare `virtualOverBytes` floor included since story 56.16, and
   only a folder that authorizes nothing at all is refused `AlwaysMaterializes`
   before the question is reached. macOS and Windows still cannot answer that
-  question without racing, so both refuse `OpenUnknown` there. Nothing releases
-  content on a macOS or Windows machine until that platform can answer the
-  question.
+  question without racing, so both refuse `OpenUnknown` there — now **before**
+  any hashing or any call to the server, and the row says `Held` rather than
+  counting down. Nothing releases content on a macOS or Windows machine until
+  that platform can answer the question (Epic 69, story 69.3, is the answer).
 - **A packaged background host, on macOS.** Tasks (§14) run there only while the
   desktop app is running: a `keeper-syncd` binary is published for macOS and its
   one-shot verbs work, but keeper ships no launchd agent, so nothing starts
@@ -3021,8 +3047,34 @@ in about 17 MiB of memory, roughly a 120:1 ratio. That is the difference between
 LFS streaming the content and gitoxide buffering it, and it is why §8 makes LFS
 mandatory rather than optional.
 
-Steady-state cost is dominated by one `lstat` per file, so a folder that is not
-changing is cheap to keep watched.
+**The reference folder** is the owner's, and it is larger than the table: 155 626
+index entries, a 26 MB index, ~450 GB on disk of which 72 641 paths are LFS
+pointers, 181 210 packed git objects in 1.02 GiB, on a USB APFS volume. There a
+full-tree walk costs p50 1.1 s, p90 5.3 s, and 61 s under I/O contention from a
+recording; that walk is Θ(entries), not bytes — one `lstat` per index entry, one
+SHA-1 over the index (dropped by `index.skipHash`, which keeper writes), and on
+macOS two case-folding tables of every path. The number that matters is
+therefore **how often** it runs. Before Epic 70 the folder was walked up to 666
+times an hour while a recording wrote into it, because a 1 Hz status poll ran an
+unclaimed full walk and every watcher event forced another. Since Epic 70 an
+event-driven pass walks only the paths the watcher named (as include pathspecs;
+the whole tree on overflow or on the fifteen-minute sweep — on a
+case-insensitive volume gix still visits every index entry but rejects each
+unnamed one by a string match before any `lstat`, which is the cost that
+dominated), a wake for a path
+the gate already holds does not walk at all, event-driven walks are floored at
+`min(settle, 5 s)`, the live-watcher backstop is five minutes, and the remote is
+polled on its own five-minute clock rather than on every scan. The requirement
+is NFR-61: under continuous single-file write a folder costs at most one
+full-tree walk per minute. The measured before/after on that folder is in
+`_bmad-output/implementation-artifacts/spec-70-8-the-record-and-the-gates.md`.
+
+`core.fsmonitor`, `core.untrackedCache` and `index.version=4` are **not** worth
+setting on a keeper-managed repository: gitoxide reads those index extensions
+and never consults them, and keeper's own stat write-back rewrites the index
+without them, so a cache a user enables for foreign `git status` is deleted on
+the next pass and a v4 index is written back as v2. keeper's watcher is the
+fsmonitor; it feeds the walk directly.
 
 ## 20. Deliberate limitations
 
@@ -3047,8 +3099,10 @@ changing is cheap to keep watched.
    `subpaths`.
 4. **macOS has no open-writer veto** (see §4).
 5. **A `git` binary is required** (see §1).
-6. **No automatic history pruning.** Sync churn grows a repository; `git gc` is
-   available but shrinking history is a destructive operation keeper will not
+6. **No history rewriting.** Sync churn grows a repository; since Epic 70 a
+   weekly `gc` task repacks it, but shrinking *history* — including the blobs
+   that were committed above today's threshold before a rule existed, which
+   the hourly anomaly counts — is a destructive operation keeper will not
    perform on its own. `lfsPruneLocal` is not this: it releases *local object
    copies* the remote confirmed it holds — an upload that completed, or an
    audit's per-object answer, recorded as `synced_at_ms` (§8) — on a pass that
@@ -3058,3 +3112,17 @@ changing is cheap to keep watched.
    and third-party applications see the pointer text rather than the content's
    size, and there is no filesystem virtualization on any platform — a closed
    question on macOS and a deferred one on Linux (§9; `docs/decisions.md` D-2).
+8. **One object per LFS round trip.** The batch API allows a hundred objects
+   per request and keeper asks for one; a first materialize of a hundred
+   thousand objects is a hundred thousand round trips, bounded by latency, not
+   bandwidth. Recorded, not fixed (review 2026-09-08, F-LFS-4).
+9. **Every clone is full.** Nothing is shallow or partial; a fresh clone pays
+   the whole history and all heads. Two clones of one remote on one machine
+   share nothing and cannot reach each other while the remote is down.
+10. **A foreign `.gitattributes` rule other than `filter=lfs`** (`text=auto`,
+    `ident`, another filter) is not applied by keeper's staging, so a path
+    under one reads as modified on every walk. keeper writes only `filter=lfs`
+    rules; the trigger is a rule a person or a peer commits.
+11. **The git store's per-commit cost is the tree, not the change.** Every
+    commit rewrites the index and every directory's tree object. Seconds on the
+    reference folder; proportional to directories, not to what changed.

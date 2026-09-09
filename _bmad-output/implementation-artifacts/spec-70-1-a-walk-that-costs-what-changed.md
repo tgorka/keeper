@@ -2,7 +2,7 @@
 title: 'Story 70.1: a walk that costs what changed'
 type: 'feature'
 created: '2026-09-09'
-status: 'in-progress'
+status: 'review'
 baseline_revision: '3cb3fd7'
 review_loop_iteration: 0
 followup_review_recommended: true
@@ -120,3 +120,8 @@ Plus `index.skipHash=true` beside `index.sparse=false`, three fields on the walk
 Each mutation was one line, reverted by the same `sed`, and the line re-read afterwards; final run of all story tests green.
 
 **Not verified here, and why.** The hesperia number (walks/hour on `tgdrive` during a recording) is 70.8's install step. `keeper` shell crate not compiled (Linux); this story touches no shell-crate code. The poll's narrowing is exercised only through `poll_walk_policy` (no `pending()`-driven test) — `pending()` already has coverage of its walk and the policy function is shared with the commit leg.
+
+
+### Addendum (2026-09-09, the macOS gate)
+
+On hesperia both narrowing tests failed with `scanned=10000`: with `core.ignoreCase` gix adds the `icase` magic to every pathspec (`gix/src/status/index_worktree.rs:191-195`, no override) and `gix-pathspec`'s common prefix for an `icase` pattern is the empty prefix directory, so the index *range* is not narrowed on a case-insensitive volume — every entry is visited and rejected by a string match before its `lstat`. The `lstat`s, the cost that dominated, are still saved. Both tests now assert what each platform can promise (`git::repo::walks_case_insensitively`); `WalkPolicy::include`'s doc and `docs/sync.md` §19 say so.

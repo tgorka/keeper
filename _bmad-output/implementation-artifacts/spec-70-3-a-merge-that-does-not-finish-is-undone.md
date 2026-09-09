@@ -2,7 +2,7 @@
 title: 'Story 70.3: a merge that does not finish is undone, and the matrix decides'
 type: 'bug-fix'
 created: '2026-09-09'
-status: 'in-progress'
+status: 'review'
 baseline_revision: '3cb3fd7'
 review_loop_iteration: 0
 followup_review_recommended: true

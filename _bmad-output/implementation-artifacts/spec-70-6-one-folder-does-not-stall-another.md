@@ -2,7 +2,7 @@
 title: 'Story 70.6: one folder does not stall another, and a pass does its own work'
 type: 'feature'
 created: '2026-09-09'
-status: 'in-progress'
+status: 'review'
 baseline_revision: 'bba8412'
 review_loop_iteration: 0
 followup_review_recommended: true

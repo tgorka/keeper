@@ -3516,7 +3516,9 @@ The route is locked by the research and must not be re-argued in a story:
 
 ### Non-Functional Requirements
 
-- NFR-23: Scale — a 100 000-file / 50 GB profile reaches steady state with bounded memory; multi-GB blobs stream and are never fully buffered
+- NFR-23: Scale — a 200 000-file / 500 GB / 100 000-LFS-object profile on removable APFS reaches steady state with bounded memory; multi-GB blobs stream and are never fully buffered. *(Re-authored by Epic 70 on 2026-09-09; the original bar of 100 000 files / 50 GB was below the owner's folder — 155 626 entries, ~450 GB — and the measured row in `docs/sync.md` §19 was 100 000 files / 393 MB on Linux SSD.)*
+- NFR-61 (Epic 70): Cadence — a folder under continuous single-file write costs at most one full-tree walk per minute, and a pass costs work proportional to the paths that changed; the walk count on the reference folder is the measure.
+- NFR-62 (Epic 70): Silence — no network leg (fetch, push, LFS, forge API) waits longer than its deadline without a word in the log, and a folder whose remote does not answer is `Offline` within one poll, logged once on entry and once on exit.
 - NFR-24: Reliability — no data loss under `kill -9`, unplug or network loss at any point; every unit is journaled before attempt and re-driven after
 - NFR-25: Responsiveness — a settled change is committed within the quiescence window plus one tick; no sync operation blocks the UI thread or the Matrix sync loop
 - NFR-26: Security — no credential or file content in logs, config, commits or errors; no `unsafe` in either new crate

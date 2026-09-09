@@ -1808,6 +1808,7 @@ reason: watch-don't-age is the right rule — a lock is stale because nobody tou
   already identifies as the load-bearing one. If this ever needs fixing the shape is a per-tick
   recovery pass that runs once before the legs rather than inside each `open` — a restructuring of the
   tick, not a tweak.
+  Epic 70 (2026-09-09): unchanged — the lock watch itself is not touched; the per-pass open count fell (sync_once walks once, the sweep opens the repository once, the prune plan reads the index once), so the multiplier is smaller. Still open.
 status: open
 
 ### DW-135: Story 34-9's headline claim — files sync when they land, in seconds rather than a poll interval — is proven by no automated test, and the one line in `tick_profile` that arms the watcher is asserted by nothing.
@@ -1869,6 +1870,7 @@ reason: the blocking finding was that the wake was set for ANY delivered event, 
   rather than standing alone. One more uncovered case, recorded so it is not rediscovered: tier 0's
   `.git` rules are subtree rules (`.git/**`), so an event on the bare `.git` directory node itself is
   not matched and still wakes. Harmless and rare.
+  Epic 70 (2026-09-09): largely mitigated rather than closed — a wake now narrows the walk to the paths the watcher named (AD-227), so a build writing into `target/` costs a walk of those paths, not the tree; event-driven walks are also floored at min(settle, 5 s). The wake itself is still set. Still open for the defaults question (DW-119).
 status: open
 
 ### DW-138: `EchoSuppressor` has no production callers; after this batch's doc correction it is a tested helper the shipped engine never uses.
@@ -2037,6 +2039,7 @@ reason: the guard exists for a real reason — `Engine::open` resolves a git bin
   second is the smaller change and matches how the rest of this repo treats honesty about what was and
   was not run. Whoever takes it should convert every site in one pass; thirty half-converted skips are
   worse than the current uniform one.
+  Epic 70 (2026-09-09): not addressed; noted in the review (F-BMAD-8) and in the epic's out-of-scope list. Still open.
 status: open
 
 ### DW-147: Opening a folder's Edit form pulls its access token out of the keychain into the webview even when the user never expands Advanced, so the read is wider than the surface that displays it.
@@ -4136,6 +4139,41 @@ reason: Story 67.4 was asked whether a `Silence` owed during the tail gate could
   when `speaking_since` was `Some`, mirroring `:996-1001`, with a test through the
   worker's `on_audio` if one can be written without the frameworks (the interruption arm
   has none either). Record on the same pass that adds one.
+status: open
+
+### DW-247: LFS transfers are one object per batch round trip; the eight-way window and the hundred-object batch are never used.
+
+origin: review 2026-09-08 (F-LFS-4, F-LFS-5, F-LFS-6, F-LFS-8, F-LFS-10, F-LFS-11, F-LFS-12, F-LFS-13), left out of Epic 70 by its scope
+location: `src-tauri/crates/keeper-sync/src/engine.rs` (`do_lfs`, one unit per call), `lfs/basic.rs` (`DEFAULT_CONCURRENT_TRANSFERS`, `SizedFileBody`), `lfs/batch.rs` (`DEFAULT_BATCH_SIZE`), `lfs/store.rs` (no fsync before publish), `lfs/stage.rs` (`clean` copies before asking `contains`), `lfs/filter.rs` (`status=error` on a failed clean; a watchdog thread per request)
+reason: a first materialize or upload of 100 000 objects is 100 000 serial batch POSTs plus 100 000 transfers, bounded by latency. The fix is a unit-claim change (drain up to `DEFAULT_BATCH_SIZE` LFS rows into one `do_lfs`), not a transfer-layer change. The same epic should take the fsync-before-publish, the hash-first `stage::clean`, `status=abort` on a failed clean, a bounded orphan sweep of `.git/lfs/objects`, merging repair batches with the pass's own changes, and the two per-frame constants. `docs/sync.md` §20 item 8 records the limit.
+status: open
+
+### DW-248: The git protocol half's remaining shapes — Trust::Full honours every foreign filter driver, staging applies only the LFS filter, the phone's push buffers the pack under a 60 s read timeout, nothing is shallow or partial, and two clones on one machine share nothing.
+
+origin: review 2026-09-08 (F-PULLPUSH-6, -7, -8, -10, -12, -15), left out of Epic 70 by its scope
+location: `git/repo.rs` (`drop_foreign_lfs_driver` strips only `lfs`), `git/commit.rs` (raw read; whole-tree write per commit), `git/push_http.rs` (Vec pack, `http::client`), `engine.rs` (`shallow: None`, `"origin"` literal)
+reason: each is a bounded, documented cost (`docs/sync.md` §20 items 9–11) rather than a defect the owner hits today; the push one becomes a defect the first time a phone pushes a pack that takes over a minute. Take the push client first (`transfer_http` + a sized streaming body — the LFS shape already exists), then the tree extension for commits.
+status: open
+
+### DW-249: A watcher that dies or goes deaf is never detected; a symlinked root breaks anchored excludes; a nested repository is skipped with a log line the user never sees.
+
+origin: review 2026-09-08 (F-GATE-5, -9, -10, -11, -12), left out of Epic 70 by its scope
+location: `watch.rs` (the `Err` batch is one `warn!`; `EventKind::Other` never reaches `classify`), `engine.rs` (`ensure_watcher` returns on `Live`; `strip_prefix` against the configured root; `report_collapsed` logs only)
+reason: silent downgrades to the paced backstop, not data loss. Record `last_event_ms` per watcher and demote on a rescan tick that found changes the watcher never reported; canonicalise `local_path` once; route the nested-repo sighting through `self.warn`. FSEvents' persistent journal (`sinceWhen`) is the larger win and needs a `notify` change or a macOS-only watcher of keeper's own.
+status: open
+
+### DW-250: Durable-state edges — the app/daemon migration race, a `file://` remote's deferred push loop, per-path ledger writes without `prepare_cached`, `materialized_rows` on the runtime, and a `.keepervirtual` that HEAD carries but the worktree lacks.
+
+origin: review 2026-09-08 (F-db-5, -6, -9, -10, F-VF-5), left out of Epic 70 by its scope
+location: `db.rs` (`ensure_*_columns` read-then-ALTER; `remember_materialized` + `note_arrival` as two auto-commits per path), `engine.rs` (`release_satisfied_waits` refunds every deferred push; `release_schedules` on the runtime), `lfs/virtual_policy.rs` (`compile`'s `NotFound` arm)
+reason: the migration race fails a daemon start once after an upgrade when both processes race (tolerate `duplicate column name`); the `file://` loop is `[INFERENCE]` from code and unreachable on the owner's HTTPS remotes; the ledger writes matter at 100k-object materialize scale; the `.keepervirtual` absence should ask the index whether the file is tracked before answering "no policy".
+status: open
+
+### DW-251: The Forgejo live-integration harness (story 31-4) and the story specs for epics 23–31 do not exist; `docs/sync.md` §18 now says only what is proven.
+
+origin: review 2026-09-08 (F-BMAD-4, F-BMAD-9, F-BMAD-12b), recorded by Epic 70 story 70.8
+location: `sprint-status.yaml` (31-4 `in-progress`, 31-6 `done`), `tests/lfs_roundtrip.rs:10` ("No network"), `_bmad-output/implementation-artifacts/` (zero `spec-2[3-9]-*.md`, zero `spec-3[01]-*.md`)
+reason: §18's earlier claim of verification "against real git remotes … and the review-lane airlock" had no artefact behind it; 70.8 downgraded the sentence rather than build the harness. The NFR-26 whole-log scan test the Phase 4 summary credits was never written either — `docs/performance.md` says so. Epics 23–31 are spec-less by construction; `docs/sync.md` plus AD-40…AD-53 is their reviewable contract, which is why §18 is load-bearing.
 status: open
 
 - source_spec: none

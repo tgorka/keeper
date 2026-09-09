@@ -1742,6 +1742,16 @@ fn owes_closing_report(spoke: bool, interval: Duration) -> bool {
 /// only consumer is the log and the set is closed by the call sites.
 pub type WalkCaller = &'static str;
 
+/// Whether gix will match this repository's pathspecs case-insensitively —
+/// `core.ignoreCase`, which `git init` sets on every APFS and NTFS volume and
+/// which decides whether an include pathspec can narrow the index *range* or
+/// only the *work* (see [`WalkPolicy::include`]).
+pub fn walks_case_insensitively(repo: &gix::Repository) -> bool {
+    repo.config_snapshot()
+        .boolean("core.ignoreCase")
+        .unwrap_or(false)
+}
+
 /// What a walk does besides answering the question it was asked.
 ///
 /// Three decisions, each of which costs or saves whole seconds on a large
@@ -1783,14 +1793,22 @@ pub struct WalkPolicy {
     /// The watcher already names every path that changed; this is where that
     /// list reaches the walk (AD-227). Each entry becomes a `:(literal)<path>`
     /// pathspec, and gix does two things with it that no post-filter could:
-    /// the index scan is narrowed to the includes' common prefix by binary
-    /// search (`gix-status/src/index_as_worktree/function.rs:88-95`), and an
-    /// entry outside the set is rejected by a string comparison *before* its
-    /// `lstat`. Measured on hesperia, one saved file therefore costs one stat
-    /// instead of 155 626. A dirwalk is pruned by the same patterns, but no
-    /// caller narrows one: an untracked sweep that looks only where it was
-    /// told is not a sweep, which is why [`Self::including`] refuses on a
-    /// `find_untracked` policy.
+    /// an entry outside the set is rejected by a string comparison *before*
+    /// its `lstat`, and — on a case-sensitive filesystem — the index scan is
+    /// narrowed to the includes' common prefix by binary search
+    /// (`gix-status/src/index_as_worktree/function.rs:88-95`). The second does
+    /// not happen where `core.ignoreCase` is set (every macOS volume): gix adds
+    /// the `icase` magic to each pathspec (`gix/src/status/index_worktree.rs:
+    /// 191-195`, `inherit_ignore_case = true`, no override) and
+    /// `gix-pathspec`'s common prefix for an `icase` pattern is the prefix
+    /// *directory*, which is empty for a repository-relative path — so every
+    /// entry is visited, and each unnamed one costs one string match. The
+    /// `lstat`s are still saved, which is the cost that dominated on hesperia:
+    /// one saved file costs one stat instead of 155 626, on both kinds of
+    /// volume. A dirwalk is pruned by the same patterns, but no caller narrows
+    /// one: an untracked sweep that looks only where it was told is not a
+    /// sweep, which is why [`Self::including`] refuses on a `find_untracked`
+    /// policy. [`walks_case_insensitively`] tells the two apart.
     pub include: Vec<PathBuf>,
 }
 
@@ -4666,10 +4684,16 @@ mod tests {
         );
     }
 
-    /// An include pathspec narrows the index scan to the named path (AD-227,
-    /// F-scan-6): 10 000 entries, one named, at most two compared. The
-    /// `scanned` figure is gix's own count of entries it compared, so a walk
-    /// that ignored the include would read 10 000 here.
+    /// An include pathspec narrows the walk to the named path (AD-227,
+    /// F-scan-6): 10 000 entries, two rewritten, one named — only the named
+    /// one is reported, on every platform. On a case-sensitive filesystem the
+    /// `scanned` figure — gix's own count of entries it visited — is at most
+    /// two, because gix binary-searches the index for the include's prefix. On
+    /// a case-insensitive one (`core.ignoreCase`, every macOS volume) gix adds
+    /// the `icase` magic to every pathspec and a case-folded index cannot be
+    /// binary-searched, so every entry is *visited* — but each is rejected by
+    /// a string match before any `lstat`, which is the cost that matters. The
+    /// test asserts what each platform can promise. See [`WalkPolicy`].
     #[test]
     fn an_include_pathspec_narrows_a_ten_thousand_entry_walk_to_the_named_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4720,6 +4744,7 @@ mod tests {
         };
         git(&["commit", "-q", "-m", "ten thousand"]);
         std::fs::write(root.join("d/f05000.txt"), "rewritten").expect("write");
+        std::fs::write(root.join("d/f07000.txt"), "also rewritten").expect("write");
 
         let repo = open(root, true).expect("reopen");
         let whole = status_paths_reported(
@@ -4730,7 +4755,10 @@ mod tests {
             "test",
         )
         .expect("status");
-        assert_eq!(whole.modified, [PathBuf::from("d/f05000.txt")]);
+        assert_eq!(
+            whole.modified,
+            [PathBuf::from("d/f05000.txt"), PathBuf::from("d/f07000.txt")]
+        );
         assert_eq!(
             whole.scanned, 10_000,
             "the control: an unnarrowed walk compares every entry"
@@ -4747,13 +4775,21 @@ mod tests {
         assert_eq!(
             narrowed.modified,
             [PathBuf::from("d/f05000.txt")],
-            "{narrowed:?}"
+            "the include decides what is reported: {narrowed:?}"
         );
-        assert!(
-            narrowed.scanned <= 2,
-            "the include must narrow the index range: scanned={}",
-            narrowed.scanned
-        );
+        if walks_case_insensitively(&repo) {
+            assert_eq!(
+                narrowed.scanned, 10_000,
+                "on a case-insensitive filesystem gix visits every entry (and \
+                 rejects the unnamed ones without a syscall)"
+            );
+        } else {
+            assert!(
+                narrowed.scanned <= 2,
+                "the include must narrow the index range: scanned={}",
+                narrowed.scanned
+            );
+        }
 
         // A `full()` policy refuses the narrowing: an untracked sweep that only
         // looks where it was told is not a sweep.

@@ -26591,10 +26591,24 @@ mod tests {
             0,
             "the file is settling"
         );
+        // On a case-insensitive volume gix visits every entry and rejects the
+        // unnamed ones by a string match before any `lstat`; on a
+        // case-sensitive one it binary-searches the index range. Both are the
+        // narrowing; only the visit count differs (see `WalkPolicy::include`).
+        let icase = git::repo::walks_case_insensitively(
+            &git::repo::open(&p.local_path, false).expect("open"),
+        );
+        let narrowed = |scanned: u64| {
+            if icase {
+                scanned == 10_000
+            } else {
+                (1..=2).contains(&scanned)
+            }
+        };
         let first = entries_scanned(&log, seen);
         assert!(
-            (1..=2).contains(&first),
-            "the include must narrow the walk to the named path: scanned={first}"
+            narrowed(first),
+            "the include must narrow the walk to the named path: scanned={first} icase={icase}"
         );
 
         // The deadline-driven walk: nothing new from the watcher, one held
@@ -26616,8 +26630,8 @@ mod tests {
         );
         let second = entries_scanned(&log, seen);
         assert!(
-            (1..=2).contains(&second),
-            "the gate's held path narrows the deadline walk: scanned={second}"
+            narrowed(second),
+            "the gate's held path narrows the deadline walk: scanned={second} icase={icase}"
         );
 
         assert_eq!(
