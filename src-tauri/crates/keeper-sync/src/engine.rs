@@ -456,15 +456,20 @@ const POLL_WALK_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// finding it.
 ///
 /// So the poll asks the index-only question, and pays for the directory walk on
-/// this cadence instead: often enough that a file the watcher missed — a create
-/// during a restart, an event the backend dropped — surfaces within the quarter
-/// hour, rarely enough that it is no longer the reason the pane says
-/// "Scanning". The first poll after a start always sweeps, because a process
-/// that has just come up knows nothing about what happened while it was down.
+/// this cadence instead. Once a day (the owner's rule, 2026-09-09, after Epic
+/// 70 made the ordinary case event-driven): a file the watcher missed — a
+/// create during a restart, an event the backend dropped — is the exception,
+/// a live watcher announces a new file within a second and its `Create`
+/// event buys a full walk on its own (`untracked_appeared`), and the first
+/// poll after a start always sweeps, because a process that has just come up
+/// knows nothing about what happened while it was down. So the daily sweep
+/// covers only what all three of those missed, and a directory walk of a
+/// 155 626-entry tree on a USB volume is not worth buying four times an hour
+/// for that.
 ///
 /// A profile with no live watcher sweeps on every poll: there is nothing to
 /// trust in that case, and correctness outranks the cost.
-const UNTRACKED_SWEEP_INTERVAL: Duration = Duration::from_secs(900);
+const UNTRACKED_SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How many watcher-named paths a profile keeps between walks (AD-227).
 ///
@@ -510,10 +515,15 @@ pub const REMOTE_POLL_MS: i64 = 300_000;
 /// While `ProfileWatch::Live` the watcher is the first source for every change
 /// and the paced walk is a backstop for the events a watcher can drop; a
 /// backstop at 15 s bought ~240 `status walk finished` lines per hour across
-/// three idle profiles. With no watcher the poll IS the source and keeps the
-/// profile's own `effective_poll_interval_ms` — the cadence `warn_watch_degraded`
-/// names. A profile whose interval is longer than this keeps its own.
-pub const LIVE_WATCH_BACKSTOP_MS: i64 = 300_000;
+/// three idle profiles, and five minutes still bought one full index walk per
+/// folder every five minutes for nothing — a change of ours is committed
+/// seconds after the watcher sees it, and a peer's change arrives by the
+/// remote poll, neither of which this walk serves. One hour (the owner's
+/// rule, 2026-09-09). With no watcher the poll IS the source and keeps the
+/// profile's own `effective_poll_interval_ms` — the cadence
+/// `warn_watch_degraded` names. A profile whose interval is longer than this
+/// keeps its own.
+pub const LIVE_WATCH_BACKSTOP_MS: i64 = 3_600_000;
 
 /// How often a folder's transfer scratch is swept.
 ///
@@ -525,14 +535,17 @@ pub const LIVE_WATCH_BACKSTOP_MS: i64 = 300_000;
 /// for a button to press. On the folder that prompted this, that was 915 files
 /// and 123 GB sitting behind a button nobody had a reason to press.
 ///
-/// An hour, matching `SCRATCH_DEBRIS_AGE`: the sweep runs as often as a file can
-/// become eligible for it, and no oftener.
+/// Once a day. It was an hour, matching `SCRATCH_DEBRIS_AGE`, and the footprint
+/// anomaly that rides the same clock re-measures the folder — a second full
+/// `lstat` sweep whenever HEAD moved. Scratch that waits a day costs disk, not
+/// correctness, and the owner's rule (2026-09-09) is that nothing walks a
+/// 155 626-entry tree on a clock oftener than that.
 ///
 /// `pub` for Story 58.7: the projected read-only row for this sweep has to state
 /// the cadence that is actually in force, and the shell crate composing that row
 /// must read the constant rather than re-spell the literal — a second copy is a
 /// second place for it to disagree.
-pub const SWEEP_EVERY_MS: i64 = 3_600_000;
+pub const SWEEP_EVERY_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// Paths one release sweep may attempt (Story 56.5, AD-126).
 ///
@@ -27292,7 +27305,9 @@ mod tests {
         .expect("a watcher arms over a real directory");
         Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
 
-        const TICKS: i64 = 600;
+        // Two hours of one-second ticks: the first-sight walk and one hourly
+        // backstop, and not one for the build.
+        const TICKS: i64 = 7_200;
         let mut walks = 0_usize;
         for tick in 0..TICKS {
             for name in [
@@ -27319,10 +27334,10 @@ mod tests {
 
         assert_eq!(
             walks, 2,
-            "the build must not buy a single walk: 600 s of ticks under a live \
-             watcher is the first-sight walk and one 300 s backstop, and every \
-             extra one is a full re-stat of the tree that nothing could ever \
-             have committed"
+            "the build must not buy a single walk: two hours of ticks under a \
+             live watcher is the first-sight walk and one hourly backstop, and \
+             every extra one is a full re-stat of the tree that nothing could \
+             ever have committed"
         );
     }
 
@@ -30073,10 +30088,11 @@ mod tests {
         assert_eq!(scan(), 1, "a wake pulls at once");
     }
 
-    /// AD-233. With a live watcher the poll is a backstop at five minutes,
-    /// whatever `pollIntervalMs` says; without one it is the profile's own.
+    /// AD-233. With a live watcher the poll is a backstop at
+    /// [`LIVE_WATCH_BACKSTOP_MS`] — an hour — whatever `pollIntervalMs` says;
+    /// without one it is the profile's own.
     #[tokio::test]
-    async fn a_live_watcher_backstops_at_five_minutes_whatever_the_poll_interval_says() {
+    async fn a_live_watcher_backstops_at_one_hour_whatever_the_poll_interval_says() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));
         let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
@@ -30089,14 +30105,15 @@ mod tests {
         engine.upsert_profile(&p).expect("upsert");
 
         let before = engine.counters(&p.id).status_walks;
-        for _ in 0..200 {
+        // Ten hours of idle 15 s ticks: 2 400 of them.
+        for _ in 0..2_400 {
             platform.advance_ms(15_000);
             engine.tick_profile(&p).await.expect("a tick never raises");
         }
         let walks = engine.counters(&p.id).status_walks - before;
         assert!(
             walks <= 11,
-            "3 000 s of idle ticks under a live watcher is at most ten backstop walks, got {walks}"
+            "ten hours of idle ticks under a live watcher is at most ten backstop walks, got {walks}"
         );
         assert!(walks >= 9, "and the backstop still walks, got {walks}");
 

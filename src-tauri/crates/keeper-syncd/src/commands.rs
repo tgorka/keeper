@@ -903,7 +903,7 @@ pub enum TaskKindArg {
     Bot,
     /// Repack the folder's git objects (`git gc --quiet`) in a quiet window:
     /// no sync pass and no status walk in flight. Keeper seeds one per folder,
-    /// weekly; a phone refuses it.
+    /// daily; a phone refuses it.
     Gc,
 }
 
@@ -7289,7 +7289,7 @@ mod tests {
         );
     }
 
-    /// A folder added through this daemon is listed with its seeded weekly
+    /// A folder added through this daemon is listed with its seeded daily
     /// `gc` task, and `tasks set --kind gc` is a kind this CLI accepts
     /// (Epic 70, Story 70.7, AD-234).
     ///

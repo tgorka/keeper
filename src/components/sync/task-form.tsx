@@ -152,7 +152,7 @@ export const TASK_FORM_KIND_LABEL = "Kind";
  * author would introduce here is the same drift AD-C7 forbids in the spellings.
  */
 export const TASK_FORM_KIND_NOTE =
-  "sync runs one sync pass over the folder, or over every enabled folder. release runs one release sweep, with every refusal dehydrate has. verify re-checks stored content against its recorded digests: it reads only, asks no network, and takes no per-folder reservation. gc repacks the folder's git objects in a quiet window, so a long-lived folder's store stays bounded; keeper seeds one per folder, weekly.";
+  "sync runs one sync pass over the folder, or over every enabled folder. release runs one release sweep, with every refusal dehydrate has. verify re-checks stored content against its recorded digests: it reads only, asks no network, and takes no per-folder reservation. gc repacks the folder's git objects in a quiet window, so a long-lived folder's store stays bounded; keeper seeds one per folder, daily.";
 
 export const TASK_FORM_MODE_LABEL = "Mode";
 /** The three modes, accurate to `tasks::decide` and no longer than that. */

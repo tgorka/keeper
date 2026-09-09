@@ -103,7 +103,7 @@ left mid-flight is returned to the queue at the next start.
    is not, **stop here** — see §6.
 2. Scan the working tree — only the paths the watcher named since the last
    pass, unless something (an overflow, a rescan, the first pass of a run, a
-   degraded watcher, the fifteen-minute untracked sweep) means the whole tree
+   degraded watcher, the daily untracked sweep) means the whole tree
    is owed — discard anything excluded, and hold anything that is not
    demonstrably complete (§4).
 3. Stage what settled, route oversized files through LFS (§8), and commit with
@@ -1972,7 +1972,7 @@ A task's `kind` is one of keeper's own verbs, never a shell string:
 | `release` | one release sweep over the named folder, or over every enabled folder — the same body §9 describes, with every one of its refusals |
 | `verify` | one verification pass over the named folder, or over every enabled folder — the same body `keeper-syncd verify` runs, reading only: no worktree file is written, no object is added to the store, and no network is asked |
 | `bot` | one question, asked of one bot: the prompt is the text of a markdown file under the named folder — `<zone>/<session>/prompts/NN-slug.md`, resolved through the same containment every other path in the crate goes through — and the answer's opening, its tool calls, its tokens and its duration are the run's detail. Reads one file, writes none, and reaches exactly the provider that bot names (already disclosed under Settings → Bots). |
-| `gc` | one `git gc --quiet` over the named folder's repository, or over every enabled folder — the shim verb AD-41 admitted and nothing then called. Runs in a quiet window: it takes the folder's reservation (no sync pass) and its walk claim (no status walk), and answers `busy` when either is held. Keeper seeds one per desktop folder (`gc-<id>`, `every 7d`, `run_now`) once; a deleted row stays deleted. A phone seeds none and refuses a hand-written one with its own sentence. The run's detail carries the loose-object count before and after. |
+| `gc` | one `git gc --quiet` over the named folder's repository, or over every enabled folder — the shim verb AD-41 admitted and nothing then called. Runs in a quiet window: it takes the folder's reservation (no sync pass) and its walk claim (no status walk), and answers `busy` when either is held. Keeper seeds one per desktop folder (`gc-<id>`, `every 1d`, `run_now`) once — a row still on the earlier weekly default is moved to daily on the next open, a schedule a person set is not; a deleted row stays deleted. A phone seeds none and refuses a hand-written one with its own sentence. The run's detail carries the loose-object count before and after. |
 
 `sync`, `release` and `verify` reuse the existing implementation rather than gaining a second one,
 which is what makes "a task is not a privileged caller" true rather than
@@ -2451,7 +2451,7 @@ daemon's reach rather than promising a run that will not happen.
 ### The *Paced* rows: what else this host paces, and why you cannot drive them
 
 Below the tasks, the same view lists the other periodic work this machine does,
-as a visibly distinct read-only class: each folder's **scan**, its hourly
+as a visibly distinct read-only class: each folder's **scan**, its daily
 **scratch sweep**, and — where a folder has a notes vault — the **notes
 cadence**. They are there because *"has keeper looked at this folder lately"* is
 a fair question and nothing answered it before.
@@ -3008,7 +3008,7 @@ sync task's governance over a folder's own pacing, the three-way missed-window
 policy with a recorded outcome for the two settings that decline a window, the
 ⌘8 view (create, edit, forget, the run report, the run history, and the
 read-only *Paced* rows), the systemd timer pair, and since Epic 70 the `gc`
-kind, seeded weekly for every desktop folder. Two parts are not reachable
+kind, seeded daily for every desktop folder. Two parts are not reachable
 everywhere:
 
 - **Releasing content (§9), on macOS and Windows.** `dehydrate` and the release
@@ -3058,13 +3058,17 @@ therefore **how often** it runs. Before Epic 70 the folder was walked up to 666
 times an hour while a recording wrote into it, because a 1 Hz status poll ran an
 unclaimed full walk and every watcher event forced another. Since Epic 70 an
 event-driven pass walks only the paths the watcher named (as include pathspecs;
-the whole tree on overflow or on the fifteen-minute sweep — on a
+the whole tree on overflow or on the daily sweep — on a
 case-insensitive volume gix still visits every index entry but rejects each
 unnamed one by a string match before any `lstat`, which is the cost that
 dominated), a wake for a path
 the gate already holds does not walk at all, event-driven walks are floored at
-`min(settle, 5 s)`, the live-watcher backstop is five minutes, and the remote is
-polled on its own five-minute clock rather than on every scan. The requirement
+`min(settle, 5 s)`, the live-watcher backstop is one hour, and the remote is
+polled on its own five-minute clock rather than on every scan. The owner's
+rule (2026-09-09): a change of ours is committed seconds after the watcher sees
+it and a peer's change arrives by the remote poll, so nothing walks the tree on
+a clock oftener than hourly, and the directory sweep, the footprint sweep and
+`gc` run once a day. The requirement
 is NFR-61: under continuous single-file write a folder costs at most one
 full-tree walk per minute. The measured before/after on that folder is in
 `_bmad-output/implementation-artifacts/spec-70-8-the-record-and-the-gates.md`.
@@ -3100,9 +3104,9 @@ fsmonitor; it feeds the walk directly.
 4. **macOS has no open-writer veto** (see §4).
 5. **A `git` binary is required** (see §1).
 6. **No history rewriting.** Sync churn grows a repository; since Epic 70 a
-   weekly `gc` task repacks it, but shrinking *history* — including the blobs
+   daily `gc` task repacks it, but shrinking *history* — including the blobs
    that were committed above today's threshold before a rule existed, which
-   the hourly anomaly counts — is a destructive operation keeper will not
+   the daily anomaly counts — is a destructive operation keeper will not
    perform on its own. `lfsPruneLocal` is not this: it releases *local object
    copies* the remote confirmed it holds — an upload that completed, or an
    audit's per-object answer, recorded as `synced_at_ms` (§8) — on a pass that

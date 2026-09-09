@@ -4252,12 +4252,16 @@ pub fn delete_task(conn: &Connection, id: &str) -> Result<()> {
 
 /// The schedule every seeded `gc` task is born with (Epic 70, AD-234).
 ///
-/// Weekly, in the interval dialect rather than `@weekly`: an interval fires
-/// seven days after the previous run **finished**, so two folders seeded in
-/// the same second still drift apart after their first runs instead of every
-/// folder on the machine repacking at Sunday midnight. Hesperia's own launchd
-/// job was weekly, and 403 loose objects is what a week of sync churn came to.
-pub const GC_TASK_SCHEDULE: &str = "every 7d";
+/// Daily, in the interval dialect rather than `@daily`: an interval fires a
+/// day after the previous run **finished**, so two folders seeded in the same
+/// second still drift apart after their first runs instead of every folder on
+/// the machine repacking at midnight. Hesperia's own launchd job was weekly
+/// and 403 loose objects is what a week of sync churn came to; the owner's
+/// rule (2026-09-09) is once a day, and `git gc --quiet` on a repository with
+/// nothing to pack is cheap. A row seeded with the earlier weekly default is
+/// re-seeded to this one by [`seed_gc_task`] — it is keeper's row, under
+/// keeper's id, and a person's own `gc` row under another id is not touched.
+pub const GC_TASK_SCHEDULE: &str = "every 1d";
 
 /// The task id a seeded `gc` task is stored under for `profile_id`.
 ///
@@ -4272,7 +4276,17 @@ fn gc_task_seeded_marker(profile_id: &str) -> String {
     format!("gc_task_seeded:{profile_id}")
 }
 
-/// Give `profile_id` its default weekly `gc` task, exactly once, and say
+/// The schedule keeper's own `gc` rows were seeded with before 2026-09-09.
+///
+/// [`seed_gc_task`] moves a row still carrying it to [`GC_TASK_SCHEDULE`] —
+/// and only such a row: a schedule a person set is by definition not this
+/// one.
+const GC_TASK_SCHEDULE_BEFORE: &str = "every 7d";
+
+/// The sentence on keeper's own `gc` row; the CLI and the ⌘8 view show it.
+const GC_TASK_DESCRIPTION: &str = "keeper's daily repack of this folder's git objects";
+
+/// Give `profile_id` its default daily `gc` task, exactly once, and say
 /// whether this call was the once (Epic 70, AD-234, FR-527).
 ///
 /// **Once per profile, marked in `meta`**, on [`ensure_prune_default`]'s
@@ -4299,6 +4313,26 @@ pub fn seed_gc_task(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<
         })
         .optional()?;
     if seeded.is_some() {
+        // Offered already. The one thing still owed is the default's own
+        // change: a row keeper wrote with the earlier weekly schedule moves to
+        // the daily one, and a row a person re-scheduled is left alone.
+        let moved = conn.execute(
+            "UPDATE tasks SET schedule = ?1, updated_ms = ?2, description = ?3 \
+             WHERE id = ?4 AND kind = 'gc' AND schedule = ?5",
+            (
+                GC_TASK_SCHEDULE,
+                now_ms,
+                GC_TASK_DESCRIPTION,
+                gc_task_id(profile_id),
+                GC_TASK_SCHEDULE_BEFORE,
+            ),
+        )?;
+        if moved > 0 {
+            tracing::info!(
+                profile = profile_id,
+                "moved this folder's gc task from the weekly default to the daily one"
+            );
+        }
         return Ok(false);
     }
     // No transaction of its own: `upsert_task` opens one, and SQLite refuses
@@ -4325,7 +4359,7 @@ pub fn seed_gc_task(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<
             running_host: None,
             lease_until_ms: None,
             on_missed: crate::tasks::TaskMissedPolicy::RunNow,
-            description: Some("keeper's weekly repack of this folder's git objects".to_owned()),
+            description: Some(GC_TASK_DESCRIPTION.to_owned()),
             missed_delay_ms: None,
             bot_id: None,
             prompt_subpath: None,
@@ -4881,6 +4915,48 @@ mod tests {
         delete_profile(&c, "01A").expect("delete");
         assert_eq!(pending_count(&c, "01A").expect("count"), 0);
         assert!(get_profile(&c, "01A").expect("get").is_none());
+    }
+
+    /// The default moved from weekly to daily on 2026-09-09. A row keeper
+    /// seeded with the old default follows; a schedule a person chose does not.
+    #[test]
+    fn a_gc_row_on_the_old_weekly_default_moves_to_daily_and_a_chosen_one_stays() {
+        let c = conn();
+        upsert_profile(&c, &profile("01A"), 1).expect("insert");
+        upsert_profile(&c, &profile("01B"), 1).expect("insert");
+        assert!(seed_gc_task(&c, "01A", 1).expect("seed"));
+        assert!(seed_gc_task(&c, "01B", 1).expect("seed"));
+        // Both rows as an earlier keeper left them; 01B's then re-scheduled by
+        // hand.
+        c.execute(
+            "UPDATE tasks SET schedule = ?1 WHERE kind = 'gc'",
+            [GC_TASK_SCHEDULE_BEFORE],
+        )
+        .expect("age both rows");
+        c.execute(
+            "UPDATE tasks SET schedule = 'every 3d' WHERE id = ?1",
+            [gc_task_id("01B")],
+        )
+        .expect("a person's choice");
+
+        assert!(
+            !seed_gc_task(&c, "01A", 2).expect("re-open"),
+            "offered already"
+        );
+        assert!(!seed_gc_task(&c, "01B", 2).expect("re-open"));
+        let schedule = |id: &str| {
+            get_task(&c, id)
+                .expect("get")
+                .expect("row")
+                .schedule
+                .expect("scheduled")
+        };
+        assert_eq!(schedule(&gc_task_id("01A")), GC_TASK_SCHEDULE);
+        assert_eq!(
+            schedule(&gc_task_id("01B")),
+            "every 3d",
+            "a chosen schedule is not keeper's to move"
+        );
     }
 
     /// `delete_profile` takes the ledger with it, and it is one transaction:
