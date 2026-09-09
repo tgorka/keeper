@@ -1,0 +1,27 @@
+_bmad/custom/bmad-architecture.toml
+  s_996117c36b47d2::t_694c6bc2450099 1-20
+_bmad/custom/bmad-create-epics-and-stories.toml
+  s_996117c36b47d2::t_832af517980281 1-20
+_bmad/custom/bmad-prd.toml
+  s_996117c36b47d2::t_67c704b6a1c57a 1-20
+_bmad/custom/bmad-retrospective.toml
+  s_996117c36b47d2::t_314b61c58edc00 1-20
+_bmad/custom/bmad-spec.toml
+  s_996117c36b47d2::t_62e50273febfee 1-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "95ff4adc302ae956ddb8401efd2bbe79dc017ee2",
+  "prompts": {},
+  "sessions": {
+    "s_996117c36b47d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3189de24-33a6-4994-8bd4-097d8ca2cc3c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
