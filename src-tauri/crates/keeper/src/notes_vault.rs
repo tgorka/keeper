@@ -2627,6 +2627,17 @@ struct CadenceState {
     /// engine already serializes per profile, and asking twice only queues work
     /// behind itself.
     in_flight: bool,
+    /// `last_change_ms` as it stood when the in-flight action was claimed.
+    ///
+    /// This is how [`Cadence::finish`] tells "a change arrived while the action
+    /// ran" (keep `Dirty`) from "the phase was simply `Dirty` when the action
+    /// started" (move on). Without it every claim of a `Dirty` vault finished
+    /// `Dirty` again, and `decide` fired `Commit` — one `wake_now`, one full
+    /// walk, one fetch — on every tick of every vault that had ever been
+    /// touched, for the rest of the process. Measured on hesperia, 2026-09-09:
+    /// a meeting recording's note stub dirtied `neuradrive` at 16:44 and the
+    /// folder walked and pulled once a second until the app was restarted.
+    claimed_change_ms: i64,
 }
 
 impl Cadence {
@@ -2658,10 +2669,12 @@ impl Cadence {
     fn finish(&self, ahead: bool, push_interval_ms: u64) {
         let mut state = self.lock();
         state.in_flight = false;
-        // A change that arrived while the action ran left the phase `Dirty`;
-        // that must survive, or the note that arrived mid-commit waits for the
-        // next unrelated edit.
-        if state.phase == Phase::Dirty {
+        // A change that arrived while the action ran left the phase `Dirty`
+        // *and* moved the clock past the claim; that must survive, or the note
+        // that arrived mid-commit waits for the next unrelated edit. A vault
+        // that was `Dirty` when claimed and untouched since is the ordinary
+        // case, and it moves on — see `claimed_change_ms`.
+        if state.phase == Phase::Dirty && state.last_change_ms > state.claimed_change_ms {
             return;
         }
         if ahead {
@@ -2761,6 +2774,7 @@ fn dispatch_cadence(forced: bool) {
             let action = decide(&state, cadence, now, force_this);
             if action != Action::None {
                 state.in_flight = true;
+                state.claimed_change_ms = state.last_change_ms;
                 due.push((slot.vault.id.clone(), action, cadence.push_interval_ms));
             }
         }
@@ -3535,6 +3549,7 @@ mod tests {
             last_change_ms: 10_000,
             push_deadline_ms: 0,
             in_flight: false,
+            claimed_change_ms: 0,
         };
         // Still typing.
         assert_eq!(decide(&dirty, &cadence, 11_500, false), Action::None);
@@ -3562,6 +3577,7 @@ mod tests {
             last_change_ms: 10_000,
             push_deadline_ms: 40_000,
             in_flight: false,
+            claimed_change_ms: 0,
         };
         assert_eq!(decide(&ahead, &cadence, 39_000, false), Action::None);
         assert_eq!(decide(&ahead, &cadence, 40_000, false), Action::Push);
@@ -3588,6 +3604,53 @@ mod tests {
         cadence.finish(false, 30_000);
         assert_eq!(cadence.lock().phase, Phase::Dirty);
         assert!(!cadence.lock().in_flight);
+    }
+
+    /// A vault that was `Dirty` when its commit was claimed, and untouched
+    /// since, leaves `Dirty` when the commit finishes — or `decide` fires
+    /// `Commit` on every tick for the rest of the process. Measured on hesperia
+    /// (2026-09-09): one note stub written by a meeting recording put
+    /// `neuradrive` on a one-second `wake_now` → full walk → fetch loop that
+    /// only a restart ended.
+    #[test]
+    fn a_claimed_commit_with_no_further_change_leaves_dirty_behind() {
+        let cadence = Cadence::default();
+        cadence.mark_dirty();
+        // The claim, exactly as `dispatch_cadence` makes it.
+        {
+            let mut state = cadence.lock();
+            state.in_flight = true;
+            state.claimed_change_ms = state.last_change_ms;
+        }
+        cadence.finish(true, 30_000);
+        let state = *cadence.lock();
+        assert_eq!(
+            state.phase,
+            Phase::Ahead,
+            "the commit landed; the push is what is owed now"
+        );
+        assert!(!state.in_flight);
+        assert_eq!(
+            decide(
+                &state,
+                &NotesCadence::default(),
+                state.last_change_ms + 60_000,
+                false
+            ),
+            Action::Push,
+            "and the next decision is the push, never another commit"
+        );
+
+        // The same claim, finished with nothing ahead: idle, not dirty.
+        let idle = Cadence::default();
+        idle.mark_dirty();
+        {
+            let mut state = idle.lock();
+            state.in_flight = true;
+            state.claimed_change_ms = state.last_change_ms;
+        }
+        idle.finish(false, 30_000);
+        assert_eq!(idle.lock().phase, Phase::Idle);
     }
 
     /// Declining a paused folder's vault must cost it nothing.
