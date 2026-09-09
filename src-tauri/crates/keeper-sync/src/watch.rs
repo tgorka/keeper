@@ -99,9 +99,13 @@ pub const DEFAULT_DEBOUNCE_MS: u64 = 500;
 /// `PollWatcher` never raise it, so on those backends a dropped or missed
 /// change is invisible until this sweep runs. The same sweep covers a mount
 /// that emits no events at all (NFS, CIFS, some FUSE) and a watcher that
-/// failed to arm. Fifteen minutes bounds the worst-case detection latency
-/// without making the rescan itself a load source on a 100 000-file profile.
-pub const DEFAULT_RESCAN_INTERVAL_MS: u64 = 15 * 60 * 1_000;
+/// failed to arm. It rides the engine's untracked-sweep clock (Story 70.6),
+/// which is daily since 2026-09-09 — a live FSEvents/inotify watcher announces
+/// a new file within a second and its `Create` buys a full walk on its own, so
+/// this is the backstop for a backend that dropped an event, not the way a
+/// change is found — and a rescan every quarter hour was one directory walk
+/// of a 155 626-entry tree per quarter hour for that.
+pub const DEFAULT_RESCAN_INTERVAL_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// Poll interval used when [`WatchConfig::force_poll`] is set.
 ///

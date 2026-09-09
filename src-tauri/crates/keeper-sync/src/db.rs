@@ -4272,6 +4272,9 @@ fn gc_task_seeded_marker(profile_id: &str) -> String {
     format!("gc_task_seeded:{profile_id}")
 }
 
+/// The sentence on keeper's own `gc` row; the CLI and the ⌘8 view show it.
+const GC_TASK_DESCRIPTION: &str = "keeper's weekly repack of this folder's git objects";
+
 /// Give `profile_id` its default weekly `gc` task, exactly once, and say
 /// whether this call was the once (Epic 70, AD-234, FR-527).
 ///
@@ -4325,7 +4328,7 @@ pub fn seed_gc_task(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<
             running_host: None,
             lease_until_ms: None,
             on_missed: crate::tasks::TaskMissedPolicy::RunNow,
-            description: Some("keeper's weekly repack of this folder's git objects".to_owned()),
+            description: Some(GC_TASK_DESCRIPTION.to_owned()),
             missed_delay_ms: None,
             bot_id: None,
             prompt_subpath: None,
