@@ -1276,7 +1276,7 @@ development_status:
   70-5-the-gate-keeps-its-promises: review
   70-6-one-folder-does-not-stall-another-and-a-pass-does-its-own-work: review
   70-7-both-stores-are-maintained-and-a-countdown-that-cannot-end-says-so: review
-  70-8-the-record-and-the-gates: in-progress
+  70-8-the-record-and-the-gates: review
 
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #
