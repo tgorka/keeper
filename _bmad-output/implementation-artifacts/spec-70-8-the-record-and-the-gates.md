@@ -2,9 +2,9 @@
 title: 'Story 70.8: the record and the gates'
 type: 'docs'
 created: '2026-09-09'
-status: 'review'
+status: 'done'
 baseline_revision: 'd42a9e6'
-final_revision: ''
+final_revision: '766a11f'
 review_loop_iteration: 0
 followup_review_recommended: false
 context:

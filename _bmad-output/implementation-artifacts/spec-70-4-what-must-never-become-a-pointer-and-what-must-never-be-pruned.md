@@ -2,8 +2,9 @@
 title: 'Story 70.4: what must never become a pointer, and what must never be pruned'
 type: 'feature'
 created: '2026-09-09'
-status: 'review'
+status: 'done'
 baseline_revision: '3cb3fd7'
+final_revision: '766a11f'
 review_loop_iteration: 0
 followup_review_recommended: true
 context:

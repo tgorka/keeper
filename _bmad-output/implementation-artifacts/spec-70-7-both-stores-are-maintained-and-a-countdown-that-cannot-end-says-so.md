@@ -2,8 +2,9 @@
 title: 'Story 70.7: both stores are maintained, and a countdown that cannot end says so'
 type: 'feature'
 created: '2026-09-09'
-status: 'review'
+status: 'done'
 baseline_revision: 'bba8412'
+final_revision: '766a11f'
 review_loop_iteration: 0
 followup_review_recommended: true
 context:

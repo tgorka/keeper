@@ -1268,15 +1268,18 @@ development_status:
   69-5-the-record-in-the-session: backlog
   69-6-the-record-and-the-gates: backlog
 
-  # Epic 70 — a pass that costs what changed, and a folder that says when it is cut off (2026-09-09)
-  70-1-a-walk-that-costs-what-changed: review
-  70-2-offline-is-a-word-the-folder-reaches: review
-  70-3-a-merge-that-does-not-finish-is-undone-and-the-matrix-decides: review
-  70-4-what-must-never-become-a-pointer-and-what-must-never-be-pruned: review
-  70-5-the-gate-keeps-its-promises: review
-  70-6-one-folder-does-not-stall-another-and-a-pass-does-its-own-work: review
-  70-7-both-stores-are-maintained-and-a-countdown-that-cannot-end-says-so: review
-  70-8-the-record-and-the-gates: review
+  # Epic 70 — a pass that costs what changed, and a folder that says when it is cut off (2026-09-09).
+  # From the sync review (review-sync-2026-09-08.md); eight stories, one PR
+  # (#337, stacked on #336) merged into main @ 766a11f, released as v0.8.25.
+  epic-70: done
+  70-1-a-walk-that-costs-what-changed: done
+  70-2-offline-is-a-word-the-folder-reaches: done
+  70-3-a-merge-that-does-not-finish-is-undone-and-the-matrix-decides: done
+  70-4-what-must-never-become-a-pointer-and-what-must-never-be-pruned: done
+  70-5-the-gate-keeps-its-promises: done
+  70-6-one-folder-does-not-stall-another-and-a-pass-does-its-own-work: done
+  70-7-both-stores-are-maintained-and-a-countdown-that-cannot-end-says-so: done
+  70-8-the-record-and-the-gates: done
 
   # -- EPIC 52, 2026-08-17: the stack, and what review caught ----------------
   #

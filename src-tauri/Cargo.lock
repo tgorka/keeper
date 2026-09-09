@@ -4134,7 +4134,7 @@ dependencies = [
 
 [[package]]
 name = "keeper"
-version = "0.8.24"
+version = "0.8.25"
 dependencies = [
  "block2",
  "chrono",
@@ -4176,7 +4176,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-core"
-version = "0.8.24"
+version = "0.8.25"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -4207,7 +4207,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-sync"
-version = "0.8.24"
+version = "0.8.25"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4238,7 +4238,7 @@ dependencies = [
 
 [[package]]
 name = "keeper-syncd"
-version = "0.8.24"
+version = "0.8.25"
 dependencies = [
  "clap",
  "hex",

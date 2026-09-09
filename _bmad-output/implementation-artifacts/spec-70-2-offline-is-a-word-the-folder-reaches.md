@@ -2,8 +2,9 @@
 title: 'Story 70.2: offline is a word the folder reaches'
 type: 'fix'
 created: '2026-09-09'
-status: 'review'
+status: 'done'
 baseline_revision: '3cb3fd7'
+final_revision: '766a11f'
 review_loop_iteration: 0
 followup_review_recommended: true
 context:
