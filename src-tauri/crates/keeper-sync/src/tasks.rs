@@ -158,7 +158,9 @@ const MAX_DAYS_IN_MONTH: [u32; 13] = [0, 31, 29, 31, 30, 31, 30, 31, 31, 30, 31,
 /// `ARCHITECTURE-SCHEDULED-TASKS.md`'s `## Deferred` entry is therefore
 /// **still deferred**, and adding a variant here does not touch it: the price
 /// of a closed vocabulary is that somebody must write the arm, which is
-/// exactly the price being kept.
+/// exactly the price being kept. [`Self::Gc`] (Epic 70, AD-234) is the fifth
+/// proof of the same rule: it names `GitCli::gc`, a verb this tree has
+/// carried since AD-41 with no production caller, and nothing wider.
 ///
 /// `Sync` is the kind that exists first because its effect is already real and
 /// already safe: `sync --once` is documented as the cron entry point, and
@@ -248,6 +250,28 @@ pub enum TaskKind {
     /// host sentence (NFR-43's shape, one rung up: the kind is *known* here,
     /// and still not this host's to run).
     Bot,
+    /// One `git gc --quiet` over the named folder's repository, or over every
+    /// enabled folder when the task is host-wide (Epic 70, Story 70.7,
+    /// AD-234, FR-527).
+    ///
+    /// `GitCli::gc` is the whole implementation — the verb AD-41 admitted the
+    /// shim for and that nothing then called. On hesperia the folder carried
+    /// 403 loose objects and gc ran from a launchd job the owner wrote by
+    /// hand, because gix commits write loose objects and gitoxide has no
+    /// maintenance path of its own. This kind is that job, inside keeper.
+    ///
+    /// **It runs in a quiet window and nowhere else.** The arm takes the same
+    /// per-profile reservation `tick_profile` takes — so no unit is running —
+    /// and the same walk claim every full-tree walk takes — so no status walk
+    /// is reading the index while `gc` rewrites packs. Either being held is
+    /// [`TaskOutcome::Busy`], retried within the minute rather than consumed.
+    ///
+    /// Seeded by default, weekly, for every folder on a desktop (`gc-<id>`),
+    /// once per profile and never again — an operator who deletes the row has
+    /// made a decision, and a restart must not unmake it. A phone seeds none
+    /// and answers a hand-written one with the shim's own refusal sentence:
+    /// the Mac keeps that folder's objects bounded.
+    Gc,
 }
 
 impl TaskKind {
@@ -259,6 +283,7 @@ impl TaskKind {
             Self::Release => "release",
             Self::Verify => "verify",
             Self::Bot => "bot",
+            Self::Gc => "gc",
         }
     }
 
@@ -270,6 +295,7 @@ impl TaskKind {
             "release" => Some(Self::Release),
             "verify" => Some(Self::Verify),
             "bot" => Some(Self::Bot),
+            "gc" => Some(Self::Gc),
             _ => None,
         }
     }
@@ -1796,6 +1822,9 @@ mod tests {
         // the vocabulary by exactly one word — `bot`, keeper's own verb — and
         // `exec` is still nothing this build can name after it.
         assert_eq!(TaskKind::from_stored("bot"), Some(TaskKind::Bot));
+        // Epic 70's kind: a *fifth* variant, `gc`, the verb AD-41 admitted the
+        // shim for and nothing then called. `update` is still not a kind.
+        assert_eq!(TaskKind::from_stored("gc"), Some(TaskKind::Gc));
     }
 
     /// The on-disk spellings are the compatibility surface, so every one of
@@ -1807,6 +1836,7 @@ mod tests {
             TaskKind::Release,
             TaskKind::Verify,
             TaskKind::Bot,
+            TaskKind::Gc,
         ] {
             assert_eq!(TaskKind::from_stored(kind.as_str()), Some(kind));
         }

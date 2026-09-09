@@ -463,6 +463,13 @@ pub fn start_supervisor(platform: Arc<dyn Platform>) {
 /// A closed receiver (supervisor already gone) is not an error.
 pub fn stop_supervisor() {
     if let Some(stop_tx) = supervisor_slot().take() {
+        // The flag first, then the signal (Story 70.6, F-engine-11): the
+        // signal is observed at an `await`, the flag by the fetch between
+        // packets and by the drain before every unit — so a supervisor deep in
+        // a 2 GB upload stops after that unit instead of after the queue.
+        if let Some(engine) = engine_if_open() {
+            engine.request_stop();
+        }
         let _ = stop_tx.send(true);
     }
 }

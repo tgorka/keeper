@@ -19,13 +19,28 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::{
     error::{Result, SyncError},
     git::cli,
 };
+
+/// Longest a fetch may run before the engine stops waiting for it (AD-228,
+/// F-PULLPUSH-3, F-Deps-2).
+///
+/// gitoxide's reqwest transport sets one timeout — 20 s to connect
+/// (`gix-transport/src/client/blocking_io/http/reqwest/remote.rs:64`) — and
+/// nothing after it: no read timeout, no total. A peer that completes the TCP
+/// handshake and then goes silent therefore parked the fetch, the
+/// `spawn_blocking` thread under it and the profile's one-operation
+/// reservation for ever. Ten minutes is the whole-fetch bound the engine
+/// applies from outside (`Engine::do_pull`), generous enough for a first fetch
+/// of the reference folder's history over a slow link and finite, which is the
+/// property the transport lacked. The LFS legs bound their silence with a
+/// read timeout; a fetch has no seam for one, so the bound is on the leg.
+pub const FETCH_DEADLINE: Duration = Duration::from_secs(600);
 
 /// Byte- or object-level transfer progress as `(done, total)`; a `total` of `0`
 /// means the remote did not say.
@@ -126,19 +141,22 @@ pub fn fetch(
 
     let mut connection = remote
         .connect(gix::remote::Direction::Fetch)
-        .map_err(|err| classify("fetch", &flatten(&err), &host, interrupt))?;
+        .map_err(|err| classify_error("fetch", &err, &host, interrupt))?;
 
-    if let Some(credential) = credential {
-        // Owned clones because the callback must be `'static`: gix keeps it for
-        // the life of the connection and follows redirects with it.
-        let username = credential.username.clone();
-        let secret = credential.secret.clone();
-        // The closure's return type is gix's, and its 192-byte `Err` lives in
-        // `gix_credentials::protocol::Error` — a foreign type we can neither
-        // box nor shrink, and the callback signature is not ours to change.
-        #[allow(clippy::result_large_err)]
-        connection.set_credentials(move |action| static_credential(&username, &secret, action));
-    }
+    // Installed whether or not there is a credential. With no callback gitoxide
+    // reads `credential.helper` from the configuration and asks whatever it
+    // finds — on a Mac that has run `git config --global credential.helper
+    // osxkeychain` that is *somebody's* account for this host, not this
+    // profile's, and the fetch quietly authenticates as them (F-PULLPUSH-5).
+    // A callback that answers "no credential" makes the failure `Auth`, which
+    // is the truth. Owned clone because the callback must be `'static`: gix
+    // keeps it for the life of the connection and follows redirects with it.
+    let credential = credential.cloned();
+    // The closure's return type is gix's, and its 192-byte `Err` lives in
+    // `gix_credentials::protocol::Error` — a foreign type we can neither box
+    // nor shrink, and the callback signature is not ours to change.
+    #[allow(clippy::result_large_err)]
+    connection.set_credentials(move |action| static_credential(credential.as_ref(), action));
 
     // A repository created in the forge and not yet pushed to advertises zero
     // refs. gitoxide surfaces that as a refspec-match failure, and it can come
@@ -166,7 +184,7 @@ pub fn fetch(
         Err(err) if mentions_an_empty_advertisement(&flatten(&err)) => {
             return nothing_to_pull();
         }
-        Err(err) => return Err(classify("fetch", &flatten(&err), &host, interrupt)),
+        Err(err) => return Err(classify_error("fetch", &err, &host, interrupt)),
     };
     let prepared = match options.shallow {
         Some(depth) => prepared.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth)),
@@ -178,7 +196,7 @@ pub fn fetch(
         Err(err) if mentions_an_empty_advertisement(&flatten(&err)) => {
             return nothing_to_pull();
         }
-        Err(err) => return Err(classify("fetch", &flatten(&err), &host, interrupt)),
+        Err(err) => return Err(classify_error("fetch", &err, &host, interrupt)),
     };
 
     summarize(repo, &outcome)
@@ -194,31 +212,40 @@ fn mentions_an_empty_advertisement(text: &str) -> bool {
     text.contains("matched any of the 0 refs")
 }
 
-/// Answer gitoxide's credential requests from a secret we already hold.
+/// Answer gitoxide's credential requests from a secret we already hold — or
+/// refuse, when we hold none.
 ///
 /// `Store` and `Erase` deliberately return `Ok(None)`: the OS keychain owns the
 /// secret's lifecycle, and letting git "approve" it would write a copy into a
 /// credential store the user never opted into.
+///
+/// `Get` with no credential answers `Quit` rather than `Ok(None)`. Both end
+/// the handshake, but `Ok(None)` is what gix reports as *"No credentials were
+/// returned at all as if the credential helper isn't functioning unknowingly"*
+/// — a sentence about a helper this callback exists to keep out of the loop.
+/// `Quit` is *"Failed to obtain credentials"*, which [`cli::classify_message`]
+/// already reads as [`SyncError::Auth`]: the remote asked for an identity and
+/// this profile has none to give, and only a person can change that.
 // The return type is dictated by gix's credential-callback contract, and the
 // 192-byte `Err` variant lives in `gix_credentials::protocol::Error` — a
 // foreign type we cannot box or shrink. Boxing our side would not change it.
 #[allow(clippy::result_large_err)]
 pub(crate) fn static_credential(
-    username: &str,
-    secret: &str,
+    credential: Option<&Credential>,
     action: gix::credentials::helper::Action,
 ) -> gix::credentials::protocol::Result {
     match action {
-        gix::credentials::helper::Action::Get(context) => {
-            Ok(Some(gix::credentials::protocol::Outcome {
+        gix::credentials::helper::Action::Get(context) => match credential {
+            Some(credential) => Ok(Some(gix::credentials::protocol::Outcome {
                 identity: gix::sec::identity::Account {
-                    username: username.to_owned(),
-                    password: secret.to_owned(),
+                    username: credential.username.clone(),
+                    password: credential.secret.clone(),
                     oauth_refresh_token: None,
                 },
                 next: context.into(),
-            }))
-        }
+            })),
+            None => Err(gix::credentials::protocol::Error::Quit),
+        },
         gix::credentials::helper::Action::Store(_) | gix::credentials::helper::Action::Erase(_) => {
             Ok(None)
         }
@@ -248,11 +275,117 @@ pub(crate) fn flatten(err: &dyn std::error::Error) -> String {
     message
 }
 
-/// Turn a gitoxide transport error into the engine's taxonomy.
+/// Turn a gitoxide transport error into the engine's taxonomy, by what it
+/// **is** before by what it **says** (AD-228).
 ///
-/// An interruption is checked first: gitoxide reports a cancelled transfer as
-/// an ordinary transport error, and a user-requested stop must never be
-/// retried with backoff or shown as a warning.
+/// The text list in [`cli::classify_message`] is shared with the `git` shim
+/// and is the only thing a shim has; a gitoxide error is a typed chain, and
+/// the chain knows things the text does not. The order:
+///
+/// 1. an interruption is `Cancelled` — gitoxide reports a cancelled transfer
+///    as an ordinary transport error, and a user-requested stop must never be
+///    retried with backoff or shown as a warning;
+/// 2. the text, so `Auth` and `Diverged` keep the precedence they have for
+///    the shim (a 403 arrives inside wording that also reads as a network
+///    failure);
+/// 3. the chain: a `reqwest::Error` that is a connect or timeout failure, or
+///    an `io::Error` of a connection-shaped kind, anywhere under `source()`;
+/// 4. `Git`, for what is left.
+///
+/// Step 3 is what hesperia lacked. `tcp connect error: deadline has elapsed`
+/// matched no needle, so a remote that had been unreachable for six days was
+/// `Git` — Transient, but not `Network` — and the profile never once read
+/// `Offline` (F-engine-1). The needle is in the list now too, because the
+/// shim can produce the same words; the type is what stops the next wording
+/// nobody has seen yet from repeating the six days.
+pub(crate) fn classify_error(
+    operation: &str,
+    err: &(dyn std::error::Error + 'static),
+    host: &str,
+    interrupt: &AtomicBool,
+) -> SyncError {
+    if interrupt.load(Ordering::Relaxed) {
+        return SyncError::Cancelled;
+    }
+    let text = flatten(err);
+    let message = cli::truncate(&cli::scrub_userinfo(&text), 1_024);
+    if let Some(classified) = cli::classify_message(&message, host, Some(host), &[]) {
+        return classified;
+    }
+    if let Some(kind) = network_cause(err) {
+        return SyncError::Network {
+            host: host.to_owned(),
+            reason: format!("{kind}: {}", cli::one_line(&message)),
+        };
+    }
+    SyncError::Git(format!("{operation} from {host} failed: {message}"))
+}
+
+/// The connection-shaped cause in an error chain, named, if there is one.
+///
+/// Walks `source()` from the top and inspects each frame for the two types a
+/// gitoxide HTTP failure can carry: the `reqwest::Error` gix preserves inside
+/// its `io::Error` (`reqwest/remote.rs:203`, `io::Error::other(err)`), and the
+/// `io::Error` itself. The kinds are the ones that mean *the other end is not
+/// there or stopped talking*. Two gix mappings are deliberately absent: an
+/// HTTP 5xx becomes `ConnectionAborted` and a 401 becomes `PermissionDenied`
+/// (`reqwest/remote.rs:191-198`), and neither is the network's fault.
+///
+/// The `get_ref` step is not optional. `io::Error::source()` does not return
+/// the payload `other()` wrapped — it returns the payload's *own* source, so a
+/// plain `source()` walk steps over the `reqwest::Error` without ever seeing
+/// it. For a refused connection that still ends at an `io::Error` two frames
+/// down; for the connect timeout hesperia hit it ends at
+/// `tokio::time::error::Elapsed`, and only the `reqwest::Error` frame knows
+/// that was a timeout.
+fn network_cause(err: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut frame = Some(err);
+    while let Some(current) = frame {
+        if let Some(kind) = connection_failure(current) {
+            return Some(kind);
+        }
+        if let Some(inner) = current
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+        {
+            if let Some(kind) = connection_failure(inner) {
+                return Some(kind);
+            }
+        }
+        frame = current.source();
+    }
+    None
+}
+
+/// One frame of [`network_cause`]'s walk.
+fn connection_failure(frame: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    if let Some(err) = frame.downcast_ref::<reqwest::Error>() {
+        if err.is_timeout() {
+            return Some("timed out");
+        }
+        if err.is_connect() {
+            return Some("could not connect");
+        }
+    }
+    let err = frame.downcast_ref::<std::io::Error>()?;
+    use std::io::ErrorKind as K;
+    match err.kind() {
+        K::TimedOut => Some("timed out"),
+        K::ConnectionRefused => Some("connection refused"),
+        K::ConnectionReset => Some("connection reset"),
+        K::NotConnected => Some("not connected"),
+        K::HostUnreachable => Some("host unreachable"),
+        K::NetworkUnreachable => Some("network unreachable"),
+        K::BrokenPipe => Some("connection broken"),
+        _ => None,
+    }
+}
+
+/// [`classify_error`] for a caller that holds only the text — the shim, and
+/// the tests that feed it a line from a log.
+///
+/// Same order minus the chain, which text does not have.
+#[cfg(test)]
 pub(crate) fn classify(
     operation: &str,
     text: &str,
@@ -748,13 +881,16 @@ mod tests {
 
     #[test]
     fn the_credential_callback_answers_get_and_declines_to_store() {
+        let credential = Credential {
+            username: "keeper".to_owned(),
+            secret: "token".to_owned(),
+        };
         let context = gix::credentials::protocol::Context {
             url: Some("https://git.example.com/x.git".into()),
             ..Default::default()
         };
         let got = static_credential(
-            "keeper",
-            "token",
+            Some(&credential),
             gix::credentials::helper::Action::Get(context),
         )
         .expect("no error")
@@ -765,12 +901,204 @@ mod tests {
         // Approving would copy the secret into a credential store the user
         // never asked for; the keychain is the only home it has.
         let stored = static_credential(
-            "keeper",
-            "token",
+            Some(&credential),
             gix::credentials::helper::Action::Store("whatever".into()),
         )
         .expect("no error");
         assert!(stored.is_none());
+    }
+
+    /// With no credential the callback still answers — with a refusal, so the
+    /// handshake ends in `Failed to obtain credentials` and the folder reads
+    /// `Auth`, never in a helper the machine happens to have (F-PULLPUSH-5).
+    #[test]
+    fn the_credential_callback_refuses_when_there_is_no_credential() {
+        let context = gix::credentials::protocol::Context {
+            url: Some("https://git.example.com/x.git".into()),
+            ..Default::default()
+        };
+        let refused = static_credential(None, gix::credentials::helper::Action::Get(context))
+            .expect_err("no credential is an answer, not an absence of one");
+        assert!(
+            matches!(refused, gix::credentials::protocol::Error::Quit),
+            "{refused}"
+        );
+        // And the sentence gix wraps that in is one the classifier reads as
+        // the credential problem it is.
+        let interrupt = AtomicBool::new(false);
+        let err = classify(
+            "fetch",
+            &format!("Failed to obtain credentials: {refused}"),
+            "git.example.com",
+            &interrupt,
+        );
+        assert_eq!(err.code(), "auth", "{err}");
+
+        // Store and erase with nothing held are still "no opinion".
+        let stored = static_credential(
+            None,
+            gix::credentials::helper::Action::Store("whatever".into()),
+        )
+        .expect("no error");
+        assert!(stored.is_none());
+    }
+
+    /// The exact line hesperia's log carried 53 times over six days, verbatim
+    /// from `review-sync-2026-09-08/evidence-hesperia.md`. It was `Git`.
+    #[test]
+    fn hesperias_connect_timeout_wording_is_network() {
+        let interrupt = AtomicBool::new(false);
+        let text = "fetch from electra failed: An IO error occurred when talking to the server: \
+                    error sending request for url (https://electra/tgorka/tgdrive.git/info/refs?\
+                    service=git-upload-pack): client error (Connect): tcp connect error: deadline \
+                    has elapsed";
+        let err = classify("fetch", text, "electra", &interrupt);
+        assert_eq!(err.code(), "network", "{err}");
+        assert_eq!(
+            err.retriability(),
+            crate::error::Retriability::Transient,
+            "offline is retried, never parked"
+        );
+    }
+
+    /// An error chain whose *words* say nothing and whose *type* says the
+    /// connection is gone. The wording of the next transport nobody has seen
+    /// yet cannot be in a needle list; its `io::ErrorKind` can.
+    #[test]
+    fn a_connection_shaped_io_error_is_network_whatever_it_says() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("boom")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let interrupt = AtomicBool::new(false);
+
+        for (kind, word) in [
+            (std::io::ErrorKind::TimedOut, "timed out"),
+            (std::io::ErrorKind::ConnectionRefused, "connection refused"),
+            (std::io::ErrorKind::ConnectionReset, "connection reset"),
+            (std::io::ErrorKind::NotConnected, "not connected"),
+            (std::io::ErrorKind::HostUnreachable, "host unreachable"),
+            (
+                std::io::ErrorKind::NetworkUnreachable,
+                "network unreachable",
+            ),
+            (std::io::ErrorKind::BrokenPipe, "connection broken"),
+        ] {
+            let err = Outer(std::io::Error::new(kind, "zzz"));
+            assert_eq!(
+                classify("fetch", &flatten(&err), "h", &interrupt).code(),
+                "git",
+                "the text alone must NOT classify, or this test proves nothing: {kind:?}"
+            );
+            let classified = classify_error("fetch", &err, "h", &interrupt);
+            assert_eq!(classified.code(), "network", "{kind:?}: {classified}");
+            assert!(
+                classified.to_string().contains(word),
+                "the reason must name the kind: {classified}"
+            );
+        }
+
+        // And the kinds gix uses for HTTP statuses stay out of it: a 5xx is
+        // `ConnectionAborted`, a 401 is `PermissionDenied`, and neither is the
+        // network's fault.
+        for kind in [
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let err = Outer(std::io::Error::new(kind, "zzz"));
+            assert_eq!(
+                classify_error("fetch", &err, "h", &interrupt).code(),
+                "git",
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A real `reqwest::Error` from a real refused connection and a real
+    /// timeout, each found by type through the `io::Error::other` gix wraps it
+    /// in. The timeout is the one that matters: its chain ends in tokio's
+    /// `Elapsed`, not in an `io::Error`, so only the `reqwest::Error` frame —
+    /// reachable through `get_ref`, invisible to `source()` — can name it.
+    #[test]
+    fn a_reqwest_failure_is_found_through_gix_s_io_wrapper() {
+        // Bind and drop: the port was ours a moment ago, so nothing answers.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let refused = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("client")
+            .get(format!("http://127.0.0.1:{port}/x.git/info/refs"))
+            .send()
+            .expect_err("nothing listens there");
+        assert!(refused.is_connect(), "{refused}");
+        // `reqwest/remote.rs:203`: `std::io::Error::other(err)`.
+        let wrapped = std::io::Error::other(refused);
+        assert_eq!(network_cause(&wrapped), Some("could not connect"));
+
+        // A listener that accepts and says nothing, against a client that
+        // gives up: hesperia's failure shape, one layer in.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let quiet = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let timed_out = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("client")
+            .get(format!("http://127.0.0.1:{port}/x.git/info/refs"))
+            .send()
+            .expect_err("the peer never answers");
+        assert!(timed_out.is_timeout(), "{timed_out}");
+        let wrapped = std::io::Error::other(timed_out);
+        assert_eq!(network_cause(&wrapped), Some("timed out"));
+        // And through `source()` alone the frame is gone — which is why the
+        // walk looks inside the wrapper.
+        let below = std::error::Error::source(&wrapped);
+        assert!(
+            below.is_none_or(|deeper| deeper.downcast_ref::<reqwest::Error>().is_none()),
+            "io::Error::source() must not hand back the payload, or this test is moot"
+        );
+        drop(quiet.join());
+    }
+
+    /// A rejected credential arrives inside wording that also reads as a
+    /// network failure, and the chain may carry a reset too; `Auth` must win,
+    /// or the profile retries a token that will never start working.
+    #[test]
+    fn auth_keeps_precedence_over_a_network_shaped_chain() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Authentication failed for 'https://git.example.com/x.git'")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let interrupt = AtomicBool::new(false);
+        let err = Outer(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert_eq!(
+            classify_error("fetch", &err, "git.example.com", &interrupt).code(),
+            "auth"
+        );
     }
 
     #[test]

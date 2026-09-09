@@ -29,7 +29,7 @@ use std::{collections::HashSet, path::Path};
 
 use gix::bstr::ByteSlice as _;
 
-use super::repo::{open_read_only, status_paths};
+use super::repo::{open_read_only, status_paths_for};
 use crate::error::{Result, SyncError};
 
 /// One commit, as the desktop's `--format=%H%x1f%ct%x1f%B` printed it.
@@ -276,7 +276,7 @@ pub fn unified_diff(
 /// `/`-separated, prefix included — the paths `git status --porcelain` names.
 pub fn dirty_paths(repo_path: &Path, prefix: &str) -> Result<HashSet<String>> {
     let repo = open(repo_path)?;
-    let status = status_paths(&repo)?;
+    let status = status_paths_for(&repo, "history")?;
     Ok(status
         .added
         .iter()

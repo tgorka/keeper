@@ -39,6 +39,12 @@ fn profile(root: &Path) -> SyncProfile {
     p
 }
 
+/// The policy of [`profile`]: no opt-outs, so the only rules the writer
+/// retires are control-file ones, which none of these fixtures write.
+fn policy(root: &Path) -> stage::LfsPolicy {
+    stage::LfsPolicy::from_profile(&profile(root)).expect("policy")
+}
+
 fn commit(
     repo: &gix::Repository,
     changes: &git::commit::StagedChange,
@@ -188,7 +194,8 @@ fn attributes_written_for_one_profile_are_readable_as_git_attributes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     init_repo(root);
-    stage::ensure_attributes(root, &["*.mp4".into(), "*.iso".into()]).expect("write");
+    stage::ensure_attributes(root, &["*.mp4".into(), "*.iso".into()], &policy(root))
+        .expect("write");
 
     let out = std::process::Command::new("git")
         .args(["check-attr", "filter", "--", "a.mp4", "b.iso", "c.txt"])
@@ -227,7 +234,8 @@ fn a_path_with_a_space_is_one_pattern_that_git_resolves() {
     assert_eq!(spaced, "/2021 holiday/clip");
     assert_eq!(versioned, "*.2 final draft");
 
-    stage::ensure_attributes(root, &[spaced, versioned, "*.mp4".into()]).expect("write");
+    stage::ensure_attributes(root, &[spaced, versioned, "*.mp4".into()], &policy(root))
+        .expect("write");
 
     let (resolved, stderr) = resolved_filters(
         root,
@@ -313,7 +321,8 @@ fn a_glob_metacharacter_in_a_real_name_is_a_literal_that_git_resolves() {
     assert_eq!(exact, "/report \\[final]");
     assert_eq!(in_a_parent, "/2021 \\[q4]/clip");
 
-    stage::ensure_attributes(root, &[with_extension, exact, in_a_parent]).expect("write");
+    stage::ensure_attributes(root, &[with_extension, exact, in_a_parent], &policy(root))
+        .expect("write");
 
     let (resolved, stderr) = resolved_filters(
         root,
@@ -359,7 +368,7 @@ fn the_broken_lines_already_on_disk_are_repaired_and_git_stops_complaining() {
     // Let keeper write its own marker rather than duplicating the constant
     // here; the fixture this test is about is the bytes BELOW it, which are
     // spelled out literally because that is what is on the owner's disk.
-    stage::ensure_attributes(root, &["*.mp4".into()]).expect("marker");
+    stage::ensure_attributes(root, &["*.mp4".into()], &policy(root)).expect("marker");
     let mut seed = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
     for _ in 0..59 {
         seed.push_str("/2021 holiday/clip filter=lfs diff=lfs merge=lfs -text\n");
@@ -386,7 +395,10 @@ fn the_broken_lines_already_on_disk_are_repaired_and_git_stops_complaining() {
     );
 
     let pattern = stage::pattern_for(Path::new("2021 holiday/clip"));
-    assert!(stage::ensure_attributes(root, std::slice::from_ref(&pattern)).expect("repair"));
+    assert!(
+        stage::ensure_attributes(root, std::slice::from_ref(&pattern), &policy(root))
+            .expect("repair")
+    );
 
     let after = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
     assert_eq!(
@@ -411,7 +423,10 @@ fn the_broken_lines_already_on_disk_are_repaired_and_git_stops_complaining() {
 
     // FR-137: the repaired line is coverage, so the next session writes
     // nothing at all.
-    assert!(!stage::ensure_attributes(root, std::slice::from_ref(&pattern)).expect("second"));
+    assert!(
+        !stage::ensure_attributes(root, std::slice::from_ref(&pattern), &policy(root))
+            .expect("second")
+    );
     assert_eq!(
         std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
         after
@@ -432,15 +447,15 @@ fn re_running_ensure_attributes_for_a_spaced_path_leaves_the_file_untouched() {
     init_repo(root);
 
     let patterns = [stage::pattern_for(Path::new("2021 holiday/clip"))];
-    assert!(stage::ensure_attributes(root, &patterns).expect("first"));
+    assert!(stage::ensure_attributes(root, &patterns, &policy(root)).expect("first"));
     let after_first = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
 
     assert!(
-        !stage::ensure_attributes(root, &patterns).expect("second"),
+        !stage::ensure_attributes(root, &patterns, &policy(root)).expect("second"),
         "the rule keeper wrote a moment ago must read as already present"
     );
     assert!(
-        !stage::ensure_attributes(root, &patterns).expect("third"),
+        !stage::ensure_attributes(root, &patterns, &policy(root)).expect("third"),
         "and it must keep reading that way"
     );
     assert_eq!(

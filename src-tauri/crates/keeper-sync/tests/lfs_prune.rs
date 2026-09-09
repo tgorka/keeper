@@ -6,7 +6,7 @@
 //! paired with the WORKTREE file's stat, which is the arrangement
 //! `lfs_pointer_stat.rs` proves reads as clean.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use gix::index::{entry::Flags, entry::Mode, entry::Stat, State};
@@ -87,10 +87,18 @@ fn fixture() -> Fixture {
     }
 }
 
+/// The plan with the fixture's one object confirmed by the remote — the memo
+/// `Engine::note_unit_synced` writes when the upload completes — so every
+/// refusal below is about *its* condition and not about the missing memo.
 fn plan_for(f: &Fixture, owed: &BTreeSet<String>) -> Vec<Releasable> {
+    let synced: HashSet<String> = [f.oid.clone()].into_iter().collect();
+    plan_with(f, owed, &synced)
+}
+
+fn plan_with(f: &Fixture, owed: &BTreeSet<String>, synced: &HashSet<String>) -> Vec<Releasable> {
     let repo = git::repo::open(&f.root, false).expect("reopen");
     let tracked = git::repo::tracked_paths(&repo).expect("tracked");
-    prune::plan(&repo, &f.root, &f.store, &tracked, owed).expect("plan")
+    prune::plan(&repo, &f.root, &f.store, &tracked, owed, synced).expect("plan")
 }
 
 #[test]
@@ -101,6 +109,29 @@ fn an_uploaded_object_whose_content_is_still_in_the_worktree_is_releasable() {
     assert_eq!(plan[0].oid, f.oid);
     assert_eq!(plan[0].size, f.size);
     assert_eq!(plan[0].rebuildable_from, f.rela);
+}
+
+/// AD-231, Story 70.4. The third condition used to be "left to the caller",
+/// and the caller stopped at two — on the argument that a returned push has
+/// landed its objects, which `lfs::audit` records failing in the field: 16
+/// objects, 8.0 GB, missing on the server under two clean folders.
+#[test]
+fn an_object_the_remote_was_never_seen_holding_is_never_released() {
+    let f = fixture();
+    assert!(
+        plan_with(&f, &BTreeSet::new(), &HashSet::new()).is_empty(),
+        "no memo, no release — whatever the worktree and the journal say"
+    );
+    let other: HashSet<String> = ["b".repeat(64)].into_iter().collect();
+    assert!(
+        plan_with(&f, &BTreeSet::new(), &other).is_empty(),
+        "a memo for a different object confirms nothing about this one"
+    );
+    assert_eq!(
+        plan_for(&f, &BTreeSet::new()).len(),
+        1,
+        "and the same fixture with the memo is the ordinary releasable case"
+    );
 }
 
 #[test]

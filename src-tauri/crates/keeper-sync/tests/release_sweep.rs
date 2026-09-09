@@ -2246,12 +2246,20 @@ async fn with_no_task_rows_at_all_a_successful_sync_releases_what_it_always_did(
         "the ledger no longer claims this machine holds the content"
     );
 
+    // The only row on the host is the weekly `gc` task every desktop folder
+    // is seeded with (Epic 70, AD-234) — a repack, which governs nothing about
+    // release. No release row was invented anywhere to make the release
+    // above happen: Story 57.4 adds a governor, not a default.
     let listing = db::list_tasks(&ledger_conn(&f.platform)).expect("list the host's tasks");
+    assert_eq!(listing.unknown.len(), 0);
     assert_eq!(
-        (listing.tasks.len(), listing.unknown.len()),
-        (0, 0),
-        "and no row was invented anywhere to make that happen: this story adds a \
-         governor, not a default"
+        listing
+            .tasks
+            .iter()
+            .map(|task| (task.kind, task.id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(TaskKind::Gc, db::gc_task_id(PROFILE_ID).as_str())],
+        "the seeded gc row, and no release row invented to make that happen"
     );
 }
 
@@ -2475,5 +2483,190 @@ async fn a_task_does_not_release_a_path_the_remote_has_never_confirmed() {
              0 declined, 0 already syncing, 0 unavailable"
         ),
         "and it says so rather than reporting a release it did not make"
+    );
+}
+
+/// A row released 91 days ago is gone after a success edge, one released 89
+/// days ago is not (Epic 70, AD-234, F-VF-7) — through a real `sync_once`,
+/// which is the edge that ages the ledger.
+#[tokio::test]
+async fn a_success_edge_forgets_rows_released_more_than_ninety_days_ago() {
+    const DAY: i64 = 24 * 60 * 60 * 1_000;
+    let Some(f) = fixture(&["old.mp4", "recent.mp4"], |_| {}).await else {
+        return;
+    };
+    let now = f.platform.now_ms();
+    f.arrived("old.mp4", 1);
+    f.arrived("recent.mp4", 1);
+    let conn = ledger_conn(&f.platform);
+    db::forget_materialized(&conn, PROFILE_ID, "old.mp4", now - 91 * DAY).expect("released");
+    db::forget_materialized(&conn, PROFILE_ID, "recent.mp4", now - 89 * DAY).expect("released");
+    let rows = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).expect("count") };
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM materialized WHERE profile_id = '01JRELEASE'"),
+        2,
+        "both released rows stand before the edge"
+    );
+
+    f.sync().await;
+
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM materialized WHERE profile_id = '01JRELEASE' AND path = 'old.mp4'"),
+        0,
+        "ninety-one days: forgotten on the success edge"
+    );
+    assert_eq!(
+        rows("SELECT COUNT(*) FROM materialized WHERE profile_id = '01JRELEASE' AND path = 'recent.mp4'"),
+        1,
+        "eighty-nine days: kept"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A countdown that cannot end says so (Epic 70, Story 70.7, AD-235)
+// ---------------------------------------------------------------------------
+
+/// On a machine whose `open_file_state` cannot answer, every row is `Held`
+/// with the platform named — and nothing below the probe runs.
+///
+/// The whole listing is asked once with the platform answering `Unknown`,
+/// which is what macOS and Windows answer today. One row is pinned and one is
+/// on a clock, so the claim is that the probe sits ABOVE the pin and the
+/// clock: a `Held` row that read "Pinned" would tell the person the pin is
+/// what keeps the content, and unpinning it would change nothing.
+#[tokio::test]
+async fn on_a_machine_that_cannot_see_open_files_every_row_is_held_and_names_the_platform() {
+    let Some(f) = fixture(&["clip.mp4", "keep.mp4"], |_| {}).await else {
+        return;
+    };
+    let landed = f.platform.now_ms();
+    f.arrived("clip.mp4", landed);
+    f.arrived("keep.mp4", landed);
+    f.engine
+        .pin_entry(PROFILE_ID, "keep.mp4", true)
+        .expect("the path is tracked");
+
+    // The answerable machine first, so the test is about the probe and not
+    // about the fixture: a clock and a pin, as every test above sees them.
+    let answered = f
+        .engine
+        .release_schedules(PROFILE_ID)
+        .expect("the profile is registered");
+    assert!(matches!(answered["clip.mp4"], ReleaseSchedule::Due { .. }));
+    assert_eq!(answered["keep.mp4"], ReleaseSchedule::Pinned);
+
+    f.platform
+        .set_open_file_state(keeper_sync::platform::OpenFileState::Unknown);
+    let held = f
+        .engine
+        .release_schedules(PROFILE_ID)
+        .expect("the profile is registered");
+    let platform = keeper_sync::engine::host_platform_name();
+    for name in ["clip.mp4", "keep.mp4"] {
+        assert_eq!(
+            held[name],
+            ReleaseSchedule::Held { platform },
+            "{name}: the machine's answer outranks the pin and the clock"
+        );
+        assert_eq!(held[name].hold(), Some("Held"));
+        assert!(
+            held[name].sentence().contains(platform),
+            "the sentence names the machine: {}",
+            held[name].sentence()
+        );
+    }
+}
+
+/// On such a machine the sweep refuses BEFORE it hashes or asks the remote.
+///
+/// Proven by order rather than by a counter: the worktree bytes are replaced
+/// with different bytes of the same length, so a chain that reached the
+/// content-identity proof would answer `Modified`, and a chain that reached
+/// the remote proof would have hashed first. `OpenUnknown` from a request is
+/// therefore the probe answering ahead of both — the same probe the sweep
+/// runs, since both doors are one `release_resolved`.
+#[tokio::test]
+async fn a_machine_that_cannot_tell_refuses_before_hashing_or_asking_the_remote() {
+    let Some(f) = fixture(&["clip.mp4"], |_| {}).await else {
+        return;
+    };
+    f.arrived("clip.mp4", f.platform.now_ms());
+    let mut edited = f.content("clip.mp4").to_vec();
+    edited[0] ^= 0xff;
+    std::fs::write(f.path("clip.mp4"), &edited).expect("edit in place, same length");
+    f.platform
+        .set_open_file_state(keeper_sync::platform::OpenFileState::Unknown);
+
+    let err = f
+        .engine
+        .dehydrate_entry(PROFILE_ID, "clip.mp4")
+        .await
+        .expect_err("an unanswerable question is not permission");
+    assert!(
+        matches!(
+            &err,
+            SyncError::Refused(keeper_sync::lfs::hydrate::ContentRefusal::OpenUnknown { .. })
+        ),
+        "`OpenUnknown` and not `Modified`: the probe answered before the hash ran: {err}"
+    );
+}
+
+/// A candidate whose path has left the index is retracted after one sweep
+/// (Epic 70, F-VF-3) — and a candidate on an absent volume is not (AD-48).
+///
+/// The ledger row outlives a rename or a deletion, and before this every
+/// sweep re-selected it, opened the repository, parsed the index and was told
+/// `NotTracked` — forever. The row is retracted from the arm where the index
+/// was read and lacks the path. The `.git`-missing arm answers the same word
+/// and must not retract, because a `.git` that is not there is a drive that
+/// is not plugged in, and the row is the record that its content exists.
+#[tokio::test]
+async fn a_candidate_whose_path_left_the_index_is_retracted_after_one_sweep() {
+    let Some(f) = fixture(&["gone.mp4", "stays.mp4"], |_| {}).await else {
+        return;
+    };
+    f.open_the_release_window().await;
+    let landed = f.platform.now_ms();
+    f.arrived("gone.mp4", landed);
+    f.arrived("stays.mp4", landed);
+    // Pinned, so the neighbour is refused rather than released and the
+    // ledger's answer after the sweep is about the retraction alone.
+    f.engine
+        .pin_entry(PROFILE_ID, "stays.mp4", true)
+        .expect("the path is tracked");
+
+    // The path leaves the index — a deletion committed by somebody else —
+    // while its ledger row stands.
+    {
+        let repo = git::repo::open(&f.root, false).expect("open");
+        std::fs::remove_file(f.path("gone.mp4")).expect("delete the worktree file");
+        commit(
+            &repo,
+            f._remote.path(),
+            &git::commit::StagedChange {
+                deleted: vec![PathBuf::from("gone.mp4")],
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(
+        ledger_paths(&f.platform),
+        vec!["gone.mp4".to_owned(), "stays.mp4".to_owned()],
+        "the row outlived the path"
+    );
+
+    f.platform.advance_ms(TTL_MS as i64 + 1);
+    f.sync().await;
+
+    assert_eq!(
+        ledger_paths(&f.platform),
+        vec!["stays.mp4".to_owned()],
+        "one sweep retracted the row for the path the index no longer carries, \
+         and the pinned neighbour is still live"
+    );
+    assert_eq!(
+        std::fs::read(f.path("stays.mp4")).expect("read"),
+        f.content("stays.mp4"),
+        "the pinned candidate kept its bytes"
     );
 }

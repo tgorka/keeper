@@ -387,12 +387,16 @@ pub async fn sync_footprint(
             )))
         })?;
     let root = profile.local_path.clone();
-    let measured = tokio::task::spawn_blocking(move || keeper_sync::footprint::measure(&root))
-        .await
-        .map_err(|err| {
-            sync_ipc_error(&keeper_sync::SyncError::Config(format!("footprint: {err}")))
-        })?
-        .map_err(|e| sync_ipc_error(&e))?;
+    // What prune may release is what the remote was seen holding (AD-231);
+    // the ledger read happens here because `measure` holds no database.
+    let synced = engine.synced_oids(&id).map_err(|e| sync_ipc_error(&e))?;
+    let measured =
+        tokio::task::spawn_blocking(move || keeper_sync::footprint::measure(&root, &synced))
+            .await
+            .map_err(|err| {
+                sync_ipc_error(&keeper_sync::SyncError::Config(format!("footprint: {err}")))
+            })?
+            .map_err(|e| sync_ipc_error(&e))?;
     Ok(SyncFootprintVm {
         on_disk: measured.on_disk,
         lfs_cache: measured.lfs_cache,
@@ -3230,17 +3234,28 @@ pub async fn sync_browse(
     // A read that fails costs the rows their countdown and nothing else, so it
     // degrades to an empty map with a `warn!` — the only trace anywhere, since
     // a row with no deadline renders exactly as a row that has none.
+    //
+    // On the blocking pool since Epic 70 (F-db-5): the read allocates every
+    // non-released row of the profile — 89 289 on hesperia, order 10 MB of
+    // `String`s — under the connection mutex, and it ran on a tokio worker
+    // the whole desktop's IPC shares. `lfs_files` beside it was already
+    // wrapped; this one was not.
     let schedules = if unavailable.is_some() {
         HashMap::new()
     } else {
-        engine.release_schedules(&id).unwrap_or_else(|error| {
-            tracing::warn!(
-                profile = id,
-                error = %error,
-                "files: could not read when this folder's content is released"
-            );
-            HashMap::new()
-        })
+        let engine = Arc::clone(&engine);
+        let schedules_of = id.clone();
+        tokio::task::spawn_blocking(move || engine.release_schedules(&schedules_of))
+            .await
+            .unwrap_or_else(|err| Err(SyncError::Journal(format!("release schedules: {err}"))))
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    profile = id,
+                    error = %error,
+                    "files: could not read when this folder's content is released"
+                );
+                HashMap::new()
+            })
     };
 
     let listing = {
@@ -3359,7 +3374,7 @@ fn files_listing_vm(
                             .map(|schedule| FilesReleaseVm {
                                 releases_after_ms: schedule.releases_after_ms(),
                                 hold: schedule.hold().map(str::to_owned),
-                                detail: schedule.sentence().to_owned(),
+                                detail: schedule.sentence().into_owned(),
                             });
                     FilesEntryVm::new(FilesEntryFacts {
                         name: entry.name,

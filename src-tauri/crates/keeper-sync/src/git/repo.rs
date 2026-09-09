@@ -114,6 +114,34 @@ pub fn open_read_only(path: &Path, trust_full: bool) -> Result<gix::Repository> 
         .map_err(|err| SyncError::Git(format!("open failed: {}", super::fetch::flatten(&err))))
 }
 
+/// [`open`], for the leg that is about to talk to the remote.
+///
+/// The same housekeeping, plus one in-memory override: `credential.helper=`
+/// — git's "reset the list" spelling — so the machine's global, system and
+/// repository helper chain is not in the room while the fetch negotiates.
+/// [`clone`] has applied exactly this override since it was written and the
+/// `git` shim prepends it to every invocation; the fetch was the one door that
+/// did not, and a profile with no stored credential fetched as whichever
+/// account `osxkeychain` held for the host (F-PULLPUSH-5). The credential
+/// callback [`super::fetch::fetch`] installs is the first line of defence and
+/// makes gix skip the configuration entirely; this override is what stands if
+/// that callback is ever absent, and it costs nothing.
+///
+/// In memory, not written: the user's own `credential.helper` is theirs, and
+/// their `git` in this folder keeps using it.
+pub fn open_for_fetch(path: &Path, trust_full: bool) -> Result<gix::Repository> {
+    let mut options = gix::open::Options::default().config_overrides(["credential.helper="]);
+    if trust_full {
+        options = options.with(gix::sec::Trust::Full);
+    }
+    let mut repo = gix::open_opts(path, options)
+        .map_err(|err| SyncError::Git(format!("open failed: {}", super::fetch::flatten(&err))))?;
+    release_stale_index_lock(repo.git_dir());
+    release_stale_ref_locks(repo.git_dir());
+    drop_foreign_lfs_driver(&mut repo)?;
+    Ok(repo)
+}
+
 /// Remove every `filter "lfs"` driver that is not this repository's own from the
 /// merged, in-memory configuration.
 ///
@@ -574,33 +602,29 @@ pub fn clone(
         prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
     }
 
-    if let Some(credential) = credential {
-        // Cloned per connection rather than moved: `configure_connection` takes
-        // an `FnMut` (gitoxide may reconnect, e.g. across a redirect) while the
-        // callback it installs has to own its strings.
-        let username = credential.username.clone();
-        let secret = credential.secret.clone();
-        prepare = prepare.configure_connection(move |connection| {
-            let username = username.clone();
-            let secret = secret.clone();
-            // The closure's return type is gix's, and its 192-byte `Err` lives
-            // in `gix_credentials::protocol::Error` — a foreign type we can
-            // neither box nor shrink, and the callback signature is not ours to
-            // change. Same allow, same reason, as in `super::fetch`.
-            #[allow(clippy::result_large_err)]
-            connection.set_credentials(move |action| {
-                super::fetch::static_credential(&username, &secret, action)
-            });
-            Ok(())
+    // Cloned per connection rather than moved: `configure_connection` takes an
+    // `FnMut` (gitoxide may reconnect, e.g. across a redirect) while the
+    // callback it installs has to own its strings. Installed with or without
+    // a credential, for [`super::fetch::fetch`]'s reason: "none" is an answer,
+    // and the answer must come from keeper rather than from the machine.
+    let credential = credential.cloned();
+    prepare = prepare.configure_connection(move |connection| {
+        let credential = credential.clone();
+        // The closure's return type is gix's, and its 192-byte `Err` lives in
+        // `gix_credentials::protocol::Error` — a foreign type we can neither
+        // box nor shrink, and the callback signature is not ours to change.
+        // Same allow, same reason, as in `super::fetch`.
+        #[allow(clippy::result_large_err)]
+        connection.set_credentials(move |action| {
+            super::fetch::static_credential(credential.as_ref(), action)
         });
-    }
+        Ok(())
+    });
 
     let host = host_of(url);
     let (mut checkout, _outcome) = prepare
         .fetch_then_checkout(gix::progress::Discard, interrupt)
-        .map_err(|err| {
-            super::fetch::classify("clone", &super::fetch::flatten(&err), &host, interrupt)
-        })?;
+        .map_err(|err| super::fetch::classify_error("clone", &err, &host, interrupt))?;
 
     let (mut repo, _outcome) = checkout
         .main_worktree(gix::progress::Discard, interrupt)
@@ -695,6 +719,21 @@ pub fn enforce_local_config_with_filter(
     config
         .set_raw_value("index.sparse", "false")
         .map_err(|err| SyncError::Git(format!("could not set index.sparse: {err}")))?;
+    // The index loses its SHA-1 trailer, and every walk stops paying for one.
+    //
+    // gitoxide honours the key both ways: on read (`gix/src/repository/index.rs:33-41`
+    // → `gix-index/src/file/init.rs:67-76`) it skips verifying the trailer,
+    // and on write (`gix/src/status/iter/types.rs:107-111`) it skips producing
+    // one. On hesperia's 26.4 MB index that was one hash per walk and a second
+    // on every write-back, 1 371 times in one session, for a file keeper
+    // rewrites from a verified `HEAD` on every repair anyway. The trade is
+    // that a torn `.git/index` is detected by its shape rather than its
+    // checksum; `restore_missing_checkout` already treats an empty or
+    // unreadable index as "rebuild from HEAD", which is the same recovery the
+    // checksum would have led to. git 2.52 (the field machine) reads the key.
+    config
+        .set_raw_value("index.skipHash", "true")
+        .map_err(|err| SyncError::Git(format!("could not set index.skipHash: {err}")))?;
 
     // A fetch writes a reflog entry for the remote-tracking ref it moves, and
     // gitoxide refuses to write one without a committer identity. On a host
@@ -935,6 +974,13 @@ pub struct RepoStatus {
     /// report about the *rest* of the folder: these paths were stepped over so
     /// the others could be answered at all. See [`status_paths`].
     pub unreadable: Vec<UnreadablePath>,
+    /// How many index entries the walk compared — its cost, as gix counts it.
+    ///
+    /// The same figure the `status walk finished` line prints as `scanned`,
+    /// carried on the answer so a caller can assert on it: an include-narrowed
+    /// walk of a 10 000-entry index that compared 10 000 entries did not
+    /// narrow anything, and only this number says so (AD-227).
+    pub scanned: u64,
 }
 
 impl RepoStatus {
@@ -1046,9 +1092,17 @@ const MAX_UNREADABLE_SKIPPED: usize = 32;
 /// file return to synchronization the moment its permissions are restored,
 /// with no restart and nothing for the user to press.
 pub fn status_paths(repo: &gix::Repository) -> Result<RepoStatus> {
+    status_paths_for(repo, "status")
+}
+
+/// [`status_paths`], naming who asked. Every production caller takes this
+/// door so the `status walk finished` line can say which leg produced a walk;
+/// the unnamed one above is for tests and the one-shot verbs, which have no
+/// leg to name.
+pub fn status_paths_for(repo: &gix::Repository, caller: WalkCaller) -> Result<RepoStatus> {
     // No reporter, so the interval cannot matter: the walk asks nothing. And no
     // claim, so it changes nothing either — see [`WalkPolicy::read_only`].
-    status_paths_reported(repo, None, Duration::MAX, WalkPolicy::read_only())
+    status_paths_reported(repo, None, Duration::MAX, WalkPolicy::read_only(), caller)
 }
 
 /// [`status_paths`], plus a way for a slow walk to say how far it has got.
@@ -1064,6 +1118,7 @@ pub fn status_paths_reported(
     report: Option<WalkReport<'_>>,
     interval: Duration,
     policy: WalkPolicy,
+    caller: WalkCaller,
 ) -> Result<RepoStatus> {
     let known = still_unreadable(repo, remembered_unreadable(repo));
     let skip: Vec<PathBuf> = known.iter().map(|item| item.path.clone()).collect();
@@ -1071,7 +1126,7 @@ pub fn status_paths_reported(
     // `WalkReport` is a shared reference and therefore `Copy`, which is the
     // point: the retry arm below needs the same reporter, and a `&mut dyn
     // FnMut` could not be handed to both walks.
-    let status = match status_paths_excluding(repo, &skip, report, interval, policy) {
+    let status = match status_paths_excluding(repo, &skip, report, interval, &policy, caller) {
         Ok(mut status) => {
             status.unreadable = known;
             status
@@ -1093,7 +1148,8 @@ pub fn status_paths_reported(
                 return Err(first);
             }
             let skip: Vec<PathBuf> = found.iter().map(|item| item.path.clone()).collect();
-            let mut status = status_paths_excluding(repo, &skip, report, interval, policy)?;
+            let mut status =
+                status_paths_excluding(repo, &skip, report, interval, &policy, caller)?;
             for item in &found {
                 tracing::warn!(path = %item.path.display(), reason = %item.reason,
                     "this file could not be read; the rest of the folder was synchronized without it");
@@ -1143,6 +1199,56 @@ fn remember_unreadable(repo: &gix::Repository, unreadable: &[UnreadablePath]) {
     }
 }
 
+/// Whether `rela` on disk is still exactly what the commit `head` describes —
+/// the one-path answer a walk would give, without the walk (AD-227).
+///
+/// Three reads: the index entry (a binary search), one `lstat`, and the
+/// caller's `HEAD` tree entry. `false` for any of the ways a path stops
+/// matching its commit — gone from the index, staged as something else, gone
+/// from the disk, or a stat that no longer matches the entry's. The stat
+/// comparison is the one gix makes first about every entry in a walk
+/// (`Stat::matches` under the repository's `stat_options`); what gix does
+/// *next* for a moved stat — read the file through its filters and compare
+/// the hash — this does not, on purpose. It is asked at 1 Hz about a file
+/// that may be a gigabyte behind the LFS clean filter, and the two answers
+/// differ only for a file that was touched without changing, which the
+/// surface floors (a reading of "committed" never regresses) while nothing
+/// floors the other error. The racy-git second — a same-size rewrite inside
+/// the second the index was written — is accepted for the same reason.
+///
+/// `Err` only for a state that cannot be read at all: an index that will not
+/// open, or an `lstat` that fails for a reason other than absence. The caller
+/// treats that as "unknown", never as "safe".
+pub fn path_is_as_committed(
+    repo: &gix::Repository,
+    rela: &Path,
+    head_id: &gix::oid,
+    head_mode: gix::object::tree::EntryMode,
+) -> Result<bool> {
+    let index = repo
+        .index_or_empty()
+        .map_err(|err| SyncError::Git(format!("could not read the index: {err}")))?;
+    let key = gix::path::into_bstr(rela);
+    let Some(entry) = index.entry_by_path(key.as_ref()) else {
+        return Ok(false);
+    };
+    if entry.id.as_ref() != head_id || entry.mode.to_tree_entry_mode() != Some(head_mode) {
+        return Ok(false);
+    }
+    let absolute = workdir(repo)?.join(rela);
+    let metadata = match gix::index::fs::Metadata::from_path_no_follow(&absolute) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(SyncError::io("stat a committed path", absolute, err)),
+    };
+    let observed = gix::index::entry::Stat::from_fs(&metadata)
+        .map_err(|err| SyncError::Git(format!("{}: {err}", absolute.display())))?;
+    let options = repo
+        .stat_options()
+        .map_err(|err| SyncError::Git(format!("could not read core.checkStat: {err}")))?;
+    Ok(observed.matches(&entry.stat, options))
+}
+
 /// Which of `known` still cannot be read, with a refreshed reason.
 fn still_unreadable(repo: &gix::Repository, known: Vec<UnreadablePath>) -> Vec<UnreadablePath> {
     if known.is_empty() {
@@ -1160,6 +1266,22 @@ fn still_unreadable(repo: &gix::Repository, known: Vec<UnreadablePath>) -> Vec<U
             })
         })
         .collect()
+}
+
+/// Whether the last walk had to step over `rela`, and it still cannot be read.
+///
+/// The one-path face of the memo, for a caller that answers about one path
+/// without walking — `Engine::path_durability`. It re-verifies exactly as
+/// [`status_paths_reported`] does, so a file whose permissions were restored
+/// since the walk answers `false` here before the next walk drops it from the
+/// memo. It never writes the memo: only a walk learns anything new about it.
+pub fn remembered_as_unreadable(repo: &gix::Repository, rela: &Path) -> bool {
+    let Ok(workdir) = workdir(repo) else {
+        return false;
+    };
+    remembered_unreadable(repo)
+        .iter()
+        .any(|item| item.path == rela && why_unreadable(&workdir.join(&item.path)).is_some())
 }
 
 /// How far the walk has got through the index, as gix counts it.
@@ -1612,11 +1734,29 @@ fn owes_closing_report(spoke: bool, interval: Duration) -> bool {
     spoke || interval.is_zero()
 }
 
+/// Who asked for a walk, for the `status walk finished` line.
+///
+/// The field report could not say which of three callers produced 666 walks
+/// in one hour: the line printed the folder and the counts and nothing about
+/// the leg. A `&'static str` rather than an enum with a `Display`, because the
+/// only consumer is the log and the set is closed by the call sites.
+pub type WalkCaller = &'static str;
+
+/// Whether gix will match this repository's pathspecs case-insensitively —
+/// `core.ignoreCase`, which `git init` sets on every APFS and NTFS volume and
+/// which decides whether an include pathspec can narrow the index *range* or
+/// only the *work* (see [`WalkPolicy::include`]).
+pub fn walks_case_insensitively(repo: &gix::Repository) -> bool {
+    repo.config_snapshot()
+        .boolean("core.ignoreCase")
+        .unwrap_or(false)
+}
+
 /// What a walk does besides answering the question it was asked.
 ///
-/// Two decisions, both of which cost or save whole minutes on a large folder,
-/// and neither of which the walk can make for itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Three decisions, each of which costs or saves whole seconds on a large
+/// folder, and none of which the walk can make for itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalkPolicy {
     /// Write the stat data the walk observed back into the index.
     ///
@@ -1648,6 +1788,28 @@ pub struct WalkPolicy {
     /// already names, and sweeps for untracked ones on the cadence in
     /// `Engine::UNTRACKED_SWEEP_INTERVAL`.
     pub find_untracked: bool,
+    /// Only these repository-relative paths, or the whole index when empty.
+    ///
+    /// The watcher already names every path that changed; this is where that
+    /// list reaches the walk (AD-227). Each entry becomes a `:(literal)<path>`
+    /// pathspec, and gix does two things with it that no post-filter could:
+    /// an entry outside the set is rejected by a string comparison *before*
+    /// its `lstat`, and — on a case-sensitive filesystem — the index scan is
+    /// narrowed to the includes' common prefix by binary search
+    /// (`gix-status/src/index_as_worktree/function.rs:88-95`). The second does
+    /// not happen where `core.ignoreCase` is set (every macOS volume): gix adds
+    /// the `icase` magic to each pathspec (`gix/src/status/index_worktree.rs:
+    /// 191-195`, `inherit_ignore_case = true`, no override) and
+    /// `gix-pathspec`'s common prefix for an `icase` pattern is the prefix
+    /// *directory*, which is empty for a repository-relative path — so every
+    /// entry is visited, and each unnamed one costs one string match. The
+    /// `lstat`s are still saved, which is the cost that dominated on hesperia:
+    /// one saved file costs one stat instead of 155 626, on both kinds of
+    /// volume. A dirwalk is pruned by the same patterns, but no caller narrows
+    /// one: an untracked sweep that looks only where it was told is not a
+    /// sweep, which is why [`Self::including`] refuses on a `find_untracked`
+    /// policy. [`walks_case_insensitively`] tells the two apart.
+    pub include: Vec<PathBuf>,
 }
 
 impl WalkPolicy {
@@ -1656,6 +1818,7 @@ impl WalkPolicy {
         Self {
             persist_stats: true,
             find_untracked: true,
+            include: Vec::new(),
         }
     }
 
@@ -1665,17 +1828,50 @@ impl WalkPolicy {
         Self {
             persist_stats: true,
             find_untracked: false,
+            include: Vec::new(),
         }
     }
 
     /// Answer the question and change nothing. For callers that do not hold the
     /// walk claim, and for every test that asserts on a walk's output rather
     /// than on its effect.
+    ///
+    /// The directory walk is ON: every production caller of this shape reads
+    /// `status.untracked` (`prime_worktree_changes`, `history::dirty_paths`,
+    /// the pre-write collision check in `fast_forward`), verified one by one
+    /// when [`Self::read_only_tracked`] was split out.
     pub const fn read_only() -> Self {
         Self {
             persist_stats: false,
             find_untracked: true,
+            include: Vec::new(),
         }
+    }
+
+    /// Answer only about entries the index already names, and change nothing.
+    ///
+    /// The cheapest shape there is: no dirwalk, no write-back, and the one a
+    /// caller that never reads `status.untracked` should take. The recording
+    /// banner's durability probe used to take [`Self::read_only`] — dirwalk
+    /// on, for a path that is in `HEAD` by construction — 600 times an hour;
+    /// it now takes no walk at all, and this is the shape left for the next
+    /// caller that needs a tracked-only answer without the claim.
+    pub const fn read_only_tracked() -> Self {
+        Self {
+            persist_stats: false,
+            find_untracked: false,
+            include: Vec::new(),
+        }
+    }
+
+    /// Narrow the walk to `paths`. A no-op on an empty list, and refused —
+    /// the policy is returned unchanged — on one that walks the directories,
+    /// for the reason on [`Self::include`].
+    pub fn including(mut self, paths: Vec<PathBuf>) -> Self {
+        if !self.find_untracked {
+            self.include = paths;
+        }
+        self
     }
 }
 
@@ -1690,15 +1886,21 @@ impl WalkPolicy {
 /// `interval` is the publisher's policy, not git's: see the engine's
 /// `WALK_REPORT_INTERVAL`. `Duration::MAX` with no reporter is the silent case.
 ///
-/// `policy` decides the two things that dominate the cost on a large folder:
-/// whether the directories are walked at all, and whether what was learned is
-/// written down. See [`WalkPolicy`].
+/// `policy` decides the three things that dominate the cost on a large folder:
+/// whether the directories are walked at all, whether what was learned is
+/// written down, and whether the index is scanned whole or only where the
+/// watcher pointed. See [`WalkPolicy`]. Includes are spelled `:(literal)<path>`
+/// for the same reason the exclusions are.
+///
+/// `caller` is printed on the closing line and nothing else; see
+/// [`WalkCaller`].
 fn status_paths_excluding(
     repo: &gix::Repository,
     skip: &[PathBuf],
     report: Option<WalkReport<'_>>,
     interval: Duration,
-    policy: WalkPolicy,
+    policy: &WalkPolicy,
+    caller: WalkCaller,
 ) -> Result<RepoStatus> {
     // `flatten`, not `{err}`: a status that trips over one unreadable tracked
     // file reports "IO error while writing blob or reading file metadata or
@@ -1749,10 +1951,16 @@ fn status_paths_excluding(
             // of filter processes and deadlocked every one of them.
             options.thread_limit = Some(STATUS_THREAD_LIMIT);
         });
-    let patterns: Vec<gix::bstr::BString> = skip
+    // Includes first, exclusions after: gix's `Search` reads the common
+    // prefix off the include patterns to narrow the index range, and an
+    // exclusion contributes nothing to that prefix either way.
+    let patterns: Vec<gix::bstr::BString> = policy
+        .include
         .iter()
-        .map(|path| {
-            let mut pattern = gix::bstr::BString::from(":(exclude,literal)");
+        .map(|path| (":(literal)", path))
+        .chain(skip.iter().map(|path| (":(exclude,literal)", path)))
+        .map(|(magic, path)| {
+            let mut pattern = gix::bstr::BString::from(magic);
             pattern.extend_from_slice(&gix::path::into_bstr(path.as_path()));
             pattern
         })
@@ -1851,13 +2059,31 @@ fn status_paths_excluding(
     })?;
     let mut out = walked;
 
+    // The outcome exists only once the iterator is finished, which is why this
+    // is after the scope. `None` is an interrupted walk, which is not a
+    // failure here: `finish_walk` below is what turns it into one.
+    let outcome = iter.into_outcome();
+    // The count of entries whose cached stat did not match and had to be
+    // compared by content. This is the number that answers "what were those
+    // 26 entries" in the field log (F-GATE-13): a line reading
+    // `added=modified=deleted=0` with `needs_update=26` is racily-clean
+    // paths — LFS pointers, most plausibly — that the write-back below then
+    // settles, and no other field on this line can say so.
+    let needs_update = outcome.as_ref().map_or(0, |outcome| {
+        outcome
+            .index_worktree
+            .tracked_file_modification
+            .entries_to_update
+    });
+
     // The step gitoxide leaves to the caller, and the one keeper used to skip.
     //
     // Before `finish_walk`, because an interrupted walk still learned something
-    // true about every entry it did reach — and after the scope, because the
-    // iterator has to be finished for its outcome to exist at all.
+    // true about every entry it did reach.
     if policy.persist_stats {
-        persist_observed_stats(repo, iter);
+        if let Some(outcome) = outcome {
+            persist_observed_stats(repo, outcome);
+        }
     }
 
     for bucket in [
@@ -1876,7 +2102,8 @@ fn status_paths_excluding(
     // it as though it described the whole worktree. Observed on the very first
     // run of this guard: 19 entries of a 567-file tree, reported as
     // `added=0 modified=1 deleted=2`.
-    let out = finish_walk(&interrupt, &watchdog, out)?;
+    let mut out = finish_walk(&interrupt, &watchdog, out)?;
+    out.scanned = watchdog.scans() as u64;
 
     // The shape of the pass, once, at INFO. A folder that later stalls is
     // diagnosed by comparing this line between runs — how many entries, how
@@ -1894,12 +2121,16 @@ fn status_paths_excluding(
             .and_then(|dir| dir.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default(),
+        caller,
         entries = watchdog.beats(),
         scanned = watchdog.scans(),
         elapsed_ms = watchdog.elapsed_ms(),
         added = out.added.len(),
         modified = out.modified.len(),
         deleted = out.deleted.len(),
+        untracked = out.untracked.len(),
+        needs_update,
+        included = policy.include.len(),
         "status walk finished"
     );
     Ok(out)
@@ -1913,15 +2144,11 @@ fn status_paths_excluding(
 /// caller, saying so in its own documentation: without it, "subsequent `status`
 /// operations will take longer to complete".
 ///
-/// Best-effort, and quiet about the ordinary cases. `into_outcome` returns
-/// `None` for a walk that ended early, which is not a failure: the pass was
-/// interrupted and there is nothing to save. A failed write is worth a line,
-/// because the folder will keep paying for it, but it is not worth failing a
-/// pass that has already produced a correct answer.
-fn persist_observed_stats(repo: &gix::Repository, iter: gix::status::Iter) {
-    let Some(mut outcome) = iter.into_outcome() else {
-        return;
-    };
+/// Best-effort, and quiet about the ordinary cases. The caller already turned
+/// an interrupted walk's missing outcome into nothing to save. A failed write
+/// is worth a line, because the folder will keep paying for it, but it is not
+/// worth failing a pass that has already produced a correct answer.
+fn persist_observed_stats(repo: &gix::Repository, mut outcome: gix::status::Outcome) {
     if !outcome.has_changes() {
         return;
     }
@@ -2528,7 +2755,7 @@ pub fn fast_forward(
 
     // git's own refusal, in git's own terms: a local change on a path about
     // to move is never silently overwritten.
-    let status = status_paths(repo)?;
+    let status = status_paths_for(repo, "fast-forward")?;
     let touched = |path: &PathBuf| to_write.contains(path) || to_remove.contains(path);
     let in_the_way = status
         .modified
@@ -4240,8 +4467,8 @@ mod tests {
         );
 
         let repo = open(dir.path(), true).expect("reopen");
-        let status =
-            status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full()).expect("status");
+        let status = status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full(), "test")
+            .expect("status");
         assert!(
             status.modified.is_empty(),
             "the file matches its blob; a stat-less entry is not a modified one: {status:?}"
@@ -4269,7 +4496,8 @@ mod tests {
 
         // One handle for the whole pass, exactly as `commit_local` uses it.
         let repo = open(dir.path(), true).expect("reopen");
-        status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full()).expect("status");
+        status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full(), "test")
+            .expect("status");
         let after_walk = stat_of(dir.path(), "a.txt").mtime.secs;
         assert_ne!(after_walk, 0, "the walk must have written the stat first");
 
@@ -4309,7 +4537,8 @@ mod tests {
         let before = std::fs::read(dir.path().join(".git/index")).expect("read index");
 
         let repo = open(dir.path(), true).expect("reopen");
-        status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::read_only()).expect("status");
+        status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::read_only(), "test")
+            .expect("status");
 
         assert_eq!(
             std::fs::read(dir.path().join(".git/index")).expect("read index"),
@@ -4331,8 +4560,8 @@ mod tests {
         std::fs::write(dir.path().join("new.txt"), "untracked").expect("write");
 
         let repo = open(dir.path(), true).expect("reopen");
-        let full =
-            status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full()).expect("status");
+        let full = status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full(), "test")
+            .expect("status");
         assert_eq!(
             full.untracked,
             [PathBuf::from("new.txt")],
@@ -4340,8 +4569,14 @@ mod tests {
         );
 
         let repo = open(dir.path(), true).expect("reopen");
-        let tracked = status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::tracked_only())
-            .expect("status");
+        let tracked = status_paths_reported(
+            &repo,
+            None,
+            Duration::MAX,
+            WalkPolicy::tracked_only(),
+            "test",
+        )
+        .expect("status");
         assert!(
             tracked.untracked.is_empty(),
             "the poll's walk must not have walked the directories: {tracked:?}"
@@ -4366,6 +4601,201 @@ mod tests {
             reopened.config_snapshot().boolean("index.sparse"),
             Some(false),
             "without this, gix::status hard-fails on a sparse index"
+        );
+    }
+
+    /// `index.skipHash` beside `index.sparse` (AD-227, F-scan-8): every walk
+    /// used to SHA-1 the whole index on open, and again on write-back.
+    #[test]
+    fn enforce_local_config_writes_skip_hash_so_a_walk_stops_hashing_the_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+
+        enforce_local_config(&repo).expect("enforce");
+
+        let reopened = open(dir.path(), true).expect("reopen");
+        assert_eq!(
+            reopened.config_snapshot().boolean("index.skipHash"),
+            Some(true),
+            "a freshly enforced config must carry the key gix honours on read and write"
+        );
+        // And the index a walk writes back under it still reads, by gix and by
+        // git: a null trailer is what both accept for the key.
+        std::fs::write(dir.path().join("a.txt"), "alpha").expect("write");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "one"]);
+        strip_stat(&open(dir.path(), true).expect("reopen"), "a.txt");
+        let repo = open(dir.path(), true).expect("reopen");
+        status_paths_reported(&repo, None, Duration::MAX, WalkPolicy::full(), "test")
+            .expect("a walk that writes back under skipHash");
+        assert_ne!(
+            stat_of(dir.path(), "a.txt").mtime.secs,
+            0,
+            "the walk wrote the index"
+        );
+        git(&["status", "--porcelain"]);
+        assert!(status_paths(&open(dir.path(), true).expect("reopen"))
+            .expect("gix reads the index it wrote")
+            .is_empty());
+    }
+
+    /// The cheapest shape: no dirwalk, no write-back (AD-227, F-scan-3).
+    #[test]
+    fn a_read_only_tracked_walk_neither_walks_directories_nor_writes_the_index() {
+        let (dir, _repo) = repo_with_two_files();
+        std::fs::write(dir.path().join("new.txt"), "untracked").expect("write");
+        std::fs::write(dir.path().join("a.txt"), "changed").expect("write");
+        strip_stat(&open(dir.path(), true).expect("reopen"), "b.txt");
+        let before = std::fs::read(dir.path().join(".git/index")).expect("read index");
+
+        let repo = open(dir.path(), true).expect("reopen");
+        let status = status_paths_reported(
+            &repo,
+            None,
+            Duration::MAX,
+            WalkPolicy::read_only_tracked(),
+            "test",
+        )
+        .expect("status");
+        assert!(status.untracked.is_empty(), "no dirwalk: {status:?}");
+        assert_eq!(status.modified, [PathBuf::from("a.txt")], "{status:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(".git/index")).expect("read index"),
+            before,
+            "no write-back: b.txt's stat-less entry must still be stat-less"
+        );
+    }
+
+    /// An include pathspec narrows the walk to the named path (AD-227,
+    /// F-scan-6): 10 000 entries, two rewritten, one named — only the named
+    /// one is reported, on every platform. On a case-sensitive filesystem the
+    /// `scanned` figure — gix's own count of entries it visited — is at most
+    /// two, because gix binary-searches the index for the include's prefix. On
+    /// a case-insensitive one (`core.ignoreCase`, every macOS volume) gix adds
+    /// the `icase` magic to every pathspec and a case-folded index cannot be
+    /// binary-searched, so every entry is *visited* — but each is rejected by
+    /// a string match before any `lstat`, which is the cost that matters. The
+    /// test asserts what each platform can promise. See [`WalkPolicy`].
+    #[test]
+    fn an_include_pathspec_narrows_a_ten_thousand_entry_walk_to_the_named_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("d")).expect("dir");
+        let mut index = gix::index::State::new(repo.object_hash());
+        for i in 0..10_000u32 {
+            let rela = format!("d/f{i:05}.txt");
+            let absolute = root.join(&rela);
+            std::fs::write(&absolute, rela.as_bytes()).expect("write");
+            let blob = repo
+                .write_blob(rela.as_bytes())
+                .expect("write blob")
+                .detach();
+            let metadata = gix::index::fs::Metadata::from_path_no_follow(&absolute)
+                .expect("stat the worktree");
+            let stat = gix::index::entry::Stat::from_fs(&metadata).expect("stat convert");
+            index.dangerously_push_entry(
+                stat,
+                blob,
+                gix::index::entry::Flags::empty(),
+                gix::index::entry::Mode::FILE,
+                rela.as_str().into(),
+            );
+        }
+        index.sort_entries();
+        gix::index::File::from_state(index, repo.index_path())
+            .write(gix::index::write::Options::default())
+            .expect("write index");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["commit", "-q", "-m", "ten thousand"]);
+        std::fs::write(root.join("d/f05000.txt"), "rewritten").expect("write");
+        std::fs::write(root.join("d/f07000.txt"), "also rewritten").expect("write");
+
+        let repo = open(root, true).expect("reopen");
+        let whole = status_paths_reported(
+            &repo,
+            None,
+            Duration::MAX,
+            WalkPolicy::tracked_only(),
+            "test",
+        )
+        .expect("status");
+        assert_eq!(
+            whole.modified,
+            [PathBuf::from("d/f05000.txt"), PathBuf::from("d/f07000.txt")]
+        );
+        assert_eq!(
+            whole.scanned, 10_000,
+            "the control: an unnarrowed walk compares every entry"
+        );
+
+        let narrowed = status_paths_reported(
+            &repo,
+            None,
+            Duration::MAX,
+            WalkPolicy::tracked_only().including(vec![PathBuf::from("d/f05000.txt")]),
+            "test",
+        )
+        .expect("status");
+        assert_eq!(
+            narrowed.modified,
+            [PathBuf::from("d/f05000.txt")],
+            "the include decides what is reported: {narrowed:?}"
+        );
+        if walks_case_insensitively(&repo) {
+            assert_eq!(
+                narrowed.scanned, 10_000,
+                "on a case-insensitive filesystem gix visits every entry (and \
+                 rejects the unnamed ones without a syscall)"
+            );
+        } else {
+            assert!(
+                narrowed.scanned <= 2,
+                "the include must narrow the index range: scanned={}",
+                narrowed.scanned
+            );
+        }
+
+        // A `full()` policy refuses the narrowing: an untracked sweep that only
+        // looks where it was told is not a sweep.
+        assert_eq!(
+            WalkPolicy::full().including(vec![PathBuf::from("d/f05000.txt")]),
+            WalkPolicy::full()
         );
     }
 
@@ -4834,6 +5264,7 @@ mod tests {
             Some(&report),
             Duration::from_secs(1),
             WalkPolicy::read_only(),
+            "test",
         )
         .expect("status");
         assert!(
@@ -4865,6 +5296,7 @@ mod tests {
             Some(&report),
             Duration::ZERO,
             WalkPolicy::read_only(),
+            "test",
         )
         .expect("status");
         let seen = seen.lock().expect("lock").clone();
@@ -4957,7 +5389,8 @@ mod tests {
             &[],
             Some(&report),
             Duration::ZERO,
-            WalkPolicy::read_only(),
+            &WalkPolicy::read_only(),
+            "test",
         )
         .expect("status");
 
@@ -5046,8 +5479,15 @@ mod tests {
 
         let seen = std::sync::Mutex::new(Vec::new());
         let report = |done: u64, total: u64| seen.lock().expect("lock").push((done, total));
-        status_paths_excluding(&repo, &[], Some(&report), CADENCE, WalkPolicy::read_only())
-            .expect("status");
+        status_paths_excluding(
+            &repo,
+            &[],
+            Some(&report),
+            CADENCE,
+            &WalkPolicy::read_only(),
+            "test",
+        )
+        .expect("status");
 
         let seen = seen.lock().expect("lock").clone();
         assert!(

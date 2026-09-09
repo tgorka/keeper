@@ -1051,3 +1051,45 @@ time a webview is found not running.
   None reopens "the turn is Rust's".
 - **Status / owner:** decided. Owner is the architect; Epic 67, Stories 67.1–67.3
   implement it; the hardware proof is Story 67.4's gate.
+
+## D-18 — The store is git, and what that costs
+
+keeper's folder sync stores the tree in a git repository with git-LFS for content above a
+threshold, and it will keep doing so. This is recorded here because it was never a decision
+before: `epics.md` enters git as an owner premise ("synchronize a local folder with a server
+over the git protocol, built on gitoxide"), and the sync research of 2026-07-25 scoped itself
+to *how*, not *whether* — it surveyed Syncthing, Nextcloud, rclone, gut-sync and Dropbox for
+file-completeness mechanics and rejected Syncthing's block protocol *given* git. The review of
+2026-09-08 (`_bmad-output/planning-artifacts/review-sync-2026-09-08.md`, §7) asked the question
+against the owner's real folder — 155 626 entries, ~450 GB, 72 641 LFS pointers, on a USB APFS
+volume, with one person and at most three clients on one Forgejo — and this is the answer.
+
+- **What git buys, for this owner:** a browsable folder any `git` can read, history and
+  provenance trailers for free, an agent airlock that is a branch, a server that already exists
+  (Forgejo), offline-first by construction, and a causality model (the commit DAG) instead of a
+  vector clock. Every alternative that was weighed — an object store (rustfs / S3-shaped) as the
+  tree, PostgreSQL on the server with SQLite on the client, a Syncthing-like peer protocol — means
+  owning a server, a wire protocol, a migration and a conflict model, and loses the checkout.
+  (review §7; research §2.1's REJECT of BEP; AD-40…AD-53)
+- **What git costs, stated so nobody re-discovers it:** the per-pass cost is a full index ↔
+  worktree comparison and the per-commit cost is the whole tree, neither proportional to the
+  change; an LFS transfer is one round trip per object; a blob that entered history above the
+  threshold stays there (1.96 GB on the reference folder); every clone is full; two clones of one
+  remote on one machine cannot reach each other. (`docs/sync.md` §19, §20 items 6, 8, 9, 11)
+- **Where the field cost actually was:** not in git. The 1–5 s full-tree walk cadence measured
+  on hesperia (1 371 walks in one session, 666 in one hour) was keeper discarding the watcher's
+  path list and running an unclaimed walk behind a 1 Hz poll — the class of cost git itself
+  removed with fsmonitor, and which keeper removes the same way, one layer down, because
+  gitoxide does not consult `UNTR`/`FSMN` and keeper's index write-back drops them. Epic 70 made
+  the pass proportional to the change (AD-227, AD-233) and left the store alone.
+- **The assumptions this rests on, each falsifiable:** one writer at a time on any path in
+  practice, so conflict copies rather than merges are the right shape (AD-43, now actually
+  executed — AD-229); the tree is 99.99 % static per pass, so a watcher-scoped walk is the
+  common case; the remote is a git host with an LFS batch API (Forgejo); a person, not a fleet,
+  is on the other end.
+- **Revisit triggers — any one reopens the store question, none reopens it otherwise:** a
+  folder past 10⁶ entries; more than three concurrent writers on one remote; a first materialize
+  that must finish in minutes rather than hours (the per-object round trip becomes the term);
+  a second owner whose folder is not a git host's tenant.
+- **Status / owner:** decided. Owner is the architect; Epic 70 implements the cost model the
+  decision assumes; NFR-23 (re-authored), NFR-61 and NFR-62 are the bars.

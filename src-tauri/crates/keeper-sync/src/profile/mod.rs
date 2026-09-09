@@ -1094,12 +1094,20 @@ impl SyncProfile {
         }
     }
 
-    /// The scan cadence the scheduler will actually use.
+    /// The scan cadence the scheduler will actually use while no watcher is
+    /// live.
     ///
     /// Beside `effective_settle_ms` because it is the same kind of thing: the
     /// number in force is not always the number stored, and both the form and
     /// the degraded-watcher warning have to be able to say which is which
     /// (AD-34-8).
+    ///
+    /// While a watcher IS live the paced walk is only a backstop, and the
+    /// engine paces it at `LIVE_WATCH_BACKSTOP_MS` (five minutes) or this
+    /// value, whichever is longer (Story 70.6, AD-233): the watcher is the
+    /// source for every change, and the 15 s default bought a full-tree walk
+    /// four times a minute on an idle folder. This value is the whole cadence
+    /// only in the degraded case the warning names.
     pub fn effective_poll_interval_ms(&self) -> u64 {
         self.poll_interval_ms.max(MIN_POLL_INTERVAL_MS)
     }

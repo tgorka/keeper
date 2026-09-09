@@ -137,9 +137,12 @@ pub enum SyncError {
     Quota { host: String },
 
     /// A divergence was detected that policy could not resolve automatically.
-    /// Bidirectional profiles never produce this (they make conflict copies,
-    /// AD-43); a one-way lane whose remote branch moved does (AD-50), because
-    /// there a human decision is the point.
+    /// Bidirectional profiles never produce this for a *history* divergence
+    /// (they make conflict copies, AD-43); a one-way lane whose remote branch
+    /// moved does (AD-50), because there a human decision is the point — and
+    /// so does a removable profile whose change set would delete most of its
+    /// index (Epic 70, `MASS_DELETION_FRACTION`), which is the same shape of
+    /// question: only a person can say the deletion was meant.
     #[error("{profile}: {reason}")]
     Diverged { profile: String, reason: String },
 

@@ -86,7 +86,7 @@ export type SyncLfsMode = (typeof SYNC_LFS_MODES)[number];
  * mis-anchoring cannot leave it passing over nothing — which is how that one
  * was caught.
  */
-export const TASK_KINDS = ["sync", "release", "verify"] as const;
+export const TASK_KINDS = ["sync", "release", "verify", "gc"] as const;
 
 /**
  * The legal task `mode` values (mirror of the Rust `TaskMode::from_stored`
