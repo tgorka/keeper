@@ -2873,10 +2873,15 @@ async fn run_cadence_action(vault_id: &str, action: Action) -> bool {
             // recording had just closed lost the episode they needed. The
             // recording could not sync because it had written a note about
             // itself.
+            tracing::info!(
+                vault = vault_id,
+                "notes cadence: commit — asking the engine to look now"
+            );
             engine.wake_now(vault_id);
             true
         }
         Action::Push => {
+            tracing::info!(vault = vault_id, "notes cadence: push — one sync pass");
             if let Err(error) = engine.sync_once(vault_id, SyncSource::Watch).await {
                 // Offline is the ordinary case, not a fault: the commit already
                 // happened locally, and the push is a journaled unit with

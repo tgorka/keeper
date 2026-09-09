@@ -1481,6 +1481,10 @@ pub struct Engine {
     /// needs. See [`UNTRACKED_SWEEP_INTERVAL`].
     untracked_sweep: Mutex<HashMap<String, Instant>>,
 
+    /// Why the next scan pass runs, by profile: the word [`Self::scan_due`]
+    /// decided on, consumed by the `scan pass` line `scan_and_enqueue` logs.
+    scan_reasons: Mutex<HashMap<String, &'static str>>,
+
     /// Profiles whose watcher has named a path the index does not carry.
     ///
     /// The directory scan exists to find files git has never seen, and this is
@@ -1786,6 +1790,7 @@ impl Engine {
             poll_walked: Mutex::new(HashMap::new()),
             walking: Mutex::new(std::collections::HashSet::new()),
             untracked_sweep: Mutex::new(HashMap::new()),
+            scan_reasons: Mutex::new(HashMap::new()),
             untracked_appeared: Mutex::new(HashSet::new()),
         };
         engine.seed_gc_tasks()?;
@@ -1945,6 +1950,15 @@ impl Engine {
         let named = self.take_watch_paths(&profile.id);
         if !watched || due {
             swept.insert(profile.id.clone(), now);
+            tracing::info!(
+                profile = profile.name,
+                reason = if watched {
+                    "sweep due"
+                } else {
+                    "no live watcher"
+                },
+                "untracked sweep: this walk reads every directory"
+            );
             return git::repo::WalkPolicy::full();
         }
         drop(swept);
@@ -4329,7 +4343,16 @@ impl Engine {
         // The sweep reports its own anomaly when it removes anything, so there
         // is nothing to log here: a sweep that found nothing is the normal case
         // and has nothing to say.
-        let _ = tokio::task::spawn_blocking(move || store.sweep_scratch(&name)).await;
+        if let Ok(swept) = tokio::task::spawn_blocking(move || store.sweep_scratch(&name)).await {
+            tracing::info!(
+                profile = profile.name,
+                found = swept.found,
+                found_bytes = swept.found_bytes,
+                removed = swept.removed,
+                removed_bytes = swept.removed_bytes,
+                "scratch sweep"
+            );
+        }
         self.report_blobs_over_threshold(profile).await;
     }
 
@@ -4393,6 +4416,13 @@ impl Engine {
             self.bump_counters(&profile.id, |counters| counters.footprint_sweeps += 1);
         }
         Self::lock(&self.footprint_memo).insert(profile.id.clone(), memo);
+        tracing::info!(
+            profile = profile.name,
+            files = memo.files,
+            bytes = memo.bytes,
+            measured = swept,
+            "footprint sweep"
+        );
         if memo.files > 0 {
             crate::anomaly::Anomaly {
                 what: "files git carries as plain blobs that today's threshold would send to LFS",
@@ -4586,7 +4616,21 @@ impl Engine {
         if paced {
             self.widen_watch_paths(&profile.id);
         }
-        paced || self.watch_wake_pending(profile) || self.settle_window_elapsed(profile)
+        // The word the pass logs (`docs/sync.md` §21): paced outranks the
+        // others because it is the one that widens the walk.
+        let reason = if paced {
+            Some("paced")
+        } else if self.watch_wake_pending(profile) {
+            Some("wake")
+        } else if self.settle_window_elapsed(profile) {
+            Some("settle")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            Self::lock(&self.scan_reasons).insert(profile.id.clone(), reason);
+        }
+        reason.is_some()
     }
 
     /// Whether any path this profile is holding could be stable by now.
@@ -6911,19 +6955,27 @@ impl Engine {
         // task's mode may veto this pass (Story 57.4); the swallow below is
         // unchanged, because a folder whose sweep is switched off is not a
         // folder whose sync failed.
-        if let Err(failure) = self
+        match self
             .release_expired(profile, ReleaseTrigger::SuccessEdge)
             .await
         {
-            // The count comes with the error now, and the line says both: a pass
-            // that released three paths and then met an unreadable fourth is not
-            // a pass that "released no expired content".
-            tracing::warn!(
+            Ok(sweep) if sweep.looked => tracing::info!(
                 profile = profile.name,
-                released = failure.swept.released,
-                error = %failure.error,
-                "the release sweep did not finish this pass",
-            );
+                released = sweep.released,
+                "release sweep"
+            ),
+            Ok(_) => {}
+            Err(failure) => {
+                // The count comes with the error now, and the line says both: a pass
+                // that released three paths and then met an unreadable fourth is not
+                // a pass that "released no expired content".
+                tracing::warn!(
+                    profile = profile.name,
+                    released = failure.swept.released,
+                    error = %failure.error,
+                    "the release sweep did not finish this pass",
+                );
+            }
         }
     }
 
@@ -7419,11 +7471,26 @@ impl Engine {
         // is that the two refs differ.
         let Some(remote_id) = outcome.remote_id else {
             // The remote has no such branch yet — a brand-new repository.
+            tracing::info!(
+                profile = profile.name,
+                "remote polled: the branch does not exist there yet"
+            );
             return Ok(Converged::default());
         };
         if outcome.local_id == Some(remote_id) {
+            tracing::info!(
+                profile = profile.name,
+                received_pack = outcome.received_pack,
+                "remote polled: up to date"
+            );
             return Ok(Converged::default());
         }
+        tracing::info!(
+            profile = profile.name,
+            fast_forward = outcome.fast_forward,
+            received_pack = outcome.received_pack,
+            "remote polled: the remote branch moved"
+        );
 
         // A fetch only moves `refs/remotes/origin/<branch>`; without an apply
         // step the working tree stays behind and the next push is rejected as
@@ -8469,6 +8536,12 @@ impl Engine {
             self.reconcile_and_retry_push(profile, source, &refspec, err, tree)
                 .await?;
         }
+        tracing::info!(
+            profile = profile.name,
+            branch = working,
+            commits = count,
+            "pushed"
+        );
 
         if count > 0 {
             let mut event = self.progress(profile, SyncPhase::Pushing);
@@ -10705,6 +10778,7 @@ impl Engine {
         let releasable =
             lfs::prune::plan(&repo, &profile.local_path, &store, &tracked, &owed, &synced)?;
         if releasable.is_empty() {
+            tracing::info!(profile = profile.name, "lfs prune: nothing to release");
             return Ok(());
         }
         let count = releasable.len();
@@ -14590,6 +14664,17 @@ impl Engine {
         // Read before it is spent: a wake is one of the three things that pull
         // at once (below), and clearing it first would lose that.
         let woke = self.watch_wake_pending(profile);
+        // One line per pass saying why it ran (`docs/sync.md` §21); the walk
+        // it drives says what it cost.
+        let reason = Self::lock(&self.scan_reasons)
+            .remove(&profile.id)
+            .unwrap_or("requested");
+        tracing::info!(
+            profile = profile.name,
+            reason,
+            source = ?source,
+            "scan pass"
+        );
         // The walk this function is about to do answers whatever the watcher
         // reported, so the wake is spent here rather than at the point the
         // decision was taken — a tick that chose to drain journal work instead
@@ -14624,6 +14709,14 @@ impl Engine {
         // change of ours — a push owed, a wake — asks sooner, because that is
         // when a peer's change is most likely.
         if profile.direction.pulls() && (self.remote_poll_due(profile, now) || push_owed || woke) {
+            let reason = if push_owed {
+                "push owed"
+            } else if woke {
+                "wake"
+            } else {
+                "paced"
+            };
+            tracing::info!(profile = profile.name, reason, "remote poll queued");
             self.arm_remote_poll(profile, now);
             self.with_db(|conn| {
                 db::enqueue_unique(conn, &profile.id, &WorkKind::Pull, now, now).map(drop)

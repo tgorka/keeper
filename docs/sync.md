@@ -1972,7 +1972,7 @@ A task's `kind` is one of keeper's own verbs, never a shell string:
 | `release` | one release sweep over the named folder, or over every enabled folder — the same body §9 describes, with every one of its refusals |
 | `verify` | one verification pass over the named folder, or over every enabled folder — the same body `keeper-syncd verify` runs, reading only: no worktree file is written, no object is added to the store, and no network is asked |
 | `bot` | one question, asked of one bot: the prompt is the text of a markdown file under the named folder — `<zone>/<session>/prompts/NN-slug.md`, resolved through the same containment every other path in the crate goes through — and the answer's opening, its tool calls, its tokens and its duration are the run's detail. Reads one file, writes none, and reaches exactly the provider that bot names (already disclosed under Settings → Bots). |
-| `gc` | one `git gc --quiet` over the named folder's repository, or over every enabled folder — the shim verb AD-41 admitted and nothing then called. Runs in a quiet window: it takes the folder's reservation (no sync pass) and its walk claim (no status walk), and answers `busy` when either is held. Keeper seeds one per desktop folder (`gc-<id>`, `every 1d`, `run_now`) once — a row still on the earlier weekly default is moved to daily on the next open, a schedule a person set is not; a deleted row stays deleted. A phone seeds none and refuses a hand-written one with its own sentence. The run's detail carries the loose-object count before and after. |
+| `gc` | one `git gc --quiet` over the named folder's repository, or over every enabled folder — the shim verb AD-41 admitted and nothing then called. Runs in a quiet window: it takes the folder's reservation (no sync pass) and its walk claim (no status walk), and answers `busy` when either is held. Keeper seeds one per desktop folder (`gc-<id>`, `every 7d`, `run_now`) once; a deleted row stays deleted. A phone seeds none and refuses a hand-written one with its own sentence. The run's detail carries the loose-object count before and after. |
 
 `sync`, `release` and `verify` reuse the existing implementation rather than gaining a second one,
 which is what makes "a task is not a privileged caller" true rather than
@@ -3008,7 +3008,7 @@ sync task's governance over a folder's own pacing, the three-way missed-window
 policy with a recorded outcome for the two settings that decline a window, the
 ⌘8 view (create, edit, forget, the run report, the run history, and the
 read-only *Paced* rows), the systemd timer pair, and since Epic 70 the `gc`
-kind, seeded daily for every desktop folder. Two parts are not reachable
+kind, seeded weekly for every desktop folder. Two parts are not reachable
 everywhere:
 
 - **Releasing content (§9), on macOS and Windows.** `dehydrate` and the release
@@ -3067,14 +3067,14 @@ the gate already holds does not walk at all, event-driven walks are floored at
 polled on its own five-minute clock rather than on every scan. The owner's
 rule (2026-09-09): a change of ours is committed seconds after the watcher sees
 it and a peer's change arrives by the remote poll, so nothing walks the tree on
-a clock oftener than hourly, and the directory sweep, the footprint sweep and
-`gc` run once a day. The requirement
+a clock oftener than hourly, and the directory sweep and the footprint sweep run
+once a day, and `gc` weekly. The requirement
 is NFR-61: under continuous single-file write a folder costs at most one
 full-tree walk per minute. The measured before/after on that folder is in
 `_bmad-output/implementation-artifacts/spec-70-8-the-record-and-the-gates.md`.
 
 `core.fsmonitor`, `core.untrackedCache` and `index.version=4` are **not** worth
-setting on a keeper-managed repository: gitoxide reads those index extensions
+setting on a keeper-managed repository (§21 has every cadence): gitoxide reads those index extensions
 and never consults them, and keeper's own stat write-back rewrites the index
 without them, so a cache a user enables for foreign `git status` is deleted on
 the next pass and a v4 index is written back as v2. keeper's watcher is the
@@ -3104,7 +3104,7 @@ fsmonitor; it feeds the walk directly.
 4. **macOS has no open-writer veto** (see §4).
 5. **A `git` binary is required** (see §1).
 6. **No history rewriting.** Sync churn grows a repository; since Epic 70 a
-   daily `gc` task repacks it, but shrinking *history* — including the blobs
+   weekly `gc` task repacks it, but shrinking *history* — including the blobs
    that were committed above today's threshold before a rule existed, which
    the daily anomaly counts — is a destructive operation keeper will not
    perform on its own. `lfsPruneLocal` is not this: it releases *local object
@@ -3130,3 +3130,51 @@ fsmonitor; it feeds the walk directly.
 11. **The git store's per-commit cost is the tree, not the change.** Every
     commit rewrites the index and every directory's tree object. Seconds on the
     reference folder; proportional to directories, not to what changed.
+
+## 21. Everything keeper does on a clock
+
+One table, so the question *"why did keeper just do that, and how often will it"*
+has one answer. Every row is a **cadence** (the ordinary case is event-driven and
+listed first), every row logs **one line** when it runs — grep the log for the
+quoted text — and none of them is a task: §14's tasks are records a person
+creates; this is the engine's own pacing, and the read-only *Paced* rows in ⌘8
+show the ones that concern a folder.
+
+The rule behind the numbers (the owner's, 2026-09-09, after Epic 70): a change
+of ours is committed seconds after the watcher sees it and a peer's change
+arrives by the remote poll, so **nothing walks the tree on a clock more often
+than once an hour**, and the thorough passes run once a day.
+
+| what | why it exists | what it does | when | log line | where |
+| --- | --- | --- | --- | --- | --- |
+| **watcher** | the way a local change is found | FSEvents/inotify events, 500 ms debounce, tier-0 exclusion, the wake floor; the paths are kept for the walk | continuous while the folder's volume is attached | `folder watch armed` once; events are not logged | `watch.rs`, `Engine::fold_watch_events` |
+| **scan pass** (event-driven) | commit what settled | a walk of the paths the watcher named (`:(literal)` include pathspecs), the stability gate, LFS staging, the commit; a `Push` is queued if anything was committed or the branch is ahead | a wake, once the gate's settle window (5 s; 10 s on removable media; 60 s ceiling) has run out; at most one wake-driven walk per `min(settle, 5 s)` | `scan pass reason=wake` / `reason=settle`, then `status walk finished caller="commit" included=N` | `scan_due`, `scan_and_enqueue`, `WalkPolicy::include` |
+| **scan pass** (backstop) | an event the watcher dropped | the same pass over the **whole index** (every entry `lstat`-ed, no directory walk) | every **1 h** while the watcher is live (`LIVE_WATCH_BACKSTOP_MS`); every `pollIntervalMs` (default 15 s) when it is not — the cadence the degraded-watcher warning names | `scan pass reason=paced`, `status walk finished … included=0` | `scan_is_due`, `LIVE_WATCH_BACKSTOP_MS` |
+| **untracked sweep** | a file that appeared while nothing was watching | the walk also reads every directory (`find_untracked`), so a path git has never seen is found; a live watcher's `Create` event buys the same walk at once, so this is only for what it missed | every **24 h** (`UNTRACKED_SWEEP_INTERVAL`), on the first pass of a run, and on every pass with no live watcher; the watcher's own 24 h rescan event rides the same clock | `untracked sweep: this walk reads every directory`, then `status walk finished … untracked=N` | `walk_policy`, `watch::DEFAULT_RESCAN_INTERVAL_MS` |
+| **remote poll** | a peer's change | one fetch of `refs/heads/<branch>` (a single HTTPS request when nothing moved), then fast-forward, or §5's merge | every **5 min** (`REMOTE_POLL_MS`); at once when this pass committed something or a wake named a path; `wake_now` and *Sync now* force it | `remote poll queued reason=paced|wake|push owed`, then `remote polled: up to date` / `the remote branch moved` | `scan_and_enqueue`, `do_pull` |
+| **push** | publish what was committed | `git push` of the working branch, held while any LFS upload is outstanding | a journaled unit, drained on the tick after it is queued; retried with backoff | `committed profile=… files=N`, then `pushed branch=… commits=N` | `do_push` |
+| **LFS transfers** | the objects a commit or a pull needs | one upload/download per queued unit, verify-after-upload, resume on download | journaled units, drained as they are queued | `materialized LFS content`, the transfer's own lines | `do_lfs` |
+| **LFS prune** | the second local copy | release local objects the remote **confirmed** holding (`synced_at_ms`) whose content is in the worktree | on a successful pass that moved an LFS object, or the hourly release look (`RELEASE_LOOK_EVERY_MS`) | `lfs prune: nothing to release` / `released local LFS objects the remote is known to hold` | `mark_synced`, `prune_lfs_store` |
+| **release sweep** | virtual files: let content go after its window | §9's sweep over the ledger, budgeted (32 objects / 1 GiB per pass), every refusal `dehydrate` has | on the success edge, at most once an **hour** per folder (`RELEASE_LOOK_EVERY_MS`); a `release` task can veto or drive it (§14) | `release sweep released=N` / `the release sweep did not finish this pass` | `release_expired`, `release_is_due` |
+| **ledger ageing** | the `materialized` table does not grow forever | delete rows released more than 90 days ago | on the same success edge | `forgot ledger rows released more than ninety days ago` when any went | `age_out_materialized` |
+| **scratch sweep** | an interrupted transfer's leftovers | delete `.git/lfs/tmp` and `incomplete/` entries older than an hour | every **24 h** (`SWEEP_EVERY_MS`) | `scratch sweep found=N removed=N` | `sweep_scratch_if_due` |
+| **footprint sweep** | say what history carries as plain blobs above today's threshold, and whether a control file is pointer text | one `lstat` per tracked path — or, when HEAD and the threshold have not moved since the last one, the remembered numbers with no walk | rides the scratch sweep, every **24 h** | `footprint sweep files=N bytes=N measured=true|false`, and the `anomaly:` line when files > 0 | `report_blobs_over_threshold` |
+| **`gc`** (a §14 task) | the object store stays packed | `git gc --quiet` in a quiet window (the folder's reservation and its walk claim) | seeded **`every 7d`** per desktop folder (`gc-<id>`); editable and deletable like any task | the task's run line (`task … outcome=…`) and `loose_before=… loose_after=…` | `perform_gc_task`, `db::seed_gc_task` |
+| **notes cadence** | a note is committed soon after you stop typing and pushed soon after | `commit` asks the engine to look now (`wake_now`); `push` is one `sync_once` | commit **2 s** after the last edit (`commitIdleMs`); push **30 s** after the commit (`pushIntervalMs`), or at once on blur where `pushOnBlur` is set | `notes cadence: commit — …` / `notes cadence: push — …` | `notes_vault::dispatch_cadence` |
+| **recordings push** | a finished recording reaches the remote | one push pass, on the policy the folder carries | `sessionEnd` (or the policy's other triggers) | `published this folder's recordings` | `push_recordings_if_due` |
+| **Pending list poll** (UI) | the Sync pane's *waiting* rows | an index-only walk, never the directories | at most once a **minute** while the pane is open (`POLL_WALK_MIN_INTERVAL`) | `status walk finished caller="poll"` | `Engine::pending` |
+| **transient retry** | a unit that failed for a passing reason | the same unit again | exponential backoff, 2 s → 10 min, full jitter, no ceiling | `sync retrying` (once per attempt at `debug`), `sync offline` / `sync reachable again` once per edge | `reschedule_after`, `backoff.rs` |
+
+Three things the table implies, stated so nobody infers the opposite:
+
+- **A local change never waits for a clock.** The watcher, the settle window and
+  the journal are the whole path from a saved file to a pushed commit; the hourly
+  and daily rows exist for what the watcher could not see.
+- **A peer's change waits for the remote poll** — up to five minutes, less when
+  this machine is itself changing things. Forgejo does not push to clients;
+  making that faster means asking the remote more often, which is a request per
+  poll, not a walk.
+- **Every number here is a `const` or a profile field, and the log line is the
+  proof it ran.** `grep 'scan pass' keeper.log | cut -c1-16 | uniq -c` is the
+  walk cadence; a folder that walks oftener than this table says is a bug, and
+  the line's `reason=` names the door it came through.
