@@ -387,12 +387,16 @@ pub async fn sync_footprint(
             )))
         })?;
     let root = profile.local_path.clone();
-    let measured = tokio::task::spawn_blocking(move || keeper_sync::footprint::measure(&root))
-        .await
-        .map_err(|err| {
-            sync_ipc_error(&keeper_sync::SyncError::Config(format!("footprint: {err}")))
-        })?
-        .map_err(|e| sync_ipc_error(&e))?;
+    // What prune may release is what the remote was seen holding (AD-231);
+    // the ledger read happens here because `measure` holds no database.
+    let synced = engine.synced_oids(&id).map_err(|e| sync_ipc_error(&e))?;
+    let measured =
+        tokio::task::spawn_blocking(move || keeper_sync::footprint::measure(&root, &synced))
+            .await
+            .map_err(|err| {
+                sync_ipc_error(&keeper_sync::SyncError::Config(format!("footprint: {err}")))
+            })?
+            .map_err(|e| sync_ipc_error(&e))?;
     Ok(SyncFootprintVm {
         on_disk: measured.on_disk,
         lfs_cache: measured.lfs_cache,

@@ -73,6 +73,14 @@ pub struct Footprint {
 
 /// Measure `root`.
 ///
+/// `synced` is every oid the remote was observed holding
+/// ([`crate::db::synced_oids`]), because [`Footprint::reclaimable`] is what
+/// prune would release and prune releases nothing else (Story 70.4, AD-231).
+/// It is a parameter rather than a ledger read because this module holds no
+/// database — the caller that has one passes the set; a caller with none
+/// passes an empty set and reads `reclaimable = 0`, which is the truth for a
+/// folder whose confirmations it cannot see.
+///
 /// Almost metadata only: this walks and stats, and the only content it reads is
 /// the first [`lfs::stage::MAX_POINTER_BYTES`] of a tracked LFS path whose
 /// worktree file is small enough to *be* a pointer — the read that decides
@@ -84,7 +92,7 @@ pub struct Footprint {
 /// folder that prompted it — 210 GB, a few thousand entries — that is a
 /// sub-second walk, which is why it can be asked for on demand rather than
 /// cached and served stale.
-pub fn measure(root: &Path) -> Result<Footprint> {
+pub fn measure(root: &Path, synced: &std::collections::HashSet<String>) -> Result<Footprint> {
     let git_dir = root.join(".git");
     let store = lfs::store::LfsStore::in_git_dir(git_dir.clone());
     let mut out = Footprint {
@@ -101,7 +109,9 @@ pub fn measure(root: &Path) -> Result<Footprint> {
     // answer a question with silence.
     if let Ok(repo) = git::repo::open(root, false) {
         if let Ok(tracked) = git::repo::tracked_paths(&repo) {
-            if let Ok(plan) = lfs::prune::plan(&repo, root, &store, &tracked, &Default::default()) {
+            if let Ok(plan) =
+                lfs::prune::plan(&repo, root, &store, &tracked, &Default::default(), synced)
+            {
                 out.reclaimable = plan.iter().map(|entry| entry.size).sum();
             }
             let tally = tracked_tally(&repo, root, &tracked);
@@ -273,7 +283,7 @@ mod tests {
         std::fs::write(objects.join("abc"), vec![0u8; 5000]).expect("write");
         std::fs::write(dir.path().join("note.md"), vec![0u8; 100]).expect("write");
 
-        let f = measure(dir.path()).expect("measure");
+        let f = measure(dir.path(), &Default::default()).expect("measure");
 
         assert_eq!(f.on_disk, 5100);
         assert_eq!(f.lfs_cache, 5000);
@@ -360,7 +370,7 @@ mod tests {
             ],
         );
 
-        let f = measure(root).expect("measure");
+        let f = measure(root, &Default::default()).expect("measure");
 
         assert_eq!(
             f.materialized_paths, 2,
@@ -394,7 +404,7 @@ mod tests {
         repo_with_index(root, &[("gone.bin", gone_bytes)]);
         std::fs::remove_file(root.join("gone.bin")).expect("delete gone");
 
-        let f = measure(root).expect("measure");
+        let f = measure(root, &Default::default()).expect("measure");
 
         assert_eq!(f.virtual_paths, 0);
         assert_eq!(f.materialized_paths, 0);
@@ -415,7 +425,7 @@ mod tests {
         std::fs::write(root.join("note.md"), b"hello").expect("write note");
         repo_with_index(root, &[("note.md", b"hello".to_vec())]);
 
-        let f = measure(root).expect("measure");
+        let f = measure(root, &Default::default()).expect("measure");
 
         assert_eq!(f.virtual_paths, 0);
         assert_eq!(f.materialized_paths, 0);

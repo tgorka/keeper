@@ -2365,6 +2365,36 @@ pub fn referenced_oids(conn: &Connection, profile_id: &str) -> Result<BTreeSet<S
     Ok(out)
 }
 
+/// Every LFS oid the remote was observed holding for this profile (Story
+/// 70.4, AD-231).
+///
+/// The third input to `lfs::prune::plan`, read off the `materialized` ledger:
+/// a row carrying both an `oid` and a `synced_at_ms`. The pair is consistent
+/// by construction — [`note_local_authorship`] writes the oid and clears the
+/// memo on every new commit of the path, and [`note_synced`] is written only
+/// where a per-path proof exists (`Engine::note_unit_synced`, which refuses a
+/// stale unit by checking the index still names the uploaded oid, and the
+/// remote audit's per-object `serves`). A row with the memo and no `oid` —
+/// one an older keeper wrote — confirms nothing: the memo says the remote
+/// held *something* for the path once, and prune needs to know which object.
+///
+/// A memo, not a proof, and it authorizes prune precisely because prune
+/// deletes a copy the worktree can rebuild; `Engine::remote_serves` still
+/// re-proves an object at the moment a *release* would make the store copy the
+/// last one.
+pub fn synced_oids(conn: &Connection, profile_id: &str) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT oid FROM materialized
+          WHERE profile_id = ?1 AND synced_at_ms IS NOT NULL AND oid IS NOT NULL",
+    )?;
+    let rows = stmt.query_map((profile_id,), |r| r.get::<_, String>(0))?;
+    let mut out = HashSet::new();
+    for oid in rows {
+        out.insert(oid?);
+    }
+    Ok(out)
+}
+
 /// How many units of one kind are still being *worked* on — parked excluded.
 ///
 /// The deliberate counterpart of [`outstanding_count`], and the two are not
@@ -4913,6 +4943,39 @@ mod tests {
             "only the timestamp moved: an upsert that named more than `at_ms`, \
              or a REPLACE that named less, fails here"
         );
+    }
+
+    /// Story 70.4, AD-231. Prune's third input: an oid counts as confirmed
+    /// only with both the memo and the identity, on this profile.
+    #[test]
+    fn synced_oids_are_the_confirmed_objects_and_nothing_less() {
+        let c = conn();
+        // Authored here, confirmed by the upload: the releasable shape.
+        note_local_authorship(&c, "p", "a.bin", 1_000, "aaa", 10).expect("author");
+        note_synced(&c, "p", "a.bin", 1_100).expect("confirm");
+        // Authored, never confirmed.
+        note_local_authorship(&c, "p", "b.bin", 1_000, "bbb", 10).expect("author");
+        // Confirmed for a path whose row never recorded which object — an
+        // older keeper's row: the memo says nothing prune can act on.
+        remember_materialized(&c, "p", "c.bin", 1_000).expect("arrive");
+        note_synced(&c, "p", "c.bin", 1_100).expect("confirm");
+        // Another profile's confirmation is another profile's.
+        note_local_authorship(&c, "q", "d.bin", 1_000, "ddd", 10).expect("author");
+        note_synced(&c, "q", "d.bin", 1_100).expect("confirm");
+        // Re-authored after confirmation: the memo is cleared with the oid.
+        note_local_authorship(&c, "p", "e.bin", 1_000, "eee", 10).expect("author");
+        note_synced(&c, "p", "e.bin", 1_100).expect("confirm");
+        note_local_authorship(&c, "p", "e.bin", 1_200, "eee2", 10).expect("re-author");
+
+        assert_eq!(
+            synced_oids(&c, "p").expect("read"),
+            HashSet::from(["aaa".to_owned()]),
+        );
+        assert_eq!(
+            synced_oids(&c, "q").expect("read"),
+            HashSet::from(["ddd".to_owned()])
+        );
+        assert!(synced_oids(&c, "r").expect("read").is_empty());
     }
 
     /// The pin is the one thing a release may not cross, so every way of not

@@ -175,15 +175,30 @@ export function useRecordingSession(): UseRecordingSession {
 
   // Poll while live: 1 s cadence, stopped on any terminal state. A failed poll
   // keeps the previous snapshot (never flickers to idle mid-recording).
+  //
+  // One call in flight at a time. The interval fires whether or not the
+  // previous `recordingStatus()` has answered, and on the field machine the
+  // read behind it took up to a minute while a recording was writing to the
+  // same USB volume — every tick queued another one behind it, and each was a
+  // full-tree walk of the sync folder (Epic 70, F-scan-2). A tick that finds
+  // one pending simply skips; the next one after the answer asks again.
   const live = isLiveRecording(status);
+  const pollInFlight = useRef(false);
   useEffect(() => {
     if (!live) {
       return;
     }
     const interval = setInterval(() => {
+      if (pollInFlight.current) {
+        return;
+      }
+      pollInFlight.current = true;
       void recordingStatus()
         .then(adopt)
-        .catch(() => {});
+        .catch(() => {})
+        .finally(() => {
+          pollInFlight.current = false;
+        });
     }, 1000);
     return () => {
       clearInterval(interval);

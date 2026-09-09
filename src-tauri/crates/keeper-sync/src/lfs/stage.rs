@@ -91,7 +91,8 @@ pub fn applies(profile: &SyncProfile, size: u64) -> bool {
     profile.lfs_mode != LfsMode::Disabled && size >= profile.lfs_threshold_bytes
 }
 
-/// Files git reads for its own configuration, before any filter runs.
+/// Files git and keeper read for their own configuration, before any filter
+/// runs.
 ///
 /// git and gitoxide read these straight out of the worktree (or the index) as
 /// bytes. No smudge filter is ever applied to them, so a path in here that is
@@ -106,22 +107,54 @@ pub fn applies(profile: &SyncProfile, size: u64) -> bool {
 /// `.gitattributes` files crossed the threshold, keeper wrote itself an
 /// anchored rule for each, and every later git or gitoxide operation on the
 /// repository printed `is not a valid attribute name` — while the subtree they
-/// governed had no attributes at all.
-const GIT_CONTROL_FILES: [&str; 3] = [".gitattributes", ".gitignore", ".gitmodules"];
+/// governed had no attributes at all. 1 314 669 such lines on 2026-08-27/28.
+///
+/// keeper's own two are here for the same reason (Story 70.4, AD-230):
+/// `.lfsconfig` is read unfiltered by the endpoint resolver, so a pointerised
+/// one reads as "no LFS endpoint"; `.keepervirtual` is compiled from the
+/// worktree, so a pointerised one is a policy that erased itself. Both used to
+/// be protected from *virtualization* and not from *conversion*, which is the
+/// step that produces the pointer the first protection feared.
+const CONTROL_FILES: [&str; 5] = [
+    ".gitattributes",
+    ".gitignore",
+    ".gitmodules",
+    ".lfsconfig",
+    crate::lfs::virtual_policy::VIRTUAL_PATTERN_FILE,
+];
 
-/// Is this a file git reads unfiltered, and therefore must never be a pointer?
+/// Is this a file git or keeper reads unfiltered, and therefore must never be
+/// a pointer — from any door?
 ///
 /// Matched on the file name at any depth, which is how git finds them: a
-/// `.gitattributes` is read in every directory it appears in.
+/// `.gitattributes` is read in every directory it appears in. Anything under
+/// a `.git` or `.keeper` component counts too: `.keeper/keeper.toml` is the
+/// folder's own configuration and carries the `toml` **extension**, so one
+/// oversized TOML anywhere in the repository writes `*.toml filter=lfs` and
+/// every folder-config file in the tree is then routed by attribute without
+/// ever crossing the threshold itself.
 ///
-/// Visible to the crate because the virtualization question has the same
-/// answer for the same reason: a `.gitattributes` whose bytes are absent is a
-/// file git reads as pointer text, so it must be unreachable from both the
-/// routing rule and the policy that decides what may stay away.
-pub(crate) fn is_git_control_file(path: &Path) -> bool {
-    path.file_name()
+/// The ONE predicate (AD-230). Before 70.4 there were two lists that had to
+/// agree — this one, and `virtual_policy::is_control_file`'s wider one — and
+/// only one of them was complete. Every routing door consults this:
+/// [`LfsPolicy::applies`], [`already_routed`], [`mismatched_filtered_paths`],
+/// [`unconverted_after_repair`], `Engine::ensure_lfs_rule`, and the
+/// virtualization policy delegates here.
+pub fn is_control_file(path: &Path) -> bool {
+    if path
+        .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| GIT_CONTROL_FILES.contains(&name))
+        .is_some_and(|name| CONTROL_FILES.contains(&name))
+    {
+        return true;
+    }
+    path.components().any(|part| {
+        matches!(
+            part,
+            std::path::Component::Normal(part)
+                if part == ".git" || part == crate::profile::FOLDER_CONFIG_DIR
+        )
+    })
 }
 
 /// The size rule plus the profile's opt-out globs, compiled once per run.
@@ -188,16 +221,68 @@ impl LfsPolicy {
     /// against — matching an absolute path would make `*.md` depend on where
     /// the folder happens to be mounted.
     ///
-    /// A git control file is refused before the size rule is even consulted:
-    /// see [`is_git_control_file`] for why size is the wrong question there.
+    /// A control file and an opted-out path are refused before the size rule
+    /// is even consulted: see [`Self::excludes`].
     pub fn applies(&self, path: &Path, size: u64) -> bool {
-        if !self.enabled || size < self.threshold || is_git_control_file(path) {
+        self.enabled && size >= self.threshold && !self.excludes(path)
+    }
+
+    /// Must `path` stay an ordinary blob whatever its size and whatever
+    /// `.gitattributes` says?
+    ///
+    /// Two reasons, one answer, asked at every door (Story 70.4): a control
+    /// file — see [`is_control_file`] for why size is the wrong question there
+    /// — and a path the profile's `lfsNever` names. Before this the opt-out
+    /// was read by the size rule alone, so an existing `*.md filter=lfs` line
+    /// kept routing every `.md` however small through [`already_routed`], and
+    /// `docs/sync.md`'s "escape hatch" silently did nothing whenever the rule
+    /// predated it — which is the ordinary way a user discovers they need one.
+    pub fn excludes(&self, path: &Path) -> bool {
+        is_control_file(path)
+            || self
+                .never
+                .as_ref()
+                .is_some_and(|never| never.is_match(path))
+    }
+
+    /// Should a keeper-written rule with this decoded `pattern` be retired from
+    /// the managed block?
+    ///
+    /// Only the two shapes keeper writes are judged — [`pattern_for`]'s
+    /// exact path (`/a/b/file`) and [`pattern_for_extension`]'s `*.ext` —
+    /// because only those can be re-derived into a path the routing gates
+    /// would ask about. Anything else below the marker is hand-added and is
+    /// not this function's to remove.
+    ///
+    /// An exact-path rule is retired when its path [`is_control_file`] or
+    /// `lfsNever` names it — hesperia's `.gitattributes` lines 114–115 are two
+    /// anchored `…/.gitattributes` rules from the 2026-08-27 incident that no
+    /// code path could remove. A `*.ext` rule is retired when `.ext` is a
+    /// control-file name — wildmatch's `*` matches the empty string, so
+    /// `*.gitattributes` covers `.gitattributes` itself — or when `lfsNever`
+    /// matches a bare `a.ext`, which is what a basename opt-out (`*.md`,
+    /// compiled as `**/*.md`) matches and a scoped one (`notes/*.md`) does
+    /// not: the scoped opt-out leaves the rule governing the rest of the tree,
+    /// and that is correct.
+    ///
+    /// The pattern arrives as the line's decoded bytes, glob-escaped the way
+    /// [`escape_globs`] wrote it; the escape is stripped before the path is
+    /// judged, since `\[` is a spelling of `[` and not a byte of a name. A
+    /// pattern that is not UTF-8 was not written by keeper's writer — which
+    /// only ever formats a `String` — and answers `false`.
+    pub(crate) fn retires(&self, pattern: &[u8]) -> bool {
+        let Ok(pattern) = std::str::from_utf8(pattern) else {
             return false;
+        };
+        if let Some(rest) = pattern.strip_prefix('/') {
+            return self.excludes(Path::new(unescape_globs(rest).as_ref()));
         }
-        !self
-            .never
-            .as_ref()
-            .is_some_and(|never| never.is_match(path))
+        let Some(ext) = pattern.strip_prefix("*.") else {
+            return false;
+        };
+        let ext = unescape_globs(ext);
+        is_control_file(Path::new(&format!(".{ext}")))
+            || self.excludes(Path::new(&format!("a.{ext}")))
     }
 }
 
@@ -302,6 +387,36 @@ fn escape_globs(literal: &str) -> Cow<'_, str> {
     for ch in literal.chars() {
         if ch.is_ascii() && is_glob_meta(ch as u8) {
             out.push('\\');
+        }
+        out.push(ch);
+    }
+    Cow::Owned(out)
+}
+
+/// [`escape_globs`] read backwards: the literal a keeper-written pattern
+/// stands for.
+///
+/// Only the escape is undone. A `*` or `?` that is not escaped stays as it
+/// is, so `*.mp4` comes back as `*.mp4` — [`LfsPolicy::retires`] strips the
+/// `*.` prefix before asking, and an exact-path rule keeper wrote never holds
+/// a bare meta byte, because [`pattern_for`] escaped every one. A trailing
+/// lone backslash is kept: it escapes nothing, so it is a byte of the name.
+fn unescape_globs(pattern: &str) -> Cow<'_, str> {
+    if !pattern.contains('\\') {
+        return Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek() {
+                Some(&next) if next.is_ascii() && is_glob_meta(next as u8) => {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+                _ => {}
+            }
         }
         out.push(ch);
     }
@@ -618,7 +733,18 @@ fn repaired_rule(body: &str) -> Option<String> {
 /// written twice, and after repair so are `/a b …` and `"/a b" …`. Lines that
 /// do not carry keeper's exact [`ATTRIBUTE_SUFFIX`] are not candidates at all;
 /// see [`keeper_rule_pattern`].
-fn repair_managed_block(text: &str) -> Option<String> {
+///
+/// # Retirement (Story 70.4, AD-230)
+///
+/// A keeper-written rule the `policy` [`LfsPolicy::retires`] is dropped, the
+/// same way a duplicate is: a third reason for `keep[index] = false`, judged
+/// on the decoded pattern **after** repair, so a broken spelling of an
+/// anchored `…/.gitattributes` rule is retired rather than repaired into a
+/// working one. It rides the keep-vector rather than a second pass so the
+/// property the whole function is built on survives unchanged: a file with
+/// nothing to repair, collapse or retire is not rewritten, and is therefore
+/// byte-identical afterwards — the user's lines above the marker included.
+fn repair_managed_block(text: &str, policy: &LfsPolicy) -> Option<String> {
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let header = lines
         .iter()
@@ -642,7 +768,7 @@ fn repair_managed_block(text: &str) -> Option<String> {
         let Some(pattern) = keeper_rule_pattern(body) else {
             continue;
         };
-        if seen.iter().any(|earlier| earlier == pattern.as_ref()) {
+        if policy.retires(&pattern) || seen.iter().any(|earlier| earlier == pattern.as_ref()) {
             keep[index] = false;
         } else {
             seen.push(pattern.into_owned());
@@ -683,20 +809,25 @@ fn repair_managed_block(text: &str) -> Option<String> {
 /// pattern holding a space is one line that git can parse and that this
 /// function recognises as its own on the next run.
 ///
-/// Lines an older keeper wrote and broke are repaired, and their duplicates
-/// collapsed, before anything else is decided — see [`repair_managed_block`]
-/// for the boundary that keeps that off the user's own lines. Repair runs
-/// **first** because a broken line about to become coverage for one of
-/// `patterns` must not also be appended: doing it the other way round would
-/// leave the file holding both the repaired rule and a fresh copy of it.
-pub fn ensure_attributes(root: &Path, patterns: &[String]) -> Result<bool> {
+/// Lines an older keeper wrote and broke are repaired, their duplicates
+/// collapsed, and the rules `policy` retires dropped, before anything else is
+/// decided — see [`repair_managed_block`] for the boundary that keeps all
+/// three off the user's own lines. Repair runs **first** because a broken
+/// line about to become coverage for one of `patterns` must not also be
+/// appended: doing it the other way round would leave the file holding both
+/// the repaired rule and a fresh copy of it. A pattern in `patterns` that the
+/// policy retires is never written either: [`LfsPolicy::applies`] refuses the
+/// path before [`prepare`] asks for its rule, and `Engine::ensure_lfs_rule`
+/// refuses the extension before it asks — this is the writer, and a writer
+/// that had to second-guess its callers would be two opinions about one rule.
+pub fn ensure_attributes(root: &Path, patterns: &[String], policy: &LfsPolicy) -> Result<bool> {
     let file = root.join(".gitattributes");
     let existing = match std::fs::read_to_string(&file) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(SyncError::io("read .gitattributes", file, err)),
     };
-    let repaired = repair_managed_block(&existing);
+    let repaired = repair_managed_block(&existing, policy);
 
     let mut wanted: Vec<&String> = Vec::new();
     for pattern in patterns {
@@ -913,7 +1044,7 @@ fn blob_could_be_a_pointer(repo: &gix::Repository, blob: gix::hash::ObjectId) ->
 /// vaults of small files — every one of which is inside the window
 /// [`blob_could_be_a_pointer`] admits, so an allocation here would be an
 /// allocation per file listed.
-fn pointer_blob(repo: &gix::Repository, blob: gix::hash::ObjectId) -> Option<Pointer> {
+pub(crate) fn pointer_blob(repo: &gix::Repository, blob: gix::hash::ObjectId) -> Option<Pointer> {
     if !blob_could_be_a_pointer(repo, blob) {
         return None;
     }
@@ -1098,6 +1229,64 @@ pub fn read_worktree_pointer(
         return Ok(None);
     }
     Ok(Pointer::parse(&bytes))
+}
+
+/// A tracked control file whose worktree bytes are pointer text, and the
+/// subtree whose rules it was carrying (Story 70.4, AD-230).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerisedControlFile {
+    /// Repository-relative path of the file.
+    pub path: PathBuf,
+    /// What the file governs: a `.gitattributes` or `.gitignore` governs its
+    /// own directory downwards; `.gitmodules`, `.lfsconfig`, `.keepervirtual`
+    /// and anything under `.keeper/` govern the whole folder.
+    pub governs: PathBuf,
+}
+
+/// Which of `tracked` are control files that are pointer text on disk.
+///
+/// The detection half of [`is_control_file`]'s guarantee. The routing doors
+/// stop keeper from *creating* one; nothing found one that already existed —
+/// hesperia's `.gitattributes` announced itself only as 1 314 669
+/// `is not a valid attribute name` warnings, two per parse of the pointer's
+/// two lines, while `filter=lfs` routing was void for the whole subtree and
+/// 600 files / 1.96 GB were committed as plain blobs under a threshold that
+/// never moved.
+///
+/// Cheap by construction: `tracked` is filtered by name first, which leaves a
+/// handful of paths in any repository, and each of those costs one `lstat`
+/// and — only when it is pointer-sized — one bounded read through
+/// [`worktree_pointer`]. It is asked from the hourly footprint sweep, which
+/// already holds the tracked list inside a blocking task; the commit leg
+/// would have paid an index read per pass to learn the same few names.
+///
+/// An unreadable or absent file is not a finding: this answers "is it pointer
+/// text", and a file that cannot be read is neither.
+pub fn pointerised_control_files(root: &Path, tracked: &[PathBuf]) -> Vec<PointerisedControlFile> {
+    let mut out = Vec::new();
+    for rela in tracked.iter().filter(|rela| is_control_file(rela)) {
+        let absolute = root.join(rela);
+        let Ok(meta) = std::fs::symlink_metadata(&absolute) else {
+            continue;
+        };
+        if worktree_pointer(&absolute, &meta).is_none() {
+            continue;
+        }
+        let per_directory = rela
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == ".gitattributes" || name == ".gitignore");
+        let governs = if per_directory {
+            rela.parent().map(Path::to_path_buf).unwrap_or_default()
+        } else {
+            PathBuf::new()
+        };
+        out.push(PointerisedControlFile {
+            path: rela.clone(),
+            governs,
+        });
+    }
+    out
 }
 
 /// Every pointer the index records, keyed by the path git spells it under.
@@ -1440,7 +1629,17 @@ fn head_records(repo: &gix::Repository, rela: &Path, blob: gix::hash::ObjectId) 
 /// will not open, a path with no index entry (a brand-new file, whose size rule
 /// has already been consulted). That is the conservative direction here: it
 /// leaves a file as an ordinary blob, which is what it is today.
-fn already_routed(repo: &gix::Repository, rela: &Path) -> bool {
+///
+/// A path the `policy` [`LfsPolicy::excludes`] answers `false` **before** the
+/// attributes are read (Story 70.4, AD-230). This was the open door: the size
+/// rule refused a `.gitattributes` and this one routed it the moment a stale
+/// anchored rule said `filter=lfs` — the exact shape hesperia's managed block
+/// still carries from the 2026-08-27 incident — and an `lfsNever` opt-out was
+/// never consulted here at all.
+fn already_routed(repo: &gix::Repository, rela: &Path, policy: &LfsPolicy) -> bool {
+    if policy.excludes(rela) {
+        return false;
+    }
     let Ok(index) = repo.index_or_empty() else {
         return false;
     };
@@ -1521,7 +1720,10 @@ pub fn mismatched_filtered_paths(
             break;
         }
         at = start + examined + 1;
-        if skip.contains(rela) {
+        // A control file is never a repair candidate, whatever its attributes
+        // say: converting it is the defect the sweep exists to clean up after
+        // (Story 70.4, AD-230). Free, like the skip beside it — a name check.
+        if skip.contains(rela) || is_control_file(rela) {
             continue;
         }
         let key = index_key(rela);
@@ -1588,6 +1790,10 @@ pub fn unconverted_after_repair(repo: &gix::Repository, paths: &[PathBuf]) -> Ve
     };
     let mut out = Vec::new();
     for rela in paths {
+        // Never offered by the sweep, so never a failed repair either.
+        if is_control_file(rela) {
+            continue;
+        }
         let key = index_key(rela);
         let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes())) else {
             // The commit removed it from the index entirely, which is a change
@@ -1661,8 +1867,10 @@ pub fn prepare(
         // is why the size question is asked only of a real file. The attribute
         // question is asked second because it reads `.gitattributes` and the
         // index, and the threshold answers yes for everything this used to
-        // catch: only a file BELOW the threshold reaches the second half.
-        if !policy.applies(rela, metadata.len()) && !already_routed(repo, rela) {
+        // catch: only a file BELOW the threshold reaches the second half. Both
+        // halves refuse what the policy excludes — a control file, an
+        // `lfsNever` path — so neither door routes it (Story 70.4).
+        if !policy.applies(rela, metadata.len()) && !already_routed(repo, rela, &policy) {
             continue;
         }
 
@@ -1681,9 +1889,11 @@ pub fn prepare(
         }
     }
 
-    if !patterns.is_empty() {
-        staging.attributes_changed = ensure_attributes(&profile.local_path, &patterns)?;
-    }
+    // Asked even when nothing was routed this pass: a rule the policy retires
+    // has to leave the managed block on the next commit of the folder, not on
+    // the next commit that happens to route something (Story 70.4). One read
+    // of a small file when there is nothing to write.
+    staging.attributes_changed = ensure_attributes(&profile.local_path, &patterns, &policy)?;
     Ok(staging)
 }
 
@@ -2136,6 +2346,13 @@ mod tests {
         let mut p = SyncProfile::new("01J", "p", root, "https://git.invalid/r.git");
         p.lfs_threshold_bytes = 1024;
         p
+    }
+
+    /// A policy with no opt-outs, for the tests about the writer's own
+    /// spelling and repair — where the only rules retired are control-file
+    /// ones, and none of these fixtures write one.
+    fn no_opt_out() -> LfsPolicy {
+        LfsPolicy::from_profile(&profile(Path::new("/unused"))).expect("policy")
     }
 
     /// A materialized file keeps the mode git checked its pointer out with.
@@ -3029,7 +3246,13 @@ mod tests {
         let p = profile(dir.path());
         let policy = LfsPolicy::from_profile(&p).expect("policy");
 
-        for name in [".gitattributes", ".gitignore", ".gitmodules"] {
+        for name in [
+            ".gitattributes",
+            ".gitignore",
+            ".gitmodules",
+            ".lfsconfig",
+            ".keepervirtual",
+        ] {
             assert!(
                 !policy.applies(Path::new(name), 10_000_000),
                 "{name} at the repository root"
@@ -3042,9 +3265,178 @@ mod tests {
                 "{name} is read in every directory it appears in, so depth is irrelevant"
             );
         }
+        // Anything under keeper's own directory, or git's: the folder config
+        // carries the `toml` extension, so a `*.toml` rule reaches it by
+        // attribute without it ever crossing the threshold.
+        for path in [
+            ".keeper/keeper.toml",
+            "sub/.keeper/host.toml",
+            ".git/config",
+        ] {
+            assert!(is_control_file(Path::new(path)), "{path}");
+            assert!(!policy.applies(Path::new(path), u64::MAX), "{path}");
+        }
         // A file that merely *contains* the name is content like any other.
         assert!(policy.applies(Path::new("docs/.gitattributes.bak"), 10_000_000));
         assert!(policy.applies(Path::new("docs/my.gitignore.example"), 10_000_000));
+        assert!(policy.applies(Path::new("keeper.toml"), 10_000_000));
+        assert!(!is_control_file(Path::new("notes/.keeperish/a.md")));
+    }
+
+    /// [`LfsPolicy::retires`] judges the two shapes keeper writes and nothing
+    /// else, and asks the questions the doors ask.
+    #[test]
+    fn a_keeper_rule_is_retired_for_a_control_file_or_an_opted_out_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut p = profile(dir.path());
+        p.lfs_never = vec!["*.md".into(), "notes/*.txt".into(), "exact/keep.bin".into()];
+        let policy = LfsPolicy::from_profile(&p).expect("policy");
+
+        // Exact-path rules: the control file, however deep, escaped or not.
+        assert!(policy.retires(b"/a/b/.gitattributes"));
+        assert!(policy.retires(b"/.lfsconfig"));
+        assert!(policy.retires(b"/.keeper/keeper.toml"));
+        assert!(policy.retires(b"/2021 \\[q4\\]/.gitignore"));
+        assert!(
+            policy.retires(b"/exact/keep.bin"),
+            "an opt-out naming the exact path"
+        );
+        assert!(!policy.retires(b"/2021 holiday/clip.mp4"));
+        // Extension rules: `*` matches the empty string, so `*.gitattributes`
+        // covers `.gitattributes` itself; and a basename opt-out covers `a.md`
+        // while a scoped one does not.
+        assert!(policy.retires(b"*.gitattributes"));
+        assert!(policy.retires(b"*.keepervirtual"));
+        assert!(policy.retires(b"*.md"));
+        assert!(
+            !policy.retires(b"*.txt"),
+            "`notes/*.txt` leaves the rest of the tree governed"
+        );
+        assert!(!policy.retires(b"*.mp4"));
+        assert!(
+            !policy.retires(b"*.toml"),
+            "the folder config is refused at the doors, not here"
+        );
+        // Hand-added shapes below the marker are not keeper's to judge.
+        assert!(!policy.retires(b"media/**"));
+        assert!(
+            !policy.retires(b"\xff\xfe/.gitattributes"),
+            "not UTF-8: not keeper's writer"
+        );
+    }
+
+    #[test]
+    fn unescaping_globs_is_the_exact_inverse_of_escaping_them() {
+        for literal in ["plain", "a [1].mp4", "back\\slash", "q?", "star*", "ends\\"] {
+            let escaped = escape_globs(literal);
+            assert_eq!(
+                unescape_globs(&escaped),
+                literal,
+                "{literal:?} via {escaped:?}"
+            );
+        }
+        // A bare meta byte was never escaped and stays what it is.
+        assert_eq!(unescape_globs("*.mp4"), "*.mp4");
+    }
+
+    /// The retirement through the writer, with the user's lines byte-for-byte:
+    /// a stale anchored control-file rule and an opted-out extension both leave
+    /// the managed block; a scoped opt-out and the healthy rule stay.
+    #[test]
+    fn ensure_attributes_retires_control_file_and_opted_out_rules_below_the_marker_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let mut p = profile(root);
+        p.lfs_never = vec!["*.md".into(), "notes/*.txt".into()];
+        let policy = LfsPolicy::from_profile(&p).expect("policy");
+        // The user's own copy of the same hazard above the marker is theirs.
+        let user = "*.psd binary\n/legacy/.gitattributes filter=lfs\n\n";
+        let seed = format!(
+            "{user}{MANAGED_HEADER}\n*.mp4 {ATTRIBUTE_SUFFIX}\n/a/b/.gitattributes {ATTRIBUTE_SUFFIX}\n\
+             *.md {ATTRIBUTE_SUFFIX}\n*.txt {ATTRIBUTE_SUFFIX}\n\"/2021 q4/.gitignore\" {ATTRIBUTE_SUFFIX}\n"
+        );
+        std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
+
+        assert!(ensure_attributes(root, &[], &policy).expect("retire"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            format!("{user}{MANAGED_HEADER}\n*.mp4 {ATTRIBUTE_SUFFIX}\n*.txt {ATTRIBUTE_SUFFIX}\n")
+        );
+        // A fixpoint: nothing left to retire, nothing written.
+        assert!(!ensure_attributes(root, &[], &policy).expect("second"));
+        // And a file with nothing to retire is never rewritten at all.
+        let clean = format!("{user}{MANAGED_HEADER}\n*.mp4 {ATTRIBUTE_SUFFIX}\n");
+        std::fs::write(root.join(".gitattributes"), &clean).expect("clean");
+        assert!(!ensure_attributes(root, &[], &policy).expect("untouched"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
+            clean
+        );
+    }
+
+    /// F-LFS-7 on the attribute door: an existing `*.md filter=lfs` rule kept
+    /// routing every `.md` however small, because `already_routed` never read
+    /// `lfsNever`. Driven through `prepare`, which is the door.
+    #[test]
+    fn an_opted_out_path_under_an_existing_rule_is_not_routed_and_the_rule_is_retired() {
+        use gix::index::{entry::Flags, entry::Mode, entry::Stat, State};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(root)
+            .status()
+            .expect("git init");
+        let mut p = profile(root);
+        p.lfs_never = vec!["*.md".into()];
+        std::fs::write(
+            root.join(".gitattributes"),
+            format!("{MANAGED_HEADER}\n*.md {ATTRIBUTE_SUFFIX}\n*.gif {ATTRIBUTE_SUFFIX}\n"),
+        )
+        .expect("rules");
+        // Both tracked as raw blobs, both under a rule: the gif is routed on
+        // the next commit (the repair `prepare` exists for) and the note is not.
+        let repo = crate::git::repo::open(root, false).expect("open");
+        let mut index = State::new(repo.object_hash());
+        for (rela, bytes) in [("note.md", vec![b'x'; 100]), ("small.gif", vec![9u8; 100])] {
+            let absolute = root.join(rela);
+            std::fs::write(&absolute, &bytes).expect("write");
+            let blob = repo.write_blob(&bytes).expect("blob").detach();
+            let meta = gix::index::fs::Metadata::from_path_no_follow(&absolute).expect("stat");
+            let stat = Stat::from_fs(&meta).expect("stat");
+            index.dangerously_push_entry(stat, blob, Flags::empty(), Mode::FILE, rela.into());
+        }
+        index.sort_entries();
+        gix::index::File::from_state(index, repo.index_path())
+            .write(gix::index::write::Options::default())
+            .expect("write index");
+        let repo = crate::git::repo::open(root, false).expect("reopen");
+        let store = LfsStore::in_git_dir(root.join(".git"));
+
+        let staging = prepare(
+            &repo,
+            &p,
+            &store,
+            &[PathBuf::from("note.md"), PathBuf::from("small.gif")],
+        )
+        .expect("prepare");
+        assert!(
+            !staging.substitutions.contains_key(Path::new("note.md")),
+            "the opt-out beats the rule on the attribute door: {:?}",
+            staging.substitutions.keys()
+        );
+        assert!(
+            staging.substitutions.contains_key(Path::new("small.gif")),
+            "the rule still routes what nothing opted out"
+        );
+        assert!(
+            staging.attributes_changed,
+            "the `*.md` rule is retired in the same pass"
+        );
+        let text = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
+        assert!(!text.contains("*.md"), "{text}");
+        assert!(text.contains("*.gif"), "{text}");
     }
 
     #[test]
@@ -3243,7 +3635,9 @@ mod tests {
         let root = dir.path();
         let pattern = pattern_for(Path::new("2021 holiday/clip"));
 
-        assert!(ensure_attributes(root, std::slice::from_ref(&pattern)).expect("first"));
+        assert!(
+            ensure_attributes(root, std::slice::from_ref(&pattern), &no_opt_out()).expect("first")
+        );
         let after_first = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
         assert!(
             after_first.contains("\"/2021 holiday/clip\" filter=lfs diff=lfs merge=lfs -text"),
@@ -3256,7 +3650,8 @@ mod tests {
         );
 
         assert!(
-            !ensure_attributes(root, std::slice::from_ref(&pattern)).expect("second"),
+            !ensure_attributes(root, std::slice::from_ref(&pattern), &no_opt_out())
+                .expect("second"),
             "the rule keeper just wrote must read as already present"
         );
         assert_eq!(
@@ -3281,7 +3676,8 @@ mod tests {
         std::fs::write(root.join(".gitattributes"), &legacy).expect("seed");
 
         assert!(
-            !ensure_attributes(root, &["*.mp4".into(), "*.iso".into()]).expect("rerun"),
+            !ensure_attributes(root, &["*.mp4".into(), "*.iso".into()], &no_opt_out())
+                .expect("rerun"),
             "nothing changed, so nothing may be written"
         );
         assert_eq!(
@@ -3294,12 +3690,12 @@ mod tests {
     fn attributes_are_written_once_and_are_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        assert!(ensure_attributes(root, &["*.mp4".into()]).expect("first"));
+        assert!(ensure_attributes(root, &["*.mp4".into()], &no_opt_out()).expect("first"));
         let after_first = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
         assert!(after_first.contains("*.mp4 filter=lfs diff=lfs merge=lfs -text"));
 
         assert!(
-            !ensure_attributes(root, &["*.mp4".into()]).expect("second"),
+            !ensure_attributes(root, &["*.mp4".into()], &no_opt_out()).expect("second"),
             "re-running must not rewrite the file"
         );
         assert_eq!(
@@ -3319,10 +3715,10 @@ mod tests {
         .expect("seed");
 
         assert!(
-            !ensure_attributes(root, &["*.psd".into()]).expect("existing coverage"),
+            !ensure_attributes(root, &["*.psd".into()], &no_opt_out()).expect("existing coverage"),
             "a rule the user already wrote must be respected, not duplicated"
         );
-        assert!(ensure_attributes(root, &["*.mp4".into()]).expect("new rule"));
+        assert!(ensure_attributes(root, &["*.mp4".into()], &no_opt_out()).expect("new rule"));
 
         let text = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
         assert_eq!(text.matches("*.psd").count(), 1);
@@ -3337,7 +3733,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::write(root.join(".gitattributes"), "*.bin binary\n").expect("seed");
-        assert!(ensure_attributes(root, &["*.bin".into()]).expect("add"));
+        assert!(ensure_attributes(root, &["*.bin".into()], &no_opt_out()).expect("add"));
         let text = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
         assert!(text.contains("*.bin filter=lfs"));
     }
@@ -3445,7 +3841,9 @@ mod tests {
         std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
 
         let pattern = pattern_for(Path::new("2021 holiday/clip"));
-        assert!(ensure_attributes(root, std::slice::from_ref(&pattern)).expect("repair"));
+        assert!(
+            ensure_attributes(root, std::slice::from_ref(&pattern), &no_opt_out()).expect("repair")
+        );
 
         let text = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
         assert_eq!(
@@ -3459,7 +3857,10 @@ mod tests {
         // The repaired line is coverage, so the pattern is not appended on top
         // of it, and a second call is a no-op. Repair is a fixpoint because it
         // re-emits through the writer rather than patching the line.
-        assert!(!ensure_attributes(root, std::slice::from_ref(&pattern)).expect("second"));
+        assert!(
+            !ensure_attributes(root, std::slice::from_ref(&pattern), &no_opt_out())
+                .expect("second")
+        );
         assert_eq!(
             std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
             text
@@ -3481,7 +3882,7 @@ mod tests {
         );
         std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
 
-        assert!(ensure_attributes(root, &[]).expect("repair"));
+        assert!(ensure_attributes(root, &[], &no_opt_out()).expect("repair"));
         assert_eq!(
             std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
             format!(
@@ -3509,7 +3910,7 @@ mod tests {
         );
         std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
 
-        assert!(ensure_attributes(root, &[]).expect("repair"));
+        assert!(ensure_attributes(root, &[], &no_opt_out()).expect("repair"));
         assert_eq!(
             std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
             format!(
@@ -3534,7 +3935,7 @@ mod tests {
         );
         std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
 
-        assert!(!ensure_attributes(root, &["*.psd".into()]).expect("run"));
+        assert!(!ensure_attributes(root, &["*.psd".into()], &no_opt_out()).expect("run"));
         assert_eq!(
             std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
             seed
@@ -3557,7 +3958,7 @@ mod tests {
         );
         std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
 
-        assert!(ensure_attributes(root, &[]).expect("dedup"));
+        assert!(ensure_attributes(root, &[], &no_opt_out()).expect("dedup"));
         assert_eq!(
             std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
             format!("{MANAGED_HEADER}\n*.mp4 -filter\n*.mp4 {ATTRIBUTE_SUFFIX}\n"),
@@ -3580,7 +3981,7 @@ mod tests {
         );
         std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
 
-        assert!(ensure_attributes(root, &[]).expect("dedup"));
+        assert!(ensure_attributes(root, &[], &no_opt_out()).expect("dedup"));
         assert_eq!(
             std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
             format!("{MANAGED_HEADER}\n*.mp4 {ATTRIBUTE_SUFFIX}\n\"/a b\" {ATTRIBUTE_SUFFIX}\n")
@@ -3610,7 +4011,7 @@ mod tests {
         std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
 
         assert!(
-            !ensure_attributes(root, &[]).expect("run"),
+            !ensure_attributes(root, &[], &no_opt_out()).expect("run"),
             "neither line is broken and they are not duplicates, so nothing is written"
         );
         assert_eq!(
@@ -3694,7 +4095,7 @@ mod tests {
         let seed = format!("{MANAGED_HEADER}\r\n/my clip {ATTRIBUTE_SUFFIX}\r\n");
         std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
 
-        assert!(ensure_attributes(root, &[]).expect("repair"));
+        assert!(ensure_attributes(root, &[], &no_opt_out()).expect("repair"));
         assert_eq!(
             std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
             format!("{MANAGED_HEADER}\r\n\"/my clip\" {ATTRIBUTE_SUFFIX}\r\n")
@@ -3715,14 +4116,19 @@ mod tests {
         std::fs::write(root.join(".gitattributes"), &seed).expect("seed");
 
         let pattern = pattern_for(Path::new("2021 [q4]/clip"));
-        assert!(ensure_attributes(root, std::slice::from_ref(&pattern)).expect("repair"));
+        assert!(
+            ensure_attributes(root, std::slice::from_ref(&pattern), &no_opt_out()).expect("repair")
+        );
         let text = std::fs::read_to_string(root.join(".gitattributes")).expect("read");
         assert_eq!(
             text,
             format!("{MANAGED_HEADER}\n\"/2021 \\\\[q4]/clip\" {ATTRIBUTE_SUFFIX}\n")
         );
 
-        assert!(!ensure_attributes(root, std::slice::from_ref(&pattern)).expect("second"));
+        assert!(
+            !ensure_attributes(root, std::slice::from_ref(&pattern), &no_opt_out())
+                .expect("second")
+        );
         assert_eq!(
             std::fs::read_to_string(root.join(".gitattributes")).expect("read"),
             text

@@ -132,8 +132,19 @@ the window.
 | 0 — name and shape | Excludes known in-flight and lock-file conventions | `curl` and `wget` write their **final** filename from byte 0 |
 | 1 — event trigger | Filesystem events; on Linux a close-write shortens the wait | A program can close and reopen a file; macOS has no close event at all |
 | 2 — quiescence | Size, mtime, ctime and inode unchanged across a window | A writer that stalls longer than the window looks finished |
-| 3 — open-writer veto | Linux only: `/proc/locks`, optionally open file descriptors | Almost nothing takes advisory locks; other users' processes are invisible |
-| 4 — verify-on-read | Re-stats the open descriptor before and after, hashes while reading | — this is the proof |
+| 3 — open-writer veto | Linux only: one read of `/proc/locks`, asked by the gate of every path tier 2 clears | Almost nothing takes advisory locks; other users' processes are invisible |
+| 4 — verify-on-read | `fstat`s the open descriptor before and after reading, and checks the first against the sample the gate cleared the path on | — this is the proof |
+
+**Where tiers 3 and 4 actually run.** Tier 3 is consulted from
+`StabilityGate::is_stable`, after tier 2 has answered `Stable` and before the
+path is handed to the commit; a vetoed path stays *settling* and is looked at
+again on the next walk. Tier 4 runs on the commit path itself:
+`git::commit::stage_and_commit` reads every non-LFS blob through
+`stability::read_verified`, and a file whose descriptor changed under the
+read — or no longer matches the gate's sample — is left out of that commit,
+named once on the folder's card, and committed on the next pass once it holds
+still. The `verify` verb runs the same check over the whole tree. Before Epic
+70 only the verb did, and the commit read was a plain `read`.
 
 Tier 0 covers, among others: `*.crdownload` (Chrome), `*.part` (Firefox),
 `*.partial` (rclone), `~$*` (Office), `.~lock.*#` (LibreOffice), editor swap
@@ -148,7 +159,13 @@ partial download is a **package directory**, not a file — the whole
 | Linux, after a close-write | 1 s |
 | Default | 5 s |
 | Removable or network media | 10 s |
-| Hard ceiling — forced through regardless | 60 s |
+| Hard ceiling — the longest one set of bytes is held | 60 s |
+
+The ceiling is measured from the last *change* to the file, not from the first
+time keeper saw it: a file rewritten between every walk is never forced through
+mid-write, and commits when its writer pauses for a window. A producer's
+assertion (§9) or a rename prime is spent by the first look at the asserted
+bytes and buys nothing for bytes written afterwards.
 
 A file whose modification time is more than 10 s in the **future** is never
 held: a machine with a broken clock would otherwise wedge it forever.
@@ -160,8 +177,8 @@ held: a machine with a broken clock would otherwise wedge it forever.
   close-write signal (EndpointSecurity) requires an entitlement granted by
   Apple. macOS therefore relies on tiers 0, 1, 2 and 4 with the 5 s window.
 - **Tier 4 is the only guarantee.** If a file changes while being read, the
-  transfer is abandoned and re-queued silently. That is a normal event, not an
-  error, and it is never surfaced as a failure.
+  path is left out of that commit and picked up by the next pass; the folder's
+  card says so once, and the folder is never marked failed for it.
 
 ### iCloud placeholders
 
@@ -377,7 +394,7 @@ inverse case — there the store object is the *only* local copy of the content
 hashed — but it is not needed forever. Measured on a 211 GB archive: 215 GB of
 worktree content plus 215 GB of store objects on one 920 GB drive.
 
-keeper releases it at the end of a successful sync — `lfsPruneLocal` is **on by
+keeper releases it on a successful sync — `lfsPruneLocal` is **on by
 default**. An object is released only when **all** of these hold:
 
 1. **The journal references no transfer for it.** Not an inference from ref
@@ -393,8 +410,17 @@ default**. An object is released only when **all** of these hold:
    keeps this and virtual files (§9) off each other's ground: a path holding
    pointer text fails it, so a virtual path is **never** a prune candidate and
    the two features can never contend for the same byte.
-3. **Nothing else is running.** It happens after the upload queue has drained to
-   quiescence and after the push, never between them.
+3. **The remote is known to hold the object.** Enforced, not inferred: the
+   object's oid must carry a `synced_at_ms` memo in the ledger — written when
+   its upload unit completed and the path still named that object, or when
+   `verify --remote` got a per-object affirmative from the server. A returned
+   push is *not* taken as proof: an audit once found 16 objects (8.0 GB)
+   missing on the server under two folders that both reported a clean sync.
+   An object nothing ever confirmed stays in the store, whatever else is true.
+
+The prune runs on a pass in which an LFS upload completed, and otherwise at
+most once an hour — never on every successful pull. It is a plan over every
+tracked path, and a pull that moved no object cannot have made one releasable.
 
 The honest trade: the drive stops being self-sufficient. Every file the worktree
 still holds is intact, but restoring one it later loses now needs the network —
@@ -3023,7 +3049,10 @@ changing is cheap to keep watched.
 6. **No automatic history pruning.** Sync churn grows a repository; `git gc` is
    available but shrinking history is a destructive operation keeper will not
    perform on its own. `lfsPruneLocal` is not this: it releases *local object
-   copies* the remote already holds and never touches history.
+   copies* the remote confirmed it holds — an upload that completed, or an
+   audit's per-object answer, recorded as `synced_at_ms` (§8) — on a pass that
+   moved an LFS object or hourly, and never touches history. An object with no
+   such record is never released.
 7. **A virtual file looks like ~130 bytes to everything else.** `ls -l`, `du`
    and third-party applications see the pointer text rather than the content's
    size, and there is no filesystem virtualization on any platform — a closed

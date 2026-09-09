@@ -2053,7 +2053,11 @@ pub fn write_conflict_copy(vault: &Vault, rel: &str, theirs: &str) -> Option<Str
     let device = crate::sync::engine_if_open()
         .map_or_else(|| "device".to_owned(), |engine| engine.device().label);
     let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let name = keeper_sync::git::conflict::conflict_name(Path::new(rel), &stamp, &device);
+    // `rel` is UTF-8, so the name built from its bytes is too; the lossy
+    // rendering here is exact.
+    let name = keeper_sync::git::conflict::conflict_name(Path::new(rel), &stamp, &device)
+        .to_string_lossy()
+        .into_owned();
     let copy_rel = match rel.rfind('/') {
         Some(index) => format!("{}{name}", &rel[..=index]),
         None => name,
@@ -3425,7 +3429,8 @@ mod tests {
             "20260802-120000",
             "laptop",
         );
-        assert_eq!(conflict_origin(&name).as_deref(), Some("note.md"));
+        let name = name.to_str().expect("a UTF-8 input yields a UTF-8 name");
+        assert_eq!(conflict_origin(name).as_deref(), Some("note.md"));
 
         // Ordinary notes, including ones with hyphens, dates and the words
         // themselves in the name.

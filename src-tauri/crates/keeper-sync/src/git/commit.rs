@@ -45,6 +45,7 @@ use crate::{
     lfs::basic::{ProgressCoalescer, DEFAULT_PROGRESS_INTERVAL},
     profile::SyncProfile,
     provenance::{change_subject, commit_message, Provenance},
+    stability::{read_verified, FileSample},
 };
 
 /// Observes staging as it walks the change set: `(files_done, path in flight)`.
@@ -104,6 +105,19 @@ pub struct StagedChange {
     /// individual paths one commit moved, and the recently-synced list needs
     /// them named and measured together.
     pub sizes: BTreeMap<PathBuf, u64>,
+    /// The sample each added or modified path was judged quiet on (Epic 70,
+    /// AD-232).
+    ///
+    /// The gate's `Stable` verdict is a statement about one specific
+    /// `(size, mtime, ctime, inode)`, and the staging read happens later — after
+    /// the rest of the walk, the LFS routing and the journal writes. Carrying
+    /// the sample here lets [`stage_and_commit`] refuse a file whose descriptor
+    /// no longer matches it before reading a byte, which is how a rewrite that
+    /// lands between the verdict and the read is kept out of the commit rather
+    /// than committed as whatever it happened to be at that instant. A missing
+    /// key means no verdict was taken for that path (a repair batch, a test
+    /// fixture), and the read is guarded by its own before/after `fstat` alone.
+    pub samples: BTreeMap<PathBuf, FileSample>,
 }
 
 impl StagedChange {
@@ -116,6 +130,34 @@ impl StagedChange {
     pub fn len(&self) -> usize {
         self.added.len() + self.modified.len() + self.deleted.len()
     }
+
+    /// This change set minus `skipped`, for a commit that had to leave some
+    /// of its added or modified paths out (see
+    /// [`stage_and_commit_skipping_torn`]).
+    ///
+    /// Deletions are never skipped, so they are carried over untouched; the
+    /// sizes and samples of the skipped paths go with them, so the activity
+    /// rows the engine writes from the result name only what the commit holds.
+    pub fn without(&self, skipped: &[PathBuf]) -> Self {
+        let keep = |rela: &&PathBuf| !skipped.contains(rela);
+        Self {
+            added: self.added.iter().filter(keep).cloned().collect(),
+            modified: self.modified.iter().filter(keep).cloned().collect(),
+            deleted: self.deleted.clone(),
+            sizes: self
+                .sizes
+                .iter()
+                .filter(|(rela, _)| !skipped.contains(rela))
+                .map(|(rela, size)| (rela.clone(), *size))
+                .collect(),
+            samples: self
+                .samples
+                .iter()
+                .filter(|(rela, _)| !skipped.contains(rela))
+                .map(|(rela, sample)| (rela.clone(), *sample))
+                .collect(),
+        }
+    }
 }
 
 /// At most this many paths are listed individually in a commit body.
@@ -123,6 +165,32 @@ impl StagedChange {
 /// A 10 000-file first sync would otherwise produce a commit message no tool
 /// can display and every `git log` would scroll for minutes.
 const MAX_LISTED_PATHS: usize = 50;
+
+/// The share of a removable profile's index a single change set may delete
+/// before keeper refuses to record it (Epic 70, AD-232, AD-48).
+///
+/// The volume gate at the top of a tick answers "is the drive here" once, and
+/// the walk that follows takes up to a minute on the folder this was written
+/// for (p90 5.3 s, max 60.8 s). A drive unplugged inside that window feeds the
+/// walk one `Removed` per tracked path, and the only guard on this path fired
+/// for an empty index alone. Half is the threshold because a user does not
+/// delete half of a 155 626-entry folder in one pass and a yanked drive
+/// deletes all of it; anything in between is a folder that needs a look, not a
+/// commit.
+pub const MASS_DELETION_FRACTION: f64 = 0.5;
+
+/// What a removable profile is told when a change set would delete most of
+/// its index. `{n}` is the deletion count.
+pub const MASS_DELETION_PREFIX: &str = "keeper will not record";
+pub const MASS_DELETION_SENTENCE: &str =
+    "deletions from a drive that may have been unplugged; recheck the folder";
+
+/// What a profile is told, after the path, when tier 4 refused a staging read
+/// (see [`stage_and_commit_skipping_torn`]). Raised by the engine, owned here
+/// beside the refusal that produces it.
+pub const TORN_READ_SENTENCE: &str =
+    "changed while keeper was reading it and was left out of this commit; \
+     it is recorded once it holds still";
 
 /// Stage `changes` and commit them on `HEAD`.
 ///
@@ -134,6 +202,12 @@ const MAX_LISTED_PATHS: usize = 50;
 ///
 /// `progress` observes each path as it is reached; see [`StagingSink`].
 ///
+/// Every non-LFS blob is read through tier 4 ([`read_verified`]); a file that
+/// changes under the read fails the whole commit with
+/// [`SyncError::Integrity`], exactly as any other read failure would. The
+/// engine, which has a next pass to defer the path to, uses
+/// [`stage_and_commit_skipping_torn`] instead.
+///
 /// See the module docs for the LFS precondition on `changes`.
 pub fn stage_and_commit(
     repo: &gix::Repository,
@@ -143,6 +217,66 @@ pub fn stage_and_commit(
     author: &gix::actor::Signature,
     substitutions: &BTreeMap<PathBuf, Vec<u8>>,
     progress: Option<StagingSink<'_>>,
+) -> Result<Option<gix::hash::ObjectId>> {
+    stage_and_commit_inner(
+        repo,
+        changes,
+        provenance,
+        profile,
+        author,
+        substitutions,
+        progress,
+        None,
+    )
+}
+
+/// [`stage_and_commit`] for a caller that can try again: a path whose tier-4
+/// read fails is left out of this commit and appended to `torn` instead of
+/// failing the call (Epic 70, AD-232).
+///
+/// The distinction is who pays for the refusal. A torn read is the gate's
+/// proof doing its job — the bytes were not one coherent version of the file
+/// — and the right response is to commit everything else now and this path
+/// once it holds still, which the engine's next pass does for free. Failing
+/// the commit would instead hold every other settled file hostage to the one
+/// still being written. A caller with no next pass keeps the strict form.
+///
+/// The commit's subject, body and index carry only what was staged: a torn
+/// path is absent from all three, and a change set that is nothing but torn
+/// paths records nothing (`Ok(None)`).
+#[allow(clippy::too_many_arguments)]
+pub fn stage_and_commit_skipping_torn(
+    repo: &gix::Repository,
+    changes: &StagedChange,
+    provenance: &Provenance,
+    profile: &SyncProfile,
+    author: &gix::actor::Signature,
+    substitutions: &BTreeMap<PathBuf, Vec<u8>>,
+    progress: Option<StagingSink<'_>>,
+    torn: &mut Vec<PathBuf>,
+) -> Result<Option<gix::hash::ObjectId>> {
+    stage_and_commit_inner(
+        repo,
+        changes,
+        provenance,
+        profile,
+        author,
+        substitutions,
+        progress,
+        Some(torn),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_and_commit_inner(
+    repo: &gix::Repository,
+    changes: &StagedChange,
+    provenance: &Provenance,
+    profile: &SyncProfile,
+    author: &gix::actor::Signature,
+    substitutions: &BTreeMap<PathBuf, Vec<u8>>,
+    progress: Option<StagingSink<'_>>,
+    mut torn: Option<&mut Vec<PathBuf>>,
 ) -> Result<Option<gix::hash::ObjectId>> {
     if changes.is_empty() {
         return Ok(None);
@@ -199,6 +333,34 @@ pub fn stage_and_commit(
             ),
         });
     }
+    // The same field failure from the other side, one epic later (Epic 70,
+    // F-GATE-1). The guard above fires for an index with NO entries — the
+    // checkout that never finished. A removable drive unplugged between the
+    // volume gate at the top of the tick and the end of a walk that can take a
+    // minute reaches here with a FULL index and every entry in
+    // `changes.deleted`, through the index↔worktree half of the walk
+    // (`EntryStatus::Change(Removed)`), and the guard above is inert for it.
+    // `do_push` re-checks the volume so the commit is not published in the
+    // same pass, but it is durable locally and ships the moment the drive
+    // returns, followed by an add-everything commit; a peer pulling between
+    // the two sees the folder emptied.
+    //
+    // Removable profiles only: on a fixed disk a mass deletion is a mass
+    // deletion, and refusing it would refuse the user. Same placement as the
+    // guard above, for the same reason — the index is written before the
+    // commit, so this has to run before the staging loop. Two integers.
+    if profile.removable
+        && sorted_len > 0
+        && changes.deleted.len() as f64 / sorted_len as f64 > MASS_DELETION_FRACTION
+    {
+        return Err(SyncError::Diverged {
+            profile: profile.name.clone(),
+            reason: format!(
+                "{MASS_DELETION_PREFIX} {} {MASS_DELETION_SENTENCE}",
+                changes.deleted.len()
+            ),
+        });
+    }
 
     // `files_done` counts paths this loop has finished, so a report names the
     // path being read next to the number already behind it — which is exactly
@@ -237,12 +399,33 @@ pub fn stage_and_commit(
                 // `gix::status` (and `git status`) call it unchanged without
                 // reading gigabytes back — exactly how git+LFS itself works.
                 Some(pointer) => (mode, pointer.clone()),
-                None => {
-                    let bytes = std::fs::read(&absolute).map_err(|source| {
-                        SyncError::io("read staged file", absolute.clone(), source)
-                    })?;
-                    (mode, bytes)
-                }
+                // Tier 4, on the read that matters (Epic 70, AD-232). This
+                // was a bare `std::fs::read`, which made every promise in
+                // `stability.rs` about verify-on-read a promise about the
+                // audit verb only: a writer that fooled tier 2 by pausing, or a
+                // file the ceiling forced through mid-rewrite, was committed
+                // as whatever bytes the read happened to see. Now the
+                // descriptor is `fstat`ed before and after the read and
+                // checked against the sample the gate cleared the path on.
+                None => match read_verified(&absolute, changes.samples.get(rela)) {
+                    Ok(bytes) => (mode, bytes),
+                    Err(SyncError::Integrity { .. }) if torn.is_some() => {
+                        // Not this pass. The engine's next walk samples it
+                        // again and commits it once it holds still.
+                        tracing::info!(
+                            profile = profile.name,
+                            path = %rela.display(),
+                            "the file changed while it was being read; \
+                             leaving it out of this commit"
+                        );
+                        if let Some(torn) = torn.as_deref_mut() {
+                            torn.push(rela.clone());
+                        }
+                        files_done += 1;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                },
             }
         } else {
             // A fifo, socket or device has no meaning on a peer's filesystem;
@@ -300,6 +483,25 @@ pub fn stage_and_commit(
         }
         // `BString: Borrow<BStr>`, so the callback's borrowed path is the key.
         index.remove_entries(|_, path, _| doomed.contains(path));
+    }
+
+    // From here on the change set is what was actually staged. A torn path is
+    // absent from the index mutations above, so it must be absent from the
+    // subject, the body and the "nothing to record" decision too — a commit
+    // titled "3 files added" that added two would be a record that lies, and a
+    // change set that was nothing but torn paths must not reach the commit
+    // below: on an unborn branch there is no parent tree to compare against,
+    // so it would create an empty root commit.
+    let staged_only;
+    let changes = match torn.as_deref() {
+        Some(skipped) if !skipped.is_empty() => {
+            staged_only = changes.without(skipped);
+            &staged_only
+        }
+        _ => changes,
+    };
+    if changes.is_empty() {
+        return Ok(None);
     }
 
     // `dangerously_push_entry` appended out of order and `remove_entries` left
@@ -771,6 +973,203 @@ mod tests {
         assert!(
             dir.path().join("a.txt").exists() && dir.path().join("b.txt").exists(),
             "nothing on disk is touched"
+        );
+    }
+
+    /// The innermost half of the F-GATE-1 fix (Epic 70): with a FULL index,
+    /// a change set deleting most of it is refused on a removable profile —
+    /// exactly the shape a drive unplugged mid-walk produces, which the
+    /// empty-index guard above cannot see. Asserted here past the engine's
+    /// own post-walk volume check, for the reason the test above gives.
+    #[test]
+    fn a_mass_deletion_is_refused_on_removable_media_only_and_never_staged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        let files: Vec<(String, String)> = (0..4)
+            .map(|i| (format!("f{i}.txt"), format!("{i}")))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.as_str()))
+            .collect();
+        let head = commit_files(dir.path(), &repo, &borrowed).expect("a commit");
+        let mut removable = profile();
+        removable.removable = true;
+
+        // 3 of 4 — over the fraction.
+        let most = StagedChange {
+            deleted: (0..3).map(|i| PathBuf::from(format!("f{i}.txt"))).collect(),
+            ..Default::default()
+        };
+        let err = stage_and_commit(
+            &repo,
+            &most,
+            &provenance(),
+            &removable,
+            &signature(),
+            &no_lfs(),
+            None,
+        )
+        .expect_err("most of the index at once is a drive that may be gone");
+        assert!(matches!(err, SyncError::Diverged { .. }), "got {err:?}");
+        assert!(
+            err.to_string().contains(&format!(
+                "{MASS_DELETION_PREFIX} 3 {MASS_DELETION_SENTENCE}"
+            )),
+            "got {err}"
+        );
+        assert_eq!(
+            super::super::repo::head_commit_id(&repo).expect("head"),
+            Some(head)
+        );
+        assert_eq!(
+            repo.index_or_empty().expect("index").entries().len(),
+            4,
+            "the guard has to stop the staging, not merely the commit"
+        );
+
+        // Exactly half is not over it: the threshold is "more than", so a
+        // two-file folder losing one file is still a deletion.
+        let half = StagedChange {
+            deleted: (0..2).map(|i| PathBuf::from(format!("f{i}.txt"))).collect(),
+            ..Default::default()
+        };
+        for (name, _) in &files[..2] {
+            std::fs::remove_file(dir.path().join(name)).expect("remove");
+        }
+        assert!(stage_and_commit(
+            &repo,
+            &half,
+            &provenance(),
+            &removable,
+            &signature(),
+            &no_lfs(),
+            None,
+        )
+        .expect("half is not most")
+        .is_some());
+
+        // And on a fixed disk the same shape is the user's deletion.
+        let rest = StagedChange {
+            deleted: (2..4).map(|i| PathBuf::from(format!("f{i}.txt"))).collect(),
+            ..Default::default()
+        };
+        for (name, _) in &files[2..] {
+            std::fs::remove_file(dir.path().join(name)).expect("remove");
+        }
+        assert!(stage_and_commit(
+            &repo,
+            &rest,
+            &provenance(),
+            &profile(),
+            &signature(),
+            &no_lfs(),
+            None,
+        )
+        .expect("a fixed disk deleting everything deleted everything")
+        .is_some());
+    }
+
+    /// Tier 4 at the staging read (Epic 70, AD-232): a descriptor that does
+    /// not match the sample the gate cleared the path on is refused before a
+    /// byte is read. The strict form fails the commit; the skipping form
+    /// leaves the path out, names it, and records only what it staged.
+    #[test]
+    fn a_path_whose_sample_no_longer_matches_is_torn_and_handled_by_the_form_asked_for() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = gix::init(dir.path()).expect("init");
+        std::fs::write(dir.path().join("quiet.txt"), "still").expect("write");
+        std::fs::write(dir.path().join("moving.txt"), "rewritten since").expect("write");
+        let quiet = crate::stability::FileSample::of(&dir.path().join("quiet.txt"))
+            .expect("stat")
+            .expect("present");
+        let stale = crate::stability::FileSample { size: 1, ..quiet };
+        let mut changes = StagedChange {
+            added: vec![PathBuf::from("quiet.txt"), PathBuf::from("moving.txt")],
+            ..Default::default()
+        };
+        changes.samples.insert(PathBuf::from("quiet.txt"), quiet);
+        changes.samples.insert(PathBuf::from("moving.txt"), stale);
+
+        let err = stage_and_commit(
+            &repo,
+            &changes,
+            &provenance(),
+            &profile(),
+            &signature(),
+            &no_lfs(),
+            None,
+        )
+        .expect_err("the strict form fails the commit on a torn read");
+        assert!(matches!(err, SyncError::Integrity { .. }), "got {err:?}");
+        assert_eq!(
+            super::super::repo::head_commit_id(&repo).expect("head"),
+            None,
+            "nothing was committed"
+        );
+
+        let mut torn = Vec::new();
+        let id = stage_and_commit_skipping_torn(
+            &repo,
+            &changes,
+            &provenance(),
+            &profile(),
+            &signature(),
+            &no_lfs(),
+            None,
+            &mut torn,
+        )
+        .expect("the skipping form commits the rest")
+        .expect("the quiet file is a commit");
+        assert_eq!(torn, vec![PathBuf::from("moving.txt")]);
+        let commit = repo.find_commit(id).expect("commit");
+        let tree = commit.tree().expect("tree");
+        assert!(tree
+            .lookup_entry_by_path("quiet.txt")
+            .expect("lookup")
+            .is_some());
+        assert!(
+            tree.lookup_entry_by_path("moving.txt")
+                .expect("lookup")
+                .is_none(),
+            "a torn path is absent from the tree"
+        );
+        let message = commit.message_raw().expect("message").to_string();
+        assert!(
+            message.starts_with("sync(docs@work laptop): 1 added\n"),
+            "the subject counts what was staged, not what was asked: {message}"
+        );
+        assert!(
+            !message.contains("moving.txt"),
+            "and the body does not name it either: {message}"
+        );
+
+        // Nothing but torn paths records nothing, even on an unborn branch.
+        let only_torn = StagedChange {
+            added: vec![PathBuf::from("moving.txt")],
+            samples: changes.samples.clone(),
+            ..Default::default()
+        };
+        let mut torn = Vec::new();
+        let before = super::super::repo::head_commit_id(&repo).expect("head");
+        assert_eq!(
+            stage_and_commit_skipping_torn(
+                &repo,
+                &only_torn,
+                &provenance(),
+                &profile(),
+                &signature(),
+                &no_lfs(),
+                None,
+                &mut torn,
+            )
+            .expect("no error"),
+            None
+        );
+        assert_eq!(torn, vec![PathBuf::from("moving.txt")]);
+        assert_eq!(
+            super::super::repo::head_commit_id(&repo).expect("head"),
+            before
         );
     }
 

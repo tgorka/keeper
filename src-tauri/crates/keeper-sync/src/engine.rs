@@ -161,6 +161,14 @@ pub struct EngineCounters {
     /// that stops a walk can therefore be pinned by a test that counts ZERO
     /// rather than by one that eyeballs `status walk finished`.
     pub status_walks: u64,
+    /// LFS prune plans run for this profile — [`Engine::prune_lfs_store`]
+    /// reaching `lfs::prune::plan`, whether or not it released anything.
+    ///
+    /// Counted for the same reason `status_walks` is: a plan is a walk over
+    /// every tracked path, and AD-231 says it runs only on a pass that moved
+    /// an LFS unit or on the hourly look — never on every successful pull.
+    /// "This pull ran no prune" is a claim only a count can pin.
+    pub lfs_prune_plans: u64,
 }
 
 /// How safe one recorded file already is, read locally (Story 41.6, FR-138).
@@ -450,6 +458,31 @@ const POLL_WALK_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// A profile with no live watcher sweeps on every poll: there is nothing to
 /// trust in that case, and correctness outranks the cost.
 const UNTRACKED_SWEEP_INTERVAL: Duration = Duration::from_secs(900);
+
+/// How many watcher-named paths a profile keeps between walks (AD-227).
+///
+/// The watcher already names every path that changed, and the walk already
+/// accepts pathspecs; this set is where the two meet. Bounded the way an
+/// fsmonitor cookie is: past the cap the set is discarded and the next walk
+/// looks at the whole index, because a list this long is no longer cheaper
+/// than the index scan it stands in for, and a burst that large is what the
+/// full walk exists for anyway. 4 096 is well past any real batch — hesperia's
+/// hour of 666 walks was driven by *one* segment file — and small enough that
+/// the pathspec search stays a string compare per entry.
+const WATCH_PATHS_CAP: usize = 4_096;
+
+/// The least time between two walks that a watcher wake drove.
+///
+/// A recorder writing continuously delivers one event per debounce window,
+/// and before this every one of them set `scan_due` on the next 1 Hz tick:
+/// measured on hesperia, 666 walks of 155 626 entries in one hour to learn,
+/// once a second, that one file was still growing. The floor is on the gap
+/// between wake-driven walks only; a paced walk and a settle deadline keep
+/// their own clocks. A wake that arrives inside the floor is kept, not
+/// dropped, so the walk it asked for still happens — later. Capped by the
+/// profile's own settle window (see [`Engine::wake_walk_floor_ms`]), so a
+/// folder whose files settle in two seconds is not made to wait five.
+const WAKE_WALK_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often a folder's transfer scratch is swept.
 ///
@@ -741,6 +774,25 @@ const WATCH_REARM_INTERVAL_MS: i64 = 60_000;
 /// its own prefix is the only way to tell our message from someone else's.
 const WATCH_DEGRADED_PREFIX: &str = "keeper cannot watch this folder for changes";
 
+/// The refusal when a merge in progress cannot be undone (Story 70.3, AD-229).
+///
+/// Raised by [`Engine::commit_local`] when `MERGE_HEAD` survives a
+/// `merge --abort`: a commit taken over an unmerged index silently drops the
+/// contested paths from the tree, so nothing is committed until a human has
+/// looked. The path of the file follows the sentence.
+pub const MERGE_IN_PROGRESS_SENTENCE: &str =
+    "a merge is still in progress in this folder and keeper could not undo it; run `git merge --abort` there";
+
+/// The opening words of the refusal when the matrix left a path unmerged; the
+/// path follows.
+pub const MERGE_UNRESOLVED_PREFIX: &str = "the merge left a path keeper could not resolve: ";
+
+/// How many copies of one path one second may hold before the pass refuses.
+///
+/// Two is the real case (a pass whose merge was undone and retried within the
+/// stamp's second); the cap only stops a loop from filling a disk.
+const CONFLICT_COPY_ORDINALS: u32 = 64;
+
 /// How many watch events [`Engine::watch_tap`] buffers for a slow subscriber.
 ///
 /// A save storm — a branch checkout, an editor rewriting a directory — delivers
@@ -851,6 +903,50 @@ enum ProfileWatch {
     },
 }
 
+/// What one profile's watcher has said since the last walk (AD-227).
+///
+/// Three facts that used to be one boolean. `due` is that boolean — "walk
+/// now" — and keeps its exact lifetime: set by a surviving event, cleared by
+/// the walk that answers it. `paths` is what the boolean threw away: the
+/// repository-relative path of every surviving event, which the walk takes as
+/// `:(literal)` includes so it costs one `lstat` per named path instead of one
+/// per index entry. `overflow` is the fsmonitor cookie's escape: the list is
+/// not trustworthy — more than [`WATCH_PATHS_CAP`] paths, a rescan of the
+/// root, an event outside the folder, a wake that named nothing — and the next
+/// walk must look at the whole index.
+///
+/// `last_walk_ms` is the wake floor's clock: when a *due* wake was last
+/// answered, on the platform clock so a test can move it. See
+/// [`WAKE_WALK_MIN_INTERVAL`].
+#[derive(Debug, Default)]
+struct WatchWake {
+    due: bool,
+    paths: HashSet<PathBuf>,
+    overflow: bool,
+    last_walk_ms: Option<i64>,
+}
+
+impl WatchWake {
+    /// Remember one repository-relative path, or give up on the list.
+    fn name(&mut self, rela: PathBuf) {
+        if self.overflow {
+            return;
+        }
+        if self.paths.len() >= WATCH_PATHS_CAP && !self.paths.contains(&rela) {
+            self.paths.clear();
+            self.overflow = true;
+            return;
+        }
+        self.paths.insert(rela);
+    }
+
+    /// The list is no longer a substitute for the index: look at everything.
+    fn widen(&mut self) {
+        self.paths.clear();
+        self.overflow = true;
+    }
+}
+
 /// How often a walk that is taking time says where it has got to.
 ///
 /// The pace is the whole design. A walk over a small folder finishes inside one
@@ -956,8 +1052,35 @@ pub struct Engine {
     /// A transient error is retried and, on its own, is not worth alarming
     /// anyone about. A transient error that never stops recurring is a profile
     /// that has silently stopped syncing, and reporting that one as healthy is
-    /// the dishonesty this counter exists to prevent. Reset by any success.
+    /// the dishonesty this counter exists to prevent.
+    ///
+    /// Incremented where a unit or a pass fails ([`Engine::record_failure`])
+    /// and reset where a **unit or a pass succeeds** —
+    /// [`Engine::note_unit_succeeded`], from `drain`'s `complete` site and from
+    /// [`Engine::mark_synced`] — and nowhere else. It used to be reset by
+    /// `tick`'s `Ok` arm, and `tick_profile` returns `Ok` after a drain that
+    /// rescheduled a failed unit, so the same tick that counted a failure
+    /// wiped the count: the threshold below was unreachable for any failure
+    /// raised inside a drain, which is every unit failure (F-engine-2,
+    /// F-db-2). hesperia's three profiles had 615, 549 and 559 attempts on
+    /// their pull units and no escalation line.
     transient_failures: Mutex<HashMap<String, u32>>,
+    /// Profiles currently `Offline`, as far as the log has been told.
+    ///
+    /// The sticky half of the offline edge: `sync offline` is written when a
+    /// profile enters this set and `sync reachable again` when it leaves, once
+    /// each, however many attempts happen in between (F-db-3). The snapshot's
+    /// state word cannot carry this edge, because [`Engine::publish`] flips it
+    /// to `Syncing` the moment a retry starts moving, which would read as
+    /// "reachable again" on every attempt against a remote that is not. The
+    /// same shape as [`Engine::task_faults`], for the same reason.
+    offline: Mutex<HashSet<String>>,
+    /// How long [`Engine::do_pull`] waits for a fetch, in milliseconds.
+    ///
+    /// [`git::fetch::FETCH_DEADLINE`] outside a test; an atomic rather than a
+    /// const so a test can prove the deadline against a socket that never
+    /// answers without waiting ten minutes for it.
+    fetch_deadline_ms: AtomicU64,
     /// Task ids whose last real run failed — the sticky half of
     /// [`Engine::note_task_outcome`]'s once-per-onset rule.
     ///
@@ -1100,14 +1223,18 @@ pub struct Engine {
     /// second copy of this policy on the daemon side. `run` tears them all
     /// down on its way out.
     watchers: Mutex<HashMap<String, ProfileWatch>>,
-    /// Profiles whose watcher has reported activity that no walk has answered.
+    /// What each profile's watcher has reported that no walk has answered
+    /// (AD-227).
     ///
     /// Separate from `watchers` because a wake has to survive its watcher and
     /// its tick: a tick that drains journal work instead of walking must not
     /// swallow one, or the change it announced goes back to waiting for the
-    /// paced poll — which is the entire latency bug. Cleared by the walk that
-    /// answers it.
-    watch_wake: Mutex<HashSet<String>>,
+    /// paced poll — which is the entire latency bug. The wake half is cleared
+    /// by the walk that answers it; the paths are consumed by the walk that
+    /// takes them as includes, which is usually the same walk and, when a
+    /// claim was refused, the next one. Also the clock the wake floor reads:
+    /// see [`WatchWake`].
+    watch_paths: Mutex<HashMap<String, WatchWake>>,
     /// LFS credentials minted by `git-lfs-authenticate` over ssh, keyed by
     /// [`lfs::ssh::SshRemote::cache_key`] (Story 34.17).
     ///
@@ -1124,6 +1251,22 @@ pub struct Engine {
     /// hours is not worth a row in `sync.db`, and keeping it out of there keeps
     /// it out of a backup.
     lfs_ssh_credentials: Mutex<HashMap<String, CachedSshAnswer>>,
+    /// Profiles for which an LFS upload unit completed since their last prune
+    /// (Story 70.4, AD-231).
+    ///
+    /// Set by [`Engine::note_unit_synced`], consumed by [`Engine::mark_synced`].
+    /// The prune plan walks every tracked path, and a successful pull that
+    /// moved no LFS unit cannot have made any object newly releasable — the
+    /// only thing that can is a confirmation, and confirmations arrive from
+    /// exactly one upload leg and one audit verb. So a pass without one runs no
+    /// plan; measured on hesperia that was a 155 626-path plan re-opening the
+    /// index per path on every one of the pull-only passes a poll produces.
+    lfs_moved: Mutex<HashSet<String>>,
+    /// When each profile's LFS store may next be pruned without a unit having
+    /// moved (Story 70.4). [`Self::sweep_is_due`]'s shape: the hourly look that
+    /// covers what the flag cannot see — the remote audit's memos, and a flag
+    /// lost to a restart.
+    next_prune_ms: Mutex<HashMap<String, i64>>,
     /// The fan-out behind [`Engine::watch_tap`], created by the first caller.
     ///
     /// A `OnceLock` rather than a channel built in [`Engine::open`] because
@@ -1394,6 +1537,8 @@ impl Engine {
             collapsed_reported: Mutex::new(HashSet::new()),
             labels_backfilled: Mutex::new(HashSet::new()),
             transient_failures: Mutex::new(HashMap::new()),
+            offline: Mutex::new(HashSet::new()),
+            fetch_deadline_ms: AtomicU64::new(git::fetch::FETCH_DEADLINE.as_millis() as u64),
             task_faults: Mutex::new(HashSet::new()),
             task_runs_in_flight: tokio::sync::watch::Sender::new(HashSet::new()),
             next_scan_ms: Mutex::new(HashMap::new()),
@@ -1423,8 +1568,10 @@ impl Engine {
             transferred: Mutex::new(HashMap::new()),
             session_rate: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
-            watch_wake: Mutex::new(HashSet::new()),
+            watch_paths: Mutex::new(HashMap::new()),
             lfs_ssh_credentials: Mutex::new(HashMap::new()),
+            lfs_moved: Mutex::new(HashSet::new()),
+            next_prune_ms: Mutex::new(HashMap::new()),
             watch_tap: OnceLock::new(),
             finished_tap: OnceLock::new(),
             counters: Mutex::new(HashMap::new()),
@@ -1484,23 +1631,16 @@ impl Engine {
     /// * a profile whose watcher is not live, because then there is no second
     ///   source for a new file at all.
     ///
-    /// Records the sweep as taken, so this is called exactly once per poll.
-    fn poll_walk_policy(&self, profile_id: &str) -> git::repo::WalkPolicy {
-        let watched = matches!(
-            Self::lock(&self.watchers).get(profile_id),
-            Some(ProfileWatch::Live { .. })
-        );
-        let now = Instant::now();
-        let mut swept = Self::lock(&self.untracked_sweep);
-        let due = match swept.get(profile_id) {
-            None => true,
-            Some(last) => now.saturating_duration_since(*last) >= UNTRACKED_SWEEP_INTERVAL,
-        };
-        if !watched || due {
-            swept.insert(profile_id.to_owned(), now);
-            return git::repo::WalkPolicy::full();
-        }
-        git::repo::WalkPolicy::tracked_only()
+    /// And the index-only question is asked only where the watcher pointed
+    /// (AD-227): the paths [`Self::fold_watch_events`] kept become the walk's
+    /// includes, unless the list overflowed, in which case the whole index is
+    /// scanned exactly as before. The poll is a listing, so it never narrows
+    /// further than the watcher's own list: with nothing named it looks at the
+    /// whole index, which is what a listing is for.
+    ///
+    /// Records the sweep as taken, so this is called exactly once per walk.
+    fn poll_walk_policy(&self, profile: &SyncProfile) -> git::repo::WalkPolicy {
+        self.walk_policy(profile, false)
     }
 
     /// What the commit leg asks of its walk.
@@ -1515,6 +1655,11 @@ impl Engine {
     /// `elapsed_ms=9299355` — two and a half hours against a busy USB volume —
     /// to find twelve modified files, which the index-only question answers in
     /// under two seconds.
+    ///
+    /// And, unlike the poll, it narrows to the gate's held paths as well as
+    /// the watcher's (see [`Self::walk_policy`]): a walk this leg runs for a
+    /// settle deadline has nothing new from the watcher and exactly one job —
+    /// observe the held paths a second time.
     fn commit_walk_policy(&self, profile: &SyncProfile) -> git::repo::WalkPolicy {
         // The precise question, not the ordinary wake: a tracked file being
         // written sets that too, and the index-only walk answers it in
@@ -1522,12 +1667,64 @@ impl Engine {
         //
         // Consumed rather than merely read — the scan this grants is the one
         // that answers it, and a flag left set makes every later pass pay again
-        // for one file that appeared once.
+        // for one file that appeared once. The path list goes with it: a full
+        // walk answers every path on it.
         if Self::lock(&self.untracked_appeared).remove(&profile.id) {
             Self::lock(&self.untracked_sweep).insert(profile.id.clone(), Instant::now());
+            self.take_watch_paths(&profile.id);
             return git::repo::WalkPolicy::full();
         }
-        self.poll_walk_policy(&profile.id)
+        self.walk_policy(profile, true)
+    }
+
+    /// The one arithmetic behind both policies.
+    ///
+    /// The list is consumed here either way — this policy is what the walk
+    /// runs with, so a walk that took the list is the walk that answers it,
+    /// and the full walks consume it too: a sweep of the whole tree answers
+    /// every path on it. `with_held` adds every path the gate is still
+    /// holding. The gate needs a second observation to clear a settling
+    /// path, and the walk is the only observer; a narrowed walk that did not
+    /// name a held path would report nothing for it, and
+    /// `collect_stable_changes` would then `retain` it away — the episode
+    /// forgotten, the file never committed, which is the exact shape of the
+    /// bug the wake was invented to fix. The gate holds only what is
+    /// mid-episode, so this is a handful. An empty list narrows nothing: the
+    /// whole index, as before.
+    fn walk_policy(&self, profile: &SyncProfile, with_held: bool) -> git::repo::WalkPolicy {
+        let watched = matches!(
+            Self::lock(&self.watchers).get(&profile.id),
+            Some(ProfileWatch::Live { .. })
+        );
+        let now = Instant::now();
+        let mut swept = Self::lock(&self.untracked_sweep);
+        let due = match swept.get(&profile.id) {
+            None => true,
+            Some(last) => now.saturating_duration_since(*last) >= UNTRACKED_SWEEP_INTERVAL,
+        };
+        let named = self.take_watch_paths(&profile.id);
+        if !watched || due {
+            swept.insert(profile.id.clone(), now);
+            return git::repo::WalkPolicy::full();
+        }
+        drop(swept);
+        let Some(mut include) = named else {
+            return git::repo::WalkPolicy::tracked_only();
+        };
+        if with_held {
+            if let Some(gate) = Self::lock(&self.gates).get(&profile.id) {
+                include.extend(gate.export().into_iter().filter_map(|(absolute, _)| {
+                    absolute
+                        .strip_prefix(&profile.local_path)
+                        .ok()
+                        .map(Path::to_path_buf)
+                }));
+            }
+        }
+        let mut include: Vec<PathBuf> = include.into_iter().collect();
+        include.sort_unstable();
+        include.dedup();
+        git::repo::WalkPolicy::tracked_only().including(include)
     }
 
     /// Report a walk's progress on every item, for tests.
@@ -1720,6 +1917,8 @@ impl Engine {
         Self::lock(&self.gates).remove(id);
         Self::lock(&self.next_scan_ms).remove(id);
         Self::lock(&self.next_sweep_ms).remove(id);
+        Self::lock(&self.next_prune_ms).remove(id);
+        Self::lock(&self.lfs_moved).remove(id);
         Self::lock(&self.next_release_ms).remove(id);
         Self::lock(&self.release_cursor).remove(id);
         self.drop_watcher(id);
@@ -1760,6 +1959,7 @@ impl Engine {
             // a request to look now.
             Self::lock(&self.next_scan_ms).remove(id);
             Self::lock(&self.next_sweep_ms).remove(id);
+            Self::lock(&self.next_prune_ms).remove(id);
             Self::lock(&self.next_release_ms).remove(id);
             Self::lock(&self.release_cursor).remove(id);
         }
@@ -2194,11 +2394,14 @@ impl Engine {
                 continue;
             }
             self.sweep_scratch_if_due(&profile).await;
-            match self.tick_profile(&profile).await {
-                Ok(()) => {
-                    Self::lock(&self.transient_failures).remove(&profile.id);
-                }
-                Err(err) => self.record_failure(&profile, &err),
+            // `Ok` here is not success. `tick_profile` returns `Ok` after a
+            // drain that rescheduled a failed unit, after a volume gate that
+            // skipped the profile, after a reservation it could not take — so
+            // an `Ok` arm that reset the failure counter wiped, on the same
+            // tick, the count `record_failure` had just made (F-engine-2). The
+            // counter is reset where a unit completes, and only there.
+            if let Err(err) = self.tick_profile(&profile).await {
+                self.record_failure(&profile, &err);
             }
         }
         Ok(())
@@ -3366,6 +3569,16 @@ impl Engine {
             // A watcher on a detached drive is watching a path that no longer
             // exists; the tick after the volume returns arms a fresh one.
             self.drop_watcher(&profile.id);
+            // And so is every settle window (Epic 70, F-GATE-8). An episode
+            // measured against a clock from before the detach says nothing
+            // about the bytes that come back with the drive — they may have
+            // been rewritten on another machine in between — so the gate
+            // forgets them all, and the durable rows go too, or `ensure_gate`
+            // would re-import them on re-attach. Once per absent tick rather
+            // than on the edge: the `DELETE` is a primary-key prefix seek that
+            // matches nothing after the first, and it is what makes a process
+            // restarted while the drive is out come back clean as well.
+            self.forget_settle_windows(&profile.id)?;
             return Ok(());
         }
 
@@ -3574,7 +3787,8 @@ impl Engine {
     }
 
     /// Say, once an hour, how much of this folder git is carrying as plain
-    /// blobs that today's threshold would have sent to LFS.
+    /// blobs that today's threshold would have sent to LFS — and whether any
+    /// control file in it is pointer text (Story 70.4, AD-230).
     ///
     /// The threshold moves — this folder went from 4 MiB to 0.25 MB — and a
     /// commit cannot change its mind afterwards. So a drive quietly accumulates
@@ -3583,6 +3797,12 @@ impl Engine {
     /// suspect something. Reported and not fixed: converting them means
     /// rewriting history, which is not a thing keeper does to a folder two
     /// people are syncing.
+    ///
+    /// The control-file check rides here rather than the commit leg because
+    /// this is the site that already holds the tracked list inside a blocking
+    /// task once an hour; the commit leg would pay an index read per pass to
+    /// learn the same handful of names. It runs **first**, and is not part of
+    /// the footprint number, so a memo of that number (AD-233) cannot hide it.
     async fn report_blobs_over_threshold(&self, profile: &SyncProfile) {
         let root = profile.local_path.clone();
         let threshold = profile.lfs_threshold_bytes;
@@ -3594,6 +3814,7 @@ impl Engine {
             let Ok(tracked) = git::repo::tracked_paths(&repo) else {
                 return;
             };
+            Self::report_pointerised_control_files(&name, &root, &tracked);
             let (count, bytes) =
                 crate::footprint::blobs_over_threshold(&repo, &root, &tracked, threshold);
             if count == 0 {
@@ -3611,6 +3832,34 @@ impl Engine {
         .await;
     }
 
+    /// One anomaly per tracked control file whose worktree bytes are an LFS
+    /// pointer, naming the path and the subtree it governs (Story 70.4).
+    ///
+    /// The routing doors keep keeper from making one; this is the line that
+    /// says one exists — from a hand-run `git lfs track`, an older keeper, or
+    /// a peer. Without it the state announces itself only as a flood of
+    /// gitoxide warnings (1 314 669 on hesperia) that no shipped log filter
+    /// keeps, while `filter=lfs` routing is void below the file. Synchronous
+    /// and free of the engine so the blocking task above can call it.
+    fn report_pointerised_control_files(profile: &str, root: &Path, tracked: &[PathBuf]) {
+        for found in lfs::stage::pointerised_control_files(root, tracked) {
+            let governs = if found.governs.as_os_str().is_empty() {
+                "the whole folder".to_owned()
+            } else {
+                found.governs.display().to_string()
+            };
+            crate::anomaly::Anomaly {
+                what: "a control file git reads unfiltered is LFS pointer text",
+                measured: format!("path={} governs={governs}", found.path.display()),
+                expected: "the file's own rules; a control file is never routed through LFS",
+                consequence: "every rule the file carried is void for what it governs until it \
+                              is restored from history or the LFS store; new files there may be \
+                              committed as plain blobs",
+            }
+            .report(profile);
+        }
+    }
+
     fn sweep_is_due(&self, profile: &SyncProfile) -> bool {
         let now = self.platform.now_ms();
         let mut due = Self::lock(&self.next_sweep_ms);
@@ -3621,6 +3870,39 @@ impl Engine {
         }
         due.insert(profile.id.clone(), now.saturating_add(SWEEP_EVERY_MS));
         true
+    }
+
+    /// Whether this profile's LFS store may be pruned on this success edge
+    /// without an upload having moved (Story 70.4, AD-231).
+    ///
+    /// [`Self::release_is_due`]'s shape and [`RELEASE_LOOK_EVERY_MS`]'s
+    /// interval: **first sight arms and declines**, so a success edge that
+    /// moved no LFS unit never runs a plan just because the process is young —
+    /// that is the acceptance line, and a plan is a walk over every tracked
+    /// path. The look exists for what the `lfs_moved` flag cannot see: the
+    /// remote audit's memos, and a flag lost to a restart, both of which can
+    /// wait an hour. [`Self::prune_lfs_store`] re-arms the clock whenever it
+    /// runs, so a flag-driven prune does not leave the look due a moment later.
+    fn prune_is_due(&self, profile: &SyncProfile) -> bool {
+        let now = self.platform.now_ms();
+        let armed = now.saturating_add(RELEASE_LOOK_EVERY_MS);
+        let mut due = Self::lock(&self.next_prune_ms);
+        match due.get(&profile.id) {
+            None => {
+                due.insert(profile.id.clone(), armed);
+                false
+            }
+            Some(at) if now >= *at => {
+                due.insert(profile.id.clone(), armed);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Consume the "an LFS upload completed" flag for one profile.
+    fn take_lfs_moved(&self, profile_id: &str) -> bool {
+        Self::lock(&self.lfs_moved).remove(profile_id)
     }
 
     /// Whether this profile's release candidates may be looked at now (Story
@@ -3725,7 +4007,10 @@ impl Engine {
     /// left armed rather than removed.
     fn scan_due(&self, profile: &SyncProfile) -> bool {
         let paced = self.scan_is_due(profile) && self.sync_poll_permits(profile);
-        paced || self.watch_wake_pending(&profile.id) || self.settle_window_elapsed(profile)
+        if paced {
+            self.widen_watch_paths(&profile.id);
+        }
+        paced || self.watch_wake_pending(profile) || self.settle_window_elapsed(profile)
     }
 
     /// Whether any path this profile is holding could be stable by now.
@@ -3960,6 +4245,15 @@ impl Engine {
         let tap = self.watch_tap.get();
         let mut tapped: Vec<PathBuf> = Vec::new();
         let mut wake = false;
+        // What this batch names, to be merged into `watch_paths` once the gate
+        // lock is released (never both locks at once). `widen` is every reason
+        // the list cannot stand in for the index: the root itself — how
+        // `fold_batch` spells a queue overflow and how the periodic sweep
+        // speaks — a path outside the folder, or the bare `.git` node, which
+        // is not an index key and is "worth one look" at everything.
+        let mut named: Vec<PathBuf> = Vec::new();
+        let mut widen = false;
+        let now = self.platform.now_ms();
         // Whether any surviving event named a path the index does not carry.
         //
         // This is what decides whether the next commit pass owes a directory
@@ -3981,26 +4275,55 @@ impl Engine {
                 if gate.is_excluded(&path) {
                     continue;
                 }
-                wake = true;
+                // The wake floor (AD-227). A path the gate already holds with
+                // a deadline still ahead does not need a walk now: the walk
+                // that deadline schedules — `settle_window_elapsed` — is the
+                // one that can change its verdict, and a walk before it can
+                // only learn the file is still being written. This is what a
+                // recorder's 500 ms event stream used to buy: one full walk
+                // per tick, for hours, to be told "still growing". A
+                // close-write is the exception: it shortens the deadline the
+                // gate holds to `CLOSE_WRITE_SETTLE_MS`, and only the next
+                // observation folds it in, so it must be allowed to ask.
+                let held = !close_write
+                    && gate
+                        .holds_until_ms(&path, now)
+                        .is_some_and(|until| until > now);
+                if !held {
+                    wake = true;
+                }
                 if close_write {
                     gate.note_close_write(&path);
                 }
-                if !appeared {
-                    if index.is_none() {
-                        index = self
-                            .open_repo(profile)
-                            .ok()
-                            .and_then(|repo| repo.index_or_empty().ok());
-                    }
-                    appeared = match (&index, path.strip_prefix(&profile.local_path)) {
-                        (Some(index), Ok(rela)) => {
-                            let key = gix::path::into_bstr(rela);
-                            index.entry_index_by_path(key.as_ref()).is_err()
+                match path.strip_prefix(&profile.local_path) {
+                    Ok(rela)
+                        if !rela.as_os_str().is_empty()
+                            && rela.components().next()
+                                != Some(Component::Normal(".git".as_ref())) =>
+                    {
+                        if !appeared {
+                            if index.is_none() {
+                                index = self
+                                    .open_repo(profile)
+                                    .ok()
+                                    .and_then(|repo| repo.index_or_empty().ok());
+                            }
+                            appeared = match &index {
+                                Some(index) => {
+                                    let key = gix::path::into_bstr(rela);
+                                    index.entry_index_by_path(key.as_ref()).is_err()
+                                }
+                                // No index to ask: assume the scan is owed
+                                // rather than skip a new file.
+                                None => true,
+                            };
                         }
-                        // No index to ask, or a path outside the folder: assume
-                        // the scan is owed rather than skip a new file.
-                        _ => true,
-                    };
+                        named.push(rela.to_path_buf());
+                    }
+                    _ => {
+                        widen = true;
+                        appeared = true;
+                    }
                 }
                 // Only the tap wants a path beyond this point, so an untapped
                 // engine — every daemon, every other test — moves each survivor
@@ -4020,9 +4343,18 @@ impl Engine {
         }
         // A batch that was entirely excluded is a batch that says nothing: it
         // must leave `scan_due` exactly as it found it, or the filter above buys
-        // nothing.
-        if wake {
-            self.note_watch_wake(&profile.id);
+        // nothing. A batch held entirely by the floor still names its paths,
+        // so the walk the deadline schedules knows where to look.
+        if widen || !named.is_empty() {
+            let mut wakes = Self::lock(&self.watch_paths);
+            let entry = wakes.entry(profile.id.clone()).or_default();
+            entry.due |= wake;
+            if widen {
+                entry.widen();
+            }
+            for rela in named {
+                entry.name(rela);
+            }
         }
         if appeared {
             Self::lock(&self.untracked_appeared).insert(profile.id.clone());
@@ -4147,24 +4479,116 @@ impl Engine {
         }
     }
 
-    /// The watcher reported something no walk has answered yet.
+    /// The watcher reported something no walk has answered yet, without
+    /// saying what.
+    ///
+    /// The unnamed door: [`Self::wake_now`] and the tests take it. A wake that
+    /// names nothing must be answered by a walk that looks at everything, so
+    /// it widens whatever list the named door has been building.
     fn note_watch_wake(&self, profile_id: &str) {
-        Self::lock(&self.watch_wake).insert(profile_id.to_owned());
+        let mut wakes = Self::lock(&self.watch_paths);
+        let wake = wakes.entry(profile_id.to_owned()).or_default();
+        wake.due = true;
+        wake.widen();
     }
 
-    fn watch_wake_pending(&self, profile_id: &str) -> bool {
-        Self::lock(&self.watch_wake).contains(profile_id)
+    /// Whether a wake is set and the floor has passed since the last walk it
+    /// drove. A wake held by the floor stays set — the next tick asks again.
+    fn watch_wake_pending(&self, profile: &SyncProfile) -> bool {
+        let wakes = Self::lock(&self.watch_paths);
+        let Some(wake) = wakes.get(&profile.id) else {
+            return false;
+        };
+        if !wake.due {
+            return false;
+        }
+        let floor = self.wake_walk_floor_ms(profile);
+        wake.last_walk_ms
+            .is_none_or(|last| self.platform.now_ms().saturating_sub(last) >= floor)
+    }
+
+    /// The least gap between two wake-driven walks of this folder:
+    /// [`WAKE_WALK_MIN_INTERVAL`], or the profile's settle window when that is
+    /// shorter — a window the walk cannot be later than without holding the
+    /// file past the point it settled.
+    fn wake_walk_floor_ms(&self, profile: &SyncProfile) -> i64 {
+        let floor = WAKE_WALK_MIN_INTERVAL
+            .as_millis()
+            .min(u128::from(profile.effective_settle_ms()));
+        i64::try_from(floor).unwrap_or(i64::MAX)
     }
 
     /// A walk has now answered whatever the watcher reported.
+    ///
+    /// Clears the wake and starts the floor's clock — only when a wake was
+    /// actually due, so a paced walk does not hold back the next wake. The
+    /// paths are left for [`Self::take_watch_paths`]: this is called at the
+    /// top of `scan_and_enqueue`, before the walk that consumes them.
     fn clear_watch_wake(&self, profile_id: &str) {
-        Self::lock(&self.watch_wake).remove(profile_id);
+        let mut wakes = Self::lock(&self.watch_paths);
+        if let Some(wake) = wakes.get_mut(profile_id) {
+            if wake.due {
+                wake.due = false;
+                wake.last_walk_ms = Some(self.platform.now_ms());
+            }
+        }
+    }
+
+    /// The paths the watcher named since the last walk, as includes for the
+    /// walk about to run; `None` when the list overflowed and the walk must
+    /// look at the whole index. A profile nobody has named a path for answers
+    /// an empty list, which narrows nothing on its own and lets the commit leg
+    /// add the gate's held paths (see [`Self::walk_policy`]).
+    ///
+    /// Consumes the list either way. The wake and the floor's clock stay: a
+    /// list is spent by the walk that takes it, a wake by the walk that
+    /// answers it, and those are the same walk only when the claim was
+    /// granted.
+    fn take_watch_paths(&self, profile_id: &str) -> Option<HashSet<PathBuf>> {
+        let mut wakes = Self::lock(&self.watch_paths);
+        let Some(wake) = wakes.get_mut(profile_id) else {
+            return Some(HashSet::new());
+        };
+        let paths = std::mem::take(&mut wake.paths);
+        let overflow = std::mem::take(&mut wake.overflow);
+        (!overflow).then_some(paths)
+    }
+
+    /// A paced walk is about to run: whatever the watcher named, the walk
+    /// looks at the whole index, and the list is spent by it.
+    ///
+    /// The paced backstop's job is the paths the watcher never saw — a
+    /// dropped event, a write on a mount that emits none — and a backstop
+    /// narrowed to the watcher's own list could not do it. Only the
+    /// event-driven walks are narrowed (AD-227).
+    fn widen_watch_paths(&self, profile_id: &str) {
+        Self::lock(&self.watch_paths)
+            .entry(profile_id.to_owned())
+            .or_default()
+            .widen();
+    }
+
+    /// Forget every settle window a profile holds, in memory and in
+    /// `file_state` (Epic 70, F-GATE-8).
+    ///
+    /// The in-memory gate is emptied rather than removed from the map, so the
+    /// next [`Self::ensure_gate`] finds it and does not re-import; the rows are
+    /// deleted so a gate built fresh — after a restart — has nothing to
+    /// re-import either. Both halves are needed: [`Self::rescan`] documents
+    /// that the durable rows, not the map entry, are what carry an episode
+    /// across a dropped gate.
+    fn forget_settle_windows(&self, profile_id: &str) -> Result<()> {
+        if let Some(gate) = Self::lock(&self.gates).get_mut(profile_id) {
+            gate.forget_all();
+        }
+        self.with_db(|conn| db::clear_file_state(conn, profile_id))?;
+        Ok(())
     }
 
     /// Tear down a profile's watcher, if it has one, and forget its wake.
     fn drop_watcher(&self, profile_id: &str) {
         let dropped = Self::lock(&self.watchers).remove(profile_id);
-        self.clear_watch_wake(profile_id);
+        Self::lock(&self.watch_paths).remove(profile_id);
         if dropped.is_some() {
             tracing::debug!(profile_id, "folder watch retired");
         }
@@ -4205,7 +4629,7 @@ impl Engine {
     /// is the one teardown that absolutely may not block: see `watch::retire`.
     fn stop_all_watchers(&self) {
         let dropped = std::mem::take(&mut *Self::lock(&self.watchers));
-        Self::lock(&self.watch_wake).clear();
+        Self::lock(&self.watch_paths).clear();
         drop(dropped);
     }
 
@@ -4279,6 +4703,17 @@ impl Engine {
         // profile's scan queues behind that lock and a SQLite transaction has
         // no business holding it.
         self.with_db(|conn| db::save_file_state(conn, &profile.id, &pending))?;
+        // A moved-in file is untracked by definition, and the steady-state walk
+        // while a watcher is live is `tracked_only` — which cannot see it, after
+        // which `gate.retain` prunes every entry the walk did not observe,
+        // primes included, and the move splits after all (Epic 70, F-GATE-7).
+        // The watcher usually rescued this by raising a Create for the
+        // destination, but a correctness property must not depend on a
+        // best-effort watcher; this is the same flag that Create sets, set here
+        // by the caller who knows the arrival happened.
+        if primed > 0 {
+            Self::lock(&self.untracked_appeared).insert(profile.id.clone());
+        }
         Ok(primed)
     }
 
@@ -4327,7 +4762,9 @@ impl Engine {
             )));
         };
         let repo = self.open_repo(&profile)?;
-        let status = git::repo::status_paths(&repo)?;
+        // `read_only`, dirwalk on: this reads `status.untracked` — a note the
+        // phone just created is exactly what it exists to prime.
+        let status = git::repo::status_paths_for(&repo, "prime")?;
         drop(repo);
         let changed: Vec<PathBuf> = status
             .added
@@ -4531,7 +4968,39 @@ impl Engine {
             return Ok(false);
         }
         let pattern = lfs::stage::pattern_for_extension(ext);
-        match lfs::stage::ensure_attributes(&profile.local_path, std::slice::from_ref(&pattern)) {
+        // The rule this would write is the one `prepare` writes, so it is
+        // refused on the same terms (Story 70.4, AD-230): an extension that
+        // spells a control-file name — wildmatch's `*` matches the empty
+        // string, so `*.gitattributes` routes `.gitattributes` itself — or one
+        // the profile's `lfsNever` opted out of, which the size rule already
+        // honours and this door did not. A malformed opt-out is refused as a
+        // config error here, exactly as `prepare` would refuse the commit.
+        let policy = match lfs::stage::LfsPolicy::from_profile(&profile) {
+            Ok(policy) => policy,
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    extension = ext,
+                    error = %err,
+                    "the folder's LFS opt-out list cannot be read, so no LFS rule was written"
+                );
+                return Ok(false);
+            }
+        };
+        if policy.retires(pattern.as_bytes()) {
+            tracing::warn!(
+                profile = profile.name,
+                extension = ext,
+                "this extension names a control file or one the folder's lfsNever excludes, so \
+                 no LFS rule was written"
+            );
+            return Ok(false);
+        }
+        match lfs::stage::ensure_attributes(
+            &profile.local_path,
+            std::slice::from_ref(&pattern),
+            &policy,
+        ) {
             Ok(false) => Ok(false),
             Ok(true) => {
                 self.bump_counters(&profile.id, |counters| counters.attribute_writes += 1);
@@ -4948,11 +5417,13 @@ impl Engine {
             }
         };
 
-        // `HEAD` before the walk: this is the cheap half, and it is the whole
-        // answer while a session is still local.
-        let in_head = match repo.head_tree() {
+        // `HEAD` first: this is the cheap half, and it is the whole answer
+        // while a session is still local. The entry's id and mode are what the
+        // index is compared against below.
+        let (head_id, head_mode) = match repo.head_tree() {
             Ok(tree) => match tree.lookup_entry_by_path(rela) {
-                Ok(entry) => entry.is_some(),
+                Ok(Some(entry)) => (entry.oid().to_owned(), entry.mode()),
+                Ok(None) => return Ok(durability),
                 Err(err) => {
                     tracing::warn!(
                         profile = profile.name,
@@ -4972,36 +5443,15 @@ impl Engine {
                     error = %err,
                     "nothing is committed on this branch yet"
                 );
-                false
-            }
-        };
-        if !in_head {
-            return Ok(durability);
-        }
-
-        let status = match git::repo::status_paths(&repo) {
-            Ok(status) => status,
-            Err(err) => {
-                tracing::warn!(
-                    profile = profile.name,
-                    error = %err,
-                    "could not read this folder's status, so the recording's durability is \
-                     unknown; the last known state stands"
-                );
                 return Ok(durability);
             }
         };
-        // A path the walk had to step over is a path whose state nobody knows,
-        // and "unknown" must never round up to "safe" on this surface: the
-        // whole question being asked is whether a recording is already durable,
-        // and a wrong yes is the answer that loses one. The status succeeded,
-        // which is exactly why this has to be checked — before the fix that let
-        // it succeed, the failing branch above caught this case for free.
-        if status
-            .unreadable
-            .iter()
-            .any(|item| item.path.as_path() == rela)
-        {
+
+        // A path the last walk had to step over is a path whose state nobody
+        // knows, and "unknown" must never round up to "safe" on this surface:
+        // the whole question being asked is whether a recording is already
+        // durable, and a wrong yes is the answer that loses one.
+        if git::repo::remembered_as_unreadable(&repo, rela) {
             tracing::warn!(
                 profile = profile.name,
                 path = %rela.display(),
@@ -5011,19 +5461,30 @@ impl Engine {
             return Ok(durability);
         }
 
-        // A path in `HEAD` that the status walk also names has moved since the
-        // commit — staged again, edited again, or deleted — so the commit no
-        // longer describes what is on the drive.
-        let uncommitted = [
-            &status.added,
-            &status.modified,
-            &status.deleted,
-            &status.untracked,
-        ]
-        .into_iter()
-        .any(|bucket| bucket.iter().any(|candidate| candidate == rela));
-        durability.committed = !uncommitted;
-        if uncommitted {
+        // One index entry, one `lstat`, and the `HEAD` entry above — no walk
+        // (AD-227). This used to be `status_paths`, a full-tree walk with the
+        // directory scan on, taken without the folder's walk claim, and the
+        // recording banner asked it once a second: measured on hesperia, ~600
+        // of the 666 walks of 155 626 entries in one hour were this call, to
+        // answer one boolean about one path that is in `HEAD` by construction.
+        // The question is the one gix asks first about every entry — does the
+        // cached stat still match — and a stat that has moved is answered "not
+        // committed" without hashing, which is the safe direction (see the
+        // function's doc).
+        durability.committed =
+            match git::repo::path_is_as_committed(&repo, rela, &head_id, head_mode) {
+                Ok(committed) => committed,
+                Err(err) => {
+                    tracing::warn!(
+                        profile = profile.name,
+                        error = %err,
+                        "could not read this folder's status, so the recording's durability is \
+                         unknown; the last known state stands"
+                    );
+                    return Ok(durability);
+                }
+            };
+        if !durability.committed {
             return Ok(durability);
         }
 
@@ -5066,6 +5527,13 @@ impl Engine {
     fn bump_counters(&self, profile_id: &str, f: impl FnOnce(&mut EngineCounters)) {
         let mut counters = Self::lock(&self.counters);
         f(counters.entry(profile_id.to_owned()).or_default());
+    }
+
+    /// Every LFS oid the remote was observed holding for this profile — the
+    /// set [`crate::footprint::measure`] needs to say what prune may release
+    /// (Story 70.4, AD-231). One ledger read; see [`db::synced_oids`].
+    pub fn synced_oids(&self, profile_id: &str) -> Result<HashSet<String>> {
+        self.with_db(|conn| db::synced_oids(conn, profile_id))
     }
 
     /// Execute every journal unit that is ready for this profile.
@@ -5150,7 +5618,7 @@ impl Engine {
             {
                 Ok(()) => {
                     self.with_db(|conn| db::complete(conn, item.id))?;
-                    self.clear_warning(&profile.id);
+                    self.note_unit_succeeded(profile);
                 }
                 Err(err) => {
                     self.reschedule_after(profile, item.id, item.attempts, &err)?;
@@ -5315,7 +5783,18 @@ impl Engine {
                 // Offline is a state, not a failure: local git keeps working
                 // and the queue drains when connectivity returns (AD-49).
                 self.set_state(&profile.id, ProfileState::Offline);
-                tracing::debug!(profile = profile.name, error = %err, "sync offline");
+                // The edge at `info!`, the attempts at `debug!`. The shipped
+                // subscribers install a bare `info` filter, so a `debug!` here
+                // was a line no field log ever carried: six days offline on
+                // hesperia and nothing in `keeper.log` said when it began
+                // (F-db-3). Once per onset, off the sticky set, because the
+                // 615 attempts that followed are not 615 pieces of news.
+                let onset = Self::lock(&self.offline).insert(profile.id.clone());
+                if onset {
+                    tracing::info!(profile = profile.name, error = %err, "sync offline");
+                } else {
+                    tracing::debug!(profile = profile.name, error = %err, "sync still offline");
+                }
             }
             Retriability::Transient => {
                 tracing::warn!(profile = profile.name, error = %err, "sync retrying");
@@ -5355,6 +5834,44 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Record that a unit — or a whole pass — genuinely succeeded: retire the
+    /// warning, the failure count and the offline edge, and say so once.
+    ///
+    /// [`Self::record_failure`]'s opposite, and the **only** reset for
+    /// [`Self::transient_failures`] and [`Self::offline`]. It is called from
+    /// exactly two places: `drain`'s `complete` site, after `execute`
+    /// returned `Ok` for one journal row, and [`Self::mark_synced`], which
+    /// every leg of a successful pass ends in. Neither is reachable by a tick
+    /// that merely ran — the failure counter used to be reset by one, and that
+    /// is how a profile failing every attempt for a week never reached
+    /// `NeedsAttention` (F-engine-2).
+    ///
+    /// `sync reachable again` is the other half of `sync offline`, once per
+    /// recovery: the same sticky set decides, so a profile that was never
+    /// offline says nothing here.
+    fn note_unit_succeeded(&self, profile: &SyncProfile) {
+        self.clear_warning(&profile.id);
+        Self::lock(&self.transient_failures).remove(&profile.id);
+        if Self::lock(&self.offline).remove(&profile.id) {
+            tracing::info!(profile = profile.name, "sync reachable again");
+        }
+    }
+
+    /// How long [`Self::do_pull`] waits for a fetch before calling the remote
+    /// unreachable.
+    fn fetch_deadline(&self) -> Duration {
+        Duration::from_millis(self.fetch_deadline_ms.load(Ordering::Relaxed))
+    }
+
+    /// Shorten the fetch deadline. Test-only: the deadline is proven against a
+    /// socket that accepts and never answers, and a suite cannot wait ten
+    /// minutes to watch it fire.
+    #[cfg(test)]
+    fn set_fetch_deadline(&self, deadline: Duration) {
+        self.fetch_deadline_ms
+            .store(deadline.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Refresh both halves of "what is this profile waiting on".
@@ -5696,10 +6213,15 @@ impl Engine {
     /// the manual step it exists to avoid. This function is the single point
     /// every path agrees means "it worked".
     ///
-    /// Safe at each of them for the same reason: `do_push` refuses to publish
-    /// while an upload is outstanding, so a push that returned has landed its
-    /// objects, and the planner independently refuses anything the journal still
-    /// references.
+    /// Not on every one of them, though (Story 70.4, AD-231). The plan walks
+    /// every tracked path, and the only thing that can make an object newly
+    /// releasable is a confirmation from the remote — an upload unit that
+    /// completed, or the audit verb's memos. So the prune runs when
+    /// [`Self::note_unit_synced`] has raised `lfs_moved` for this profile
+    /// since the last one, or when the hourly look ([`Self::prune_is_due`])
+    /// is due; a pull that moved no LFS unit runs no plan. The planner itself
+    /// refuses anything the journal still references and anything the remote
+    /// was never seen holding.
     ///
     /// Never fatal. Reclaiming space is housekeeping, and a pass that did
     /// everything asked of it must not report failure because a delete did not.
@@ -5717,7 +6239,14 @@ impl Engine {
                 snapshot.last_sync_ms = Some(self.platform.now_ms());
             }
         }
-        if profile.lfs_prune_local {
+        // A pass that reached here had every leg succeed, which is the other
+        // definition of "a unit succeeded" — `sync_once` runs its legs inline
+        // with no journal row to complete, so this is where its success resets
+        // the failure count and the offline edge.
+        self.note_unit_succeeded(profile);
+        if profile.lfs_prune_local
+            && (self.take_lfs_moved(&profile.id) || self.prune_is_due(profile))
+        {
             if let Err(err) = self.prune_lfs_store(profile) {
                 tracing::warn!(
                     profile = profile.name,
@@ -6117,7 +6646,13 @@ impl Engine {
 
         let profile = profile.clone();
         let credential = self.credential(&profile)?;
-        let interrupt = Arc::clone(&self.interrupt);
+        // The fetch's own flag, not the process-wide `interrupt`. gitoxide
+        // reads one `AtomicBool`; the deadline below has to set it to stop the
+        // pack receive, and the process flag is shutdown — set once, never
+        // cleared, and read by every fetch and checkout in the process. Seeded
+        // from it so nothing shutdown could tell this fetch is lost.
+        let interrupt = Arc::new(AtomicBool::new(self.interrupt.load(Ordering::SeqCst)));
+        let stop = Arc::clone(&interrupt);
         let repo_path = profile.local_path.clone();
         let removable = profile.removable;
         let branch = profile.branch.clone();
@@ -6130,7 +6665,10 @@ impl Engine {
         // this the callback was a no-op, which is why the bar never moved.
         let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
         let fetching = tokio::task::spawn_blocking(move || -> Result<git::fetch::FetchOutcome> {
-            let repo = git::repo::open(&repo_path, removable)?;
+            // `open_for_fetch`: the helper chain is cleared for this handle,
+            // as `clone` clears it, so no `credential.helper` in any scope is
+            // consulted by the leg that talks to the remote.
+            let repo = git::repo::open_for_fetch(&repo_path, removable)?;
             let options = git::fetch::FetchOptions {
                 shallow: None,
                 refspecs: vec![format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")],
@@ -6149,6 +6687,16 @@ impl Engine {
                 &interrupt,
             )
         });
+        // The bound the transport does not have (F-PULLPUSH-3): gitoxide's
+        // reqwest client times out the connect at 20 s and nothing after it,
+        // so a peer that accepted the socket and went silent held this thread
+        // — and the profile's reservation — for ever. The deadline is the
+        // engine's, and on expiry it does two things: sets the flag gix polls
+        // between packets, and stops waiting. The blocking thread is not
+        // joined; it ends when the socket does, holding nothing this profile
+        // needs.
+        let deadline = self.fetch_deadline();
+        let fetching = tokio::time::timeout(deadline, fetching);
 
         // Every node of the tree keeps its OWN counter, so the reported figures
         // are not cumulative across phases. The live bar tracks whichever phase
@@ -6170,8 +6718,20 @@ impl Engine {
                 },
                 fetching,
             )
-            .await
-            .map_err(|err| SyncError::Journal(format!("fetch task failed: {err}")))??;
+            .await;
+        let outcome = match outcome {
+            Ok(joined) => {
+                joined.map_err(|err| SyncError::Journal(format!("fetch task failed: {err}")))??
+            }
+            Err(_elapsed) => {
+                stop.store(true, Ordering::SeqCst);
+                return Err(SyncError::Network {
+                    host: git::cli::host_from_url(&profile.remote_url)
+                        .unwrap_or_else(|| "local".to_owned()),
+                    reason: git::cli::deadline_reason("the fetch", deadline),
+                });
+            }
+        };
 
         // Only a pack is transferred content. Without a pack the counters
         // observed above are negotiation and ref-advertisement bookkeeping, and
@@ -6398,11 +6958,24 @@ impl Engine {
         .map_err(|err| SyncError::Journal(format!("apply task failed: {err}")))?
     }
 
-    /// Converge a diverged branch without asking anyone (AD-43).
+    /// Converge a diverged branch without asking anyone (AD-43, AD-229).
     ///
     /// The remote keeps the canonical path and the local revision is preserved
     /// beside it, so the `-X theirs` merge that follows can never lose content:
     /// by the time it runs, every contested file already exists twice.
+    ///
+    /// **The matrix decides, twice.** Each side's [`git::conflict::ChangeKind`]
+    /// for every path comes from `diff --name-status` against the merge base,
+    /// and [`git::conflict::resolve`] says what to do: only a `ConflictCopy`
+    /// verdict gets a copy written *before* the merge, which is the last
+    /// moment the local bytes exist at their own path. `-X theirs` is then
+    /// asked the one question it can answer — content — and what it leaves
+    /// unmerged (modify/delete, rename-vs-modify, file/directory, a case-only
+    /// rename under `core.ignorecase`) is decided by the same function again,
+    /// this time from the index stages, and applied with `checkout --ours` or
+    /// `--theirs`. Measured before this existed: every one of those shapes
+    /// exited 1, left `MERGE_HEAD`, and made every later merge exit 128 —
+    /// the six-day livelock in the field.
     ///
     /// **Changing the same path is not the same as disagreeing about it.** Two
     /// devices that ran the same formatter, or regenerated the same
@@ -6419,6 +6992,14 @@ impl Engine {
     /// declared get that treatment; keeper never guesses that an edit is
     /// disposable.
     ///
+    /// **The copies are in the merge commit.** The merge stops before
+    /// committing, the copies and the resolutions are staged together, and one
+    /// commit closes it — so `docs/sync.md` §5's "both are committed as
+    /// ordinary tracked files" is true of *this* pass, not of whichever later
+    /// pass happened to pick the copy up. If any step fails the merge is
+    /// aborted and the copies made for it are removed: after the abort the
+    /// local revision is back at its own path.
+    ///
     /// Blocking.
     fn converge_with_conflict_copies(
         git: &GitCli,
@@ -6428,76 +7009,285 @@ impl Engine {
         device: &str,
         provenance: &Provenance,
     ) -> Result<Converged> {
+        use git::conflict::{ChangeKind, Resolution};
+
         let repo_path = &profile.local_path;
         let base = git.merge_base(repo_path, "HEAD", tracking)?;
-        let ours: std::collections::HashSet<PathBuf> = git
-            .diff_names(repo_path, &base, "HEAD")?
-            .into_iter()
-            .collect();
-        let theirs: std::collections::HashSet<PathBuf> = git
-            .diff_names(repo_path, &base, tracking)?
-            .into_iter()
-            .collect();
+        // What each side did to each path since the base. A side that does
+        // not list the path left it alone, which is the fourth kind.
+        let mut kinds: std::collections::BTreeMap<PathBuf, (ChangeKind, ChangeKind)> =
+            std::collections::BTreeMap::new();
+        for (kind, rela) in git.diff_status(repo_path, &base, "HEAD")? {
+            kinds
+                .entry(rela)
+                .or_insert((ChangeKind::Unchanged, ChangeKind::Unchanged))
+                .0 = kind;
+        }
+        for (kind, rela) in git.diff_status(repo_path, &base, tracking)? {
+            kinds
+                .entry(rela)
+                .or_insert((ChangeKind::Unchanged, ChangeKind::Unchanged))
+                .1 = kind;
+        }
         // Tip against tip: what the two sides actually hold different bytes for.
         let differing: std::collections::HashSet<PathBuf> = git
-            .diff_names(repo_path, "HEAD", tracking)?
+            .diff_status(repo_path, "HEAD", tracking)?
             .into_iter()
+            .map(|(_, rela)| rela)
             .collect();
         // Compiled here rather than per profile: divergence is the rare path,
         // and a set nobody configured costs one `is_empty` to skip.
         let regenerable = crate::exclude::PatternSet::new(&profile.regenerable)?;
 
         let mut converged = Converged::default();
-        for rela in ours.intersection(&theirs) {
+        // Every copy this pass created, repository-relative: staged into the
+        // merge commit on success, removed on abort.
+        let mut copies: Vec<PathBuf> = Vec::new();
+        for (rela, (local, remote)) in &kinds {
             // Both sides moved, and landed on the same content: there is
             // nothing to preserve and nothing to tell the user about.
-            if !differing.contains(rela.as_path()) {
+            if !differing.contains(rela) {
                 continue;
             }
+            let Resolution::ConflictCopy { .. } =
+                git::conflict::resolve(*local, *remote, rela, stamp, device)
+            else {
+                // `TakeRemote` and `KeepLocal` are applied from the index
+                // stages once the merge has said which it could not decide;
+                // `Nothing` is nothing.
+                continue;
+            };
             if !regenerable.is_empty() && regenerable.matches(rela) {
-                converged
-                    .stale
-                    .push(rela.to_string_lossy().replace('\\', "/"));
+                converged.stale.push(Self::rela_display(rela));
                 continue;
             }
             let source = repo_path.join(rela);
-            // A path deleted locally has nothing to preserve.
+            // HEAD lists the path, but the worktree may hold a directory
+            // there (the other side has a file at the name) — that is git's
+            // rescue to make, and it is turned into a copy below.
             if !source.is_file() {
                 continue;
             }
-            let copy_name = git::conflict::conflict_name(rela, stamp, device);
-            let destination = match rela.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => {
-                    repo_path.join(parent).join(&copy_name)
-                }
-                _ => repo_path.join(&copy_name),
-            };
-            std::fs::copy(&source, &destination)
-                .map_err(|err| SyncError::io("write conflict copy", destination.clone(), err))?;
-            converged.copies.push(
-                destination
-                    .strip_prefix(repo_path)
-                    .unwrap_or(&destination)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
+            let mut file = std::fs::File::open(&source)
+                .map_err(|err| SyncError::io("read the local revision", source.clone(), err))?;
+            let copy = Self::write_conflict_copy(repo_path, rela, stamp, device, &mut file)?;
+            converged.copies.push(Self::rela_display(&copy));
+            copies.push(copy);
         }
 
-        git.merge_theirs(
-            repo_path,
+        let message = commit_message(
+            &format!("sync({}): merge remote changes", profile.name),
+            "",
+            provenance,
+        );
+        if let Err(err) = Self::finish_merge(
+            git,
+            profile,
             tracking,
-            &commit_message(
-                &format!("sync({}): merge remote changes", profile.name),
-                "",
-                provenance,
-            ),
-        )?;
+            &message,
+            stamp,
+            device,
+            &mut copies,
+            &mut converged,
+        ) {
+            // A merge that does not finish is undone (AD-229). The copies go
+            // with it: after the abort the local revision is back at its own
+            // path, and a copy of it would be litter the next pass makes
+            // again under a fresh name.
+            if let Err(abort) = git.merge_abort(repo_path) {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %abort,
+                    "the merge could not be aborted after it failed to finish"
+                );
+            }
+            for copy in &copies {
+                if let Err(remove) = std::fs::remove_file(repo_path.join(copy)) {
+                    if remove.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            profile = profile.name,
+                            path = %copy.display(),
+                            error = %remove,
+                            "a conflict copy of an aborted merge could not be removed"
+                        );
+                    }
+                }
+            }
+            return Err(err);
+        }
         // Sorted so a run is reportable in a stable order: a set iteration is
         // deliberately unordered and two devices comparing notes on the same
         // divergence should read the same list.
         converged.copies.sort();
         converged.stale.sort();
         Ok(converged)
+    }
+
+    /// Merge, resolve what `-X theirs` left, stage everything, commit once.
+    ///
+    /// The caller undoes the merge if this returns `Err`; nothing here does.
+    /// `copies` grows by the rescue copies made for git's `<path>~HEAD` /
+    /// `<path>~<ref>` files, so the caller can remove them too.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_merge(
+        git: &GitCli,
+        profile: &SyncProfile,
+        tracking: &str,
+        message: &str,
+        stamp: &str,
+        device: &str,
+        copies: &mut Vec<PathBuf>,
+        converged: &mut Converged,
+    ) -> Result<()> {
+        use git::cli::MergeOutcome;
+        use git::conflict::{ChangeKind, Side};
+
+        let repo_path = &profile.local_path;
+        let outcome = git.merge_theirs(repo_path, tracking, message)?;
+        // Paths whose resolution is recorded by the one `add` below.
+        let mut resolved: Vec<PathBuf> = Vec::new();
+        if outcome == MergeOutcome::Conflicted {
+            // Stages per path, in index order: [base, ours, theirs].
+            let mut stages: std::collections::BTreeMap<PathBuf, [Option<String>; 3]> =
+                std::collections::BTreeMap::new();
+            for entry in git.unmerged_entries(repo_path)? {
+                stages.entry(entry.path).or_default()[usize::from(entry.stage) - 1] =
+                    Some(entry.oid);
+            }
+            let their_label = git::conflict::rescue_label(tracking);
+            let mut take_ours: Vec<PathBuf> = Vec::new();
+            let mut take_theirs: Vec<PathBuf> = Vec::new();
+            for (path, [in_base, ours, theirs]) in &stages {
+                // git's rescue: a file whose canonical name is a directory on
+                // the other side is recorded *at* `<path>~HEAD` (ours) or
+                // `<path>~<ref>` (theirs). Both sides carry content and the
+                // directory keeps the name, so the file becomes an ordinary
+                // conflict copy of the canonical path — the one shape a user
+                // has been taught to look for — and the rescue litter goes.
+                let rescue = match (ours, theirs) {
+                    (Some(oid), None) => {
+                        git::conflict::rescue_origin(path, "HEAD").map(|origin| (origin, oid))
+                    }
+                    (None, Some(oid)) => {
+                        git::conflict::rescue_origin(path, &their_label).map(|origin| (origin, oid))
+                    }
+                    _ => None,
+                };
+                if let Some((origin, oid)) = rescue {
+                    let bytes = git.blob_bytes(repo_path, oid)?;
+                    let copy = Self::write_conflict_copy(
+                        repo_path,
+                        &origin,
+                        stamp,
+                        device,
+                        &mut bytes.as_slice(),
+                    )?;
+                    converged.copies.push(Self::rela_display(&copy));
+                    copies.push(copy);
+                    Self::remove_if_present(repo_path, path)?;
+                    resolved.push(path.clone());
+                    continue;
+                }
+                let local = ChangeKind::from_stages(in_base.is_some(), ours.is_some());
+                let remote = ChangeKind::from_stages(in_base.is_some(), theirs.is_some());
+                let verdict = git::conflict::resolve(local, remote, path, stamp, device);
+                match verdict.canonical() {
+                    Some(Side::Local) if ours.is_some() => take_ours.push(path.clone()),
+                    Some(Side::Remote) if theirs.is_some() => take_theirs.push(path.clone()),
+                    // The winning side holds no blob, so the path is gone on
+                    // the matrix's own terms; recording the removal resolves
+                    // the entry.
+                    _ => Self::remove_if_present(repo_path, path)?,
+                }
+                resolved.push(path.clone());
+            }
+            git.checkout_side(repo_path, Side::Local, &take_ours)?;
+            git.checkout_side(repo_path, Side::Remote, &take_theirs)?;
+        }
+
+        // One `add` for everything: the copies and the resolutions.
+        let mut staged = copies.clone();
+        staged.append(&mut resolved);
+        git.add_paths(repo_path, &staged)?;
+        if let Some(first) = git.unmerged_entries(repo_path)?.first() {
+            return Err(SyncError::Diverged {
+                profile: profile.name.clone(),
+                reason: format!("{MERGE_UNRESOLVED_PREFIX}{}", first.path.display()),
+            });
+        }
+        git.commit_merge(repo_path, message)?;
+        if git::cli::merge_head_path(repo_path).exists() {
+            return Err(SyncError::Diverged {
+                profile: profile.name.clone(),
+                reason: MERGE_IN_PROGRESS_SENTENCE.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Write `source` beside `rela` under a conflict name nobody holds yet.
+    ///
+    /// `create_new`, and an ordinal from 2 on collision: two passes within one
+    /// second share a stamp, and `fs::copy` onto the first pass' copy truncated
+    /// it. Returns the copy's repository-relative path.
+    fn write_conflict_copy(
+        repo_path: &Path,
+        rela: &Path,
+        stamp: &str,
+        device: &str,
+        source: &mut dyn std::io::Read,
+    ) -> Result<PathBuf> {
+        let parent = rela
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        for ordinal in 1..=CONFLICT_COPY_ORDINALS {
+            let name = if ordinal == 1 {
+                git::conflict::conflict_name(rela, stamp, device)
+            } else {
+                git::conflict::conflict_name_numbered(rela, stamp, device, ordinal)
+            };
+            let copy = parent.map_or_else(|| PathBuf::from(&name), |parent| parent.join(&name));
+            let destination = repo_path.join(&copy);
+            let mut file = match std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+            {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(SyncError::io("write conflict copy", destination, err)),
+            };
+            if let Err(err) = std::io::copy(source, &mut file) {
+                // A half-written copy is worse than none: nothing references
+                // it, and the next attempt makes a whole one.
+                drop(file);
+                let _ = std::fs::remove_file(&destination);
+                return Err(SyncError::io("write conflict copy", destination, err));
+            }
+            return Ok(copy);
+        }
+        Err(SyncError::Config(format!(
+            "{CONFLICT_COPY_ORDINALS} conflict copies of {} already exist for this second",
+            rela.display()
+        )))
+    }
+
+    /// Remove a worktree file the merge is done with; an absent one is fine.
+    fn remove_if_present(repo_path: &Path, rela: &Path) -> Result<()> {
+        let absolute = repo_path.join(rela);
+        match std::fs::remove_file(&absolute) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(SyncError::io("remove a resolved path", absolute, err)),
+        }
+    }
+
+    /// A repository-relative path as the activity list shows it.
+    ///
+    /// Lossy, and only ever *shown*: the paths this engine reaches are the
+    /// `PathBuf`s themselves.
+    fn rela_display(rela: &Path) -> String {
+        rela.to_string_lossy().replace('\\', "/")
     }
 
     /// The last repair-backlog probe for this profile, if it is still fresh.
@@ -6613,6 +7403,35 @@ impl Engine {
         }))
     }
 
+    /// Undo a merge an earlier keeper left in progress, or refuse to go on.
+    ///
+    /// Before Story 70.3 nothing looked for `MERGE_HEAD`, and two things went
+    /// wrong behind it: every later `merge` exited 128, and a commit taken
+    /// over the unmerged index dropped the contested paths from the tree —
+    /// `write_tree_from_index` skips unmerged entries — while `MERGE_HEAD`
+    /// stayed. The abort is mechanical and keeper's to run; a `MERGE_HEAD`
+    /// that survives it is not, and the refusal names the file.
+    fn clear_stale_merge(&self, profile: &SyncProfile) -> Result<()> {
+        let merge_head = git::cli::merge_head_path(&profile.local_path);
+        if !merge_head.exists() {
+            return Ok(());
+        }
+        tracing::warn!(
+            profile = profile.name,
+            "a merge was left in progress; undoing it before anything is committed"
+        );
+        if let Err(err) = self.git.merge_abort(&profile.local_path) {
+            tracing::warn!(profile = profile.name, error = %err, "the merge could not be aborted");
+        }
+        if merge_head.exists() {
+            return Err(SyncError::Config(format!(
+                "{MERGE_IN_PROGRESS_SENTENCE}: {}",
+                merge_head.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Scan, gate and commit whatever settled. Returns how many paths landed.
     ///
     /// Shared by both legs so the working tree is always clean before a merge
@@ -6626,6 +7445,9 @@ impl Engine {
         source: SyncSource,
         push_unit: Option<i64>,
     ) -> Result<u64> {
+        // Before anything reads the index, whichever way the profile syncs:
+        // a merge an earlier keeper left in progress breaks the pull leg too.
+        self.clear_stale_merge(profile)?;
         if !profile.direction.pushes() {
             // A pull-only profile never commits; a local edit there is
             // preserved by the merge's own conflict handling instead.
@@ -7170,8 +7992,31 @@ impl Engine {
                 Some(&report),
                 self.walk_report_interval,
                 self.commit_walk_policy(profile),
+                "commit",
             )?
         };
+        #[cfg(test)]
+        after_walk::fire(&profile.local_path);
+        // The volume gate at the top of the tick answered "is the drive here"
+        // before the walk, and the walk it licensed takes up to a minute on the
+        // folder this was written for (p90 5.3 s, max 60.8 s). A removable
+        // drive unplugged inside that window is indistinguishable, from here,
+        // from a user who deleted every file in it: the walk reports one
+        // `Removed` per tracked path and `staged.deleted` takes them without
+        // asking (Epic 70, F-GATE-1, AD-48). So the question is asked again,
+        // on the walk's far side, before a single one of its answers is kept —
+        // `find_mount_root` is one `is_file` per ancestor, the cheapest test
+        // that still means "the media is attached" (`VolumeMarker::is_present`
+        // says why a parse would be the wrong one). `stage_and_commit`'s
+        // mass-deletion refusal is the belt to this brace.
+        if profile.removable && volume::find_mount_root(&profile.local_path).is_none() {
+            tracing::warn!(
+                profile = profile.name,
+                "the removable volume went away during the status walk; \
+                 discarding what the walk found"
+            );
+            return Err(SyncError::MediaAbsent);
+        }
         // The pass only got this far because those paths were stepped over, and
         // a folder that syncs while quietly omitting a file is the one outcome
         // worse than a folder that stops: nobody looks for what they were not
@@ -7282,9 +8127,17 @@ impl Engine {
         // vanished in between simply has no size to record. It waits until
         // here on purpose: every other profile's scan queues behind the gate
         // lock, and this walk has no business holding it.
+        //
+        // The whole sample is kept, not only its size (Epic 70, AD-232): it is
+        // what `stage_and_commit`'s tier-4 read compares the open descriptor
+        // against, so a rewrite landing between this instant and that read is
+        // refused rather than committed. Taken a moment after the verdict, not
+        // at it, for the lock reason above; the `fstat` pair around the read
+        // covers the rest.
         for rela in staged.added.iter().chain(staged.modified.iter()) {
             if let Ok(Some(sample)) = FileSample::of(&profile.local_path.join(rela)) {
                 staged.sizes.insert(rela.clone(), sample.size);
+                staged.samples.insert(rela.clone(), sample);
             }
         }
         for rela in &staged.deleted {
@@ -7493,7 +8346,13 @@ impl Engine {
             lfs_units.insert(object.path.clone(), unit_id);
         }
 
-        let Some(id) = git::commit::stage_and_commit(
+        // The skipping form, because this caller has a next pass (Epic 70,
+        // AD-232): a path whose tier-4 read was torn is left out of this
+        // commit, named on the profile card once, and picked up by the next
+        // walk once it holds still — where the strict form would hold every
+        // other settled file hostage to the one still being written.
+        let mut torn: Vec<PathBuf> = Vec::new();
+        let committed = git::commit::stage_and_commit_skipping_torn(
             &repo,
             &staged,
             &provenance,
@@ -7501,14 +8360,34 @@ impl Engine {
             &author,
             &staging.substitutions,
             Some(&staging_progress),
-        )?
-        else {
+            &mut torn,
+        )?;
+        if let Some(first) = torn.first() {
+            // Sticky and edge-triggered like every other warning: the sentence
+            // stays on the card until a unit succeeds, and the toast fires on
+            // the first torn read only. One path is named — the first — because
+            // a card holds one sentence, and the rest are in the log above.
+            self.warn(
+                &profile.id,
+                &profile.name,
+                format!("{} {}", first.display(), git::commit::TORN_READ_SENTENCE),
+            );
+        }
+        let Some(id) = committed else {
             return Ok(());
+        };
+        // What the commit holds, and nothing it does not: the activity rows
+        // below are read as "these files synced", and a torn path did not.
+        let staged = if torn.is_empty() {
+            staged
+        } else {
+            staged.without(&torn)
         };
         tracing::info!(
             profile = profile.name,
             commit = %id,
             files = staged.len(),
+            torn = torn.len(),
             lfs = staging.uploads.len(),
             "committed"
         );
@@ -8097,6 +8976,11 @@ impl Engine {
     /// Best-effort: the bytes reached the remote, and failing the unit because
     /// a memo did not land would re-upload them.
     fn note_unit_synced(&self, profile: &SyncProfile, label: Option<&str>, oid: &str) {
+        // Before the label guard: an unlabelled upload still moved an object,
+        // and the flag says only that the next success edge is worth a prune
+        // plan (Story 70.4, AD-231). The plan then reads the ledger, which an
+        // unlabelled unit did not write to, and finds nothing new for it.
+        Self::lock(&self.lfs_moved).insert(profile.id.clone());
         let Some(path) = label else {
             return;
         };
@@ -8948,13 +9832,11 @@ impl Engine {
     /// pull-to-refresh, each of them one call to this. Without the record the
     /// divergence sentence (AD-199) would reach only the caller of the moment
     /// and never the profile's own status row, which is where a person looks.
-    /// The success path is `sync_once`'s own, which already clears the state.
+    /// The success path is `sync_once`'s own: `mark_synced` resets the failure
+    /// count and the offline edge for every pass that reaches it.
     pub async fn sync_once_recording(&self, id: &str, source: SyncSource) -> Result<SyncOutcome> {
         match self.sync_once(id, source).await {
-            Ok(outcome) => {
-                Self::lock(&self.transient_failures).remove(id);
-                Ok(outcome)
-            }
+            Ok(outcome) => Ok(outcome),
             Err(err) => {
                 if let Ok(Some(profile)) = self.with_db(|conn| db::get_profile(conn, id)) {
                     self.record_failure(&profile, &err);
@@ -9102,17 +9984,31 @@ impl Engine {
         Ok(outcome)
     }
 
-    /// Release local LFS objects whose content is still in the worktree and
-    /// whose upload the journal no longer owes.
+    /// Release local LFS objects whose content is still in the worktree, whose
+    /// upload the journal no longer owes, and which the remote was observed
+    /// holding.
     ///
-    /// See [`crate::lfs::prune`] for why those two conditions are sufficient,
+    /// See [`crate::lfs::prune`] for why those three conditions are the ones,
     /// and why this is safer than the heuristic `git lfs prune` has to use.
+    /// The third is [`db::synced_oids`] — the memo [`Self::note_unit_synced`]
+    /// and the remote audit write — and it was the one this used to leave out
+    /// (Story 70.4, AD-231).
+    ///
+    /// Re-arms the hourly look on every run, so a prune the `lfs_moved` flag
+    /// asked for is not followed by an unprompted one a moment later.
     fn prune_lfs_store(&self, profile: &SyncProfile) -> Result<()> {
+        Self::lock(&self.next_prune_ms).insert(
+            profile.id.clone(),
+            self.platform.now_ms().saturating_add(RELEASE_LOOK_EVERY_MS),
+        );
         let repo = git::repo::open(&profile.local_path, false)?;
         let tracked = git::repo::tracked_paths(&repo)?;
         let owed = self.with_db(|conn| db::referenced_oids(conn, &profile.id))?;
+        let synced = self.with_db(|conn| db::synced_oids(conn, &profile.id))?;
         let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
-        let releasable = lfs::prune::plan(&repo, &profile.local_path, &store, &tracked, &owed)?;
+        self.bump_counters(&profile.id, |counters| counters.lfs_prune_plans += 1);
+        let releasable =
+            lfs::prune::plan(&repo, &profile.local_path, &store, &tracked, &owed, &synced)?;
         if releasable.is_empty() {
             return Ok(());
         }
@@ -9122,7 +10018,7 @@ impl Engine {
             profile = profile.name,
             objects = count,
             bytes = reclaimed,
-            "released local LFS objects the remote already holds",
+            "released local LFS objects the remote is known to hold",
         );
         Ok(())
     }
@@ -12441,7 +13337,7 @@ impl Engine {
             // files takes 996 s on that volume — every poll, for rows the gate
             // already holds. So the poll asks about the index and sweeps for
             // untracked paths on a cadence; see `untracked_sweep_due`.
-            let policy = self.poll_walk_policy(profile_id);
+            let policy = self.poll_walk_policy(&profile);
             // The walk runs on a blocking thread and cannot touch `&self`, so
             // its progress comes back over a channel and is published from
             // here. Without this the Pending list is the one surface that
@@ -12464,8 +13360,13 @@ impl Engine {
                         // still has a list to finish, so the send is dropped.
                         let _ = tx.send((seen, entries));
                     };
-                    let status =
-                        git::repo::status_paths_reported(&repo, Some(&report), interval, policy)?;
+                    let status = git::repo::status_paths_reported(
+                        &repo,
+                        Some(&report),
+                        interval,
+                        policy,
+                        "poll",
+                    )?;
                     // Asked here, where the repository is already open and on a
                     // blocking thread: a deleted path cannot be stat'd, and the
                     // index is the only thing that still knows how big it was.
@@ -13898,6 +14799,48 @@ fn filesystem_remote_store(profile: &SyncProfile) -> Option<lfs::store::LfsStore
         return None;
     }
     lfs::local::remote_store(&profile.remote_url).filter(|store| store.root().exists())
+}
+
+/// A seam between the status walk and everything that trusts it, for tests
+/// only (Epic 70, F-GATE-1).
+///
+/// The volume re-check in [`Engine::collect_stable_changes`] guards a window
+/// that is the walk's own duration — up to a minute in the field, a few
+/// milliseconds on a fixture — and there is no other way to unplug a drive
+/// *inside* it deterministically: a thread racing the walk on a fixture this
+/// small would be flakier than no test at all. Keyed on the profile root so
+/// parallel tests, each in its own tempdir, cannot fire one another's hooks.
+/// Production builds carry neither the map nor the call.
+#[cfg(test)]
+mod after_walk {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn Fn() + Send + Sync>;
+
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Run `hook` once, after the next walk of the profile rooted at `root`.
+    pub(super) fn install(root: &Path, hook: impl Fn() + Send + Sync + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(root.to_path_buf(), Box::new(hook));
+    }
+
+    /// Called by the walk. The hook is taken out of the map before it runs,
+    /// so it fires once and may install a successor.
+    pub(super) fn fire(root: &Path) {
+        let hook = HOOKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(root);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -21826,6 +22769,386 @@ mod tests {
         );
     }
 
+    // ---- Story 70.5: the gate keeps its promises (AD-232, AD-45, AD-48) ----
+
+    /// What `HEAD` holds at `rela`, or `None` when the tree does not name it.
+    fn head_blob(engine: &Engine, p: &SyncProfile, rela: &str) -> Option<Vec<u8>> {
+        let repo = engine.open_repo(p).expect("open");
+        let tree = repo.head_commit().ok()?.tree().ok()?;
+        let entry = tree.lookup_entry_by_path(rela).ok()??;
+        let data = entry.object().ok()?.data.clone();
+        Some(data)
+    }
+
+    fn head_id(engine: &Engine, p: &SyncProfile) -> Option<gix::hash::ObjectId> {
+        let repo = engine.open_repo(p).expect("open");
+        git::repo::head_commit_id(&repo).expect("head")
+    }
+
+    /// A removable profile on a fixture "volume": the marker is planted at the
+    /// tempdir root and the profile folder sits under it, so `volume_ready`
+    /// binds rather than refuses, and deleting the marker is unplugging the
+    /// drive.
+    fn removable_on(dir: &Path) -> SyncProfile {
+        let mut p = adoptable(dir);
+        p.removable = true;
+        VolumeMarker::ensure(dir, "Fixture Stick", "someone-else", 1).expect("plant a marker");
+        p
+    }
+
+    /// Tier 4 on the commit path (F-GATE-2). A file rewritten after the gate
+    /// cleared it and before the staging read must not be committed as
+    /// whatever it happened to be — and must not hold the rest of the pass
+    /// hostage either. Driven through `collect_stable_changes` and `commit`,
+    /// the two halves of `commit_local`, because the window under test is
+    /// exactly the gap between them; a writer thread racing that gap on a
+    /// fixture this small would be flakier than no test at all, which is the
+    /// stance `stability::verify_while_reading_hooked` already takes.
+    #[tokio::test]
+    async fn a_file_rewritten_after_the_verdict_is_skipped_with_one_warning_and_committed_next_pass(
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("notes.md"), b"first draft").expect("write");
+        std::fs::write(p.local_path.join("other.md"), b"untouched").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 2);
+
+        // Both edited, both settle, and then one is rewritten between the
+        // verdict and the read.
+        std::fs::write(p.local_path.join("notes.md"), b"second draft").expect("write");
+        std::fs::write(p.local_path.join("other.md"), b"edited too").expect("write");
+        engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("first pass opens the episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        let staged = engine.collect_stable_changes(&p).expect("walk");
+        assert_eq!(staged.modified.len(), 2, "both cleared the gate");
+        assert!(
+            staged.samples.contains_key(Path::new("notes.md")),
+            "the walk hands the commit the sample it cleared the path on"
+        );
+        std::fs::write(p.local_path.join("notes.md"), b"third draft, mid-write").expect("rewrite");
+
+        engine
+            .commit(&p, &staged, SyncSource::Watch, None)
+            .expect("the torn path is skipped, not fatal");
+        assert_eq!(
+            head_blob(&engine, &p, "notes.md").as_deref(),
+            Some(b"first draft".as_slice()),
+            "the rewritten file must not be committed as whatever it was at that instant"
+        );
+        assert_eq!(
+            head_blob(&engine, &p, "other.md").as_deref(),
+            Some(b"edited too".as_slice()),
+            "and the quiet file beside it still lands in this pass"
+        );
+        let warning = engine
+            .status(&p.id)
+            .expect("status")
+            .warning
+            .expect("a skipped file is said out loud");
+        assert!(
+            warning.starts_with("notes.md ") && warning.ends_with(git::commit::TORN_READ_SENTENCE),
+            "the card names the path and the house sentence, got: {warning}"
+        );
+        let rows = engine.activity(&p.id, 10).await.expect("activity");
+        assert!(
+            rows.iter()
+                .all(|r| r.path != "notes.md" || r.ts_ms != platform.now_ms()),
+            "no activity row may claim a file the commit does not hold"
+        );
+
+        // Torn again on a second pass: the warning is sticky, and the toast is
+        // not repeated.
+        engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("the rewritten bytes open a new episode");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        let staged = engine.collect_stable_changes(&p).expect("walk");
+        assert_eq!(staged.modified, vec![PathBuf::from("notes.md")]);
+        std::fs::write(p.local_path.join("notes.md"), b"fourth draft, still moving")
+            .expect("rewrite");
+        engine
+            .commit(&p, &staged, SyncSource::Watch, None)
+            .expect("skipped again");
+        assert_eq!(
+            platform
+                .notifications
+                .lock()
+                .map(|n| n.len())
+                .unwrap_or_default(),
+            1,
+            "one toast for a recurring torn read, not one per pass"
+        );
+
+        // And once it holds still, the next pass commits it.
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        assert_eq!(
+            head_blob(&engine, &p, "notes.md").as_deref(),
+            Some(b"fourth draft, still moving".as_slice())
+        );
+    }
+
+    /// F-GATE-1: the volume gate runs before the walk, and the walk can take a
+    /// minute. A drive unplugged inside it must come out as absence, not as a
+    /// deletion of every tracked file. The marker vanishes through the
+    /// after-walk seam, which is the only deterministic way to unplug it
+    /// *inside* the window.
+    #[test]
+    fn a_volume_that_vanishes_during_the_walk_is_absence_and_commits_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = removable_on(dir.path());
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(p.local_path.join(name), name).expect("write");
+        }
+        engine.upsert_profile(&p).expect("upsert");
+        assert!(
+            engine.volume_ready(&p).expect("scan"),
+            "the fixture stick is attached"
+        );
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 3);
+        let before = head_id(&engine, &p);
+
+        // What an unplugged drive looks like to a walk that started before it
+        // went: every file gone, and the marker gone with them.
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::remove_file(p.local_path.join(name)).expect("remove");
+        }
+        let marker = volume::marker_path(dir.path());
+        after_walk::install(&p.local_path, move || {
+            std::fs::remove_file(&marker).expect("unplug");
+        });
+        let err = engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect_err("a walk whose volume vanished must not be trusted");
+        assert!(
+            matches!(err, SyncError::MediaAbsent),
+            "absence, never deletion (AD-48); got {err:?}"
+        );
+        assert_eq!(
+            head_id(&engine, &p),
+            before,
+            "nothing was committed from the walk's answers"
+        );
+        assert!(
+            engine
+                .with_db(|conn| db::load_file_state(conn, &p.id))
+                .expect("rows")
+                .is_empty(),
+            "and nothing the walk observed was mirrored to file_state either"
+        );
+    }
+
+    /// The belt to that brace: a change set deleting most of a removable
+    /// index is refused with the sentence, while an ordinary deletion is
+    /// committed. Driven through `commit_local` so the refusal is proven at
+    /// `stage_and_commit`, where no caller can route around it.
+    #[test]
+    fn a_mass_deletion_on_a_removable_profile_is_refused_and_a_small_one_commits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = removable_on(dir.path());
+        let names: Vec<String> = (0..10).map(|i| format!("file-{i}.txt")).collect();
+        for name in &names {
+            std::fs::write(p.local_path.join(name), name).expect("write");
+        }
+        engine.upsert_profile(&p).expect("upsert");
+        assert!(engine.volume_ready(&p).expect("scan"));
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 10);
+
+        // 10 %: a deletion.
+        std::fs::remove_file(p.local_path.join(&names[0])).expect("remove");
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("one deleted file is a deletion"),
+            1
+        );
+        assert!(head_blob(&engine, &p, &names[0]).is_none());
+
+        // 6 of the remaining 9: a drive that may have been unplugged.
+        for name in &names[1..7] {
+            std::fs::remove_file(p.local_path.join(name)).expect("remove");
+        }
+        let before = head_id(&engine, &p);
+        let err = engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect_err("most of the index gone at once is refused on removable media");
+        let said = err.to_string();
+        assert!(
+            said.contains(&format!(
+                "{} 6 {}",
+                git::commit::MASS_DELETION_PREFIX,
+                git::commit::MASS_DELETION_SENTENCE
+            )),
+            "the refusal counts the deletions and uses the house sentence, got: {said}"
+        );
+        assert_eq!(
+            err.retriability(),
+            Retriability::Permanent,
+            "a folder in this state needs a look, not a retry loop"
+        );
+        assert_eq!(head_id(&engine, &p), before, "nothing was committed");
+        assert!(
+            head_blob(&engine, &p, &names[1]).is_some(),
+            "the refused deletions are still in HEAD"
+        );
+
+        // Control: the same deletions on a fixed disk are the user's business.
+        let mut fixed = p.clone();
+        fixed.removable = false;
+        engine.upsert_profile(&fixed).expect("upsert");
+        assert_eq!(
+            engine
+                .commit_local(&fixed, SyncSource::Watch, None)
+                .expect("a fixed disk deleting six files deleted six files"),
+            6
+        );
+    }
+
+    /// F-GATE-7: a prime is an untracked arrival by definition, and the
+    /// steady-state walk cannot see one. The prime has to buy the full walk
+    /// itself rather than lean on the watcher having raised a Create.
+    #[test]
+    fn priming_moved_paths_makes_the_next_walk_a_full_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("moved.bin"), b"bytes").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            tx,
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+
+        // Spend the first-pass sweep, so the steady state is what is measured.
+        assert_eq!(engine.commit_walk_policy(&p), git::repo::WalkPolicy::full());
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only()
+        );
+
+        assert_eq!(
+            engine
+                .prime_moved_paths(&p.id, &[p.local_path.join("moved.bin")])
+                .expect("prime"),
+            1
+        );
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::full(),
+            "a primed arrival is untracked, and only a full walk can observe it"
+        );
+
+        // A prime that recorded nothing buys nothing: no directory scan. The
+        // gate still holds the earlier prime, and 70.1's policy names every
+        // held path as an include — which is the narrowed walk, not the full
+        // one, so only the scan bit is asserted here.
+        assert_eq!(
+            engine
+                .prime_moved_paths(&p.id, &[p.local_path.join("never-there.bin")])
+                .expect("prime"),
+            0
+        );
+        assert!(
+            !engine.commit_walk_policy(&p).find_untracked,
+            "nothing new was primed, so the scan is not owed"
+        );
+    }
+
+    /// F-GATE-8: a settle window that straddles a detach is meaningless, and an
+    /// entry that survives one is past the ceiling the instant the drive
+    /// returns. The detach arm of `tick_profile` forgets the gate and the rows
+    /// behind it, so the first observation after a re-attach is `Settling`.
+    #[tokio::test]
+    async fn a_detach_forgets_the_settle_windows_so_a_reattach_starts_fresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = removable_on(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        assert!(engine.volume_ready(&p).expect("scan"));
+        // Bound now, so the profile the tick reads carries the volume id.
+        let p = engine
+            .list_profiles()
+            .expect("list")
+            .into_iter()
+            .find(|stored| stored.id == p.id)
+            .expect("stored");
+
+        // One observation opens an episode and mirrors it to file_state.
+        let held = p.local_path.join("held.bin");
+        std::fs::write(&held, b"mid-write").expect("write");
+        engine
+            .collect_stable_changes(&p)
+            .expect("the first pass opens the episode");
+        assert_eq!(
+            engine
+                .with_db(|conn| db::load_file_state(conn, &p.id))
+                .expect("rows")
+                .len(),
+            1
+        );
+
+        // Unplugged, and one tick passes.
+        std::fs::remove_file(volume::marker_path(dir.path())).expect("unplug");
+        engine
+            .tick_profile(&p)
+            .await
+            .expect("an absent volume is not an error");
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::MediaAbsent
+        );
+        assert!(
+            engine
+                .with_db(|conn| db::load_file_state(conn, &p.id))
+                .expect("rows")
+                .is_empty(),
+            "the durable windows go with the drive"
+        );
+
+        // Plugged back in, long enough later that the old episode would have
+        // been past the ceiling. The gate must not remember it.
+        VolumeMarker::ensure(dir.path(), "Fixture Stick", "someone-else", 1).expect("re-attach");
+        platform.advance_ms(i64::try_from(crate::profile::SETTLE_CEILING_MS).expect("fits") * 2);
+        let now = platform.now_ms();
+        let verdict = {
+            let mut gates = Engine::lock(&engine.gates);
+            let gate = engine.ensure_gate(&mut gates, &p).expect("gate");
+            gate.is_stable(&held, now)
+        };
+        assert!(
+            matches!(verdict, StabilityVerdict::Settling { .. }),
+            "the first observation after a re-attach starts a fresh window; got {verdict:?}"
+        );
+    }
+
     /// A profile that holds recordings, with its root already on disk.
     ///
     /// The default [`crate::profile::RecordingsConfig`] is what story 41.2
@@ -23708,7 +25031,7 @@ mod tests {
         engine.fold_watch_events(&p).expect("fold");
 
         assert!(
-            engine.watch_wake_pending(&p.id),
+            engine.watch_wake_pending(&p),
             "a delivered event is a reason to walk now"
         );
 
@@ -23762,12 +25085,12 @@ mod tests {
         // The first poll of a run always sweeps: nothing was watching while the
         // process was down.
         assert_eq!(
-            engine.poll_walk_policy(&p.id),
+            engine.poll_walk_policy(&p),
             git::repo::WalkPolicy::full(),
             "the first poll after a start has to look for itself"
         );
         assert_eq!(
-            engine.poll_walk_policy(&p.id),
+            engine.poll_walk_policy(&p),
             git::repo::WalkPolicy::tracked_only(),
             "and the next one must not walk the tree again five seconds later"
         );
@@ -23781,7 +25104,7 @@ mod tests {
                 .expect("the test clock is not at the epoch"),
         );
         assert_eq!(
-            engine.poll_walk_policy(&p.id),
+            engine.poll_walk_policy(&p),
             git::repo::WalkPolicy::full(),
             "a due sweep is what catches an event the backend dropped"
         );
@@ -23806,7 +25129,7 @@ mod tests {
 
         for pass in 1..=3 {
             assert_eq!(
-                engine.poll_walk_policy(&p.id),
+                engine.poll_walk_policy(&p),
                 git::repo::WalkPolicy::full(),
                 "pass {pass}: an unwatched folder has nothing else to trust"
             );
@@ -23928,6 +25251,546 @@ mod tests {
         );
     }
 
+    // ---- Story 70.1: a walk that costs what changed (AD-227) ----
+
+    /// A committed fixture of `count` files under `d/`, made with real `git`
+    /// so the index carries every stat and the engine's first pass finds a
+    /// clean tree. Returns the profile, adopted and swept once so the
+    /// first-pass full walk is behind it.
+    fn committed_fixture_of(
+        engine: &Engine,
+        platform: &TestPlatform,
+        dir: &Path,
+        count: u32,
+    ) -> SyncProfile {
+        let mut p = adoptable(dir);
+        p.poll_interval_ms = 15_000;
+        std::fs::create_dir_all(p.local_path.join("d")).expect("dir");
+        for i in 0..count {
+            std::fs::write(p.local_path.join(format!("d/f{i:05}.txt")), i.to_string())
+                .expect("write");
+        }
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p.local_path)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", &p.branch]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        engine.upsert_profile(&p).expect("upsert");
+        // The first pass of a run always sweeps the whole tree; spend it here
+        // so what follows measures the steady state.
+        assert!(engine.scan_due(&p), "first sight walks");
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the sweep"),
+            0,
+            "the fixture is clean"
+        );
+        // And past the sweep's own cadence check: `scan_is_due` is armed for
+        // the poll window, which the wake below must not be confused with.
+        platform.advance_ms(1);
+        p
+    }
+
+    /// Arm a live watcher whose channel the test drives by hand.
+    fn arm_watcher(
+        engine: &Engine,
+        p: &SyncProfile,
+    ) -> tokio::sync::mpsc::UnboundedSender<WatchEvent> {
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = FolderWatcher::start(
+            &p.local_path,
+            WatchConfig {
+                debounce_ms: 50,
+                rescan_interval_ms: 0,
+                force_poll: false,
+            },
+            tx.clone(),
+        )
+        .expect("a watcher arms over a real directory");
+        Engine::lock(&engine.watchers).insert(p.id.clone(), ProfileWatch::Live { watcher, events });
+        tx
+    }
+
+    /// The largest `files_done` a Scanning event carried since `from`: with
+    /// [`Engine::report_every_walk_item`] set, that is the walk's `scanned`.
+    fn entries_scanned(log: &Arc<Mutex<Vec<SyncProgress>>>, from: usize) -> u64 {
+        Engine::lock(log)
+            .iter()
+            .skip(from)
+            .filter(|event| event.phase == SyncPhase::Scanning)
+            .map(|event| event.files_done)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The acceptance test: one saved file on a 10 000-entry folder costs the
+    /// commit leg one entry's comparison, not ten thousand — and the walk the
+    /// settle deadline runs afterwards costs the same, because the gate's
+    /// held path rides along as an include. hesperia paid `scanned=155626`
+    /// per second for one growing segment file.
+    #[test]
+    fn a_wake_naming_one_path_walks_one_entry_of_ten_thousand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let p = committed_fixture_of(&engine, &platform, dir.path(), 10_000);
+        let tx = arm_watcher(&engine, &p);
+        let log = recording(&engine);
+
+        let changed = p.local_path.join("d/f05000.txt");
+        std::fs::write(&changed, b"rewritten").expect("write");
+        tx.send(WatchEvent {
+            path: changed.clone(),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(engine.scan_due(&p), "a delivered event opens the walk");
+
+        // The wake-driven walk: the gate opens the episode on one path.
+        let seen = Engine::lock(&log).len();
+        engine.clear_watch_wake(&p.id);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("first pass"),
+            0,
+            "the file is settling"
+        );
+        let first = entries_scanned(&log, seen);
+        assert!(
+            (1..=2).contains(&first),
+            "the include must narrow the walk to the named path: scanned={first}"
+        );
+
+        // The deadline-driven walk: nothing new from the watcher, one held
+        // path in the gate. It must be narrowed too, and it must still commit.
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert!(engine.scan_due(&p), "the held file's window elapsed");
+        assert!(
+            !engine.watch_wake_pending(&p),
+            "and it is the deadline, not a wake, that reopened the walk"
+        );
+        let seen = Engine::lock(&log).len();
+        engine.clear_watch_wake(&p.id);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("second pass"),
+            1,
+            "the settled file is committed"
+        );
+        let second = entries_scanned(&log, seen);
+        assert!(
+            (1..=2).contains(&second),
+            "the gate's held path narrows the deadline walk: scanned={second}"
+        );
+
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            3,
+            "the sweep, the wake's walk and the deadline's walk, and nothing else"
+        );
+    }
+
+    /// Past [`WATCH_PATHS_CAP`] the list is not a substitute for the index:
+    /// one walk, the whole index, and nothing left over.
+    #[test]
+    fn overflowing_the_path_cap_produces_one_whole_index_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(mut engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        engine.report_every_walk_item();
+        let count = u32::try_from(WATCH_PATHS_CAP + 4).expect("fits");
+        let p = committed_fixture_of(&engine, &platform, dir.path(), count);
+        let tx = arm_watcher(&engine, &p);
+        let log = recording(&engine);
+
+        for i in 0..count {
+            tx.send(WatchEvent {
+                path: p.local_path.join(format!("d/f{i:05}.txt")),
+                close_write: false,
+            })
+            .expect("the supervisor is listening");
+        }
+        engine.fold_watch_events(&p).expect("fold");
+        {
+            let wakes = Engine::lock(&engine.watch_paths);
+            let wake = wakes.get(&p.id).expect("the batch was noted");
+            assert!(wake.overflow, "past the cap the list is discarded");
+            assert!(
+                wake.paths.is_empty(),
+                "and holds nothing: {}",
+                wake.paths.len()
+            );
+        }
+        assert!(engine.scan_due(&p));
+
+        let seen = Engine::lock(&log).len();
+        let before = engine.counters(&p.id).status_walks;
+        engine.clear_watch_wake(&p.id);
+        engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("the walk");
+        assert_eq!(engine.counters(&p.id).status_walks, before + 1, "one walk");
+        assert_eq!(
+            entries_scanned(&log, seen),
+            u64::from(count),
+            "and it compared the whole index"
+        );
+        assert!(
+            !engine.scan_due(&p),
+            "nothing is owed afterwards: the overflow was spent by the walk"
+        );
+    }
+
+    /// The 1 Hz question is answered from the index entry, one `lstat` and the
+    /// `HEAD` entry — never from a walk. Counter test against `status_walks`,
+    /// the door every walk goes through, plus the four answers the old walk
+    /// gave: present, modified, missing, unreadable.
+    #[tokio::test]
+    async fn path_durability_takes_no_walk_claim_and_answers_present_modified_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        if gix::init_bare(&remote).is_err() {
+            return;
+        }
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = recordings_profile(dir.path(), &remote, PushPolicy::SessionEnd);
+        engine.upsert_profile(&p).expect("upsert");
+        let segment = close_segment(&engine, &p, "clip-0.mkv", 512);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit at close"),
+            1
+        );
+
+        // Present.
+        let walks = engine.counters(&p.id).status_walks;
+        let present = engine.path_durability(&p.id, &segment).expect("read");
+        assert!(present.committed, "{present:?}");
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            walks,
+            "a durability read is not a walk"
+        );
+
+        // Modified: the segment was rewritten after its commit — at the same
+        // size, so only the stat says so, which is the comparison this answer
+        // rests on (and what makes a walk read the file, which the unreadable
+        // arm below relies on). The mtime is pushed a second on because the
+        // whole test runs inside one wall-clock second, and a same-second
+        // same-size rewrite is the racy-git hole the doc comment accepts.
+        std::fs::write(&segment, vec![b'x'; 512]).expect("rewrite");
+        std::fs::File::options()
+            .write(true)
+            .open(&segment)
+            .and_then(|file| {
+                file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            })
+            .expect("age the rewrite");
+        let modified = engine.path_durability(&p.id, &segment).expect("read");
+        assert!(!modified.committed, "{modified:?}");
+
+        // Unreadable, and remembered as such by a walk that stepped over it:
+        // the last known state stands. Only where permissions bind at all.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod");
+            if std::fs::read(&segment).is_err() {
+                let repo = engine.open_repo(&p).expect("open");
+                let stepped = git::repo::status_paths(&repo).expect("the walk steps over it");
+                assert_eq!(stepped.unreadable.len(), 1, "{stepped:?}");
+                let unknown = engine.path_durability(&p.id, &segment).expect("read");
+                assert!(!unknown.committed, "unknown never rounds up: {unknown:?}");
+            }
+            std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod back");
+            assert!(
+                !engine
+                    .path_durability(&p.id, &segment)
+                    .expect("read")
+                    .committed,
+                "readable again, and still modified"
+            );
+        }
+
+        // Missing.
+        std::fs::remove_file(&segment).expect("delete");
+        let missing = engine.path_durability(&p.id, &segment).expect("read");
+        assert!(!missing.committed, "{missing:?}");
+        assert_eq!(
+            engine.counters(&p.id).status_walks,
+            walks,
+            "none of those answers cost a walk"
+        );
+    }
+
+    /// The first floor: a path the gate already holds, with its deadline still
+    /// ahead, does not set the wake — the deadline schedules the walk. A
+    /// close-write on that path does, because it shortens the deadline.
+    #[test]
+    fn a_wake_for_a_settling_path_does_not_set_scan_due() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.poll_interval_ms = 15_000;
+        // A window well past the floor, so advancing the floor below cannot be
+        // mistaken for the held file's deadline elapsing.
+        p.settle_ms = 30_000;
+        engine.upsert_profile(&p).expect("upsert");
+        // Spend first sight, and the list it widened.
+        assert!(engine.scan_due(&p));
+        engine.clear_watch_wake(&p.id);
+        engine.take_watch_paths(&p.id);
+        assert!(!engine.scan_due(&p));
+
+        // One path mid-window, exactly as a walk would have left it.
+        let now = platform.now_ms();
+        let held = p.local_path.join("held.bin");
+        std::fs::write(&held, [0u8; 128]).expect("write");
+        let mut gate = StabilityGate::for_profile(&p).expect("gate");
+        gate.observe(
+            &held,
+            FileSample {
+                size: 128,
+                mtime_ns: i128::from(now) * 1_000_000,
+                ctime_ns: i128::from(now) * 1_000_000,
+                inode: 11,
+            },
+            now,
+            false,
+        );
+        Engine::lock(&engine.gates).insert(p.id.clone(), gate);
+        let tx = arm_watcher(&engine, &p);
+
+        tx.send(WatchEvent {
+            path: held.clone(),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            !engine.scan_due(&p),
+            "a write to a file the gate is already holding buys no walk before its deadline"
+        );
+        assert!(
+            Engine::lock(&engine.watch_paths)
+                .get(&p.id)
+                .is_some_and(|wake| wake.paths.contains(Path::new("held.bin"))),
+            "but the path is kept for the walk the deadline runs"
+        );
+
+        // A path the gate does not hold still wakes at once.
+        tx.send(WatchEvent {
+            path: p.local_path.join("other.txt"),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            engine.scan_due(&p),
+            "an unheld path is a reason to walk now"
+        );
+        engine.clear_watch_wake(&p.id);
+        // Past the floor, so the next assertion is about the gate and not
+        // about the interval.
+        platform.advance_ms(WAKE_WALK_MIN_INTERVAL.as_millis() as i64);
+        assert!(!engine.scan_due(&p));
+
+        // A close-write on the held path shortens its deadline, so it asks.
+        tx.send(WatchEvent {
+            path: held,
+            close_write: true,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(
+            engine.scan_due(&p),
+            "a close-write is the one event on a held path that changes its deadline"
+        );
+    }
+
+    /// The second floor: two wakes one second apart are one walk. The second
+    /// wake is kept, not dropped — it opens the walk once the floor passes.
+    #[test]
+    fn two_wakes_one_second_apart_produce_one_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.poll_interval_ms = 15_000;
+        engine.upsert_profile(&p).expect("upsert");
+        assert!(engine.scan_due(&p), "first sight");
+        engine.clear_watch_wake(&p.id);
+        let tx = arm_watcher(&engine, &p);
+
+        // One supervisor tick: an event, the fold, the question, one second.
+        // Returns whether the tick walked.
+        let tick = |name: &str| -> bool {
+            tx.send(WatchEvent {
+                path: p.local_path.join(name),
+                close_write: false,
+            })
+            .expect("the supervisor is listening");
+            engine.fold_watch_events(&p).expect("fold");
+            let walked = engine.scan_due(&p);
+            if walked {
+                engine.clear_watch_wake(&p.id);
+            }
+            platform.advance_ms(1_000);
+            walked
+        };
+        assert!(tick("one.txt"), "the first wake walks at once");
+        assert!(
+            !tick("two.txt"),
+            "a wake one second later is inside the floor"
+        );
+        assert!(
+            Engine::lock(&engine.watch_paths)
+                .get(&p.id)
+                .is_some_and(|wake| wake.due),
+            "and it is kept, not dropped"
+        );
+        // The floor is min(settle, 5 s); this profile settles in 5 s. The
+        // first walk was at t=0, so the wake stays held through t=4.
+        assert!(!tick("three.txt"));
+        assert!(!tick("four.txt"));
+        assert!(!tick("five.txt"));
+        assert!(
+            tick("six.txt"),
+            "the kept wake opens the walk once the floor has passed"
+        );
+    }
+
+    /// A shorter settle window shortens the floor with it: a folder whose
+    /// files settle in two seconds is not made to wait five.
+    #[test]
+    fn the_wake_floor_is_capped_by_the_settle_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.settle_ms = 2_000;
+        assert_eq!(engine.wake_walk_floor_ms(&p), 2_000);
+        p.settle_ms = 30_000;
+        assert_eq!(
+            engine.wake_walk_floor_ms(&p),
+            WAKE_WALK_MIN_INTERVAL.as_millis() as i64
+        );
+    }
+
+    /// A wake that names nothing widens the list; a paced walk widens it too.
+    /// Both are walks that must look at the whole index.
+    #[test]
+    fn an_unnamed_wake_and_a_paced_walk_both_widen_the_list_to_the_whole_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.poll_interval_ms = 15_000;
+        engine.upsert_profile(&p).expect("upsert");
+        assert!(engine.scan_due(&p), "first sight");
+        engine.clear_watch_wake(&p.id);
+        engine.take_watch_paths(&p.id);
+        // Behind the first-pass sweep, so the policy below is the steady one.
+        Engine::lock(&engine.untracked_sweep).insert(p.id.clone(), Instant::now());
+        let tx = arm_watcher(&engine, &p);
+        std::fs::write(p.local_path.join("a.txt"), b"a").expect("write");
+
+        // Named: narrowed.
+        tx.send(WatchEvent {
+            path: p.local_path.join("a.txt"),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        // A path the index does not carry owes the scan; take that flag off so
+        // this test is about the list and not about `untracked_appeared`.
+        Engine::lock(&engine.untracked_appeared).remove(&p.id);
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("a.txt")])
+        );
+
+        // Named, then an unnamed wake on top: the whole index.
+        tx.send(WatchEvent {
+            path: p.local_path.join("a.txt"),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        engine.note_watch_wake(&p.id);
+        Engine::lock(&engine.untracked_appeared).remove(&p.id);
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only()
+        );
+
+        // Named, then the paced backstop fires: the whole index.
+        tx.send(WatchEvent {
+            path: p.local_path.join("a.txt"),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        platform.advance_ms(15_000);
+        assert!(engine.scan_due(&p), "the paced window elapsed");
+        Engine::lock(&engine.untracked_appeared).remove(&p.id);
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only()
+        );
+
+        // The root event — how an overflow is spelled — widens on its own.
+        tx.send(WatchEvent {
+            path: p.local_path.clone(),
+            close_write: false,
+        })
+        .expect("the supervisor is listening");
+        engine.fold_watch_events(&p).expect("fold");
+        assert!(Engine::lock(&engine.watch_paths)
+            .get(&p.id)
+            .is_some_and(|wake| wake.overflow),);
+    }
+
     /// The tap is an observer: it sees what the drain saw, and its absence —
     /// or its subscriber's disappearance — cannot turn a drain into a failure.
     #[test]
@@ -23983,7 +25846,7 @@ mod tests {
             .fold_watch_events(&p)
             .expect("a send with no receivers is not a sync failure");
         assert!(
-            engine.watch_wake_pending(&p.id),
+            engine.watch_wake_pending(&p),
             "and the event still counted as a reason to walk"
         );
     }
@@ -24051,7 +25914,7 @@ mod tests {
             .expect("the supervisor is listening");
             engine.fold_watch_events(&p).expect("fold");
             assert!(
-                !engine.watch_wake_pending(&p.id),
+                !engine.watch_wake_pending(&p),
                 "{relative} is excluded, so no walk may be armed for it"
             );
         }
@@ -24066,7 +25929,7 @@ mod tests {
         .expect("the supervisor is listening");
         engine.fold_watch_events(&p).expect("fold");
         assert!(
-            !engine.watch_wake_pending(&p.id),
+            !engine.watch_wake_pending(&p),
             "a close-write does not exempt an excluded path"
         );
 
@@ -24079,7 +25942,7 @@ mod tests {
         .expect("the supervisor is listening");
         engine.fold_watch_events(&p).expect("fold");
         assert!(
-            engine.watch_wake_pending(&p.id),
+            engine.watch_wake_pending(&p),
             "an ordinary change is still a reason to walk at once"
         );
     }
@@ -24132,7 +25995,7 @@ mod tests {
         .expect("the supervisor is listening");
         engine.fold_watch_events(&p).expect("fold");
         assert!(
-            !engine.watch_wake_pending(&p.id),
+            !engine.watch_wake_pending(&p),
             "our own object writes must not each buy a walk of the worktree"
         );
 
@@ -24145,11 +26008,14 @@ mod tests {
         .expect("the supervisor is listening");
         engine.fold_watch_events(&p).expect("fold");
         assert!(
-            engine.watch_wake_pending(&p.id),
+            engine.watch_wake_pending(&p),
             "an overflow rescan is the one event that must never be filtered"
         );
 
         engine.clear_watch_wake(&p.id);
+        // Past the wake floor (AD-227), so the next assertion is about the
+        // filter and not about the interval between two wake-driven walks.
+        platform.advance_ms(WAKE_WALK_MIN_INTERVAL.as_millis() as i64);
         tx.send(WatchEvent {
             path: p.local_path.join(".git"),
             close_write: false,
@@ -24157,7 +26023,7 @@ mod tests {
         .expect("the supervisor is listening");
         engine.fold_watch_events(&p).expect("fold");
         assert!(
-            engine.watch_wake_pending(&p.id),
+            engine.watch_wake_pending(&p),
             "a repository appearing or vanishing is worth one look"
         );
     }
@@ -24507,6 +26373,105 @@ mod tests {
             "not one of those refusals may have written a thing"
         );
         assert_eq!(engine.counters(&p.id).attribute_writes, 0);
+    }
+
+    /// Story 70.4, AD-230. The session-start door wrote rules without asking
+    /// what the commit path asks: wildmatch's `*` matches the empty string, so
+    /// `*.gitattributes` routes `.gitattributes` itself; and `lfsNever` was
+    /// read by the size rule alone, so this door wrote a rule for an extension
+    /// the folder had explicitly opted out of.
+    #[test]
+    fn an_lfs_rule_for_a_control_file_name_or_an_opted_out_extension_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let Some(engine) = engine(dir.path()) else {
+            return;
+        };
+        let mut p = recordings_profile(dir.path(), dir.path(), PushPolicy::SessionEnd);
+        p.lfs_never = vec!["*.md".into(), "notes/*.txt".into()];
+        engine.upsert_profile(&p).expect("upsert");
+        let attributes = p.local_path.join(".gitattributes");
+
+        for extension in [
+            "gitattributes",
+            ".gitignore",
+            "gitmodules",
+            "lfsconfig",
+            "keepervirtual",
+        ] {
+            assert!(
+                !engine.ensure_lfs_rule(&p.id, extension).expect("refused"),
+                "`*.{extension}` would route the control file itself"
+            );
+        }
+        assert!(
+            !engine.ensure_lfs_rule(&p.id, "md").expect("refused"),
+            "the folder opted `.md` out; a rule for it would be an opt-out that does nothing"
+        );
+        assert!(
+            !attributes.exists(),
+            "not one of those refusals may have written a thing"
+        );
+        assert_eq!(engine.counters(&p.id).attribute_writes, 0);
+
+        assert!(
+            engine.ensure_lfs_rule(&p.id, "txt").expect("written"),
+            "a scoped opt-out (`notes/*.txt`) leaves the rest of the tree governed by the rule"
+        );
+        assert!(engine.ensure_lfs_rule(&p.id, "mp4").expect("written"));
+        assert_eq!(engine.counters(&p.id).attribute_writes, 2);
+    }
+
+    /// Story 70.4, AD-231. The prune plan is a walk over every tracked path
+    /// and it used to run on every success edge — on hesperia, on every
+    /// pull-only pass a poll produced. Only a confirmation can make an object
+    /// newly releasable, so a pass without one runs no plan; the hourly look
+    /// covers the memos the flag cannot see.
+    #[tokio::test]
+    async fn a_success_edge_that_moved_no_lfs_unit_runs_no_prune_plan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        assert!(p.lfs_prune_local, "the default this story bounds");
+        std::fs::write(p.local_path.join("keep.txt"), b"ordinary").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        let plans = || engine.counters(&p.id).lfs_prune_plans;
+
+        engine.mark_synced(&p).await;
+        engine.mark_synced(&p).await;
+        assert_eq!(
+            plans(),
+            0,
+            "two pull-only success edges: no unit moved, no plan"
+        );
+
+        // The upload leg's confirmation — the label is irrelevant to the flag.
+        engine.note_unit_synced(&p, None, &"a".repeat(64));
+        engine.mark_synced(&p).await;
+        assert_eq!(
+            plans(),
+            1,
+            "a completed upload is what makes an object releasable"
+        );
+        engine.mark_synced(&p).await;
+        assert_eq!(
+            plans(),
+            1,
+            "and the flag is consumed by the plan it asked for"
+        );
+
+        platform.advance_ms(RELEASE_LOOK_EVERY_MS);
+        engine.mark_synced(&p).await;
+        assert_eq!(
+            plans(),
+            2,
+            "the hourly look covers what the flag cannot see"
+        );
+        engine.mark_synced(&p).await;
+        assert_eq!(plans(), 2, "once, and the plan re-armed the look");
     }
 
     /// FR-136: the default policy holds everything until the session ends, so
@@ -26337,6 +28302,379 @@ mod tests {
         chosen.virtual_patterns = vec!["media/**".to_owned()];
         chosen.make_fully_virtual();
         assert_eq!(chosen.virtual_patterns, vec!["media/**".to_owned()]);
+    }
+
+    // ---- Story 70.2: offline is a word the folder reaches (AD-228) ----
+    //
+    // Every test here drives `tick()` — the supervisor's own pass — against a
+    // remote that misbehaves in one specific way. The epic's failure shape was
+    // a counter reset by the tick that incremented it, invisible to a test
+    // that called `record_failure` in a loop; nothing below calls it.
+
+    /// A `tracing` subscriber that keeps every event's level and message.
+    ///
+    /// Hand-rolled rather than a `tracing-subscriber` dev-dependency: seven
+    /// no-op methods are cheaper than a manifest edit, and the one question
+    /// asked of it — how many times did *this* line appear — needs nothing
+    /// else. Installed with `set_default`, which is per thread: the offline
+    /// edge is written by `record_failure` on the test's own thread under a
+    /// current-thread runtime, so nothing is lost to a worker.
+    #[derive(Default)]
+    struct RecordedLog {
+        lines: Mutex<Vec<(tracing::Level, String)>>,
+    }
+
+    impl RecordedLog {
+        fn count(&self, level: tracing::Level, message: &str) -> usize {
+            Engine::lock(&self.lines)
+                .iter()
+                .filter(|(l, m)| *l == level && m == message)
+                .count()
+        }
+    }
+
+    struct MessageOf(String);
+
+    impl tracing::field::Visit for MessageOf {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = value.to_owned();
+            }
+        }
+    }
+
+    impl tracing::Subscriber for RecordedLog {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = MessageOf(String::new());
+            event.record(&mut message);
+            Engine::lock(&self.lines).push((*event.metadata().level(), message.0));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// What a loopback listener does with a connection.
+    #[derive(Clone, Copy)]
+    enum Peer {
+        /// Accept and never send a byte — the half-open socket of
+        /// F-PULLPUSH-3.
+        Silent,
+        /// Answer every request with `401 Unauthorized`, which is what makes
+        /// gitoxide ask for a credential.
+        Unauthorized,
+    }
+
+    /// A listener on `127.0.0.1` behaving as `peer`, alive until the returned
+    /// sender is dropped — which also closes every socket it accepted, and
+    /// with them the blocking fetch that was still waiting on one.
+    fn loopback(peer: Peer) -> (u16, std::sync::mpsc::Sender<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => match peer {
+                        Peer::Silent => held.push(stream),
+                        Peer::Unauthorized => {
+                            use std::io::{Read as _, Write as _};
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                            let mut buf = [0u8; 4096];
+                            let _ = stream.read(&mut buf);
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\n\
+                                  WWW-Authenticate: Basic realm=\"x\"\r\n\
+                                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => break,
+                }
+                match stopped.try_recv() {
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    _ => break,
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(held);
+        });
+        (port, stop)
+    }
+
+    /// [`committed_fixture`] pointed at `remote_url` from the start, then made
+    /// pull-only so the only remote leg a tick runs is the fetch under test.
+    /// (Pull-only from the start would commit nothing: `commit_local` returns
+    /// early for a profile that never publishes.)
+    fn committed_fixture_at(
+        engine: &Engine,
+        platform: &TestPlatform,
+        dir: &Path,
+        remote_url: &str,
+    ) -> SyncProfile {
+        let mut p = SyncProfile::new("01JTESTPROFILE", "fixture", dir.join("work"), remote_url);
+        std::fs::create_dir_all(&p.local_path).expect("work dir");
+        std::fs::write(p.local_path.join("a.txt"), b"alpha").expect("write a");
+        engine.upsert_profile(&p).expect("upsert");
+        engine
+            .commit_local(&p, SyncSource::Watch, None)
+            .expect("the first pass opens the settle window");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("commit the fixture"),
+            1
+        );
+        p.direction = SyncDirection::PullOnly;
+        engine.upsert_profile(&p).expect("upsert pull-only");
+        p
+    }
+
+    /// One supervisor tick, then the clock past every backoff so the unit the
+    /// tick rescheduled is claimable by the next one.
+    async fn tick_and_wait_out_the_backoff(engine: &Engine, platform: &TestPlatform) {
+        let _ = engine.tick().await;
+        platform.advance_ms(700_000);
+    }
+
+    /// F-engine-2 / F-db-2. Three failed units in a row, through the tick,
+    /// reach the warning and `NeedsAttention`. This used to be impossible:
+    /// `tick_profile` returns `Ok` after a drain that rescheduled the failed
+    /// unit, and `tick`'s `Ok` arm reset the counter the drain had just
+    /// incremented.
+    #[tokio::test]
+    async fn three_failed_units_through_the_tick_reach_needs_attention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        // A remote that is a path with nothing at it: not a network failure
+        // (which would be `Offline`, AD-49), a transient `Git` one.
+        let nowhere = dir.path().join("no-such-remote.git");
+        let p = committed_fixture_at(&engine, &platform, dir.path(), &nowhere.to_string_lossy());
+
+        // The first tick scans and enqueues the pull; each later tick claims
+        // it, fails it and reschedules it.
+        tick_and_wait_out_the_backoff(&engine, &platform).await;
+        for attempt in 1..TRANSIENT_FAILURES_BEFORE_WARNING {
+            tick_and_wait_out_the_backoff(&engine, &platform).await;
+            let snapshot = engine.status(&p.id).expect("status");
+            assert_ne!(
+                snapshot.state,
+                ProfileState::Offline,
+                "the fixture's failure must not be a network one, or this proves nothing"
+            );
+            assert!(
+                snapshot.warning.is_none(),
+                "attempt {attempt} is below the threshold: {:?}",
+                snapshot.warning
+            );
+            assert_eq!(
+                Engine::lock(&engine.transient_failures).get(&p.id).copied(),
+                Some(attempt),
+                "the count must survive the tick that made it"
+            );
+        }
+        tick_and_wait_out_the_backoff(&engine, &platform).await;
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::NeedsAttention, "{snapshot:?}");
+        let warning = snapshot
+            .warning
+            .expect("a folder failing every attempt says so");
+        assert!(
+            warning.contains(&format!("failed {TRANSIENT_FAILURES_BEFORE_WARNING} times")),
+            "{warning}"
+        );
+        assert!(
+            snapshot.error.is_some(),
+            "and the sentence is beside the folder"
+        );
+        assert_eq!(
+            platform
+                .notifications
+                .lock()
+                .map(|n| n.len())
+                .unwrap_or_default(),
+            1,
+            "one notification at the onset, not one per tick"
+        );
+    }
+
+    /// F-PULLPUSH-3 / F-Deps-2. A peer that accepts the socket and never
+    /// answers used to park the fetch for ever; the deadline ends it as
+    /// `Network`, the folder reads `Offline`, and the onset is logged once at
+    /// `info` however many ticks retry it (F-db-3).
+    #[tokio::test]
+    async fn a_remote_that_accepts_and_never_answers_is_offline_within_the_deadline() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (port, listener) = loopback(Peer::Silent);
+        let p = committed_fixture_at(
+            &engine,
+            &platform,
+            dir.path(),
+            &format!("http://127.0.0.1:{port}/x.git"),
+        );
+        let deadline = Duration::from_secs(2);
+        engine.set_fetch_deadline(deadline);
+
+        tick_and_wait_out_the_backoff(&engine, &platform).await;
+        let started = Instant::now();
+        tick_and_wait_out_the_backoff(&engine, &platform).await;
+        let elapsed = started.elapsed();
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Offline, "{snapshot:?}");
+        assert!(snapshot.error.is_none(), "offline is a state, not an error");
+        assert!(
+            elapsed < deadline + Duration::from_secs(10),
+            "the tick must return at the deadline, not when the socket dies: {elapsed:?}"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync offline"), 1);
+
+        // A second attempt against the same silence is not news.
+        tick_and_wait_out_the_backoff(&engine, &platform).await;
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(
+            log.count(tracing::Level::INFO, "sync offline"),
+            1,
+            "the onset is logged once, the attempts at debug"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 0);
+        // Closing the sockets is what lets the abandoned fetch threads end.
+        drop(listener);
+    }
+
+    /// The other half of the edge: a unit that completes after the profile was
+    /// offline logs `sync reachable again`, once, from the drain that
+    /// completed it — and clears the count with it.
+    #[tokio::test]
+    async fn a_unit_completing_after_offline_logs_reachable_again_once() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        let p = committed_fixture_at(&engine, &platform, dir.path(), &remote.to_string_lossy());
+
+        // Two network failures, the way every one of them arrives.
+        for _ in 0..2 {
+            engine.record_failure(
+                &p,
+                &SyncError::Network {
+                    host: "127.0.0.1".to_owned(),
+                    reason: "connection refused".to_owned(),
+                },
+            );
+        }
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync offline"), 1);
+
+        // An offline profile only ticks when a unit is due; give it one.
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Pull, 0, 0).map(drop))
+            .expect("enqueue");
+        tick_and_wait_out_the_backoff(&engine, &platform).await;
+        tick_and_wait_out_the_backoff(&engine, &platform).await;
+
+        assert_ne!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline,
+            "the fetch from the bare remote must have succeeded"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 1);
+        assert!(
+            Engine::lock(&engine.transient_failures)
+                .get(&p.id)
+                .is_none(),
+            "a completed unit is the reset"
+        );
+    }
+
+    /// F-PULLPUSH-5. A profile with no stored credential and a repository
+    /// `credential.helper` that writes a sentinel: the fetch ends `Auth` and
+    /// the sentinel never appears, because keeper answers the credential
+    /// question itself and the helper chain is cleared for the fetch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fetch_with_no_credential_refuses_instead_of_asking_the_machine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let (port, listener) = loopback(Peer::Unauthorized);
+        let p = committed_fixture_at(
+            &engine,
+            &platform,
+            dir.path(),
+            &format!("http://127.0.0.1:{port}/x.git"),
+        );
+        let sentinel = dir.path().join("the-helper-ran");
+        let config = p.local_path.join(".git/config");
+        let mut text = std::fs::read_to_string(&config).expect("config");
+        text.push_str(&format!(
+            "[credential]\n\thelper = !sh -c 'touch {}'\n",
+            sentinel.display()
+        ));
+        std::fs::write(&config, text).expect("write config");
+
+        tick_and_wait_out_the_backoff(&engine, &platform).await;
+        tick_and_wait_out_the_backoff(&engine, &platform).await;
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::NeedsAttention, "{snapshot:?}");
+        let error = snapshot
+            .error
+            .expect("a refused credential is recorded beside the folder");
+        assert!(
+            error.contains("rejected the access token"),
+            "the outcome must be `Auth`, got: {error}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "the machine's helper ran: keeper fetched as somebody else"
+        );
+        assert!(
+            std::fs::read_to_string(&config)
+                .expect("config")
+                .contains("the-helper-ran"),
+            "the helper must still be configured, or the test proved nothing"
+        );
+        drop(listener);
     }
 }
 

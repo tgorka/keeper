@@ -30,11 +30,14 @@
 //!   module without passing through `scrub_userinfo` (NFR-26).
 
 use std::{
+    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
+    time::{Duration, Instant},
 };
 
 use crate::error::{Result, SyncError};
+use crate::git::conflict::{ChangeKind, Side};
 use crate::git::fetch::Credential;
 
 /// Environment variables the credential helper below reads the secret from.
@@ -75,6 +78,29 @@ pub const MIN_GIT_MINOR: u32 = 42;
 /// `git` can emit megabytes on a bad push; an error that big is unusable in a
 /// notification and would bloat every journal row that stores it.
 const STDERR_CAP: usize = 2_048;
+
+/// Longest a `git` child may run before it is killed (AD-228, F-PULLPUSH-4).
+///
+/// `capture` used to end in `Command::output()`, which waits for ever. The
+/// prompt hang is closed by the environment below; the *network* hang was not:
+/// a `git push` over HTTPS to a peer that accepted the connection and then
+/// stopped answering sat on a `spawn_blocking` thread holding the profile's
+/// reservation with no bound at all. Ten minutes is far past any push this
+/// engine makes — a pack is commits and pointers, the bytes travel through the
+/// LFS legs, which carry their own 30-minute transfer client — and it is the
+/// same figure the fetch leg uses, so a stalled remote costs the same whichever
+/// door it stalled behind. The low-speed limits in
+/// [`repository_config_args`] end a stalled transfer in one minute; this is
+/// the backstop for the case they cannot see, a `git` that is not transferring
+/// at all.
+pub const GIT_DEADLINE: Duration = Duration::from_secs(600);
+
+/// How often [`capture`] asks a running child whether it has finished.
+///
+/// Coarse on purpose: a `git` verb that finishes in 20 ms is 20 ms plus one
+/// poll, and a verb that takes a minute is not made faster by asking more
+/// often. The reader threads, not this loop, are what keep the pipes moving.
+const CHILD_POLL: Duration = Duration::from_millis(50);
 
 /// What the discovered `git` binary can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,11 +164,12 @@ impl GitEngine {
 pub enum Verb {
     /// `git push`.
     Push,
-    /// `merge`, `switch`, `symbolic-ref`, `rev-parse`: moving or reading
-    /// `HEAD` and the working tree.
+    /// `merge`, `merge --abort`, `checkout --ours|--theirs`, `add`, `commit`,
+    /// `switch`, `symbolic-ref`, `rev-parse`: moving or reading `HEAD`, the
+    /// index and the working tree.
     Checkout,
-    /// `merge-base`, `merge-base --is-ancestor`, `diff --name-only`: reading
-    /// history.
+    /// `merge-base`, `merge-base --is-ancestor`, `diff --name-status`,
+    /// `ls-files --unmerged`, `cat-file`: reading history and the index.
     History,
     /// `worktree add|remove|prune`.
     Worktree,
@@ -152,6 +179,33 @@ pub enum Verb {
     Gc,
     /// `git --version`.
     Probe,
+}
+
+/// How a [`GitCli::merge_theirs`] ended. Both leave `MERGE_HEAD` set: the
+/// merge is committed by [`GitCli::commit_merge`] once the caller is done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// Every path merged; the result is staged.
+    Clean,
+    /// git left unmerged entries — [`GitCli::unmerged_entries`] lists them,
+    /// and the caller resolves each before committing.
+    Conflicted,
+}
+
+/// One stage of one unmerged index entry, as `git ls-files --unmerged`
+/// reports it.
+///
+/// Stage 1 is the merge base, 2 ours, 3 theirs. A path has one to three of
+/// them, and which are present is the whole story of the conflict: a missing
+/// stage 2 says we deleted it, a missing stage 1 says nobody had it before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmergedEntry {
+    /// Repository-relative, as bytes: `-z` output, never git's quoted form.
+    pub path: PathBuf,
+    /// 1, 2 or 3.
+    pub stage: u8,
+    /// The blob at this stage, for [`GitCli::blob_bytes`].
+    pub oid: String,
 }
 
 /// The sentence a phone answers a shim verb with (AD-198).
@@ -188,6 +242,8 @@ pub fn phone_refusal(verb: Verb) -> String {
 pub struct GitCli {
     program: PathBuf,
     engine: GitEngine,
+    /// How long one child may run. [`GIT_DEADLINE`] outside a test.
+    deadline: Duration,
 }
 
 impl GitCli {
@@ -197,6 +253,7 @@ impl GitCli {
         Self {
             program,
             engine: GitEngine::Binary,
+            deadline: GIT_DEADLINE,
         }
     }
 
@@ -205,7 +262,18 @@ impl GitCli {
         Self {
             program: PathBuf::new(),
             engine: GitEngine::Gix,
+            deadline: GIT_DEADLINE,
         }
+    }
+
+    /// The same handle with a shorter child deadline.
+    ///
+    /// Test-only: the kill path is proven against a `git` that sleeps, and a
+    /// suite that waited ten minutes to watch it die would never be run.
+    #[cfg(test)]
+    pub(crate) fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Which engine this handle drives.
@@ -316,26 +384,186 @@ impl GitCli {
     /// shell out. `--ff-only` is deliberate: if the branches diverged this must
     /// fail loudly so the caller runs the conflict-copy path instead of
     /// silently creating a merge commit nobody asked for.
+    ///
+    /// A failure is undone with [`Self::merge_abort`] before it is returned. A
+    /// fast-forward that git refuses leaves nothing to abort, and the abort
+    /// says so and succeeds; the point is that no merge verb in this module
+    /// can return `Err` with a `MERGE_HEAD` still standing, because that is
+    /// the one state a folder never leaves on its own (AD-229).
     pub fn merge_ff_only(&self, repo: &Path, reference: &str) -> Result<()> {
         self.refuse_on_phone(Verb::Checkout)?;
         self.run("merge --ff-only", repo, &merge_ff_only_args(reference)?)
             .map(drop)
+            .map_err(|err| self.undo_failed_merge(repo, err))
     }
 
-    /// Merge `reference`, resolving every content conflict in the remote's
-    /// favour.
+    /// Merge `reference` with the remote winning every content conflict, and
+    /// stop before committing.
     ///
     /// This is only ever called *after* the local revision of each contested
     /// path has been preserved as a conflict copy (AD-43), so "theirs wins" is
     /// a naming decision, not a data-loss one.
-    pub fn merge_theirs(&self, repo: &Path, reference: &str, message: &str) -> Result<()> {
+    ///
+    /// `--no-commit` is what lets the copies land **in** the merge commit: the
+    /// caller stages them and calls [`Self::commit_merge`]. It is also what
+    /// makes a clean merge and a conflicted one the same shape for the caller —
+    /// `MERGE_HEAD` is set either way, and the difference is only whether
+    /// [`Self::unmerged_entries`] has anything to resolve.
+    ///
+    /// `-X theirs` answers content conflicts and nothing else. Measured on the
+    /// exact vector below: modify/delete, rename-vs-modify, file/directory and
+    /// a case-only rename under `core.ignorecase=true` all exit 1 with
+    /// `MERGE_HEAD` set and stages left in the index. That is
+    /// [`MergeOutcome::Conflicted`] — the merge is alive and the caller finishes
+    /// it. Any other failure is a merge that will never finish, and it is
+    /// aborted here so the next pass meets a clean repository rather than the
+    /// `128: you have unmerged files` that every later merge answered with in
+    /// the field.
+    pub fn merge_theirs(
+        &self,
+        repo: &Path,
+        reference: &str,
+        message: &str,
+    ) -> Result<MergeOutcome> {
         self.refuse_on_phone(Verb::Checkout)?;
-        self.run(
+        match self.run(
             "merge -X theirs",
             repo,
             &merge_theirs_args(reference, message)?,
+        ) {
+            Ok(_) => Ok(MergeOutcome::Clean),
+            Err(SyncError::GitCommand { code: 1, .. }) if merge_head_path(repo).is_file() => {
+                Ok(MergeOutcome::Conflicted)
+            }
+            Err(err) => Err(self.undo_failed_merge(repo, err)),
+        }
+    }
+
+    /// Abort the merge in progress, then hand the original failure back.
+    ///
+    /// The abort's own failure is logged and dropped: the caller asked about
+    /// the merge, and the merge's error is the one that says what happened.
+    fn undo_failed_merge(&self, repo: &Path, err: SyncError) -> SyncError {
+        if let Err(abort) = self.merge_abort(repo) {
+            tracing::warn!(error = %abort, "a failed merge could not be aborted");
+        }
+        err
+    }
+
+    /// Undo a merge in progress, restoring the index and worktree to `HEAD`.
+    ///
+    /// Best-effort by contract: a repository with no `MERGE_HEAD` answers
+    /// `128: There is no merge to abort`, and nothing to undo is success, not a
+    /// fault. Run through [`capture`] rather than [`Self::run`] for that
+    /// reason — the "nothing to abort" exit would otherwise be logged as a
+    /// failed subcommand on every fast-forward git refuses.
+    pub fn merge_abort(&self, repo: &Path) -> Result<()> {
+        self.refuse_on_phone(Verb::Checkout)?;
+        let output = capture(
+            &self.program,
+            Some(repo),
+            &merge_abort_args(),
+            None,
+            self.deadline,
+            "merge --abort",
+        )?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let raw = String::from_utf8_lossy(&output.stderr);
+        if raw.contains(NO_MERGE_TO_ABORT) {
+            return Ok(());
+        }
+        Err(command_failure("merge --abort", &output))
+    }
+
+    /// Restore `paths` from one side of the merge in progress, in both the
+    /// worktree and the index (`git checkout --ours|--theirs`).
+    ///
+    /// The path stays unmerged until [`Self::add_paths`] records the choice;
+    /// the two are separate verbs because the caller batches every path of a
+    /// side into one process and then adds everything at once.
+    pub fn checkout_side(&self, repo: &Path, side: Side, paths: &[PathBuf]) -> Result<()> {
+        self.refuse_on_phone(Verb::Checkout)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let pathspecs = PathspecFile::new(paths)?;
+        self.run(
+            "checkout --ours/--theirs",
+            repo,
+            &checkout_side_args(side, pathspecs.arg()),
         )
         .map(drop)
+    }
+
+    /// Stage `paths` as they stand in the worktree: a new file is added, a
+    /// changed one updated, a missing one recorded as removed, and an unmerged
+    /// one resolved to whatever the worktree holds.
+    ///
+    /// `--force`, because a conflict copy is committed by promise (`docs/sync.md`
+    /// §5: "both are committed as ordinary tracked files, so every peer sees
+    /// the same pair") and a user's ignore rule for its extension must not
+    /// quietly break that; and because a contested path git is waiting on must
+    /// be resolvable whatever `.gitignore` says about it.
+    pub fn add_paths(&self, repo: &Path, paths: &[PathBuf]) -> Result<()> {
+        self.refuse_on_phone(Verb::Checkout)?;
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let pathspecs = PathspecFile::new(paths)?;
+        self.run("add", repo, &add_paths_args(pathspecs.arg()))
+            .map(drop)
+    }
+
+    /// Commit the merge in progress with `message`, clearing `MERGE_HEAD`.
+    ///
+    /// The message is passed again rather than left to `MERGE_MSG`: git's
+    /// cleanup rules for that file depend on whether an editor ran, and the
+    /// provenance trailers must arrive as they were written.
+    pub fn commit_merge(&self, repo: &Path, message: &str) -> Result<()> {
+        self.refuse_on_phone(Verb::Checkout)?;
+        self.run("commit", repo, &commit_merge_args(message))
+            .map(drop)
+    }
+
+    /// Every stage of every unmerged index entry, in index order.
+    ///
+    /// Empty after a clean merge; after a conflicted one, exactly the paths
+    /// [`Self::commit_merge`] would refuse over. Read with `-z`, so a path is
+    /// its bytes and not git's quoted rendering of them.
+    pub fn unmerged_entries(&self, repo: &Path) -> Result<Vec<UnmergedEntry>> {
+        self.refuse_on_phone(Verb::History)?;
+        let out = self.run_raw("ls-files --unmerged", repo, &ls_files_unmerged_args())?;
+        parse_unmerged(&out)
+    }
+
+    /// The bytes of one blob, by object id.
+    ///
+    /// How the engine reads a side of an unmerged entry that `checkout` cannot
+    /// write — a file whose canonical path is a directory on the other side.
+    pub fn blob_bytes(&self, repo: &Path, oid: &str) -> Result<Vec<u8>> {
+        self.refuse_on_phone(Verb::History)?;
+        self.run_raw("cat-file blob", repo, &cat_file_blob_args(oid)?)
+    }
+
+    /// What changed between two commits, path by path, as the kind the
+    /// conflict matrix reasons about.
+    ///
+    /// `--no-renames`, to match the merge's own `-X no-renames`: a rename is a
+    /// `Deleted` and an `Added`, which is what the merge will see and what
+    /// [`super::conflict::resolve`] has to decide on. `-z`, because a
+    /// non-UTF-8 path would otherwise arrive octal-quoted and be joined onto
+    /// the root as a file that does not exist.
+    pub fn diff_status(
+        &self,
+        repo: &Path,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<(ChangeKind, PathBuf)>> {
+        self.refuse_on_phone(Verb::History)?;
+        let out = self.run_raw("diff --name-status", repo, &diff_status_args(from, to)?)?;
+        parse_name_status(&out)
     }
 
     /// The merge base of two commits, used to work out which side changed what.
@@ -400,7 +628,14 @@ impl GitCli {
         // through the warn-logging path — the supervisor asks on every tick and
         // would otherwise fill the log with warnings about nothing.
         let args = is_ancestor_args(ancestor, descendant)?;
-        let output = capture(&self.program, Some(repo), &args, None)?;
+        let output = capture(
+            &self.program,
+            Some(repo),
+            &args,
+            None,
+            self.deadline,
+            "merge-base --is-ancestor",
+        )?;
         match output.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -421,16 +656,25 @@ impl GitCli {
         }
     }
 
-    /// Paths that differ between two commits, repository-relative.
-    pub fn diff_names(&self, repo: &Path, from: &str, to: &str) -> Result<Vec<PathBuf>> {
-        self.refuse_on_phone(Verb::History)?;
-        let out = self.run("diff --name-only", repo, &diff_names_args(from, to)?)?;
-        Ok(out
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(PathBuf::from)
-            .collect())
+    /// Run one subcommand whose stdout is bytes rather than text — `-z` path
+    /// lists and blob contents.
+    ///
+    /// The exit code is the whole classification: none of these verbs talks
+    /// to a remote, so `classify_message`'s auth, network and diverged needles
+    /// have nothing to find in their diagnostics.
+    fn run_raw(&self, subcommand: &'static str, repo: &Path, args: &[String]) -> Result<Vec<u8>> {
+        let output = capture(
+            &self.program,
+            Some(repo),
+            args,
+            None,
+            self.deadline,
+            subcommand,
+        )?;
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
+        Err(command_failure(subcommand, &output))
     }
 
     /// Run one subcommand, returning its stdout.
@@ -458,7 +702,14 @@ impl GitCli {
             .chain(args.iter().cloned())
             .collect();
         let args = args.as_slice();
-        let output = capture(&self.program, Some(repo), args, credential)?;
+        let output = capture(
+            &self.program,
+            Some(repo),
+            args,
+            credential,
+            self.deadline,
+            subcommand,
+        )?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         if output.status.success() {
             return Ok(stdout);
@@ -513,7 +764,8 @@ pub fn version(program: &Path) -> Result<(u32, u32)> {
 /// folded onto one line because it lands in a settings row.
 pub(crate) fn version_detail(program: &Path) -> std::result::Result<(u32, u32), String> {
     let args = [String::from("--version")];
-    let output = capture(program, None, &args, None).map_err(|err| err.to_string())?;
+    let output = capture(program, None, &args, None, GIT_DEADLINE, "--version")
+        .map_err(|err| err.to_string())?;
     if !output.status.success() {
         let stderr = one_line(&scrub_userinfo(&String::from_utf8_lossy(&output.stderr)));
         return Err(format!("`git --version` failed: {stderr}"));
@@ -560,14 +812,34 @@ fn clears_floor(major: u32, minor: u32) -> bool {
     (major, minor) >= (MIN_GIT_MAJOR, MIN_GIT_MINOR)
 }
 
+/// Longest captured `stdout` kept.
+///
+/// Not [`STDERR_CAP`]: stdout is data, not diagnostics. `diff --name-only`
+/// across a divergence of the reference folder is 155 626 paths, tens of
+/// megabytes, every byte of which the caller needs. The cap exists so a `git`
+/// that has gone wrong cannot grow this process without bound, and it sits far
+/// above anything a correct verb produces.
+const STDOUT_CAP: usize = 64 * 1024 * 1024;
+
 /// The one place a process is created.
 ///
-/// Environment hardening lives here so no call site can forget it.
+/// Environment hardening lives here so no call site can forget it, and so does
+/// the deadline: `deadline` bounds the child's whole life, and a child still
+/// running when it elapses is killed, reaped and reported as
+/// [`SyncError::Network`] naming `leg` — because the only way a `git` verb this
+/// engine runs takes ten minutes is a remote that stopped answering.
+///
+/// Both pipes are drained on their own threads, capped, from the moment the
+/// child starts. `Command::output()` did that too, but only for as long as it
+/// took the child to exit, which was unbounded; here the parent polls
+/// `try_wait` against the clock instead of blocking on the child.
 fn capture(
     program: &Path,
     cwd: Option<&Path>,
     args: &[String],
     credential: Option<&Credential>,
+    deadline: Duration,
+    leg: &str,
 ) -> Result<Output> {
     // Prepended rather than passed through: `-c` only counts before the
     // subcommand, and hardening a call site can forget is not hardening.
@@ -614,7 +886,7 @@ fn capture(
         "spawning git"
     );
 
-    command.output().map_err(|source| {
+    let mut child = command.spawn().map_err(|source| {
         if source.kind() == std::io::ErrorKind::NotFound {
             SyncError::GitMissing {
                 reason: format!("{} does not exist or is not executable", program.display()),
@@ -622,8 +894,108 @@ fn capture(
         } else {
             SyncError::io("spawn git", program.to_path_buf(), source)
         }
-    })
+    })?;
+    // Taken before the wait: a pipe nobody reads fills, and a child blocked on
+    // a full pipe never exits, which would turn a chatty push into a deadline
+    // kill for no reason.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout = std::thread::spawn(move || drain_capped(stdout, STDOUT_CAP));
+    let stderr = std::thread::spawn(move || drain_capped(stderr, STDERR_CAP));
+
+    match wait_within(&mut child, deadline)? {
+        Some(status) => Ok(Output {
+            status,
+            stdout: stdout.join().unwrap_or_default(),
+            stderr: stderr.join().unwrap_or_default(),
+        }),
+        None => {
+            // Kill, then wait: the wait is what reaps it. Without it the entry
+            // stays in the process table as a zombie for the life of this
+            // process — the exact leak the filter-process fork closed.
+            let _ = child.kill();
+            let _ = child.wait();
+            // The readers are not joined. A helper `git` spawned
+            // (`git-remote-https`) may still hold the pipe's write end, and a
+            // join would wait on a process this kill did not reach; the threads
+            // end when that end closes, and hold nothing but a capped buffer.
+            tracing::warn!(
+                leg,
+                deadline_s = deadline.as_secs(),
+                "git did not finish within its deadline and was killed"
+            );
+            let hints: Vec<&str> = args.iter().map(String::as_str).collect();
+            Err(SyncError::Network {
+                host: host_from_text("", None, &hints),
+                reason: deadline_reason(&format!("git {leg}"), deadline),
+            })
+        }
+    }
 }
+
+/// Poll `child` until it exits or `deadline` elapses.
+///
+/// `Some(status)` is an exit; `None` is the deadline. An error from
+/// `try_wait` itself is an `Io` error — it means the process table, not the
+/// remote, is what is wrong.
+fn wait_within(child: &mut Child, deadline: Duration) -> Result<Option<ExitStatus>> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| SyncError::io("wait for git", PathBuf::new(), source))?
+        {
+            return Ok(Some(status));
+        }
+        if started.elapsed() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(CHILD_POLL);
+    }
+}
+
+/// Read `pipe` to EOF, keeping the first `cap` bytes and discarding the rest.
+///
+/// Reading past the cap is not optional: the pipe has to keep draining or the
+/// child blocks on it, and then the deadline kills a `git` that was only
+/// talkative.
+fn drain_capped<R: Read>(pipe: Option<R>, cap: usize) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let Some(mut pipe) = pipe else {
+        return kept;
+    };
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => return kept,
+            Ok(n) => {
+                let room = cap.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
+    }
+}
+
+/// The `reason` a leg cut off by its deadline carries (NFR-62).
+///
+/// One sentence for both doors — the gitoxide fetch and the `git` child — so a
+/// log reader learns to recognise it once. `leg` names what was running;
+/// the duration is rendered in minutes when it is whole minutes, because
+/// `600 s` reads as a code and `10 min` reads as a wait.
+pub(crate) fn deadline_reason(leg: &str, deadline: Duration) -> String {
+    let secs = deadline.as_secs();
+    let shown = if secs >= 60 && secs.is_multiple_of(60) {
+        format!("{} min", secs / 60)
+    } else if secs > 0 {
+        format!("{secs} s")
+    } else {
+        format!("{} ms", deadline.as_millis())
+    };
+    format!("{leg} {DEADLINE_SENTENCE} {shown}")
+}
+
+/// The words between the leg and the duration in [`deadline_reason`].
+const DEADLINE_SENTENCE: &str = "got no answer from the remote and was stopped after";
 
 /// `git push` argument vector.
 ///
@@ -680,6 +1052,17 @@ const NO_HOOKS_PATH: &str = r"NUL\keeper-runs-no-repository-hooks";
 /// there is no case in which running one is required and every case in which
 /// running one is a surprise.
 ///
+/// # A stalled transfer ends in a minute
+///
+/// `http.lowSpeedLimit`/`http.lowSpeedTime` are curl's own stall detector: a
+/// transfer moving under 1 000 bytes/s for 60 s is abandoned with `Operation
+/// too slow`, which [`classify_message`] reads as `Network`. Without them a
+/// `git push` to a peer that completed the TCP handshake and then went silent
+/// waited for ever — `git` has no default here at all — and only
+/// [`GIT_DEADLINE`] would have ended it, ten minutes later. The LFS legs
+/// already carry the equivalent in their read timeout; this is the git leg
+/// catching up.
+///
 /// `cwd` gates this because it is exactly the "are we in a repository" question:
 /// [`version_detail`] probes a binary with no repository in sight, and a `-c`
 /// on that call would only make the diagnostic vector harder to read.
@@ -687,8 +1070,21 @@ fn repository_config_args(cwd: Option<&Path>) -> Vec<String> {
     if cwd.is_none() {
         return Vec::new();
     }
-    vec!["-c".to_owned(), format!("core.hooksPath={NO_HOOKS_PATH}")]
+    vec![
+        "-c".to_owned(),
+        format!("core.hooksPath={NO_HOOKS_PATH}"),
+        "-c".to_owned(),
+        format!("http.lowSpeedLimit={HTTP_LOW_SPEED_LIMIT}"),
+        "-c".to_owned(),
+        format!("http.lowSpeedTime={HTTP_LOW_SPEED_TIME_S}"),
+    ]
 }
+
+/// Bytes per second below which a `git` HTTP transfer counts as stalled.
+const HTTP_LOW_SPEED_LIMIT: u32 = 1_000;
+/// How long a transfer may stay under [`HTTP_LOW_SPEED_LIMIT`] before `git`
+/// abandons it.
+const HTTP_LOW_SPEED_TIME_S: u32 = 60;
 
 fn credential_config_args(credential: Option<&Credential>) -> Vec<String> {
     let mut args = vec!["-c".to_owned(), "credential.helper=".to_owned()];
@@ -832,6 +1228,10 @@ fn merge_ff_only_args(reference: &str) -> Result<Vec<String>> {
 fn merge_theirs_args(reference: &str, message: &str) -> Result<Vec<String>> {
     Ok(vec![
         "merge".to_owned(),
+        // Stopped before the commit so the conflict copies — and whatever
+        // `-X theirs` could not decide — go into the merge commit itself
+        // rather than a later pass' (`GitCli::commit_merge` finishes it).
+        "--no-commit".to_owned(),
         "--no-edit".to_owned(),
         "--quiet".to_owned(),
         // Adopting an existing folder gives the local side its own root
@@ -892,14 +1292,240 @@ fn is_ancestor_args(ancestor: &str, descendant: &str) -> Result<Vec<String>> {
     ])
 }
 
-/// `git diff --name-only <from> <to>` argument vector.
-fn diff_names_args(from: &str, to: &str) -> Result<Vec<String>> {
+/// `git diff --name-status --no-renames -z <from> <to>` argument vector.
+fn diff_status_args(from: &str, to: &str) -> Result<Vec<String>> {
     Ok(vec![
         "diff".to_owned(),
-        "--name-only".to_owned(),
+        "--name-status".to_owned(),
+        "--no-renames".to_owned(),
+        "-z".to_owned(),
         safe_ref(from)?,
         safe_ref(to)?,
     ])
+}
+
+/// `git merge --abort` argument vector.
+fn merge_abort_args() -> Vec<String> {
+    vec!["merge".to_owned(), "--abort".to_owned()]
+}
+
+/// `git checkout --ours|--theirs` argument vector, paths from a file.
+///
+/// `--literal-pathspecs` is a *global* option and precedes the subcommand:
+/// without it a name beginning with `:` is pathspec magic and a `*` is a glob,
+/// and both are legal file names.
+fn checkout_side_args(side: Side, pathspec_file: &str) -> Vec<String> {
+    vec![
+        "--literal-pathspecs".to_owned(),
+        "checkout".to_owned(),
+        "--quiet".to_owned(),
+        match side {
+            Side::Local => "--ours",
+            Side::Remote => "--theirs",
+        }
+        .to_owned(),
+        pathspec_file.to_owned(),
+        "--pathspec-file-nul".to_owned(),
+    ]
+}
+
+/// `git add --force` argument vector, paths from a file.
+fn add_paths_args(pathspec_file: &str) -> Vec<String> {
+    vec![
+        "--literal-pathspecs".to_owned(),
+        "add".to_owned(),
+        "--force".to_owned(),
+        pathspec_file.to_owned(),
+        "--pathspec-file-nul".to_owned(),
+    ]
+}
+
+/// `git commit --no-edit -m <message>` argument vector, for the merge in
+/// progress. The message gets the same carriage-return treatment as
+/// [`merge_theirs_args`], and for the same reason.
+fn commit_merge_args(message: &str) -> Vec<String> {
+    vec![
+        "commit".to_owned(),
+        "--quiet".to_owned(),
+        "--no-edit".to_owned(),
+        "-m".to_owned(),
+        message.replace('\r', ""),
+    ]
+}
+
+/// `git ls-files --unmerged -z` argument vector.
+fn ls_files_unmerged_args() -> Vec<String> {
+    vec![
+        "ls-files".to_owned(),
+        "--unmerged".to_owned(),
+        "-z".to_owned(),
+    ]
+}
+
+/// `git cat-file blob <oid>` argument vector.
+///
+/// An object id is hex and nothing else; refusing anything else is what keeps
+/// this from ever being an option or a revision expression.
+fn cat_file_blob_args(oid: &str) -> Result<Vec<String>> {
+    if oid.is_empty() || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SyncError::Config(format!(
+            "refusing an object id that is not hexadecimal: {oid:?}"
+        )));
+    }
+    Ok(vec![
+        "cat-file".to_owned(),
+        "blob".to_owned(),
+        oid.to_owned(),
+    ])
+}
+
+/// The sentence git answers `merge --abort` with when nothing is in progress.
+const NO_MERGE_TO_ABORT: &str = "There is no merge to abort";
+
+/// Where git keeps the merge in progress for `repo`'s working tree.
+///
+/// `repo/.git/MERGE_HEAD`, the same spelling every other door in this crate
+/// uses for the git directory (`LfsStore::in_git_dir`, `first_checkout_is_unfinished`):
+/// a profile's folder is always a main worktree (`docs/sync.md` §7).
+pub fn merge_head_path(repo: &Path) -> PathBuf {
+    repo.join(".git").join("MERGE_HEAD")
+}
+
+/// The failure a raw verb reports: scrubbed, capped, logged once.
+fn command_failure(subcommand: &'static str, output: &Output) -> SyncError {
+    let raw = String::from_utf8_lossy(&output.stderr);
+    let stderr = truncate(&scrub_userinfo(&raw), STDERR_CAP);
+    tracing::warn!(subcommand, %stderr, "git subcommand failed");
+    SyncError::GitCommand {
+        subcommand,
+        code: output.status.code().unwrap_or(-1),
+        stderr,
+    }
+}
+
+/// A path list on its way to `git`, as a NUL-separated file.
+///
+/// Never argv. A repository path is bytes and [`capture`] takes `String`s; and
+/// `ARG_MAX` is real — the housekeeping pass that motivated `-X no-renames`
+/// contested 138 311 paths, which no argument vector holds.
+/// `--pathspec-from-file` with `--pathspec-file-nul` carries every byte of
+/// every name through one process. The file lives for as long as this value
+/// does, which is exactly the length of the invocation.
+struct PathspecFile {
+    _file: tempfile::NamedTempFile,
+    arg: String,
+}
+
+impl PathspecFile {
+    fn new(paths: &[PathBuf]) -> Result<Self> {
+        use std::io::Write as _;
+        let scratch = std::env::temp_dir();
+        let mut file = tempfile::NamedTempFile::new_in(&scratch)
+            .map_err(|err| SyncError::io("create pathspec file", &scratch, err))?;
+        for path in paths {
+            file.write_all(&path_to_git_bytes(path))
+                .and_then(|()| file.write_all(b"\0"))
+                .map_err(|err| SyncError::io("write pathspec file", file.path(), err))?;
+        }
+        file.flush()
+            .map_err(|err| SyncError::io("write pathspec file", file.path(), err))?;
+        let Some(location) = file.path().to_str() else {
+            return Err(SyncError::Config(format!(
+                "the temporary directory's path is not UTF-8 and cannot be handed to git: {}",
+                scratch.display()
+            )));
+        };
+        let arg = format!("--pathspec-from-file={location}");
+        Ok(Self { _file: file, arg })
+    }
+
+    fn arg(&self) -> &str {
+        &self.arg
+    }
+}
+
+/// A repository-relative path as the bytes git reads and writes for it.
+#[cfg(unix)]
+fn path_to_git_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+/// Off unix a path is not bytes; git wants `/` and UTF-8 there.
+#[cfg(not(unix))]
+fn path_to_git_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().replace('\\', "/").into_bytes()
+}
+
+/// A path from the bytes git printed under `-z`.
+#[cfg(unix)]
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// Parse `git ls-files --unmerged -z`: `<mode> <oid> <stage>\t<path>\0` per
+/// entry.
+fn parse_unmerged(out: &[u8]) -> Result<Vec<UnmergedEntry>> {
+    let mut entries = Vec::new();
+    for record in out
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let malformed = || {
+            SyncError::Git(format!(
+                "unreadable `ls-files --unmerged` record: {:?}",
+                String::from_utf8_lossy(record)
+            ))
+        };
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or_else(malformed)?;
+        let header = std::str::from_utf8(&record[..tab]).map_err(|_| malformed())?;
+        let mut fields = header.split(' ');
+        let _mode = fields.next().ok_or_else(malformed)?;
+        let oid = fields.next().ok_or_else(malformed)?;
+        let stage: u8 = fields
+            .next()
+            .and_then(|stage| stage.parse().ok())
+            .filter(|stage| (1..=3).contains(stage))
+            .ok_or_else(malformed)?;
+        entries.push(UnmergedEntry {
+            path: path_from_git_bytes(&record[tab + 1..]),
+            stage,
+            oid: oid.to_owned(),
+        });
+    }
+    Ok(entries)
+}
+
+/// Parse `git diff --name-status -z`: `<status>\0<path>\0` per entry.
+fn parse_name_status(out: &[u8]) -> Result<Vec<(ChangeKind, PathBuf)>> {
+    let mut fields = out.split(|byte| *byte == 0);
+    let mut entries = Vec::new();
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            // The trailing NUL leaves one empty field at the end.
+            continue;
+        }
+        let Some(path) = fields.next().filter(|path| !path.is_empty()) else {
+            return Err(SyncError::Git(format!(
+                "`diff --name-status` ended with a status and no path: {:?}",
+                String::from_utf8_lossy(status)
+            )));
+        };
+        entries.push((
+            ChangeKind::from_status(status[0]),
+            path_from_git_bytes(path),
+        ));
+    }
+    Ok(entries)
 }
 
 /// Render an absolute path as a command argument.
@@ -1106,7 +1732,7 @@ pub(crate) fn classify_message(
         });
     }
 
-    const NETWORK: [&str; 10] = [
+    const NETWORK: [&str; 15] = [
         "could not resolve host",
         "connection refused",
         "connection timed out",
@@ -1117,6 +1743,20 @@ pub(crate) fn classify_message(
         "the remote end hung up unexpectedly",
         "early eof",
         "operation timed out",
+        // hyper-util's wording for a connect that ran out its timer, which is
+        // what gitoxide's reqwest transport says after its 20 s connect
+        // deadline. Measured on hesperia: 53 lines of `tcp connect error:
+        // deadline has elapsed` over six days, and every one of them fell
+        // through to `Git` because none of the ten needles above is in it
+        // (F-engine-1). `timed out` alone is the bare form both curl and
+        // tokio produce; `connection closed` is hyper's for a peer that hung
+        // up mid-response; `operation too slow` is curl's for the low-speed
+        // limit `repository_config_args` sets.
+        "tcp connect error",
+        "deadline has elapsed",
+        "timed out",
+        "connection closed",
+        "operation too slow",
     ];
     if NETWORK.iter().any(|needle| lower.contains(needle)) {
         return Some(SyncError::Network {
@@ -1301,9 +1941,11 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-qm", "the drop is empty"]);
 
-        GitCli::new(PathBuf::from("git"))
+        let cli = GitCli::new(PathBuf::from("git"));
+        let outcome = cli
             .merge_theirs(root, "refs/heads/remote", "sync: merge remote changes\n")
             .expect("a move on one side and a delete on the other is not a conflict");
+        assert_eq!(outcome, MergeOutcome::Clean);
         assert!(
             root.join("records/report.pdf").is_file(),
             "the destination the remote published has to land here"
@@ -1311,6 +1953,134 @@ mod tests {
         assert!(
             !root.join("inbox/report.pdf").exists(),
             "and the emptied inbox stays empty"
+        );
+        // Stopped before the commit, by design; the caller finishes it.
+        assert!(merge_head_path(root).is_file());
+        cli.commit_merge(root, "sync: merge remote changes\n")
+            .expect("a clean merge commits");
+        assert!(!merge_head_path(root).exists());
+    }
+
+    /// The shape that livelocked a profile for six days in the field: a
+    /// modify/delete `-X theirs` cannot decide. The verb must report it as a
+    /// live merge — not abort it, not return `Err` — and the finishing verbs
+    /// must leave no `MERGE_HEAD` behind.
+    #[test]
+    fn a_modify_delete_conflict_is_reported_alive_and_finished_by_the_matrix_verbs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("f.txt"), b"base").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["checkout", "-q", "-b", "remote"]);
+        std::fs::write(root.join("f.txt"), b"theirs").expect("write");
+        git(&["commit", "-qam", "modify"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::remove_file(root.join("f.txt")).expect("delete");
+        git(&["commit", "-qam", "delete"]);
+
+        let cli = GitCli::new(PathBuf::from("git"));
+        let outcome = cli
+            .merge_theirs(root, "refs/heads/remote", "m\n")
+            .expect("a conflict is an outcome, not a failure");
+        assert_eq!(outcome, MergeOutcome::Conflicted);
+        let unmerged = cli.unmerged_entries(root).expect("stages");
+        assert_eq!(
+            unmerged.iter().map(|e| e.stage).collect::<Vec<_>>(),
+            [1, 3],
+            "we deleted it (no stage 2), they modified it (stage 3): {unmerged:?}"
+        );
+        assert_eq!(
+            cli.blob_bytes(root, &unmerged[1].oid).expect("their blob"),
+            b"theirs"
+        );
+
+        let path = vec![PathBuf::from("f.txt")];
+        cli.checkout_side(root, Side::Remote, &path)
+            .expect("their version is written");
+        cli.add_paths(root, &path).expect("and recorded");
+        assert!(cli.unmerged_entries(root).expect("stages").is_empty());
+        cli.commit_merge(root, "m\n").expect("the merge commits");
+        assert!(!merge_head_path(root).exists());
+        assert_eq!(std::fs::read(root.join("f.txt")).expect("kept"), b"theirs");
+
+        // Nothing in progress: the abort is a no-op, not a fault.
+        cli.merge_abort(root)
+            .expect("there is no merge to abort, and that is success");
+    }
+
+    /// A merge that dies *after* writing `MERGE_HEAD` — a child killed at its
+    /// deadline, a `.git` with debris in it — must not hand the caller an
+    /// error with the merge still standing: that is the state every later
+    /// merge answered with exit 128 in the field.
+    ///
+    /// Arranged with `MERGE_MSG` as a directory: git writes `MERGE_HEAD`
+    /// first and dies on the message, exit 128, deterministically.
+    #[test]
+    fn a_merge_that_dies_after_writing_merge_head_is_undone_before_the_error_returns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("f.txt"), b"base").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["checkout", "-q", "-b", "remote"]);
+        std::fs::write(root.join("t.txt"), b"theirs").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "theirs"]);
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("o.txt"), b"ours").expect("write");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "ours"]);
+        std::fs::create_dir(root.join(".git/MERGE_MSG")).expect("plant the debris");
+
+        let err = GitCli::new(PathBuf::from("git"))
+            .merge_theirs(root, "refs/heads/remote", "m\n")
+            .expect_err("git died on MERGE_MSG");
+        assert!(
+            matches!(err, SyncError::GitCommand { code: 128, .. }),
+            "the original failure is what comes back: {err:?}"
+        );
+        assert!(
+            !merge_head_path(root).exists(),
+            "the merge was undone before the error was returned"
+        );
+        assert!(
+            !root.join("t.txt").exists(),
+            "and the worktree is back at HEAD"
         );
     }
 
@@ -1346,7 +2116,7 @@ mod tests {
         // refuse to run without git-lfs on PATH, which is how a desktop launch
         // lost every push. Nothing keeper does needs a hook, so none run.
         let args = repository_config_args(Some(Path::new("/w/folder")));
-        assert_eq!(args.len(), 2);
+        assert_eq!(args.len(), 6, "{args:?}");
         assert_eq!(args[0], "-c");
         assert!(
             args[1].starts_with("core.hooksPath="),
@@ -1361,6 +2131,88 @@ mod tests {
         // Probing a binary is not repository work, and a `-c` there would only
         // clutter the one diagnostic that gets read by a human.
         assert!(repository_config_args(None).is_empty());
+    }
+
+    /// A `git push` to a peer that accepted the connection and then stopped
+    /// answering waited for ever: `git` has no stall detector unless one is
+    /// configured (F-PULLPUSH-4).
+    #[test]
+    fn a_repository_invocation_carries_a_low_speed_limit() {
+        let args = repository_config_args(Some(Path::new("/w/folder")));
+        let rendered = args.join(" ");
+        assert!(
+            rendered.contains("-c http.lowSpeedLimit=1000"),
+            "no stall floor: {rendered}"
+        );
+        assert!(
+            rendered.contains("-c http.lowSpeedTime=60"),
+            "no stall window: {rendered}"
+        );
+    }
+
+    /// A fake `git` that sleeps past its deadline is killed and reported as
+    /// the remote not answering — the one reason a verb this engine runs
+    /// would take that long. Driven through a real child, because the kill
+    /// and the reap are the whole point and an argument vector proves neither.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_child_past_its_deadline_is_killed_and_classified_network() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("git");
+        // `exec`, so the kill lands on the sleeper and not on a shell that
+        // would leave it running.
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").expect("write fake git");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+
+        let deadline = Duration::from_millis(300);
+        let started = Instant::now();
+        let err = GitCli::new(fake)
+            .with_deadline(deadline)
+            .gc(&repo)
+            .expect_err("a git that never returns must not be waited on");
+        let elapsed = started.elapsed();
+
+        assert_eq!(err.code(), "network", "{err}");
+        assert!(
+            err.to_string().contains("git gc"),
+            "the sentence must name the verb that was cut off: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the child slept for 30 s; the caller waited {elapsed:?}"
+        );
+    }
+
+    /// A `git` that finishes inside its deadline is unaffected by it, and its
+    /// output still arrives whole — the reader threads must not lose bytes to
+    /// the poll.
+    #[test]
+    fn a_git_child_inside_its_deadline_returns_its_output() {
+        let (major, minor) = version(Path::new("git")).expect("a git on PATH");
+        assert!(major >= 1, "{major}.{minor}");
+    }
+
+    /// The transport wording hesperia's log carried for six days, and the bare
+    /// forms it shares with curl and tokio. Every one of them used to fall
+    /// through to `Git`, which is Transient-but-not-Network — so the profile
+    /// retried for ever and never once said "offline" (F-engine-1, F-db-1).
+    #[test]
+    fn transport_timeout_wording_is_network() {
+        for text in [
+            "error sending request for url (https://electra/x.git/info/refs): client error \
+             (Connect): tcp connect error: deadline has elapsed",
+            "deadline has elapsed",
+            "fatal: unable to access 'https://x/': Operation timed out after 60001 milliseconds",
+            "error: RPC failed; curl 28 Operation too slow. Less than 1000 bytes/sec transferred",
+            "connection closed before message completed",
+        ] {
+            let err = classify_message(text, "folder", Some("electra"), &[])
+                .unwrap_or_else(|| panic!("unclassified: {text}"));
+            assert_eq!(err.code(), "network", "{text} -> {err}");
+        }
     }
 
     #[test]
@@ -1481,6 +2333,117 @@ mod tests {
     fn gc_and_sparse_disable_vectors() {
         assert_eq!(gc_args(), ["gc", "--quiet"]);
         assert_eq!(sparse_disable_args(), ["sparse-checkout", "disable"]);
+    }
+
+    #[test]
+    fn the_merge_finishing_verbs_never_put_a_path_on_argv() {
+        // The pathspec file is the whole design: a path is bytes, argv is
+        // `String`s, and `ARG_MAX` is real for the 138k-path folder.
+        let checkout = checkout_side_args(Side::Remote, "--pathspec-from-file=/tmp/ps");
+        assert_eq!(
+            checkout,
+            [
+                "--literal-pathspecs",
+                "checkout",
+                "--quiet",
+                "--theirs",
+                "--pathspec-from-file=/tmp/ps",
+                "--pathspec-file-nul"
+            ]
+        );
+        assert_eq!(
+            checkout_side_args(Side::Local, "--pathspec-from-file=/tmp/ps")[3],
+            "--ours"
+        );
+        assert_eq!(
+            add_paths_args("--pathspec-from-file=/tmp/ps"),
+            [
+                "--literal-pathspecs",
+                "add",
+                "--force",
+                "--pathspec-from-file=/tmp/ps",
+                "--pathspec-file-nul"
+            ]
+        );
+        assert_eq!(merge_abort_args(), ["merge", "--abort"]);
+        assert_eq!(ls_files_unmerged_args(), ["ls-files", "--unmerged", "-z"]);
+        assert_eq!(
+            commit_merge_args("subject\r\n\r\nKeeper-Profile: x\r\n"),
+            [
+                "commit",
+                "--quiet",
+                "--no-edit",
+                "-m",
+                "subject\n\nKeeper-Profile: x\n"
+            ]
+        );
+        assert_eq!(
+            diff_status_args("base", "HEAD").expect("plain refs"),
+            [
+                "diff",
+                "--name-status",
+                "--no-renames",
+                "-z",
+                "base",
+                "HEAD"
+            ]
+        );
+        assert_eq!(
+            cat_file_blob_args("0123456789abcdef").expect("hex"),
+            ["cat-file", "blob", "0123456789abcdef"]
+        );
+        assert_eq!(
+            cat_file_blob_args("--batch").expect_err("not hex").code(),
+            "config"
+        );
+    }
+
+    #[test]
+    fn a_merge_that_stops_before_committing_is_what_puts_the_copies_in_the_commit() {
+        let args = merge_theirs_args("refs/remotes/origin/main", "m").expect("args");
+        assert_eq!(args[..2], ["merge", "--no-commit"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pathspec_file_carries_the_bytes_of_every_name_nul_separated() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let odd = PathBuf::from(std::ffi::OsString::from_vec(b"na\xFFme.txt".to_vec()));
+        let file = PathspecFile::new(&[PathBuf::from("a/b.txt"), odd]).expect("file");
+        let location = file
+            .arg()
+            .strip_prefix("--pathspec-from-file=")
+            .expect("the option carries the location");
+        assert_eq!(
+            std::fs::read(location).expect("readable while the value lives"),
+            b"a/b.txt\0na\xFFme.txt\0"
+        );
+    }
+
+    #[test]
+    fn unmerged_and_name_status_records_parse_from_their_z_forms() {
+        let entries = parse_unmerged(
+            b"100644 df967b96a579e45a18b8251732d16804b2e56a55 1\tf.txt\x00100644 950b81b7eee953d050aa05a641f8e056c85dd1bd 3\tf.txt\0",
+        )
+        .expect("two stages");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].stage, 1);
+        assert_eq!(entries[1].stage, 3);
+        assert_eq!(entries[1].path, PathBuf::from("f.txt"));
+        assert_eq!(entries[1].oid, "950b81b7eee953d050aa05a641f8e056c85dd1bd");
+        assert!(parse_unmerged(b"").expect("nothing unmerged").is_empty());
+        assert!(parse_unmerged(b"garbage\0").is_err());
+
+        let status = parse_name_status(b"A\0new.txt\0D\0gone.txt\0M\0dir/x.txt\0").expect("three");
+        assert_eq!(
+            status,
+            [
+                (ChangeKind::Added, PathBuf::from("new.txt")),
+                (ChangeKind::Deleted, PathBuf::from("gone.txt")),
+                (ChangeKind::Modified, PathBuf::from("dir/x.txt")),
+            ]
+        );
+        assert!(parse_name_status(b"A\0").is_err());
     }
 
     #[test]
@@ -1737,7 +2700,27 @@ mod tests {
             phone_refusal(Verb::Checkout)
         );
         assert_eq!(
-            sentence(phone.merge_theirs(nowhere, "refs/remotes/origin/main", "m")),
+            sentence(
+                phone
+                    .merge_theirs(nowhere, "refs/remotes/origin/main", "m")
+                    .map(drop)
+            ),
+            phone_refusal(Verb::Checkout)
+        );
+        assert_eq!(
+            sentence(phone.merge_abort(nowhere)),
+            phone_refusal(Verb::Checkout)
+        );
+        assert_eq!(
+            sentence(phone.checkout_side(nowhere, Side::Remote, &[PathBuf::from("a")])),
+            phone_refusal(Verb::Checkout)
+        );
+        assert_eq!(
+            sentence(phone.add_paths(nowhere, &[PathBuf::from("a")])),
+            phone_refusal(Verb::Checkout)
+        );
+        assert_eq!(
+            sentence(phone.commit_merge(nowhere, "m")),
             phone_refusal(Verb::Checkout)
         );
         assert_eq!(
@@ -1757,7 +2740,15 @@ mod tests {
             phone_refusal(Verb::History)
         );
         assert_eq!(
-            sentence(phone.diff_names(nowhere, "a", "b").map(drop)),
+            sentence(phone.diff_status(nowhere, "a", "b").map(drop)),
+            phone_refusal(Verb::History)
+        );
+        assert_eq!(
+            sentence(phone.unmerged_entries(nowhere).map(drop)),
+            phone_refusal(Verb::History)
+        );
+        assert_eq!(
+            sentence(phone.blob_bytes(nowhere, "abcd").map(drop)),
             phone_refusal(Verb::History)
         );
         assert_eq!(

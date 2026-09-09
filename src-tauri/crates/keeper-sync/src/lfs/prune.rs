@@ -31,23 +31,28 @@
 //!    it costs one local read. A path whose worktree content is pointer text is
 //!    the inverse case — there the store object IS the only local copy, and it is
 //!    never a candidate.
-//! 3. **The remote confirms it holds the object.** Left to the caller, because it
-//!    is the only condition that needs the network. It must be answered by the
-//!    same upload-batch the upload path uses (an object with neither `actions`
-//!    nor `error` means the server already has the content — see
-//!    [`crate::lfs::batch`]), not by a cheaper existence probe that could be
-//!    satisfied by something other than readable bytes.
+//! 3. **The remote is known to hold the object.** Not inferred: a memo the
+//!    remote gave — an upload unit that completed and whose path still names
+//!    the oid (`Engine::note_unit_synced`), or an object the remote audit
+//!    affirmed per object (`lfs::audit::serves`) — recorded as `synced_at_ms`
+//!    on the `materialized` row and read back by `db::synced_oids`. Until
+//!    Story 70.4 this condition was "left to the caller", and the one caller
+//!    supplied the first two and stopped, on the argument that a returned push
+//!    has landed its objects. `lfs::audit`'s own doc records that argument
+//!    failing in the field: 16 objects, 8.0 GB, missing on the server while
+//!    both folders reported a clean sync. The planner now refuses anything
+//!    without the memo (AD-231).
 //!
-//! The planner answers 1 and 2 offline and hands the survivors up. Nothing here
-//! deletes; [`release`] does, one object at a time, so a failure midway leaves a
-//! consistent store rather than a half-applied plan.
+//! The planner answers all three offline and hands the survivors up. Nothing
+//! here deletes; [`release`] does, one object at a time, so a failure midway
+//! leaves a consistent store rather than a half-applied plan.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SyncError};
 use crate::lfs::pointer;
-use crate::lfs::stage::indexed_pointer;
+use crate::lfs::stage::{index_key, pointer_blob};
 use crate::lfs::store::LfsStore;
 
 /// A local object the planner believes may be released.
@@ -62,12 +67,22 @@ pub struct Releasable {
     pub rebuildable_from: PathBuf,
 }
 
-/// Which local objects are safe to release, ignoring the remote.
+/// Which local objects are safe to release.
 ///
 /// `owed` is every oid the journal still references — outstanding uploads and
-/// queued downloads alike. `tracked` is the index's path list, which is where
+/// queued downloads alike. `synced` is every oid the remote was observed
+/// holding ([`crate::db::synced_oids`]); an oid absent from it is refused
+/// whatever else is true. `tracked` is the index's path list, which is where
 /// the oid→path mapping comes from: the worktree file is real content, so the
 /// only cheap way to learn its oid is the pointer recorded in the index.
+///
+/// **One index read for the whole plan.** This used to ask
+/// `stage::indexed_pointer` per tracked path, and that re-opens the index and
+/// probes the object database each time — on the owner's 155 626 tracked
+/// paths against 181 210 packed objects, on every successful pass (F-LFS-9).
+/// The index is read once here and each entry looked up by its key; the blob
+/// question is still a header read and, only inside the pointer window, one
+/// bounded object read.
 ///
 /// Objects are deduplicated by oid. Two paths with identical content share one
 /// object, and releasing it twice would be a spurious second delete.
@@ -77,13 +92,28 @@ pub fn plan(
     store: &LfsStore,
     tracked: &[PathBuf],
     owed: &BTreeSet<String>,
+    synced: &HashSet<String>,
 ) -> Result<Vec<Releasable>> {
     let mut found: BTreeMap<String, Releasable> = BTreeMap::new();
+    // Nothing confirmed means nothing releasable, before the index is opened.
+    if synced.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Ok(index) = repo.index_or_empty() else {
+        return Ok(Vec::new());
+    };
 
     for rela in tracked {
-        let Some(recorded) = indexed_pointer(repo, rela) else {
+        let key = index_key(rela);
+        let Some(entry) = index.entry_by_path(gix::bstr::BStr::new(key.as_bytes())) else {
+            continue;
+        };
+        let Some(recorded) = pointer_blob(repo, entry.id) else {
             continue; // an ordinary file, not an LFS path
         };
+        if !synced.contains(&recorded.oid) {
+            continue; // the remote never said it holds this one
+        }
         if owed.contains(&recorded.oid) || found.contains_key(&recorded.oid) {
             continue;
         }

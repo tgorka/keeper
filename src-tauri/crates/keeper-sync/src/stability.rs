@@ -8,14 +8,19 @@
 //! * **Tier 2, quiescence.** `(size, mtime_ns, ctime_ns, inode)` identical
 //!   across two samples `W` apart. Cheap (~1.2 µs per `lstat`) and correct for
 //!   almost everything, but a writer that pauses longer than `W` fools it.
-//! * **Tier 3, open-writer veto.** A single `/proc/locks` read on Linux. Costs
+//! * **Tier 3, open-writer veto.** A single `/proc/locks` read on Linux,
+//!   asked by [`StabilityGate::is_stable`] of every path tier 2 clears. Costs
 //!   ~0.01 ms and occasionally saves us; almost nothing takes advisory locks,
 //!   so it can only ever veto, never approve. **There is no macOS equivalent**
 //!   — see [`open_writer_veto`] for why that is a platform limit rather than
 //!   an omission.
-//! * **Tier 4, verify-on-read.** `fstat` the open fd, stream SHA-256, `fstat`
-//!   again. This is the only actual proof in the whole gate, and it is the
-//!   reason the other three are allowed to be approximations.
+//! * **Tier 4, verify-on-read.** `fstat` the open fd, stream the content,
+//!   `fstat` again. This is the only actual proof in the whole gate, and it is
+//!   the reason the other three are allowed to be approximations. It runs on
+//!   the commit path — `git::commit::stage_and_commit`'s read of every
+//!   non-LFS blob goes through [`read_verified`] — and in the audit verb
+//!   through [`verify_while_reading`]. Until Epic 70 only the audit called it,
+//!   and the staging read was a bare `std::fs::read` (F-GATE-2).
 //!
 //! # The producer's assertion (Story 41.4)
 //!
@@ -272,9 +277,25 @@ impl StabilityGate {
 
     /// Fold one sample into the per-path state.
     ///
-    /// A changed tuple restarts the unchanged run *and* clears the close-write
-    /// fast path: if the bytes moved after the close, a writer reopened the
-    /// file and the earlier close proved nothing about the new content.
+    /// A changed tuple restarts the unchanged run, restarts the **episode**,
+    /// and clears the close-write fast path: if the bytes moved after the
+    /// close, a writer reopened the file and the earlier close proved nothing
+    /// about the new content.
+    ///
+    /// The episode restarts too — `pending_since_ms`, the anchor the ceiling
+    /// measures from — because the ceiling is a bound on how long the *current*
+    /// bytes may be held, not a licence that outlives them. It did not used to:
+    /// the anchor was set on the first observation and never touched again, so
+    /// once a path had been pending a minute, every later sample was `Stable`
+    /// on sight whatever the bytes were doing. That is exactly what
+    /// [`Self::declare_settled`] exploits on purpose — it backdates the anchor
+    /// past the ceiling so the *next* verdict clears — and what made the
+    /// exploit unsafe: an asserted or primed path stayed `Stable` for life,
+    /// including for bytes written after the assertion (F-GATE-3), and an
+    /// entry that survived a volume detach was past the ceiling the instant the
+    /// drive returned (F-GATE-8). With the anchor moving on change, an
+    /// assertion clears exactly once, for the bytes it was made about, and
+    /// never again for new ones.
     pub fn observe(&mut self, path: &Path, sample: FileSample, now_ms: i64, close_write: bool) {
         if let Some(entry) = self.entries.get_mut(path) {
             if entry.last == sample {
@@ -282,6 +303,7 @@ impl StabilityGate {
             } else {
                 entry.last = sample;
                 entry.unchanged_since_ms = now_ms;
+                entry.pending_since_ms = now_ms;
                 entry.close_write = close_write;
             }
             return;
@@ -298,8 +320,9 @@ impl StabilityGate {
     }
 
     /// Record `path` as having *already* been quiet long enough that the very
-    /// next [`Self::verdict`] returns [`StabilityVerdict::Stable`] — the rename
-    /// escape hatch (Story 40.4).
+    /// next [`Self::verdict`] returns [`StabilityVerdict::Stable`] — provided
+    /// the bytes are still the ones sampled here — the rename escape hatch
+    /// (Story 40.4).
     ///
     /// Tier 2 measures quiescence from the first moment it *saw* a path. That
     /// is the right question for a file being written and the wrong one for a
@@ -325,12 +348,15 @@ impl StabilityGate {
     /// survives a restart exactly like any other episode.
     ///
     /// The file is sampled here rather than left for the next observation,
-    /// because [`Self::is_stable`] restarts the run whenever the sample it
-    /// takes differs from `last` — an entry holding a guessed tuple would prime
-    /// nothing. Returns whether an entry was recorded: an excluded path, or one
-    /// that cannot be stat-ed (it vanished again, or it is unreadable), is left
-    /// alone rather than treated as an error, since the gate's ordinary
-    /// fail-closed handling is the correct answer for both.
+    /// because [`Self::is_stable`] restarts the run — and, since Epic 70, the
+    /// episode — whenever the sample it takes differs from `last`: an entry
+    /// holding a guessed tuple would prime nothing, and an entry whose bytes
+    /// moved after the prime is `Settling` again on its next look rather than
+    /// `Stable` on the strength of a claim made about different bytes. Returns
+    /// whether an entry was recorded: an excluded path, or one that cannot be
+    /// stat-ed (it vanished again, or it is unreadable), is left alone rather
+    /// than treated as an error, since the gate's ordinary fail-closed
+    /// handling is the correct answer for both.
     pub fn prime_stable(&mut self, path: &Path, now_ms: i64) -> bool {
         self.declare_settled(path, now_ms)
     }
@@ -357,11 +383,17 @@ impl StabilityGate {
     /// * **Tier 0 still hides the path.** An excluded name — a `.partial`
     ///   mid-rotation above all — is not made visible by asserting it, and the
     ///   assertion is simply declined (`false`).
-    /// * **Tier 2 is skipped.** That is the whole feature.
-    /// * **Tier 3** never approved anything anyway; it can still veto.
+    /// * **Tier 2 is skipped.** That is the whole feature — for the bytes the
+    ///   assertion was made about, and only those. The assertion records a
+    ///   sample, and [`Self::observe`] restarts the episode on a changed one,
+    ///   so a segment appended to after it was declared finished is `Settling`
+    ///   again on its next look; the claim does not outlive its bytes.
+    /// * **Tier 3** never approved anything anyway; it can still veto, and on
+    ///   Linux [`Self::is_stable`] asks it.
     /// * **Tier 4 still reads the file.** This is a claim about *writing being
-    ///   over*, not about the bytes being correct, and verify-on-read remains
-    ///   the only proof in the gate.
+    ///   over*, not about the bytes being correct, and verify-on-read — on the
+    ///   commit path's staging read since Epic 70 — remains the only proof in
+    ///   the gate.
     ///
     /// # How this differs from [`Self::prime_stable`]
     ///
@@ -395,6 +427,13 @@ impl StabilityGate {
     /// [`Self::note_finished`]: record `path` as an entry that has already been
     /// pending for the hard ceiling, so `verdict`'s very first condition
     /// clears it.
+    ///
+    /// Clears it **once**, and only while the bytes are the ones sampled here.
+    /// The backdated anchor is an ordinary `pending_since_ms`, and
+    /// [`Self::observe`] moves it to `now` the moment a later sample differs —
+    /// so the exemption is spent by the first verdict that sees the same
+    /// bytes, and cannot be inherited by different ones. Before Epic 70 the
+    /// anchor never moved and the exemption was for life (F-GATE-3).
     ///
     /// Deliberately not public. The two callers differ in what entitles them to
     /// call it, and that distinction is the entire safety argument for skipping
@@ -440,9 +479,19 @@ impl StabilityGate {
             return StabilityVerdict::Settling { since_ms: now_ms };
         };
 
-        // The hard ceiling. A continuously appended log — a build output, a
-        // running capture, a syslog — must eventually sync even though it never
-        // quiesces. Checked first so no other condition can outvote it.
+        // The hard ceiling: no set of bytes is held longer than this, whatever
+        // the window and the mtime say. Checked first so no other condition can
+        // outvote it. It is anchored on the episode, and since Epic 70 an
+        // episode is one set of bytes — `observe` restarts it on a changed
+        // sample — so the ceiling bounds how long the *current* content waits,
+        // not how long the path has been busy. A file rewritten between every
+        // walk therefore no longer forces through a torn snapshot once a
+        // minute (F-GATE-3); it commits when its writer pauses for a window,
+        // and tier 4 on the staging read is what catches the one that never
+        // does. What the ceiling still outranks is the mtime arm below: an
+        // mtime inside the future-mtime grace, or a filesystem whose clock
+        // disagrees with ours by less than that, could otherwise hold unchanged
+        // bytes past any window.
         let ceiling = i64::try_from(SETTLE_CEILING_MS).unwrap_or(i64::MAX);
         if now_ms.saturating_sub(entry.pending_since_ms) >= ceiling {
             return StabilityVerdict::Stable;
@@ -497,6 +546,21 @@ impl StabilityGate {
             .values()
             .map(|entry| self.stable_at_ms(entry, now_ms))
             .min()
+    }
+
+    /// [`Self::next_stable_ms`] for one path: the instant the gate would stop
+    /// holding it, or `None` when it holds no entry for `path`.
+    ///
+    /// `path` is the same absolute path [`Self::observe`] and
+    /// [`Self::is_stable`] key on. This is what lets the watcher's wake decline
+    /// a walk for a path whose deadline is already scheduled (Epic 70, AD-227):
+    /// a wake for a settling file used to buy a full-tree walk on every 1 Hz
+    /// tick for as long as the write lasted, to learn a number the gate was
+    /// already holding.
+    pub fn holds_until_ms(&self, path: &Path, now_ms: i64) -> Option<i64> {
+        self.entries
+            .get(path)
+            .map(|entry| self.stable_at_ms(entry, now_ms))
     }
 
     /// The instant one entry stops being mid-episode: the earliest `now_ms` at
@@ -601,9 +665,33 @@ impl StabilityGate {
         let settle_ms = self.settle_ms;
         self.observe(path, sample, now_ms, close_write);
         let verdict = self.verdict(path, now_ms, settle_ms);
-        if verdict == StabilityVerdict::Stable {
-            self.forget(path);
+        if verdict != StabilityVerdict::Stable {
+            return verdict;
         }
+        // Tier 3, asked only of a path tier 2 has just cleared — so it is paid
+        // once per settled file, never per walk. On Linux it is one read of
+        // `/proc/locks`; everywhere else `open_writer_veto` is a constant
+        // `false` and this compiles away (see its non-Linux doc for why macOS
+        // has no tier 3 at all). Until Epic 70 nothing called it: the module
+        // doc promised a veto the gate never asked for (F-GATE-2). The ceiling
+        // does not outrank this: it is a bound on tier 2's wait, and a writer
+        // that still holds the file is not a wait, it is a fact.
+        if open_writer_veto(path, &sample) {
+            tracing::debug!(
+                path = %path.display(),
+                "a writer holds an advisory write lock on this file; holding it"
+            );
+            // The entry is kept, not forgotten, but its unchanged run restarts:
+            // a held lock is evidence of a writer, so the quiet the tuple
+            // showed is not yet proof of anything, and the deadline the
+            // supervisor schedules from moves one window out instead of
+            // sitting in the past and buying a walk on every tick.
+            if let Some(entry) = self.entries.get_mut(path) {
+                entry.unchanged_since_ms = now_ms;
+            }
+            return StabilityVerdict::Settling { since_ms: now_ms };
+        }
+        self.forget(path);
         verdict
     }
 
@@ -613,8 +701,12 @@ impl StabilityGate {
         self.pending_close_write.remove(path);
     }
 
-    /// Drop all state. Used when a profile is paused or its volume detaches:
-    /// windows measured against a clock from before the pause are meaningless.
+    /// Drop all state. Called by `Engine::tick_profile`'s detach arm when a
+    /// removable profile's volume is gone (Epic 70, F-GATE-8): windows measured
+    /// against a clock from before the detach are meaningless, and an entry
+    /// that survived one used to be past the ceiling the instant the drive
+    /// returned. A pause drops the gate from the engine's map instead, which
+    /// ends in the same place.
     pub fn forget_all(&mut self) {
         self.entries.clear();
         self.pending_close_write.clear();
@@ -694,7 +786,9 @@ impl StabilityGate {
 /// whole file), matched on `MAJOR:MINOR:INODE`. A `WRITE` lock means "not
 /// stable"; the absence of one means nothing at all, because almost nothing
 /// takes advisory locks — browsers, `curl`, `cp` and most editors do not. It is
-/// kept only because it costs nothing and occasionally saves us.
+/// kept only because it costs nothing and occasionally saves us. Asked by
+/// [`StabilityGate::is_stable`] of every path tier 2 clears — and of nothing
+/// else, so the `/proc/locks` read is paid per settled file, not per walk.
 #[cfg(target_os = "linux")]
 pub fn open_writer_veto(path: &Path, sample: &FileSample) -> bool {
     use std::os::unix::fs::MetadataExt as _;
@@ -814,8 +908,71 @@ pub fn verify_while_reading(path: &Path) -> Result<(String, u64)> {
 /// test at all. Production passes an empty closure, which compiles away.
 fn verify_while_reading_hooked(
     path: &Path,
-    mut after_first_chunk: impl FnMut(),
+    after_first_chunk: impl FnMut(),
 ) -> Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut bytes: u64 = 0;
+    read_guarded(
+        path,
+        None,
+        |chunk| {
+            hasher.update(chunk);
+            bytes = bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        },
+        after_first_chunk,
+    )?;
+    Ok((hex::encode(hasher.finalize()), bytes))
+}
+
+/// Tier 4 on the **staging read**: the file's bytes, proven to be one coherent
+/// version of the file, or [`SyncError::Integrity`] (Epic 70, AD-232).
+///
+/// `git::commit::stage_and_commit` used to read a non-LFS blob with a bare
+/// `std::fs::read`, so the module's whole safety argument — tier 2 may be
+/// fooled by a writer that pauses, and the ceiling *deliberately* commits a
+/// file that never quiesces, because tier 4 catches the torn result — was a
+/// claim about a check that ran only in the audit verb (F-GATE-2). An
+/// in-place rewrite that slipped tier 2 committed a Frankenstein blob,
+/// silently. This is the same `fstat`-read-`fstat` as
+/// [`verify_while_reading`], keeping the bytes instead of a digest.
+///
+/// `approved` is the sample the gate cleared the path on, when the caller
+/// has one. A descriptor whose `fstat` already differs from it is refused
+/// before a byte is read: the bytes on disk are not the bytes that were
+/// judged quiet, and reading them coherently would prove nothing about
+/// whether their writer has finished. The engine's walk records that sample
+/// beside the verdict; other callers pass `None` and get the read-window
+/// check alone.
+pub fn read_verified(path: &Path, approved: Option<&FileSample>) -> Result<Vec<u8>> {
+    read_verified_hooked(path, approved, || {})
+}
+
+/// [`read_verified`] with [`verify_while_reading_hooked`]'s test hook.
+fn read_verified_hooked(
+    path: &Path,
+    approved: Option<&FileSample>,
+    after_first_chunk: impl FnMut(),
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    read_guarded(
+        path,
+        approved,
+        |chunk| bytes.extend_from_slice(chunk),
+        after_first_chunk,
+    )?;
+    Ok(bytes)
+}
+
+/// The one guarded read behind both tier-4 entry points: refuse a dataless
+/// placeholder and a non-regular file, `fstat` the open descriptor, stream
+/// the content into `consume`, `fstat` again, and refuse the result if the
+/// two samples differ — or if the first one differs from `approved`.
+fn read_guarded(
+    path: &Path,
+    approved: Option<&FileSample>,
+    mut consume: impl FnMut(&[u8]),
+    mut after_first_chunk: impl FnMut(),
+) -> Result<()> {
     let md = std::fs::symlink_metadata(path).map_err(|err| SyncError::io("stat", path, err))?;
 
     if metadata_is_dataless(&md) {
@@ -843,10 +1000,17 @@ fn verify_while_reading_hooked(
             .metadata()
             .map_err(|err| SyncError::io("fstat", path, err))?,
     );
+    if let Some(approved) = approved {
+        if *approved != before {
+            return Err(SyncError::Integrity {
+                subject: path.display().to_string(),
+                expected: describe(approved),
+                actual: describe(&before),
+            });
+        }
+    }
 
-    let mut hasher = Sha256::new();
     let mut buf = vec![0u8; VERIFY_CHUNK_BYTES];
-    let mut bytes: u64 = 0;
     let mut hooked = false;
     loop {
         let read = file
@@ -855,8 +1019,7 @@ fn verify_while_reading_hooked(
         if read == 0 {
             break;
         }
-        hasher.update(&buf[..read]);
-        bytes = bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        consume(&buf[..read]);
         if !hooked {
             hooked = true;
             after_first_chunk();
@@ -875,8 +1038,7 @@ fn verify_while_reading_hooked(
             actual: describe(&after),
         });
     }
-
-    Ok((hex::encode(hasher.finalize()), bytes))
+    Ok(())
 }
 
 /// Render a sample for an error message. Sizes and timestamps only — never
@@ -1024,34 +1186,67 @@ mod tests {
         assert_eq!(g.verdict(&path, 6_000, SETTLE), StabilityVerdict::Stable);
     }
 
+    /// The ceiling is anchored on the current bytes, not on the path's first
+    /// sighting (Epic 70, F-GATE-3). A writer that changes the file on every
+    /// look is never forced through — that used to happen at t=60 s and
+    /// committed whatever half-written snapshot the walk found — and the file
+    /// commits when the writer pauses for a window.
     #[test]
-    fn the_ceiling_forces_stable_on_a_file_that_never_quiesces() {
+    fn a_file_that_never_quiesces_is_held_until_its_writer_pauses() {
         let mut g = gate();
         let path = p("build.log");
-        // Appended to every second forever: tier 2 alone would hold it until
-        // the heat death of the universe.
         let mut t = 0i64;
-        while t < 59_000 {
+        while t <= 120_000 {
             g.observe(&path, sample(100 + t as u64, t, 7), t, false);
             assert!(
                 matches!(
                     g.verdict(&path, t, SETTLE),
                     StabilityVerdict::Settling { .. }
                 ),
-                "still settling at t={t}"
+                "still settling at t={t}: the ceiling measures the current bytes, and \
+                 they are a second old"
             );
             t += 1_000;
         }
-        g.observe(&path, sample(100_000, 59_999, 7), 59_999, false);
-        assert!(matches!(
-            g.verdict(&path, 59_999, SETTLE),
-            StabilityVerdict::Settling { .. }
-        ));
-        g.observe(&path, sample(101_000, 60_000, 7), 60_000, false);
+        // The writer stops. One window later the last bytes are Stable — and
+        // they are the bytes the tuple describes, not a snapshot of a file
+        // still moving.
         assert_eq!(
-            g.verdict(&path, 60_000, SETTLE),
+            g.verdict(
+                &path,
+                120_000 + i64::try_from(SETTLE).expect("fits"),
+                SETTLE
+            ),
+            StabilityVerdict::Stable
+        );
+    }
+
+    /// The mutation the moving anchor exists to catch: a sample change late
+    /// in an episode must push the ceiling out, or a path that has merely
+    /// been *busy* for a minute is `Stable` on sight whatever its bytes are
+    /// doing.
+    #[test]
+    fn a_changed_sample_restarts_the_ceiling() {
+        let mut g = gate();
+        let path = p("rewritten.db");
+        g.observe(&path, sample(1, 0, 7), 0, false);
+        // Rewritten one second before the old anchor would have fired.
+        g.observe(&path, sample(2, 59_000, 7), 59_000, false);
+        assert!(
+            matches!(
+                g.verdict(&path, 60_000, SETTLE),
+                StabilityVerdict::Settling { .. }
+            ),
+            "bytes one second old are not a minute old because the path is"
+        );
+        assert_eq!(
+            g.verdict(
+                &path,
+                59_000 + i64::try_from(SETTLE_CEILING_MS).expect("fits"),
+                SETTLE
+            ),
             StabilityVerdict::Stable,
-            "the {SETTLE_CEILING_MS} ms ceiling must win over an active writer"
+            "the ceiling still bounds the hold — from the change, not the first sighting"
         );
     }
 
@@ -1740,10 +1935,11 @@ mod tests {
         );
     }
 
-    /// The ceiling outvotes everything in `verdict`, so it caps the deadline
-    /// too: a log that is appended to forever must still be scheduled.
+    /// The ceiling caps the deadline as it caps `verdict`, and both are
+    /// anchored on the last change (Epic 70): a log appended to on every tick
+    /// is scheduled one ceiling after its most recent bytes, never earlier.
     #[test]
-    fn a_file_that_never_quiesces_is_still_scheduled_by_the_ceiling() {
+    fn a_file_that_never_quiesces_is_scheduled_one_ceiling_after_its_last_change() {
         let mut g = StabilityGate::new(
             "/tmp/profile-root",
             ExcludeSet::new(&[]).expect("excludes"),
@@ -1760,13 +1956,175 @@ mod tests {
         let at = g.next_stable_ms(t).expect("a held path has a deadline");
         assert_eq!(
             at,
-            i64::try_from(SETTLE_CEILING_MS).expect("fits"),
-            "the episode began at t=0, so the ceiling falls at exactly 60 s"
+            30_000 + i64::try_from(SETTLE_CEILING_MS).expect("fits"),
+            "the current bytes arrived at t=30 s, so the ceiling falls at 90 s — not \
+             at 60 s from the first sighting"
+        );
+        assert!(
+            matches!(
+                g.verdict(&path, at - 1, SETTLE_CEILING_MS),
+                StabilityVerdict::Settling { .. }
+            ),
+            "and the deadline is not early"
         );
         assert_eq!(
             g.verdict(&path, at, SETTLE_CEILING_MS),
             StabilityVerdict::Stable
         );
+    }
+
+    /// The reason the anchor moves (Epic 70, F-GATE-3): a producer's
+    /// assertion is spent by the first verdict that sees the asserted bytes,
+    /// and buys nothing for bytes written after it. Before this, `observe`
+    /// left `pending_since_ms` where `declare_settled` backdated it, so an
+    /// asserted segment was `Stable` for life — appended to or not — until a
+    /// walk happened to collect it.
+    #[test]
+    fn an_asserted_path_appended_to_afterwards_is_settling_on_its_next_look() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("segment-001.mov");
+        std::fs::write(&path, b"the segment as the recorder closed it").expect("write");
+        let mut g = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            SETTLE,
+        );
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after 1970")
+                .as_millis(),
+        )
+        .expect("fits");
+        assert!(g.note_finished(&path, now_ms));
+
+        // Somebody kept writing after the assertion.
+        let mut appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("reopen");
+        appended.write_all(b" and more").expect("append");
+        drop(appended);
+
+        assert!(
+            matches!(
+                g.is_stable(&path, now_ms + 1),
+                StabilityVerdict::Settling { .. }
+            ),
+            "the assertion was about different bytes; these have to earn their window"
+        );
+        assert_eq!(
+            g.tracked(now_ms + 1),
+            1,
+            "and it is counted as waiting, not merely held"
+        );
+
+        // The control: asserted and left alone, the first look is Stable.
+        let quiet = dir.path().join("segment-002.mov");
+        std::fs::write(&quiet, b"closed and untouched").expect("write");
+        assert!(g.note_finished(&quiet, now_ms));
+        assert_eq!(g.is_stable(&quiet, now_ms + 1), StabilityVerdict::Stable);
+    }
+
+    /// Tier 3 on the path it was written for, with a real advisory lock:
+    /// `flock(1)` holds `LOCK_EX` on the file from a child process while the
+    /// gate looks. Linux only — `/proc/locks` is the whole mechanism — and it
+    /// steps aside where util-linux's `flock` is not installed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_locked_file_is_refused_by_tier_3_until_the_lock_is_released() {
+        use std::io::BufRead as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        std::fs::write(&path, b"a database somebody has open").expect("write");
+        // A zero window, so tier 2 clears on the first look and tier 3 is the
+        // only thing that can hold the file.
+        let mut g = StabilityGate::new(
+            dir.path(),
+            ExcludeSet::new(&[]).expect("corpus compiles"),
+            0,
+        );
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after 1970")
+                .as_millis(),
+        )
+        .expect("fits");
+
+        let Ok(mut holder) = std::process::Command::new("flock")
+            .arg("-x")
+            .arg(&path)
+            .args(["-c", "echo held; exec sleep 30"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            eprintln!("skipped: util-linux flock(1) is not installed");
+            return;
+        };
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.take().expect("piped"))
+            .read_line(&mut line)
+            .expect("read");
+        if line.trim() != "held" {
+            let _ = holder.kill();
+            eprintln!("skipped: flock(1) did not take the lock ({line:?})");
+            return;
+        }
+
+        let held = g.is_stable(&path, now_ms);
+        let _ = holder.kill();
+        let _ = holder.wait();
+        assert!(
+            matches!(held, StabilityVerdict::Settling { .. }),
+            "a file under an exclusive advisory lock has a writer; got {held:?}"
+        );
+
+        // Released: the next look clears, on the same entry.
+        assert_eq!(g.is_stable(&path, now_ms + 1), StabilityVerdict::Stable);
+    }
+
+    /// Tier 4 on the staging read (Epic 70, AD-232): the bytes, or
+    /// `Integrity` when the descriptor changed under the read — or when it
+    /// never matched the sample the gate cleared the path on.
+    #[test]
+    fn read_verified_returns_the_bytes_and_refuses_a_file_that_moved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, b"one coherent version").expect("write");
+        let approved = FileSample::of(&path).expect("stat").expect("present");
+
+        assert_eq!(
+            read_verified(&path, Some(&approved)).expect("quiet file"),
+            b"one coherent version"
+        );
+        assert_eq!(
+            read_verified(&path, None).expect("no sample to check against"),
+            b"one coherent version"
+        );
+
+        // Rewritten between the verdict and the read: the descriptor no longer
+        // matches the approved sample, and not a byte is read.
+        let stale = FileSample {
+            size: approved.size + 1,
+            ..approved
+        };
+        let err = read_verified(&path, Some(&stale)).expect_err("a stale sample is refused");
+        assert!(matches!(err, SyncError::Integrity { .. }), "got {err:?}");
+
+        // Rewritten during the read.
+        let big = dir.path().join("big.bin");
+        std::fs::write(&big, vec![b'a'; VERIFY_CHUNK_BYTES * 2]).expect("write");
+        let err = read_verified_hooked(&big, None, || {
+            let mut appended = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&big)
+                .expect("reopen for append");
+            appended.write_all(b"b").expect("append");
+        })
+        .expect_err("a torn read must not produce bytes");
+        assert!(matches!(err, SyncError::Integrity { .. }), "got {err:?}");
     }
 
     /// A timestamp far in the future is a broken clock, and `verdict` skips the

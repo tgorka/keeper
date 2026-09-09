@@ -60,7 +60,7 @@ use std::path::{Component, Path};
 
 use crate::error::{Result, SyncError};
 use crate::exclude::PatternSet;
-use crate::profile::{SyncProfile, FOLDER_CONFIG_DIR};
+use crate::profile::SyncProfile;
 
 /// The repository's own answer, committed at its root, in gitignore dialect.
 ///
@@ -86,6 +86,15 @@ const FILE_SOURCE: &str = ".keepervirtual";
 /// The list a refusal names for an entry the profile carries — its stored row
 /// or either folder TOML layer above it, which are indistinguishable here.
 const PROFILE_SOURCE: &str = "virtualPatterns";
+
+/// The refusal for a policy file whose bytes are an LFS pointer, followed by
+/// the file's path (Story 70.4).
+///
+/// A `const` because the sentence is user-visible and the test that pins the
+/// refusal quotes it rather than retyping it.
+pub const POINTER_TEXT_POLICY_PREFIX: &str =
+    "the virtualization policy is an LFS pointer instead of its rules; restore the file before \
+     anything here can be trusted:";
 
 /// Whether one path's content may stay away.
 ///
@@ -211,6 +220,23 @@ impl VirtualPolicy {
                 )));
             }
         };
+        // A file whose bytes are an LFS pointer is the same broken repository
+        // wearing a plausible face (Story 70.4, F-VF-6): pointer text parses
+        // as three legal globs, `tier()` reports `PatternFile`,
+        // `authorizes_anything()` is true, and every `resolve` answers
+        // `Materialize` — a policy that erased itself while claiming to be in
+        // force. Same shape as the unreadable arm, because it is the same
+        // answer: keeper cannot read the policy, and says so naming the file.
+        // The candidate check first, so an empty file — which `Pointer::parse`
+        // reads as the empty pointer by spec — stays the ordinary "no policy".
+        if crate::lfs::pointer::is_pointer_candidate(file_text.as_bytes())
+            && crate::lfs::pointer::Pointer::parse(file_text.as_bytes()).is_some()
+        {
+            return Err(SyncError::Config(format!(
+                "{POINTER_TEXT_POLICY_PREFIX} {}",
+                path.display()
+            )));
+        }
         // A byte-order mark is not whitespace, so `trim` leaves it on the first
         // line and the line stops being the pattern the user wrote. Worse for a
         // `!` line: prefixed by a BOM it no longer starts with `!`, so a line
@@ -620,23 +646,21 @@ fn is_inside_the_repository(rela: &Path) -> bool {
 /// A virtualized `.keepervirtual` is a policy that erases itself, and `compile`
 /// would then parse `version https://git-lfs.github.com/spec/v1` as a pattern.
 /// A virtualized `.gitattributes` breaks LFS routing for its whole subtree.
+///
+/// One predicate, shared with the routing doors (Story 70.4, AD-230). This
+/// used to be the wider of two lists — the routing one lacked `.lfsconfig`,
+/// `.keepervirtual` and the `.keeper/` component — so a file this module
+/// refused to virtualize could still be *converted* into the very pointer it
+/// feared. The union now lives beside the conversion code, and this is a
+/// name for the same answer.
 fn is_control_file(rela: &Path) -> bool {
-    if crate::lfs::stage::is_git_control_file(rela) {
-        return true;
-    }
-    let name = rela.file_name().and_then(|name| name.to_str());
-    if name.is_some_and(|name| name == VIRTUAL_PATTERN_FILE || name == ".lfsconfig") {
-        return true;
-    }
-    rela.components().any(|part| {
-        matches!(part, Component::Normal(part) if part == ".git" || part == FOLDER_CONFIG_DIR)
-    })
+    crate::lfs::stage::is_control_file(rela)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::FolderTier;
+    use crate::profile::{FolderTier, FOLDER_CONFIG_DIR};
 
     fn profile(root: &Path) -> SyncProfile {
         SyncProfile::new("01JVIRT", "media", root, "https://git.invalid/r.git")
