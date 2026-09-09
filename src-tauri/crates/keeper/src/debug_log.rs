@@ -56,9 +56,19 @@ pub fn app_log_path() -> PathBuf {
         .join("Library/Logs/keeper/keeper.log")
 }
 
+/// The one handle on [`app_log_path`], opened on first use and kept
+/// (Epic 70, F-db-8). Before this every event opened and closed the file —
+/// 4.35 M `open(2)` pairs over a month on hesperia — and nothing ever
+/// rotated it. [`keeper_sync::logfile::RotatingFile`] rotates at
+/// [`keeper_sync::logfile::LOG_ROTATE_BYTES`] keeping two generations; the
+/// arithmetic is tested in that crate, where a compiler runs.
+static FILE: std::sync::LazyLock<std::sync::Mutex<keeper_sync::logfile::RotatingFile>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(keeper_sync::logfile::RotatingFile::open(app_log_path()))
+    });
+
 /// A `tracing` writer that always mirrors to stderr and appends to
-/// [`app_log_path`] when this event earns a file line. Opened per event: debug
-/// volume is low, and per-write opens make the live toggle trivially safe.
+/// [`app_log_path`] when this event earns a file line.
 struct GatedWriter {
     to_file: bool,
 }
@@ -97,17 +107,10 @@ impl Write for GatedWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let _ = std::io::stderr().write_all(buf);
         if self.to_file {
-            let path = app_log_path();
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                let _ = file.write_all(buf);
-            }
+            // A poisoned lock is a writer that panicked mid-line; the log is
+            // best-effort, so the next line takes the lock anyway.
+            let mut file = FILE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = file.write_all(buf);
         }
         Ok(buf.len())
     }
@@ -127,8 +130,9 @@ pub fn init(data_dir: &Path) {
         .with_ansi(false)
         .with_writer(GatedMakeWriter)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(keeper_sync::logfile::default_filter("info"))
+            }),
         )
         .try_init();
     if seeded {
@@ -138,10 +142,12 @@ pub fn init(data_dir: &Path) {
 
 /// The tail of the app log, oldest line first, capped at `lines`.
 ///
-/// Reads the whole file and keeps the last `lines`: the log is small by
-/// construction (warnings and errors always, everything else only while debug
-/// mode is on) and a backwards seek would buy nothing at this size while
-/// costing the ability to be sure a line is whole.
+/// Reads the whole file and keeps the last `lines`: the live file is bounded
+/// at [`keeper_sync::logfile::LOG_ROTATE_BYTES`] since Epic 70 (it reached
+/// 895 MB on hesperia before that), and ordinarily far smaller — warnings and
+/// errors always, everything else only while debug mode is on — so a
+/// backwards seek would buy little while costing the ability to be sure a
+/// line is whole.
 ///
 /// A missing file is an empty tail, not an error — no log yet is the normal
 /// state of a healthy install, and a viewer that shows a scary message for it

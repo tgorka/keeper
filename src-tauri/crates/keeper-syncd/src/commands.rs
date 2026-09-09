@@ -901,6 +901,10 @@ pub enum TaskKindArg {
     /// and record what it answered. Needs `--bot` and `--prompt`; runs only on
     /// a host with a bot runner, which today is the keeper app.
     Bot,
+    /// Repack the folder's git objects (`git gc --quiet`) in a quiet window:
+    /// no sync pass and no status walk in flight. Keeper seeds one per folder,
+    /// weekly; a phone refuses it.
+    Gc,
 }
 
 /// `--mode`'s vocabulary, which is [`TaskMode`]'s and nothing more.
@@ -977,6 +981,7 @@ impl From<TaskKindArg> for TaskKind {
             TaskKindArg::Release => Self::Release,
             TaskKindArg::Verify => Self::Verify,
             TaskKindArg::Bot => Self::Bot,
+            TaskKindArg::Gc => Self::Gc,
         }
     }
 }
@@ -1615,7 +1620,12 @@ async fn cmd_sync(
 /// and is re-driven on the next start — instead of being killed mid-write.
 async fn run_supervisor(printer: &Printer, engine: Engine) -> std::result::Result<(), CliError> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut supervisor = tokio::spawn(async move { engine.run(shutdown_rx).await });
+    // `Engine::run` fans profiles out as tasks and takes the engine as an
+    // `Arc` (Story 70.6); the handle kept here is what lets the signal reach a
+    // supervisor mid-unit.
+    let engine = Arc::new(engine);
+    let runner = Arc::clone(&engine);
+    let mut supervisor = tokio::spawn(async move { runner.run(shutdown_rx).await });
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|err| {
@@ -1652,8 +1662,12 @@ async fn run_supervisor(printer: &Printer, engine: Engine) -> std::result::Resul
         bound_secs = GRACEFUL_FINALIZE.as_secs(),
         "stopping: finalizing in-flight work"
     );
-    // A supervisor that has already dropped its receiver makes this fail, which
-    // is not a problem — it is already stopping.
+    // The flag first, then the signal (F-engine-11): the signal is observed at
+    // an `await`, and a supervisor deep in a 2 GB upload is a long way from
+    // one; the flag is read by the fetch between packets and by the drain
+    // before every unit. A supervisor that has already dropped its receiver
+    // makes the send fail, which is not a problem — it is already stopping.
+    engine.request_stop();
     let _ = shutdown_tx.send(true);
 
     match tokio::time::timeout(GRACEFUL_FINALIZE, &mut supervisor).await {
@@ -7273,6 +7287,71 @@ mod tests {
             cmd_task_status(&printer, &engine, now, "adhoc").expect("status"),
             EXIT_OK
         );
+    }
+
+    /// A folder added through this daemon is listed with its seeded weekly
+    /// `gc` task, and `tasks set --kind gc` is a kind this CLI accepts
+    /// (Epic 70, Story 70.7, AD-234).
+    ///
+    /// The human line is asserted through [`task_lines`], the same function
+    /// `tasks list` prints from, so the word an operator sees is the store's
+    /// own `gc` and the target column names the folder.
+    #[test]
+    fn a_folder_lists_its_seeded_gc_task_and_the_cli_accepts_the_kind() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let platform = Arc::new(keeper_sync::platform::TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let printer = Printer::new(false);
+        let now = platform.now_ms();
+        let folder = SyncProfile::new(
+            "01DOCS",
+            "docs",
+            dir.path().join("docs"),
+            "https://example.com/docs.git",
+        );
+        engine.upsert_profile(&folder).expect("a folder");
+
+        let listing = engine.tasks().expect("tasks");
+        let profiles = engine.list_profiles().expect("profiles");
+        let views: Vec<TaskView<'_>> = listing
+            .tasks
+            .iter()
+            .map(|task| TaskView {
+                task,
+                profile_name: task_profile_name(&profiles, task),
+                last: None,
+            })
+            .collect();
+        let lines = task_lines(now, &views, &listing.unknown);
+        let gc_id = keeper_sync::db::gc_task_id("01DOCS");
+        assert!(
+            lines.iter().any(|line| line.starts_with(&format!(
+                "{gc_id}  gc  scheduled  docs  {}  ",
+                keeper_sync::db::GC_TASK_SCHEDULE
+            ))),
+            "the seeded row is listed as the store spells it, bound to the folder:\n{}",
+            lines.join("\n")
+        );
+        assert_eq!(
+            cmd_task_list(&printer, &engine, now).expect("list"),
+            EXIT_OK
+        );
+
+        // And a person may write one under any other id.
+        let mut args = set_args("repack-nightly");
+        args.kind = Some(TaskKindArg::Gc);
+        args.profile = Some("docs".to_owned());
+        args.schedule = Some("@daily".to_owned());
+        assert_eq!(
+            cmd_task_set(&printer, &engine, now, &args).expect("create"),
+            EXIT_OK
+        );
+        let listing = engine.tasks().expect("tasks");
+        let row = select_task(&listing, "repack-nightly").expect("stored");
+        assert_eq!(row.kind, TaskKind::Gc);
+        assert_eq!(row.profile_id.as_deref(), Some("01DOCS"));
     }
 
     /// `--on-missed` is writable from the CLI, keeps its stored value when

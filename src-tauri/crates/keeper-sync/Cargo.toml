@@ -77,6 +77,10 @@ objc2-foundation = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# `logfile::default_filter` is proven against the real `EnvFilter` parser both
+# hosts install it into (Epic 70). Already in the workspace catalog and linked
+# by both hosts, so no new crate is resolved.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

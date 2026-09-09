@@ -3715,6 +3715,12 @@ describe("FilesPane — the state verbs and the release clock", () => {
    *  place. The other refuse-certain mode cause, and the opposite setting. */
   const LFS_OFF_SENTENCE =
     "Large-file support is off for this folder, so keeper is not releasing anything from it on a clock";
+  /** `ReleaseSchedule::Held { platform: "macOS" }` — the machine cannot see
+   *  whether the file is open, so every request here refuses `OpenUnknown`
+   *  (Epic 70, AD-235). The one refused word that is the machine's, not the
+   *  folder's; rendered from `RELEASE_HELD_SENTENCE` with the platform filled. */
+  const HELD_SENTENCE =
+    "keeper cannot see whether this file is open on macOS, so it keeps the content here; a keeper on Linux can release it, and until then the copy stays";
 
   /** One of story 56.4's five refusals, verbatim. The whole point of the sink is
    *  that this sentence reaches the screen unaltered. */
@@ -4655,6 +4661,7 @@ describe("FilesPane — the state verbs and the release clock", () => {
         ["forever.mp4", "Manual", INDEFINITE_SENTENCE],
         ["mode.mp4", "Kept", MODE_KEEPS_SENTENCE],
         ["nolfs.mp4", "Kept", LFS_OFF_SENTENCE],
+        ["mac.mp4", "Held", HELD_SENTENCE],
       ] as const;
       await tree(rows.map(([name, word, sentence]) => held(name, word, sentence)));
 
@@ -4692,7 +4699,7 @@ describe("FilesPane — the state verbs and the release clock", () => {
    * mode releases nothing produced a guaranteed red `role="alert"` from a control
    * the pane was already holding Rust's word for.
    *
-   * All five words in one tree, because the claim is a partition and a test that
+   * All six words in one tree, because the claim is a partition and a test that
    * checked only the withheld half would pass on a gate that withheld everything.
    * `Manual` is the load-bearing one: `Engine::release_resolved` has no TTL guard
    * anywhere in its chain, so a `releaseTtlMs = 0` row releases on request and the
@@ -4704,6 +4711,7 @@ describe("FilesPane — the state verbs and the release clock", () => {
       held("pinned.mp4", "Pinned", PINNED_SENTENCE),
       held("mode.mp4", "Kept", MODE_KEEPS_SENTENCE),
       held("nolfs.mp4", "Kept", LFS_OFF_SENTENCE),
+      held("mac.mp4", "Held", HELD_SENTENCE),
       held("forever.mp4", "Manual", INDEFINITE_SENTENCE),
       held("fresh.mp4", "Not sent", UNCONFIRMED_SENTENCE),
       counting("due.mp4", Date.now() + 3_600_000),
@@ -4713,6 +4721,9 @@ describe("FilesPane — the state verbs and the release clock", () => {
       ["pinned.mp4", "Pinned", PINNED_SENTENCE],
       ["mode.mp4", "Kept", MODE_KEEPS_SENTENCE],
       ["nolfs.mp4", "Kept", LFS_OFF_SENTENCE],
+      // Epic 70: refused by the machine rather than the folder, and withheld
+      // for the same reason — a press can only produce the red alert.
+      ["mac.mp4", "Held", HELD_SENTENCE],
     ] as const) {
       const row = screen.getByRole("treeitem", { name });
       expect(verbs(row)).not.toContain(FILES_RELEASE_LABEL);

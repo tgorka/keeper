@@ -93,6 +93,16 @@ fn migrate(conn: &Connection) -> Result<()> {
             ON journal (state, not_before_ms);
         CREATE INDEX IF NOT EXISTS journal_by_profile
             ON journal (profile_id, state);
+        -- `enqueue_unique` dedups on `(profile_id, payload)` from a per-object
+        -- loop; with only the profile prefix indexed, queueing a backlog of N
+        -- transfers compared N² JSON strings under the connection mutex
+        -- (F-db-4). `journal_kind` serves `undefer_kind` and `outstanding_count`
+        -- — asked once per push and once per drain — which filtered `kind` by
+        -- scanning the profile's rows (F-db-11).
+        CREATE INDEX IF NOT EXISTS journal_dedup
+            ON journal (profile_id, payload);
+        CREATE INDEX IF NOT EXISTS journal_kind
+            ON journal (profile_id, kind, state);
 
         CREATE TABLE IF NOT EXISTS file_state (
             profile_id  TEXT NOT NULL,
@@ -1378,17 +1388,16 @@ pub fn is_pinned(conn: &Connection, profile_id: &str, path: &str) -> Result<bool
 ///
 /// # What it costs
 ///
-/// The table now grows with the number of distinct paths this profile has ever
-/// hydrated rather than with the number it currently holds, and **nothing
-/// prunes a released row**: there is no `DELETE FROM materialized` anywhere in
-/// this crate. So the bound is paths-ever-hydrated, which for a folder with
-/// renames, dated exports or a rolling archive grows with time and not with the
-/// cone. Both filtered readers stay correct and index-ranged either way; the
-/// cost is disk, and it is small per row. Bounding it needs a rule about which
-/// released rows are worth keeping — an age relative to the folder's TTL, plus
-/// an index read to know the path is gone upstream — which is a decision rather
-/// than an edit, and it is recorded as deferred work rather than guessed at
-/// here.
+/// The table grows with the number of distinct paths this profile has ever
+/// hydrated rather than with the number it currently holds, and a released row
+/// is kept for [`MATERIALIZED_RETENTION_MS`] before [`age_out_materialized`]
+/// deletes it on the success edge (Epic 70). Until then the bound is
+/// paths-ever-hydrated — on hesperia 89 289 rows against 72 641 LFS-tracked
+/// index paths, read and allocated whole on every sweep — which for a folder
+/// with renames, dated exports or a rolling archive grows with time and not
+/// with the cone. Both filtered readers stay correct and index-ranged either
+/// way; ninety days is long enough that a path materialized again inside any
+/// TTL a folder would set still finds its `last_used_ms` and `local_origin`.
 ///
 /// # Why the statement will not touch a pinned row
 ///
@@ -1426,6 +1435,48 @@ pub fn forget_materialized(
         (profile_id, path, now_ms),
     )?;
     Ok(())
+}
+
+/// How long a released ledger row is kept before [`age_out_materialized`]
+/// deletes it (Epic 70, AD-234).
+///
+/// Ninety days. A released row's remaining value is the memo it carries —
+/// `last_used_ms`, `local_origin`, `synced_at_ms` — for the next time the same
+/// path lands, and every TTL a folder can set is a small number of days, so a
+/// path that has not come back in ninety is one that will arrive as new. The
+/// horizon is fixed rather than derived from the folder's TTL because the
+/// table is what grows with the machine's whole life, and a rule that moved
+/// with a setting would let one folder's `releaseTtlMs = 0` keep every row
+/// forever.
+pub const MATERIALIZED_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
+
+/// Delete this profile's ledger rows whose release is older than
+/// `older_than_ms`, and say how many went (Epic 70, F-VF-7, F-db-7).
+///
+/// Only rows with `released_at_ms` set are candidates: a live row is content
+/// this machine holds, and a pinned row never has the stamp at all —
+/// [`forget_materialized`] refuses to write it over a pin — so neither can
+/// reach this statement. The cut is `<`, so a row released exactly at the
+/// horizon is kept: the horizon is a floor on how long a row survives, and a
+/// floor that is not inclusive is one that lies by a millisecond.
+///
+/// The primary key `(profile_id, path)` gives the profile range; the age test
+/// is a scan inside it. That is the right trade for a statement run once per
+/// successful pass: the rows are few after the first sweep, and an index on
+/// `released_at_ms` would be paid for on every write to a table that grows
+/// with paths-ever-hydrated.
+pub fn age_out_materialized(
+    conn: &Connection,
+    profile_id: &str,
+    older_than_ms: i64,
+) -> Result<usize> {
+    Ok(conn.execute(
+        "DELETE FROM materialized
+          WHERE profile_id = ?1
+            AND released_at_ms IS NOT NULL
+            AND released_at_ms < ?2",
+        (profile_id, older_than_ms),
+    )?)
 }
 
 /// Queued transfers that have no name yet, as oid → the units wanting it.
@@ -1678,27 +1729,44 @@ fn stored_profile(conn: &Connection, id: &str) -> Result<Option<SyncProfile>> {
     }
 }
 
-/// Delete a profile and every journal/file-state/activity row belonging to it.
+/// Delete a profile and every journal/file-state/activity/ledger/task row
+/// belonging to it — as one transaction.
 ///
 /// Deliberately not a foreign-key cascade: the journal is intentionally
 /// decoupled so a corrupt profile row can never take pending work with it.
+///
+/// **One transaction** (Epic 70, F-db-7). Seven auto-commit statements meant
+/// a crash or a `SQLITE_BUSY` between any two of them left a profile row whose
+/// journal was gone or a journal whose profile was — and, after
+/// `keeper-syncd` re-created the folder under the same id from `config.toml`,
+/// a folder that inherited half of a stranger's state. Inside one transaction
+/// the failure shape is the row intact and the removal retryable, which is the
+/// shape `Engine::delete_profile` already promises for a keychain failure.
+///
+/// `materialized` goes too. It was the one table left behind, and the
+/// largest — 89 289 rows on hesperia — and it feeds a *deletion* sweep: a
+/// re-created profile reusing the id inherited every row and spent its
+/// 32-attempt budget each pass on paths whose content it never held.
 pub fn delete_profile(conn: &Connection, id: &str) -> Result<()> {
-    conn.execute("DELETE FROM journal WHERE profile_id = ?1", [id])?;
-    conn.execute("DELETE FROM file_state WHERE profile_id = ?1", [id])?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM journal WHERE profile_id = ?1", [id])?;
+    tx.execute("DELETE FROM file_state WHERE profile_id = ?1", [id])?;
     // Otherwise a re-created profile reusing the id would inherit the deleted
     // one's history, and a removed profile would leave its file names behind.
-    conn.execute("DELETE FROM activity WHERE profile_id = ?1", [id])?;
+    tx.execute("DELETE FROM activity WHERE profile_id = ?1", [id])?;
+    tx.execute("DELETE FROM materialized WHERE profile_id = ?1", [id])?;
     // A task naming a folder that no longer exists is a task whose every run
     // fails permanently, on a schedule, forever — and 57.6 will notify on the
     // onset of that. There is deliberately no foreign key (see the schema), so
     // the history goes first and by hand.
-    conn.execute(
+    tx.execute(
         "DELETE FROM task_runs
           WHERE task_id IN (SELECT id FROM tasks WHERE profile_id = ?1)",
         [id],
     )?;
-    conn.execute("DELETE FROM tasks WHERE profile_id = ?1", [id])?;
-    conn.execute("DELETE FROM profiles WHERE id = ?1", [id])?;
+    tx.execute("DELETE FROM tasks WHERE profile_id = ?1", [id])?;
+    tx.execute("DELETE FROM profiles WHERE id = ?1", [id])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2287,8 +2355,10 @@ pub fn undefer_profile(conn: &Connection, profile_id: &str, now_ms: i64) -> Resu
 /// unit waiting on an absent volume, which would spend an attempt to be
 /// re-deferred straight away.
 ///
-/// `kind` is the [`WorkKind::tag`] spelling, so this filters on the indexed
-/// `kind` column without deserializing a payload.
+/// `kind` is the [`WorkKind::tag`] spelling, so this filters on the `kind`
+/// column — served by `journal_kind (profile_id, kind, state)` since Epic 70;
+/// before that it was a scan of the profile's rows — without deserializing a
+/// payload.
 ///
 /// # Why the wait is refunded
 ///
@@ -4180,6 +4250,99 @@ pub fn delete_task(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The schedule every seeded `gc` task is born with (Epic 70, AD-234).
+///
+/// Weekly, in the interval dialect rather than `@weekly`: an interval fires
+/// seven days after the previous run **finished**, so two folders seeded in
+/// the same second still drift apart after their first runs instead of every
+/// folder on the machine repacking at Sunday midnight. Hesperia's own launchd
+/// job was weekly, and 403 loose objects is what a week of sync churn came to.
+pub const GC_TASK_SCHEDULE: &str = "every 7d";
+
+/// The task id a seeded `gc` task is stored under for `profile_id`.
+///
+/// One function so the CLI, the app and a test all spell it one way; a person
+/// may of course create a second `gc` row under any other id.
+pub fn gc_task_id(profile_id: &str) -> String {
+    format!("gc-{profile_id}")
+}
+
+/// The `meta` marker that says `profile_id` has been offered its `gc` task.
+fn gc_task_seeded_marker(profile_id: &str) -> String {
+    format!("gc_task_seeded:{profile_id}")
+}
+
+/// Give `profile_id` its default weekly `gc` task, exactly once, and say
+/// whether this call was the once (Epic 70, AD-234, FR-527).
+///
+/// **Once per profile, marked in `meta`**, on [`ensure_prune_default`]'s
+/// reasoning one row down: an absent task has two meanings after seeding —
+/// never offered, and deleted by somebody — and only a marker keeps them
+/// apart. Re-seeding on every open would make `keeper-syncd tasks rm gc-…`
+/// last until the next restart, which is a decision unmade by a reboot.
+///
+/// A row already stored under [`gc_task_id`] — a person got there first — is
+/// left exactly as it is and the marker is written anyway, so the seed never
+/// overwrites a schedule somebody chose. Called from `Engine::open` for the
+/// profiles already present and from `Engine::upsert_profile` for the ones
+/// that arrive later; never on a phone, whose engine refuses the verb.
+///
+/// `on_missed` is `run_now`: a machine that was asleep for its window has
+/// exactly the loose objects the window was for, and there is no deletion in
+/// this kind for [`crate::tasks::TaskMissedPolicy`]'s N-passes concern to
+/// bite on.
+pub fn seed_gc_task(conn: &Connection, profile_id: &str, now_ms: i64) -> Result<bool> {
+    let marker = gc_task_seeded_marker(profile_id);
+    let seeded: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [&marker], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if seeded.is_some() {
+        return Ok(false);
+    }
+    // No transaction of its own: `upsert_task` opens one, and SQLite refuses
+    // to nest. The marker is written after the row, so a crash between the
+    // two re-offers the task on the next open — and `upsert_task` over an
+    // existing row is an update that changes nothing about it — which is the
+    // harmless direction to fail in.
+    let id = gc_task_id(profile_id);
+    let taken: Option<String> = conn
+        .query_row("SELECT id FROM tasks WHERE id = ?1", [&id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    let created = if taken.is_none() {
+        let row = TaskRow {
+            id,
+            profile_id: Some(profile_id.to_owned()),
+            kind: TaskKind::Gc,
+            schedule: Some(GC_TASK_SCHEDULE.to_owned()),
+            mode: TaskMode::Scheduled,
+            next_due_ms: None,
+            enabled: true,
+            updated_ms: now_ms,
+            running_host: None,
+            lease_until_ms: None,
+            on_missed: crate::tasks::TaskMissedPolicy::RunNow,
+            description: Some("keeper's weekly repack of this folder's git objects".to_owned()),
+            missed_delay_ms: None,
+            bot_id: None,
+            prompt_subpath: None,
+            model: None,
+        };
+        upsert_task(conn, &row, None)?;
+        true
+    } else {
+        false
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
+        (&marker, now_ms.to_string()),
+    )?;
+    Ok(created)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4718,6 +4881,155 @@ mod tests {
         delete_profile(&c, "01A").expect("delete");
         assert_eq!(pending_count(&c, "01A").expect("count"), 0);
         assert!(get_profile(&c, "01A").expect("get").is_none());
+    }
+
+    /// `delete_profile` takes the ledger with it, and it is one transaction:
+    /// a failure injected between two of its statements leaves every row —
+    /// the profile's included — exactly where it was (Epic 70, F-db-7).
+    #[test]
+    fn deleting_a_profile_takes_its_ledger_and_is_all_or_nothing() {
+        let c = conn();
+        upsert_profile(&c, &profile("01A"), 1).expect("insert");
+        enqueue(&c, "01A", &WorkKind::Push, 1, 0).expect("enqueue");
+        remember_materialized(&c, "01A", "a.mp4", 1_700).expect("ledger");
+        remember_materialized(&c, "01A", "b.mp4", 1_800).expect("ledger");
+        let count = |sql: &str| -> i64 { c.query_row(sql, ["01A"], |r| r.get(0)).expect("count") };
+
+        // A failure in the middle: `tasks` is the sixth of seven statements,
+        // so the journal and the ledger were already deleted inside the
+        // transaction when it fires.
+        c.execute_batch(
+            "CREATE TRIGGER fail_mid_delete BEFORE DELETE ON tasks
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .expect("trigger");
+        // The trigger fires only if a row is deleted, so one task must exist.
+        seed_gc_task(&c, "01A", 1).expect("a task to delete");
+        let err = delete_profile(&c, "01A").expect_err("the injected failure propagates");
+        assert!(err.to_string().contains("injected"), "{err}");
+        assert!(
+            get_profile(&c, "01A").expect("get").is_some(),
+            "the profile row is still there"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM journal WHERE profile_id = ?1"),
+            1,
+            "and so is the journal row deleted three statements earlier: rolled back"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM materialized WHERE profile_id = ?1"),
+            2
+        );
+
+        c.execute_batch("DROP TRIGGER fail_mid_delete")
+            .expect("drop");
+        delete_profile(&c, "01A").expect("delete");
+        assert!(get_profile(&c, "01A").expect("get").is_none());
+        assert_eq!(
+            count("SELECT COUNT(*) FROM journal WHERE profile_id = ?1"),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM materialized WHERE profile_id = ?1"),
+            0,
+            "no ledger row survives the folder"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM tasks WHERE profile_id = ?1"), 0);
+    }
+
+    /// A row released 91 days ago is gone after ageing; one released 89 days
+    /// ago, a live one and a pinned one are not (Epic 70, F-VF-7).
+    #[test]
+    fn ageing_forgets_rows_released_past_the_horizon_and_no_others() {
+        const DAY: i64 = 24 * 60 * 60 * 1_000;
+        let now = 200 * DAY;
+        let c = conn();
+        for path in [
+            "old.mp4",
+            "recent.mp4",
+            "live.mp4",
+            "pinned.mp4",
+            "other.mp4",
+        ] {
+            remember_materialized(&c, "p", path, 1).expect("ledger");
+        }
+        forget_materialized(&c, "p", "old.mp4", now - 91 * DAY).expect("released");
+        forget_materialized(&c, "p", "recent.mp4", now - 89 * DAY).expect("released");
+        set_pinned(&c, "p", "pinned.mp4", true, 1).expect("pin");
+        // A pin refuses the stamp, so this row stays live whatever its age.
+        forget_materialized(&c, "p", "pinned.mp4", now - 100 * DAY).expect("refused quietly");
+        // Another profile's old row is not this profile's to age.
+        remember_materialized(&c, "q", "old.mp4", 1).expect("ledger");
+        forget_materialized(&c, "q", "old.mp4", now - 91 * DAY).expect("released");
+
+        let aged = age_out_materialized(&c, "p", now - MATERIALIZED_RETENTION_MS).expect("age");
+        assert_eq!(aged, 1, "exactly the 91-day row");
+
+        let remaining: Vec<String> = c
+            .prepare("SELECT path FROM materialized WHERE profile_id = 'p' ORDER BY path")
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<std::result::Result<_, _>>()
+            .expect("rows");
+        assert_eq!(
+            remaining,
+            vec!["live.mp4", "other.mp4", "pinned.mp4", "recent.mp4"],
+            "89 days is kept, live and pinned rows are never candidates"
+        );
+        let other: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM materialized WHERE profile_id = 'q'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(other, 1, "scoped to the profile");
+
+        // The cut is strict: a row released exactly at the horizon is kept.
+        remember_materialized(&c, "p", "edge.mp4", 1).expect("ledger");
+        forget_materialized(&c, "p", "edge.mp4", now - MATERIALIZED_RETENTION_MS)
+            .expect("released");
+        assert_eq!(
+            age_out_materialized(&c, "p", now - MATERIALIZED_RETENTION_MS).expect("age"),
+            0,
+            "the horizon is a floor on how long a row survives"
+        );
+    }
+
+    /// `enqueue_unique`'s dedup `SELECT` is served by `journal_dedup`, and the
+    /// two `kind` filters by `journal_kind` (Epic 70, F-db-4, F-db-11).
+    ///
+    /// Asked of the planner rather than inferred from `CREATE INDEX`: an index
+    /// the planner declines to use is an index that does nothing.
+    #[test]
+    fn the_journal_dedup_and_kind_indexes_serve_their_statements() {
+        let c = conn();
+        let plan = |sql: &str| -> String {
+            c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("prepare")
+                .query_map([], |r| r.get::<_, String>(3))
+                .expect("plan")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("rows")
+                .join("\n")
+        };
+        let dedup = plan(
+            "SELECT id FROM journal
+              WHERE profile_id = 'p' AND payload = 'x'
+                AND state IN ('pending','deferred','running')
+              ORDER BY id LIMIT 1",
+        );
+        assert!(
+            dedup.contains("journal_dedup"),
+            "the dedup select walks the (profile_id, payload) index:\n{dedup}"
+        );
+        let kind =
+            plan("SELECT COUNT(*) FROM journal WHERE profile_id = 'p' AND kind = 'lfsUpload'");
+        assert!(
+            kind.contains("journal_kind"),
+            "`outstanding_count` walks the (profile_id, kind, state) index:\n{kind}"
+        );
     }
 
     /// An activity row nothing is accountable for — the shape every test that

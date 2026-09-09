@@ -427,6 +427,10 @@ export const FILES_FETCH_DURATIONS: readonly {
  *   button is the only mechanism it has. Offered.
  * - `"Not sent"` — `Unconfirmed`. No `synced_at_ms` gate either, so it releases
  *   on request. Offered.
+ * - `"Held"` — this machine cannot see whether the file is open, so
+ *   `release_resolved` refuses `OpenUnknown` on every request here (Epic 70,
+ *   AD-235). Withheld; the row's sentence names the platform and says a
+ *   keeper on Linux can release it.
  * - `null` — on a clock (`Due`). Offered.
  *
  * Pin is NOT gated by this. It is idempotent in Rust and sends only `true`, so
@@ -440,7 +444,7 @@ export const FILES_FETCH_DURATIONS: readonly {
  * honest failure in that direction. So the test is on the word, not on the
  * presence of the object.
  */
-export const FILES_RELEASE_REFUSED_HOLDS: readonly string[] = ["Pinned", "Kept"];
+export const FILES_RELEASE_REFUSED_HOLDS: readonly string[] = ["Pinned", "Kept", "Held"];
 
 /** How the header counts what Delete would act on. A count, because the
  * confirmation is where the files are named. */

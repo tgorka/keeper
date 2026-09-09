@@ -102,6 +102,14 @@ async fn main() -> ExitCode {
 /// reads. ANSI is off on both — this process normally has no terminal, and
 /// escape codes in a journal or a log file are noise, not colour.
 ///
+/// The file is a [`keeper_sync::logfile::RotatingFile`] (Epic 70): one open
+/// handle, one `write_all` per event, and past
+/// [`keeper_sync::logfile::LOG_ROTATE_BYTES`] the file is moved to `.1` with
+/// two generations kept — where a bare `File` grew without bound and, on
+/// hesperia, reached 2.2 GB of two gitoxide targets' per-path chatter. Behind
+/// a `Mutex` because `MakeWriter` hands out a writer per event and the
+/// rotation is a state change that two events must not race.
+///
 /// Best-effort by design. A state directory that cannot be written is worth a
 /// warning, not a refusal to sync: losing the log file is strictly better than
 /// losing the daemon.
@@ -109,37 +117,19 @@ fn init_logging(log_path: &Path, verbose: u8, configured_level: Option<&str>) {
     let (filter, rust_log_problem) = build_filter(verbose, configured_level);
 
     let stderr_layer = fmt::layer().with_ansi(false).with_writer(std::io::stderr);
-    let registry = tracing_subscriber::registry()
+    let file = std::sync::Mutex::new(keeper_sync::logfile::RotatingFile::open(
+        log_path.to_path_buf(),
+    ));
+    let installed = tracing_subscriber::registry()
         .with(filter)
-        .with(stderr_layer);
-
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path);
-    let (installed, file_problem) = match file {
-        // A bare `File` is itself a `MakeWriter`; each event is one `write_all`
-        // on an `O_APPEND` descriptor, so nothing sits in a buffer waiting to be
-        // lost if the process is killed.
-        Ok(file) => (
-            registry
-                .with(fmt::layer().with_ansi(false).with_writer(file))
-                .try_init(),
-            None,
-        ),
-        Err(err) => (
-            registry.try_init(),
-            Some(format!("{}: {err}", log_path.display())),
-        ),
-    };
+        .with(stderr_layer)
+        .with(fmt::layer().with_ansi(false).with_writer(file))
+        .try_init();
 
     if installed.is_err() {
         // Only reachable if something already installed a global subscriber,
         // which in a binary means a test harness. Nothing to report to.
         return;
-    }
-    if let Some(problem) = file_problem {
-        tracing::warn!(problem = %problem, "cannot open the daemon log file; logging to stderr only");
     }
     if let Some(problem) = rust_log_problem {
         tracing::warn!(problem = %problem, "RUST_LOG could not be parsed and was ignored");
@@ -164,9 +154,13 @@ fn build_filter(verbose: u8, configured_level: Option<&str>) -> (EnvFilter, Opti
             // `EnvFilter::new` parses leniently, so a malformed directive would
             // degrade silently. Every string reaching it is either a literal
             // from `default_level` or a level `config::parse` already checked
-            // against its allow-list.
+            // against its allow-list, joined to `logfile::LOG_TARGET_DIRECTIVES`
+            // — which `keeper_sync::logfile`'s own test parses strictly.
             (
-                EnvFilter::new(default_level(verbose, configured_level)),
+                EnvFilter::new(keeper_sync::logfile::default_filter(default_level(
+                    verbose,
+                    configured_level,
+                ))),
                 complaint,
             )
         }

@@ -52,6 +52,7 @@ pub mod footprint;
 pub mod git;
 pub mod http;
 pub mod lfs;
+pub mod logfile;
 pub mod names;
 pub mod openfiles;
 pub mod platform;
