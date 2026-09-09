@@ -636,7 +636,10 @@ async fn a_merge_whose_commit_dies_is_undone_with_its_copies_and_finishes_next_p
     assert!(f.in_head_commit().contains(&copy));
 }
 
-#[cfg(unix)]
+/// Linux only: APFS refuses a non-UTF-8 name outright (`EILSEQ`, "Illegal
+/// byte sequence"), so on macOS the fixture cannot be written and the case
+/// cannot arise there — the copy-naming code is the same on both.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_non_utf8_path_gets_its_own_copy() {
     use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
