@@ -1,0 +1,23 @@
+AGENTS.md
+  s_996117c36b47d2::t_9da26e60f8fede 1-169
+CLAUDE.md
+  s_996117c36b47d2::t_be60d087f92a63 1-8
+docs/project-context.md
+  s_996117c36b47d2::t_3f812f778a3b43 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "15d4eec34be4ec1e11071db8b7f3cb040626a700",
+  "prompts": {},
+  "sessions": {
+    "s_996117c36b47d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3189de24-33a6-4994-8bd4-097d8ca2cc3c",
+        "model": "claude-opus-5"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
