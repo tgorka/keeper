@@ -29,10 +29,12 @@ visual_tools = "intermediate"
 
 [modules.gds]
 game_dev_experience = "intermediate"
-planning_artifacts = "{project-root}/skills/planning-artifacts"
-implementation_artifacts = "{project-root}/skills/implementation-artifacts"
-project_knowledge = "{project-root}/docs"
 primary_platform = ["unity", "unreal", "godot", "other"]
+# planning_artifacts / implementation_artifacts / project_knowledge removed here:
+# render_skill.py resolves `{{.<key>}}` by searching every module and halts when
+# two define it, and [modules.bmm] already owns all three for this repository
+# (keeper is not a game project; skills/*-artifacts never existed). Re-run the
+# installer without the gds module to make this durable.
 
 [modules.tea]
 test_artifacts = "{project-root}/skills/test-artifacts"
