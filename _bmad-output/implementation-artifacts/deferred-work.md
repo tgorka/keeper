@@ -6017,3 +6017,8 @@ status: open
     would BE the second interaction idiom `spec-45-17…:200` forbids by name — the fix is one
     decision taken once for every browsing surface (which key opens beside, and whether Enter
     should preview), and then applied to Files, Notes, Sessions and Tasks together.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-sweep-found-untracked-files-never-commit.md`
+  summary: A sweep-found file that keeps changing buys a full directory walk on every settle-deadline pass until it settles, because the gate's only observer is the walk and only a walk with a directory scan can see an untracked path.
+  evidence: `collect_stable_changes` sets `untracked_appeared` whenever an untracked path is `Settling`, and `commit_walk_policy` spends it on `full()`; a file still being written stays `Settling` per pass, so on the reference folder (155 626 entries, USB) each pass costs the 1.6–6.8 s directory walk measured 2026-09-09 rather than one `lstat`. The watcher's `Create` path already behaves this way, so the story extends an existing cost rather than adding a class; the durable fix is a second look that re-samples the held unindexed paths directly (one `FileSample` each) instead of walking the tree, which is a gate/walk design change outside this story's Never list.
+  status: open
