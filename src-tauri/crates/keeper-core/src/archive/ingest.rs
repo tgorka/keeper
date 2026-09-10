@@ -51,11 +51,13 @@ pub(super) async fn run(mut rx: UnboundedReceiver<ArchiveMsg>, conn: Connection)
                 session_id,
                 relative_path,
             } => move_recording(&conn, &session_id, &relative_path),
-            ArchiveMsg::RebuildRecordings {
-                root,
+            ArchiveMsg::RebuildRecordings(request) => {
+                blocking(|| rebuild_recordings(&conn, &request))
+            }
+            ArchiveMsg::ForgetRecordingsRoot {
                 root_kind,
                 profile_id,
-            } => rebuild_recordings(&conn, &root, &root_kind, profile_id.as_deref()),
+            } => forget_recordings_root(&conn, &root_kind, profile_id.as_deref()),
         }
     }
     tracing::info!("archive writer task ended (all senders dropped)");
@@ -140,26 +142,85 @@ fn move_recording(conn: &Connection, session_id: &str, relative_path: &str) {
 /// the recorder may be appending to — a second connection doing that would be
 /// the one race this whole module is arranged to make impossible.
 ///
+/// Since the archive followed every recordings root, the pass also RECONCILES:
+/// a session found under another root than its row named is re-homed, and a
+/// row this root's walk could not find anywhere is forgotten with its
+/// segments and its search entry. Both counts are logged; a pass that wrote
+/// and removed nothing says nothing.
+///
 /// Best-effort like every other recording write: a walk that cannot finish is
 /// logged and the writer carries on. Nothing upstream is waiting on the count.
-fn rebuild_recordings(
-    conn: &Connection,
-    root: &std::path::Path,
-    root_kind: &str,
-    profile_id: Option<&str>,
-) {
-    match recordings::rebuild_from_disk(conn, root, root_kind, profile_id) {
-        Ok(0) => {}
-        Ok(written) => tracing::info!(
-            written,
-            root = %root.display(),
+fn rebuild_recordings(conn: &Connection, request: &recordings::RebuildRequest) {
+    let profile_id = request.profile_id.as_deref().unwrap_or("-");
+    match recordings::rebuild_from_disk(conn, request) {
+        Ok(recordings::RebuildOutcome {
+            written: 0,
+            removed: 0,
+            ..
+        }) => {}
+        Ok(outcome) => tracing::info!(
+            written = outcome.written,
+            removed = outcome.removed,
+            found = outcome.found.len(),
+            root_kind = %request.root_kind,
+            profile_id,
+            root = %request.root.display(),
             "archive: rebuilt the recordings index from the session folders"
         ),
         Err(e) => tracing::warn!(
-            root = %root.display(),
+            root = %request.root.display(),
+            root_kind = %request.root_kind,
+            profile_id,
             error = %e,
             "archive: could not rebuild the recordings index"
         ),
+    }
+}
+
+/// Forget one root's rows on the writer's own connection (the archive follows
+/// every recordings root): the removed synced folder's sessions leave the
+/// index with their segments and search entries. Logged with the count; a
+/// root that had no rows says nothing.
+fn forget_recordings_root(conn: &Connection, root_kind: &str, profile_id: Option<&str>) {
+    match recordings::forget_root(conn, root_kind, profile_id) {
+        Ok(0) => {}
+        Ok(removed) => tracing::info!(
+            removed,
+            root_kind,
+            profile_id = profile_id.unwrap_or("-"),
+            "archive: forgot a removed root's recordings"
+        ),
+        Err(e) => tracing::warn!(
+            root_kind,
+            profile_id = profile_id.unwrap_or("-"),
+            error = %e,
+            "archive: could not forget a removed root's recordings"
+        ),
+    }
+}
+
+/// Run a rebuild without starving the runtime the writer may be sharing.
+///
+/// The writer task is spawned onto whatever runtime is current
+/// ([`super::spawn_writer`]): under Tauri that is the app's multi-thread
+/// runtime, whose worker this task then occupies for as long as a rebuild
+/// runs — and a rebuild walks a whole recordings root and, under a profile,
+/// opens a repository per session folder through its probe. On that runtime
+/// the body goes through `tokio::task::block_in_place`, which hands the
+/// worker's other tasks to another thread first. On the fallback
+/// current-thread runtime (the writer's own OS thread) there is nothing to
+/// hand over and `block_in_place` would panic, so the body simply runs.
+fn blocking(body: impl FnOnce()) {
+    let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+        matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        )
+    });
+    if multi_thread {
+        tokio::task::block_in_place(body);
+    } else {
+        body();
     }
 }
 

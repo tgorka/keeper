@@ -31,8 +31,8 @@
 //! parameter, or is parsed out of the manifest's own ISO-8601 stamps by
 //! [`epoch_ms_from_rfc3339`].
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use serde::Deserialize;
@@ -400,6 +400,24 @@ pub fn upsert_recording(conn: &Connection, row: &RecordingRow) -> Result<(), Arc
     in_transaction(conn, "recording row", || {
         let stored = stored_durability(conn, &row.session_id)?;
         let durability = floored_durability(stored.as_deref(), &row.durability);
+        write_recording_as(conn, row, &durability)
+    })
+}
+
+/// The body of [`upsert_recording`] with the `durability` word decided by the
+/// caller — the one write both spellings share.
+///
+/// [`upsert_recording`] floors it against the row on file; a rebuild
+/// ([`write_rebuilt_session`]) has already read that row for another reason
+/// and decides the word from what it read — floored where the session sits
+/// where it sat, exact where it has moved — so it resolves the word itself
+/// and comes here with it, rather than reading the row a second time.
+fn write_recording_as(
+    conn: &Connection,
+    row: &RecordingRow,
+    durability: &str,
+) -> Result<(), ArchiveError> {
+    in_transaction(conn, "recording row", || {
         conn.execute(
             "INSERT OR REPLACE INTO recordings(\
                 session_id, device_id, relative_path, root_kind, profile_id, started_ts, \
@@ -701,11 +719,13 @@ pub fn relative_session_path(root: &Path, path: &Path) -> Option<String> {
 /// So the fallback is the relative path, namespaced with a `legacy:` prefix that
 /// no real `<device ULID>-<session ULID>` can produce. **The consequence, stated
 /// plainly:** if such a session's folder moves, a later rebuild mints a
-/// different id for it and the old row stays behind, pointing at a path that is
-/// no longer there. That is the epic's rule anyway (a row is never deleted
-/// because a folder is missing), and it costs a duplicate entry for
-/// pre-40.3 sessions only — every session recorded since carries
-/// `meta.session_id` and is immune.
+/// different id for it, and the old row — a session no folder under its root
+/// carries any more — is forgotten by that root's next reconcile
+/// ([`rebuild_from_disk`]). Between the move and that rebuild the browser
+/// lists the session twice, and a pre-40.3 session that was `pushed` under
+/// the old id starts over at `local` under the new one, because nothing ties
+/// the two rows together. Pre-40.3 sessions only — every session recorded
+/// since carries `meta.session_id` and is immune.
 pub fn fallback_session_id(relative_path: &str) -> String {
     format!("legacy:{relative_path}")
 }
@@ -879,98 +899,317 @@ impl RecordingSegmentRow {
     }
 }
 
-/// Re-derive every row from the session folders under `root` (Story 42.1).
+/// What one root's repository says about a session folder's durability —
+/// supplied by the shell, which has a sync engine, to a rebuild here, which
+/// must not (`keeper-core` links no `keeper-sync`).
+///
+/// Asked once per session folder found under a PROFILE root, with the folder's
+/// absolute path. `None` means the probe could not answer — a transient read
+/// failure the shell has already logged — and the rebuild then treats the
+/// folder as one no repository has spoken for: `local`, floored against the
+/// row wherever the floor applies (see [`rebuild_from_disk`]), so silence
+/// never downgrades anything. A rebuild of the plain-folder destination
+/// carries no probe at all: nothing publishes what is recorded there, so
+/// `local` is simply the truth.
+pub type DurabilityProbeFn = Box<dyn Fn(&Path) -> Option<RecordingDurabilityState> + Send + Sync>;
+
+/// A [`DurabilityProbeFn`] that can ride an [`super::ArchiveMsg`]: the message
+/// derives `Debug`, and a boxed closure has none of its own.
+pub struct DurabilityProbe(pub DurabilityProbeFn);
+
+impl DurabilityProbe {
+    /// Ask the repository about one session folder.
+    pub fn ask(&self, folder: &Path) -> Option<RecordingDurabilityState> {
+        (self.0)(folder)
+    }
+}
+
+impl std::fmt::Debug for DurabilityProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DurabilityProbe")
+    }
+}
+
+/// One recordings root the archive follows, as the rebuild of ANOTHER root
+/// needs to know it: enough to look for a session folder that a row says is
+/// there (the archive follows every recordings root).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownRoot {
+    /// The absolute root.
+    pub root: PathBuf,
+    /// `"folder"` or `"profile"` — the `root_kind` column word.
+    pub root_kind: String,
+    /// The profile, when the root is a synced folder's.
+    pub profile_id: Option<String>,
+}
+
+impl KnownRoot {
+    /// The absolute folder a row's root-relative, `/`-joined path names under
+    /// this root — [`relative_session_path`] run backwards.
+    fn folder(&self, relative_path: &str) -> PathBuf {
+        relative_path
+            .split('/')
+            .fold(self.root.clone(), |acc, part| acc.join(part))
+    }
+
+    /// Whether this is the root a row's `(root_kind, profile_id)` names.
+    fn is(&self, root_kind: &str, profile_id: Option<&str>) -> bool {
+        self.root_kind == root_kind && self.profile_id.as_deref() == profile_id
+    }
+}
+
+/// Everything one rebuild of one root needs to know (the archive follows every
+/// recordings root). The plain shape of [`super::ArchiveMsg::RebuildRecordings`].
+#[derive(Debug)]
+pub struct RebuildRequest {
+    /// The recordings root to walk. Every path derived under it is stored
+    /// relative to it.
+    pub root: PathBuf,
+    /// `"folder"` or `"profile"` — which kind of place that root is.
+    pub root_kind: String,
+    /// The profile, when the root is a synced folder's.
+    pub profile_id: Option<String>,
+    /// The repository's answer for a session folder's durability, when the
+    /// root is a synced folder's; `None` for the plain folder, where nothing
+    /// publishes and `local` is the truth.
+    pub probe: Option<DurabilityProbe>,
+    /// The session folders a recording in progress has reserved, as absolute
+    /// paths. A reserved folder is neither rewritten, pruned nor reconciled:
+    /// the recorder sends a segment's row before the manifest lists it, so a
+    /// rebuild that read the manifest now would prune the newest segment, and
+    /// its `closed_ts` exists nowhere else. Its row counts as found.
+    pub skip: HashSet<PathBuf>,
+    /// Every root the archive follows right now — this one may be among them.
+    /// A session whose row names one of these, and whose folder is still
+    /// there, is not re-homed by this rebuild (see [`rebuild_from_disk`]).
+    pub followed_roots: Vec<KnownRoot>,
+}
+
+impl RebuildRequest {
+    /// A request over one root with no probe, nothing reserved and no other
+    /// root known — the plain-folder shape, and the shape every Story 42.1
+    /// caller had.
+    pub fn new(root: impl Into<PathBuf>, root_kind: &str, profile_id: Option<&str>) -> Self {
+        Self {
+            root: root.into(),
+            root_kind: root_kind.to_owned(),
+            profile_id: profile_id.map(str::to_owned),
+            probe: None,
+            skip: HashSet::new(),
+            followed_roots: Vec::new(),
+        }
+    }
+
+    /// The same request, with the root's repository answering for durability.
+    pub fn with_probe(mut self, probe: DurabilityProbe) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// The same request, leaving these session folders alone.
+    pub fn skipping(mut self, folders: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.skip.extend(folders);
+        self
+    }
+
+    /// The same request, knowing where these roots are.
+    pub fn beside(mut self, roots: impl IntoIterator<Item = KnownRoot>) -> Self {
+        self.followed_roots.extend(roots);
+        self
+    }
+}
+
+/// What one [`rebuild_from_disk`] pass did to its root's rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebuildOutcome {
+    /// Sessions whose row was written from a manifest found under the root.
+    pub written: usize,
+    /// Rows under the root's `(root_kind, profile_id)` that no folder under it
+    /// claims any more, and were therefore removed with their segments and
+    /// search entries. Always zero when the root could not be read whole.
+    pub removed: usize,
+    /// The session ids of every session found under the root — the reserved
+    /// folders' rows first, then the walk's in the order it found them — the
+    /// set the removal above was taken against.
+    pub found: Vec<String>,
+}
+
+/// Re-derive every row from the session folders under the request's root, and
+/// reconcile the root's rows against what the walk found (Story 42.1; the
+/// archive follows every recordings root).
 ///
 /// **This is what makes the database a cache rather than a second truth.**
 /// Deleting `archive.db` loses nothing the manifests do not carry, and this
-/// function is the proof: it walks the tree, reads each `manifest.json`, and
+/// puts it back. Every session folder under `root` (a folder holding a
+/// `manifest.json`; the walk goes no deeper into one) is loaded and its row
 /// writes the rows through the ordinary [`upsert_recording`] /
 /// [`upsert_segment`] path — the same derivation ([`RecordingRow::from_manifest`])
 /// the recorder used, so the result is identical rather than approximate.
-/// Returns how many sessions it wrote.
 ///
 /// **The walk is the recovery pass's walk**, and reuses its two caps
 /// ([`RECOVERY_MAX_DEPTH`], [`RECOVERY_MAX_VISITS`]) rather than inventing a
-/// third pair that could disagree with them: the root is a folder the USER chose
-/// and may be a whole media library, so a rebuild must cost a bounded number of
-/// `read_dir` calls. Like that pass it walks iteratively (a pathological tree
-/// costs heap, never stack), skips symlinks by `DirEntry::file_type` so it can
-/// never leave the tree or loop back into it, skips dot entries (`.Trash` and
-/// friends are the OS's, not the user's recordings), and treats a directory
-/// whose `manifest.json` LOADS as the session itself — never descending into it,
-/// so a manifest a user copied inside a session cannot surface as a second row.
-/// A manifest that fails to load is walked like any ordinary directory rather
-/// than hiding every real session beneath it. It also sorts each directory's
-/// entries by name before examining them, which that pass has no need to do:
-/// `read_dir` order is whatever the filesystem happens to say, and the
-/// duplicate rule below has to name the same winner on every machine.
+/// third notion of "how far into a tree is far enough": the same tree, walked
+/// for a different reason, is bounded the same way. Both skip symlinks and dot
+/// entries. Entries are visited in name order, so a rebuild is reproducible.
 ///
-/// **A session's segment ledger is reconciled, not cleared and rewritten.** The
-/// manifest's ledger is authoritative (the terminal reconcile rebuilds it from
+/// **A session's segment ledger is reconciled, never cleared.** The manifest's
+/// `segments` list is the truth for which segments exist (it was rebuilt from
 /// disk), so a segment it no longer lists is deleted — but only that one.
 /// Clearing the whole ledger first would be one statement shorter and would
 /// destroy `closed_ts`, the one segment fact no manifest carries, before
-/// [`upsert_segment`] ever got the chance to preserve it. Session rows are never
-/// deleted at all: absence on disk is a fact for a later story to present, not a
-/// reason to forget the session.
+/// [`upsert_segment`] ever got the chance to preserve it.
+///
+/// **A reserved folder is left alone.** `skip` holds the folders a recording
+/// in progress has claimed. The recorder writes a segment's row the moment the
+/// segment closes and the manifest lists it only later, so a rebuild that
+/// loaded that manifest would prune the newest row as stale — and `closed_ts`
+/// would be gone. A reserved folder is therefore not read at all, its row
+/// (looked up by its root-relative path) counts as found so the reconcile
+/// keeps it, and its id is claimed before the walk so a copy of it elsewhere
+/// under the root cannot take the id from the live session.
 ///
 /// **A session id is written at most once per run.** Two folders under one root
 /// can carry the same `meta.session_id` — a session folder copied BESIDE its
-/// original, or one synced tree mounted twice — and the primary key cannot hold
-/// both. The first folder the (sorted, therefore reproducible) walk reaches
-/// keeps the row; the second is logged at `warn` naming both relative paths, and
-/// is neither written nor counted. Letting it through would be destructive
-/// rather than merely wrong: its write would move the row onto the copy's path
-/// and reconcile the ledger against the copy's manifest, so rebuilding an
-/// untouched tree would DELETE rows, and the returned count would name more
-/// sessions than the table holds. A duplicate is a fact about the tree, not a
-/// reason to lose a row.
+/// original rather than moved — and `INSERT OR REPLACE` would otherwise let the
+/// second silently overwrite the first's row and ledger. The walk's first
+/// folder keeps it; the second is skipped with a warn naming both (root-relative
+/// paths only, never absolute ones), and is not counted, so `written` never
+/// claims more rows than the run produced. Ordering by name means the same
+/// folder wins on every machine, but the rule is "one row per id, always the
+/// first", not a judgement about which copy is real — that is the person's to
+/// make, and the log line is what tells them to. Idempotent for the same reason
+/// every other path is: rerun, the same folders win again, and the walk never
+/// appends. `written` is the count of ids written, so a duplicate tree writes
+/// fewer sessions than the table holds. A duplicate is a fact about the tree,
+/// not a reason to lose a row.
+///
+/// **A session found under a different `(root_kind, profile_id)` than its row
+/// names has moved between roots**, by hand or by a `mv`, and its row follows
+/// it: the path, the root kind and the profile are all rewritten, and so is
+/// its durability — written EXACTLY as `probe` answers for the folder (`local`
+/// without an answer), never floored against the stored word. The floor
+/// exists so a row cannot walk backwards while the session sits in one
+/// repository; a session carried out of that repository and into another (or
+/// into none) has not walked backwards, it has left, and what the old
+/// repository committed says nothing about where the bytes are now. The one
+/// exception: when the root the row names is among `followed_roots` and the
+/// folder the row points at is STILL THERE, the session has been copied, not
+/// moved, and the row stays with the first copy — "one session id under two
+/// roots; keeping the first" — so a copied folder does not change roots on
+/// every rebuild.
+///
+/// **A rename inside one root is not a move between roots.** The same
+/// `(root_kind, profile_id)` with a different path is a folder relocated
+/// within its own repository — a retitle, or a subfolder shuffle. The stored
+/// word described the old path, so the repository's answer for the new one
+/// replaces it when there is one; when the probe has no answer (or there is
+/// no probe), the floor keeps the stronger stored word, because silence is
+/// not a downgrade. Found where its row already says it is, a session keeps
+/// the floor whatever the probe says, so an in-place rebuild — the only kind
+/// Story 42.1 knew — still cannot lower anything.
+///
+/// **Durability under a profile root comes from `probe`**, the repository's own
+/// answer, and under the plain folder (no probe) is `local`.
+///
+/// **After a walk that saw the whole root, the root's rows are reconciled.**
+/// Every row under this root's `(root_kind, profile_id)` whose session no
+/// folder under the root claims any more is removed with its segment rows and
+/// its search entry ([`super::recordings_fts::unindex_recording`]) — the row was
+/// a cache of a manifest that is gone, or of one that now lives under another
+/// root, whose own rebuild has re-homed it. The scope is exactly one root's
+/// rows: a pass over `tgdrive` never touches a row that says `neuradrive`, and
+/// a pass over the plain folder never touches a profile's. Reconciliation runs
+/// ONLY when the walk was complete — a root whose directory is absent (a drive
+/// that is out), a directory or a manifest the walk could not read, a session
+/// folder the walk could not name relative to the root, or a walk cut short by
+/// the visit budget all leave the rows exactly as they were — AND when the
+/// walk either wrote at least one session or the root held no rows before.
+/// A root that is present, holds rows, and shows the walk nothing is far
+/// more often a stale mountpoint or a subfolder that has not synced yet than
+/// a folder someone emptied, and forgetting every row on that evidence would
+/// be forgetting them because keeper looked in the wrong place. A row must
+/// never be forgotten because the walk did not get to look.
 ///
 /// **Each session commits once.** Its row and the whole reconcile of its ledger
 /// go in one transaction, so no reader on another connection can catch a session
 /// between the delete of a stale segment and the insert of its replacement, and
-/// a fifty-session tree costs fifty commits instead of several hundred.
+/// a fifty-session tree costs fifty commits instead of several hundred. The
+/// removals commit once as a group, for the same reason.
 ///
-/// Filesystem trouble is skipped and logged; a SQLite failure propagates,
-/// because a rebuild that cannot write is not a rebuild and its caller is an
-/// explicit maintenance action, never the recorder. The failing session's
-/// transaction rolls back, so it is absent rather than half-written.
+/// Filesystem trouble is skipped and logged (and disarms the reconcile); a
+/// SQLite failure propagates, because a rebuild that cannot write is not a
+/// rebuild and its caller is an explicit maintenance action, never the
+/// recorder. The failing session's transaction rolls back, so it is absent
+/// rather than half-written.
 pub fn rebuild_from_disk(
     conn: &Connection,
-    root: &Path,
-    root_kind: &str,
-    profile_id: Option<&str>,
-) -> Result<usize, ArchiveError> {
-    rebuild_from_disk_within(conn, root, root_kind, profile_id, RECOVERY_MAX_VISITS)
+    request: &RebuildRequest,
+) -> Result<RebuildOutcome, ArchiveError> {
+    rebuild_from_disk_within(conn, request, RECOVERY_MAX_VISITS)
 }
 
 /// [`rebuild_from_disk`] with its visit budget as an argument, so the budget's
-/// own behaviour can be proven against a tree of a dozen directories rather than
-/// one of [`RECOVERY_MAX_VISITS`] — the seam
-/// [`crate::recording::recover_orphaned_sessions`] keeps for exactly the same
-/// reason, and for the same reason a truncated walk must be reachable from a
-/// test at all. Every shipping caller goes through [`rebuild_from_disk`], which
-/// always passes the real budget.
+/// own behaviour can be proven against a tree of four sessions rather than one
+/// of [`RECOVERY_MAX_VISITS`]. Every shipping caller goes through the public
+/// entry point, which always passes the real budget.
 pub fn rebuild_from_disk_within(
     conn: &Connection,
-    root: &Path,
-    root_kind: &str,
-    profile_id: Option<&str>,
+    request: &RebuildRequest,
     max_visits: usize,
-) -> Result<usize, ArchiveError> {
+) -> Result<RebuildOutcome, ArchiveError> {
+    let root = request.root.as_path();
+    let root_kind = request.root_kind.as_str();
+    let profile_id = request.profile_id.as_deref();
+    // How many rows this root had before anything was looked at: the reconcile
+    // below refuses to run when a present root shows the walk nothing and
+    // there was something to forget.
+    let held_before = count_root_rows(conn, root_kind, profile_id)?;
     let mut written = 0usize;
     let mut visits = 0usize;
+    // Whether the walk saw every session folder under the root. Cleared by
+    // anything that could have hidden one — an absent or unreadable directory,
+    // a manifest that would not load, a folder with no root-relative name, the
+    // visit budget — because the reconcile below may only forget a session the
+    // walk PROVED is gone.
+    let mut complete = true;
+    // Whether the root directory itself is not there — a drive that is out,
+    // which is nothing to warn about.
+    let mut absent = false;
     // Every session id this run has already written, mapped to the folder that
     // claimed it: what makes the first of two duplicate folders win, and what
-    // lets the warn name both.
+    // lets the warn name both. Its keys are the `found` set the reconcile
+    // keeps; the order they were found in is kept beside it for the outcome.
     let mut written_ids: HashMap<String, String> = HashMap::new();
+    let mut found: Vec<String> = Vec::new();
+    // The reserved folders' rows are found before the walk starts, so the walk
+    // can neither prune them nor let a copy claim their ids.
+    let reserved: Vec<String> = request
+        .skip
+        .iter()
+        .filter_map(|folder| relative_session_path(root, folder))
+        .collect();
+    for (session_id, relative) in rows_at_paths(conn, root_kind, profile_id, &reserved)? {
+        tracing::debug!(
+            session_id = %session_id,
+            "archive rebuild: a recording in progress holds this session; leaving its rows alone"
+        );
+        written_ids.insert(session_id.clone(), relative);
+        found.push(session_id);
+    }
     let mut pending = vec![(root.to_path_buf(), 0usize)];
     'walk: while let Some((dir, depth)) = pending.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                complete = false;
+                if depth == 0 {
+                    absent = true;
+                }
+                continue;
+            }
             Err(error) => {
                 tracing::warn!(%error, "archive rebuild: unreadable directory (non-fatal)");
+                complete = false;
                 continue;
             }
         };
@@ -982,6 +1221,7 @@ pub fn rebuild_from_disk_within(
                 Ok(entry) => Some(entry),
                 Err(error) => {
                     tracing::warn!(%error, "archive rebuild: skipping unreadable directory entry");
+                    complete = false;
                     None
                 }
             })
@@ -996,6 +1236,7 @@ pub fn rebuild_from_disk_within(
                 Ok(file_type) => file_type,
                 Err(error) => {
                     tracing::warn!(%error, "archive rebuild: skipping entry with unreadable type");
+                    complete = false;
                     continue;
                 }
             };
@@ -1011,30 +1252,42 @@ pub fn rebuild_from_disk_within(
                     written,
                     "archive rebuild: stopping at the visit budget; keeping the sessions found so far"
                 );
+                complete = false;
                 break 'walk;
             }
             visits += 1;
             let folder = entry.path();
+            if request.skip.contains(&folder) {
+                // Not read, not rewritten, not descended into: whatever is in
+                // there is being written right now.
+                continue;
+            }
             if folder.join("manifest.json").is_file() {
                 match SessionManifest::load(&folder) {
                     Ok(manifest) => {
-                        if write_rebuilt_session(
+                        match write_rebuilt_session(
                             conn,
-                            root,
+                            request,
                             &folder,
                             &manifest,
-                            root_kind,
-                            profile_id,
                             &mut written_ids,
                         )? {
-                            written += 1;
+                            SessionWrite::Written(session_id) => {
+                                written += 1;
+                                found.push(session_id);
+                            }
+                            SessionWrite::Kept => {}
+                            SessionWrite::Unplaceable => complete = false,
                         }
                         continue;
                     }
-                    Err(error) => tracing::warn!(
-                        %error,
-                        "archive rebuild: unreadable manifest; walking the directory instead"
-                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            "archive rebuild: unreadable manifest; walking the directory instead"
+                        );
+                        complete = false;
+                    }
                 }
             }
             if depth + 1 < RECOVERY_MAX_DEPTH {
@@ -1045,17 +1298,71 @@ pub fn rebuild_from_disk_within(
             pending.push((folder, depth + 1));
         }
     }
-    Ok(written)
+    let removed = if absent {
+        tracing::debug!(
+            root_kind,
+            profile_id = profile_id.unwrap_or("-"),
+            "archive rebuild: the root is not there, so its rows stay as they are"
+        );
+        0
+    } else if !complete {
+        tracing::info!(
+            root_kind,
+            profile_id = profile_id.unwrap_or("-"),
+            written,
+            "archive rebuild: the walk did not see the whole root, so no row is forgotten"
+        );
+        0
+    } else if written == 0 && held_before > 0 {
+        tracing::warn!(
+            root_kind,
+            profile_id = profile_id.unwrap_or("-"),
+            held = held_before,
+            "archive rebuild: the root is there but holds no session; refusing to forget its rows (a stale mountpoint, or a subfolder not yet synced?)"
+        );
+        0
+    } else {
+        remove_unfound_sessions(conn, root_kind, profile_id, &written_ids)?
+    };
+    Ok(RebuildOutcome {
+        written,
+        removed,
+        found,
+    })
 }
 
-/// Write one rebuilt session and reconcile its whole segment ledger, returning
-/// whether a row was written — and therefore whether the run counts it.
+/// What [`write_rebuilt_session`] did with one session folder.
+enum SessionWrite {
+    /// A row was written for this session id — the run counts it and the
+    /// reconcile keeps it.
+    Written(String),
+    /// Nothing was written and nothing is wrong: another folder in this run,
+    /// or a folder still standing under another root, already holds the id.
+    Kept,
+    /// The folder could not be named relative to the root, so nothing could
+    /// be written for it and the walk did not see the whole root.
+    Unplaceable,
+}
+
+/// Write one rebuilt session and reconcile its whole segment ledger.
 ///
-/// `Ok(false)`, never an error, in exactly two cases: the folder cannot be
-/// expressed relative to `root`, which would force an absolute path into the row
-/// (the one thing no column may hold), or another folder in this same run
-/// already claimed the session id, in which case the first one keeps it (see
-/// [`rebuild_from_disk`] on duplicates).
+/// [`SessionWrite::Kept`], never an error, when another folder in this same
+/// run already claimed the session id (the first one keeps it — see
+/// [`rebuild_from_disk`] on duplicates), or when the row on file names a root
+/// among the request's `followed_roots` where the session's folder still
+/// stands (a copy, not a move — the first root keeps it).
+/// [`SessionWrite::Unplaceable`] when the folder cannot be expressed relative
+/// to the root, which would force an absolute path into the row (the one
+/// thing no column may hold) — the walk is then incomplete, so the row that
+/// was not rewritten is not forgotten either.
+///
+/// The row's durability is `probe`'s answer for the folder — `local` without a
+/// probe or without an answer — and whether the floor applies to it is decided
+/// HERE, from the row already on file, read once: the same
+/// `(root_kind, profile_id)` keeps the floor (unless the folder was relocated
+/// within the root and the probe DID answer, in which case the answer stands),
+/// any other root is a move and takes the answer exactly (see
+/// [`rebuild_from_disk`]).
 ///
 /// The row, its search index entry and the ledger reconcile share one
 /// transaction, so a concurrent reader sees the session either wholly rebuilt or
@@ -1063,18 +1370,23 @@ pub fn rebuild_from_disk_within(
 /// row describing one thing and an index entry describing another (Story 42.2).
 fn write_rebuilt_session(
     conn: &Connection,
-    root: &Path,
+    request: &RebuildRequest,
     folder: &Path,
     manifest: &SessionManifest,
-    root_kind: &str,
-    profile_id: Option<&str>,
     written_ids: &mut HashMap<String, String>,
-) -> Result<bool, ArchiveError> {
-    let Some(relative) = relative_session_path(root, folder) else {
-        tracing::warn!("archive rebuild: skipping a session that is not under the root");
-        return Ok(false);
+) -> Result<SessionWrite, ArchiveError> {
+    let Some(relative) = relative_session_path(&request.root, folder) else {
+        tracing::warn!(
+            "archive rebuild: a session folder has no root-relative name (outside the root, or not UTF-8); the walk is incomplete"
+        );
+        return Ok(SessionWrite::Unplaceable);
     };
-    let row = RecordingRow::from_manifest(manifest, relative.clone(), root_kind, profile_id);
+    let mut row = RecordingRow::from_manifest(
+        manifest,
+        relative.clone(),
+        &request.root_kind,
+        request.profile_id.as_deref(),
+    );
     if let Some(kept) = written_ids.get(&row.session_id) {
         // Both paths are root-relative, so this names positions inside the tree
         // the caller already chose and no location on the user's disk.
@@ -1084,13 +1396,66 @@ fn write_rebuilt_session(
             skipped = %relative,
             "archive rebuild: two folders carry one session id; keeping the first"
         );
-        return Ok(false);
+        return Ok(SessionWrite::Kept);
     }
-    in_transaction(conn, "rebuilt recording session", || {
-        // Reindexes the session too, inside THIS transaction: `upsert_recording`
+    // The repository's word for this folder, when there is one. `None` — no
+    // probe, or a probe that could not answer — leaves the row at `local`, the
+    // word `from_manifest` starts every row at.
+    let answer = request.probe.as_ref().and_then(|probe| probe.ask(folder));
+    if let Some(state) = answer {
+        row.durability = durability_label(state).to_owned();
+    }
+    let outcome = in_transaction(conn, "rebuilt recording session", || {
+        let durability = match stored_row(conn, &row.session_id)? {
+            None => row.durability.clone(),
+            Some(stored)
+                if stored.root_kind != row.root_kind || stored.profile_id != row.profile_id =>
+            {
+                let standing = request
+                    .followed_roots
+                    .iter()
+                    .find(|known| known.is(&stored.root_kind, stored.profile_id.as_deref()))
+                    .is_some_and(|known| {
+                        known
+                            .folder(&stored.relative_path)
+                            .join("manifest.json")
+                            .is_file()
+                    });
+                if standing {
+                    tracing::warn!(
+                        session_id = %row.session_id,
+                        kept_root_kind = %stored.root_kind,
+                        kept_profile_id = stored.profile_id.as_deref().unwrap_or("-"),
+                        kept = %stored.relative_path,
+                        skipped_root_kind = %row.root_kind,
+                        skipped_profile_id = row.profile_id.as_deref().unwrap_or("-"),
+                        skipped = %relative,
+                        "archive rebuild: one session id under two roots; keeping the first"
+                    );
+                    return Ok(SessionWrite::Kept);
+                }
+                tracing::info!(
+                    session_id = %row.session_id,
+                    from_root_kind = %stored.root_kind,
+                    from_profile_id = stored.profile_id.as_deref().unwrap_or("-"),
+                    to_root_kind = %row.root_kind,
+                    to_profile_id = row.profile_id.as_deref().unwrap_or("-"),
+                    durability = %row.durability,
+                    "archive rebuild: a session moved between roots; re-homing its row"
+                );
+                row.durability.clone()
+            }
+            Some(stored) if stored.relative_path != relative && answer.is_some() => {
+                // Relocated within its own root, and the repository has spoken
+                // for the new path: its word replaces the old path's.
+                row.durability.clone()
+            }
+            Some(stored) => floored_durability(Some(&stored.durability), &row.durability),
+        };
+        // Reindexes the session too, inside THIS transaction: `write_recording_as`
         // owns that pairing and is reentrant, so a rebuilt session — row, index
         // entry and ledger — still commits exactly once (see `in_transaction`).
-        upsert_recording(conn, &row)?;
+        write_recording_as(conn, &row, &durability)?;
         // Drop only what the ledger has stopped listing — see the note on
         // [`rebuild_from_disk`] about why this is not a wholesale clear.
         for (index, track) in stale_segment_keys(conn, &row.session_id, manifest)? {
@@ -1109,10 +1474,185 @@ fn write_rebuilt_session(
                 &RecordingSegmentRow::from_entry(&row.session_id, &relative, entry),
             )?;
         }
+        Ok(SessionWrite::Written(row.session_id.clone()))
+    })?;
+    if matches!(outcome, SessionWrite::Written(_)) {
+        written_ids.insert(row.session_id, relative);
+    }
+    Ok(outcome)
+}
+
+/// What a session's row on file says about where it lives and how safe it is.
+struct StoredRow {
+    root_kind: String,
+    profile_id: Option<String>,
+    relative_path: String,
+    durability: String,
+}
+
+/// The session's row on file — its place and its durability word, in one
+/// read — or `None` when it has no row.
+fn stored_row(conn: &Connection, session_id: &str) -> Result<Option<StoredRow>, ArchiveError> {
+    conn.query_row(
+        "SELECT root_kind, profile_id, relative_path, durability FROM recordings \
+         WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |r| {
+            Ok(StoredRow {
+                root_kind: r.get(0)?,
+                profile_id: r.get(1)?,
+                relative_path: r.get(2)?,
+                durability: r.get(3)?,
+            })
+        },
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(ArchiveError::Sqlite(format!(
+            "could not read a stored recording row: {other}"
+        ))),
+    })
+}
+
+/// How many rows a root's `(root_kind, profile_id)` holds.
+///
+/// `profile_id IS ?2` rather than `=`: the plain folder's rows hold `NULL`, and
+/// `NULL = NULL` is not true in SQL.
+fn count_root_rows(
+    conn: &Connection,
+    root_kind: &str,
+    profile_id: Option<&str>,
+) -> Result<usize, ArchiveError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM recordings WHERE root_kind = ?1 AND profile_id IS ?2",
+        rusqlite::params![root_kind, profile_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| usize::try_from(n).unwrap_or(0))
+    .map_err(|e| ArchiveError::Sqlite(format!("could not count a root's sessions: {e}")))
+}
+
+/// The `(session_id, relative_path)` of every row under `(root_kind,
+/// profile_id)` whose path is one of `paths` — the rows of the reserved
+/// folders, which the walk does not read.
+fn rows_at_paths(
+    conn: &Connection,
+    root_kind: &str,
+    profile_id: Option<&str>,
+    paths: &[String],
+) -> Result<Vec<(String, String)>, ArchiveError> {
+    let mut out = Vec::new();
+    for path in paths {
+        let row = conn
+            .query_row(
+                "SELECT session_id, relative_path FROM recordings \
+                 WHERE root_kind = ?1 AND profile_id IS ?2 AND relative_path = ?3",
+                rusqlite::params![root_kind, profile_id, path],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(ArchiveError::Sqlite(format!(
+                    "could not read a reserved session's row: {other}"
+                ))),
+            })?;
+        out.extend(row);
+    }
+    Ok(out)
+}
+
+/// Forget every row under `(root_kind, profile_id)` — with its segment rows
+/// and its search entry — because keeper no longer knows that root at all: a
+/// synced folder that was removed. The reconcile half of [`rebuild_from_disk`]
+/// against an empty found set, and the only way a root's rows go without a
+/// walk; a paused folder's rows are not touched, because a pause is not a
+/// removal. Returns how many sessions went.
+pub fn forget_root(
+    conn: &Connection,
+    root_kind: &str,
+    profile_id: Option<&str>,
+) -> Result<usize, ArchiveError> {
+    remove_unfound_sessions(conn, root_kind, profile_id, &HashMap::new())
+}
+
+/// Remove every row under `(root_kind, profile_id)` whose session id is not in
+/// `found`, with its segment rows and its search entry, in one transaction;
+/// returns how many sessions went. The reconcile half of
+/// [`rebuild_from_disk`], and only ever called after a complete walk (or, from
+/// [`forget_root`], for a root keeper no longer follows).
+///
+/// `profile_id IS ?2` rather than `=`: the plain folder's rows hold `NULL`, and
+/// `NULL = NULL` is not true in SQL. The ids are read out in full before the
+/// first delete, the shape [`move_session`] uses for the same reason.
+///
+/// Logged with ids only, never content: a removed row may have carried a title
+/// or a note, and those were the manifest's — the manifest that is no longer
+/// anywhere this root can see.
+fn remove_unfound_sessions(
+    conn: &Connection,
+    root_kind: &str,
+    profile_id: Option<&str>,
+    found: &HashMap<String, String>,
+) -> Result<usize, ArchiveError> {
+    let stored: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id FROM recordings \
+                 WHERE root_kind = ?1 AND profile_id IS ?2",
+            )
+            .map_err(|e| ArchiveError::Sqlite(format!("could not read a root's sessions: {e}")))?;
+        let rows = stmt
+            .query_map(rusqlite::params![root_kind, profile_id], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|e| ArchiveError::Sqlite(format!("could not read a root's sessions: {e}")))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| {
+                ArchiveError::Sqlite(format!("could not read a root's session id: {e}"))
+            })?);
+        }
+        out
+    };
+    let orphaned: Vec<String> = stored
+        .into_iter()
+        .filter(|session_id| !found.contains_key(session_id))
+        .collect();
+    if orphaned.is_empty() {
+        return Ok(0);
+    }
+    in_transaction(conn, "recording reconcile", || {
+        for session_id in &orphaned {
+            delete_session(conn, session_id)?;
+            tracing::info!(
+                session_id = %session_id,
+                root_kind,
+                profile_id = profile_id.unwrap_or("-"),
+                "archive rebuild: no folder under the root carries this session any more; forgetting its row"
+            );
+        }
         Ok(())
     })?;
-    written_ids.insert(row.session_id, relative);
-    Ok(true)
+    Ok(orphaned.len())
+}
+
+/// Delete one session's row, its segment rows and its search entry. Runs
+/// inside the caller's transaction; the three deletes are one unit of work.
+fn delete_session(conn: &Connection, session_id: &str) -> Result<(), ArchiveError> {
+    conn.execute(
+        "DELETE FROM recording_segments WHERE session_id = ?1",
+        rusqlite::params![session_id],
+    )
+    .map_err(|e| ArchiveError::Sqlite(format!("could not delete recording segment rows: {e}")))?;
+    super::recordings_fts::unindex_recording(conn, session_id)?;
+    conn.execute(
+        "DELETE FROM recordings WHERE session_id = ?1",
+        rusqlite::params![session_id],
+    )
+    .map_err(|e| ArchiveError::Sqlite(format!("could not delete a recording row: {e}")))?;
+    Ok(())
 }
 
 /// The `(index, track)` keys stored for a session that its manifest's ledger no
@@ -1415,6 +1955,74 @@ mod tests {
             |r| r.get(0),
         )
         .expect("read durability")
+    }
+
+    /// [`rebuild_from_disk`] without a probe — the plain-folder shape, and the
+    /// shape every Story 42.1 test was written against — reduced to the count
+    /// of sessions written.
+    fn rebuild(conn: &Connection, root: &Path, root_kind: &str, profile_id: Option<&str>) -> usize {
+        rebuild_from_disk(conn, &request(root, root_kind, profile_id))
+            .expect("rebuild")
+            .written
+    }
+
+    /// A request over one root with nothing else: no probe, nothing reserved,
+    /// no other root known.
+    fn request(root: &Path, root_kind: &str, profile_id: Option<&str>) -> RebuildRequest {
+        RebuildRequest::new(root, root_kind, profile_id)
+    }
+
+    /// One root as another root's rebuild knows it.
+    fn known(root: &Path, root_kind: &str, profile_id: Option<&str>) -> KnownRoot {
+        KnownRoot {
+            root: root.to_path_buf(),
+            root_kind: root_kind.to_owned(),
+            profile_id: profile_id.map(str::to_owned),
+        }
+    }
+
+    /// Copy a session folder — files and subfolders — the way a person's `cp
+    /// -R` would, so two folders carry one manifest.
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create the copy's folder");
+        for entry in std::fs::read_dir(from).expect("read the folder to copy") {
+            let entry = entry.expect("read an entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("entry type").is_dir() {
+                copy_dir(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copy a file");
+            }
+        }
+    }
+
+    /// A probe answering one fixed state for every folder it is asked about.
+    fn probe(state: RecordingDurabilityState) -> DurabilityProbe {
+        DurabilityProbe(Box::new(move |_folder: &Path| Some(state)))
+    }
+
+    /// Every `(root_kind, profile_id, relative_path, durability)` a session's
+    /// row holds, or `None` when it has none.
+    fn place_of(
+        conn: &Connection,
+        session_id: &str,
+    ) -> Option<(String, Option<String>, String, String)> {
+        conn.query_row(
+            "SELECT root_kind, profile_id, relative_path, durability FROM recordings \
+             WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .ok()
+    }
+
+    /// How many search entries the index holds — `recordings_fts_docs` and
+    /// `recordings_fts` must always agree.
+    fn fts_entries(conn: &Connection) -> (i64, i64) {
+        (
+            count(conn, "recordings_fts_docs"),
+            count(conn, "recordings_fts"),
+        )
     }
 
     #[test]
@@ -1949,7 +2557,7 @@ mod tests {
         manifest.write().expect("rewrite without an end stamp");
 
         let conn = memory_db();
-        let written = rebuild_from_disk(&conn, &root, "folder", None).expect("rebuild");
+        let written = rebuild(&conn, &root, "folder", None);
         assert_eq!(written, 1, "an older manifest is still a session");
 
         let (session_id, device_id, started, title, participants): (
@@ -1987,13 +2595,13 @@ mod tests {
             &[(0, "screen", 100)],
         );
         let conn = memory_db();
-        rebuild_from_disk(&conn, &root, "folder", None).expect("rebuild");
+        rebuild(&conn, &root, "folder", None);
 
         // Story 40.4 moves the folder; the manifest (and its session id) rides
         // along byte-identical.
         let after = root.join("2026").join("1432 Standup");
         std::fs::rename(&before, &after).expect("move the session folder");
-        rebuild_from_disk(&conn, &root, "folder", None).expect("rebuild after the move");
+        rebuild(&conn, &root, "folder", None);
 
         assert_eq!(count(&conn, "recordings"), 1, "the same session, one row");
         let (session_id, path): (String, String) = conn
@@ -2015,30 +2623,776 @@ mod tests {
     }
 
     #[test]
-    fn a_rebuild_never_forgets_a_session_whose_folder_is_gone() {
+    fn a_rebuild_forgets_a_session_whose_folder_is_gone_with_its_segments_and_search_entry() {
         let dir = temp_dir();
         let root = dir.join("recordings");
         let folder = seed_session(
             &root,
             "2026/deleted",
             Some("01DEVICE-01SESSION"),
+            Some("Pricing review"),
+            Some("2026-08-08T12:00:00+02:00"),
+            &[(0, "screen", 100), (1, "screen", 200)],
+        );
+        seed_session(
+            &root,
+            "2026/kept",
+            Some("01DEVICE-02KEPT"),
+            Some("Standup"),
+            Some("2026-08-08T13:00:00+02:00"),
+            &[(0, "screen", 100)],
+        );
+        let conn = memory_db();
+        let first = rebuild_from_disk(&conn, &request(&root, "folder", None)).expect("rebuild");
+        assert_eq!((first.written, first.removed), (2, 0));
+        assert_eq!(count(&conn, "recordings"), 2);
+        assert_eq!(count(&conn, "recording_segments"), 3);
+        assert_eq!(fts_entries(&conn), (2, 2));
+
+        std::fs::remove_dir_all(&folder).expect("delete the session folder");
+        let again =
+            rebuild_from_disk(&conn, &request(&root, "folder", None)).expect("rebuild again");
+        assert_eq!(again.written, 1, "the surviving session is rewritten");
+        assert_eq!(again.removed, 1, "and the deleted one is counted out");
+        assert_eq!(again.found, vec!["01DEVICE-02KEPT".to_owned()]);
+        assert_eq!(
+            session_ids(&conn),
+            vec!["01DEVICE-02KEPT".to_owned()],
+            "a folder found nowhere is a row found nowhere"
+        );
+        assert_eq!(
+            segment_paths(&conn),
+            vec!["2026/kept/screen-0000.mov".to_owned()],
+            "its segments go with it"
+        );
+        assert_eq!(fts_entries(&conn), (1, 1), "and so does its search entry");
+        let hits = crate::archive::recordings_fts::search_recordings(
+            &conn,
+            &crate::archive::recordings_fts::RecordingFilter {
+                query: "pricing".to_owned(),
+                ..Default::default()
+            },
+        )
+        .expect("search");
+        assert!(
+            hits.is_empty(),
+            "a forgotten session is not a hit: {hits:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reconcile's one scope rule: a pass over one root never touches
+    /// another root's rows, whichever kind of root either is.
+    #[test]
+    fn a_rebuild_forgets_only_the_rows_of_its_own_root() {
+        let dir = temp_dir();
+        let root = dir.join("recordings");
+        seed_session(
+            &root,
+            "2026/here",
+            Some("01DEVICE-01HERE"),
             None,
             Some("2026-08-08T12:00:00+02:00"),
             &[],
         );
         let conn = memory_db();
-        rebuild_from_disk(&conn, &root, "folder", None).expect("rebuild");
-        assert_eq!(count(&conn, "recordings"), 1);
+        // Rows that belong to other roots: the plain folder's, another
+        // profile's, and one with no profile under the profile kind.
+        for (id, root_kind, profile_id) in [
+            ("01DEVICE-02FOLDER", "folder", None),
+            ("01DEVICE-03OTHER", "profile", Some("02OTHER")),
+            ("01DEVICE-04BARE", "profile", None),
+        ] {
+            let mut row = start_row(id);
+            row.root_kind = root_kind.to_owned();
+            row.profile_id = profile_id.map(str::to_owned);
+            upsert_recording(&conn, &row).expect("seed a foreign row");
+        }
+        let mut stale = start_row("01DEVICE-05STALE");
+        stale.root_kind = "profile".to_owned();
+        stale.profile_id = Some("01PROFILE".to_owned());
+        upsert_recording(&conn, &stale).expect("seed this root's orphan");
 
-        std::fs::remove_dir_all(&folder).expect("delete the session folder");
-        let written = rebuild_from_disk(&conn, &root, "folder", None).expect("rebuild again");
-        assert_eq!(written, 0, "nothing on disk to write");
+        let outcome = rebuild_from_disk(&conn, &request(&root, "profile", Some("01PROFILE")))
+            .expect("rebuild");
+        assert_eq!((outcome.written, outcome.removed), (1, 1));
+        assert_eq!(
+            session_ids(&conn),
+            vec![
+                "01DEVICE-01HERE".to_owned(),
+                "01DEVICE-02FOLDER".to_owned(),
+                "01DEVICE-03OTHER".to_owned(),
+                "01DEVICE-04BARE".to_owned(),
+            ],
+            "only the row under (profile, 01PROFILE) that the walk did not find is gone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The "drive out" row: a root whose directory is not there reconciles
+    /// nothing — its rows are exactly as they were.
+    #[test]
+    fn a_rebuild_of_an_absent_root_leaves_every_row_untouched() {
+        let dir = temp_dir();
+        let root = dir.join("recordings");
+        seed_session(
+            &root,
+            "2026/session",
+            Some("01DEVICE-01SESSION"),
+            None,
+            Some("2026-08-08T12:00:00+02:00"),
+            &[(0, "screen", 100)],
+        );
+        let conn = memory_db();
+        assert_eq!(rebuild(&conn, &root, "profile", Some("01STICK")), 1);
+        let before = dump(&conn);
+
+        std::fs::remove_dir_all(&root).expect("unplug the drive");
+        let outcome =
+            rebuild_from_disk(&conn, &request(&root, "profile", Some("01STICK"))).expect("rebuild");
+        assert_eq!(
+            outcome,
+            RebuildOutcome::default(),
+            "nothing seen, nothing done"
+        );
+        assert_eq!(
+            before,
+            dump(&conn),
+            "an unreadable root is not an empty one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root that is there, holds rows, and shows the walk no session at all
+    /// — a stale mountpoint, a subfolder that has not synced yet — is not
+    /// believed: nothing is forgotten on that evidence. A root that never held
+    /// a row reconciles nothing either way, and a root that shows the walk at
+    /// least one session is believed about the rest.
+    #[test]
+    fn a_rebuild_of_an_empty_but_present_root_refuses_to_forget_its_rows() {
+        let dir = temp_dir();
+        let root = dir.join("recordings");
+        let folder = seed_session(
+            &root,
+            "2026/session",
+            Some("01DEVICE-01SESSION"),
+            None,
+            Some("2026-08-08T12:00:00+02:00"),
+            &[(0, "screen", 100)],
+        );
+        let conn = memory_db();
+        assert_eq!(rebuild(&conn, &root, "profile", Some("01PROFILE")), 1);
+        let before = dump(&conn);
+
+        // The session folder goes; the root and its year folder stay, empty.
+        std::fs::remove_dir_all(&folder).expect("empty the root");
+        let outcome = rebuild_from_disk(&conn, &request(&root, "profile", Some("01PROFILE")))
+            .expect("rebuild an empty root");
+        assert_eq!((outcome.written, outcome.removed), (0, 0));
+        assert_eq!(
+            before,
+            dump(&conn),
+            "an empty root with rows is a root keeper may be looking at wrongly"
+        );
+
+        // A root that never held a row: the same walk, and nothing to refuse.
+        let fresh = memory_db();
+        let outcome = rebuild_from_disk(&fresh, &request(&root, "profile", Some("01PROFILE")))
+            .expect("rebuild an empty root into an empty index");
+        assert_eq!(outcome, RebuildOutcome::default());
+
+        // One session back on disk beside the missing one: the walk saw a
+        // session, so it is believed, and the missing one is forgotten.
+        seed_session(
+            &root,
+            "2026/another",
+            Some("01DEVICE-02ANOTHER"),
+            None,
+            Some("2026-08-08T13:00:00+02:00"),
+            &[],
+        );
+        let outcome = rebuild_from_disk(&conn, &request(&root, "profile", Some("01PROFILE")))
+            .expect("rebuild a root with one session");
+        assert_eq!((outcome.written, outcome.removed), (1, 1));
+        assert_eq!(session_ids(&conn), vec!["01DEVICE-02ANOTHER".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session folder the rebuild cannot name relative to its root is a
+    /// session it could not vouch for: nothing is written for it, and the
+    /// walk that met it is incomplete.
+    #[test]
+    fn a_session_folder_with_no_root_relative_name_makes_the_walk_incomplete() {
+        let dir = temp_dir();
+        let root = dir.join("recordings");
+        let elsewhere = seed_session(
+            &dir.join("elsewhere"),
+            "session",
+            Some("01DEVICE-01AWAY"),
+            None,
+            Some("2026-08-08T12:00:00+02:00"),
+            &[],
+        );
+        let manifest = SessionManifest::load(&elsewhere).expect("load");
+        let conn = memory_db();
+        let mut written_ids = HashMap::new();
+        let outcome = write_rebuilt_session(
+            &conn,
+            &request(&root, "folder", None),
+            &elsewhere,
+            &manifest,
+            &mut written_ids,
+        )
+        .expect("a folder outside the root is not an error");
+        assert!(matches!(outcome, SessionWrite::Unplaceable));
+        assert_eq!(count(&conn, "recordings"), 0, "nothing was written for it");
+        assert!(written_ids.is_empty(), "and it claimed no id");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The walk-level half of the test above, on the one filesystem family
+    /// that will create a folder whose name is not UTF-8: the row of a session
+    /// the walk could not name is not forgotten, because the walk was
+    /// incomplete.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_walk_that_meets_a_non_utf8_folder_name_forgets_nothing() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = temp_dir();
+        let root = dir.join("recordings");
+        let folder = seed_session(
+            &root,
+            "2026/session",
+            Some("01DEVICE-01SESSION"),
+            None,
+            Some("2026-08-08T12:00:00+02:00"),
+            &[],
+        );
+        let conn = memory_db();
+        assert_eq!(rebuild(&conn, &root, "folder", None), 1);
+        let renamed = root
+            .join("2026")
+            .join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+        std::fs::rename(&folder, &renamed).expect("a name that is not UTF-8");
+        let outcome = rebuild_from_disk(&conn, &request(&root, "folder", None)).expect("rebuild");
+        assert_eq!((outcome.written, outcome.removed), (0, 0));
         assert_eq!(
             count(&conn, "recordings"),
             1,
-            "absence on disk is a fact for a later story, never a deletion"
+            "the row it could not name stays"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest the walk cannot read is a session it cannot vouch for, so the
+    /// pass writes what it can and forgets nothing.
+    #[test]
+    fn a_rebuild_that_meets_an_unreadable_manifest_forgets_nothing() {
+        let dir = temp_dir();
+        let root = dir.join("recordings");
+        let broken = seed_session(
+            &root,
+            "2026/broken",
+            Some("01DEVICE-01BROKEN"),
+            None,
+            Some("2026-08-08T12:00:00+02:00"),
+            &[],
+        );
+        seed_session(
+            &root,
+            "2026/fine",
+            Some("01DEVICE-02FINE"),
+            None,
+            Some("2026-08-08T12:00:00+02:00"),
+            &[],
+        );
+        let conn = memory_db();
+        assert_eq!(rebuild(&conn, &root, "folder", None), 2);
+        std::fs::write(broken.join("manifest.json"), b"{ not json").expect("corrupt the manifest");
+
+        let outcome = rebuild_from_disk(&conn, &request(&root, "folder", None)).expect("rebuild");
+        assert_eq!((outcome.written, outcome.removed), (1, 0));
+        assert_eq!(
+            count(&conn, "recordings"),
+            2,
+            "the unreadable session keeps its row"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The recorder writes a segment's row the moment it closes and the
+    /// manifest lists it only later. A rebuild that runs meanwhile must leave
+    /// the reserved folder alone: the fresh row (and its `closed_ts`, which
+    /// exists nowhere else) survives, the session still counts as found so the
+    /// reconcile keeps it, and the rest of the root is rebuilt as usual.
+    #[test]
+    fn a_reserved_folders_fresh_segment_row_survives_a_rebuild() {
+        let dir = temp_dir();
+        let root = dir.join("recordings");
+        let live = seed_session(
+            &root,
+            "2026/live",
+            Some("01DEVICE-01LIVE"),
+            Some("Still going"),
+            Some("2026-08-08T12:00:00+02:00"),
+            &[(0, "screen", 100)],
+        );
+        let gone = seed_session(
+            &root,
+            "2026/gone",
+            Some("01DEVICE-02GONE"),
+            None,
+            Some("2026-08-08T13:00:00+02:00"),
+            &[],
+        );
+        seed_session(
+            &root,
+            "2026/kept",
+            Some("01DEVICE-03KEPT"),
+            None,
+            Some("2026-08-08T14:00:00+02:00"),
+            &[],
+        );
+        let conn = memory_db();
+        assert_eq!(rebuild(&conn, &root, "folder", None), 3);
+        // Segment 1 has just closed: its row is here, the manifest has not
+        // caught up, and its `closed_ts` is a fact only this row holds.
+        upsert_segment(
+            &conn,
+            &RecordingSegmentRow {
+                session_id: "01DEVICE-01LIVE".to_owned(),
+                index: 1,
+                track: "screen".to_owned(),
+                relative_path: "2026/live/screen-0001.mov".to_owned(),
+                bytes: 4096,
+                pts_start: Some(4.0),
+                pts_end: Some(8.0),
+                closed_ts: Some(1_754_600_100_000),
+            },
+        )
+        .expect("the fresh segment row");
+        std::fs::remove_dir_all(&gone).expect("a session deleted meanwhile");
+
+        let outcome = rebuild_from_disk(
+            &conn,
+            &request(&root, "folder", None).skipping([live.clone()]),
+        )
+        .expect("rebuild around a recording in progress");
+        assert_eq!(
+            outcome.written, 1,
+            "only the session that is neither live nor gone is rewritten"
+        );
+        assert_eq!(outcome.removed, 1, "the deleted session is still forgotten");
+        assert_eq!(
+            outcome.found,
+            vec!["01DEVICE-01LIVE".to_owned(), "01DEVICE-03KEPT".to_owned()],
+            "the reserved folder's session is found without being read"
+        );
+        assert_eq!(
+            segment_paths(&conn),
+            vec![
+                "2026/live/screen-0000.mov".to_owned(),
+                "2026/live/screen-0001.mov".to_owned(),
+            ],
+            "the fresh row was not pruned"
+        );
+        let closed: Option<i64> = conn
+            .query_row(
+                "SELECT closed_ts FROM recording_segments WHERE session_id = '01DEVICE-01LIVE' \
+                 AND \"index\" = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read closed_ts");
+        assert_eq!(closed, Some(1_754_600_100_000));
+
+        // A copy of the live session elsewhere under the root cannot take its
+        // id: the reserved folder claimed it before the walk began.
+        copy_dir(&live, &root.join("2026").join("live copy"));
+        let outcome = rebuild_from_disk(
+            &conn,
+            &request(&root, "folder", None).skipping([live.clone()]),
+        )
+        .expect("rebuild with a copy of the live session");
+        assert_eq!(outcome.written, 1, "the copy is kept out");
+        assert_eq!(
+            place_of(&conn, "01DEVICE-01LIVE").map(|place| place.2),
+            Some("2026/live".to_owned()),
+            "the row still names the live folder"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The "session moved between roots by hand" row, in both orders the two
+    /// roots can be rebuilt in: one row, under the new root, with the
+    /// durability the NEW root's repository reports — `local` when it has
+    /// never committed the folder — however far the old row had climbed.
+    #[test]
+    fn a_session_moved_between_roots_is_re_homed_and_its_durability_re_derived() {
+        for old_root_first in [true, false] {
+            let dir = temp_dir();
+            let old_root = dir.join("tgdrive");
+            let new_root = dir.join("neuradrive").join("70-comms").join("meetings");
+            let before = seed_session(
+                &old_root,
+                "2026/2026-09-08 10.01 gsd",
+                Some("01DEVICE-01GSD"),
+                Some("GSD"),
+                Some("2026-09-08T10:01:00+02:00"),
+                &[(0, "screen", 100), (1, "screen", 200)],
+            );
+            let conn = memory_db();
+            let roots = [
+                known(&old_root, "profile", Some("tgdrive")),
+                known(&new_root, "profile", Some("neuradrive")),
+            ];
+            let old = || {
+                request(&old_root, "profile", Some("tgdrive"))
+                    .with_probe(probe(RecordingDurabilityState::Pushed))
+                    .beside(roots.clone())
+            };
+            let new = || {
+                request(&new_root, "profile", Some("neuradrive"))
+                    .with_probe(probe(RecordingDurabilityState::Local))
+                    .beside(roots.clone())
+            };
+            assert_eq!(
+                rebuild_from_disk(&conn, &old())
+                    .expect("index the old root")
+                    .written,
+                1
+            );
+            set_durability(&conn, "01DEVICE-01GSD", "verified").expect("the old root climbed");
+            assert_eq!(
+                place_of(&conn, "01DEVICE-01GSD"),
+                Some((
+                    "profile".to_owned(),
+                    Some("tgdrive".to_owned()),
+                    "2026/2026-09-08 10.01 gsd".to_owned(),
+                    "verified".to_owned()
+                ))
+            );
+
+            // Moved by hand: the folder, manifest and all, now sits under a
+            // root that has never committed it.
+            std::fs::create_dir_all(&new_root).expect("the new root");
+            let after = new_root.join("2026-09-08 10.01 gsd");
+            std::fs::rename(&before, &after).expect("move the session by hand");
+            let (old_outcome, new_outcome) = if old_root_first {
+                let o = rebuild_from_disk(&conn, &old()).expect("rebuild the old root");
+                (
+                    o,
+                    rebuild_from_disk(&conn, &new()).expect("rebuild the new root"),
+                )
+            } else {
+                let n = rebuild_from_disk(&conn, &new()).expect("rebuild the new root");
+                (
+                    rebuild_from_disk(&conn, &old()).expect("rebuild the old root"),
+                    n,
+                )
+            };
+            assert_eq!(new_outcome.written, 1, "order {old_root_first}");
+            assert_eq!(old_outcome.written, 0, "order {old_root_first}");
+            // The old root is present but now shows the walk nothing, so its
+            // pass refuses to forget on that evidence; it is the new root's
+            // pass that re-homes the row. Either order: one row.
+            assert_eq!(old_outcome.removed, 0, "order {old_root_first}");
+            assert_eq!(count(&conn, "recordings"), 1, "order {old_root_first}");
+            assert_eq!(
+                place_of(&conn, "01DEVICE-01GSD"),
+                Some((
+                    "profile".to_owned(),
+                    Some("neuradrive".to_owned()),
+                    "2026-09-08 10.01 gsd".to_owned(),
+                    "local".to_owned()
+                )),
+                "order {old_root_first}: the row follows the folder and the old floor does not"
+            );
+            assert_eq!(
+                segment_paths(&conn),
+                vec![
+                    "2026-09-08 10.01 gsd/screen-0000.mov".to_owned(),
+                    "2026-09-08 10.01 gsd/screen-0001.mov".to_owned(),
+                ],
+                "order {old_root_first}: its segments moved with it"
+            );
+            assert_eq!(fts_entries(&conn), (1, 1), "order {old_root_first}");
+
+            // And the floor is a floor again from here: a later advance climbs,
+            // a later regression does not.
+            set_durability(&conn, "01DEVICE-01GSD", "committed").expect("advance");
+            assert_eq!(durability_of(&conn, "01DEVICE-01GSD"), "committed");
+            set_durability(&conn, "01DEVICE-01GSD", "local").expect("a weaker word is a no-op");
+            assert_eq!(durability_of(&conn, "01DEVICE-01GSD"), "committed");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Out of a synced folder and into the plain one: no repository, no probe,
+    /// and the row reads `local` — exactly, whatever the old folder had
+    /// pushed.
+    #[test]
+    fn a_session_moved_from_a_profile_to_the_plain_folder_reads_local() {
+        let dir = temp_dir();
+        let profile_root = dir.join("tgdrive").join("recordings");
+        let folder_root = dir.join("Movies").join("keeper");
+        let before = seed_session(
+            &profile_root,
+            "2026/call",
+            Some("01DEVICE-01CALL"),
+            None,
+            Some("2026-08-08T12:00:00+02:00"),
+            &[(0, "screen", 100)],
+        );
+        let conn = memory_db();
+        rebuild_from_disk(
+            &conn,
+            &request(&profile_root, "profile", Some("tgdrive"))
+                .with_probe(probe(RecordingDurabilityState::Verified)),
+        )
+        .expect("index the profile root");
+        assert_eq!(durability_of(&conn, "01DEVICE-01CALL"), "verified");
+
+        std::fs::create_dir_all(folder_root.join("2026")).expect("the plain folder");
+        std::fs::rename(&before, folder_root.join("2026").join("call")).expect("move by hand");
+        let outcome = rebuild_from_disk(
+            &conn,
+            &request(&folder_root, "folder", None).beside([
+                known(&profile_root, "profile", Some("tgdrive")),
+                known(&folder_root, "folder", None),
+            ]),
+        )
+        .expect("rebuild the plain folder");
+        assert_eq!(outcome.written, 1);
+        assert_eq!(
+            place_of(&conn, "01DEVICE-01CALL"),
+            Some((
+                "folder".to_owned(),
+                None,
+                "2026/call".to_owned(),
+                "local".to_owned()
+            )),
+            "nothing publishes the plain folder, so nothing it holds is more than local"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename inside one root is not a move between roots. The repository's
+    /// answer for the new path replaces the old path's word when there is one
+    /// — `committed` over `verified`, because the old path's push says nothing
+    /// about the new path — and when there is none, the floor keeps the
+    /// stronger word: silence is not a downgrade.
+    #[test]
+    fn a_rename_within_a_root_takes_the_repositorys_answer_and_keeps_the_floor_without_one() {
+        for (answer, expected) in [
+            (Some(RecordingDurabilityState::Committed), "committed"),
+            (None, "verified"),
+        ] {
+            let dir = temp_dir();
+            let root = dir.join("recordings");
+            let before = seed_session(
+                &root,
+                "2026/1432 Untitled",
+                Some("01DEVICE-01SESSION"),
+                None,
+                Some("2026-08-08T12:00:00+02:00"),
+                &[(0, "screen", 100)],
+            );
+            let conn = memory_db();
+            assert_eq!(rebuild(&conn, &root, "profile", Some("01PROFILE")), 1);
+            set_durability(&conn, "01DEVICE-01SESSION", "verified").expect("climb");
+
+            std::fs::rename(&before, root.join("2026").join("1432 Standup")).expect("retitle");
+            let silent_or_not = DurabilityProbe(Box::new(move |_folder: &Path| answer));
+            let outcome = rebuild_from_disk(
+                &conn,
+                &request(&root, "profile", Some("01PROFILE")).with_probe(silent_or_not),
+            )
+            .expect("rebuild after the rename");
+            assert_eq!((outcome.written, outcome.removed), (1, 0));
+            assert_eq!(
+                place_of(&conn, "01DEVICE-01SESSION"),
+                Some((
+                    "profile".to_owned(),
+                    Some("01PROFILE".to_owned()),
+                    "2026/1432 Standup".to_owned(),
+                    expected.to_owned()
+                )),
+                "answer {answer:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A session folder COPIED into a second root, with the first copy still
+    /// standing, is not a move: the row stays with the first root, on every
+    /// rebuild of either, so it cannot flap between them. Once the first copy
+    /// is gone, the second is the session, and the row follows it.
+    #[test]
+    fn a_session_id_under_two_roots_keeps_the_first_until_the_first_is_gone() {
+        let dir = temp_dir();
+        let first_root = dir.join("tgdrive");
+        let second_root = dir.join("neuradrive");
+        let original = seed_session(
+            &first_root,
+            "2026/talk",
+            Some("01DEVICE-01TALK"),
+            None,
+            Some("2026-08-08T12:00:00+02:00"),
+            &[(0, "screen", 100)],
+        );
+        let conn = memory_db();
+        let roots = [
+            known(&first_root, "profile", Some("tgdrive")),
+            known(&second_root, "profile", Some("neuradrive")),
+        ];
+        let first = || {
+            request(&first_root, "profile", Some("tgdrive"))
+                .with_probe(probe(RecordingDurabilityState::Pushed))
+                .beside(roots.clone())
+        };
+        let second = || {
+            request(&second_root, "profile", Some("neuradrive"))
+                .with_probe(probe(RecordingDurabilityState::Local))
+                .beside(roots.clone())
+        };
+        assert_eq!(
+            rebuild_from_disk(&conn, &first()).expect("index").written,
+            1
+        );
+        let copy = second_root.join("2026").join("talk");
+        copy_dir(&original, &copy);
+
+        for round in 0..3 {
+            let outcome = rebuild_from_disk(&conn, &second()).expect("rebuild the second root");
+            assert_eq!((outcome.written, outcome.removed), (0, 0), "round {round}");
+            let outcome = rebuild_from_disk(&conn, &first()).expect("rebuild the first root");
+            assert_eq!((outcome.written, outcome.removed), (1, 0), "round {round}");
+            assert_eq!(
+                place_of(&conn, "01DEVICE-01TALK"),
+                Some((
+                    "profile".to_owned(),
+                    Some("tgdrive".to_owned()),
+                    "2026/talk".to_owned(),
+                    "pushed".to_owned()
+                )),
+                "round {round}: the first root keeps it"
+            );
+        }
+        assert_eq!(count(&conn, "recordings"), 1);
+
+        // The original goes: the copy is the session now.
+        std::fs::remove_dir_all(&original).expect("delete the original");
+        let outcome = rebuild_from_disk(&conn, &second()).expect("rebuild the second root");
+        assert_eq!(outcome.written, 1);
+        assert_eq!(
+            place_of(&conn, "01DEVICE-01TALK"),
+            Some((
+                "profile".to_owned(),
+                Some("neuradrive".to_owned()),
+                "2026/talk".to_owned(),
+                "local".to_owned()
+            )),
+            "with the first copy gone the row follows the second"
+        );
+        assert_eq!(count(&conn, "recordings"), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The "durability re-derived" row: in place, the probe's answer is
+    /// floored against the row like any other write — a repository that
+    /// committed and pushed the folder lifts a `local` row to `pushed`, and a
+    /// later advance still climbs from there.
+    #[test]
+    fn a_rebuild_in_place_takes_the_repositorys_word_and_keeps_the_floor() {
+        let dir = temp_dir();
+        let root = dir.join("recordings");
+        seed_session(
+            &root,
+            "2026/session",
+            Some("01DEVICE-01SESSION"),
+            None,
+            Some("2026-08-08T12:00:00+02:00"),
+            &[],
+        );
+        let conn = memory_db();
+        assert_eq!(rebuild(&conn, &root, "profile", Some("01PROFILE")), 1);
+        assert_eq!(durability_of(&conn, "01DEVICE-01SESSION"), "local");
+
+        rebuild_from_disk(
+            &conn,
+            &request(&root, "profile", Some("01PROFILE"))
+                .with_probe(probe(RecordingDurabilityState::Pushed)),
+        )
+        .expect("rebuild with the repository's answer");
+        assert_eq!(durability_of(&conn, "01DEVICE-01SESSION"), "pushed");
+
+        // A probe that cannot answer says `local`, and in place the floor keeps
+        // the stronger word the row already earned.
+        let silent = DurabilityProbe(Box::new(|_folder: &Path| None));
+        rebuild_from_disk(
+            &conn,
+            &request(&root, "profile", Some("01PROFILE")).with_probe(silent),
+        )
+        .expect("rebuild with a probe that cannot answer");
+        assert_eq!(durability_of(&conn, "01DEVICE-01SESSION"), "pushed");
+
+        set_durability(&conn, "01DEVICE-01SESSION", "verified").expect("a later advance");
+        assert_eq!(durability_of(&conn, "01DEVICE-01SESSION"), "verified");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A removed synced folder's rows go — row, segments and search entry —
+    /// and nobody else's: another profile's and the plain folder's stay.
+    #[test]
+    fn forgetting_a_root_removes_exactly_its_rows() {
+        let conn = memory_db();
+        for (id, root_kind, profile_id) in [
+            ("01DEVICE-01GONE", "profile", Some("gone")),
+            ("01DEVICE-02GONE", "profile", Some("gone")),
+            ("01DEVICE-03OTHER", "profile", Some("other")),
+            ("01DEVICE-04FOLDER", "folder", None),
+        ] {
+            let mut row = start_row(id);
+            row.root_kind = root_kind.to_owned();
+            row.profile_id = profile_id.map(str::to_owned);
+            row.title = Some(format!("Meeting {id}"));
+            upsert_recording(&conn, &row).expect("seed");
+            upsert_segment(
+                &conn,
+                &RecordingSegmentRow {
+                    session_id: id.to_owned(),
+                    index: 0,
+                    track: "screen".to_owned(),
+                    relative_path: "2026/session/screen-0000.mov".to_owned(),
+                    bytes: 1,
+                    pts_start: None,
+                    pts_end: None,
+                    closed_ts: None,
+                },
+            )
+            .expect("seed a segment");
+        }
+        assert_eq!(fts_entries(&conn), (4, 4));
+
+        assert_eq!(
+            forget_root(&conn, "profile", Some("gone")).expect("forget"),
+            2
+        );
+        assert_eq!(
+            session_ids(&conn),
+            vec![
+                "01DEVICE-03OTHER".to_owned(),
+                "01DEVICE-04FOLDER".to_owned()
+            ]
+        );
+        assert_eq!(count(&conn, "recording_segments"), 2);
+        assert_eq!(fts_entries(&conn), (2, 2));
+        assert_eq!(
+            forget_root(&conn, "profile", Some("gone")).expect("forget again"),
+            0,
+            "forgetting a root twice forgets nothing more"
+        );
     }
 
     #[test]
@@ -2073,7 +3427,7 @@ mod tests {
         );
 
         let conn = memory_db();
-        let written = rebuild_from_disk(&conn, &root, "folder", None).expect("rebuild");
+        let written = rebuild(&conn, &root, "folder", None);
         assert_eq!(written, 1);
         let ids: Vec<String> = {
             let mut stmt = conn
@@ -2240,8 +3594,7 @@ mod tests {
         // already stored, and the three it cannot carry are still there
         // afterwards. Any drift either way changes the dump.
         let before = dump(&normal);
-        let rewritten =
-            rebuild_from_disk(&normal, &root, "profile", Some("01PROFILE")).expect("rebuild");
+        let rewritten = rebuild(&normal, &root, "profile", Some("01PROFILE"));
         assert_eq!(rewritten, 50);
         assert_eq!(
             before,
@@ -2252,8 +3605,7 @@ mod tests {
         // And `archive.db` deleted outright: the same rows, short of precisely
         // the three columns no manifest can carry.
         let rebuilt = memory_db();
-        let written =
-            rebuild_from_disk(&rebuilt, &root, "profile", Some("01PROFILE")).expect("rebuild");
+        let written = rebuild(&rebuilt, &root, "profile", Some("01PROFILE"));
         assert_eq!(written, 50);
         assert_eq!(count(&rebuilt, "recordings"), 50);
         assert_eq!(count(&normal, "recordings"), 50);
@@ -2272,7 +3624,7 @@ mod tests {
         // And running it again changes nothing: the ledger is reconciled, never
         // appended to.
         let before = dump(&rebuilt);
-        rebuild_from_disk(&rebuilt, &root, "profile", Some("01PROFILE")).expect("rebuild twice");
+        rebuild(&rebuilt, &root, "profile", Some("01PROFILE"));
         assert_eq!(before, dump(&rebuilt), "a rebuild is idempotent");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2398,7 +3750,7 @@ mod tests {
         );
 
         let conn = memory_db();
-        let written = rebuild_from_disk(&conn, &root, "folder", None).expect("rebuild");
+        let written = rebuild(&conn, &root, "folder", None);
         assert_eq!(
             written, 1,
             "one id is one row, and the count never claims more rows than the run wrote"
@@ -2420,7 +3772,7 @@ mod tests {
 
         // Deterministic rather than merely lucky: the same tree rebuilds to the
         // same row every time, on every machine.
-        let again = rebuild_from_disk(&conn, &root, "folder", None).expect("rebuild twice");
+        let again = rebuild(&conn, &root, "folder", None);
         assert_eq!(again, 1);
         let path: String = conn
             .query_row("SELECT relative_path FROM recordings", [], |r| r.get(0))
@@ -2449,10 +3801,10 @@ mod tests {
         // through the seam the public entry point delegates to, with a budget
         // of two against a root of four sessions.
         let capped = memory_db();
-        let written =
-            rebuild_from_disk_within(&capped, &root, "folder", None, 2).expect("capped rebuild");
+        let outcome = rebuild_from_disk_within(&capped, &request(&root, "folder", None), 2)
+            .expect("capped rebuild");
         assert_eq!(
-            written, 2,
+            outcome.written, 2,
             "the walk stops at the budget instead of running the root to its end"
         );
         assert_eq!(
@@ -2461,14 +3813,24 @@ mod tests {
             "and it is the sorted walk's first two, the same two on every machine"
         );
 
+        // A walk the budget cut short did not see the whole root, so it may not
+        // forget the sessions it never reached.
+        let indexed = memory_db();
+        assert_eq!(rebuild(&indexed, &root, "folder", None), 4);
+        let outcome = rebuild_from_disk_within(&indexed, &request(&root, "folder", None), 2)
+            .expect("capped rebuild over an indexed root");
+        assert_eq!((outcome.written, outcome.removed), (2, 0));
+        assert_eq!(
+            count(&indexed, "recordings"),
+            4,
+            "charlie and delta were beyond the budget, not gone"
+        );
+
         // The shipping entry point passes the real budget, which this tree is
         // nowhere near — so the truncation above is the budget's doing and
         // nothing else's.
         let whole = memory_db();
-        assert_eq!(
-            rebuild_from_disk(&whole, &root, "folder", None).expect("whole rebuild"),
-            4
-        );
+        assert_eq!(rebuild(&whole, &root, "folder", None), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2495,8 +3857,8 @@ mod tests {
         )
         .expect("arm the failing insert");
 
-        let error =
-            rebuild_from_disk(&conn, &root, "folder", None).expect_err("the failure propagates");
+        let error = rebuild_from_disk(&conn, &request(&root, "folder", None))
+            .expect_err("the failure propagates");
         assert!(
             matches!(error, ArchiveError::Sqlite(_)),
             "a rebuild that cannot write fails loudly: {error:?}"
@@ -2610,7 +3972,7 @@ mod tests {
         let root = dir.join("recordings");
         seed_fifty(&root);
         let conn = memory_db();
-        rebuild_from_disk(&conn, &root, "profile", Some("01PROFILE")).expect("rebuild");
+        rebuild(&conn, &root, "profile", Some("01PROFILE"));
 
         let serialized = dump(&conn);
         let root_text = root.to_string_lossy().into_owned();

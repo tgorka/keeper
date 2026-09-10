@@ -6038,3 +6038,8 @@ status: open
     as the permanent arm does) and a retire keyed to that upload moving or being unparked, rather
     than to any unit's success.
   status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-the-archive-follows-every-recordings-root.md`
+  summary: Orphan recovery now runs over every recordings root, so a session another machine is recording into a shared (removable) root right now is not in this machine's reserved set and is marked `recovered`.
+  evidence: `recover_orphaned_sessions` judges a `status: "recording"` manifest by the local reservation set only; it was already true for a shared destination root and now applies to every followed root. The durable fix is a liveness signal in the manifest (a heartbeat stamp the recorder refreshes) that recovery honours across machines.
+  status: open

@@ -1310,6 +1310,12 @@ pub async fn sync_profile_save(
     // The merge is the honest fallback: it is what was written, minus only the
     // folder-owned keys the write stripped.
     let answer = profile_by_id(&state, &profile.id).unwrap_or(profile);
+    // A saved profile may have gained, lost or moved a recordings root, so the
+    // archive follows it (the archive follows every recordings root).
+    crate::ipc::spawn_recordings_index_rebuild(
+        state.inner(),
+        crate::ipc::RecordingsIndexTrigger::because("a synced folder was saved"),
+    );
     Ok(SyncProfileVm::from(&answer))
 }
 
@@ -1374,7 +1380,18 @@ pub async fn sync_profile_remove(
     id: String,
 ) -> Result<(), IpcError> {
     let engine = engine_of(&state)?;
-    engine.remove_profile(&id).map_err(|e| sync_ipc_error(&e))
+    engine.remove_profile(&id).map_err(|e| sync_ipc_error(&e))?;
+    // The profile set changed, so the archive follows it (the archive follows
+    // every recordings root). The removed folder's rows go with it — keeper no
+    // longer knows that folder, so nothing could walk it, and a session that
+    // is only there is a session keeper cannot list — and a destination that
+    // named it falls back to the plain folder, which is indexed. A PAUSED
+    // folder's rows stay; a pause is not a removal.
+    crate::ipc::spawn_recordings_index_rebuild(
+        state.inner(),
+        crate::ipc::RecordingsIndexTrigger::because("a synced folder was removed").forgetting(id),
+    );
+    Ok(())
 }
 
 /// Pause or resume a profile.
@@ -1389,6 +1406,12 @@ pub async fn sync_profile_set_enabled(
         .set_enabled(&id, enabled)
         .map_err(|e| sync_ipc_error(&e))?;
     let status = engine.status(&id).map_err(|e| sync_ipc_error(&e))?;
+    // Pausing takes a root out of the set the archive follows and resuming
+    // puts it back (the archive follows every recordings root).
+    crate::ipc::spawn_recordings_index_rebuild(
+        state.inner(),
+        crate::ipc::RecordingsIndexTrigger::because("a synced folder was paused or resumed"),
+    );
     Ok(SyncStatusVm::from(&status))
 }
 

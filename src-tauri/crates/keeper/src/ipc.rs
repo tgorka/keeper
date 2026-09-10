@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Datelike, FixedOffset, Local, TimeZone, Timelike};
 use keeper_core::account::AccountManager;
 use keeper_core::archive::recordings::{
-    fallback_session_id, relative_session_path, RecordingRow, RecordingSegmentRow,
+    fallback_session_id, relative_session_path, DurabilityProbe, RecordingRow, RecordingSegmentRow,
 };
 use keeper_core::auth;
 use keeper_core::auth::BeeperFlowRegistry;
@@ -6817,6 +6817,10 @@ pub async fn recording_start(
     // above holds the other `Arc` — one session, one row, two writers of it —
     // so this is the last use and moves rather than clones.
     let task_archive = archive;
+    // What the driver task needs to run a recordings-index refresh that a
+    // trigger deferred while this session recorded (the archive follows every
+    // recordings root) — cloned out now, because the task outlives this call.
+    let index_handles = RecordingsIndexHandles::of(state.inner());
     // The handle is stored into the run slot below (Story 18.2): aborting it is
     // the quit kill-timeout's force-kill lever (see `RecordingRun::driver`).
     let driver = tauri::async_runtime::spawn(async move {
@@ -6861,6 +6865,11 @@ pub async fn recording_start(
         // before the folder becomes recoverable. An aborted driver (quit
         // kill-timeout) drops the future, which drops this guard the same way.
         drop(reservation);
+        // The folder is released, so a recordings-index refresh that waited
+        // for this session may run now (the archive follows every recordings
+        // root). An aborted driver never gets here; the next trigger, or the
+        // next start, runs whatever was deferred.
+        release_deferred_recordings_index_rebuild(index_handles);
     });
 
     // Story 18.5: the live disk-space guard. A ~1 Hz task probes the
@@ -7973,14 +7982,17 @@ fn resolve_path_template(stored: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_TEMPLATE.to_owned())
 }
 
-/// The startup orphan-recovery pass (Story 17.3, FR-73, AD-37): derive the
-/// current EFFECTIVE recordings destination (the same
+/// The startup orphan-recovery pass (Story 17.3, FR-73, AD-37): derive every
+/// recordings root the archive follows — the EFFECTIVE destination (the same
 /// [`effective_destination_dir`] source of truth `recording_start` uses) and
-/// run the core `recover_orphaned_sessions` scan over it, marking every
+/// each enabled synced folder that holds recordings ([`recordings_roots`]) —
+/// and run the core `recover_orphaned_sessions` scan over each, marking every
 /// crash-orphaned `recording` manifest `recovered` on disk — the durable
-/// signal Story 20.3's notice consumes. Best-effort end to end: any failure is
-/// logged and swallowed, never fatal (this runs on a detached boot thread —
-/// see `lib.rs` `setup`).
+/// signal Story 20.3's notice consumes. Every root rather than only the
+/// destination, since the archive followed every recordings root: a session
+/// that crashed in a second synced folder is an orphan too. Best-effort end
+/// to end: any failure is logged and swallowed, never fatal (this runs on a
+/// detached boot thread — see `lib.rs` `setup`).
 ///
 /// Safe against a concurrent `recording_start` (the detached thread can still
 /// be walking a slow volume after the user clicked Record): the scan holds the
@@ -7990,46 +8002,595 @@ fn resolve_path_template(stored: Option<String>) -> String {
 /// session has reserved is skipped untouched — a live session's manifest is
 /// never rewritten to `recovered` mid-capture.
 pub(crate) fn recover_orphaned_recordings(state: &AppState) {
-    let data_dir = match state.platform.data_dir() {
-        Ok(data_dir) => data_dir,
-        Err(error) => {
-            tracing::warn!(%error, "startup recovery: could not resolve the data dir (non-fatal)");
-            return;
+    let handles = RecordingsIndexHandles::of(state);
+    let Some(plans) = recordings_index_plans(&handles.platform) else {
+        return;
+    };
+    {
+        let _scan = plain_lock(&state.recovery_scan);
+        let is_active =
+            |folder: &Path| plain_lock(&state.reserved_recording_folders).contains(folder);
+        for plan in &plans {
+            let recovered = recover_orphaned_sessions(&plan.root, &is_active);
+            if !recovered.is_empty() {
+                tracing::info!(
+                    count = recovered.len(),
+                    root_kind = %plan.root_kind(),
+                    profile = plan.profile_id.as_deref().unwrap_or("-"),
+                    "startup recovery marked orphaned session(s) recovered"
+                );
+            }
+        }
+    }
+    // Story 42.1: the same pass, for the index — and since the archive followed
+    // every recordings root, for EVERY root, not only the one recordings land
+    // in today. The recovery walk above has just reconciled every manifest
+    // under every root, so this is the moment those manifests are most worth
+    // replaying into rows. Startup is NOT a moment nothing can be recording —
+    // the user can click Record seconds after boot, while this thread is still
+    // walking a slow volume — so this pass takes the reserved folders as its
+    // skip set exactly as a triggered one does, and goes through the same
+    // gate, so a settings save that lands during boot coalesces with it.
+    run_recordings_index_rebuild(&handles, RecordingsIndexTrigger::because("keeper started"));
+}
+
+/// One recordings root the archive must follow: where it is, which kind of
+/// place it is, and whose profile it is (the archive follows every recordings
+/// root).
+///
+/// The plain shape of one [`keeper_core::archive::RebuildRequest`] short of
+/// its probe, its skip set and its neighbours, so the ENUMERATION — which
+/// roots, and which are left alone — is a pure function the matrix can be
+/// asserted against without an engine, a `git` or a drive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordingsRootPlan {
+    /// The absolute root to walk.
+    root: PathBuf,
+    /// Which kind of place [`Self::root`] is.
+    kind: RecordingDestinationKind,
+    /// The profile the root belongs to, under [`RecordingDestinationKind::Profile`].
+    profile_id: Option<String>,
+}
+
+impl RecordingsRootPlan {
+    /// The `root_kind` column word for this root — the wire spelling of
+    /// [`RecordingDestinationKind`], which is what every row already stores.
+    fn root_kind(&self) -> String {
+        match self.kind {
+            RecordingDestinationKind::Folder => "folder".to_owned(),
+            RecordingDestinationKind::Profile => "profile".to_owned(),
+        }
+    }
+
+    /// This root as the rebuild of another root knows it.
+    fn known(&self) -> keeper_core::archive::KnownRoot {
+        keeper_core::archive::KnownRoot {
+            root: self.root.clone(),
+            root_kind: self.root_kind(),
+            profile_id: self.profile_id.clone(),
+        }
+    }
+}
+
+/// Every recordings root the archive follows right now: the effective
+/// destination, then each enabled synced folder that says it holds recordings
+/// — each once, and none whose removable volume is not here.
+///
+/// **A root that is not here is not enumerated, rather than enumerated and
+/// found empty.** The rebuild leaves an unreadable root's rows alone anyway,
+/// but a removable profile's mountpoint can hold a DIFFERENT volume (Story
+/// 27.3's foreign stick), and walking that would index a stranger's disk under
+/// the profile's name. `volume::scan` is the one attachment test, and the
+/// table's [`DestinationVolume`] already carries its answer; anything but
+/// `Attached` — absent, foreign, unreadable — is left out here, the same three
+/// answers on which `recording_start` refuses to record there.
+///
+/// A paused profile is left out too: nothing recorded there is committed, its
+/// rows say whatever they said when it was live, and a rebuild that rewrote
+/// them as `local` would be reporting a pause as a loss. Its rows stay for the
+/// day it resumes.
+///
+/// **One root, one plan.** The destination is listed first; a profile that IS
+/// the destination is not listed twice, and neither is a second profile that
+/// resolves to the same root. When the plain-folder destination is a synced
+/// folder's recordings root — a hand-edited setting, since the setter refuses
+/// it — the PROFILE'S plan replaces the folder's: its repository can answer
+/// for durability and a plain folder cannot, and its rows should say so. A
+/// root nested inside a root already planned, or enclosing one, is not
+/// followed at all, with a warn naming both: two walks over one tree would
+/// each re-home the other's sessions on every rebuild.
+///
+/// An unreadable table (no usable `git`, no engine) is not an error: the
+/// destination is still a root, and the profiles are simply not known.
+fn recordings_roots(
+    destination: &RecordingDestination,
+    table: &DestinationProfileTable,
+) -> Vec<RecordingsRootPlan> {
+    fn present(volume: Option<&DestinationVolume>) -> bool {
+        volume.is_none_or(|volume| volume.status == DestinationVolumeStatus::Attached)
+    }
+    let mut plans = Vec::new();
+    if present(destination.volume.as_ref()) {
+        plans.push(RecordingsRootPlan {
+            root: destination.root.clone(),
+            kind: destination.kind,
+            profile_id: destination.profile_id.clone(),
+        });
+    } else {
+        tracing::info!(
+            profile = destination.profile_id.as_deref().unwrap_or("-"),
+            "archive rebuild: the destination's drive is not attached, so its rows stay as they are"
+        );
+    }
+    let rows = match table {
+        Ok(rows) => rows,
+        Err(reason) => {
+            tracing::debug!(
+                %reason,
+                "archive rebuild: the synced folders cannot be read, so only the destination is indexed"
+            );
+            return plans;
         }
     };
-    let destination = effective_recording_destination(&data_dir, &|need| {
-        destination_profile_table(&state.platform, need)
-    });
-    let base = destination.root.clone();
-    let _scan = plain_lock(&state.recovery_scan);
-    let is_active = |folder: &Path| plain_lock(&state.reserved_recording_folders).contains(folder);
-    let recovered = recover_orphaned_sessions(&base, &is_active);
-    if !recovered.is_empty() {
+    for row in rows {
+        let Some(root) = row.recordings_root() else {
+            continue;
+        };
+        if !row.enabled {
+            tracing::debug!(
+                profile = %row.id,
+                "archive rebuild: a paused folder's recordings are not indexed; its rows wait for it"
+            );
+            continue;
+        }
+        if !present(row.volume.as_ref()) {
+            tracing::info!(
+                profile = %row.id,
+                "archive rebuild: this folder's drive is not attached, so its rows stay as they are"
+            );
+            continue;
+        }
+        if let Some(listed) = plans.iter_mut().find(|plan| plan.root == root) {
+            if listed.kind == RecordingDestinationKind::Folder {
+                tracing::info!(
+                    profile = %row.id,
+                    "archive rebuild: the plain folder is this synced folder's recordings root; the folder's repository answers for it"
+                );
+                *listed = RecordingsRootPlan {
+                    root: root.to_path_buf(),
+                    kind: RecordingDestinationKind::Profile,
+                    profile_id: Some(row.id.clone()),
+                };
+            }
+            continue;
+        }
+        if plans
+            .iter()
+            .any(|plan| plan.profile_id.as_deref() == Some(row.id.as_str()))
+        {
+            continue;
+        }
+        if let Some(other) = plans
+            .iter()
+            .find(|plan| plan.root.starts_with(root) || root.starts_with(&plan.root))
+        {
+            tracing::warn!(
+                profile = %row.id,
+                root = %root.display(),
+                other_root = %other.root.display(),
+                other_profile = other.profile_id.as_deref().unwrap_or("the plain folder"),
+                "archive rebuild: one recordings root is nested inside another; following only the first"
+            );
+            continue;
+        }
+        plans.push(RecordingsRootPlan {
+            root: root.to_path_buf(),
+            kind: RecordingDestinationKind::Profile,
+            profile_id: Some(row.id.clone()),
+        });
+    }
+    plans
+}
+
+/// One step of a recordings-index refresh, as the trigger path emits it (the
+/// archive follows every recordings root).
+///
+/// The seam between deciding what to do and doing it: production hands each
+/// step to the archive writer, a test hands it to a `Vec` and asserts one
+/// rebuild per root per trigger, and a forget for a folder that was removed.
+enum RecordingsIndexStep {
+    /// Walk one root and reconcile its rows, with its repository's answer for
+    /// durability when it has one.
+    Rebuild {
+        plan: RecordingsRootPlan,
+        probe: Option<DurabilityProbe>,
+    },
+    /// Forget a removed synced folder's rows: keeper no longer knows that
+    /// folder, so nothing can walk it, and its sessions leave the index.
+    Forget { profile_id: String },
+}
+
+/// Why the index is being refreshed, and what the refresh owes besides the
+/// walk (the archive follows every recordings root).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordingsIndexTrigger {
+    /// The trigger, for the log line, and nothing else is carried about it.
+    reason: &'static str,
+    /// Synced folders removed since the last refresh, whose rows go first.
+    forget: Vec<String>,
+}
+
+impl RecordingsIndexTrigger {
+    /// A refresh for this reason, owing nothing but the walk.
+    pub(crate) fn because(reason: &'static str) -> Self {
+        Self {
+            reason,
+            forget: Vec::new(),
+        }
+    }
+
+    /// The same refresh, also forgetting this removed folder's rows.
+    pub(crate) fn forgetting(mut self, profile_id: String) -> Self {
+        self.forget.push(profile_id);
+        self
+    }
+
+    /// Fold a later trigger into this one: one refresh answers both, and it
+    /// owes every forget either owed. The later reason is the one logged,
+    /// because it is the one the refresh is now late for.
+    fn fold(&mut self, later: Self) {
+        self.reason = later.reason;
+        self.forget.extend(later.forget);
+    }
+}
+
+/// Emit the steps one refresh takes, in order: every forget the trigger
+/// owes, then one rebuild per planned root — a profile root's with the probe
+/// `probe_for` builds over its repository, the plain folder's with none.
+///
+/// Pure in the sense that matters: what goes into `sink`, and in what order,
+/// depends on `plans` and `trigger` alone, so a test can hand it a fake sink
+/// and count.
+fn recordings_index_steps(
+    plans: Vec<RecordingsRootPlan>,
+    trigger: &RecordingsIndexTrigger,
+    probe_for: &dyn Fn(&str) -> Option<DurabilityProbe>,
+    sink: &dyn Fn(RecordingsIndexStep),
+) {
+    for profile_id in &trigger.forget {
+        sink(RecordingsIndexStep::Forget {
+            profile_id: profile_id.clone(),
+        });
+    }
+    for plan in plans {
+        let probe = plan.profile_id.as_deref().and_then(probe_for);
+        sink(RecordingsIndexStep::Rebuild { plan, probe });
+    }
+}
+
+/// The handles a refresh needs, cloned out of [`AppState`] so a detached
+/// thread — or the driver task, when it releases a session's folder — can run
+/// one without the state.
+#[derive(Clone)]
+struct RecordingsIndexHandles {
+    platform: Arc<dyn Platform>,
+    archive: Option<keeper_core::archive::ArchiveHandle>,
+    reserved: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+impl RecordingsIndexHandles {
+    fn of(state: &AppState) -> Self {
+        Self {
+            platform: Arc::clone(&state.platform),
+            archive: state.accounts.archive(),
+            reserved: Arc::clone(&state.reserved_recording_folders),
+        }
+    }
+}
+
+/// The roots the archive follows right now, resolved from the registry and
+/// the engine — or `None` when even the data dir cannot be found. Runs on
+/// whatever thread calls it, which must not be the async runtime's: the table
+/// is an engine read and the destination a registry read.
+fn recordings_index_plans(platform: &Arc<dyn Platform>) -> Option<Vec<RecordingsRootPlan>> {
+    let data_dir = match platform.data_dir() {
+        Ok(data_dir) => data_dir,
+        Err(error) => {
+            tracing::warn!(%error, "archive rebuild: could not resolve the data dir (non-fatal)");
+            return None;
+        }
+    };
+    let table = destination_profile_table(platform, ProfileTableNeed::Chosen);
+    let destination = effective_recording_destination(&data_dir, &|_need| table.clone());
+    Some(recordings_roots(&destination, &table))
+}
+
+/// One refresh of the recordings index, now, on this thread, under the gate
+/// (the archive follows every recordings root): every forget the trigger
+/// owes, then one [`keeper_core::archive::ArchiveHandle::rebuild_recordings`]
+/// per [`recordings_roots`] plan — a profile root's with a probe over the
+/// engine's own durability reading, the plain folder's with none — each
+/// carrying the reserved session folders as its skip set and every planned
+/// root as its neighbours.
+///
+/// Sent, not called: the writer owns the one connection to `archive.db`, and a
+/// rebuild is exactly the operation that must not open a second. Nothing waits
+/// on it — a boot that cannot index is a boot whose folders are still the
+/// truth.
+///
+/// **The skip set is a snapshot, and that is enough.** The reserved set is
+/// read once here and every rebuild in this refresh carries it. A session
+/// that starts AFTER the snapshot reserves its folder before that folder
+/// exists, and every segment row it then sends is queued on the writer's
+/// channel BEHIND the rebuild messages sent here — so the rebuild runs
+/// before those rows land and cannot prune them. The only rows a rebuild can
+/// prune are ones sent before it was queued, and every session that could
+/// have sent one is in the snapshot.
+fn run_recordings_index_rebuild(handles: &RecordingsIndexHandles, trigger: RecordingsIndexTrigger) {
+    let Some(archive) = handles.archive.as_ref() else {
+        return;
+    };
+    RECORDINGS_INDEX_GATE.run(trigger, |trigger| {
+        let Some(plans) = recordings_index_plans(&handles.platform) else {
+            return;
+        };
         tracing::info!(
-            count = recovered.len(),
-            "startup recovery marked orphaned session(s) recovered"
+            reason = trigger.reason,
+            roots = plans.len(),
+            forgetting = trigger.forget.len(),
+            "archive rebuild: following every recordings root"
         );
-    }
-    // Story 42.1: the same pass, for the index. The recovery walk above has just
-    // reconciled every manifest under this root, so this is the moment those
-    // manifests are most worth replaying into rows — and startup is the only
-    // moment nothing is recording, so a walk that rewrites rows cannot race a
-    // session that is appending to them.
-    //
-    // Sent, not called: the writer owns the one connection to `archive.db`, and
-    // a rebuild is exactly the operation that must not open a second. Nothing
-    // waits on it — a boot that cannot index is a boot whose folders are still
-    // the truth.
-    if let Some(archive) = state.accounts.archive() {
-        archive.rebuild_recordings(
-            base,
-            match destination.kind {
-                RecordingDestinationKind::Folder => "folder".to_owned(),
-                RecordingDestinationKind::Profile => "profile".to_owned(),
-            },
-            destination.profile_id.clone(),
+        let skip: HashSet<PathBuf> = plain_lock(&handles.reserved).clone();
+        let followed: Vec<keeper_core::archive::KnownRoot> =
+            plans.iter().map(RecordingsRootPlan::known).collect();
+        let sink = |step: RecordingsIndexStep| match step {
+            RecordingsIndexStep::Rebuild { plan, probe } => {
+                let mut request = keeper_core::archive::RebuildRequest::new(
+                    plan.root.clone(),
+                    &plan.root_kind(),
+                    plan.profile_id.as_deref(),
+                )
+                .skipping(skip.iter().cloned())
+                .beside(followed.iter().cloned());
+                request.probe = probe;
+                archive.rebuild_recordings(request);
+            }
+            RecordingsIndexStep::Forget { profile_id } => {
+                archive.forget_recordings_root("profile".to_owned(), Some(profile_id));
+            }
+        };
+        recordings_index_steps(
+            plans,
+            trigger,
+            &|profile_id| durability_probe(&handles.platform, profile_id),
+            &sink,
         );
+    });
+}
+
+/// The one-at-a-time guard around the index refresh (the archive follows
+/// every recordings root): a burst of saves runs one refresh now and one
+/// after, never N, and a trigger that lands while a session is recording
+/// waits for the session.
+///
+/// Three slots. `running` is the in-flight guard; `pending` is the dirty flag,
+/// as the trigger the rerun is owed to (folded, so a burst of five saves
+/// during a run is one rerun owing all five forgets); `deferred` is the
+/// trigger a recording put off, released by the driver task when the
+/// session's folder is. A refresh that panics is caught and logged, and the
+/// guard is released the same way, so one bad walk cannot wedge every later
+/// one shut.
+struct RecordingsIndexGate {
+    state: Mutex<RecordingsIndexGateState>,
+}
+
+struct RecordingsIndexGateState {
+    running: bool,
+    pending: Option<RecordingsIndexTrigger>,
+    deferred: Option<RecordingsIndexTrigger>,
+}
+
+impl RecordingsIndexGate {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(RecordingsIndexGateState {
+                running: false,
+                pending: None,
+                deferred: None,
+            }),
+        }
     }
+
+    /// Take the guard for `trigger`: `Some` to run it now, `None` when a run
+    /// is in flight and `trigger` has been folded into the rerun it owes.
+    fn claim(&self, trigger: RecordingsIndexTrigger) -> Option<RecordingsIndexTrigger> {
+        let mut state = plain_lock(&self.state);
+        if state.running {
+            match state.pending.as_mut() {
+                Some(pending) => pending.fold(trigger),
+                None => state.pending = Some(trigger),
+            }
+            return None;
+        }
+        state.running = true;
+        Some(trigger)
+    }
+
+    /// Give the guard back after a run: `Some` is the rerun owed (the guard
+    /// stays taken for it), `None` releases it.
+    fn release(&self) -> Option<RecordingsIndexTrigger> {
+        let mut state = plain_lock(&self.state);
+        let next = state.pending.take();
+        if next.is_none() {
+            state.running = false;
+        }
+        next
+    }
+
+    /// A trigger that arrived while a session was recording: remember it for
+    /// the session's end, folded with any other that did.
+    fn defer(&self, trigger: RecordingsIndexTrigger) {
+        let mut state = plain_lock(&self.state);
+        match state.deferred.as_mut() {
+            Some(deferred) => deferred.fold(trigger),
+            None => state.deferred = Some(trigger),
+        }
+    }
+
+    /// The session ended: the trigger it put off, if any.
+    fn take_deferred(&self) -> Option<RecordingsIndexTrigger> {
+        plain_lock(&self.state).deferred.take()
+    }
+
+    /// Run `body` for `trigger` under the guard, then again for whatever was
+    /// folded in while it ran, until nothing is owed — or fold `trigger` into
+    /// a run already in flight and return at once.
+    fn run(&self, trigger: RecordingsIndexTrigger, mut body: impl FnMut(&RecordingsIndexTrigger)) {
+        let reason = trigger.reason;
+        let Some(mut trigger) = self.claim(trigger) else {
+            tracing::debug!(
+                reason,
+                "archive rebuild: a refresh is already running; this one is folded into the next"
+            );
+            return;
+        };
+        loop {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                body(&trigger);
+            }));
+            if let Err(payload) = outcome {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a panic with no message".to_owned());
+                tracing::error!(
+                    reason = trigger.reason,
+                    panic = %message,
+                    "archive rebuild: the refresh panicked; caught, the index is as it was"
+                );
+            }
+            match self.release() {
+                Some(next) => trigger = next,
+                None => break,
+            }
+        }
+    }
+}
+
+/// The process-wide gate: there is one index and one writer, so there is one
+/// refresh at a time whoever asked for it.
+static RECORDINGS_INDEX_GATE: RecordingsIndexGate = RecordingsIndexGate::new();
+
+/// Refresh the recordings index on a detached thread — the answer to the
+/// profile set or the destination having changed (the archive follows every
+/// recordings root), from a command that must return now.
+///
+/// Detached for the reason the boot pass is: the walk may cross a slow volume,
+/// and neither a settings save nor a profile edit should wait on it. While a
+/// session is recording the refresh is deferred instead — logged, folded with
+/// any other that lands meanwhile, and run by the driver task the moment the
+/// session's folder is released ([`release_deferred_recordings_index_rebuild`]).
+/// The rebuild would leave the live folder alone anyway (its skip set), but a
+/// walk over a root that is being written to is a walk over a slow volume
+/// while the recorder needs it most.
+pub(crate) fn spawn_recordings_index_rebuild(state: &AppState, trigger: RecordingsIndexTrigger) {
+    if state.accounts.archive().is_none() {
+        return;
+    }
+    let recording =
+        live_snapshot(&state.recording_run).is_some_and(|(snapshot, ..)| snapshot.state.is_live());
+    if recording {
+        tracing::info!(
+            reason = trigger.reason,
+            "archive rebuild: a recording is in progress; the refresh waits for it to end"
+        );
+        RECORDINGS_INDEX_GATE.defer(trigger);
+        return;
+    }
+    spawn_recordings_index_thread(RecordingsIndexHandles::of(state), trigger);
+}
+
+/// A session's folder has just been released (the driver task's last act):
+/// run the refresh a trigger put off while it recorded, if any did.
+fn release_deferred_recordings_index_rebuild(handles: RecordingsIndexHandles) {
+    if let Some(trigger) = RECORDINGS_INDEX_GATE.take_deferred() {
+        tracing::info!(
+            reason = trigger.reason,
+            "archive rebuild: the recording ended; running the refresh that waited for it"
+        );
+        spawn_recordings_index_thread(handles, trigger);
+    }
+}
+
+/// [`run_recordings_index_rebuild`] on a detached, named thread. A thread the
+/// OS refuses is logged, never fatal: the next trigger, or the next start,
+/// asks again.
+fn spawn_recordings_index_thread(handles: RecordingsIndexHandles, trigger: RecordingsIndexTrigger) {
+    let spawned = std::thread::Builder::new()
+        .name("keeper-recordings-index".to_owned())
+        .spawn(move || {
+            tracing::debug!(
+                reason = trigger.reason,
+                "archive rebuild: the roots may have changed"
+            );
+            run_recordings_index_rebuild(&handles, trigger);
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "archive rebuild: could not start the refresh thread (non-fatal)");
+    }
+}
+
+/// The engine's durability reading for one profile, in the shape a rebuild
+/// takes (the archive follows every recordings root): the same
+/// [`RecordingSyncPort::path_durability`] the live session's status poll asks,
+/// folded by the same [`durability_state`], so a rebuilt row and a polled
+/// banner cannot rank the facts differently.
+///
+/// `None` when there is no engine to ask — [`recording_sync_port`] has said
+/// why — and the rebuild then writes `local`, which on a machine with no
+/// usable `git` is exactly true.
+#[cfg(desktop)]
+fn durability_probe(platform: &Arc<dyn Platform>, profile_id: &str) -> Option<DurabilityProbe> {
+    let port = recording_sync_port(platform)?;
+    Some(durability_probe_over(port, profile_id))
+}
+
+/// iOS links no `keeper-sync`, so there is no repository to ask and — since
+/// [`destination_profile_table`] answers with an empty table there — no
+/// profile root this is ever asked about.
+#[cfg(not(desktop))]
+fn durability_probe(_platform: &Arc<dyn Platform>, _profile_id: &str) -> Option<DurabilityProbe> {
+    None
+}
+
+/// A probe over any [`RecordingSyncPort`] — the engine's in production, a
+/// scripted double in a test — asking it about each session folder by its
+/// absolute path, as the status poll does.
+///
+/// A port that has an engine and still cannot read a folder logs it and
+/// answers `None` for that folder alone: the rebuild treats that as no answer
+/// — `local`, floored where the floor applies, so a transient read failure
+/// never lowers a row.
+///
+/// Reached from the desktop probe above and from tests; a phone build has no
+/// port to hand it, so it is not compiled there.
+#[cfg(any(desktop, test))]
+fn durability_probe_over(port: Arc<dyn RecordingSyncPort>, profile_id: &str) -> DurabilityProbe {
+    let profile_id = profile_id.to_owned();
+    DurabilityProbe(Box::new(move |folder: &Path| {
+        match port.path_durability(&profile_id, folder) {
+            Ok(facts) => Some(durability_state(&facts)),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    profile = %profile_id,
+                    "archive rebuild: the repository could not be read for a session folder, so its row says local"
+                );
+                None
+            }
+        }
+    }))
 }
 
 /// Map a loaded [`SessionManifest`] to the read-only [`RecordingSummaryVm`] the
@@ -10063,12 +10624,20 @@ pub async fn recording_settings_set(
     let session_live =
         live_snapshot(&state.recording_run).is_some_and(|(snapshot, ..)| snapshot.state.is_live());
     let platform = Arc::clone(&state.platform);
-    off_async_runtime(move || {
+    let saved = off_async_runtime(move || {
         write_recording_settings(&data_dir, &settings, session_live, &|need| {
             destination_profile_table(&platform, need)
         })
     })
-    .await?
+    .await??;
+    // The destination may have moved, so the archive follows it: the old
+    // root's rows are reconciled and the new root's are indexed (the archive
+    // follows every recordings root).
+    spawn_recordings_index_rebuild(
+        state.inner(),
+        RecordingsIndexTrigger::because("the recording settings were saved"),
+    );
+    Ok(saved)
 }
 
 /// The blocking body of [`recording_settings_set`]: the Story 22.7 liveness
@@ -12506,6 +13075,424 @@ mod tests {
             }),
             ..flagged_row(id, name, local)
         }
+    }
+
+    // --- The archive follows every recordings root ---------------------------
+
+    /// The plan for one plain folder root.
+    fn folder_plan(root: &str) -> RecordingsRootPlan {
+        RecordingsRootPlan {
+            root: PathBuf::from(root),
+            kind: RecordingDestinationKind::Folder,
+            profile_id: None,
+        }
+    }
+
+    /// The plan for one profile's root.
+    fn profile_plan(id: &str, root: &str) -> RecordingsRootPlan {
+        RecordingsRootPlan {
+            root: PathBuf::from(root),
+            kind: RecordingDestinationKind::Profile,
+            profile_id: Some(id.to_owned()),
+        }
+    }
+
+    /// The destination a table row resolves to, volume and all.
+    fn destination_of(row: &DestinationProfileRow) -> RecordingDestination {
+        RecordingDestination {
+            root: row.recordings_root().expect("a flagged row").to_path_buf(),
+            kind: RecordingDestinationKind::Profile,
+            profile_id: Some(row.id.clone()),
+            profile_name: Some(row.name.clone()),
+            volume: row.volume.clone(),
+        }
+    }
+
+    /// The hesperia case: tgdrive is the destination and neuradrive also holds
+    /// recordings. Both roots are followed, each under its own profile, and
+    /// the destination is not listed twice.
+    #[test]
+    fn recordings_roots_follow_the_destination_and_every_other_flagged_folder() {
+        let tgdrive = flagged_row("tgdrive", "tgdrive", "/Volumes/tg");
+        let mut neuradrive = flagged_row("neuradrive", "neuradrive", "/Volumes/neura");
+        neuradrive.recordings = Some(RecordingsPlace {
+            root: PathBuf::from("/Volumes/neura/70-comms/meetings"),
+            subfolder: "70-comms/meetings".to_owned(),
+        });
+        let mut unflagged = flagged_row("work", "work notes", "/Users/x/work");
+        unflagged.recordings = None;
+        let table = Ok(vec![tgdrive.clone(), unflagged, neuradrive]);
+
+        assert_eq!(
+            recordings_roots(&destination_of(&tgdrive), &table),
+            vec![
+                profile_plan("tgdrive", "/Volumes/tg/recordings"),
+                profile_plan("neuradrive", "/Volumes/neura/70-comms/meetings"),
+            ],
+            "the destination first, then every other folder that holds recordings, once each"
+        );
+
+        // A plain-folder destination beside the same table: the folder, then
+        // both profiles.
+        let folder = RecordingDestination {
+            root: PathBuf::from("/Users/x/Movies/keeper"),
+            kind: RecordingDestinationKind::Folder,
+            profile_id: None,
+            profile_name: None,
+            volume: None,
+        };
+        assert_eq!(
+            recordings_roots(&folder, &table),
+            vec![
+                folder_plan("/Users/x/Movies/keeper"),
+                profile_plan("tgdrive", "/Volumes/tg/recordings"),
+                profile_plan("neuradrive", "/Volumes/neura/70-comms/meetings"),
+            ]
+        );
+    }
+
+    /// A paused profile's root is not indexed, and neither is a removable
+    /// profile's whose drive is out or whose mountpoint holds a stranger's
+    /// disk — those rows stay exactly as they are.
+    #[test]
+    fn recordings_roots_leave_out_a_paused_folder_and_a_drive_that_is_not_here() {
+        let mut paused = flagged_row("old", "old stick", "/Volumes/old");
+        paused.enabled = false;
+        let out = removable_row(
+            "merope",
+            "merope",
+            "/Volumes/merope",
+            Some("merope"),
+            DestinationVolumeStatus::Absent,
+        );
+        let foreign = removable_row(
+            "stick",
+            "stick",
+            "/Volumes/stick",
+            Some("stick"),
+            DestinationVolumeStatus::Unexpected {
+                detail: "a different volume (01OTHER) is mounted there".to_owned(),
+            },
+        );
+        let here = removable_row(
+            "ssd",
+            "ssd",
+            "/Volumes/ssd",
+            Some("ssd"),
+            DestinationVolumeStatus::Attached,
+        );
+        let folder = RecordingDestination {
+            root: PathBuf::from("/Users/x/Movies/keeper"),
+            kind: RecordingDestinationKind::Folder,
+            profile_id: None,
+            profile_name: None,
+            volume: None,
+        };
+        let table = Ok(vec![paused, out.clone(), foreign, here]);
+        assert_eq!(
+            recordings_roots(&folder, &table),
+            vec![
+                folder_plan("/Users/x/Movies/keeper"),
+                profile_plan("ssd", "/Volumes/ssd/recordings"),
+            ],
+            "only the plain folder and the drive that is attached"
+        );
+
+        // The destination itself on a drive that is out: nothing is indexed at
+        // all for it, not even as the destination.
+        assert_eq!(
+            recordings_roots(&destination_of(&out), &table),
+            vec![profile_plan("ssd", "/Volumes/ssd/recordings")],
+            "an unplugged destination is left alone like any other unplugged root"
+        );
+    }
+
+    /// No engine — no usable `git`, or iOS — is not a failure: the destination
+    /// is still a root, and it is the only one there is.
+    #[test]
+    fn recordings_roots_are_just_the_destination_when_the_folders_cannot_be_read() {
+        let folder = RecordingDestination {
+            root: PathBuf::from("/Users/x/Movies/keeper"),
+            kind: RecordingDestinationKind::Folder,
+            profile_id: None,
+            profile_name: None,
+            volume: None,
+        };
+        let table: DestinationProfileTable = Err("no usable git".to_owned());
+        assert_eq!(
+            recordings_roots(&folder, &table),
+            vec![folder_plan("/Users/x/Movies/keeper")]
+        );
+    }
+
+    /// The column word a plan writes is the wire word every row already stores.
+    #[test]
+    fn a_root_plan_spells_its_kind_the_way_the_rows_do() {
+        assert_eq!(folder_plan("/x").root_kind(), "folder");
+        assert_eq!(profile_plan("p", "/x").root_kind(), "profile");
+    }
+
+    /// A root nested inside a planned root, or enclosing one, is not followed
+    /// — in either direction — and a root beside them still is.
+    #[test]
+    fn recordings_roots_leave_out_a_root_nested_inside_another_either_way() {
+        let tgdrive = flagged_row("tgdrive", "tgdrive", "/Volumes/tg");
+        // Its recordings root sits INSIDE tgdrive's.
+        let deep = flagged_row("deep", "deep", "/Volumes/tg/recordings");
+        // Its recordings root ENCLOSES tgdrive's.
+        let mut wide = flagged_row("wide", "wide", "/Volumes");
+        wide.recordings = Some(RecordingsPlace {
+            root: PathBuf::from("/Volumes/tg"),
+            subfolder: "tg".to_owned(),
+        });
+        let beside = flagged_row("beside", "beside", "/Volumes/other");
+        let table = Ok(vec![deep, wide, tgdrive.clone(), beside]);
+        assert_eq!(
+            recordings_roots(&destination_of(&tgdrive), &table),
+            vec![
+                profile_plan("tgdrive", "/Volumes/tg/recordings"),
+                profile_plan("beside", "/Volumes/other/recordings"),
+            ],
+            "the destination, then only the root that shares no tree with it"
+        );
+
+        // The same in the other direction: a plain-folder destination with a
+        // synced folder's root underneath it.
+        let folder = RecordingDestination {
+            root: PathBuf::from("/Users/x/Movies/keeper"),
+            kind: RecordingDestinationKind::Folder,
+            profile_id: None,
+            profile_name: None,
+            volume: None,
+        };
+        let under = flagged_row("under", "under", "/Users/x/Movies/keeper");
+        let table = Ok(vec![
+            under,
+            flagged_row("beside", "beside", "/Volumes/other"),
+        ]);
+        assert_eq!(
+            recordings_roots(&folder, &table),
+            vec![
+                folder_plan("/Users/x/Movies/keeper"),
+                profile_plan("beside", "/Volumes/other/recordings"),
+            ]
+        );
+    }
+
+    /// When the plain-folder destination IS a synced folder's recordings root,
+    /// the profile's plan wins — once — because its repository can answer for
+    /// durability and the plain folder cannot.
+    #[test]
+    fn recordings_roots_let_the_profile_win_a_root_the_plain_folder_shares() {
+        let tgdrive = flagged_row("tgdrive", "tgdrive", "/Volumes/tg");
+        let folder = RecordingDestination {
+            root: PathBuf::from("/Volumes/tg/recordings"),
+            kind: RecordingDestinationKind::Folder,
+            profile_id: None,
+            profile_name: None,
+            volume: None,
+        };
+        let table = Ok(vec![tgdrive]);
+        assert_eq!(
+            recordings_roots(&folder, &table),
+            vec![profile_plan("tgdrive", "/Volumes/tg/recordings")]
+        );
+    }
+
+    /// A fake sink for the trigger path: one line per step, in order.
+    fn recording_sink(lines: &Mutex<Vec<String>>) -> impl Fn(RecordingsIndexStep) + '_ {
+        move |step| {
+            let line = match step {
+                RecordingsIndexStep::Forget { profile_id } => format!("forget {profile_id}"),
+                RecordingsIndexStep::Rebuild { plan, probe } => format!(
+                    "rebuild {} {} {}",
+                    plan.root_kind(),
+                    plan.root.display(),
+                    if probe.is_some() {
+                        "probed"
+                    } else {
+                        "unprobed"
+                    }
+                ),
+            };
+            lines.lock().expect("lock the sink").push(line);
+        }
+    }
+
+    /// A probe for every profile, answering nothing in particular.
+    fn a_probe(_profile_id: &str) -> Option<DurabilityProbe> {
+        Some(DurabilityProbe(Box::new(|_folder: &Path| {
+            Some(RecordingDurabilityState::Local)
+        })))
+    }
+
+    /// One trigger is one refresh: every forget it owes first, then one
+    /// rebuild per planned root — a profile root's with a probe, the plain
+    /// folder's without.
+    #[test]
+    fn a_refresh_emits_the_forgets_then_one_rebuild_per_root() {
+        let plans = vec![
+            folder_plan("/Users/x/Movies/keeper"),
+            profile_plan("tgdrive", "/Volumes/tg/recordings"),
+            profile_plan("neuradrive", "/Volumes/neura/70-comms/meetings"),
+        ];
+        let lines = Mutex::new(Vec::new());
+        let trigger = RecordingsIndexTrigger::because("a synced folder was removed")
+            .forgetting("gone".to_owned());
+        recordings_index_steps(plans, &trigger, &a_probe, &recording_sink(&lines));
+        assert_eq!(
+            lines.into_inner().expect("sink lines"),
+            vec![
+                "forget gone".to_owned(),
+                "rebuild folder /Users/x/Movies/keeper unprobed".to_owned(),
+                "rebuild profile /Volumes/tg/recordings probed".to_owned(),
+                "rebuild profile /Volumes/neura/70-comms/meetings probed".to_owned(),
+            ]
+        );
+    }
+
+    /// A burst of triggers during a refresh runs one refresh now and one
+    /// after — never one per trigger — and the one after owes every forget
+    /// the burst carried.
+    #[test]
+    fn a_burst_of_triggers_during_a_refresh_runs_exactly_one_more() {
+        let gate = RecordingsIndexGate::new();
+        let plans = vec![
+            folder_plan("/Users/x/Movies/keeper"),
+            profile_plan("tgdrive", "/Volumes/tg/recordings"),
+        ];
+        let lines = Mutex::new(Vec::new());
+        let mut runs = Vec::new();
+        gate.run(
+            RecordingsIndexTrigger::because("the recording settings were saved"),
+            |trigger| {
+                runs.push(trigger.clone());
+                if runs.len() == 1 {
+                    // Three saves land while the first refresh is walking.
+                    for id in ["a", "b", "c"] {
+                        let folded = gate.claim(
+                            RecordingsIndexTrigger::because("a synced folder was removed")
+                                .forgetting(id.to_owned()),
+                        );
+                        assert!(
+                            folded.is_none(),
+                            "a trigger during a run is folded, not run"
+                        );
+                    }
+                }
+                recordings_index_steps(
+                    plans.clone(),
+                    trigger,
+                    &|_profile_id| None,
+                    &recording_sink(&lines),
+                );
+            },
+        );
+        assert_eq!(runs.len(), 2, "one refresh now and one after, never four");
+        assert_eq!(runs[0].forget, Vec::<String>::new());
+        assert_eq!(
+            runs[1],
+            RecordingsIndexTrigger {
+                reason: "a synced folder was removed",
+                forget: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            },
+            "the rerun owes every forget the burst carried"
+        );
+        let lines = lines.into_inner().expect("sink lines");
+        assert_eq!(
+            lines.len(),
+            2 + 3 + 2,
+            "two rebuilds, then three forgets and two rebuilds"
+        );
+        assert_eq!(lines[2], "forget a");
+        // And the gate is open again afterwards.
+        assert!(
+            gate.claim(RecordingsIndexTrigger::because("later"))
+                .is_some(),
+            "the guard is released when nothing more is owed"
+        );
+    }
+
+    /// A trigger that lands while a session is recording waits for the
+    /// session — folded with any other that lands meanwhile — and is handed
+    /// back once, when the session ends.
+    #[test]
+    fn a_trigger_during_a_recording_is_deferred_and_folded() {
+        let gate = RecordingsIndexGate::new();
+        assert_eq!(gate.take_deferred(), None, "nothing waits at first");
+        gate.defer(RecordingsIndexTrigger::because("a synced folder was saved"));
+        gate.defer(
+            RecordingsIndexTrigger::because("a synced folder was removed")
+                .forgetting("gone".to_owned()),
+        );
+        assert_eq!(
+            gate.take_deferred(),
+            Some(RecordingsIndexTrigger {
+                reason: "a synced folder was removed",
+                forget: vec!["gone".to_owned()],
+            })
+        );
+        assert_eq!(gate.take_deferred(), None, "handed back once");
+    }
+
+    /// A refresh that panics is caught, and the guard is released so the
+    /// next trigger can run — one bad walk cannot wedge the gate shut.
+    #[test]
+    fn a_refresh_that_panics_releases_the_gate() {
+        let gate = RecordingsIndexGate::new();
+        let mut runs = 0;
+        gate.run(
+            RecordingsIndexTrigger::because("keeper started"),
+            |_trigger| {
+                runs += 1;
+                panic!("the walk fell over");
+            },
+        );
+        assert_eq!(runs, 1);
+        assert!(
+            gate.claim(RecordingsIndexTrigger::because("later"))
+                .is_some(),
+            "the guard was given back on the way out of the panic"
+        );
+    }
+
+    /// The probe a profile root's rebuild carries asks the port about each
+    /// session folder by its absolute path and folds the answer exactly as
+    /// the banner does — `verified` over `pushed` over `committed` over
+    /// `local` — and a port that cannot read a folder is no answer at all.
+    #[test]
+    fn the_rebuild_probe_asks_the_port_about_the_folder_and_folds_its_facts() {
+        let facts = |committed: bool, pushed: bool, verified: bool| SegmentDurability {
+            committed,
+            pushed,
+            verified,
+            problem: None,
+        };
+        let port = Arc::new(CountingSyncPort::scripted(vec![
+            Ok(facts(true, true, true)),
+            Ok(facts(true, true, false)),
+            Ok(facts(true, false, false)),
+            Ok(facts(false, false, false)),
+            Err("the repository would not open".to_owned()),
+        ]));
+        let probe =
+            durability_probe_over(Arc::clone(&port) as Arc<dyn RecordingSyncPort>, "tgdrive");
+        let folder = Path::new("/Volumes/tg/recordings/2026/2026-09-08 10.01 gsd");
+        assert_eq!(probe.ask(folder), Some(RecordingDurabilityState::Verified));
+        assert_eq!(probe.ask(folder), Some(RecordingDurabilityState::Pushed));
+        assert_eq!(probe.ask(folder), Some(RecordingDurabilityState::Committed));
+        assert_eq!(probe.ask(folder), Some(RecordingDurabilityState::Local));
+        assert_eq!(
+            probe.ask(folder),
+            None,
+            "a folder the port cannot read has no answer"
+        );
+        assert_eq!(port.durability_asks(), 5);
+        assert_eq!(
+            port.count(&SyncCall::Durability(folder.to_path_buf())),
+            5,
+            "every ask named the session folder's absolute path"
+        );
     }
 
     /// The `tgdrive` fixture the matrix names, as a one-row table.
