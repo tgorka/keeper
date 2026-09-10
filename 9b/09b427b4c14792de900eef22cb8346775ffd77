@@ -1,0 +1,60 @@
+docs/release.md
+  s_8d9397bbd01a6d::t_9cd97c1dcb6c24 167-199
+scripts/check-macos.sh
+  s_8d9397bbd01a6d::t_b3f15a2d764926 50-52,54-62
+  s_8d9397bbd01a6d::t_7e1972dd1d6f8e 49,53
+scripts/build-macos-signed.sh
+  s_8d9397bbd01a6d::t_ee1ceb558fc1ae 80-81,101,110,112-113
+  s_8d9397bbd01a6d::t_cf0c5291852c90 82-100,102-109
+  s_8d9397bbd01a6d::t_f425fb766c146a 111
+src-tauri/crates/keeper/build.rs
+  s_8d9397bbd01a6d::t_7581a3ebed4927 164
+  s_8d9397bbd01a6d::t_18e3c67d17a1b3 183-184
+  s_8d9397bbd01a6d::t_eb830fa83961c8 98-99,101-106,113-116,130,132-133,170-177,179-180,186
+  s_8d9397bbd01a6d::t_5816f57d609269 9-20,22-31,77-80,82,86-97,100,107-112,117-120,122-124,128-129,131,135-138,140-154,156-163,165-169,178,181-182,185
+  s_8d9397bbd01a6d::t_8dabfacaf7726d 46-56
+  s_8d9397bbd01a6d::t_30ac2919e28cfe 121,134,139,155
+  s_8d9397bbd01a6d::t_4f25a3a96d5f28 125-127
+src-tauri/crates/keeper/src/build_identity.rs
+  s_8d9397bbd01a6d::t_3647402e69955f 46,49
+  s_8d9397bbd01a6d::t_2ba7713162fa23 124-183,218
+  s_8d9397bbd01a6d::t_31b54905fb40b4 190-197,202-217
+  s_8d9397bbd01a6d::t_ab4c731848443d 19-24
+  s_8d9397bbd01a6d::t_2ba14eb85cd408 219
+_bmad-output/implementation-artifacts/spec-the-build-names-the-tree-it-came-from.md
+  s_8d9397bbd01a6d::t_288974b07503e6 1-4,8-44,47-54,70-78,82-83
+  s_8d9397bbd01a6d::t_fba61edccdd64d 45-46,62-69,79-81
+  s_8d9397bbd01a6d::t_6acb665165eee0 7
+  s_8d9397bbd01a6d::t_45294e807274be 6,60-61
+  s_8d9397bbd01a6d::t_fdb31af660578a 5,55-59
+  s_8d9397bbd01a6d::t_34a8158504de48 84-118
+scripts/build-sha.test.ts
+  s_8d9397bbd01a6d::t_1dbf8a6c3c97c1 1-159
+scripts/lib/build-sha.sh
+  s_8d9397bbd01a6d::t_030a98b428d18f 7-10,12-25,31-32,48-52,61,65,70-77,82-85
+  s_8d9397bbd01a6d::t_8bf53df0f913a1 1-6,11,26-30,33-47,53-60,62-64,66-69,78-81,86-90
+scripts/install-macos.sh
+  s_8d9397bbd01a6d::t_1771380590fb5b 52-56
+  s_8d9397bbd01a6d::t_b21b3469d25895 57-58
+  s_8d9397bbd01a6d::t_475c34ce1eb47e 78-83
+scripts/install-ios.sh
+  s_8d9397bbd01a6d::t_7fb8685d9bb27a 238-243
+  s_8d9397bbd01a6d::t_4a3b9023fd73da 89-94
+  s_8d9397bbd01a6d::t_e67dfa0aa6ea2d 95-96
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9b09b427b4c14792de900eef22cb8346775ffd77",
+  "prompts": {},
+  "sessions": {
+    "s_8d9397bbd01a6d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "63be83c1-4166-4326-a818-287e4c4ee1b9",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "tgorka <tomasz@gorka.org.pl>"
+    }
+  }
+}
