@@ -4211,6 +4211,7 @@ version = "0.8.26"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "fs4",
  "gix",
  "gix-pack",
  "gix-quote",

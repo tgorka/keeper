@@ -55,6 +55,15 @@ gix-pack = { workspace = true }
 # `[[profile]]` config, and this crate now owns the profile↔TOML mapping the
 # two of them share. MIT/Apache — passes `cargo deny check`.
 toml = { workspace = true }
+# The exclusive lock a long-running `lfs filter-process` helper holds on its
+# `.git/lfs/helpers/<pid>` marker, and the `try_lock` the engine's hourly look
+# uses to tell a live helper from a dead one's leftover (`lfs::store`). The
+# lock is what makes the question answerable without a pid table: a lock the
+# kernel released is a process that is gone. Adds no new crate — the workspace
+# already resolves it for the `keeper` crate's free-space probe, and the `sync`
+# feature is the blocking `std::fs::File` extension. Apache-2.0/MIT — passes
+# `cargo deny check`.
+fs4 = { workspace = true }
 
 # The FIRST platform-conditional dependency in this crate, and it is macOS-only
 # on purpose: AD-40 requires `keeper-syncd` to keep linking this crate on a

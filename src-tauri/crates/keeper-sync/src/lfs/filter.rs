@@ -86,7 +86,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Result, SyncError};
 use crate::lfs::pktline::{self, Packet};
 use crate::lfs::pointer::{Pointer, MAX_POINTER_BYTES};
-use crate::lfs::store::LfsStore;
+use crate::lfs::store::{HelperMarker, LfsStore};
 
 /// What an `lfs …` argument list asks this binary to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,6 +389,44 @@ fn store_object_from_file(
 pub fn run_process(repo: &Path, input: &mut impl Read, output: &mut impl Write) -> Result<()> {
     let store = LfsStore::in_git_dir(repo.join(".git"));
     store.ensure_layout()?;
+    // Say "I am here" where keeper's hourly look will see it: a locked marker
+    // under the store, held to the end of this function and touched after
+    // every request. This process is started by whatever git runs in the
+    // folder — most of them not keeper's — and eighteen of them were once found
+    // idle for three hours, each holding a `git status` nobody was waiting for,
+    // slowing every walk on the volume from seconds to minutes. Nothing in the
+    // log named one. Between requests this process waits by design (an idle
+    // exit is a filter that produced zero bytes under `required=false`), so
+    // the marker is what makes the waiting visible without ending it.
+    let pid = std::process::id();
+    let marker = match store.register_helper(pid) {
+        Ok(marker) => Some(marker),
+        Err(err) => {
+            // stderr, like every line this process writes: stdout is the
+            // protocol. Serving unregistered beats not serving — a filter that
+            // failed here would fail the git that started it — and the reason
+            // goes on the line, because the person reading it is the one who
+            // has to make `helpers/` creatable.
+            eprintln!(
+                "keeper lfs filter: could not register helper {pid} under {}: {err}; serving \
+                 unregistered, so keeper's helper look will not see this process",
+                store.helpers_dir().display()
+            );
+            None
+        }
+    };
+    // The idle clock moves on every sign of life, not only on a finished
+    // request: on arrival, so a request that takes forty minutes is a helper
+    // that was busy from its first byte; on an unknown command, because a
+    // refusal is still an answer; and after `serve_one`, for the wait that
+    // follows it.
+    let touch = |marker: &Option<HelperMarker>| {
+        if let Some(marker) = marker {
+            if let Err(err) = marker.touch() {
+                eprintln!("keeper lfs filter: could not touch helper marker {pid}: {err}");
+            }
+        }
+    };
     // The long-running form carries the same content through the same pipe, so
     // it wants the same buffer. See [`OUTPUT_BUFFER_BYTES`].
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, output);
@@ -404,6 +442,7 @@ pub fn run_process(repo: &Path, input: &mut impl Read, output: &mut impl Write) 
         if keys.is_empty() {
             continue;
         }
+        touch(&marker);
         let command = value_of(&keys, "command");
         let direction = match command.as_deref() {
             Some("clean") => Some(Direction::Clean),
@@ -418,6 +457,7 @@ pub fn run_process(repo: &Path, input: &mut impl Read, output: &mut impl Write) 
             pktline::write_line(output, "status=error")?;
             pktline::write_flush(output)?;
             flush(output)?;
+            touch(&marker);
             continue;
         };
         // The guard is armed around the request and disarmed when it answers.
@@ -430,7 +470,12 @@ pub fn run_process(repo: &Path, input: &mut impl Read, output: &mut impl Write) 
         let named = value_of(&keys, "pathname").map(PathBuf::from);
         serve_one(&store, repo, named.as_deref(), direction, input, output)?;
         drop(serving);
+        // A request finished: the wait that starts now is measured from here.
+        touch(&marker);
     }
+    // Explicit, so the order is on the page: the marker's unlock and unlink
+    // are this helper's last act, after the last answer has been written.
+    drop(marker);
     Ok(())
 }
 
@@ -1211,6 +1256,38 @@ mod tests {
         assert_eq!(answers[0].status, vec!["status=success".to_owned()]);
         assert_eq!(answers[0].body, pointer.as_bytes());
         assert!(!answers[0].body.is_empty(), "never zero bytes");
+    }
+
+    /// Registration never fails the helper: a `helpers` path that cannot be a
+    /// directory costs this process its marker — one stderr line, with the
+    /// reason — and not its service, because a filter that refused to serve
+    /// would fail the `git status` that started it.
+    #[test]
+    fn a_helper_that_cannot_register_still_serves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LfsStore::in_git_dir(dir.path().join(".git"));
+        store.ensure_layout().expect("layout");
+        // A regular file where `helpers/` has to go.
+        std::fs::write(store.helpers_dir(), b"not a directory").expect("block helpers/");
+        let pointer = Pointer::new(
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".to_owned(),
+            4,
+        )
+        .render();
+
+        let mut script = hello();
+        script.extend(request("smudge", "a/big.mov", pointer.as_bytes()));
+        let mut out = Vec::new();
+        run_process(dir.path(), &mut script.as_slice(), &mut out).expect("served unregistered");
+
+        let answers = replies(&out);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].status, vec!["status=success".to_owned()]);
+        assert_eq!(answers[0].body, pointer.as_bytes());
+        assert!(
+            store.helpers_dir().is_file(),
+            "the blocker is not keeper's to remove"
+        );
     }
 
     #[test]

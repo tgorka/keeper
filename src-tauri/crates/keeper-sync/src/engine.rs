@@ -596,6 +596,19 @@ pub const RELEASE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 /// literal there would silently stop reaching one if this changed.
 pub const RELEASE_LOOK_EVERY_MS: i64 = 3_600_000;
 
+/// How often a folder's `filter.lfs.process` helpers are looked at.
+///
+/// An hour, [`RELEASE_LOOK_EVERY_MS`]'s shape and a look interval in the same
+/// sense: nothing fires on it, and the cost bounded by it is one `read_dir`
+/// and one `try_lock` per marker. The thing it detects is a helper idle for
+/// [`lfs::store::LfsStore::STUCK_HELPER_IDLE`] — thirty minutes — so asking
+/// hourly names a stuck helper within ninety minutes of its last request,
+/// against the three and a half hours the field ones had already been standing
+/// when a person found them by hand. Unlike the release look, **absent means
+/// now**: the first tick of a run looks, because a restart is the moment a
+/// helper orphaned by the previous run is most likely to be standing there.
+pub const HELPER_LOOK_EVERY_MS: i64 = 3_600_000;
+
 /// What a `Held` row says, with `{platform}` standing for
 /// [`host_platform_name`] (Epic 70, Story 70.7, AD-235).
 ///
@@ -846,6 +859,13 @@ const WATCH_REARM_INTERVAL_MS: i64 = 60_000;
 /// be retired again without disturbing anything else on display, and matching
 /// its own prefix is the only way to tell our message from someone else's.
 const WATCH_DEGRADED_PREFIX: &str = "keeper cannot watch this folder for changes";
+
+/// The opening words of the stuck-helper warning, for [`WATCH_DEGRADED_PREFIX`]'s
+/// reason: the helper look retires its own warning by these words and no
+/// other, so a look that finds nothing never wipes a warning about something
+/// else. The tail carries numbers that move between looks; the prefix must
+/// not.
+const HELPER_STUCK_PREFIX: &str = "a git run in this folder has left keeper's LFS helper waiting";
 
 /// The refusal when a merge in progress cannot be undone (Story 70.3, AD-229).
 ///
@@ -1239,6 +1259,24 @@ pub struct Engine {
     /// leaves scratch behind is the one that was killed, and the next start is
     /// the first moment anything can clean up after it.
     next_sweep_ms: Mutex<HashMap<String, i64>>,
+    /// When each profile's `filter.lfs.process` helpers may next be looked at.
+    ///
+    /// [`Self::next_sweep_ms`]'s shape, absent meaning "now", for the same
+    /// reason: a helper the previous run left standing is found on the first
+    /// tick of this one. See [`HELPER_LOOK_EVERY_MS`].
+    next_helper_look_ms: Mutex<HashMap<String, i64>>,
+    /// Profiles whose stuck-helper warning has already been announced.
+    ///
+    /// [`Self::task_faults`]'s shape, for [`Self::warn_watch_degraded`]'s
+    /// reason: `warn` keys its toast on the snapshot's `None → Some`, and
+    /// [`Self::clear_warning`] wipes the snapshot after every successful
+    /// unit — which a stuck helper does not stop. Without this set the hourly
+    /// look would find the field empty every time and post the same onset
+    /// once an hour for as long as the helper stands, the storm Story 29.6
+    /// exists to prevent. The set says "already told"; the look re-asserts
+    /// the text silently while it is in, and [`Self::clear_helper_warning`]
+    /// is the only way out of it.
+    helper_warned: Mutex<HashSet<String>>,
     /// When each profile's release candidates may next be looked at (Story
     /// 56.5).
     ///
@@ -1768,6 +1806,8 @@ impl Engine {
             next_remote_poll_ms: Mutex::new(HashMap::new()),
             footprint_memo: Mutex::new(HashMap::new()),
             next_sweep_ms: Mutex::new(HashMap::new()),
+            next_helper_look_ms: Mutex::new(HashMap::new()),
+            helper_warned: Mutex::new(HashSet::new()),
             next_release_ms: Mutex::new(HashMap::new()),
             release_cursor: Mutex::new(HashMap::new()),
             // `current_exe` is the daemon in a CLI run and the app binary in a
@@ -2347,6 +2387,8 @@ impl Engine {
         Self::lock(&self.gates).remove(id);
         Self::lock(&self.next_scan_ms).remove(id);
         Self::lock(&self.next_sweep_ms).remove(id);
+        Self::lock(&self.next_helper_look_ms).remove(id);
+        Self::lock(&self.helper_warned).remove(id);
         Self::lock(&self.next_prune_ms).remove(id);
         Self::lock(&self.lfs_moved).remove(id);
         Self::lock(&self.next_release_ms).remove(id);
@@ -2389,6 +2431,7 @@ impl Engine {
             // a request to look now.
             Self::lock(&self.next_scan_ms).remove(id);
             Self::lock(&self.next_sweep_ms).remove(id);
+            Self::lock(&self.next_helper_look_ms).remove(id);
             Self::lock(&self.next_prune_ms).remove(id);
             Self::lock(&self.next_release_ms).remove(id);
             Self::lock(&self.release_cursor).remove(id);
@@ -2913,9 +2956,10 @@ impl Engine {
         Ok(())
     }
 
-    /// One profile's share of a tick: the hourly sweep, then the pass.
+    /// One profile's share of a tick: the housekeeping looks, then the pass.
     async fn tick_one(&self, profile: &SyncProfile) {
         self.sweep_scratch_if_due(profile).await;
+        self.look_at_helpers_if_due(profile).await;
         // `Ok` here is not success. `tick_profile` returns `Ok` after a
         // drain that rescheduled a failed unit, after a volume gate that
         // skipped the profile, after a reservation it could not take — so
@@ -4616,6 +4660,170 @@ impl Engine {
         }
         due.insert(profile.id.clone(), now.saturating_add(SWEEP_EVERY_MS));
         true
+    }
+
+    /// [`Self::sweep_is_due`]'s shape on [`HELPER_LOOK_EVERY_MS`]: first sight
+    /// looks, then hourly.
+    fn helper_look_is_due(&self, profile: &SyncProfile) -> bool {
+        let now = self.platform.now_ms();
+        let mut due = Self::lock(&self.next_helper_look_ms);
+        match due.get(&profile.id) {
+            None => {}
+            Some(at) if now >= *at => {}
+            Some(_) => return false,
+        }
+        due.insert(profile.id.clone(), now.saturating_add(HELPER_LOOK_EVERY_MS));
+        true
+    }
+
+    /// Look, once an hour, at the `filter.lfs.process` helpers alive in this
+    /// folder, and name the ones nobody is talking to.
+    ///
+    /// # Why keeper has to look at processes it did not start
+    ///
+    /// Keeper registers itself as the folder's LFS filter, so a `git` that
+    /// cleans or smudges a tracked path there starts a `keeper lfs
+    /// filter-process` helper — and until this look, keeper had no view of
+    /// those helpers at all. On hesperia (2026-09-09) eighteen `git status`
+    /// processes from an external caller each held one, idle for 3 h 22 min
+    /// on `/Volumes/merope/neuradrive`; keeper's own walks on that volume went
+    /// from seconds to 200–240 s and one never finished, and nothing in the
+    /// log said why. The helper's own watchdog covers a request that never
+    /// ends, not the wait between requests — that wait is by design — and
+    /// `GIT_DEADLINE` covers only the git children keeper spawned.
+    ///
+    /// # What it does, and what it never does
+    ///
+    /// [`lfs::store::LfsStore::look_at_helpers`]: a marker whose lock can be
+    /// taken is a dead helper's leftover and is removed; a locked marker idle
+    /// longer than [`lfs::store::LfsStore::STUCK_HELPER_IDLE`] is a stuck
+    /// helper. A marker the lock could not be tried on — a mount that refuses
+    /// `flock` — is placed by asking the pid table instead, so the look cannot
+    /// read as healthy on a filesystem that hides every helper. Keeper counts
+    /// them, names the oldest's idle time, its git and the process that ran
+    /// that git ([`helper_parent_command`], at look time, only for stuck
+    /// ones), writes one INFO line per look, raises one sticky warning per
+    /// onset — kept in [`Self::helper_warned`], because a stuck helper does
+    /// not stop units succeeding and every success wipes the snapshot's text —
+    /// and retires it, by its own words, see [`Self::clear_helper_warning`],
+    /// when none remain. It never kills, signals or closes a helper or its
+    /// parent: they belong to a git keeper did not start, and that git holds
+    /// state an ended filter would not release cleanly. The warning tells the
+    /// person which process to quit instead.
+    ///
+    /// Never fails the tick, for [`Self::sweep_scratch_if_due`]'s reason.
+    async fn look_at_helpers_if_due(&self, profile: &SyncProfile) {
+        if !self.helper_look_is_due(profile) {
+            return;
+        }
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        let helpers_dir = store.helpers_dir();
+        let looked = tokio::task::spawn_blocking(move || {
+            let idle = lfs::store::LfsStore::STUCK_HELPER_IDLE;
+            let mut look = store.look_at_helpers(std::time::SystemTime::now(), idle);
+            // The lock could not be tried on these, so the pid table answers
+            // the question the lock normally does. `ps` per marker, and only
+            // here: on a filesystem that locks, this loop is empty.
+            for (pid, idle_for) in &look.skipped {
+                if pid_is_alive(*pid) {
+                    look.alive += 1;
+                    if *idle_for >= idle {
+                        look.stuck.push((*pid, *idle_for));
+                    }
+                }
+            }
+            look
+        })
+        .await;
+        let look = match looked {
+            Ok(look) => look,
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %err,
+                    "the helper look did not finish"
+                );
+                return;
+            }
+        };
+        tracing::info!(
+            profile = profile.name,
+            alive = look.alive,
+            stuck = look.stuck.len(),
+            removed = look.removed,
+            skipped = look.skipped.len(),
+            "helper look"
+        );
+        if !look.skipped.is_empty() {
+            crate::anomaly::Anomaly {
+                what: "LFS helper markers whose lock could not be tried",
+                measured: format!(
+                    "skipped={} dir={}",
+                    look.skipped.len(),
+                    helpers_dir.display()
+                ),
+                expected: "zero; a marker is a locked file, and the lock is what tells a live \
+                           helper from a dead one's leftover",
+                consequence: "those helpers were placed by pid instead, which says alive or gone \
+                              but never removes a leftover; a mount that refuses file locks is \
+                              the usual cause, and the folder's LFS store is on one",
+            }
+            .report(&profile.name);
+        }
+        let Some((pid, idle)) = look.oldest_stuck() else {
+            self.clear_helper_warning(&profile.id);
+            return;
+        };
+        // `ps` only now, and only for the stuck one worth naming: the look
+        // itself must stay one `read_dir` and one `try_lock` per marker.
+        let parent = helper_parent_command(pid).await;
+        let idle_min = idle.as_secs() / 60;
+        crate::anomaly::Anomaly {
+            what: "an LFS filter helper has had no request for longer than any walk takes",
+            measured: format!(
+                "stuck={} alive={} oldest_pid={pid} oldest_idle_min={idle_min} parent={parent}",
+                look.stuck.len(),
+                look.alive
+            ),
+            expected: "zero; a helper waits only between the requests of a git that is still \
+                       walking, and a walk is seconds",
+            consequence: "the git that started it is standing on this folder, and keeper's own \
+                          walks here slow from seconds to minutes while it does; keeper never \
+                          kills a helper — quit the process that ran that git",
+        }
+        .report(&profile.name);
+        let message = format!(
+            "{HELPER_STUCK_PREFIX}: {} LFS filter helper(s) idle, the oldest for {idle_min} min, \
+             waiting on {parent}. Every sync walk here is slower while it stands. keeper never \
+             ends another program's git — quit the process that ran it and the warning clears \
+             on the next look",
+            look.stuck.len()
+        );
+        // The onset is this set's, not the snapshot's: `warn` would read a
+        // fresh onset off every field a successful unit had wiped since the
+        // last look, and post the same toast once an hour.
+        let onset = Self::lock(&self.helper_warned).insert(profile.id.clone());
+        if onset {
+            self.warn(&profile.id, &profile.name, message);
+        } else if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
+            snapshot.warning = Some(message);
+        }
+    }
+
+    /// Retire the stuck-helper warning, and only that one — the
+    /// [`Self::clear_watch_warning`] idiom, keyed on [`HELPER_STUCK_PREFIX`] —
+    /// and re-arm its onset, so a helper that gets stuck again is a new toast.
+    fn clear_helper_warning(&self, profile_id: &str) {
+        Self::lock(&self.helper_warned).remove(profile_id);
+        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
+            if snapshot
+                .warning
+                .as_deref()
+                .is_some_and(|shown| shown.starts_with(HELPER_STUCK_PREFIX))
+            {
+                snapshot.warning = None;
+            }
+        }
     }
 
     /// Whether this profile's LFS store may be pruned on this success edge
@@ -11951,6 +12159,7 @@ impl Engine {
         // means the footprint report, the release look and its rotation start
         // over, and the memo behind the report goes with them.
         Self::lock(&self.next_sweep_ms).remove(id);
+        Self::lock(&self.next_helper_look_ms).remove(id);
         Self::lock(&self.next_release_ms).remove(id);
         Self::lock(&self.release_cursor).remove(id);
         Self::lock(&self.footprint_memo).remove(id);
@@ -15828,6 +16037,134 @@ fn minute_of_day(hhmm: &str) -> Option<u16> {
     let hours: u16 = hours.parse().ok()?;
     let minutes: u16 = minutes.parse().ok()?;
     (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
+}
+
+/// How long the `ps` walk behind [`helper_parent_command`] may take before
+/// the look gives up on naming anyone.
+///
+/// Generous for five `ps` calls, which are milliseconds; the case it bounds is
+/// a `ps` that hangs, which on a machine whose process table is under a stuck
+/// volume is not unheard of, and the look must not hold the tick for it.
+const PS_WALK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Name the git a stuck helper is waiting on, and the process that ran that
+/// git — `unknown` when `ps` cannot say in time.
+///
+/// The parent of a helper is always a `git`; the process a person has to quit
+/// is that git's own parent, or its parent's, when a script ran a `git` that
+/// ran a `git`. So the walk climbs the ppid chain — at most five hops — until
+/// the first command whose basename is not `git`, and names both ends. A
+/// parent of 1 at the first hop means the git has already exited and the
+/// helper's stdin is held by whatever inherited it, which is the case nothing
+/// but a stuck helper could ever show.
+///
+/// Bounded by [`PS_WALK_DEADLINE`] and never fatal: `unknown` with one `warn`
+/// line is what a `ps` that hangs, or a blocking task that panics, costs.
+async fn helper_parent_command(pid: u32) -> String {
+    let walk = tokio::task::spawn_blocking(move || helper_parent_command_blocking(pid));
+    match tokio::time::timeout(PS_WALK_DEADLINE, walk).await {
+        Ok(Ok(named)) => named,
+        Ok(Err(err)) => {
+            tracing::warn!(pid, error = %err, "naming a stuck LFS helper's parent did not finish");
+            "unknown".to_owned()
+        }
+        Err(_) => {
+            tracing::warn!(
+                pid,
+                "naming a stuck LFS helper's parent took longer than {PS_WALK_DEADLINE:?}; ps \
+                 is not answering"
+            );
+            "unknown".to_owned()
+        }
+    }
+}
+
+/// [`helper_parent_command`]'s walk, on the calling thread.
+///
+/// `ps` per hop rather than one table read: the look names one process an
+/// hour, and a whole-table read to find it would be the expensive idiom
+/// `tests/lfs_filter_process.rs` uses for a different question. `ps` rather
+/// than `libc` or `/proc`, for that test's reason too: no new crate, and the
+/// machine this was measured on is the Mac.
+fn helper_parent_command_blocking(pid: u32) -> String {
+    #[cfg(unix)]
+    {
+        const HOPS: usize = 5;
+        let Some((ppid, _)) = ps_row(pid) else {
+            return "unknown".to_owned();
+        };
+        if ppid <= 1 {
+            return "orphaned: its git has exited and pid 1 holds its stdin".to_owned();
+        }
+        let Some((mut ancestor, parent_command)) = ps_row(ppid) else {
+            return format!("pid {ppid} (unknown command)");
+        };
+        let parent = format!("`{parent_command}` (pid {ppid})");
+        for _ in 0..HOPS {
+            if ancestor <= 1 {
+                return format!("{parent}, orphaned: the process that ran it has exited");
+            }
+            let Some((next, command)) = ps_row(ancestor) else {
+                return format!("{parent}, run by pid {ancestor} (unknown command)");
+            };
+            if command_basename(&command) != "git" {
+                return format!("{parent}, run by `{command}` (pid {ancestor})");
+            }
+            ancestor = next;
+        }
+        format!("{parent}, run by pid {ancestor}")
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        "unknown".to_owned()
+    }
+}
+
+/// One process's parent pid and command line, from `ps`; `None` when there is
+/// no such process or `ps` will not say.
+#[cfg(unix)]
+fn ps_row(pid: u32) -> Option<(u32, String)> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=,command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (ppid, command) = text.trim().split_once(char::is_whitespace)?;
+    Some((ppid.parse().ok()?, command.trim().to_owned()))
+}
+
+/// The program name of a command line: `git` for both `git status` and
+/// `/usr/bin/git status`.
+#[cfg(unix)]
+fn command_basename(command: &str) -> &str {
+    let program = command.split_whitespace().next().unwrap_or_default();
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+}
+
+/// Whether a process with this pid exists, by `ps -p`'s exit status — the
+/// fallback the helper look uses for a marker whose lock it could not try.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// The hydration capability a verified copy asks for (Story 56.6).
@@ -19820,6 +20157,323 @@ mod tests {
         assert!(!engine.sweep_is_due(&p), "still inside the hour");
         platform.advance_ms(1);
         assert!(engine.sweep_is_due(&p), "the hour has passed");
+    }
+
+    /// The eyes on the helpers: a marker the test itself locks and back-dates
+    /// stands in for a helper whose git stopped talking to it. Onset warns
+    /// once; a second look that finds it still there does not repeat the
+    /// notification, even after a successful unit has wiped the snapshot's
+    /// text in between; unlocking it — what the kernel does when the helper
+    /// dies — retires the warning on the next look, and only this warning.
+    ///
+    /// The marker carries this test's own pid, so the `ps` walk that names
+    /// the parent resolves to a real process rather than `unknown`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_helper_warns_once_and_the_warning_retires_when_it_goes() {
+        use fs4::fs_std::FileExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        store.ensure_layout().expect("layout");
+        let notifications = || {
+            platform
+                .notifications
+                .lock()
+                .map(|n| n.len())
+                .unwrap_or_default()
+        };
+
+        // A warning about something else is up; the look must leave it alone.
+        engine.warn(
+            &p.id,
+            &p.name,
+            format!("{WATCH_DEGRADED_PREFIX}, so nothing is quick here"),
+        );
+        assert_eq!(notifications(), 1);
+
+        // No helpers: one look, zeros, and the other warning still standing.
+        engine.look_at_helpers_if_due(&p).await;
+        let shown = engine.status(&p.id).expect("status").warning;
+        assert!(
+            shown
+                .as_deref()
+                .is_some_and(|w| w.starts_with(WATCH_DEGRADED_PREFIX)),
+            "a look that finds nothing retires nothing but its own: {shown:?}"
+        );
+        assert!(!engine.helper_look_is_due(&p), "and the hour is armed");
+
+        // A helper whose git went quiet thirty-one minutes ago: the lock is
+        // the test's own, so the kernel treats it exactly as a live process.
+        std::fs::create_dir_all(store.helpers_dir()).expect("helpers dir");
+        let marker = store.helpers_dir().join(std::process::id().to_string());
+        std::fs::write(&marker, b"").expect("write marker");
+        let held = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&marker)
+            .expect("open marker");
+        assert!(
+            held.try_lock_exclusive().expect("lock"),
+            "the test holds it"
+        );
+        held.set_modified(
+            std::time::SystemTime::now()
+                - lfs::store::LfsStore::STUCK_HELPER_IDLE
+                - Duration::from_secs(60),
+        )
+        .expect("back-date");
+
+        platform.advance_ms(HELPER_LOOK_EVERY_MS);
+        engine.look_at_helpers_if_due(&p).await;
+        let shown = engine.status(&p.id).expect("status").warning;
+        let shown = shown.expect("a stuck helper is a warning");
+        assert!(shown.starts_with(HELPER_STUCK_PREFIX), "{shown}");
+        assert!(shown.contains("1 LFS filter helper"), "the count: {shown}");
+        assert!(
+            shown.contains("waiting on `") && shown.contains("run by `"),
+            "the git and the process that ran it: {shown}"
+        );
+        assert!(
+            shown.contains("the oldest for 31 min"),
+            "the idle time: {shown}"
+        );
+        assert!(
+            marker.exists(),
+            "a look never removes a live helper's marker"
+        );
+        // The other warning was replaced, not added to, and the toast rode
+        // the level rather than a fresh onset — as `warn` does today.
+        assert_eq!(notifications(), 1, "no onset while another warning stands");
+
+        // A unit succeeds in between — a stuck helper does not stop the
+        // folder syncing — and wipes the snapshot's text, as it does after
+        // every success. Same helper, next hour: the warning is re-asserted,
+        // and the toast is not repeated, because the onset is the set's and
+        // not the field's.
+        engine.clear_warning(&p.id);
+        assert!(
+            engine.status(&p.id).expect("status").warning.is_none(),
+            "the success wiped the text"
+        );
+        platform.advance_ms(HELPER_LOOK_EVERY_MS);
+        engine.look_at_helpers_if_due(&p).await;
+        assert!(
+            engine
+                .status(&p.id)
+                .expect("status")
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.starts_with(HELPER_STUCK_PREFIX)),
+            "still stuck, still warned"
+        );
+        assert_eq!(
+            notifications(),
+            1,
+            "a second look does not repeat the toast, even after the field was wiped"
+        );
+
+        // The helper dies: the kernel drops the lock, the file stays.
+        held.unlock().expect("unlock");
+        drop(held);
+        platform.advance_ms(HELPER_LOOK_EVERY_MS);
+        engine.look_at_helpers_if_due(&p).await;
+        assert!(
+            engine.status(&p.id).expect("status").warning.is_none(),
+            "no stuck helper, no warning"
+        );
+        assert!(!marker.exists(), "the leftover is removed");
+
+        // And the onset re-arms: a helper that gets stuck again is a new
+        // toast, because the clear took the profile out of `helper_warned`.
+        let held = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&marker)
+            .expect("open marker again");
+        assert!(held.try_lock_exclusive().expect("lock again"));
+        held.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .expect("back-date again");
+        platform.advance_ms(HELPER_LOOK_EVERY_MS);
+        engine.look_at_helpers_if_due(&p).await;
+        assert_eq!(notifications(), 2, "a fresh onset notifies again");
+        drop(held);
+    }
+
+    /// The clock behind the look: the first tick of a run, then hourly.
+    #[test]
+    fn helpers_are_looked_at_on_the_first_tick_and_then_hourly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+
+        assert!(
+            engine.helper_look_is_due(&p),
+            "a folder is looked at when first seen"
+        );
+        assert!(
+            !engine.helper_look_is_due(&p),
+            "and not again on the next tick"
+        );
+
+        platform.advance_ms(HELPER_LOOK_EVERY_MS - 1);
+        assert!(!engine.helper_look_is_due(&p), "still inside the hour");
+        platform.advance_ms(1);
+        assert!(engine.helper_look_is_due(&p), "the hour has passed");
+    }
+
+    /// Two stuck at once: the warning carries the count, and the one it
+    /// names is the older.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_stuck_helpers_warn_with_the_count_and_name_the_older() {
+        use fs4::fs_std::FileExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        std::fs::create_dir_all(store.helpers_dir()).expect("helpers dir");
+
+        let now = std::time::SystemTime::now();
+        let lock_back_dated = |pid: u32, ago: Duration| {
+            let path = store.helpers_dir().join(pid.to_string());
+            std::fs::write(&path, b"").expect("write marker");
+            let held = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open marker");
+            assert!(held.try_lock_exclusive().expect("lock"));
+            held.set_modified(now - ago).expect("back-date");
+            held
+        };
+        // The older one is this process, so the walk names a real parent;
+        // the younger is a pid nothing answers for.
+        let older = lock_back_dated(std::process::id(), Duration::from_secs(2 * 3600));
+        let younger = lock_back_dated(u32::MAX - 7, Duration::from_secs(3600));
+
+        engine.look_at_helpers_if_due(&p).await;
+        let shown = engine.status(&p.id).expect("status").warning;
+        let shown = shown.expect("two stuck helpers are a warning");
+        assert!(
+            shown.contains("2 LFS filter helper(s)"),
+            "the count: {shown}"
+        );
+        assert!(
+            shown.contains("the oldest for 120 min"),
+            "the older one's idle, not the younger's: {shown}"
+        );
+        assert!(
+            shown.contains("run by `"),
+            "named from the older's pid: {shown}"
+        );
+        drop(older);
+        drop(younger);
+    }
+
+    /// "Recheck all files" restarts the hourly clocks by name, this one
+    /// included: a person pressing it has a folder that is misbehaving, and a
+    /// stuck helper is one of the things that makes a folder misbehave.
+    #[test]
+    fn a_rescan_re_arms_the_helper_look() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert!(engine.helper_look_is_due(&p), "first sight");
+        assert!(!engine.helper_look_is_due(&p), "then armed for an hour");
+        engine.rescan(&p.id).expect("rescan");
+        assert!(
+            engine.helper_look_is_due(&p),
+            "a rescan looks again without waiting out the hour"
+        );
+    }
+
+    /// The wiring, not the private method: a tick over a folder with a
+    /// locked, back-dated marker leaves the stuck-helper warning on the
+    /// folder's card. The reservation is held across the tick so the pass
+    /// itself declines — the look runs before it, and this test is about the
+    /// look reaching the snapshot, not about what a pass over a folder that
+    /// is not a repository would say afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tick_over_a_stuck_helper_puts_the_warning_on_the_card() {
+        use fs4::fs_std::FileExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        std::fs::create_dir_all(store.helpers_dir()).expect("helpers dir");
+        let marker = store.helpers_dir().join(std::process::id().to_string());
+        std::fs::write(&marker, b"").expect("write marker");
+        let held = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&marker)
+            .expect("open marker");
+        assert!(held.try_lock_exclusive().expect("lock"));
+        held.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .expect("back-date");
+
+        let reserved = engine.reserve(&p.id).expect("free before the tick");
+        let _ = engine.tick().await;
+        drop(reserved);
+
+        let shown = engine.status(&p.id).expect("status").warning;
+        assert!(
+            shown
+                .as_deref()
+                .is_some_and(|w| w.starts_with(HELPER_STUCK_PREFIX)),
+            "the tick's look reached the card: {shown:?}"
+        );
+        drop(held);
+    }
+
+    /// The `ps` walk on a process that certainly exists — this one: it names
+    /// the parent by pid, climbs to something that is not `git`, and is not
+    /// `unknown`. A pid nothing answers for is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_parent_walk_names_this_tests_own_parent() {
+        let me = std::process::id();
+        let (ppid, _) = ps_row(me).expect("ps knows this process");
+        let named = helper_parent_command(me).await;
+        assert_ne!(named, "unknown");
+        assert!(
+            named.contains(&format!("(pid {ppid})")),
+            "the parent's pid is in it: {named}"
+        );
+        assert!(named.contains("run by "), "and who ran it: {named}");
+
+        assert_eq!(helper_parent_command(u32::MAX - 7).await, "unknown");
+        assert!(pid_is_alive(me));
+        assert!(!pid_is_alive(u32::MAX - 7));
+        assert_eq!(command_basename("/usr/bin/git status"), "git");
+        assert_eq!(command_basename("git status"), "git");
+        assert_eq!(command_basename("/bin/zsh -l"), "zsh");
     }
 
     /// A ledger row with nothing recorded but the instant content landed.

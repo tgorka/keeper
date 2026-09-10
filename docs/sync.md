@@ -338,6 +338,18 @@ for one path instead of emptying the rest. What `false` still buys is that a
 worktree whose keeper binary has moved remains checkout-able, as pointers,
 rather than hard-failing every git command in the folder.
 
+Keeper watches the helpers this registration starts — a `git` that cleans or
+smudges a tracked path in the folder starts one (a `status` over a changed
+media file does; a `log` does not), and it waits between requests by design —
+and names a stuck one: each helper holds a locked `.git/lfs/helpers/<pid>`
+marker it touches on every request, and the hourly *helper look* (§21) counts
+the live ones, removes a dead one's leftover, and warns once — with the count,
+the oldest's idle time, the git it is waiting on and the process that ran that
+git — when one has had no request for 30 minutes. It never kills a helper: the
+helper belongs to a git keeper did not start, and that git holds state (an
+index lock, a half-written index) that ending its filter would not release
+cleanly, so the warning names the process to quit instead.
+
 Two guards sit behind it:
 
 - **A file that is empty while its pointer names non-zero bytes is never
@@ -405,7 +417,10 @@ serve this". A non-empty result exits non-zero so a cron wrapper sees it.
 On the machine where content originates, every LFS file whose worktree holds the
 real content exists **twice**: once in the worktree, and once in
 `<git-dir>/lfs/objects` as the byte-identical object the clean path streamed
-there to compute the pointer. A path whose worktree bytes are the pointer is the
+there to compute the pointer. (`objects/` is the store proper; beside it the
+same directory holds `incomplete/` for a download that can resume, `tmp/` for
+the scratch an atomic publish goes through, and `helpers/` for the live filter
+helpers' markers — the last is keeper's own and `git-lfs` never reads it.) A path whose worktree bytes are the pointer is the
 inverse case — there the store object is the *only* local copy of the content
 (§9). That copy is unavoidable at stage time — the bytes have to be read and
 hashed — but it is not needed forever. Measured on a 211 GB archive: 215 GB of
@@ -3164,6 +3179,7 @@ than once an hour**, and the thorough passes run once a day.
 | **release sweep** | virtual files: let content go after its window | §9's sweep over the ledger, budgeted (32 objects / 1 GiB per pass), every refusal `dehydrate` has | on the success edge, at most once an **hour** per folder (`RELEASE_LOOK_EVERY_MS`); a `release` task can veto or drive it (§14) | `release sweep released=N` / `the release sweep did not finish this pass` | `release_expired`, `release_is_due` |
 | **ledger ageing** | the `materialized` table does not grow forever | delete rows released more than 90 days ago | on the same success edge | `forgot ledger rows released more than ninety days ago` when any went | `age_out_materialized` |
 | **scratch sweep** | an interrupted transfer's leftovers | delete `.git/lfs/tmp` and `incomplete/` entries older than an hour | every **24 h** (`SWEEP_EVERY_MS`) | `scratch sweep found=N removed=N` | `sweep_scratch_if_due` |
+| **helper look** | a `filter.lfs.process` helper another git left waiting | one `read_dir` of `.git/lfs/helpers/` and one `try_lock` per marker: an unlocked marker is a dead helper's leftover and is removed; a locked one idle ≥ 30 min (`STUCK_HELPER_IDLE`) is a stuck helper — counted, and the oldest named with its idle time, its git and the process that ran that git (a `ps` walk up the parent chain, only then, bounded to 10 s); a marker whose lock cannot be tried is placed by `ps -p` instead and reported as skipped; one sticky warning per onset, retired when none remain; **never killed** — it belongs to a git keeper did not start | every **1 h** (`HELPER_LOOK_EVERY_MS`), and the first tick of a run | `helper look alive=N stuck=N removed=N skipped=N`, and the `anomaly:` line when stuck > 0 or skipped > 0 | `look_at_helpers_if_due`, `LfsStore::look_at_helpers` |
 | **footprint sweep** | say what history carries as plain blobs above today's threshold, and whether a control file is pointer text | one `lstat` per tracked path — or, when HEAD and the threshold have not moved since the last one, the remembered numbers with no walk | rides the scratch sweep, every **24 h** | `footprint sweep files=N bytes=N measured=true|false`, and the `anomaly:` line when files > 0 | `report_blobs_over_threshold` |
 | **`gc`** (a §14 task) | the object store stays packed | `git gc --quiet` in a quiet window (the folder's reservation and its walk claim) | seeded **`every 7d`** per desktop folder (`gc-<id>`); editable and deletable like any task | the task's run line (`task … outcome=…`) and `loose_before=… loose_after=…` | `perform_gc_task`, `db::seed_gc_task` |
 | **notes cadence** | a note is committed soon after you stop typing and pushed soon after | `commit` asks the engine to look now (`wake_now`); `push` is one `sync_once` | commit **2 s** after the last edit (`commitIdleMs`); push **30 s** after the commit (`pushIntervalMs`), or at once on blur where `pushOnBlur` is set | `notes cadence: commit — …` / `notes cadence: push — …` | `notes_vault::dispatch_cadence` |
