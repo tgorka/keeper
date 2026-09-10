@@ -6022,3 +6022,19 @@ status: open
   summary: A sweep-found file that keeps changing buys a full directory walk on every settle-deadline pass until it settles, because the gate's only observer is the walk and only a walk with a directory scan can see an untracked path.
   evidence: `collect_stable_changes` sets `untracked_appeared` whenever an untracked path is `Settling`, and `commit_walk_policy` spends it on `full()`; a file still being written stays `Settling` per pass, so on the reference folder (155 626 entries, USB) each pass costs the 1.6–6.8 s directory walk measured 2026-09-09 rather than one `lstat`. The watcher's `Create` path already behaves this way, so the story extends an existing cost rather than adding a class; the durable fix is a second look that re-samples the held unindexed paths directly (one `FileSample` each) instead of walking the tree, which is a gate/walk design change outside this story's Never list.
   status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-a-folders-durable-status-tells-the-truth.md`
+  summary: A `needsAttention` set by the parked-upload arm of `record_failure` carries no sentence beside it, so any other unit's success retires the word while the parked upload is still parked.
+  evidence: |
+    Pre-existing, found 2026-09-10 in the story's second review loop. `record_failure`'s
+    `LfsUploadPending` arm (`src-tauri/crates/keeper-sync/src/engine.rs`) answers a held push whose
+    uploads have all stopped moving with `set_state(NeedsAttention)` and nothing else — no `warn`, no
+    `set_error` — so the snapshot wears the word with no sentence a person could read, and
+    `note_unit_succeeded` (which runs for any unit that completed, a fetch included) moves a bare
+    `NeedsAttention` to `watching` because nothing in the snapshot says why it stood. Before
+    this story `refresh_pending` flipped it to `watching` on the next empty queue regardless, so the
+    story narrows the window rather than opening it. The parked upload itself is still visible in
+    the problems view. The fix is a sentence beside the word (`set_error` naming the parked object,
+    as the permanent arm does) and a retire keyed to that upload moving or being unparked, rather
+    than to any unit's success.
+  status: open

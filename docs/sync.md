@@ -1615,6 +1615,103 @@ row recorded before this column existed, or a conflict copy a merge just wrote,
 whose publication belongs to a commit that does not exist yet. Absence there is a
 deliberate answer, not a gap.
 
+### What `keeper-syncd status` reads, and when it is allowed to change
+
+The tray and the window poll a snapshot the running engine keeps in memory. A
+separate process — `keeper-syncd status`, or the app at its next launch — has no
+snapshot and reads three columns of the profile row in `sync.db` instead:
+
+| column | what it says | written by |
+|---|---|---|
+| `state` | the last state word the engine observed | `persist_state`, from its callers: `set_state` (every explicit change — a failure's arm, a phase's end), `note_unit_succeeded` (the success that takes `offline` or `needsAttention` off), and the pass end's `settle_and_persist` and the queue refresh's `Syncing → settled` edge, each of which writes only when the word moved |
+| `last_error` | the sentence beside the folder, or `NULL` | the failures that stop a folder, and the success that retires them |
+| `updated_ms` | the engine's clock at the last write of `json`, `state` or `last_error` | both of the above, and a profile edit — every writer of the row except the one-shot migrations, which observe nothing |
+
+The two columns are written by two separate writers on purpose: a folder can go
+`syncing → watching` a hundred times while one error stands, and a state write
+that also cleared the error would erase the reason on the very next tick.
+`updated_ms` moves on both, which is the only way to tell a row written a second
+ago from one the last run left behind in August — the state word alone reads the
+same either way.
+
+**`offline` stands until a unit reaches the remote.** A network failure puts
+the folder into the engine's sticky offline set, and what takes it out is a
+leg of work that actually round-tripped — a fetch that came back, a push that
+pushed, a transfer that moved bytes, a clone that landed. Nothing else counts:
+not a pass that committed nothing, not a queue that emptied because the failed
+unit is waiting out its backoff, not the supervisor's tick having run, not a
+pass that reached its end without a round trip, and not a unit that completed
+without one — a push with nothing to send, a checkout that adopted the folder
+in place, a transfer whose object was already in the store, a folder with
+large-file support off. Each of those completes without asking the remote a
+thing, and each used to empty the set. (Each still retires the folder's own
+sentence, because the work the sentence names is done — a checkout that
+finishes the copy an earlier run left half-made retires "this folder's first
+copy never finished" whether it cloned or restored from the commits already
+here.) The word a finished pass writes is the
+state that is *still true* of the folder, and a profile still in the offline
+set, or still carrying an error, outranks the pass's "I am done"; only
+`paused` outranks the set, because it is a setting rather than an observation.
+On hesperia, before this rule, one folder read `watching` through 1 044
+consecutive push failures: every pass end wrote the word unconditionally, and
+the pass end also declared the remote reachable — a pull-only pass whose fetch
+was fine drained an upload unit that failed on the network, the drain absorbed
+that failure into the journal's backoff, and the end of the same pass emptied
+the offline set and logged `sync reachable again`, thirteen times. A pass now
+knows what its legs proved: a round trip that came back, none at all, or a
+drained unit's failure — and only the first earns the reset. When the unit that
+does succeed publishes no phase (a push with nothing to send is not one of
+them; a fetch on the supervisor's tick is), the success itself moves the word
+to `watching` and writes the row, because nothing else would.
+
+The set has one other exit: a failure the remote *answered with*. A refused
+credential, a 403, a quota, a rejected push, history the remote holds and this
+copy does not, bytes that did not verify — each is a round trip that came
+back, and the sticky set is about a remote that cannot be reached. Such a
+failure leaves the set (logging the same `sync reachable again`, because it is
+the same edge) and lets the `needsAttention` the folder just earned stand,
+rather than a stale `offline` outranking it at the pass end. A failure the
+remote did not answer — a local file that would not open, a push held because
+its large files have not landed — is not an exit: the held push in particular
+is raised on every pass of exactly the folder whose uploads are failing, and
+reading it as "reachable" would take that folder out of `offline` on each pass
+and put it back on the next upload.
+
+**An error survives a restart until then.** A fresh process seeds its snapshot
+from the row — `last_error` as well as `state` — so an error a previous run left
+behind is shown by `keeper-syncd status` and by the app on launch, and is retired
+by the first unit that succeeds in the new run, in memory and in the row, exactly
+like an error raised in this run. It is retired by nothing else: not by time,
+not by a restart, not by a pass that moved nothing. Before this the
+snapshot was seeded from `state` alone, and a folder whose first copy had long
+since finished carried "this folder's first copy never finished" for nine days.
+
+What a fresh process believes from the row, in order:
+
+- **Any `last_error` seeds `needsAttention`, whatever the word.** The sentence
+  is what a person reads, and a row written before this rule can carry one
+  under `watching` — every pass end used to write that word over a standing
+  error — so the word is the less trustworthy of the two.
+- A persisted `needsAttention` or `mediaAbsent` keeps its word, because both
+  describe a condition a human has to change.
+- A persisted `offline` is believed while its `updated_ms` is younger than the
+  retry backoff's ceiling plus the longest single attempt (10 min + 10 min =
+  20 min, derived from those two numbers rather than written down), and seeds
+  `idle` beyond that. `keeper-syncd status` is a fresh process too, and a
+  daemon that is still failing re-stamps the row on every attempt: a young
+  `offline` is a live one, and printing `idle` beside it was the lie this rule
+  ends. The window is the cap *plus* an attempt because a daemon whose unit
+  has backed off to the cap stamps the row once per cap, and the attempt that
+  does the stamping can itself run to its deadline first — a window equal to
+  the cap alone had `status` printing `idle` in the gap between two stamps. A
+  row older than that is an observation nothing has confirmed since, and
+  whether the remote answers now is a question for this run's first attempt; a
+  row stamped in the future is not believed either. The word is seeded, the
+  sticky set is not — that set is "as far as *this* log has been told", and a
+  remote that is still down gets its `sync offline` line in this run's log
+  too.
+- `syncing` never: nothing is syncing yet. Everything else seeds `idle`.
+
 ---
 
 ## 13. `keeper-syncd` — the standalone daemon

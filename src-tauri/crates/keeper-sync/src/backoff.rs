@@ -13,6 +13,15 @@
 
 use std::time::Duration;
 
+/// The ceiling of the default schedule: 10 min. Beyond this a "retry" is
+/// indistinguishable from the next scheduled poll, so growing further buys
+/// nothing.
+///
+/// Named so that what depends on the ceiling can say so — a failing daemon at
+/// the cap re-stamps its profile row once per this interval, and the window
+/// in which a fresh process believes that row is derived from it.
+pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(600);
+
 /// Backoff schedule parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Backoff {
@@ -33,9 +42,7 @@ impl Default for Backoff {
             // short enough that a user who just plugged in an ethernet cable
             // sees progress before they wonder whether it is broken.
             base: Duration::from_secs(2),
-            // 10 min ceiling. Beyond this a "retry" is indistinguishable from
-            // the next scheduled poll, so growing further buys nothing.
-            max: Duration::from_secs(600),
+            max: RETRY_BACKOFF_MAX,
             jitter_pct: 100,
         }
     }

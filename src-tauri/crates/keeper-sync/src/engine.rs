@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::backoff::{jitter_sample, Backoff};
+use crate::backoff::{jitter_sample, Backoff, RETRY_BACKOFF_MAX};
 use crate::credential::{challenge_accepts_basic, AccessToken};
 use crate::db::{self, ActivityKind, ActivityRow, DeviceIdentity, WorkKind, WorkState};
 use crate::error::{Result, Retriability, SyncError};
@@ -98,6 +98,48 @@ struct Converged {
     copies: Vec<String>,
     /// Regenerable paths resolved to the remote with no copy kept.
     stale: Vec<String>,
+}
+
+/// What a leg, a unit or a whole pass proved about the remote.
+///
+/// [`Engine::mark_synced`] is the pass-level "it worked", and until this
+/// existed it took every pass that reached it as proof the remote was
+/// reachable: it called [`Engine::note_unit_succeeded`], which empties the
+/// sticky offline set and logs `sync reachable again`. But a pass reaches
+/// `mark_synced` whenever none of its *inline* legs raised — and the legs
+/// that talk to the remote are not always inline. A pull-only pass whose fetch
+/// was fine drained an `LfsUpload` unit that failed on the network, the drain
+/// swallowed that failure into the journal's backoff as it should, and the
+/// pass end then declared the remote reachable and wrote `watching` over the
+/// `offline` the failure had just recorded. Thirteen false `sync reachable
+/// again` lines on hesperia, 2026-09-09, beside 1 044 consecutive failures.
+///
+/// So every leg answers, the answers fold, and only [`Self::Reached`] earns
+/// the reset. `Failed` dominates `Reached` — a fetch that worked beside an
+/// upload that did not has not proved anything the failure did not already
+/// disprove — and `Reached` dominates `Skipped`, because one round trip that
+/// came back is one more than none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteContact {
+    /// A round trip was made and the remote answered it.
+    Reached,
+    /// No round trip: a direction that skips the leg, nothing to push, a
+    /// drain that claimed nothing. Proves nothing either way.
+    Skipped,
+    /// A unit this pass drained failed and was rescheduled. The failure is
+    /// already recorded beside the folder; the pass may not un-record it.
+    Failed,
+}
+
+impl RemoteContact {
+    /// Fold two answers, most pessimistic first.
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
+            (Self::Reached, _) | (_, Self::Reached) => Self::Reached,
+            (Self::Skipped, Self::Skipped) => Self::Skipped,
+        }
+    }
 }
 
 /// What is asking for a recordings push (Story 41.5, FR-136).
@@ -508,6 +550,35 @@ const WAKE_WALK_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// most likely, so a pass that queues a `Push` pulls at once, and so does a
 /// wake. `wake_now` and `sync_once` still force it.
 pub const REMOTE_POLL_MS: i64 = 300_000;
+
+/// The longest one attempt against the remote can take before keeper gives
+/// up on it: the git-child deadline or the fetch deadline, whichever is
+/// longer. Derived rather than written down, so the seed window below moves
+/// if either does.
+const LONGEST_ATTEMPT_MS: i64 = {
+    let git = git::cli::GIT_DEADLINE.as_millis();
+    let fetch = git::fetch::FETCH_DEADLINE.as_millis();
+    (if git > fetch { git } else { fetch }) as i64
+};
+
+/// How old a persisted `offline` may be for a fresh process to believe it.
+///
+/// A row that says `offline` is an observation about a run that ended, and
+/// whether the remote answers *now* is a question for this run's first
+/// attempt — so [`Engine::seed_status`] used to seed every persisted `offline`
+/// as `Idle`. But `keeper-syncd status` is itself a fresh process, and it
+/// printed `idle` beside a row the daemon had re-stamped `offline` seconds
+/// earlier, on every one of its failed attempts.
+///
+/// The window is the retry backoff's ceiling plus the longest single attempt
+/// (20 min): a daemon whose unit has backed off to the cap re-stamps the row
+/// once per [`RETRY_BACKOFF_MAX`], and the attempt that does the stamping can
+/// itself run for [`LONGEST_ATTEMPT_MS`] before it fails. The window used to
+/// be two remote-poll intervals, which equals the cap exactly — so with a
+/// strict `<`, `status` printed `idle` in the gap between a capped daemon's
+/// stamps. A row older than this is one nothing has touched since, and it
+/// seeds `Idle` as before.
+pub const OFFLINE_SEED_MAX_AGE_MS: i64 = RETRY_BACKOFF_MAX.as_millis() as i64 + LONGEST_ATTEMPT_MS;
 
 /// How often a profile's tree is walked with nothing prompting it while its
 /// watcher is live (Story 70.6, AD-233).
@@ -2261,26 +2332,87 @@ impl Engine {
                 .with_db(|conn| db::load_file_state(conn, &profile.id))
                 .map(|held| held.len() as u32)
                 .unwrap_or(0);
+            // The three runtime columns in one read, so the word, the
+            // sentence and the stamp describe one moment. A row this cannot
+            // read seeds as if it said nothing — `Idle`, no error — and says
+            // so at debug: a status that could not be restored must never keep
+            // the engine from opening, but it must not vanish silently either.
+            let runtime = match self.with_db(|conn| db::get_profile_runtime(conn, &profile.id)) {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::debug!(
+                        profile = profile.name,
+                        error = %err,
+                        "could not restore the sync profile's stored status"
+                    );
+                    None
+                }
+            };
+            // The sentence beside the state, whatever the state seeds as. It
+            // is restored unconditionally because the row is the only record
+            // of it and the only thing that retires the row is
+            // `clear_warning`, which writes the column only when the
+            // *snapshot* carried an error. Seeded from the row, an error a
+            // previous run left behind is retired by this run's first
+            // successful unit like any other; left out, it stood for ever:
+            // the owner's tgdrive-light read "this folder's first copy never
+            // finished" nine days after it had, through a row whose `state`
+            // had long since gone back to `watching`.
+            snapshot.error = runtime.as_ref().and_then(|r| r.last_error.clone());
             snapshot.state = if !profile.enabled {
                 ProfileState::Paused
             } else {
-                // Restore what the last run observed, so a one-shot `status`
-                // tells the truth about a detached drive or a profile that
-                // stopped needing attention. Transient in-flight states are
-                // deliberately NOT restored — nothing is syncing yet.
-                let stored = self
-                    .with_db(|conn| db::get_profile_state(conn, &profile.id))
-                    .unwrap_or(None);
-                match stored {
-                    Some(state @ (ProfileState::MediaAbsent | ProfileState::NeedsAttention)) => {
-                        state
-                    }
-                    _ => ProfileState::Idle,
-                }
+                Self::seeded_state(runtime.as_ref(), self.platform.now_ms())
             };
             status.insert(profile.id.clone(), snapshot);
         }
         Ok(())
+    }
+
+    /// The word a fresh process believes from a profile row, if any.
+    ///
+    /// Restore what the last run observed, so a one-shot `status` tells the
+    /// truth about a detached drive or a folder that stopped — but only the
+    /// observations that are still evidence of anything:
+    ///
+    /// * **Any error ⇒ `NeedsAttention`, whatever the word.** The sentence is
+    ///   what a person reads, and a row can carry one under `watching` — every
+    ///   pass end used to write that word over a standing error — so the word
+    ///   is the less trustworthy of the two. Seeding the state off the error
+    ///   is also what lets this run's first success retire both together.
+    /// * `NeedsAttention` and `MediaAbsent` stand on their own: both describe
+    ///   a condition a human has to change, and the volume gate re-asserts
+    ///   the second on the first tick regardless.
+    /// * `Offline` stands while the row is fresh
+    ///   ([`OFFLINE_SEED_MAX_AGE_MS`]): a daemon that is still failing
+    ///   re-stamps it on every attempt, so a young `offline` is a live one and
+    ///   `keeper-syncd status` must not print `idle` beside it. Older, it is
+    ///   an observation nothing has confirmed since, and this run's first
+    ///   attempt is the one that gets to answer. A row stamped in the
+    ///   *future* — a clock that went backwards — is not young, it is
+    ///   unbelievable, and it seeds `Idle` too.
+    /// * `Syncing` never: nothing is syncing yet. Everything else is `Idle`.
+    ///
+    /// The word alone, deliberately: the sticky [`Self::offline`] set is not
+    /// seeded, because it is "as far as *this* log has been told", and a
+    /// remote that is still down gets its onset line in this run's log too.
+    fn seeded_state(runtime: Option<&db::ProfileRuntime>, now_ms: i64) -> ProfileState {
+        let Some(runtime) = runtime else {
+            return ProfileState::Idle;
+        };
+        if runtime.last_error.is_some() {
+            return ProfileState::NeedsAttention;
+        }
+        match runtime.state {
+            Some(state @ (ProfileState::MediaAbsent | ProfileState::NeedsAttention)) => state,
+            Some(ProfileState::Offline)
+                if (0..OFFLINE_SEED_MAX_AGE_MS)
+                    .contains(&now_ms.saturating_sub(runtime.updated_ms)) =>
+            {
+                ProfileState::Offline
+            }
+            _ => ProfileState::Idle,
+        }
     }
 
     fn pending_for(&self, profile_id: &str) -> Result<u32> {
@@ -2570,18 +2702,125 @@ impl Engine {
         if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
             snapshot.state = state;
         }
-        // Persist so a separate `keeper-syncd status` invocation reports the
-        // truth rather than a fresh "idle". Best-effort: failing to record a
-        // status must never fail the sync that produced it.
-        if let Err(err) = self.with_db(|conn| db::set_profile_state(conn, profile_id, state)) {
+        self.persist_state(profile_id, state);
+    }
+
+    /// The durable half of [`Self::set_state`], for a caller that has already
+    /// moved the snapshot under its own lock and must not take it twice.
+    ///
+    /// Persist so a separate `keeper-syncd status` invocation reports the
+    /// truth rather than a fresh "idle". Best-effort: failing to record a
+    /// status must never fail the sync that produced it. Stamped with the
+    /// engine's clock, so the row can say when it was last true.
+    fn persist_state(&self, profile_id: &str, state: ProfileState) {
+        let now = self.platform.now_ms();
+        if let Err(err) = self.with_db(|conn| db::set_profile_state(conn, profile_id, state, now)) {
             tracing::debug!(error = %err, "could not persist sync profile state");
         }
     }
 
-    /// The state word this profile is currently wearing, if the engine holds a
-    /// snapshot for it at all.
-    fn state_of(&self, profile_id: &str) -> Option<ProfileState> {
-        Self::lock(&self.status).get(profile_id).map(|s| s.state)
+    /// Move this profile to the state word that is still true of it once a
+    /// pass has nothing more to say — what "I am done" is allowed to write —
+    /// and write the row only if the word moved.
+    ///
+    /// Both places that used to write `Watching` unconditionally wrote over a
+    /// failure that was still standing. `sync_once` ends every pass with the
+    /// word, and [`Self::refresh_pending`] flips `Syncing` to it whenever the
+    /// queue is empty; neither asked whether the profile was still in
+    /// [`Self::offline`] or still carried an error, so on hesperia a folder
+    /// whose push had failed 1 044 times in a row read `watching` in the row
+    /// and in `keeper-syncd status`. The truth was in this process the whole
+    /// time — the sticky set and the snapshot's error — and this is where it
+    /// outranks the pass. See [`Self::settle`] for the precedence.
+    ///
+    /// Decided and assigned under **one** hold of the status lock, through
+    /// [`Self::settle_in`]. An earlier shape computed the word in one hold and
+    /// handed it to [`Self::set_state`], which took the lock again to write
+    /// it — and a [`Self::record_failure`] from another unit's thread in
+    /// between had its `Offline` or `NeedsAttention` overwritten by a word
+    /// decided before it happened. The row is written only when the word
+    /// moved: a successful pass has already had its word written by
+    /// [`Self::note_unit_succeeded`], and a second `UPDATE` saying the same
+    /// thing is a write on the pass's hot path for nothing.
+    fn settle_and_persist(&self, profile_id: &str) {
+        // Read before the status lock, never under it: the two are separate
+        // mutexes and this keeps them from ever nesting.
+        let offline = Self::lock(&self.offline).contains(profile_id);
+        let moved = Self::lock(&self.status)
+            .get_mut(profile_id)
+            .and_then(|snapshot| Self::settle_in(offline, snapshot));
+        if let Some(state) = moved {
+            self.persist_state(profile_id, state);
+        }
+    }
+
+    /// [`Self::settle`] applied to a snapshot the caller holds the lock on:
+    /// assigns the settled word and returns it if it differs from the one the
+    /// snapshot wore, `None` if nothing moved. `offline` is the sticky set's
+    /// answer, read before the lock was taken.
+    fn settle_in(offline: bool, snapshot: &mut SyncStatus) -> Option<ProfileState> {
+        let settled = Self::settle(offline, Some((snapshot.state, Self::has_problem(snapshot))));
+        (settled != snapshot.state).then(|| {
+            snapshot.state = settled;
+            settled
+        })
+    }
+
+    /// Whether a snapshot carries the sentence that stops a folder — the
+    /// `error`, and only that.
+    ///
+    /// Not the `warning`. `warn` is also how the engine says something
+    /// informational — a branch pushed and waiting for review, conflict
+    /// copies kept beside a merge, a watcher that fell back to polling, a
+    /// cloud placeholder it skipped — and none of those is a folder that has
+    /// stopped; promoting them to `NeedsAttention` here would make
+    /// `keeper-syncd doctor` report a healthy folder as one. The two writers
+    /// that raise `NeedsAttention` *without* an error are covered by the word
+    /// itself, which [`Self::settle`] keeps on its own: the foreign-volume arm
+    /// of [`Self::volume_ready`] sets the word beside its `warn`, and the
+    /// parked-upload arm of [`Self::record_failure`] sets the word with
+    /// neither a warning nor an error.
+    fn has_problem(snapshot: &SyncStatus) -> bool {
+        snapshot.error.is_some()
+    }
+
+    /// The word that is still true of a profile, over facts already read.
+    /// `standing` is the snapshot's `(state, has_problem)` — see
+    /// [`Self::has_problem`] — or `None` for a profile the engine holds no
+    /// snapshot for.
+    ///
+    /// The precedence is by what each word is evidence *of*, most durable
+    /// first:
+    ///
+    /// * `Paused` is never overwritten: it is a setting, not an observation,
+    ///   and only enabling the profile takes it back.
+    /// * `Offline` while the profile is in the sticky set, because the only
+    ///   things that end that set are a unit that reached the remote
+    ///   ([`Self::note_unit_succeeded`]) and a failure the remote answered
+    ///   with ([`Self::record_failure`]), and a pass that reached here with
+    ///   neither has not proved the remote reachable.
+    /// * `NeedsAttention` while the snapshot wears the word **or** carries an
+    ///   error. The word on its own counts because two writers set it without
+    ///   an error, and a pass that touched no remote has done nothing to
+    ///   retire it; the sentence on its own counts because it is what the
+    ///   person reads, and the same success that retires it
+    ///   ([`Self::clear_warning`]) is what may retire the word. A warning
+    ///   alone does not count — see [`Self::has_problem`].
+    /// * `MediaAbsent` while the snapshot says so: the volume gate owns that
+    ///   word, and only a re-attach ([`Self::volume_ready`]) takes it back.
+    /// * `Watching` otherwise — nothing standing means up to date.
+    fn settle(offline: bool, standing: Option<(ProfileState, bool)>) -> ProfileState {
+        if let Some((ProfileState::Paused, _)) = standing {
+            return ProfileState::Paused;
+        }
+        if offline {
+            return ProfileState::Offline;
+        }
+        match standing {
+            Some((ProfileState::NeedsAttention, _) | (_, true)) => ProfileState::NeedsAttention,
+            Some((ProfileState::MediaAbsent, false)) => ProfileState::MediaAbsent,
+            _ => ProfileState::Watching,
+        }
     }
 
     /// Record — or retire — the sentence a person reads beside this folder,
@@ -2601,7 +2840,8 @@ impl Engine {
         if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
             snapshot.error = error.map(str::to_owned);
         }
-        if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, error)) {
+        let now = self.platform.now_ms();
+        if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, error, now)) {
             tracing::debug!(error = %err, "could not persist the sync profile's error");
         }
     }
@@ -2690,7 +2930,11 @@ impl Engine {
     /// The durable half of the error goes with it, and **only when there was
     /// one**: this runs after every successful unit, so an unconditional
     /// `UPDATE` would put a write on the journal's hot path to clear a column
-    /// that is already `NULL` on every healthy folder.
+    /// that is already `NULL` on every healthy folder. That gate is why
+    /// [`Self::seed_status`] seeds the snapshot's error from the row: an error
+    /// a previous run persisted has to be *in* the snapshot for this to ever
+    /// reach it, and until it was, tgdrive-light carried "this folder's first
+    /// copy never finished" for nine days after the copy finished.
     fn clear_warning(&self, profile_id: &str) {
         let had_error = match Self::lock(&self.status).get_mut(profile_id) {
             Some(snapshot) => {
@@ -2700,7 +2944,10 @@ impl Engine {
             None => false,
         };
         if had_error {
-            if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, None)) {
+            let now = self.platform.now_ms();
+            if let Err(err) =
+                self.with_db(|conn| db::set_profile_error(conn, profile_id, None, now))
+            {
                 tracing::debug!(error = %err, "could not retire the sync profile's error");
             }
         }
@@ -4340,7 +4587,8 @@ impl Engine {
             self.enqueue_first_checkout(profile)?;
             return self
                 .drain_kind(profile, WorkKind::CHECKOUT, SyncSource::Watch)
-                .await;
+                .await
+                .map(drop);
         }
 
         // The volume gate's other half, and the same sentence for the same
@@ -4352,7 +4600,9 @@ impl Engine {
         let scan = self.scan_due(profile);
         // The supervisor's own pass. Nobody asked for this one — the clock
         // did — so it is the only genuinely `Watch` caller (AD-34-12).
-        self.drain_journal(profile, scan, SyncSource::Watch).await
+        self.drain_journal(profile, scan, SyncSource::Watch)
+            .await
+            .map(drop)
     }
 
     /// Whether this profile's first working copy has still not been made
@@ -4442,8 +4692,17 @@ impl Engine {
     /// died on the network is the one case where no such row would exist, and
     /// [`Self::enqueue_first_checkout`] writes one *above this gate* precisely
     /// so that it does.
+    ///
+    /// Keyed on the sticky set, not on the word. Since the seed rule believes
+    /// a fresh `offline` row, a process can start wearing the word without
+    /// ever having observed the failure — and such a run has no journal row of
+    /// its own to wait for, so a gate on the word would hold the folder off
+    /// until the row went stale, or forever if nothing re-stamped it. The set
+    /// belongs to the run that saw the failure: absent, the word is a label
+    /// for readers and the first tick re-probes exactly as an `Idle` seed
+    /// would; present, the row that put it there is the row this waits for.
     fn remote_within_reach(&self, profile: &SyncProfile) -> Result<bool> {
-        if self.state_of(&profile.id) != Some(ProfileState::Offline) {
+        if !Self::lock(&self.offline).contains(&profile.id) {
             return Ok(true);
         }
         let now = self.platform.now_ms();
@@ -6171,7 +6430,7 @@ impl Engine {
             .do_push(&profile, SyncSource::Watch, None, TreeState::Unknown)
             .await
         {
-            Ok(()) => {
+            Ok(_) => {
                 tracing::info!(
                     profile = profile.name,
                     trigger = ?trigger,
@@ -6573,12 +6832,16 @@ impl Engine {
     /// rather than claiming the watcher did (AD-34-12).
     ///
     /// The caller owns the profile reservation.
+    ///
+    /// `Ok` carries what the drained units proved about the remote
+    /// ([`RemoteContact`]), folded: a pass that ends in [`Self::mark_synced`]
+    /// has to know whether a unit it drained failed on the way there.
     async fn drain_journal(
         &self,
         profile: &SyncProfile,
         scan_when_idle: bool,
         source: SyncSource,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         self.drain(profile, None, scan_when_idle, source).await
     }
 
@@ -6600,7 +6863,7 @@ impl Engine {
         profile: &SyncProfile,
         kind: &str,
         source: SyncSource,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         self.drain(profile, Some(kind), false, source).await
     }
 
@@ -6611,7 +6874,7 @@ impl Engine {
         only: Option<&str>,
         scan_when_idle: bool,
         source: SyncSource,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         let now = self.platform.now_ms();
         // Before a single unit is claimed, and on every drain: deferred work
         // waits on a condition rather than a clock, so the condition has to be
@@ -6632,9 +6895,10 @@ impl Engine {
                 // on the async worker while every other folder waited.
                 Self::blocking(|| self.scan_and_enqueue(profile, source))?;
             }
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
 
+        let mut contact = RemoteContact::Skipped;
         for item in claimed {
             // Between units, never inside one (Story 70.6, F-engine-11): a quit
             // that has set the flag is answered after the running unit ends,
@@ -6653,17 +6917,26 @@ impl Engine {
                 .execute(profile, &item.kind, item.id, item.label.as_deref(), source)
                 .await
             {
-                Ok(()) => {
+                Ok(reached) => {
+                    contact = contact.join(reached);
                     self.with_db(|conn| db::complete(conn, item.id))?;
-                    self.note_unit_succeeded(profile);
+                    // With what the unit proved: a `Push` that found nothing
+                    // to send, a `Checkout` that adopted in place, a transfer
+                    // whose object was already in the store each completes
+                    // without asking the remote a thing, and each used to
+                    // empty the sticky set and log `sync reachable again` —
+                    // the pass-end defect, one level down. The unit's own
+                    // sentence is still retired: the work it names is done.
+                    self.note_unit_succeeded(profile, reached);
                 }
                 Err(err) => {
+                    contact = contact.join(RemoteContact::Failed);
                     self.reschedule_after(profile, item.id, item.attempts, &err)?;
                 }
             }
         }
         self.refresh_pending(&profile.id);
-        Ok(())
+        Ok(contact)
     }
 
     /// Re-read every condition a deferred unit is waiting on, and release the
@@ -6775,6 +7048,16 @@ impl Engine {
     /// have repeated it, because remembering was the whole contract.
     fn record_failure(&self, profile: &SyncProfile, err: &SyncError) {
         self.clear_phase(&profile.id);
+        // A failure the remote *answered with* is a round trip that came back.
+        // The sticky set says "the remote cannot be reached", and a 403, a
+        // refused credential or a rejected push says the opposite — so the
+        // set is left here, and the word the arms below choose is the one
+        // `settle` shows, rather than the `offline` it would otherwise keep
+        // outranking a `NeedsAttention` the folder has just earned. The exit
+        // line is the same one a success logs, because it is the same edge.
+        if Self::remote_answered(err) && Self::lock(&self.offline).remove(&profile.id) {
+            tracing::info!(profile = profile.name, error = %err, "sync reachable again");
+        }
         match err.retriability() {
             // Both deferred conditions wait on a condition rather than a clock,
             // but they are waiting on utterly different things and a user reads
@@ -6873,26 +7156,105 @@ impl Engine {
         }
     }
 
+    /// Whether a failure is one the remote answered with — proof of a round
+    /// trip, whatever else it proves.
+    ///
+    /// Deliberately narrower than "not a network error". An `Io` on a local
+    /// file, a `Git` error opening the repository, a push held because its
+    /// large files have not landed ([`SyncError::LfsUploadPending`]) — none
+    /// of those touched the remote, and the last is raised on every pass of
+    /// exactly the folder whose uploads are failing on the network: reading
+    /// it as "reachable" would take that folder out of `offline` on each pass
+    /// and put it back on the next upload, flapping the word and the log. The
+    /// variants here are the ones a server produces: it refused, it rejected,
+    /// it ran out of room, it holds history this copy does not, or it sent
+    /// bytes that did not verify.
+    fn remote_answered(err: &SyncError) -> bool {
+        matches!(
+            err,
+            SyncError::Auth { .. }
+                | SyncError::Forbidden { .. }
+                | SyncError::Quota { .. }
+                | SyncError::Diverged { .. }
+                | SyncError::RemoteMoved { .. }
+                | SyncError::Integrity { .. }
+        )
+    }
+
     /// Record that a unit — or a whole pass — genuinely succeeded: retire the
-    /// warning, the failure count and the offline edge, and say so once.
+    /// warning, and — for a unit that reached the remote — the failure count
+    /// and the offline edge, saying so once.
     ///
     /// [`Self::record_failure`]'s opposite, and the **only** reset for
-    /// [`Self::transient_failures`] and [`Self::offline`]. It is called from
-    /// exactly two places: `drain`'s `complete` site, after `execute`
-    /// returned `Ok` for one journal row, and [`Self::mark_synced`], which
-    /// every leg of a successful pass ends in. Neither is reachable by a tick
-    /// that merely ran — the failure counter used to be reset by one, and that
-    /// is how a profile failing every attempt for a week never reached
+    /// [`Self::transient_failures`]. It is called from exactly two places:
+    /// `drain`'s `complete` site, after `execute` returned `Ok` for one
+    /// journal row, and [`Self::mark_synced`], for a pass whose legs reached
+    /// the remote and none failed. Neither is reachable by a tick that merely
+    /// ran — the failure counter used to be reset by one, and that is how a
+    /// profile failing every attempt for a week never reached
     /// `NeedsAttention` (F-engine-2).
+    ///
+    /// `contact` is what the unit proved about the remote, and it splits
+    /// this in two. The sentence beside the folder is about *this folder's
+    /// work*, and a unit that completed has done it: a checkout that finished
+    /// the copy an earlier run left half-made retires "this folder's first
+    /// copy never finished" whether it cloned or restored from the commits
+    /// already here — the restore is local, and the owner's tgdrive-light
+    /// carried that sentence for nine days after one. The failure count and
+    /// the sticky [`Self::offline`] set are about *the remote*, and only a
+    /// unit that [`RemoteContact::Reached`] it has proved anything there: a
+    /// push with nothing to send, a checkout adopted in place, a transfer
+    /// whose object was already in the store each complete without a round
+    /// trip, and each used to empty the set for a folder whose actual push
+    /// was still failing.
+    ///
+    /// The sticky set has one other exit, in [`Self::record_failure`]: a
+    /// failure the remote answered with.
     ///
     /// `sync reachable again` is the other half of `sync offline`, once per
     /// recovery: the same sticky set decides, so a profile that was never
     /// offline says nothing here.
-    fn note_unit_succeeded(&self, profile: &SyncProfile) {
+    ///
+    /// The word moves with the reasons. A snapshot wearing `Offline` or
+    /// `NeedsAttention` is wearing a word this success has just taken the
+    /// reasons from — the sentence is retired above, and the word on its own
+    /// is not evidence here the way it is for [`Self::settle`] at a quiet
+    /// pass end — so it is re-settled against the one thing that may still
+    /// stand, the sticky set: `Watching` once the set is left, `Offline`
+    /// while a unit that made no round trip leaves it standing. Nothing else
+    /// would take the word off: a push with nothing to send publishes no
+    /// phase, so the snapshot never reads `Syncing` and
+    /// [`Self::refresh_pending`] never sees the edge it flips on. The row
+    /// goes with it, because `keeper-syncd status` reads the row. A snapshot
+    /// mid-phase (`Syncing`) is left to that refresh, and every other word is
+    /// not this function's to change.
+    fn note_unit_succeeded(&self, profile: &SyncProfile, contact: RemoteContact) {
         self.clear_warning(&profile.id);
-        Self::lock(&self.transient_failures).remove(&profile.id);
-        if Self::lock(&self.offline).remove(&profile.id) {
-            tracing::info!(profile = profile.name, "sync reachable again");
+        if contact == RemoteContact::Reached {
+            Self::lock(&self.transient_failures).remove(&profile.id);
+            if Self::lock(&self.offline).remove(&profile.id) {
+                tracing::info!(profile = profile.name, "sync reachable again");
+            }
+        }
+        // Read before the status lock, never under it.
+        let offline = Self::lock(&self.offline).contains(&profile.id);
+        let moved = match Self::lock(&self.status).get_mut(&profile.id) {
+            Some(snapshot)
+                if matches!(
+                    snapshot.state,
+                    ProfileState::Offline | ProfileState::NeedsAttention
+                ) =>
+            {
+                let settled = Self::settle(offline, None);
+                (settled != snapshot.state).then(|| {
+                    snapshot.state = settled;
+                    settled
+                })
+            }
+            _ => None,
+        };
+        if let Some(state) = moved {
+            self.persist_state(&profile.id, state);
         }
     }
 
@@ -6921,22 +7283,53 @@ impl Engine {
     /// The gate is read, never recounted. An absent gate means nothing has been
     /// walked yet in this process, and the count seeded at open stands until the
     /// first walk measures a real one.
+    ///
+    /// An empty queue ends `Syncing`, but what it ends in is not always
+    /// `Watching`: a profile still in the sticky offline set, or still carrying
+    /// an error, settles into the word that is still true of it
+    /// ([`Self::settle`]). The flip used to be in-memory only, which left the
+    /// row saying whatever the last failure wrote; the row is written now, so
+    /// a unit that succeeds on the supervisor's tick — the path with no other
+    /// pass end — reaches `keeper-syncd status` too. One write per
+    /// `Syncing → settled` edge, never per unit, and only when the word
+    /// actually moved.
+    ///
+    /// The state and the phase move under **one** hold of the status lock.
+    /// An earlier shape computed the word under the lock and then handed it
+    /// to [`Self::set_state`], which took the lock again to write it — and a
+    /// [`Self::record_failure`] from another unit's thread in between had its
+    /// `Offline` or `NeedsAttention` overwritten by a word decided before it
+    /// happened. The row write stays outside the lock, as every database
+    /// call here does; it carries the word the snapshot already wears.
     fn refresh_pending(&self, profile_id: &str) {
         let now = self.platform.now_ms();
         let settling = self
             .existing_gate(profile_id)
             .map(|gate| GateGuard::take(&gate).tracked(now) as u32);
-        if let Ok(pending) = self.pending_for(profile_id) {
-            if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
-                snapshot.pending = pending;
-                if let Some(settling) = settling {
-                    snapshot.settling = settling;
-                }
-                if pending == 0 && snapshot.state == ProfileState::Syncing {
-                    snapshot.state = ProfileState::Watching;
-                    snapshot.phase = SyncPhase::Idle;
-                }
+        let Ok(pending) = self.pending_for(profile_id) else {
+            return;
+        };
+        // Read before the status lock, never under it: the two are separate
+        // mutexes and this keeps them from ever nesting.
+        let offline = Self::lock(&self.offline).contains(profile_id);
+        let moved = {
+            let mut status = Self::lock(&self.status);
+            let Some(snapshot) = status.get_mut(profile_id) else {
+                return;
+            };
+            snapshot.pending = pending;
+            if let Some(settling) = settling {
+                snapshot.settling = settling;
             }
+            if pending == 0 && snapshot.state == ProfileState::Syncing {
+                snapshot.phase = SyncPhase::Idle;
+                Self::settle_in(offline, snapshot)
+            } else {
+                None
+            }
+        };
+        if let Some(state) = moved {
+            self.persist_state(profile_id, state);
         }
     }
 
@@ -7105,6 +7498,15 @@ impl Engine {
     /// cover — raises the urgency of a row this loop read before the person
     /// asked, so a `bool` copied out at claim time would drop that request
     /// silently. See [`db::unit_urgency`].
+    ///
+    /// `Ok` carries what the unit proved about the remote ([`RemoteContact`]),
+    /// and every leg answers for itself: a checkout is `Reached` only when it
+    /// cloned, a transfer only when bytes moved, a pull only when it fetched,
+    /// a push only when it pushed, a pull request only when the forge was
+    /// called. `Verify` is `Skipped` outright — it reads the worktree and the
+    /// store and asks the server nothing, and its journal kind is never
+    /// enqueued. An earlier shape mapped every kind but the two legs to
+    /// `Reached` on the claim that they always round-trip; none of them do.
     async fn execute(
         &self,
         profile: &SyncProfile,
@@ -7112,21 +7514,23 @@ impl Engine {
         unit_id: i64,
         label: Option<&str>,
         source: SyncSource,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         match kind {
             WorkKind::Checkout => self.do_checkout(profile).await,
             // The conflict copies are already recorded and warned about;
             // a journaled pull has no caller to hand them back to.
             WorkKind::Pull => {
                 self.do_pull(profile, source, TreeState::Unknown).await?;
-                self.mark_synced(profile).await;
-                Ok(())
+                let contact = Self::pull_contact(profile);
+                self.mark_synced(profile, contact).await;
+                Ok(contact)
             }
             WorkKind::Push => {
-                self.do_push(profile, source, Some(unit_id), TreeState::Unknown)
+                let contact = self
+                    .do_push(profile, source, Some(unit_id), TreeState::Unknown)
                     .await?;
-                self.mark_synced(profile).await;
-                Ok(())
+                self.mark_synced(profile, contact).await;
+                Ok(contact)
             }
             WorkKind::LfsDownload { oid, size } => {
                 self.do_lfs(profile, oid, *size, label, false, Some(unit_id))
@@ -7137,7 +7541,25 @@ impl Engine {
                     .await
             }
             WorkKind::OpenPullRequest { branch } => self.do_open_pr(profile, branch).await,
-            WorkKind::Verify => self.verify(&profile.id).await.map(drop),
+            WorkKind::Verify => self
+                .verify(&profile.id)
+                .await
+                .map(|_| RemoteContact::Skipped),
+        }
+    }
+
+    /// What a [`Self::do_pull`] that returned `Ok` proved about the remote.
+    ///
+    /// The leg has exactly one return that made no round trip — the direction
+    /// that never pulls, answered before anything is opened — and every other
+    /// `Ok` came back from a fetch the remote answered. Derived from the
+    /// direction rather than threaded through [`Converged`], whose many
+    /// returns all sit past the fetch.
+    fn pull_contact(profile: &SyncProfile) -> RemoteContact {
+        if profile.direction.pulls() {
+            RemoteContact::Reached
+        } else {
+            RemoteContact::Skipped
         }
     }
 
@@ -7170,14 +7592,22 @@ impl Engine {
     /// NOT raised here: a blip during a first clone is ordinary, and
     /// `record_failure`'s existing run-of-failures threshold is what decides a
     /// folder has stopped rather than stumbled.
-    async fn do_checkout(&self, profile: &SyncProfile) -> Result<()> {
+    ///
+    /// `Ok` says whether the remote was reached ([`RemoteContact`]): only a
+    /// clone asks it anything. A folder adopted in place, a `.git` that was
+    /// already there, and the restore of an unfinished checkout — which
+    /// rebuilds the index from the commits already on disk — all complete
+    /// without a round trip, and a unit that completes that way has not
+    /// proved a remote that was `offline` reachable.
+    async fn do_checkout(&self, profile: &SyncProfile) -> Result<RemoteContact> {
         // The clone, or the restore of an unfinished checkout: minutes of
         // network and disk that used to hold the async worker (Story 70.6).
         match Self::blocking(|| self.finish_first_checkout(profile)) {
-            Ok(()) => {
-                // `drain`'s success path calls `clear_warning`, which retires
-                // the sentence on both surfaces. Nothing to do but succeed.
-                Ok(())
+            Ok(contact) => {
+                // `drain`'s success path calls `clear_warning` for a unit that
+                // reached the remote, which retires the sentence on both
+                // surfaces. Nothing to do but succeed.
+                Ok(contact)
             }
             Err(cause) => {
                 let stated = match cause {
@@ -7200,11 +7630,14 @@ impl Engine {
     /// Split out so the error handling above reads as the one decision it is,
     /// and so both exits from the repair — "there was nothing to finish" and
     /// "it could not be finished" — are visible side by side.
-    fn finish_first_checkout(&self, profile: &SyncProfile) -> Result<()> {
-        let repo = self.open_repo(profile)?;
+    ///
+    /// `Ok` carries what [`Self::open_repo_with_contact`] proved: `Reached`
+    /// for a clone, `Skipped` for everything else. The repair below is local.
+    fn finish_first_checkout(&self, profile: &SyncProfile) -> Result<RemoteContact> {
+        let (repo, contact) = self.open_repo_with_contact(profile)?;
         if !git::repo::checkout_is_unfinished(&repo)? {
             // The clone or the adoption above was the whole job.
-            return Ok(());
+            return Ok(contact);
         }
         tracing::warn!(
             profile = profile.name,
@@ -7226,7 +7659,7 @@ impl Engine {
             kept = repair.kept,
             "finished the interrupted checkout"
         );
-        Ok(())
+        Ok(contact)
     }
 
     /// Record that a pass finished without error.
@@ -7273,17 +7706,27 @@ impl Engine {
     /// `async` since Story 56.5, because the sweep's per-object remote proof is
     /// a round trip. The `status` guard is scoped so no `MutexGuard` crosses
     /// the `.await`.
-    async fn mark_synced(&self, profile: &SyncProfile) {
+    ///
+    /// `contact` is what the pass's legs proved about the remote
+    /// ([`RemoteContact`]), and it gates the one thing here that is *about*
+    /// the remote: the reset of the failure count and the offline edge.
+    /// `sync_once` runs its legs inline with no journal row to complete, so
+    /// this is where a successful pass resets them — but only a pass that
+    /// [`RemoteContact::Reached`] the remote has proved it reachable. A pass
+    /// that touched no remote proves nothing, and a pass one of whose drained
+    /// units failed has proved the opposite; both used to reset the edge
+    /// anyway, which is what wrote `watching` over 1 044 failures on hesperia.
+    /// The timestamp, the prune and the sweep are about *this folder's* work
+    /// and stand on the pass alone.
+    async fn mark_synced(&self, profile: &SyncProfile, contact: RemoteContact) {
         {
             if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
                 snapshot.last_sync_ms = Some(self.platform.now_ms());
             }
         }
-        // A pass that reached here had every leg succeed, which is the other
-        // definition of "a unit succeeded" — `sync_once` runs its legs inline
-        // with no journal row to complete, so this is where its success resets
-        // the failure count and the offline edge.
-        self.note_unit_succeeded(profile);
+        if contact == RemoteContact::Reached {
+            self.note_unit_succeeded(profile, RemoteContact::Reached);
+        }
         if profile.lfs_prune_local
             && (self.take_lfs_moved(&profile.id) || self.prune_is_due(profile))
         {
@@ -7413,6 +7856,18 @@ impl Engine {
     ///
     /// Blocking; callers wrap it.
     fn open_repo(&self, profile: &SyncProfile) -> Result<gix::Repository> {
+        self.open_repo_with_contact(profile).map(|(repo, _)| repo)
+    }
+
+    /// [`Self::open_repo`], also saying whether the remote was asked anything
+    /// ([`RemoteContact`]): `Reached` when the folder was cloned — or when the
+    /// remote answered that it had nothing to clone, which is an answer —
+    /// and `Skipped` when the repository was already there or was adopted in
+    /// place, neither of which touches the network.
+    fn open_repo_with_contact(
+        &self,
+        profile: &SyncProfile,
+    ) -> Result<(gix::Repository, RemoteContact)> {
         // The rule [`GateGuard`] states, checked where it would be broken.
         #[cfg(test)]
         gate_depth::assert_none_held();
@@ -7429,7 +7884,7 @@ impl Engine {
                     // fall through to re-creating it, and a cone that could not
                     // be applied is not that. It must surface as itself.
                     self.reconcile_sparse_cone(profile, &repo)?;
-                    return Ok(repo);
+                    return Ok((repo, RemoteContact::Skipped));
                 }
                 Err(err) => {
                     // A kill inside `gix::init` — the first thing `adopt` does
@@ -7465,12 +7920,12 @@ impl Engine {
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true);
 
-        let repo = if empty {
+        let (repo, contact) = if empty {
             tracing::info!(
                 profile = profile.name,
                 "cloning remote for a new sync profile"
             );
-            match git::repo::clone(
+            let repo = match git::repo::clone(
                 &profile.remote_url,
                 &profile.local_path,
                 &profile.branch,
@@ -7502,13 +7957,19 @@ impl Engine {
                     git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?
                 }
                 Err(err) => return Err(err),
-            }
+            };
+            // Either the clone came back or the remote said it was empty:
+            // both are the remote answering.
+            (repo, RemoteContact::Reached)
         } else {
             tracing::info!(
                 profile = profile.name,
                 "adopting an existing folder: initializing a repository in place"
             );
-            git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?
+            (
+                git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?,
+                RemoteContact::Skipped,
+            )
         };
         git::repo::enforce_local_config_with_filter(
             &repo,
@@ -7516,7 +7977,7 @@ impl Engine {
             self.filter_serves_process,
         )?;
         self.reconcile_sparse_cone(profile, &repo)?;
-        Ok(repo)
+        Ok((repo, contact))
     }
 
     /// Make the working tree match the profile's `subpaths[]` (Story 27.2,
@@ -8802,15 +9263,21 @@ impl Engine {
 
     /// `tree` as on [`Self::do_pull`]: a pass that already walked hands its
     /// push `Committed`, and the leg publishes what that walk committed.
+    ///
+    /// `Ok` says whether a push was actually attempted ([`RemoteContact`]).
+    /// Three returns below make no round trip — the direction that never
+    /// pushes, a tree with nothing committed, a phone whose history the
+    /// remote already holds — and a pass that ends on one of them has not
+    /// proved the remote reachable, whatever the last failure said.
     async fn do_push(
         &self,
         profile: &SyncProfile,
         source: SyncSource,
         push_unit: Option<i64>,
         tree: TreeState,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         if !profile.direction.pushes() {
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
         let count = match tree {
             TreeState::Unknown => Self::blocking(|| self.commit_local(profile, source, push_unit))?,
@@ -8846,7 +9313,7 @@ impl Engine {
                 profile = profile.name,
                 "nothing committed yet, so there is nothing to push"
             );
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
         drop(repo);
         // A phone asks its own history first (AD-198): the desktop's `git
@@ -8858,7 +9325,7 @@ impl Engine {
                 profile = profile.name,
                 "the remote already holds every commit here, so the phone pushes nothing"
             );
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
 
         // A push with nothing freshly committed is republishing commits whose
@@ -8908,7 +9375,7 @@ impl Engine {
             };
             self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
         }
-        Ok(())
+        Ok(RemoteContact::Reached)
     }
 
     /// Pass untracked entries through, refusing anything that is not a file.
@@ -9859,6 +10326,11 @@ impl Engine {
     /// [`Self::materialize_landed`], which asks the journal whether anybody is
     /// waiting for it. `None` for a caller that is not draining a row. Ignored
     /// on the upload leg, which publishes nothing to the worktree.
+    ///
+    /// `Ok` says whether a transfer actually happened ([`RemoteContact`]).
+    /// Two returns below make none — large-file support is off, or the object
+    /// is already in this folder's store — and a unit that completes on one
+    /// of them has asked the remote nothing.
     async fn do_lfs(
         &self,
         profile: &SyncProfile,
@@ -9867,9 +10339,9 @@ impl Engine {
         label: Option<&str>,
         upload: bool,
         unit: Option<i64>,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         if profile.lfs_mode == LfsMode::Disabled {
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
         // The object is already on this disk, so there is nothing to fetch and
         // the remaining job is the publish (Story 56.14).
@@ -9901,7 +10373,8 @@ impl Engine {
                     oid,
                     "the object is already in this folder's store; publishing without a transfer"
                 );
-                return self.materialize_landed(profile, &store, oid, label, unit);
+                self.materialize_landed(profile, &store, oid, label, unit)?;
+                return Ok(RemoteContact::Skipped);
             }
         }
         // The direction is in the phase because that is what the tray reads: an
@@ -9945,9 +10418,11 @@ impl Engine {
         // pendrive remote meant it.
         if lfsconfig.is_none() {
             if let Some(remote) = lfs::local::remote_store(&profile.remote_url) {
+                // A copy to a filesystem remote is the transfer, completed.
                 return self
                     .copy_lfs_object(profile, remote, oid, size, upload, label, unit)
-                    .await;
+                    .await
+                    .map(|()| RemoteContact::Reached);
             }
         }
         let operation = if upload {
@@ -10058,7 +10533,7 @@ impl Engine {
             // [`Self::materialize_landed`] for the 40 hours the sweep spent here.
             self.materialize_landed(profile, &store, oid, label, unit)?;
         }
-        Ok(())
+        Ok(RemoteContact::Reached)
     }
 
     /// Memo that the remote now holds the object one upload unit carried
@@ -10655,14 +11130,18 @@ impl Engine {
     /// missing token, an unreachable API or an already-open request all resolve
     /// to an actionable notice naming the branch — never a rollback, never a
     /// retry storm.
-    async fn do_open_pr(&self, profile: &SyncProfile, branch: &str) -> Result<()> {
+    ///
+    /// `Ok` says whether the forge was called ([`RemoteContact`]): a remote
+    /// with no API, or no credential to call it with, resolves to the notice
+    /// without a round trip.
+    async fn do_open_pr(&self, profile: &SyncProfile, branch: &str) -> Result<RemoteContact> {
         let Some(target) = forge_api_target(&profile.remote_url) else {
             self.warn(
                 &profile.id,
                 &profile.name,
                 format!("branch {branch} is pushed and waiting for review"),
             );
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         };
         let Some(token) = self.token(profile)? else {
             // Without a credential we cannot call the API, and prompting is not
@@ -10675,7 +11154,7 @@ impl Engine {
                     target.base
                 ),
             );
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         };
 
         let url = format!(
@@ -10730,7 +11209,7 @@ impl Engine {
                     None => format!("a pull request is open for {branch}"),
                 },
             );
-            return Ok(());
+            return Ok(RemoteContact::Reached);
         }
         // 409 is how Forgejo answers when a request for this head already
         // exists, which from the lane's point of view is success: a human
@@ -10741,14 +11220,14 @@ impl Engine {
                 branch,
                 "a pull request is already open"
             );
-            return Ok(());
+            return Ok(RemoteContact::Reached);
         }
         self.warn(
             &profile.id,
             &profile.name,
             format!("branch {branch} is pushed, but opening a pull request failed ({status})"),
         );
-        Ok(())
+        Ok(RemoteContact::Reached)
     }
 
     // -----------------------------------------------------------------------
@@ -11037,8 +11516,14 @@ impl Engine {
         // does not fire — a pass with a leg that raised is not a successful
         // pass, and the release sweep must not ride an edge that did not happen.
         let mut arrival_fault: Option<SyncError> = None;
+        // What this pass proves about the remote, folded leg by leg: every
+        // inline leg that raises leaves through `?` before the end, so what
+        // reaches `mark_synced` is either a round trip that came back, a pass
+        // that made none, or a drained unit's failure the drain absorbed.
+        let mut contact = RemoteContact::Skipped;
         if profile.direction.pulls() {
             let converged = self.do_pull(&profile, source, TreeState::Committed).await?;
+            contact = contact.join(Self::pull_contact(&profile));
             outcome.conflicts = converged.copies;
             outcome.stale = converged.stale;
             outcome.pulled = true;
@@ -11081,7 +11566,7 @@ impl Engine {
         // pass for nothing.
         let mut previous = u32::MAX;
         loop {
-            self.drain_journal(&profile, false, source).await?;
+            contact = contact.join(self.drain_journal(&profile, false, source).await?);
             let outstanding = self.lfs_uploads_outstanding(&profile)?;
             if outstanding == 0 || outstanding >= previous {
                 break;
@@ -11090,8 +11575,10 @@ impl Engine {
         }
 
         if profile.direction.pushes() {
-            self.do_push(&profile, source, None, TreeState::Committed)
-                .await?;
+            contact = contact.join(
+                self.do_push(&profile, source, None, TreeState::Committed)
+                    .await?,
+            );
             outcome.pushed = true;
         }
 
@@ -11100,7 +11587,7 @@ impl Engine {
         // tick to pick it up. `false`: the pull and the push this pass ran
         // inline are the rows a scan would queue, and its walk is the one
         // above.
-        self.drain_journal(&profile, false, source).await?;
+        contact = contact.join(self.drain_journal(&profile, false, source).await?);
         // The user's commits are published; now say what went wrong. See where
         // this was captured for why it waited until here and no longer.
         if let Some(err) = arrival_fault {
@@ -11113,10 +11600,15 @@ impl Engine {
         // Every leg this profile's direction calls for ran and none of them
         // raised: that is the whole definition of a successful pass, and it is
         // the only definition under which a pull-only profile — or a push with
-        // nothing staged — can ever record that it worked.
-        self.mark_synced(&profile).await;
+        // nothing staged — can ever record that it worked. What it proved
+        // about the remote is a separate question, and `contact` carries it.
+        self.mark_synced(&profile, contact).await;
 
-        self.set_state(&profile.id, ProfileState::Watching);
+        // Not `Watching` outright: the word a finished pass may write is the
+        // one that is still true of the folder, and a failure standing beside
+        // this pass — the sticky offline set, an error the pass did not earn
+        // the right to retire — outranks "I am done". See `settle_and_persist`.
+        self.settle_and_persist(&profile.id);
         self.publish(self.progress(&profile, SyncPhase::Idle));
         self.refresh_pending(&profile.id);
         Ok(outcome)
@@ -29038,8 +29530,8 @@ mod tests {
         assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
         let plans = || engine.counters(&p.id).lfs_prune_plans;
 
-        engine.mark_synced(&p).await;
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(
             plans(),
             0,
@@ -29048,13 +29540,13 @@ mod tests {
 
         // The upload leg's confirmation — the label is irrelevant to the flag.
         engine.note_unit_synced(&p, None, &"a".repeat(64));
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(
             plans(),
             1,
             "a completed upload is what makes an object releasable"
         );
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(
             plans(),
             1,
@@ -29062,13 +29554,13 @@ mod tests {
         );
 
         platform.advance_ms(RELEASE_LOOK_EVERY_MS);
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(
             plans(),
             2,
             "the hourly look covers what the flag cannot see"
         );
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(plans(), 2, "once, and the plan re-armed the look");
     }
 
@@ -30304,6 +30796,33 @@ mod tests {
             .expect("the profile row is readable")
     }
 
+    /// The row's `state` column as spelled on disk, read raw so a test can
+    /// tell `offline` from a word the reader would have mapped away.
+    fn stored_state(engine: &Engine, id: &str) -> String {
+        engine
+            .with_db(|conn| {
+                conn.query_row("SELECT state FROM profiles WHERE id = ?1", [id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(SyncError::from)
+            })
+            .expect("the profile row is readable")
+    }
+
+    /// The row's `updated_ms`: when the last durable writer touched it.
+    fn stored_updated_ms(engine: &Engine, id: &str) -> i64 {
+        engine
+            .with_db(|conn| {
+                conn.query_row(
+                    "SELECT updated_ms FROM profiles WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(SyncError::from)
+            })
+            .expect("the profile row is readable")
+    }
+
     /// How many journal rows of one kind this profile owns.
     fn units_of_kind(engine: &Engine, id: &str, kind: &str) -> u32 {
         engine
@@ -31255,6 +31774,1119 @@ mod tests {
                 .get(&p.id)
                 .is_none(),
             "a completed unit is the reset"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A folder's durable status tells the truth
+    // -----------------------------------------------------------------------
+
+    /// A network failure, the way every one of them arrives: through
+    /// `record_failure`, which is what a failing fetch, push or upload ends in
+    /// whether the pass was the supervisor's or an explicit sync.
+    fn go_offline(engine: &Engine, p: &SyncProfile) {
+        engine.record_failure(
+            p,
+            &SyncError::Network {
+                host: "127.0.0.1".to_owned(),
+                reason: "connection refused".to_owned(),
+            },
+        );
+    }
+
+    /// Row 1. A folder whose push keeps failing is in the sticky offline set,
+    /// and a pass that moves nothing must not write over that: neither the
+    /// queue refresh that ends `Syncing` nor the word a finished pass writes.
+    /// On hesperia both did — 1 044 consecutive push failures, and the row
+    /// and `keeper-syncd status` read `watching` throughout.
+    ///
+    /// The two writers are driven directly because neither `tick` nor
+    /// `sync_once` can reach them while the remote is down: the tick skips an
+    /// offline profile until a unit is due and the explicit pass fails on its
+    /// fetch. The sequence is the one a starting unit produces — `publish`
+    /// flips the snapshot to `Syncing` the moment a phase begins — followed by
+    /// the refresh a drain ends with, and then the pass end itself.
+    #[test]
+    fn an_offline_folder_stays_offline_through_a_pass_that_moves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+
+        // A retry starts moving, and nothing is left in the queue behind it.
+        engine.publish(engine.progress(&p, SyncPhase::Pushing));
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Syncing,
+            "arranged: a phase in flight reads as syncing"
+        );
+        engine.refresh_pending(&p.id);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Offline, "{snapshot:?}");
+        assert_eq!(
+            snapshot.phase,
+            SyncPhase::Idle,
+            "the phase is still retired"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+
+        // And the word a finished pass writes — which, unmoved, is no write.
+        let written = stored_updated_ms(&engine, &p.id);
+        platform.advance_ms(1_000);
+        engine.settle_and_persist(&p.id);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            written,
+            "a word that did not move is not written again"
+        );
+        assert!(
+            engine.status(&p.id).expect("status").error.is_none(),
+            "offline is a state, not an error"
+        );
+    }
+
+    /// Row 2. The one exit from `offline` is a unit succeeding, and when it
+    /// does the folder reads `watching` in memory **and in the row**, stamped
+    /// with the moment — through the supervisor's tick, which has no other
+    /// pass end than the queue refresh.
+    #[tokio::test]
+    async fn a_unit_succeeding_after_offline_writes_watching_to_the_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        let p = committed_fixture_at(&engine, &platform, dir.path(), &remote.to_string_lossy());
+        go_offline(&engine, &p);
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        let written_offline_at = stored_updated_ms(&engine, &p.id);
+
+        // An offline profile only ticks when a unit is due; give it one, and
+        // move the clock so the write it produces is distinguishable.
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Pull, 0, 0).map(drop))
+            .expect("enqueue");
+        platform.advance_ms(60_000);
+        let _ = engine.tick().await;
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert!(
+            !Engine::lock(&engine.offline).contains(&p.id),
+            "the success is what leaves the sticky set"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            platform.now_ms(),
+            "the row says when it became true"
+        );
+        assert!(stored_updated_ms(&engine, &p.id) > written_offline_at);
+    }
+
+    /// Row 3. A folder that stopped with an error keeps the error and the word
+    /// through a quiet pass: the queue emptying is not the success that
+    /// retires either.
+    #[test]
+    fn a_folder_needing_attention_keeps_its_error_through_a_quiet_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine.record_failure(
+            &p,
+            &SyncError::Forbidden {
+                host: "git.invalid".to_owned(),
+            },
+        );
+        let before = engine.status(&p.id).expect("status");
+        assert_eq!(before.state, ProfileState::NeedsAttention, "arranged");
+        let sentence = before.error.clone().expect("arranged: the error stands");
+        assert_eq!(
+            stored_last_error(&engine, &p.id).as_deref(),
+            Some(sentence.as_str())
+        );
+
+        // A retry runs and leaves nothing queued.
+        engine.publish(engine.progress(&p, SyncPhase::Fetching));
+        engine.refresh_pending(&p.id);
+        let after = engine.status(&p.id).expect("status");
+        assert_eq!(after.state, ProfileState::NeedsAttention, "{after:?}");
+        assert_eq!(after.error.as_deref(), Some(sentence.as_str()));
+        assert_eq!(stored_state(&engine, &p.id), "needsAttention");
+        assert_eq!(
+            stored_last_error(&engine, &p.id).as_deref(),
+            Some(sentence.as_str())
+        );
+
+        // The pass end says the same.
+        engine.settle_and_persist(&p.id);
+        let settled = engine.status(&p.id).expect("status");
+        assert_eq!(settled.state, ProfileState::NeedsAttention, "{settled:?}");
+        assert_eq!(settled.error.as_deref(), Some(sentence.as_str()));
+    }
+
+    /// Row 4. An error persisted by an earlier run is visible to a fresh
+    /// process — `keeper-syncd status` is one — and is retired, in memory and
+    /// in the row, by that process's first successful unit. Before this the
+    /// snapshot was seeded from `state` alone, so `clear_warning`'s "only when
+    /// the snapshot had one" gate never fired for it, and tgdrive-light read
+    /// "this folder's first copy never finished" nine days after it had.
+    #[tokio::test]
+    async fn an_error_from_a_previous_run_is_retired_by_this_runs_first_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        let sentence = "this folder's first copy never finished: connection reset";
+        let p = {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            let p = committed_fixture_at(&first, &platform, dir.path(), &remote.to_string_lossy());
+            first.set_state(&p.id, ProfileState::NeedsAttention);
+            first.set_error(&p.id, Some(sentence));
+            p
+        };
+
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+        let seeded = engine.status(&p.id).expect("status");
+        assert_eq!(seeded.state, ProfileState::NeedsAttention, "{seeded:?}");
+        assert_eq!(
+            seeded.error.as_deref(),
+            Some(sentence),
+            "a fresh process shows the error the last one left"
+        );
+
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Pull, 0, 0).map(drop))
+            .expect("enqueue");
+        platform.advance_ms(60_000);
+        let _ = engine.tick().await;
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert_eq!(
+            stored_last_error(&engine, &p.id),
+            None,
+            "and the row agrees"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            platform.now_ms(),
+            "the retire is dated"
+        );
+    }
+
+    /// Row 5, as amended. A persisted `offline` is believed while it is fresh
+    /// — `keeper-syncd status` is a fresh process too, and it must not print
+    /// `idle` beside a row the daemon re-stamped `offline` a minute ago — and
+    /// disbelieved once it is old: an hour-old `offline` is an observation
+    /// nothing has confirmed since, so a new run seeds `Idle` and re-probes,
+    /// and the next failure re-enters `offline` exactly as before. Neither
+    /// seeds the sticky set: that belongs to the run that observed the
+    /// failure, and this run's log gets its own onset line.
+    #[test]
+    fn a_persisted_offline_is_believed_while_fresh_and_re_probed_once_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let p = profile(dir.path());
+        {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            first.upsert_profile(&p).expect("upsert");
+            first.set_state(&p.id, ProfileState::Offline);
+            assert_eq!(stored_state(&first, &p.id), "offline");
+        }
+
+        // One minute later: the daemon that wrote this is still failing.
+        platform.advance_ms(60_000);
+        {
+            let Ok(fresh) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            let seeded = fresh.status(&p.id).expect("status");
+            assert_eq!(seeded.state, ProfileState::Offline, "{seeded:?}");
+            assert!(seeded.error.is_none(), "offline is a state, not an error");
+            assert!(
+                !Engine::lock(&fresh.offline).contains(&p.id),
+                "the word is seeded, the sticky set is not"
+            );
+        }
+
+        // An hour later: nobody has re-stamped it, so nobody is failing.
+        platform.advance_ms(3_600_000);
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let seeded = engine.status(&p.id).expect("status");
+        assert_eq!(seeded.state, ProfileState::Idle, "{seeded:?}");
+        assert!(seeded.error.is_none());
+        assert!(!Engine::lock(&engine.offline).contains(&p.id));
+
+        go_offline(&engine, &p);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            platform.now_ms(),
+            "and the re-entry is dated, which is what makes the next process believe it"
+        );
+    }
+
+    /// A seeded `offline` word is a label for readers, not a verdict this run
+    /// has reached: the sticky set is empty and there is no journal row to wait
+    /// for, so a tick gate that read the word would hold the folder off until
+    /// the row went stale — or forever, if the process that stamped it is the
+    /// one that died. The gate reads the set, so the first tick re-probes.
+    #[tokio::test]
+    async fn a_seeded_offline_word_does_not_hold_the_first_tick_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let p = adoptable(dir.path());
+        {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            // A file first: an empty folder is a first clone, which needs the
+            // network; a folder with content is adopted in place, which does not.
+            std::fs::write(p.local_path.join("note.md"), b"adopted in place").expect("write");
+            first.upsert_profile(&p).expect("upsert");
+            first.ensure_repo(&p).expect("adopt");
+            first.set_state(&p.id, ProfileState::Offline);
+            assert_eq!(stored_state(&first, &p.id), "offline");
+        }
+        platform.advance_ms(60_000);
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline,
+            "the fresh row is believed"
+        );
+        assert!(
+            engine.remote_within_reach(&p).expect("the gate answers"),
+            "but with no failure of its own to wait out, this run may look"
+        );
+        let before = engine.counters(&p.id).status_walks;
+        let engine = Arc::new(engine);
+        engine.tick().await.expect("tick");
+        assert!(
+            engine.counters(&p.id).status_walks > before,
+            "the first tick walked the folder instead of skipping it"
+        );
+    }
+
+    /// The seed rule, one row per word and per age, with the amended Always
+    /// spelled out cell by cell: any error is `NeedsAttention` whatever the
+    /// word — a `NULL` word included; `NeedsAttention` and `MediaAbsent`
+    /// stand on their own; `offline` stands for the backoff cap plus the
+    /// longest attempt and not a millisecond longer, nor for a stamp from
+    /// the future; `syncing` and everything else is `Idle`; no row at all is
+    /// `Idle`.
+    #[test]
+    fn the_seeded_word_follows_the_row_by_error_then_word_then_age() {
+        use ProfileState::{Idle, MediaAbsent, NeedsAttention, Offline, Paused, Syncing, Watching};
+        let now = 10_000_000;
+        let runtime = |state: Option<ProfileState>, error: bool, age_ms: i64| db::ProfileRuntime {
+            state,
+            last_error: error.then(|| "the remote refused the credential".to_owned()),
+            updated_ms: now - age_ms,
+        };
+        let fresh = OFFLINE_SEED_MAX_AGE_MS - 1;
+        let stale = OFFLINE_SEED_MAX_AGE_MS;
+
+        // (stored word, seeded word with no error, seeded word with an error)
+        let by_word = [
+            (Some(Idle), Idle, NeedsAttention),
+            (Some(Watching), Idle, NeedsAttention),
+            (Some(Syncing), Idle, NeedsAttention),
+            (Some(Paused), Idle, NeedsAttention),
+            (Some(NeedsAttention), NeedsAttention, NeedsAttention),
+            (Some(MediaAbsent), MediaAbsent, NeedsAttention),
+            (None, Idle, NeedsAttention),
+        ];
+        for (stored, clean, erring) in by_word {
+            for age in [0, fresh, stale] {
+                assert_eq!(
+                    Engine::seeded_state(Some(&runtime(stored, false, age)), now),
+                    clean,
+                    "{stored:?} with no error, {age} ms old"
+                );
+                assert_eq!(
+                    Engine::seeded_state(Some(&runtime(stored, true, age)), now),
+                    erring,
+                    "{stored:?} with an error, {age} ms old"
+                );
+            }
+        }
+
+        // A `NULL` word is no word, and the sentence beside it still decides.
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(None, true, 0)), now),
+            NeedsAttention,
+            "a row with no word and an error seeds off the error"
+        );
+
+        // `offline` is the one word whose age matters.
+        assert_eq!(
+            OFFLINE_SEED_MAX_AGE_MS,
+            20 * 60 * 1_000,
+            "the backoff cap (10 min) plus the longest attempt (10 min)"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), false, 0)), now),
+            Offline
+        );
+        assert_eq!(
+            Engine::seeded_state(
+                Some(&runtime(Some(Offline), false, 2 * REMOTE_POLL_MS)),
+                now
+            ),
+            Offline,
+            "the old 10-min boundary — the cap exactly, where a capped daemon's \
+             next stamp is due — is still fresh"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), false, fresh)), now),
+            Offline,
+            "one millisecond under the window is still fresh"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), false, stale)), now),
+            Idle,
+            "the window exactly is stale"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), false, -1)), now),
+            Idle,
+            "a stamp from the future is not young, it is unbelievable"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), true, 0)), now),
+            NeedsAttention,
+            "an error outranks even a fresh offline"
+        );
+        assert_eq!(Engine::seeded_state(None, now), Idle, "no row at all");
+    }
+
+    /// A folder switched off keeps its word — `Paused` is a setting — and
+    /// keeps the sentence the last run left beside it, so the person who
+    /// switches it back on sees why it had stopped before they did.
+    #[test]
+    fn a_paused_folder_with_a_persisted_error_seeds_paused_with_the_sentence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let sentence = "the remote refused the credential";
+        let mut p = profile(dir.path());
+        {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            first.upsert_profile(&p).expect("upsert");
+            first.set_state(&p.id, ProfileState::NeedsAttention);
+            first.set_error(&p.id, Some(sentence));
+            p.enabled = false;
+            first.upsert_profile(&p).expect("switch off");
+        }
+        let Ok(fresh) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let seeded = fresh.status(&p.id).expect("status");
+        assert_eq!(seeded.state, ProfileState::Paused, "{seeded:?}");
+        assert_eq!(
+            seeded.error.as_deref(),
+            Some(sentence),
+            "the sentence is kept"
+        );
+    }
+
+    /// `RemoteContact::join`, every cell: `Failed` dominates, then `Reached`,
+    /// and two `Skipped` are `Skipped`. Symmetric, so the order legs run in
+    /// cannot change what a pass proved.
+    #[test]
+    fn remote_contact_folds_most_pessimistic_first() {
+        use RemoteContact::{Failed, Reached, Skipped};
+        let table = [
+            (Skipped, Skipped, Skipped),
+            (Skipped, Reached, Reached),
+            (Skipped, Failed, Failed),
+            (Reached, Skipped, Reached),
+            (Reached, Reached, Reached),
+            (Reached, Failed, Failed),
+            (Failed, Skipped, Failed),
+            (Failed, Reached, Failed),
+            (Failed, Failed, Failed),
+        ];
+        for (left, right, folded) in table {
+            assert_eq!(left.join(right), folded, "{left:?} join {right:?}");
+            assert_eq!(right.join(left), folded, "{right:?} join {left:?}");
+        }
+    }
+
+    /// The legacy row: `watching` beside an error. Every pass end used to
+    /// write `watching` over a standing error, so this is the shape a store
+    /// from before the fix actually holds — and it seeds `NeedsAttention`
+    /// with the sentence, is shown by a fresh process, and is retired by that
+    /// process's first successful unit, in memory and in the row.
+    #[tokio::test]
+    async fn a_legacy_watching_row_with_an_error_seeds_needs_attention_until_a_unit_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        let sentence = "sync has failed 3 times in a row: the remote refused the credential";
+        let p = {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            let p = committed_fixture_at(&first, &platform, dir.path(), &remote.to_string_lossy());
+            first.set_error(&p.id, Some(sentence));
+            first.set_state(&p.id, ProfileState::Watching);
+            assert_eq!(stored_state(&first, &p.id), "watching", "arranged: the lie");
+            p
+        };
+
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+        let seeded = engine.status(&p.id).expect("status");
+        assert_eq!(seeded.state, ProfileState::NeedsAttention, "{seeded:?}");
+        assert_eq!(seeded.error.as_deref(), Some(sentence));
+
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Pull, 0, 0).map(drop))
+            .expect("enqueue");
+        platform.advance_ms(60_000);
+        let _ = engine.tick().await;
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert_eq!(stored_last_error(&engine, &p.id), None);
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+    }
+
+    /// `settle`, every cell by hand. Columns: nothing standing and not
+    /// offline; a warning or error standing; in the sticky set; both. The
+    /// rules the cells encode: `Paused` is never overwritten; the sticky set
+    /// outranks everything else; `NeedsAttention` stands by its word or by a
+    /// sentence; `MediaAbsent` stands by its word; the rest settle to
+    /// `Watching`.
+    #[test]
+    fn settle_over_every_combination_of_offline_word_and_problem() {
+        use ProfileState::{Idle, MediaAbsent, NeedsAttention, Offline, Paused, Syncing, Watching};
+        let table = [
+            //  word            clean     problem         offline  offline+problem
+            (Idle, Watching, NeedsAttention, Offline, Offline),
+            (Watching, Watching, NeedsAttention, Offline, Offline),
+            (Syncing, Watching, NeedsAttention, Offline, Offline),
+            (Offline, Watching, NeedsAttention, Offline, Offline),
+            (
+                NeedsAttention,
+                NeedsAttention,
+                NeedsAttention,
+                Offline,
+                Offline,
+            ),
+            (MediaAbsent, MediaAbsent, NeedsAttention, Offline, Offline),
+            (Paused, Paused, Paused, Paused, Paused),
+        ];
+        for (word, clean, problem, offline, both) in table {
+            assert_eq!(
+                Engine::settle(false, Some((word, false))),
+                clean,
+                "{word:?}"
+            );
+            assert_eq!(
+                Engine::settle(false, Some((word, true))),
+                problem,
+                "{word:?} with a problem"
+            );
+            assert_eq!(
+                Engine::settle(true, Some((word, false))),
+                offline,
+                "{word:?} in the sticky set"
+            );
+            assert_eq!(
+                Engine::settle(true, Some((word, true))),
+                both,
+                "{word:?} in the sticky set with a problem"
+            );
+        }
+        assert_eq!(
+            Engine::settle(false, None),
+            Watching,
+            "no snapshot: nothing standing"
+        );
+        assert_eq!(
+            Engine::settle(true, None),
+            Offline,
+            "no snapshot, but the set knows"
+        );
+    }
+
+    /// Only the error is a standing problem. `warn` is also how the engine
+    /// says something informational — a pull request open for review — and a
+    /// folder wearing one of those is not a folder that has stopped: at a
+    /// pass end that touched no remote it settles to `Watching`, the warning
+    /// still shown, and `keeper-syncd doctor` has nothing to report.
+    #[test]
+    fn a_warning_alone_is_not_a_standing_problem() {
+        let mut snapshot = SyncStatus::idle("01", "fixture");
+        assert!(!Engine::has_problem(&snapshot));
+        snapshot.warning = Some("pull request #7 is open for review".to_owned());
+        assert!(!Engine::has_problem(&snapshot), "a warning alone");
+        snapshot.error = Some("the remote refused the credential".to_owned());
+        assert!(Engine::has_problem(&snapshot), "an error beside it");
+        snapshot.warning = None;
+        assert!(Engine::has_problem(&snapshot), "an error alone");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine.warn(
+            &p.id,
+            &p.name,
+            "pull request #7 is open for review".to_owned(),
+        );
+        engine.publish(engine.progress(&p, SyncPhase::Pushing));
+        // The pass end after a `Skipped` pass: nothing reached, nothing failed.
+        engine.settle_and_persist(&p.id);
+        let settled = engine.status(&p.id).expect("status");
+        assert_eq!(settled.state, ProfileState::Watching, "{settled:?}");
+        assert_eq!(
+            settled.warning.as_deref(),
+            Some("pull request #7 is open for review"),
+            "the warning is still shown"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+    }
+
+    /// A failure the remote *answered with* — a 403 here — is a round trip,
+    /// and the sticky set is about a remote that cannot be reached. After
+    /// `offline`, such a failure leaves the set, logs the exit once, and lets
+    /// the `NeedsAttention` the folder just earned stand instead of a stale
+    /// `offline` outranking it at the pass end.
+    #[test]
+    fn a_failure_the_remote_answered_with_ends_offline_and_reads_needs_attention() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+        assert!(Engine::lock(&engine.offline).contains(&p.id), "arranged");
+
+        engine.record_failure(
+            &p,
+            &SyncError::Forbidden {
+                host: "git.invalid".to_owned(),
+            },
+        );
+        assert!(
+            !Engine::lock(&engine.offline).contains(&p.id),
+            "the remote answered, so it is not unreachable"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 1);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::NeedsAttention, "{snapshot:?}");
+        assert!(snapshot.error.is_some(), "and the sentence stands");
+        assert_eq!(stored_state(&engine, &p.id), "needsAttention");
+
+        // The pass end keeps what the failure earned.
+        engine.settle_and_persist(&p.id);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::NeedsAttention
+        );
+        assert_eq!(stored_state(&engine, &p.id), "needsAttention");
+
+        // A failure the remote did not answer — a push held for its large
+        // files — is not an exit: it is raised on every pass of exactly the
+        // folder whose uploads are failing, and reading it as reachable would
+        // flap the word.
+        go_offline(&engine, &p);
+        engine.record_failure(&p, &SyncError::LfsUploadPending { objects: 1 });
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "a held push proves nothing about the remote"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 1);
+    }
+
+    /// A `Push` unit that finds nothing to send completes without a round
+    /// trip, and a unit that completes that way must not empty the sticky
+    /// set or log `sync reachable again` — the pass-end defect, one level
+    /// down: `drain` used to reset on every `Ok`, whatever the unit proved.
+    #[tokio::test]
+    async fn a_push_with_nothing_to_send_does_not_end_offline() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        // A file inside the settle window: adopted in place, nothing committed
+        // yet, so the push has no commit to send and never asks the remote.
+        std::fs::write(p.local_path.join("note.md"), b"still settling").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        engine.ensure_repo(&p).expect("adopt");
+        go_offline(&engine, &p);
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Push, 0, 0).map(drop))
+            .expect("enqueue");
+
+        let engine = Arc::new(engine);
+        platform.advance_ms(1_000);
+        let _ = engine.tick().await;
+
+        assert_eq!(
+            units_of_kind(&engine, &p.id, WorkKind::PUSH),
+            0,
+            "arranged: the unit completed"
+        );
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "a push that sent nothing proved nothing"
+        );
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 0);
+    }
+
+    /// A transfer unit on a folder with large-file support off returns at
+    /// once, and a checkout of a folder with files in it adopts in place —
+    /// neither asks the remote anything, and neither may end `offline`.
+    #[tokio::test]
+    async fn a_unit_that_made_no_round_trip_does_not_end_offline() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_mode = LfsMode::Disabled;
+        std::fs::write(p.local_path.join("note.md"), b"adopted in place").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+
+        // The checkout: `.git` does not exist yet, and the folder has content.
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Checkout, 0, 0).map(drop))
+            .expect("enqueue checkout");
+        let contact = engine
+            .drain_kind(&p, WorkKind::CHECKOUT, SyncSource::Watch)
+            .await
+            .expect("the adoption succeeds");
+        assert_eq!(contact, RemoteContact::Skipped, "adopted, not cloned");
+        assert!(
+            p.local_path.join(".git").exists(),
+            "arranged: the repository exists"
+        );
+        assert_eq!(units_of_kind(&engine, &p.id, WorkKind::CHECKOUT), 0);
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "an adoption proves nothing"
+        );
+
+        // The transfer: large-file support is off, so there is nothing to move.
+        engine
+            .with_db(|conn| {
+                db::enqueue_unique(
+                    conn,
+                    &p.id,
+                    &WorkKind::LfsDownload {
+                        oid: "a".repeat(64),
+                        size: 7,
+                    },
+                    0,
+                    0,
+                )
+                .map(drop)
+            })
+            .expect("enqueue download");
+        let contact = engine
+            .drain_kind(&p, WorkKind::LFS_DOWNLOAD, SyncSource::Watch)
+            .await
+            .expect("a disabled transfer succeeds");
+        assert_eq!(contact, RemoteContact::Skipped, "nothing was transferred");
+        assert_eq!(units_of_kind(&engine, &p.id, WorkKind::LFS_DOWNLOAD), 0);
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "a disabled transfer proves nothing"
+        );
+
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 0);
+    }
+
+    /// The positive path, through `sync_once`: a fetch that comes back is a
+    /// round trip, so the pass empties the sticky set, logs the exit once and
+    /// writes `watching` with the moment — the one time `mark_synced` may.
+    #[tokio::test]
+    async fn a_pass_whose_fetch_came_back_ends_offline_once() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        let p = committed_fixture_at(&engine, &platform, dir.path(), &remote.to_string_lossy());
+        go_offline(&engine, &p);
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+
+        platform.advance_ms(60_000);
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("the fetch against the loopback remote comes back");
+        assert!(outcome.pulled, "arranged: the fetch ran");
+
+        assert!(
+            !Engine::lock(&engine.offline).contains(&p.id),
+            "a round trip that came back is the exit"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 1);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+    }
+
+    /// A pass that touched no remote at all — push-only, nothing committed,
+    /// nothing queued — proves nothing, and leaves the set and the row alone.
+    #[tokio::test]
+    async fn a_pass_that_skipped_every_leg_leaves_offline_standing() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.direction = SyncDirection::PushOnly;
+        std::fs::write(p.local_path.join("note.md"), b"still settling").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        engine.ensure_repo(&p).expect("adopt");
+        go_offline(&engine, &p);
+        let written = stored_updated_ms(&engine, &p.id);
+
+        platform.advance_ms(1_000);
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("every leg is skipped, none raises");
+        assert!(!outcome.pulled, "arranged: push-only");
+
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "nothing was proved"
+        );
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            written,
+            "an unmoved word is not written"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 0);
+    }
+
+    /// The hesperia shape, through `sync_once`. A pull-only folder whose
+    /// fetch is fine drains an `LfsUpload` unit that fails on the network —
+    /// the LFS server is a different host from the git remote — so the drain
+    /// records `offline` and reschedules the unit, and the pass reaches its
+    /// end with every inline leg clean. That end used to call
+    /// `note_unit_succeeded`, empty the sticky set, log `sync reachable again`
+    /// and write `watching`: thirteen times on 2026-09-09, beside 1 044
+    /// failures. Now the pass knows what it proved, and a drained failure
+    /// means it proved nothing the failure did not already disprove.
+    #[tokio::test]
+    async fn a_pass_whose_drained_unit_failed_does_not_declare_the_remote_reachable() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        // A port nothing listens on: bound to learn the number, then closed,
+        // so the LFS batch call is refused at once rather than timing out.
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            listener.local_addr().expect("addr").port()
+        };
+
+        let mut p = SyncProfile::new(
+            "01JTESTPROFILE",
+            "fixture",
+            dir.path().join("work"),
+            remote.to_string_lossy().as_ref(),
+        );
+        p.lfs_threshold_bytes = 1024;
+        std::fs::create_dir_all(&p.local_path).expect("work dir");
+        std::fs::write(
+            p.local_path.join(".lfsconfig"),
+            format!("[lfs]\n\turl = http://127.0.0.1:{refused}/info/lfs\n"),
+        )
+        .expect("write .lfsconfig");
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(
+            commit_after_settling(&engine, &platform, &p),
+            2,
+            "arranged: the pointer and the config are committed"
+        );
+        assert_eq!(
+            engine.lfs_uploads_outstanding(&p).expect("count"),
+            1,
+            "arranged: the commit queued the upload it owes"
+        );
+        // Pull-only from here: the inline push leg is skipped, which is what
+        // lets the pass reach its end with the upload still owed.
+        p.direction = SyncDirection::PullOnly;
+        engine.upsert_profile(&p).expect("upsert pull-only");
+
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("every inline leg is clean; the failure is the drained unit's");
+        assert!(outcome.pulled, "arranged: the fetch ran and came back");
+        assert_eq!(
+            engine.lfs_uploads_outstanding(&p).expect("count"),
+            1,
+            "arranged: the upload is still owed"
+        );
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Offline, "{snapshot:?}");
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "the pass end did not empty the sticky set"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(log.count(tracing::Level::INFO, "sync offline"), 1);
+        assert_eq!(
+            log.count(tracing::Level::INFO, "sync reachable again"),
+            0,
+            "a fetch that worked beside an upload that did not proves nothing"
+        );
+        assert!(
+            snapshot.last_sync_ms.is_some(),
+            "the pass itself still counts as this folder's work having run"
+        );
+    }
+
+    /// The only exit from `offline` moves the word with it, even when no
+    /// phase was ever published: a push with nothing to send never reads
+    /// `Syncing`, so `refresh_pending` never sees the edge it flips on, and
+    /// without this the folder stayed `offline` in the row after the unit
+    /// that proved otherwise.
+    #[test]
+    fn a_unit_succeeding_without_a_phase_still_writes_watching() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(
+            engine.status(&p.id).expect("status").phase,
+            SyncPhase::Idle,
+            "arranged: no phase in flight"
+        );
+
+        platform.advance_ms(1_000);
+        engine.note_unit_succeeded(&p, RemoteContact::Reached);
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+
+        // And the same for the word an error put there, once the error is
+        // gone: a `NeedsAttention` with nothing left to say why is `Watching`.
+        engine.record_failure(
+            &p,
+            &SyncError::Forbidden {
+                host: "git.invalid".to_owned(),
+            },
+        );
+        assert_eq!(stored_state(&engine, &p.id), "needsAttention", "arranged");
+        engine.note_unit_succeeded(&p, RemoteContact::Reached);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert!(snapshot.error.is_none());
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+
+        // A snapshot mid-phase is left to the refresh that ends the phase.
+        engine.publish(engine.progress(&p, SyncPhase::Pushing));
+        let written = stored_updated_ms(&engine, &p.id);
+        platform.advance_ms(1_000);
+        engine.note_unit_succeeded(&p, RemoteContact::Reached);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Syncing
+        );
+        assert_eq!(stored_updated_ms(&engine, &p.id), written, "no write");
+    }
+
+    /// `refresh_pending` writes the row only on the edge it owns: a snapshot
+    /// that is not `Syncing` is not its to move, and a queue that is not
+    /// empty ends nothing.
+    #[test]
+    fn refresh_pending_writes_the_row_only_when_it_moved_the_word() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+        let written = stored_updated_ms(&engine, &p.id);
+
+        // Not syncing: nothing to end.
+        platform.advance_ms(1_000);
+        engine.refresh_pending(&p.id);
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            written,
+            "no edge, no write"
+        );
+
+        // Syncing with work still queued: the phase is not over.
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Pull, 0, 0).map(drop))
+            .expect("enqueue");
+        engine.publish(engine.progress(&p, SyncPhase::Fetching));
+        engine.refresh_pending(&p.id);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Syncing, "{snapshot:?}");
+        assert_eq!(snapshot.pending, 1);
+        assert_eq!(stored_updated_ms(&engine, &p.id), written, "still no write");
+
+        // Empty queue: the edge, and one write, dated.
+        engine
+            .with_db(|conn| {
+                conn.execute("DELETE FROM journal WHERE profile_id = ?1", [&p.id])
+                    .map(drop)
+                    .map_err(SyncError::from)
+            })
+            .expect("empty the queue");
+        platform.advance_ms(1_000);
+        engine.refresh_pending(&p.id);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Offline, "{snapshot:?}");
+        assert_eq!(snapshot.phase, SyncPhase::Idle);
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+    }
+
+    /// Row 6. Both durable writers stamp `updated_ms` with the engine's clock,
+    /// so a reader can tell a row written a second ago from one the last run
+    /// left in August — and the retire that skips the write (no error to
+    /// retire) leaves the stamp alone, because nothing changed.
+    #[test]
+    fn every_state_and_error_write_stamps_updated_ms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let created = stored_updated_ms(&engine, &p.id);
+        assert_eq!(created, platform.now_ms(), "arranged: the upsert stamps");
+
+        platform.advance_ms(1_000);
+        engine.set_state(&p.id, ProfileState::Watching);
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+
+        platform.advance_ms(1_000);
+        engine.set_error(&p.id, Some("the remote refused the credential"));
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+
+        platform.advance_ms(1_000);
+        engine.clear_warning(&p.id);
+        assert_eq!(stored_last_error(&engine, &p.id), None);
+        let retired_at = stored_updated_ms(&engine, &p.id);
+        assert_eq!(
+            retired_at,
+            platform.now_ms(),
+            "the retire is a write, and dated"
+        );
+
+        platform.advance_ms(1_000);
+        engine.clear_warning(&p.id);
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            retired_at,
+            "nothing to retire is no write at all"
         );
     }
 

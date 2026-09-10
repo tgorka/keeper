@@ -269,8 +269,11 @@ const PRUNE_DEFAULT_MARKER: &str = "lfs_prune_local_default_on";
 /// so a profile that asks for `lfsPruneLocal = false` there is written back on
 /// the same boot and stays that way.
 ///
-/// It does not touch `updated_ms`: the operator changed nothing, and a folder
-/// reporting an edit nobody made is a worse lie than a stale timestamp.
+/// It does not touch `updated_ms`. That column is the last write of `json`,
+/// `state` or `last_error` — an operator's edit or the engine's observation —
+/// and this is neither: the operator changed nothing and the engine observed
+/// nothing, and a row reporting a write nobody made is a worse lie than a
+/// stale timestamp.
 fn ensure_prune_default(conn: &Connection) -> Result<()> {
     let applied: Option<String> = conn
         .query_row(
@@ -1789,10 +1792,19 @@ pub fn delete_profile(conn: &Connection, id: &str) -> Result<()> {
 /// go `Syncing → Watching` a hundred times while one error stands, and a
 /// state write that also cleared the error would erase the reason on the very
 /// next tick.
-pub fn set_profile_error(conn: &Connection, id: &str, last_error: Option<&str>) -> Result<()> {
+///
+/// `now_ms` stamps `updated_ms`, as [`set_profile_state`] does: the two
+/// columns are what a fresh process and `keeper-syncd status` read, and a row
+/// whose stamp never moved could not be told from one last touched weeks ago.
+pub fn set_profile_error(
+    conn: &Connection,
+    id: &str,
+    last_error: Option<&str>,
+    now_ms: i64,
+) -> Result<()> {
     conn.execute(
-        "UPDATE profiles SET last_error = ?2 WHERE id = ?1",
-        (id, last_error),
+        "UPDATE profiles SET last_error = ?2, updated_ms = ?3 WHERE id = ?1",
+        (id, last_error, now_ms),
     )?;
     Ok(())
 }
@@ -2556,24 +2568,75 @@ pub fn unpark(conn: &Connection, profile_id: &str, unit_id: i64) -> Result<bool>
 
 /// Persist a profile's observed runtime state.
 ///
-/// Only states a *fresh* process should believe are ever read back
-/// ([`get_profile_state`]); this simply records whatever the engine last saw.
-pub fn set_profile_state(conn: &Connection, id: &str, state: ProfileState) -> Result<()> {
+/// Which of these a *fresh* process believes is [`get_profile_runtime`]'s
+/// reader's decision; this simply records whatever the engine last saw.
+///
+/// `now_ms` stamps `updated_ms`, which is the only way a reader of the row can
+/// tell a state written a second ago from one the last run left behind in
+/// August — `state` alone reads the same either way. The engine's clock, not
+/// `SQLite`'s, so a test can move it and so the stamp agrees with every other
+/// timestamp the engine writes.
+pub fn set_profile_state(
+    conn: &Connection,
+    id: &str,
+    state: ProfileState,
+    now_ms: i64,
+) -> Result<()> {
     conn.execute(
-        "UPDATE profiles SET state = ?2 WHERE id = ?1",
-        (id, profile_state_str(state)),
+        "UPDATE profiles SET state = ?2, updated_ms = ?3 WHERE id = ?1",
+        (id, profile_state_str(state), now_ms),
     )?;
     Ok(())
 }
 
-/// Read back the last recorded runtime state, if it is one we recognise.
-pub fn get_profile_state(conn: &Connection, id: &str) -> Result<Option<ProfileState>> {
-    let stored: Option<String> = conn
-        .query_row("SELECT state FROM profiles WHERE id = ?1", [id], |r| {
-            r.get(0)
-        })
+/// What the last run left in a profile row's runtime columns — the three a
+/// fresh process seeds its snapshot from, read in one statement so they can
+/// never describe two different moments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileRuntime {
+    /// The last state word the engine observed, if it is one we recognise.
+    pub state: Option<ProfileState>,
+    /// The sentence the last run left beside the folder, or `None`.
+    pub last_error: Option<String>,
+    /// The engine's clock at the last write of `json`, `state` or
+    /// `last_error` — the only way to tell a row written a second ago from
+    /// one the last run left behind in August.
+    pub updated_ms: i64,
+}
+
+/// Read back the runtime columns the engine last wrote for a profile.
+///
+/// One query, deliberately. `state` used to be read alone: a fresh process
+/// seeded its snapshot from the word and never from `last_error`, so an error
+/// persisted by an earlier run was invisible to the one path that retires
+/// errors — `Engine::clear_warning`, which writes the column only when the
+/// in-memory snapshot carried something — and a folder whose first copy had
+/// long since finished went on reporting that it never did. And without
+/// `updated_ms` beside them, a persisted `offline` could not be told from
+/// one the daemon re-stamped a minute ago, which is the difference between
+/// a word worth believing and one worth re-probing.
+///
+/// `Ok(None)` is a profile with no row at all. A row whose `state` is `NULL`
+/// — the schema forbids it, but a row is a row — reads as no word, with the
+/// sentence and the stamp beside it intact: the reader's rule seeds the state
+/// off the sentence first, and a failed read here would lose the one column
+/// that matters most.
+pub fn get_profile_runtime(conn: &Connection, id: &str) -> Result<Option<ProfileRuntime>> {
+    let runtime = conn
+        .query_row(
+            "SELECT state, last_error, updated_ms FROM profiles WHERE id = ?1",
+            [id],
+            |r| {
+                let state: Option<String> = r.get(0)?;
+                Ok(ProfileRuntime {
+                    state: state.as_deref().and_then(profile_state_from_str),
+                    last_error: r.get(1)?,
+                    updated_ms: r.get(2)?,
+                })
+            },
+        )
         .optional()?;
-    Ok(stored.as_deref().and_then(profile_state_from_str))
+    Ok(runtime)
 }
 
 /// Stable on-disk spelling. Kept separate from the serde representation so a
@@ -4357,6 +4420,94 @@ mod tests {
 
     fn profile(id: &str) -> SyncProfile {
         SyncProfile::new(id, "n", "/tmp/x", "https://git.example/r.git")
+    }
+
+    /// The three runtime columns come back together, stamped by whichever
+    /// writer touched them last — and a profile with no row is `None`, not
+    /// an empty runtime.
+    #[test]
+    fn the_runtime_columns_are_read_in_one_piece() {
+        let c = conn();
+        upsert_profile(&c, &profile("01A"), 1_000).expect("upsert");
+        let fresh = get_profile_runtime(&c, "01A")
+            .expect("read")
+            .expect("the row exists");
+        assert_eq!(
+            fresh,
+            ProfileRuntime {
+                state: Some(ProfileState::Idle),
+                last_error: None,
+                updated_ms: 1_000,
+            },
+            "a new row: the schema's default word, no sentence, the upsert's stamp"
+        );
+
+        set_profile_state(&c, "01A", ProfileState::Offline, 2_000).expect("state");
+        set_profile_error(&c, "01A", Some("connection refused"), 3_000).expect("error");
+        let written = get_profile_runtime(&c, "01A")
+            .expect("read")
+            .expect("the row exists");
+        assert_eq!(
+            written,
+            ProfileRuntime {
+                state: Some(ProfileState::Offline),
+                last_error: Some("connection refused".to_owned()),
+                updated_ms: 3_000,
+            },
+            "both writers stamp, and the stamp is the later one's"
+        );
+
+        c.execute(
+            "UPDATE profiles SET state = 'daydreaming' WHERE id = '01A'",
+            [],
+        )
+        .expect("a word this build does not know");
+        let unknown = get_profile_runtime(&c, "01A")
+            .expect("read")
+            .expect("the row exists");
+        assert_eq!(unknown.state, None, "an unrecognised word is no word");
+        assert_eq!(
+            unknown.last_error.as_deref(),
+            Some("connection refused"),
+            "and the sentence beside it still comes back"
+        );
+
+        assert_eq!(
+            get_profile_runtime(&c, "01B").expect("read"),
+            None,
+            "no row, no runtime"
+        );
+    }
+
+    /// The schema says `state NOT NULL`, but the reader must not be the thing
+    /// that fails on a row that got there anyway — a store written by a build
+    /// whose table lacked the constraint. No word, and the sentence beside it
+    /// kept, because the sentence is what the seed rule reads first.
+    #[test]
+    fn a_null_state_reads_as_no_word_with_the_sentence_kept() {
+        let c = Connection::open_in_memory().expect("in-memory db");
+        c.execute_batch(
+            "CREATE TABLE profiles (
+                id TEXT PRIMARY KEY,
+                json TEXT NOT NULL,
+                state TEXT,
+                last_error TEXT,
+                updated_ms INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO profiles (id, json, state, last_error, updated_ms)
+            VALUES ('01A', '{}', NULL, 'the remote refused the credential', 5);",
+        )
+        .expect("an older shape of the table");
+        assert_eq!(
+            get_profile_runtime(&c, "01A")
+                .expect("a NULL word is not a read error")
+                .expect("the row exists"),
+            ProfileRuntime {
+                state: None,
+                last_error: Some("the remote refused the credential".to_owned()),
+                updated_ms: 5,
+            }
+        );
     }
 
     #[test]
@@ -6355,8 +6506,9 @@ mod tests {
             .expect("timestamp");
         assert_eq!(
             updated, 7,
-            "the operator edited nothing, and a folder reporting an edit \
-             nobody made is the worse lie"
+            "updated_ms is the last write of json, state or error; the operator \
+             edited nothing and the engine observed nothing, and a row reporting \
+             a write nobody made is the worse lie"
         );
     }
 
