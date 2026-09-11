@@ -1623,21 +1623,27 @@ impl Drop for WalkClaim<'_> {
     }
 }
 
-/// What [`Engine::walk_policy`]'s guard learned about the paths the gate is
-/// holding, from one probe of the index.
+/// What the pass's second look sorted the held paths its walk did not report
+/// into ([`Engine::paths_for_the_second_look`]). Every path here is
+/// repository-relative.
 ///
-/// Three answers, not two: an index that cannot be read says nothing about
-/// any held path, and reporting it as "missing" would send an operator after
-/// a phantom untracked file. Both of the non-`Indexed` answers widen the
-/// walk; they differ in what the log says.
-enum HeldIndexProbe {
-    /// Every held path is one the index carries, or nothing is held: a walk
-    /// without a directory scan can observe them all.
-    Indexed,
-    /// `missing` held paths the index does not carry, `first` among them.
-    Missing { missing: usize, first: PathBuf },
-    /// The index could not be read, so nothing is known about any held path.
-    Unreadable(String),
+/// A held path the walk could not report is owed one of four answers. A
+/// path to **sample** goes through the gate exactly as a walk-reported
+/// addition does. A path to keep **held** is one the pass could not judge —
+/// a `stat` refused for a reason other than absence, or an exclusion it
+/// could not consult — and is kept without a sample, the gate's own
+/// fail-closed rule applied here: forgetting it would be the file the sweep
+/// found and never committed, and failing the pass would be one path
+/// holding up the folder. A **collapsed** path has become a directory, for
+/// [`Engine::report_collapsed`] to name once, as the walk's are. And a path
+/// that is gone, ignored, carried by the index after all, or inside a
+/// nested repository is simply not listed, which leaves it to `retain` to
+/// forget — the whole of what any of those is owed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SecondLook {
+    sample: Vec<PathBuf>,
+    held: Vec<PathBuf>,
+    collapsed: Vec<PathBuf>,
 }
 
 /// What the last footprint sweep found, keyed by what it was measured against
@@ -2024,12 +2030,12 @@ impl Engine {
     /// Same arithmetic as [`Self::poll_walk_policy`] plus the one input that
     /// matters here: this leg publishes untracked files, so it must not miss
     /// one. The watcher is what makes skipping safe — a file that appears sets
-    /// the profile's wake — and the gate is what makes it safe for the files
-    /// only a walk found: a pass that held an untracked path sets the same
-    /// flag ([`Self::collect_stable_changes`]), and behind the flag
-    /// [`Self::walk_policy`]'s guard widens for any held path the index does
-    /// not carry. A pass with neither has nothing new for a directory scan to
-    /// find.
+    /// the profile's wake, and a `Create` sets `untracked_appeared` — and the
+    /// pass is what makes it safe for the files only a walk found: a held
+    /// path the index does not carry is sampled by the pass itself
+    /// ([`Self::collect_stable_changes`]'s second look), so it owes no
+    /// directory scan. A pass with no `Create` and no sweep due has nothing
+    /// new for a directory scan to find.
     ///
     /// Measured on the field folder: a pass that spent the scan reported
     /// `elapsed_ms=9299355` — two and a half hours against a busy USB volume —
@@ -2063,16 +2069,19 @@ impl Engine {
     /// runs with, so a walk that took the list is the walk that answers it,
     /// and the full walks consume it too: a sweep of the whole tree answers
     /// every path on it. `with_held` brings the paths the gate is still
-    /// holding into the answer: a held path the index carries rides along as
-    /// an include of the narrowed walk, and a held path the index does not
-    /// carry widens the walk to a full one. The gate needs a second
-    /// observation to clear a settling path, and the walk is the only
-    /// observer; a walk that could not see a held path would report nothing
-    /// for it, and `collect_stable_changes` would then `retain` it away — the
-    /// episode forgotten, the file never committed, which is the exact shape
-    /// of the bug the wake was invented to fix. The gate holds only what is
-    /// mid-episode, so this is a handful. An empty list narrows nothing: the
-    /// whole index, as before.
+    /// holding into the answer as includes of the narrowed walk. The gate
+    /// needs a second observation to clear a settling path; for a held path
+    /// the index carries the walk is that observer, and a walk that could not
+    /// see it would report nothing for it, and `collect_stable_changes` would
+    /// then `retain` it away — the episode forgotten, the file never
+    /// committed, which is the exact shape of the bug the wake was invented
+    /// to fix. A held path the index does *not* carry rides along too but
+    /// comes back unreported, because an include pathspec names an index
+    /// entry and none of the walks below reads a directory; that one is the
+    /// pass's own to observe ([`Self::collect_stable_changes`]'s second look),
+    /// and it used to widen this policy to a full walk on every pass until it
+    /// settled. The gate holds only what is mid-episode, so this is a
+    /// handful. An empty list narrows nothing: the whole index, as before.
     fn walk_policy(&self, profile: &SyncProfile, with_held: bool) -> git::repo::WalkPolicy {
         let watched = self.watch_is_live(&profile.id);
         let now = Instant::now();
@@ -2096,59 +2105,12 @@ impl Engine {
             return git::repo::WalkPolicy::full();
         }
         drop(swept);
-        // The guard: a held path the index does not carry can only be observed
-        // by a walk that reads the directories. Neither walk below does — the
-        // whole-index walk the overflow buys no more than the narrowed one —
-        // so handing such a path to either is handing it to `retain` to
-        // forget, which is a file the sweep found and never committed
-        // (hesperia, 2026-09-09: `untracked=160`, then `untracked=0
-        // included=159` eight seconds later, 62.8 GB never published). The
-        // flag `collect_stable_changes` sets is the ordinary, cheap answer;
-        // this is what makes "a held path is re-observed" a property of the
-        // policy rather than something every caller has to remember. One
-        // index probe per held path, only when held paths exist and the
-        // policy has no scan; the walk parses the same index a moment later.
-        let held = if with_held {
-            self.held_paths(profile)
-        } else {
-            Vec::new()
-        };
-        // Either widening stamps the sweep clock, as the sweep branch above
-        // and the flag branch in `commit_walk_policy` do: a full walk answers
-        // every path, and a sweep falling due a moment later would otherwise
-        // repeat the directory walk for nothing.
-        match self.held_paths_the_index_lacks(profile, &held) {
-            HeldIndexProbe::Indexed => {}
-            HeldIndexProbe::Missing { missing, first } => {
-                tracing::warn!(
-                    profile = profile.name,
-                    missing,
-                    path = %first.display(),
-                    "the gate holds a path the index does not carry; \
-                     a walk without a directory scan cannot observe it; \
-                     widening to a full walk"
-                );
-                Self::lock(&self.untracked_sweep).insert(profile.id.clone(), now);
-                return git::repo::WalkPolicy::full();
-            }
-            HeldIndexProbe::Unreadable(err) => {
-                tracing::warn!(
-                    profile = profile.name,
-                    index = "unreadable",
-                    held = held.len(),
-                    %err,
-                    "the gate holds paths and the index cannot be read, so whether \
-                     a walk without a directory scan could observe them is unknown; \
-                     widening to a full walk"
-                );
-                Self::lock(&self.untracked_sweep).insert(profile.id.clone(), now);
-                return git::repo::WalkPolicy::full();
-            }
-        }
         let Some(mut include) = named else {
             return git::repo::WalkPolicy::tracked_only();
         };
-        include.extend(held);
+        if with_held {
+            include.extend(self.held_paths(profile));
+        }
         let mut include: Vec<PathBuf> = include.into_iter().collect();
         include.sort_unstable();
         include.dedup();
@@ -2167,10 +2129,12 @@ impl Engine {
     /// (the field log shows `caller="poll"` first after the 02:18 restart).
     ///
     /// The gate lock is taken for the export and released at the end of the
-    /// statement, before anything else in the policy runs: the index probe
-    /// that follows opens the repository, and a repository is never opened
-    /// under a gate guard ([`GateGuard`], AD-232, Story 70.6). The
-    /// `file_state` read is a SQLite transaction under the db lock alone.
+    /// statement, before anything else in the caller runs: no repository is
+    /// opened or index read under a gate guard ([`GateGuard`], AD-232, Story
+    /// 70.6). The `file_state` read is a SQLite transaction under the db lock
+    /// alone. The pass's own second look does not come through here — it has
+    /// the seeded gate in hand and takes the export itself
+    /// ([`Self::collect_stable_changes`]).
     fn held_paths(&self, profile: &SyncProfile) -> Vec<PathBuf> {
         let held = match self.existing_gate(&profile.id) {
             Some(gate) => GateGuard::take(&gate).export(),
@@ -2197,40 +2161,206 @@ impl Engine {
             .collect()
     }
 
-    /// Which of `held` the index does not carry, from one probe of the index
-    /// — the same probe [`Self::fold_watch_events`] asks of a watcher's path.
+    /// The held paths a pass must sample itself — the second look.
     ///
-    /// An index that cannot be read is its own answer, not "missing": the walk
-    /// is widened either way, at the cost of one directory walk, where the
-    /// other answer is a held path forgotten — but the log then names the
-    /// error rather than a path the index may well carry.
-    fn held_paths_the_index_lacks(
+    /// The gate needs two observations of the same bytes across a settle
+    /// window, and until this the walk was its only observer. A held path the
+    /// walk reported (`observed`) has had its look. A held path the walk did
+    /// not report is one of two things: a path the index carries that the
+    /// walk found clean — another leg committed it, say — which is finished
+    /// business for the gate and is left to `retain`; or a path the index
+    /// does not carry, which the narrowed walk cannot report however it is
+    /// asked (no directory is read), and which the pass must therefore look
+    /// at with its own `lstat`. This sorts the second kind into what the pass
+    /// owes each ([`SecondLook`]), for [`Self::collect_stable_changes`] to
+    /// sample in the same loop as the walk's own untracked paths.
+    ///
+    /// `held` is the gate's own export, absolute, taken by the caller from
+    /// the gate it has already seeded — not a second trip through
+    /// [`Self::held_paths`] and [`Self::existing_gate`]; `observed` is the
+    /// walk's report, absolute; everything returned is repository-relative.
+    /// "Which of them the index does not carry" is one probe of the index
+    /// per pass — the same probe [`Self::fold_watch_events`] asks of a
+    /// watcher's path — made here, outside the gate lock, because an index
+    /// read is never made under a gate guard ([`GateGuard`], AD-232, Story
+    /// 70.6). The probe's answer is only *which*: an index that cannot be
+    /// read leaves every unreported path to the sample, at the cost of an
+    /// `lstat` on a path the index may well carry — which the gate then
+    /// finds clean or settling exactly as it would have — where the other
+    /// choice is a file the sweep found and never committed. That case warns
+    /// once per pass; through `commit_local` it is reachable only by a race,
+    /// since the walk a moment earlier read the same index and would have
+    /// failed the pass first.
+    ///
+    /// Each candidate then gets what a walk-reported untracked path got on
+    /// the way in. One `lstat`, as [`Self::expand_untracked`] takes: gone
+    /// (`NotFound`) is not listed, a directory is `collapsed` for
+    /// [`Self::report_collapsed`], and any other refusal — a parent that lost
+    /// its permission, say — keeps the path `held` with a `warn` naming it
+    /// and the error, rather than failing the pass: a pass that fails before
+    /// `retain` and `save_file_state` would never forget the entry and would
+    /// commit nothing in the folder for as long as the refusal lasted. And
+    /// git's own exclusion, which the dirwalk applied to every path it
+    /// reported and which a path held since before a `.gitignore` was
+    /// written has not had: the repository's excludes are consulted
+    /// (`repo.excludes`), an ignored path is not listed, and neither is one
+    /// inside a nested repository — its files belong to that repository, as
+    /// the walk's collapsed entries say. An exclusion the pass cannot consult
+    /// is the same fail-closed answer as a refused `stat`: held, with a
+    /// `warn`.
+    fn paths_for_the_second_look(
         &self,
         profile: &SyncProfile,
+        repo: &gix::Repository,
         held: &[PathBuf],
-    ) -> HeldIndexProbe {
-        if held.is_empty() {
-            return HeldIndexProbe::Indexed;
+        observed: &HashSet<PathBuf>,
+    ) -> SecondLook {
+        let unreported: Vec<PathBuf> = held
+            .iter()
+            .filter(|absolute| !observed.contains(*absolute))
+            .filter_map(|absolute| {
+                absolute
+                    .strip_prefix(&profile.local_path)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .collect();
+        if unreported.is_empty() {
+            return SecondLook::default();
         }
-        let index = match self
-            .open_repo(profile)
-            .map_err(|err| err.to_string())
-            .and_then(|repo| repo.index_or_empty().map_err(|err| err.to_string()))
-        {
-            Ok(index) => index,
-            Err(err) => return HeldIndexProbe::Unreadable(err),
+        let index = match repo.index_or_empty() {
+            Ok(index) => Some(index),
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    index = "unreadable",
+                    held = unreported.len(),
+                    %err,
+                    "the gate holds paths the walk did not report and the index cannot \
+                     be read, so which of them a walk could have seen is unknown; \
+                     sampling every one of them"
+                );
+                None
+            }
         };
-        let mut missing = held.iter().filter(|rela| {
-            let key = gix::path::into_bstr(rela.as_path());
-            index.entry_index_by_path(key.as_ref()).is_err()
-        });
-        match missing.next() {
-            None => HeldIndexProbe::Indexed,
-            Some(first) => HeldIndexProbe::Missing {
-                first: first.clone(),
-                missing: 1 + missing.count(),
-            },
+        let candidates: Vec<PathBuf> = match &index {
+            Some(index) => unreported
+                .into_iter()
+                .filter(|rela| {
+                    let key = gix::path::into_bstr(rela.as_path());
+                    index.entry_index_by_path(key.as_ref()).is_err()
+                })
+                .collect(),
+            None => unreported,
+        };
+        if candidates.is_empty() {
+            return SecondLook::default();
         }
+        // The excludes want an index only for `.gitignore` files that are not
+        // checked out (skip-worktree); an unreadable one is stood in for by an
+        // empty state, and the worktree's own files are read either way.
+        let empty;
+        let state: &gix::index::State = match &index {
+            Some(index) => index,
+            None => {
+                empty = gix::index::State::new(repo.object_hash());
+                &empty
+            }
+        };
+        let mut excludes = match repo.excludes(state, None, Default::default()) {
+            Ok(excludes) => Some(excludes),
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    held = candidates.len(),
+                    %err,
+                    "the repository's excludes could not be read, so whether git ignores \
+                     a held path is unknown; keeping every one of them held"
+                );
+                None
+            }
+        };
+        let mut look = SecondLook::default();
+        for rela in candidates {
+            let absolute = profile.local_path.join(&rela);
+            let metadata = match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) => metadata,
+                // Gone before its second look: not listed, and `retain`
+                // forgets it.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        profile = profile.name,
+                        path = %rela.display(),
+                        %err,
+                        "a held path the walk did not report could not be stat'd; \
+                         keeping it held until it can be"
+                    );
+                    look.held.push(rela);
+                    continue;
+                }
+            };
+            if metadata.is_dir() {
+                look.collapsed.push(rela);
+                continue;
+            }
+            if Self::inside_a_nested_repository(&profile.local_path, &rela) {
+                tracing::info!(
+                    profile = profile.name,
+                    path = %rela.display(),
+                    "a held path now lies inside a nested repository, so it is not this \
+                     folder's to commit; forgetting it"
+                );
+                continue;
+            }
+            let Some(excludes) = excludes.as_mut() else {
+                look.held.push(rela);
+                continue;
+            };
+            let mode = if metadata.is_symlink() {
+                gix::index::entry::Mode::SYMLINK
+            } else {
+                gix::index::entry::Mode::FILE
+            };
+            match excludes.at_path(&rela, Some(mode)) {
+                Ok(platform) if platform.is_excluded() => {
+                    tracing::info!(
+                        profile = profile.name,
+                        path = %rela.display(),
+                        "a held path is one git ignores, so it is not this folder's to \
+                         commit; forgetting it"
+                    );
+                }
+                Ok(_) => look.sample.push(rela),
+                Err(err) => {
+                    tracing::warn!(
+                        profile = profile.name,
+                        path = %rela.display(),
+                        %err,
+                        "whether git ignores a held path could not be read; keeping it \
+                         held until it can be"
+                    );
+                    look.held.push(rela);
+                }
+            }
+        }
+        // The gate exports from a map, so the order is its own; the commit
+        // and the activity rows read better sorted.
+        look.sample.sort();
+        look.held.sort();
+        look.collapsed.sort();
+        look
+    }
+
+    /// Whether `rela` lies inside a repository nested in this one: some
+    /// proper ancestor of it, below the root, holds a `.git` — a directory or
+    /// a gitfile, which is why the test is presence, not kind. One `lstat`
+    /// per ancestor, for the handful of paths the second look sorts.
+    fn inside_a_nested_repository(root: &Path, rela: &Path) -> bool {
+        rela.ancestors()
+            .skip(1)
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .any(|ancestor| std::fs::symlink_metadata(root.join(ancestor).join(".git")).is_ok())
     }
 
     /// Report a walk's progress on every item, for tests.
@@ -9610,20 +9740,56 @@ impl Engine {
         let (untracked, collapsed) =
             Self::expand_untracked(&profile.local_path, &status.untracked)?;
         self.report_collapsed(&profile.id, &collapsed);
-        // The third element says whether the group's paths are ones the
-        // index does not carry — the only group a walk without a directory
-        // scan cannot see, and so the only one whose held paths owe the next
-        // walk one.
-        let groups: [(&Vec<PathBuf>, bool, bool); 3] = [
-            (&status.added, true, false),
-            (&untracked, true, true),
-            (&status.modified, false, false),
-        ];
         // Everything the gate is legitimately allowed to remember this round.
         // Anything else it still holds is stale and must be pruned, or the
         // durable cache grows entries that can never resolve.
-        let mut observed: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::with_capacity(untracked.len() + status.modified.len());
+        let mut observed: std::collections::HashSet<PathBuf> = status
+            .added
+            .iter()
+            .chain(&untracked)
+            .chain(&status.modified)
+            .map(|rela| profile.local_path.join(rela))
+            .collect();
+        // The pass's own second look. A path the gate holds that the index
+        // does not carry is one only a walk that reads the directories could
+        // report, and the steady-state walk reads none: it is
+        // `tracked_only().including(held)`, and an include pathspec names an
+        // index entry, so an untracked path rides along and comes back
+        // unreported. Handing that to `retain` below is the file the sweep
+        // found and never committed (hesperia, 2026-09-09: `untracked=160`,
+        // then `untracked=0 included=159` eight seconds later, 62.8 GB never
+        // published). It used to buy a full walk on every pass until the path
+        // settled — 1.6–6.8 s of directory walk per settle window on the
+        // reference folder, against ~0.2 s for the narrowed one — for one
+        // `lstat` the pass can take itself. So it does: the gate's export is
+        // taken here (the lock is held for the one statement), the paths are
+        // sorted outside the gate lock (the index probe and git's excludes
+        // read files), and the ones to sample go below into the same loop as
+        // the walk's own, so the verdict, the exclusion, the dataless refusal
+        // and the sample tier 4 reads against are exactly a walk-reported
+        // addition's. The ones the pass could not judge stay held, counted
+        // and observed, so `retain` keeps them.
+        let held_now: Vec<PathBuf> = GateGuard::take(&gate)
+            .export()
+            .into_iter()
+            .map(|(absolute, _)| absolute)
+            .collect();
+        let look = self.paths_for_the_second_look(profile, &repo, &held_now, &observed);
+        self.report_collapsed(&profile.id, &look.collapsed);
+        observed.extend(
+            look.sample
+                .iter()
+                .chain(&look.held)
+                .map(|rela| profile.local_path.join(rela)),
+        );
+        held += u32::try_from(look.held.len()).unwrap_or(u32::MAX);
+        let resampled = look.sample;
+        let groups: [(&Vec<PathBuf>, bool); 4] = [
+            (&status.added, true),
+            (&untracked, true),
+            (&resampled, true),
+            (&status.modified, false),
+        ];
         // Under the guard, only the verdicts: one `lstat` per path and the
         // gate's own maps. What a `Stable` modification then costs — an LFS
         // pointer read for `truncated_media`, an attribute-stack build over
@@ -9633,21 +9799,16 @@ impl Engine {
         // other profile's settle check for the four stack builds.
         let mut stable_modified: Vec<PathBuf> = Vec::new();
         let mut dataless: Vec<PathBuf> = Vec::new();
-        let mut untracked_settling = false;
         let pending = {
             let mut gate = GateGuard::take(&gate);
-            for (paths, is_new, unindexed) in groups {
+            for (paths, is_new) in groups {
                 for rela in paths {
                     let absolute = profile.local_path.join(rela);
-                    observed.insert(absolute.clone());
                     match gate.is_stable(&absolute, now) {
                         StabilityVerdict::Stable if is_new => new_paths.push(rela.clone()),
                         StabilityVerdict::Stable => stable_modified.push(rela.clone()),
                         StabilityVerdict::Excluded | StabilityVerdict::Vanished => {}
-                        StabilityVerdict::Settling { .. } => {
-                            held += 1;
-                            untracked_settling |= unindexed;
-                        }
+                        StabilityVerdict::Settling { .. } => held += 1,
                         StabilityVerdict::Dataless => dataless.push(rela.clone()),
                     }
                 }
@@ -9660,20 +9821,6 @@ impl Engine {
             gate.export()
         };
         self.with_db(|conn| db::save_file_state(conn, &profile.id, &pending))?;
-        // A held path the index does not carry needs a second observation,
-        // and only a walk that reads the directories can take it. The
-        // steady-state walk while a watcher is live is `tracked_only()`, which
-        // cannot see an untracked path, after which `gate.retain` above prunes
-        // every entry the walk did not observe — the episode forgotten, the
-        // file never committed, and the next sweep (24 h) starting it over.
-        // The watcher's `Create` sets this flag for the files it announced;
-        // this sets it for the ones only the walk found — moved in by hand,
-        // created while keeper was down, or announced by an event the backend
-        // dropped — the same way `prime_moved_paths` does for a rename (Epic
-        // 70, F-GATE-7). Consumed by the walk that answers it, as ever.
-        if untracked_settling {
-            Self::lock(&self.untracked_appeared).insert(profile.id.clone());
-        }
         for rela in stable_modified {
             let absolute = profile.local_path.join(&rela);
             if let Some(bytes) = lfs::stage::truncated_media(&repo, &rela, &absolute) {
@@ -25691,8 +25838,9 @@ mod tests {
 
         // A prime that recorded nothing buys nothing of its own: the flag
         // stays clear. The gate still holds the earlier prime, which the index
-        // does not carry, and the policy's own guard widens for that — so it
-        // is the flag that is asserted here, and the scan is owed regardless.
+        // does not carry — and that is the pass's own to sample, not a
+        // directory scan's: the policy carries it as an include of the
+        // narrowed walk and widens for nothing.
         assert_eq!(
             engine
                 .prime_moved_paths(&p.id, &[p.local_path.join("never-there.bin")])
@@ -25703,25 +25851,47 @@ mod tests {
             !Engine::lock(&engine.untracked_appeared).contains(&p.id),
             "nothing new was primed, so the prime owes no scan"
         );
+        let policy = engine.commit_walk_policy(&p);
+        assert_eq!(
+            policy,
+            git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("moved.bin")]),
+            "the earlier prime is still held; it rides as an include, and the pass samples it itself"
+        );
         assert!(
-            engine.commit_walk_policy(&p).find_untracked,
-            "but the earlier prime is still held and untracked, and the policy widens for it"
+            !policy.find_untracked,
+            "a held path the pass can sample itself buys no directory walk"
         );
     }
 
-    /// The line `walk_policy`'s guard emits for a held path the index does not
-    /// carry — the tests below promise the line, not only the policy.
-    const WIDENING_WARN: &str = "the gate holds a path the index does not carry; \
-                                 a walk without a directory scan cannot observe it; \
-                                 widening to a full walk";
+    /// The line the untracked sweep logs when a walk reads every directory —
+    /// the tests below promise its absence between a held path's two looks.
+    const SWEEP_LINE: &str = "untracked sweep: this walk reads every directory";
 
-    /// A file the sweep finds is a file that gets committed. The first pass of
-    /// a run walks every directory and holds what it finds; the walk the settle
-    /// deadline runs must be able to see the same path again, and before this
-    /// it could not: it was `tracked_only().including(held)`, which has no
-    /// directory scan, reported nothing for the path, and `retain` forgot the
-    /// episode. hesperia's neuradrive went `untracked=160` to `untracked=0
-    /// included=159` eight seconds later, and 62.8 GB was never committed.
+    /// The `key=value` fields of the `status walk finished` line of the last
+    /// walk `log` recorded, for [`walk_says`].
+    fn last_walk(log: &RecordedLog) -> Vec<String> {
+        log.fields_of(tracing::Level::INFO, "status walk finished")
+            .last()
+            .expect("a walk finished")
+            .clone()
+    }
+
+    /// Whether a walk's line carries exactly `field` — matched by equality,
+    /// one field at a time, so `included=1` never matches `included=10`.
+    fn walk_says(walked: &[String], field: &str) -> bool {
+        walked.iter().any(|f| f == field)
+    }
+
+    /// A file the sweep finds is a file that gets committed — by a pass whose
+    /// walk read no directory. The first pass of a run walks every directory
+    /// and holds what it finds; the settle walk five seconds later is
+    /// `tracked_only().including(held)`, which has no directory scan and
+    /// cannot report an untracked path. Once that meant `retain` forgot the
+    /// episode (hesperia's neuradrive went `untracked=160` to `untracked=0
+    /// included=159` eight seconds later, and 62.8 GB was never committed);
+    /// then, from `1c26f53a`, it meant a full walk on every pass until the
+    /// path settled. Now the pass samples the held path itself, and the walk
+    /// between the two looks stays narrowed.
     #[tokio::test]
     async fn a_file_the_sweep_found_is_committed_once_it_settles() {
         let log = Arc::new(RecordedLog::default());
@@ -25746,9 +25916,14 @@ mod tests {
             0,
             "one sample is not two"
         );
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            1,
+            "the first pass of a run is the sweep"
+        );
         assert!(
-            Engine::lock(&engine.untracked_appeared).contains(&p.id),
-            "the pass that held an untracked path buys the next walk a directory scan"
+            !Engine::lock(&engine.untracked_appeared).contains(&p.id),
+            "a held path the pass can sample itself owes the next walk no directory scan"
         );
         let carried = engine
             .with_db(|conn| db::load_file_state(conn, &p.id))
@@ -25757,6 +25932,15 @@ mod tests {
             carried.iter().any(|(path, _)| path == &found),
             "the episode survives to the second pass"
         );
+        // The policy the second pass runs with: the narrowed walk, the held
+        // path riding as an include, no directory read.
+        let second = engine.commit_walk_policy(&p);
+        assert_eq!(
+            second,
+            git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("found.bin")]),
+            "the held path rides the narrowed walk as an include"
+        );
+        assert!(!second.find_untracked, "and no directory is read for it");
 
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
         assert_eq!(
@@ -25764,7 +25948,17 @@ mod tests {
                 .commit_local(&p, SyncSource::Watch, None)
                 .expect("the second pass"),
             1,
-            "the second look can see the path, and commits it"
+            "the pass's own sample is the second look, and it commits the path"
+        );
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            1,
+            "no directory walk ran between the two looks"
+        );
+        let walked = last_walk(&log);
+        assert!(
+            walk_says(&walked, "untracked=0") && walk_says(&walked, "included=1"),
+            "the second pass's walk was the narrowed one, which reported nothing for the path: {walked:?}"
         );
         let rows = engine.activity(&p.id, 10).await.expect("activity");
         let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
@@ -25772,14 +25966,18 @@ mod tests {
             paths.contains(&"found.bin"),
             "the sweep's find is what was committed: {paths:?}"
         );
-        // The mechanism, pinned: the flag is the ordinary path, and the guard
-        // behind it had nothing to widen — and once the file is committed the
-        // gate holds nothing, so the steady policy is the index-only walk.
+        let kinds: Vec<ActivityKind> = rows
+            .iter()
+            .filter(|row| row.path == "found.bin")
+            .map(|row| row.kind)
+            .collect();
         assert_eq!(
-            log.count(tracing::Level::WARN, WIDENING_WARN),
-            0,
-            "the flag answered the second look; the guard was never needed"
+            kinds,
+            vec![ActivityKind::Added],
+            "a path git has never seen is an addition, whichever look staged it"
         );
+        // Once the file is committed the gate holds nothing, so the steady
+        // policy is the index-only walk with no includes.
         assert_eq!(
             engine.commit_walk_policy(&p),
             git::repo::WalkPolicy::tracked_only(),
@@ -25787,20 +25985,17 @@ mod tests {
         );
     }
 
-    /// The guard behind the flag: a path the gate holds and the index does not
-    /// carry can only be observed by a walk that reads the directories, so the
-    /// commit leg's policy widens rather than hand it to a walk without a
-    /// directory scan — the narrowed one or the overflow's whole-index one —
-    /// that would report nothing and let `retain` forget it. A held tracked
-    /// path is what the narrowed walk was built for (Story 70.1), and stays
-    /// narrowed; the poll leg never carries held paths and is immune.
+    /// Matrix row "File still being written": a sweep-found file rewritten
+    /// between passes is sampled by every pass, stays `Settling`, and buys no
+    /// directory walk — three passes, three `lstat`s, no sweep line, and the
+    /// episode kept through all of them. Before this every one of those passes
+    /// was a full walk (the deferred-work entry against `1c26f53a`: 1.6–6.8 s
+    /// per settle window on the reference folder, for one file). A held
+    /// *tracked* path beside it is what the narrowed walk was built for
+    /// (Story 70.1) and stays the walk's business; the poll leg never carries
+    /// held paths and is untouched.
     #[test]
-    fn a_held_path_the_index_does_not_carry_makes_the_commit_walk_a_full_one() {
-        // The guard promises a line, not only a policy: the count and one
-        // path, so the log says which held path was about to be forgotten.
-        let log = Arc::new(RecordedLog::default());
-        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
-        let widening = WIDENING_WARN;
+    fn a_sweep_found_file_still_being_written_is_held_without_a_directory_walk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));
         let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
@@ -25824,19 +26019,10 @@ mod tests {
                 .expect("opens the episode"),
             0
         );
-        assert!(
-            !Engine::lock(&engine.untracked_appeared).contains(&p.id),
-            "a held tracked path owes no scan"
-        );
         assert_eq!(
             engine.commit_walk_policy(&p),
             git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("tracked.txt")]),
             "a held tracked path is the narrowed walk's whole job"
-        );
-        assert_eq!(
-            log.count(tracing::Level::WARN, widening),
-            0,
-            "and the guard has nothing to say about a path the index carries"
         );
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
         assert_eq!(
@@ -25848,7 +26034,8 @@ mod tests {
 
         // A file the watcher never announced, found by a sweep made due by
         // hand, so the gate holds a path the index does not carry.
-        std::fs::write(p.local_path.join("found.bin"), b"moved in by hand").expect("write");
+        let found = p.local_path.join("found.bin");
+        std::fs::write(&found, b"moved in by hand, still being written").expect("write");
         Engine::lock(&engine.untracked_sweep).remove(&p.id);
         assert_eq!(
             engine
@@ -25856,65 +26043,597 @@ mod tests {
                 .expect("the sweep holds it"),
             0
         );
-        // The flag that pass set is the ordinary answer; take it off by hand
-        // so what is measured is the guard alone.
         assert!(
-            Engine::lock(&engine.untracked_appeared).remove(&p.id),
-            "the sweep's find set the flag"
+            !Engine::lock(&engine.untracked_appeared).contains(&p.id),
+            "the sweep's find owes the next walk no directory scan"
+        );
+
+        // Recorded from here, so every count below is the settling passes'.
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        for pass in 1..=3usize {
+            // A different size is a different tuple: the gate's window
+            // restarts, and the pass finds the file still moving.
+            std::fs::write(&found, vec![b'w'; 64 + pass]).expect("rewrite");
+            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+            let policy = engine.commit_walk_policy(&p);
+            assert_eq!(
+                policy,
+                git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("found.bin")]),
+                "pass {pass}: the held path rides the narrowed walk as an include"
+            );
+            assert!(
+                !policy.find_untracked,
+                "pass {pass}: and no directory is read for it"
+            );
+            assert_eq!(
+                engine
+                    .commit_local(&p, SyncSource::Watch, None)
+                    .expect("a settling pass"),
+                0,
+                "pass {pass}: rewritten since the last look, so still held"
+            );
+            assert_eq!(
+                log.count(tracing::Level::INFO, SWEEP_LINE),
+                0,
+                "pass {pass}: no directory walk"
+            );
+            let walked = last_walk(&log);
+            assert!(
+                walk_says(&walked, "untracked=0") && walk_says(&walked, "included=1"),
+                "pass {pass}: the walk was the narrowed one, which reported nothing for the path: {walked:?}"
+            );
+            let carried = engine
+                .with_db(|conn| db::load_file_state(conn, &p.id))
+                .expect("rows");
+            assert!(
+                carried.iter().any(|(path, _)| path == &found),
+                "pass {pass}: the episode is kept, not forgotten"
+            );
+            assert_eq!(
+                Engine::lock(&engine.status)
+                    .get(&p.id)
+                    .map(|snapshot| snapshot.settling),
+                Some(1),
+                "pass {pass}: the pass's own sample counts as a held file"
+            );
+        }
+
+        // The writer stops: the next sample matches the last, the window
+        // runs out, and the file is committed — still without a directory
+        // walk.
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the pass after the writer stopped"),
+            1,
+            "commits once it stops"
         );
         assert_eq!(
-            engine.commit_walk_policy(&p),
-            git::repo::WalkPolicy::full(),
-            "a held path the index does not carry cannot be observed by a narrowed walk"
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            0,
+            "four passes, and none of them read a directory"
         );
-        // One line, carrying how many and which: the operator reading the log
-        // after the fact can tell a widened walk from a sweep, and name the
-        // file that would otherwise have been forgotten.
-        let warned = log.fields_of(tracing::Level::WARN, widening);
-        let [line] = warned.as_slice() else {
-            panic!(
-                "the guard warns exactly once, not {}: {warned:?}",
-                warned.len()
-            );
-        };
-        let line = line.join(" ");
-        assert!(line.contains("missing=1"), "the count: {line}");
-        assert!(line.contains("path=found.bin"), "and the path: {line}");
 
         // The poll leg does not observe into the gate, so it never carries
-        // held paths (`with_held` is false) and the guard has nothing to
-        // probe for it: the index-only listing, and no line.
+        // held paths (`with_held` is false): the index-only listing, always.
         assert_eq!(
             engine.poll_walk_policy(&p),
             git::repo::WalkPolicy::tracked_only(),
-            "the poll leg is immune: a held path is not its problem"
-        );
-        assert_eq!(
-            log.count(tracing::Level::WARN, widening),
-            1,
-            "and the guard said nothing to the poll"
-        );
-
-        // The overflow branch: the whole-index walk a spilled watcher list
-        // buys has no directory scan either, so the guard fires before it
-        // too — the Intent names any walk without a directory scan.
-        engine.widen_watch_paths(&p.id);
-        assert_eq!(
-            engine.commit_walk_policy(&p),
-            git::repo::WalkPolicy::full(),
-            "the overflow's whole-index walk cannot observe the held path either"
-        );
-        assert_eq!(
-            log.count(tracing::Level::WARN, widening),
-            2,
-            "one more line for one more widening"
+            "the poll leg is untouched: a held path is not its problem"
         );
     }
 
-    /// Matrix row "Sweep finds nothing new": the flag is set by a held
-    /// untracked path and by nothing else. A sweep over a clean tree reports
+    /// Matrix row "Held path vanished": a file the sweep found and the gate
+    /// held, deleted before its second look, is simply forgotten — nothing is
+    /// staged, nothing errors, `file_state` drops the row, and no directory
+    /// was read to learn any of it.
+    #[test]
+    fn a_held_path_that_vanished_before_its_second_look_is_forgotten() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let found = p.local_path.join("found.bin");
+        std::fs::write(&found, b"moved in by hand").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0,
+            "one sample is not two"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(
+            carried.iter().any(|(path, _)| path == &found),
+            "the sweep's find is held"
+        );
+
+        std::fs::remove_file(&found).expect("gone before its second look");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("a vanished held path is not an error"),
+            0,
+            "nothing is staged for a path that is gone"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(
+            carried.is_empty(),
+            "the episode is forgotten, not carried: {carried:?}"
+        );
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            1,
+            "only the first pass of the run read the directories"
+        );
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only(),
+            "nothing held, nothing named"
+        );
+    }
+
+    /// Matrix row "Index unreadable": the probe's answer is only *which* of
+    /// the held paths the walk could not have seen, so an index that cannot
+    /// be read leaves every one of them to the pass's own sample rather than
+    /// to `retain` — and says so once, naming the error rather than a phantom
+    /// untracked file.
+    #[test]
+    fn an_unreadable_index_leaves_every_unreported_held_path_to_the_second_look() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("tracked.txt"), b"one").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        let found = p.local_path.join("found.bin");
+        std::fs::write(&found, b"moved in by hand").expect("write");
+        Engine::lock(&engine.untracked_sweep).remove(&p.id);
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the sweep holds it"),
+            0
+        );
+
+        // The index the probe reads is garbage from here; a repository opened
+        // now cannot decode it.
+        std::fs::write(p.local_path.join(".git").join("index"), b"not an index").expect("corrupt");
+        let repo = engine.open_repo(&p).expect("the repository still opens");
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let unreported = HashSet::new();
+        assert_eq!(
+            engine.paths_for_the_second_look(&p, &repo, std::slice::from_ref(&found), &unreported),
+            SecondLook {
+                sample: vec![PathBuf::from("found.bin")],
+                ..SecondLook::default()
+            },
+            "the held path is sampled anyway"
+        );
+        let warned = log.fields_of(
+            tracing::Level::WARN,
+            "the gate holds paths the walk did not report and the index cannot \
+             be read, so which of them a walk could have seen is unknown; \
+             sampling every one of them",
+        );
+        let [line] = warned.as_slice() else {
+            panic!("one warn, not {}: {warned:?}", warned.len());
+        };
+        let line = line.join(" ");
+        assert!(line.contains("held=1"), "the count: {line}");
+        assert!(line.contains("index=unreadable"), "and the reason: {line}");
+    }
+
+    /// Review row: a held path under a directory that lost its permission.
+    /// The second look's `stat` is refused for a reason other than absence,
+    /// and the gate's fail-closed rule applies: the path stays held, counted
+    /// and observed, with one `warn` per pass naming it and the error — and
+    /// the pass succeeds, so `retain` and `save_file_state` still run for
+    /// everything else. Before this the refusal propagated with `?`, failing
+    /// every commit-leg pass before either, so the entry could never be
+    /// forgotten and nothing in the folder committed. Restoring the
+    /// permission lets it commit.
+    #[test]
+    fn a_held_path_whose_parent_lost_its_permission_stays_held_and_commits_once_it_is_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let locked = p.local_path.join("locked");
+        std::fs::create_dir_all(&locked).expect("dir");
+        let found = locked.join("found.bin");
+        std::fs::write(&found, b"moved in by hand").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0,
+            "one sample is not two"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let restore = || {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+        };
+        if std::fs::symlink_metadata(&found).is_ok() {
+            // Running as root, where a mode of 000 refuses nothing: the row
+            // cannot be exercised here.
+            restore();
+            return;
+        }
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        let passed = engine.commit_local(&p, SyncSource::Watch, None);
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        let warned = log.fields_of(
+            tracing::Level::WARN,
+            "a held path the walk did not report could not be stat'd; \
+             keeping it held until it can be",
+        );
+        let settling = Engine::lock(&engine.status)
+            .get(&p.id)
+            .map(|snapshot| snapshot.settling);
+        restore();
+        assert_eq!(
+            passed.expect("a refused stat does not fail the pass"),
+            0,
+            "nothing is staged for a path the pass could not judge"
+        );
+        assert!(
+            carried.iter().any(|(path, _)| path == &found),
+            "the row stays: {carried:?}"
+        );
+        let [line] = warned.as_slice() else {
+            panic!("one warn per pass, not {}: {warned:?}", warned.len());
+        };
+        let line = line.join(" ");
+        assert!(line.contains("path=locked/found.bin"), "the path: {line}");
+        assert!(line.contains("err="), "and the error: {line}");
+        assert_eq!(settling, Some(1), "a path kept held counts as one");
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            0,
+            "and no directory was read for it"
+        );
+
+        // The permission is back: the same bytes, a window later.
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the pass after the permission came back"),
+            1,
+            "committed once the pass can look at it"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, SWEEP_LINE), 0);
+    }
+
+    /// Review row: a re-sampled path passes git's own exclusion like a
+    /// walk-reported one. A `.gitignore` written after the sweep held the
+    /// file is one the dirwalk never applied to it; the second look consults
+    /// the repository's excludes itself, and an ignored path is not staged
+    /// and is forgotten, with an info line.
+    #[test]
+    fn a_held_path_a_later_gitignore_covers_is_forgotten_not_staged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let found = p.local_path.join("found.bin");
+        std::fs::write(&found, b"moved in by hand").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0
+        );
+
+        // Written after the hold, and unseen by the narrowed walk itself.
+        {
+            use std::io::Write as _;
+            let mut ignore = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p.local_path.join(".gitignore"))
+                .expect(".gitignore");
+            writeln!(ignore, "found.bin").expect("write");
+        }
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("an ignored held path is not an error"),
+            0,
+            "nothing is staged for a path git ignores"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(carried.is_empty(), "forgotten, not carried: {carried:?}");
+        let said = log.fields_of(
+            tracing::Level::INFO,
+            "a held path is one git ignores, so it is not this folder's to \
+             commit; forgetting it",
+        );
+        let [line] = said.as_slice() else {
+            panic!("one line, not {}: {said:?}", said.len());
+        };
+        assert!(
+            line.iter().any(|f| f == "path=found.bin"),
+            "names it: {line:?}"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, SWEEP_LINE), 0);
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only(),
+            "nothing held, nothing named"
+        );
+    }
+
+    /// Review row: a held path that became a nested repository. One that is
+    /// now a directory is reported collapsed, once, as the walk's are, and
+    /// never handed to the commit as a file; one that now lies *inside* a
+    /// nested repository belongs to that repository and is forgotten with an
+    /// info line. Neither is staged, and no directory is read to learn it.
+    #[test]
+    fn a_held_path_that_became_a_nested_repository_is_reported_collapsed_not_staged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let became = p.local_path.join("became.bin");
+        std::fs::write(&became, b"a file, for now").expect("write");
+        let sub = p.local_path.join("sub");
+        std::fs::create_dir_all(&sub).expect("dir");
+        let inside = sub.join("inside.bin");
+        std::fs::write(&inside, b"a file in a plain folder, for now").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert_eq!(carried.len(), 2, "both held: {carried:?}");
+
+        // Between the looks: the file is now a repository of its own, and the
+        // folder beside it became one.
+        std::fs::remove_file(&became).expect("rm");
+        std::fs::create_dir_all(became.join(".git")).expect("a nested repository");
+        std::fs::create_dir_all(sub.join(".git")).expect("another");
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("a nested repository is not an error"),
+            0,
+            "nothing is staged"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(carried.is_empty(), "both forgotten: {carried:?}");
+        let collapsed = log.fields_of(
+            tracing::Level::WARN,
+            "sync: skipping an untracked directory git reported collapsed — it is its own \
+             repository, so its files are not this folder's to commit, and walking it here \
+             would ignore .gitignore",
+        );
+        let [line] = collapsed.as_slice() else {
+            panic!("one collapsed line, not {}: {collapsed:?}", collapsed.len());
+        };
+        assert!(
+            line.iter().any(|f| f == "path=became.bin"),
+            "names it: {line:?}"
+        );
+        let nested = log.fields_of(
+            tracing::Level::INFO,
+            "a held path now lies inside a nested repository, so it is not this \
+             folder's to commit; forgetting it",
+        );
+        let [line] = nested.as_slice() else {
+            panic!("one nested line, not {}: {nested:?}", nested.len());
+        };
+        assert!(
+            line.iter().any(|f| f == "path=sub/inside.bin"),
+            "names it: {line:?}"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, SWEEP_LINE), 0);
+    }
+
+    /// Matrix row "Held path now tracked": a held path the index carries is
+    /// the walk's business, never the second look's. `tracked.txt` is
+    /// committed, rewritten (held), then written back to its original bytes:
+    /// the next walk finds it clean and reports nothing, the second look
+    /// declines it because the index carries it, and `retain` forgets the
+    /// episode — `file_state` empty, nothing settling, nothing committed —
+    /// while `held_paths` listed it for the walk's includes right up to that
+    /// pass.
+    #[test]
+    fn a_held_path_the_index_carries_is_the_walks_business_not_the_second_looks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let tracked = p.local_path.join("tracked.txt");
+        std::fs::write(&tracked, b"one").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        let _tx = arm_watcher(&engine, &p);
+
+        std::fs::write(&tracked, b"two, for a moment").expect("rewrite");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("opens the episode"),
+            0,
+            "held"
+        );
+        std::fs::write(&tracked, b"one").expect("the original bytes back");
+
+        assert_eq!(
+            engine.held_paths(&p),
+            vec![PathBuf::from("tracked.txt")],
+            "the policy still lists it as an include"
+        );
+        let repo = engine.open_repo(&p).expect("repo");
+        assert_eq!(
+            engine.paths_for_the_second_look(
+                &p,
+                &repo,
+                std::slice::from_ref(&tracked),
+                &HashSet::new()
+            ),
+            SecondLook::default(),
+            "but the second look declines a path the index carries"
+        );
+
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the pass after the bytes came back"),
+            0,
+            "nothing to commit: the file matches the index"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(
+            carried.is_empty(),
+            "the episode is finished business: {carried:?}"
+        );
+        assert_eq!(
+            Engine::lock(&engine.status)
+                .get(&p.id)
+                .map(|snapshot| snapshot.settling),
+            Some(0)
+        );
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only()
+        );
+    }
+
+    /// The Ask-First evidence: five hundred held paths the index does not
+    /// carry are sorted by the second look well inside a second — one index
+    /// probe, one `lstat` and one excludes lookup each — and the pass that
+    /// then samples and commits them reads no directory. A cap on the
+    /// second look would be a cap on something cheaper than the walk it
+    /// replaced.
+    #[test]
+    fn five_hundred_held_unindexed_paths_get_their_second_look_inside_a_second() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let many = p.local_path.join("many");
+        std::fs::create_dir_all(&many).expect("dir");
+        for i in 0..500u32 {
+            std::fs::write(many.join(format!("f{i:03}.bin")), format!("file {i}")).expect("write");
+        }
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0
+        );
+        let held: Vec<PathBuf> = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows")
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(held.len(), 500, "every one of them held");
+
+        let repo = engine.open_repo(&p).expect("repo");
+        let started = Instant::now();
+        let look = engine.paths_for_the_second_look(&p, &repo, &held, &HashSet::new());
+        let sorted_in = started.elapsed();
+        assert_eq!(look.sample.len(), 500);
+        assert!(look.held.is_empty() && look.collapsed.is_empty());
+        assert!(
+            sorted_in < Duration::from_secs(1),
+            "500 held unindexed paths sorted in {sorted_in:?}"
+        );
+
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        let started = Instant::now();
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the second pass"),
+            500,
+            "all committed by the pass's own sample"
+        );
+        let passed_in = started.elapsed();
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            0,
+            "and no directory was read for any of them (pass took {passed_in:?})"
+        );
+        let walked = last_walk(&log);
+        assert!(
+            walk_says(&walked, "untracked=0") && walk_says(&walked, "included=500"),
+            "the narrowed walk carried all 500 as includes and reported none: {walked:?}"
+        );
+    }
+
+    /// Matrix row "Sweep finds nothing new": a sweep over a clean tree reports
     /// `untracked=0`, holds nothing, and buys the next walk no directory scan
     /// — the steady policy is the index-only walk it would have been anyway.
+    /// The `untracked_appeared` flag is the watcher's `Create` and the rename
+    /// prime's; a pass sets it for nothing it found.
     #[test]
     fn a_sweep_that_finds_nothing_new_buys_no_walk() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -25940,18 +26659,13 @@ mod tests {
             0
         );
         assert_eq!(
-            log.count(
-                tracing::Level::INFO,
-                "untracked sweep: this walk reads every directory"
-            ),
+            log.count(tracing::Level::INFO, SWEEP_LINE),
             1,
             "the pass was the sweep"
         );
-        let walked = log.fields_of(tracing::Level::INFO, "status walk finished");
+        let walked = last_walk(&log);
         assert!(
-            walked
-                .iter()
-                .any(|line| line.iter().any(|f| f == "untracked=0")),
+            walk_says(&walked, "untracked=0"),
             "and it found nothing: {walked:?}"
         );
         assert!(
@@ -25965,11 +26679,11 @@ mod tests {
         );
     }
 
-    /// Matrix row "Restart between pass 1 and 2": the flag lives with the
-    /// process, and the sweep on the first pass of a run is what covers a
-    /// restart between the two looks. `file_state` carries the episode across
-    /// the reopen; the new run's first pass reads every directory, so it can
-    /// see the path the last run held, and commits it once it has settled.
+    /// Matrix row "Restart between the looks": `file_state` carries the
+    /// episode across the reopen, and `gate_for` imports it before the new
+    /// run's first pass looks. That pass is the run's sweep, so it reads the
+    /// directories and reports the path itself; the sample it takes is the
+    /// second, and the file is committed on the spot.
     #[tokio::test]
     async fn a_sweeps_find_is_committed_after_a_restart_between_its_two_looks() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -25990,20 +26704,16 @@ mod tests {
             "one sample is not two"
         );
         assert!(
-            Engine::lock(&first.untracked_appeared).contains(&p.id),
-            "the sweep's find set the flag"
+            !Engine::lock(&first.untracked_appeared).contains(&p.id),
+            "the sweep's find owes no scan: the next pass samples it itself"
         );
         drop(tx);
         drop(first);
 
-        // The flag went down with the process; the rows did not.
+        // The gate went down with the process; the rows did not.
         let Ok(second) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
             return;
         };
-        assert!(
-            !Engine::lock(&second.untracked_appeared).contains(&p.id),
-            "the flag is process-local"
-        );
         let carried = second
             .with_db(|conn| db::load_file_state(conn, &p.id))
             .expect("rows");
@@ -26014,37 +26724,13 @@ mod tests {
         let _tx = arm_watcher(&second, &p);
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
 
-        // The first pass of the new run sweeps, and so can see the path; how
-        // many passes the gate then wants is the gate's business — what must
-        // hold is that none of them forgets the episode on the way.
-        let mut committed = 0;
-        for pass in 1..=3 {
-            committed = second
+        assert_eq!(
+            second
                 .commit_local(&p, SyncSource::Watch, None)
-                .expect("a pass of the new run");
-            if pass == 1 {
-                // The new run's first pass is the sweep, and the sweep can see
-                // the path: it either committed it outright or held it and
-                // bought the next walk the scan — there is no third outcome
-                // in which the episode is forgotten.
-                assert!(
-                    committed > 0 || Engine::lock(&second.untracked_appeared).contains(&p.id),
-                    "the first pass of the new run either commits the find or sets the flag"
-                );
-            }
-            if committed > 0 {
-                break;
-            }
-            let carried = second
-                .with_db(|conn| db::load_file_state(conn, &p.id))
-                .expect("rows");
-            assert!(
-                carried.iter().any(|(path, _)| path == &found),
-                "pass {pass} of the new run must not forget the episode"
-            );
-            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        }
-        assert_eq!(committed, 1, "the new run commits the last run's find");
+                .expect("the first pass of the new run"),
+            1,
+            "the new run's first pass seeds the gate from file_state, looks a second time, and commits"
+        );
         let rows = second.activity(&p.id, 10).await.expect("activity");
         let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
         assert!(
@@ -26053,14 +26739,16 @@ mod tests {
         );
     }
 
-    /// The restart ordering the field log shows (`caller="poll"` first after
-    /// the 02:18 restart): with the Sync pane open, the *poll* leg's walk is
-    /// the run's first, and it takes the run's sweep with it — `walk_policy`
-    /// stamps the clock for both legs. The commit leg's first walk is then the
-    /// narrowed one against a gate not yet seeded; `gate_for` would import the
-    /// last run's held untracked path from `file_state`, and `retain` would
-    /// forget it — the original loss, on a realistic ordering. The guard must
-    /// therefore see a held path that only `file_state` carries.
+    /// Matrix row "Poll walked first after restart" — the ordering the field
+    /// log shows (`caller="poll"` first after the 02:18 restart): with the
+    /// Sync pane open, the *poll* leg's walk is the run's first, and it takes
+    /// the run's sweep with it — `walk_policy` stamps the clock for both legs.
+    /// The commit leg's first walk is then the narrowed one against a gate not
+    /// yet seeded; `gate_for` imports the last run's held untracked path from
+    /// `file_state`, the walk reports nothing for it, and before `1c26f53a`
+    /// `retain` forgot it — the original loss, on a realistic ordering.
+    /// `1c26f53a` widened the walk for it; now the pass seeds, samples the
+    /// path itself, and commits it, with no widening and no line.
     #[tokio::test]
     async fn a_sweeps_find_survives_a_restart_whose_first_walk_was_the_polls() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -26101,45 +26789,43 @@ mod tests {
             second.existing_gate(&p.id).is_none(),
             "no walk has run, so the gate is not seeded and file_state is all there is"
         );
-        // The commit leg's turn: the sweep is spent, the flag went down with
-        // the last process, and the gate is empty — the held path is a row in
-        // `file_state` and nothing else, and the guard must find it there.
+        // The poll's policy logged the run's one sweep line; nothing below
+        // may add to it.
+        let swept = log.count(tracing::Level::INFO, SWEEP_LINE);
+        assert_eq!(swept, 1, "the poll took the run's sweep");
+        // The commit leg's turn: the sweep is spent and the gate is empty —
+        // the held path is a row in `file_state` and nothing else. The policy
+        // still names it, as an include of the narrowed walk, and widens for
+        // nothing.
+        let policy = second.commit_walk_policy(&p);
         assert_eq!(
-            second.commit_walk_policy(&p),
-            git::repo::WalkPolicy::full(),
-            "a held path only file_state carries still widens the commit walk"
+            policy,
+            git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("found.bin")]),
+            "a held path only file_state carries rides the narrowed walk as an include"
         );
-        let warned = log.fields_of(tracing::Level::WARN, WIDENING_WARN);
-        let [line] = warned.as_slice() else {
-            panic!(
-                "the guard warns exactly once, not {}: {warned:?}",
-                warned.len()
-            );
-        };
-        let line = line.join(" ");
-        assert!(line.contains("missing=1"), "the count: {line}");
-        assert!(line.contains("path=found.bin"), "and the path: {line}");
+        assert!(!policy.find_untracked, "and buys no directory walk");
 
-        // And the walk that policy drives commits the file.
+        // The walk that policy drives reports nothing for the path; the pass
+        // seeds the gate from file_state, samples the path itself, and
+        // commits it — the first pass of the new run, no widening needed.
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        let mut committed = 0;
-        for pass in 1..=3 {
-            committed = second
+        assert_eq!(
+            second
                 .commit_local(&p, SyncSource::Watch, None)
-                .expect("a pass of the new run");
-            if committed > 0 {
-                break;
-            }
-            let carried = second
-                .with_db(|conn| db::load_file_state(conn, &p.id))
-                .expect("rows");
-            assert!(
-                carried.iter().any(|(path, _)| path == &found),
-                "pass {pass} of the new run must not forget the episode"
-            );
-            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        }
-        assert_eq!(committed, 1, "the new run commits the last run's find");
+                .expect("the commit leg's first pass of the new run"),
+            1,
+            "the commit leg's pass seeds, re-samples, commits"
+        );
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            swept,
+            "and no directory was read for it"
+        );
+        let walked = last_walk(&log);
+        assert!(
+            walk_says(&walked, "untracked=0") && walk_says(&walked, "included=1"),
+            "the walk was the narrowed one, which reported nothing for the path: {walked:?}"
+        );
         let rows = second.activity(&p.id, 10).await.expect("activity");
         let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
         assert!(
