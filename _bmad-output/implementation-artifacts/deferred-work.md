@@ -6021,4 +6021,51 @@ status: open
 - source_spec: `_bmad-output/implementation-artifacts/spec-sweep-found-untracked-files-never-commit.md`
   summary: A sweep-found file that keeps changing buys a full directory walk on every settle-deadline pass until it settles, because the gate's only observer is the walk and only a walk with a directory scan can see an untracked path.
   evidence: `collect_stable_changes` sets `untracked_appeared` whenever an untracked path is `Settling`, and `commit_walk_policy` spends it on `full()`; a file still being written stays `Settling` per pass, so on the reference folder (155 626 entries, USB) each pass costs the 1.6–6.8 s directory walk measured 2026-09-09 rather than one `lstat`. The watcher's `Create` path already behaves this way, so the story extends an existing cost rather than adding a class; the durable fix is a second look that re-samples the held unindexed paths directly (one `FileSample` each) instead of walking the tree, which is a gate/walk design change outside this story's Never list.
+  status: done 2026-09-10
+  resolution: |
+    Story "The pass takes its own second look" (`spec-the-pass-takes-its-own-second-look.md`).
+    `collect_stable_changes` now lists the held paths its walk did not report and the index
+    does not carry (`Engine::paths_for_the_second_look`: the gate's export, one index probe,
+    outside the gate lock) and samples them in the same loop as the walk's own untracked
+    paths — `Stable` is staged as an addition under its sample, `Settling` stays held, a path
+    that is gone is filtered by the sort's own stat before the gate and forgotten by `retain`, an
+    ignored one or one inside a nested repository likewise (the second look consults git's
+    excludes itself), and one the pass cannot stat stays held with a warn rather than failing the
+    pass. The `Settling`-untracked flag insert and `walk_policy`'s widening
+    guard (and its warn line) are gone; held paths still ride the narrowed walk as includes,
+    and the full walks that remain are the sweep, the first pass of a run, the watcher's
+    `Create` and a degraded watcher. Tests: `a_sweep_found_file_still_being_written_is_held_without_a_directory_walk`
+    (three passes, no sweep line), `a_file_the_sweep_found_is_committed_once_it_settles`
+    (committed by a narrowed walk), `a_held_path_that_vanished_before_its_second_look_is_forgotten`,
+    both restart shapes, `an_unreadable_index_leaves_every_unreported_held_path_to_the_second_look`,
+    `a_held_path_whose_parent_lost_its_permission_stays_held_and_commits_once_it_is_back`,
+    `a_held_path_a_later_gitignore_covers_is_forgotten_not_staged`,
+    `a_held_path_that_became_a_nested_repository_is_reported_collapsed_not_staged`,
+    `a_held_path_the_index_carries_is_the_walks_business_not_the_second_looks`,
+    `five_hundred_held_unindexed_paths_get_their_second_look_inside_a_second`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-a-folders-durable-status-tells-the-truth.md`
+  summary: A `needsAttention` set by the parked-upload arm of `record_failure` carries no sentence beside it, so any other unit's success retires the word while the parked upload is still parked.
+  evidence: |
+    Pre-existing, found 2026-09-10 in the story's second review loop. `record_failure`'s
+    `LfsUploadPending` arm (`src-tauri/crates/keeper-sync/src/engine.rs`) answers a held push whose
+    uploads have all stopped moving with `set_state(NeedsAttention)` and nothing else — no `warn`, no
+    `set_error` — so the snapshot wears the word with no sentence a person could read, and
+    `note_unit_succeeded` (which runs for any unit that completed, a fetch included) moves a bare
+    `NeedsAttention` to `watching` because nothing in the snapshot says why it stood. Before
+    this story `refresh_pending` flipped it to `watching` on the next empty queue regardless, so the
+    story narrows the window rather than opening it. The parked upload itself is still visible in
+    the problems view. The fix is a sentence beside the word (`set_error` naming the parked object,
+    as the permanent arm does) and a retire keyed to that upload moving or being unparked, rather
+    than to any unit's success.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-the-archive-follows-every-recordings-root.md`
+  summary: Orphan recovery now runs over every recordings root, so a session another machine is recording into a shared (removable) root right now is not in this machine's reserved set and is marked `recovered`.
+  evidence: `recover_orphaned_sessions` judges a `status: "recording"` manifest by the local reservation set only; it was already true for a shared destination root and now applies to every followed root. The durable fix is a liveness signal in the manifest (a heartbeat stamp the recorder refreshes) that recovery honours across machines.
+  status: open
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-the-pass-takes-its-own-second-look.md`
+  summary: `prime_moved_paths` still buys a full directory walk for a rename whose destinations the pass would now sample itself.
+  evidence: A rename prime records the moved-in destinations in the gate as already settled and sets `untracked_appeared` so the next commit walk is a `full()` one (`Engine::prime_moved_paths`, Epic 70, F-GATE-7) — the flag was the only way a walk without a directory scan could come to observe a path the index does not carry. With this story the pass's own second look samples every held unindexed path (`Engine::paths_for_the_second_look`), so the primed destinations would be staged by the narrowed walk's pass without the scan; the prime's flag is now a directory walk bought for paths the pass would have looked at anyway. Left as is because the story's Never list keeps `prime_moved_paths` out of it (`priming_moved_paths_makes_the_next_walk_a_full_one` still asserts the flag); the follow-up is to drop the flag insert from the prime and let the second look stage the destinations, keeping the test's shape for the rename-in-one-commit property.
   status: open

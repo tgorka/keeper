@@ -29,7 +29,10 @@ pub mod recordings;
 pub mod recordings_fts;
 
 pub use fts::{search, SearchFilter};
-pub use recordings::{RecordingRow, RecordingSegmentRow};
+pub use recordings::{
+    DurabilityProbe, DurabilityProbeFn, KnownRoot, RebuildOutcome, RebuildRequest, RecordingRow,
+    RecordingSegmentRow,
+};
 pub use recordings_fts::{search_recordings, RecordingFilter, RecordingHit};
 
 use std::path::{Path, PathBuf};
@@ -191,8 +194,9 @@ pub enum ArchiveMsg {
         /// The session folder's new path, relative to the destination root.
         relative_path: String,
     },
-    /// Re-derive every recording row by walking the destination tree (Story
-    /// 42.1).
+    /// Re-derive every recording row by walking one recordings root, and
+    /// reconcile that root's rows against what the walk found (Story 42.1; the
+    /// archive follows every recordings root).
     ///
     /// The message exists so the rebuild runs on the writer's connection like
     /// every other write. A caller holding its own `Connection` would be a second
@@ -200,13 +204,22 @@ pub enum ArchiveMsg {
     /// arranged to prevent — and a rebuild is precisely when a second writer
     /// would be worst, because it walks and rewrites the same rows the recorder
     /// may be appending to.
-    RebuildRecordings {
-        /// The destination root to walk. Every path derived under it is stored
-        /// relative to it.
-        root: std::path::PathBuf,
-        /// `"folder"` or `"profile"` — which kind of destination that root is.
+    ///
+    /// One message per root: the plain-folder destination and each synced
+    /// folder that holds recordings are each walked and reconciled on their
+    /// own, scoped to their own rows. The request carries the root, its
+    /// probe, the session folders a recording in progress has reserved, and
+    /// every other root the archive follows (see [`RebuildRequest`]).
+    RebuildRecordings(RebuildRequest),
+    /// Forget every row of one root — with its segments and its search entries
+    /// — because keeper no longer follows that root at all: a synced folder
+    /// that was removed (the archive follows every recordings root). No walk:
+    /// the folder is not keeper's to look at any more. A paused folder is
+    /// never forgotten this way; its rows wait for it.
+    ForgetRecordingsRoot {
+        /// `"folder"` or `"profile"` — which kind of place the root was.
         root_kind: String,
-        /// The destination profile, when the root is one.
+        /// The profile whose rows go.
         profile_id: Option<String>,
     },
 }
@@ -353,21 +366,36 @@ impl ArchiveHandle {
         }
     }
 
-    /// Re-derive every recording row from the session folders under `root`
-    /// (Story 42.1).
+    /// Re-derive every recording row from the session folders under `root`,
+    /// and forget the rows of this root that no folder under it carries any
+    /// more (Story 42.1; the archive follows every recordings root).
     ///
     /// This is what makes "deleting `archive.db` loses nothing" a fact rather
     /// than a claim: the manifests are the truth, and this replays them. Sent on
     /// the ordinary channel, so it queues behind whatever the writer is already
     /// doing and never races it.
-    pub fn rebuild_recordings(
-        &self,
-        root: std::path::PathBuf,
-        root_kind: String,
-        profile_id: Option<String>,
-    ) {
-        let msg = ArchiveMsg::RebuildRecordings {
-            root,
+    ///
+    /// The request's `probe` is the shell's window onto the root's repository
+    /// — what it says about each session folder's durability — and is `None`
+    /// for the plain folder. The rebuild derives a profile root's durability
+    /// from it, never from the row it is about to replace. Its `skip` names
+    /// the session folders a recording in progress holds, which the rebuild
+    /// leaves alone, and its `followed_roots` every root the archive follows
+    /// right now, so a session copied between two of them stays with the
+    /// first.
+    pub fn rebuild_recordings(&self, request: RebuildRequest) {
+        if let Err(e) = self.tx.send(ArchiveMsg::RebuildRecordings(request)) {
+            log_dropped(&e.0);
+        }
+    }
+
+    /// Forget one root's rows — with their segments and search entries —
+    /// because keeper no longer follows the root: a synced folder that was
+    /// removed (the archive follows every recordings root). Sent on the
+    /// ordinary channel like the rebuilds, so it queues behind whatever the
+    /// writer is doing and never races it.
+    pub fn forget_recordings_root(&self, root_kind: String, profile_id: Option<String>) {
+        let msg = ArchiveMsg::ForgetRecordingsRoot {
             root_kind,
             profile_id,
         };
@@ -416,9 +444,17 @@ fn log_dropped(msg: &ArchiveMsg) {
             session_id = %session_id,
             "archive: writer channel closed; dropping recording move"
         ),
-        ArchiveMsg::RebuildRecordings { root, .. } => tracing::warn!(
-            root = %root.display(),
+        ArchiveMsg::RebuildRecordings(request) => tracing::warn!(
+            root = %request.root.display(),
             "archive: writer channel closed; the recordings index was not rebuilt"
+        ),
+        ArchiveMsg::ForgetRecordingsRoot {
+            root_kind,
+            profile_id,
+        } => tracing::warn!(
+            root_kind,
+            profile_id = profile_id.as_deref().unwrap_or("-"),
+            "archive: writer channel closed; a removed root's recordings were not forgotten"
         ),
     }
 }

@@ -16,6 +16,12 @@
 //!   it names and a log claiming otherwise sends the reader to the wrong diff.
 //!   `unknown` is expected and honest: `scripts/release-macos.sh` builds from an
 //!   rsync'd copy with no `.git`.
+//! - **sha_source** — where `commit` came from: `file` (the `build-sha.txt`
+//!   stamp the scripts write), `env` (`KEEPER_BUILD_SHA`), `git` (probed at
+//!   build time) or `none`. A stamp is believed over `git` by design, which
+//!   means a stale stamp is believed too — on 2026-09-09 a build named a commit
+//!   two days older than the code it ran. The sha cannot reveal that on its
+//!   own; this field tells the reader whether it is a statement or a probe.
 //! - **built** — when, so two builds of one commit are still distinguishable.
 //! - **profile and target** — a debug build behaves differently enough that
 //!   reading its log as a release build's wastes an afternoon.
@@ -37,9 +43,10 @@ use std::process::Command;
 /// What the build says about itself, without asking the system anything.
 pub fn banner() -> String {
     format!(
-        "keeper {} commit={} built={} profile={} target={}",
+        "keeper {} commit={} sha_source={} built={} profile={} target={}",
         env!("CARGO_PKG_VERSION"),
         env!("KEEPER_BUILD_SHA"),
+        env!("KEEPER_BUILD_SHA_SOURCE"),
         built_at(),
         if cfg!(debug_assertions) {
             "debug"
@@ -114,15 +121,100 @@ fn signature() -> Option<String> {
 mod tests {
     use super::*;
 
+    /// One `key=value` field out of the banner, the way a reader greps for it.
+    fn field(line: &str, key: &str) -> String {
+        line.split(key)
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("no {key} field in {line}"))
+            .to_owned()
+    }
+
+    /// The exact shape `git rev-parse --short=12` produces, plus the suffix
+    /// `build.rs` appends: a probed sha can have no other.
+    fn is_probed_sha(commit: &str) -> bool {
+        let hex = commit.strip_suffix("-dirty").unwrap_or(commit);
+        hex.len() == 12
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    /// `commit` and `sha_source` are one fact told twice, and they have to
+    /// agree with each other: `none` is the only source that can yield
+    /// `unknown`, and a sha labelled `git` came out of `build.rs`'s own probe,
+    /// so it has that probe's exact shape. A banner where the two drift — a
+    /// stated word labelled as probed, or `unknown` labelled as a stamp — would
+    /// send the reader to the wrong explanation of the wrong sha.
+    #[test]
+    fn the_commit_and_its_source_agree() {
+        let line = banner();
+        let commit = field(&line, "commit=");
+        let source = field(&line, "sha_source=");
+        assert_eq!(
+            source == "none",
+            commit == "unknown",
+            "sha_source={source} and commit={commit} disagree about whether the sha is known: {line}"
+        );
+        if source == "git" {
+            assert!(
+                is_probed_sha(&commit),
+                "sha_source=git but commit={commit} is not 12 hex digits[-dirty]: {line}"
+            );
+        }
+    }
+
+    /// CI builds from a real `actions/checkout` with no stamp file and no
+    /// `KEEPER_BUILD_SHA` export, so the only source that can answer there is
+    /// the probe — and it must answer. A CI binary that said `unknown`, or a
+    /// stamp that had somehow reached CI, would each mean the precedence in
+    /// `build.rs` no longer does what its comment says. Gated on the variable
+    /// GitHub sets, because a developer's tree legitimately carries a stamp.
+    #[test]
+    fn ci_builds_are_probed_from_a_real_checkout() {
+        if std::env::var_os("GITHUB_ACTIONS").is_none() {
+            return;
+        }
+        let line = banner();
+        assert_eq!(field(&line, "sha_source="), "git", "{line}");
+        let commit = field(&line, "commit=");
+        assert!(is_probed_sha(&commit), "commit={commit} in {line}");
+    }
+
     /// The banner has to carry every field a reader needs to identify a binary.
     /// Asserted by name rather than by shape: a banner that lost `commit` in a
     /// refactor would still look like a banner.
     #[test]
     fn the_banner_names_the_build() {
         let line = banner();
-        for key in ["keeper ", "commit=", "built=", "profile=", "target="] {
+        for key in [
+            "keeper ",
+            "commit=",
+            "sha_source=",
+            "built=",
+            "profile=",
+            "target=",
+        ] {
             assert!(line.contains(key), "{key} missing from {line}");
         }
+    }
+
+    /// The source is a closed vocabulary — `build.rs` chooses one of four words
+    /// — and a reader greps for those words. A fifth spelling, or a value that
+    /// leaked in from the sha, would be a field that reads as text but cannot
+    /// be searched for.
+    #[test]
+    fn the_sha_source_is_one_of_the_four_words() {
+        let line = banner();
+        let source = line
+            .split("sha_source=")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .expect("a sha_source field");
+        assert!(
+            ["file", "env", "git", "none"].contains(&source),
+            "sha_source={source} is not one of file/env/git/none in {line}"
+        );
     }
 
     /// A version that is not the crate's would make every log line about a

@@ -46,6 +46,20 @@ fi
 # laptop that is nearly full.
 CARGO_ENV='export PATH="$HOME/.cargo/bin:$PATH" CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0'
 
+# Stamp the tree with the commit it is about to be synced FROM, before the
+# rsync carries it over: the remote copy has no `.git` and a probe there
+# answers for the wrong repository (the header of scripts/lib/build-sha.sh
+# says which, and why every gate run before 2026-09-09 shipped a stale stamp).
+. "$REPO_ROOT/scripts/lib/build-sha.sh"
+BUILD_SHA="$(keeper_stamp_build_sha "$REPO_ROOT")"
+say "build sha: ${BUILD_SHA:-(none: no .git here, stamp removed; build.rs will say unknown)}"
+
+# The rsync below excludes `.git` but `--delete` never removes what it
+# excludes, so a repository left on the remote by an older sync would survive
+# every run — and `git` there would answer with ITS head for OUR tree. Remove
+# it before syncing, so the copy has no repository of its own and the stamp
+# is its only word.
+ssh -o BatchMode=yes "$HOST" "rm -rf \"\$HOME/$REMOTE_DIR/.git\""
 
 # Excluded on purpose:
 #   target/, node_modules/  — rebuilt remotely; copying them is slower than

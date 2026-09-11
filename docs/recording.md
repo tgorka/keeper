@@ -185,6 +185,44 @@ the next archive rebuild, and the `![[recordings/…]]` embeds in their note stu
 stop resolving. The card says so before you save, not after. Move them yourself
 first if you want to keep them listed.
 
+### Every synced folder that holds recordings is indexed
+
+The recordings browser and its search read an index (`archive.db`) that keeper
+rebuilds from the session folders themselves, at startup and whenever a synced
+folder is added, removed, paused, resumed or edited, or the destination is
+saved. Every synced folder that declares a recordings subfolder is walked —
+not only the one recordings land in today — so a second folder's meetings are
+searchable and each session is listed under the folder it is actually in.
+
+The index follows the folders, not the other way round. A session you move by
+hand from one recordings root into another is re-homed on the next rebuild:
+one entry, under the folder it now sits in, and its durability is what *that*
+folder's repository says about it — `local` until that folder has committed
+it, whatever the old folder had already pushed. A session you *copy* into a
+second root, with the first copy still there, stays listed under the first
+one (the log names both). A session whose folder is gone from every root
+drops out of the browser and the search. A folder keeper cannot read whole —
+a drive that is unplugged, a paused folder — is left exactly as it was:
+nothing is forgotten because keeper could not look, and a folder that is
+there but suddenly shows no session at all (a stale mountpoint, a subfolder
+that has not synced yet) is not believed either.
+
+Plainly, what triggers a rebuild and what each change does to the index:
+
+- A `[folder.recordings]` block that arrives by pull or by hand edit is
+  picked up at the next save in Settings → Sync or the next start of keeper,
+  not the moment it lands.
+- A drive plugged in after keeper started is indexed at the next save or the
+  next start, for the same reason.
+- Removing a synced folder removes its recordings from the index — keeper no
+  longer knows that folder, so it cannot list what is in it. Pausing one does
+  not: a paused folder's recordings stay listed as they were, waiting for it.
+- On a machine without `git` there is no repository to ask, so every session
+  in a synced folder reads `local` — which is exactly what is true there.
+- A rebuild waits for a recording in progress. A change made while a session
+  records is remembered and the rebuild runs the moment the session ends; a
+  rebuild already under way leaves the live session's folder alone.
+
 Recordings never live at the profile root, and that is not an oversight: eight
 places depend on the root being a non-empty folder disjoint from the notes
 vault, two of them safety arguments rather than conveniences (the

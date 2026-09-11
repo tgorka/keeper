@@ -180,10 +180,19 @@ A file whose modification time is more than 10 s in the **future** is never
 held: a machine with a broken clock would otherwise wedge it forever.
 
 A path the walk found that git has never seen goes through the same four
-tiers as any other, and the walk that takes tier 2's second look at it is one
-that reads the directories again, on every pass until the path settles — an
-index-only walk cannot see an untracked path, and a held path the walk cannot
-see would be forgotten rather than committed (§21's sweep row).
+tiers as any other, and tier 2's second look at it is the pass's own sample
+of the path, not a directory walk: an index-only walk cannot see an untracked
+path, so every commit-leg pass looks at the held paths git does not carry
+itself, and a held path the walk cannot see is looked at rather than
+forgotten (§21's sweep row). What that costs, per held unindexed path per
+pass: two `lstat`s — one to sort the path (gone, a directory, refused,
+ignored, or a file to sample) and one for the gate's sample — plus one probe
+of the index and one excludes lookup, and for the path that stages, the
+read the commit makes of it. A path that is gone is not sampled at all: the
+first stat filters it before the gate, and `retain` forgets it. A path the
+pass cannot judge — its parent lost its permission, say — is kept held with
+a `warn` naming it and the error, never dropped and never a failed pass; the
+next pass looks again.
 
 ### Two honest gaps
 
@@ -338,6 +347,18 @@ for one path instead of emptying the rest. What `false` still buys is that a
 worktree whose keeper binary has moved remains checkout-able, as pointers,
 rather than hard-failing every git command in the folder.
 
+Keeper watches the helpers this registration starts — a `git` that cleans or
+smudges a tracked path in the folder starts one (a `status` over a changed
+media file does; a `log` does not), and it waits between requests by design —
+and names a stuck one: each helper holds a locked `.git/lfs/helpers/<pid>`
+marker it touches on every request, and the hourly *helper look* (§21) counts
+the live ones, removes a dead one's leftover, and warns once — with the count,
+the oldest's idle time, the git it is waiting on and the process that ran that
+git — when one has had no request for 30 minutes. It never kills a helper: the
+helper belongs to a git keeper did not start, and that git holds state (an
+index lock, a half-written index) that ending its filter would not release
+cleanly, so the warning names the process to quit instead.
+
 Two guards sit behind it:
 
 - **A file that is empty while its pointer names non-zero bytes is never
@@ -405,7 +426,10 @@ serve this". A non-empty result exits non-zero so a cron wrapper sees it.
 On the machine where content originates, every LFS file whose worktree holds the
 real content exists **twice**: once in the worktree, and once in
 `<git-dir>/lfs/objects` as the byte-identical object the clean path streamed
-there to compute the pointer. A path whose worktree bytes are the pointer is the
+there to compute the pointer. (`objects/` is the store proper; beside it the
+same directory holds `incomplete/` for a download that can resume, `tmp/` for
+the scratch an atomic publish goes through, and `helpers/` for the live filter
+helpers' markers — the last is keeper's own and `git-lfs` never reads it.) A path whose worktree bytes are the pointer is the
 inverse case — there the store object is the *only* local copy of the content
 (§9). That copy is unavoidable at stage time — the bytes have to be read and
 hashed — but it is not needed forever. Measured on a 211 GB archive: 215 GB of
@@ -1599,6 +1623,103 @@ A file with no delivery glyph at all is one no unit of work is accountable for: 
 row recorded before this column existed, or a conflict copy a merge just wrote,
 whose publication belongs to a commit that does not exist yet. Absence there is a
 deliberate answer, not a gap.
+
+### What `keeper-syncd status` reads, and when it is allowed to change
+
+The tray and the window poll a snapshot the running engine keeps in memory. A
+separate process — `keeper-syncd status`, or the app at its next launch — has no
+snapshot and reads three columns of the profile row in `sync.db` instead:
+
+| column | what it says | written by |
+|---|---|---|
+| `state` | the last state word the engine observed | `persist_state`, from its callers: `set_state` (every explicit change — a failure's arm, a phase's end), `note_unit_succeeded` (the success that takes `offline` or `needsAttention` off), and the pass end's `settle_and_persist` and the queue refresh's `Syncing → settled` edge, each of which writes only when the word moved |
+| `last_error` | the sentence beside the folder, or `NULL` | the failures that stop a folder, and the success that retires them |
+| `updated_ms` | the engine's clock at the last write of `json`, `state` or `last_error` | both of the above, and a profile edit — every writer of the row except the one-shot migrations, which observe nothing |
+
+The two columns are written by two separate writers on purpose: a folder can go
+`syncing → watching` a hundred times while one error stands, and a state write
+that also cleared the error would erase the reason on the very next tick.
+`updated_ms` moves on both, which is the only way to tell a row written a second
+ago from one the last run left behind in August — the state word alone reads the
+same either way.
+
+**`offline` stands until a unit reaches the remote.** A network failure puts
+the folder into the engine's sticky offline set, and what takes it out is a
+leg of work that actually round-tripped — a fetch that came back, a push that
+pushed, a transfer that moved bytes, a clone that landed. Nothing else counts:
+not a pass that committed nothing, not a queue that emptied because the failed
+unit is waiting out its backoff, not the supervisor's tick having run, not a
+pass that reached its end without a round trip, and not a unit that completed
+without one — a push with nothing to send, a checkout that adopted the folder
+in place, a transfer whose object was already in the store, a folder with
+large-file support off. Each of those completes without asking the remote a
+thing, and each used to empty the set. (Each still retires the folder's own
+sentence, because the work the sentence names is done — a checkout that
+finishes the copy an earlier run left half-made retires "this folder's first
+copy never finished" whether it cloned or restored from the commits already
+here.) The word a finished pass writes is the
+state that is *still true* of the folder, and a profile still in the offline
+set, or still carrying an error, outranks the pass's "I am done"; only
+`paused` outranks the set, because it is a setting rather than an observation.
+On hesperia, before this rule, one folder read `watching` through 1 044
+consecutive push failures: every pass end wrote the word unconditionally, and
+the pass end also declared the remote reachable — a pull-only pass whose fetch
+was fine drained an upload unit that failed on the network, the drain absorbed
+that failure into the journal's backoff, and the end of the same pass emptied
+the offline set and logged `sync reachable again`, thirteen times. A pass now
+knows what its legs proved: a round trip that came back, none at all, or a
+drained unit's failure — and only the first earns the reset. When the unit that
+does succeed publishes no phase (a push with nothing to send is not one of
+them; a fetch on the supervisor's tick is), the success itself moves the word
+to `watching` and writes the row, because nothing else would.
+
+The set has one other exit: a failure the remote *answered with*. A refused
+credential, a 403, a quota, a rejected push, history the remote holds and this
+copy does not, bytes that did not verify — each is a round trip that came
+back, and the sticky set is about a remote that cannot be reached. Such a
+failure leaves the set (logging the same `sync reachable again`, because it is
+the same edge) and lets the `needsAttention` the folder just earned stand,
+rather than a stale `offline` outranking it at the pass end. A failure the
+remote did not answer — a local file that would not open, a push held because
+its large files have not landed — is not an exit: the held push in particular
+is raised on every pass of exactly the folder whose uploads are failing, and
+reading it as "reachable" would take that folder out of `offline` on each pass
+and put it back on the next upload.
+
+**An error survives a restart until then.** A fresh process seeds its snapshot
+from the row — `last_error` as well as `state` — so an error a previous run left
+behind is shown by `keeper-syncd status` and by the app on launch, and is retired
+by the first unit that succeeds in the new run, in memory and in the row, exactly
+like an error raised in this run. It is retired by nothing else: not by time,
+not by a restart, not by a pass that moved nothing. Before this the
+snapshot was seeded from `state` alone, and a folder whose first copy had long
+since finished carried "this folder's first copy never finished" for nine days.
+
+What a fresh process believes from the row, in order:
+
+- **Any `last_error` seeds `needsAttention`, whatever the word.** The sentence
+  is what a person reads, and a row written before this rule can carry one
+  under `watching` — every pass end used to write that word over a standing
+  error — so the word is the less trustworthy of the two.
+- A persisted `needsAttention` or `mediaAbsent` keeps its word, because both
+  describe a condition a human has to change.
+- A persisted `offline` is believed while its `updated_ms` is younger than the
+  retry backoff's ceiling plus the longest single attempt (10 min + 10 min =
+  20 min, derived from those two numbers rather than written down), and seeds
+  `idle` beyond that. `keeper-syncd status` is a fresh process too, and a
+  daemon that is still failing re-stamps the row on every attempt: a young
+  `offline` is a live one, and printing `idle` beside it was the lie this rule
+  ends. The window is the cap *plus* an attempt because a daemon whose unit
+  has backed off to the cap stamps the row once per cap, and the attempt that
+  does the stamping can itself run to its deadline first — a window equal to
+  the cap alone had `status` printing `idle` in the gap between two stamps. A
+  row older than that is an observation nothing has confirmed since, and
+  whether the remote answers now is a question for this run's first attempt; a
+  row stamped in the future is not believed either. The word is seeded, the
+  sticky set is not — that set is "as far as *this* log has been told", and a
+  remote that is still down gets its `sync offline` line in this run's log
+  too.
+- `syncing` never: nothing is syncing yet. Everything else seeds `idle`.
 
 ---
 
@@ -3155,8 +3276,8 @@ than once an hour**, and the thorough passes run once a day.
 | --- | --- | --- | --- | --- | --- |
 | **watcher** | the way a local change is found | FSEvents/inotify events, 500 ms debounce, tier-0 exclusion, the wake floor; the paths are kept for the walk | continuous while the folder's volume is attached | `folder watch armed` once; events are not logged | `watch.rs`, `Engine::fold_watch_events` |
 | **scan pass** (event-driven) | commit what settled | a walk of the paths the watcher named (`:(literal)` include pathspecs), the stability gate, LFS staging, the commit; a `Push` is queued if anything was committed or the branch is ahead | a wake, once the gate's settle window (5 s; 10 s on removable media; 60 s ceiling) has run out; at most one wake-driven walk per `min(settle, 5 s)` | `scan pass reason=wake` / `reason=settle`, then `status walk finished caller="commit" included=N` | `scan_due`, `scan_and_enqueue`, `WalkPolicy::include` |
-| **scan pass** (backstop) | an event the watcher dropped | the same pass over the **whole index** (every entry `lstat`-ed; no directory walk, unless the gate holds a path git does not carry — then the sweep row's widening applies) | every **1 h** while the watcher is live (`LIVE_WATCH_BACKSTOP_MS`); every `pollIntervalMs` (default 15 s) when it is not — the cadence the degraded-watcher warning names | `scan pass reason=paced`, `status walk finished … included=0` | `scan_is_due`, `LIVE_WATCH_BACKSTOP_MS` |
-| **untracked sweep** | a file that appeared while nothing was watching | the walk also reads every directory (`find_untracked`), so a path git has never seen is found; a live watcher's `Create` event buys the same walk at once, so this is only for what it missed. After `untracked=N` the paths it found are held by the gate, and every commit-leg walk until they settle reads the directories again so the gate's second look can see them — an index-only walk cannot, and a held path a walk cannot see would be forgotten, not committed. The pass that held them buys the next walk that scan; should the gate still hold a path git does not carry when no scan is owed (a restart whose first walk was the poll's, say), the policy widens on its own and says so | every **24 h** (`UNTRACKED_SWEEP_INTERVAL`), on the first pass of a run, and on every pass with no live watcher; the watcher's own 24 h rescan event rides the same clock | `untracked sweep: this walk reads every directory`, then `status walk finished … untracked=N`; `the gate holds a path the index does not carry; a walk without a directory scan cannot observe it; widening to a full walk` (`missing=N path=…`) when the policy widened on its own | `walk_policy`, `watch::DEFAULT_RESCAN_INTERVAL_MS` |
+| **scan pass** (backstop) | an event the watcher dropped | the same pass over the **whole index** (every entry `lstat`-ed; no directory walk — a path the gate holds that git does not carry is `lstat`-ed by the pass itself, §4) | every **1 h** while the watcher is live (`LIVE_WATCH_BACKSTOP_MS`); every `pollIntervalMs` (default 15 s) when it is not — the cadence the degraded-watcher warning names | `scan pass reason=paced`, `status walk finished … included=0` | `scan_is_due`, `LIVE_WATCH_BACKSTOP_MS` |
+| **untracked sweep** | a file that appeared while nothing was watching | the walk also reads every directory (`find_untracked`), so a path git has never seen is found; a live watcher's `Create` event buys the same walk at once, so this is only for what it missed. After `untracked=N` the paths it found are held by the gate, and the gate's second look at each of them is the next commit-leg pass's own sample: the pass lists the held paths its walk did not report and the index does not carry (one probe of the index), gives each git's own exclusion (`.gitignore` and nested repositories, which a path held since before the rule was written has not had) and `lstat`s it itself, so a held path git has never seen costs two stats per pass (§4), never a directory walk — a settled one is committed, a moving one stays held, a gone or ignored one is forgotten, one the pass cannot stat stays held with a `warn`. The same sample covers a restart between the two looks, whichever leg walked first, because `file_state` carries the episode and the pass seeds the gate before it looks | every **24 h** (`UNTRACKED_SWEEP_INTERVAL`), on the first pass of a run, and on every pass with no live watcher; the watcher's own 24 h rescan event rides the same clock | `untracked sweep: this walk reads every directory`, then `status walk finished … untracked=N`; the second look logs nothing of its own — `status walk finished … untracked=0 included=N` is the narrowed walk it rode; `a held path is one git ignores …; forgetting it` / `… now lies inside a nested repository …; forgetting it` (info, `path=`) for one the exclusion drops; `a held path the walk did not report could not be stat'd; keeping it held until it can be` (warn, `path=` and `err=`, once per pass) for one it cannot judge; `the gate holds paths the walk did not report and the index cannot be read …; sampling every one of them` (warn, once per pass) when the index probe fails — which the commit leg can only reach by a race, since its walk read the same index a moment earlier and would have failed the pass first | `walk_policy`, `Engine::paths_for_the_second_look`, `watch::DEFAULT_RESCAN_INTERVAL_MS` |
 | **remote poll** | a peer's change | one fetch of `refs/heads/<branch>` (a single HTTPS request when nothing moved), then fast-forward, or §5's merge | every **5 min** (`REMOTE_POLL_MS`); at once when this pass committed something or a wake named a path; `wake_now` and *Sync now* force it | `remote poll queued reason=paced|wake|push owed`, then `remote polled: up to date` / `the remote branch moved` | `scan_and_enqueue`, `do_pull` |
 | **push** | publish what was committed | `git push` of the working branch, held while any LFS upload is outstanding | a journaled unit, drained on the tick after it is queued; retried with backoff | `committed profile=… files=N`, then `pushed branch=… commits=N` | `do_push` |
 | **LFS transfers** | the objects a commit or a pull needs | one upload/download per queued unit, verify-after-upload, resume on download | journaled units, drained as they are queued | `materialized LFS content`, the transfer's own lines | `do_lfs` |
@@ -3164,6 +3285,7 @@ than once an hour**, and the thorough passes run once a day.
 | **release sweep** | virtual files: let content go after its window | §9's sweep over the ledger, budgeted (32 objects / 1 GiB per pass), every refusal `dehydrate` has | on the success edge, at most once an **hour** per folder (`RELEASE_LOOK_EVERY_MS`); a `release` task can veto or drive it (§14) | `release sweep released=N` / `the release sweep did not finish this pass` | `release_expired`, `release_is_due` |
 | **ledger ageing** | the `materialized` table does not grow forever | delete rows released more than 90 days ago | on the same success edge | `forgot ledger rows released more than ninety days ago` when any went | `age_out_materialized` |
 | **scratch sweep** | an interrupted transfer's leftovers | delete `.git/lfs/tmp` and `incomplete/` entries older than an hour | every **24 h** (`SWEEP_EVERY_MS`) | `scratch sweep found=N removed=N` | `sweep_scratch_if_due` |
+| **helper look** | a `filter.lfs.process` helper another git left waiting | one `read_dir` of `.git/lfs/helpers/` and one `try_lock` per marker: an unlocked marker is a dead helper's leftover and is removed; a locked one idle ≥ 30 min (`STUCK_HELPER_IDLE`) is a stuck helper — counted, and the oldest named with its idle time, its git and the process that ran that git (a `ps` walk up the parent chain, only then, bounded to 10 s); a marker whose lock cannot be tried is placed by `ps -p` instead and reported as skipped; one sticky warning per onset, retired when none remain; **never killed** — it belongs to a git keeper did not start | every **1 h** (`HELPER_LOOK_EVERY_MS`), and the first tick of a run | `helper look alive=N stuck=N removed=N skipped=N`, and the `anomaly:` line when stuck > 0 or skipped > 0 | `look_at_helpers_if_due`, `LfsStore::look_at_helpers` |
 | **footprint sweep** | say what history carries as plain blobs above today's threshold, and whether a control file is pointer text | one `lstat` per tracked path — or, when HEAD and the threshold have not moved since the last one, the remembered numbers with no walk | rides the scratch sweep, every **24 h** | `footprint sweep files=N bytes=N measured=true|false`, and the `anomaly:` line when files > 0 | `report_blobs_over_threshold` |
 | **`gc`** (a §14 task) | the object store stays packed | `git gc --quiet` in a quiet window (the folder's reservation and its walk claim) | seeded **`every 7d`** per desktop folder (`gc-<id>`); editable and deletable like any task | the task's run line (`task … outcome=…`) and `loose_before=… loose_after=…` | `perform_gc_task`, `db::seed_gc_task` |
 | **notes cadence** | a note is committed soon after you stop typing and pushed soon after | `commit` asks the engine to look now (`wake_now`); `push` is one `sync_once` | commit **2 s** after the last edit (`commitIdleMs`); push **30 s** after the commit (`pushIntervalMs`), or at once on blur where `pushOnBlur` is set | `notes cadence: commit — …` / `notes cadence: push — …` | `notes_vault::dispatch_cadence` |

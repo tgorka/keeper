@@ -77,6 +77,40 @@ echo "==> Bundle identifier: $BUNDLE_ID"
 # `[ -f "$DMG" ]` check after a full signed build.
 KEEPER_BUNDLES="${KEEPER_BUNDLES:-app}"
 echo "==> Bundles: $KEEPER_BUNDLES"
+
+# --- Say which commit this is ----------------------------------------------
+# `build.rs` reads the sha from `crates/keeper/build-sha.txt` first, and this
+# script runs in two very different places (why the file, and why the Mac's
+# copy must never be probed: the header of lib/build-sha.sh):
+#
+#   - on a developer's checkout (`bun run tauri:build:signed`), where `.git`
+#     is real and a build in place has to refresh the stamp or it ships
+#     whatever the last script left — two days stale on 2026-09-09;
+#   - on the Mac's rsynced copy, dispatched by `install-macos.sh` or run by
+#     hand for `release-macos.sh`, where there is NO `.git` and the stamp the
+#     workstation wrote before the rsync is the only true word about the tree.
+#
+# So the rule is: re-stamp only where there is a `.git` to ask; otherwise keep
+# the stamp as it is. Calling the library unconditionally would REMOVE the
+# rsynced stamp on the Mac (that is what it does with no `.git`), and every
+# `release-macos.sh` run arrives with `KEEPER_BUILD_SHA` unset, so the env
+# cannot be the thing that decides. Either way, what is printed is the file —
+# the value `build.rs` will actually read — and `${KEEPER_BUILD_SHA:-}` is
+# only consulted when there is no file: the install scripts export it EMPTY
+# when the workstation itself had no `.git`, and empty means "not stated".
+. "$SCRIPT_DIR/lib/build-sha.sh"
+if [ -e "$REPO_ROOT/.git" ]; then
+  keeper_stamp_build_sha "$REPO_ROOT" >/dev/null
+fi
+BUILD_SHA_FILE="$REPO_ROOT/$KEEPER_BUILD_SHA_FILE"
+if [ -s "$BUILD_SHA_FILE" ]; then
+  echo "==> Build sha: $(cat "$BUILD_SHA_FILE") (from $KEEPER_BUILD_SHA_FILE)"
+elif [ -n "${KEEPER_BUILD_SHA:-}" ]; then
+  echo "==> Build sha: $KEEPER_BUILD_SHA (from KEEPER_BUILD_SHA; no stamp file)"
+else
+  echo "==> Build sha: not stated (no stamp file); build.rs will probe git if it can, else say unknown"
+fi
+
 bash "$SCRIPT_DIR/build-keeper-rec.sh"
 bunx tauri build \
   --config src-tauri/crates/keeper/tauri.conf.json \

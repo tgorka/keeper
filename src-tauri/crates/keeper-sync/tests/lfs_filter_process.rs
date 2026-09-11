@@ -262,6 +262,172 @@ fn a_finished_status_walk_reaps_the_filter_children_it_launched() {
     );
 }
 
+/// A helper is a helper keeper can name: while it serves, its marker under
+/// `.git/lfs/helpers/<pid>` is held under an exclusive lock and touched after
+/// every request; once its git drops it, the marker is unlocked or gone.
+///
+/// Two arms, because the two halves of the contract are observable at
+/// different moments. The **serving** half needs a helper that is provably
+/// alive at the instant the marker is inspected, and a gix status walk is
+/// synchronous — by the time it returns its helpers are gone — so that arm
+/// drives the very command the config names by hand over the real pipe, the
+/// way `filter.rs`'s own tests script `run_process`, but against the built
+/// binary and a real pid. The **dropped** half is the walk itself: every
+/// helper gitoxide launched has left nothing locked behind when `status`
+/// returns.
+#[cfg(unix)]
+#[test]
+fn a_serving_helper_holds_a_locked_marker_and_leaves_none_behind() {
+    use fs4::fs_std::FileExt as _;
+    use keeper_sync::lfs::pktline;
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let repo = pointer_fixture(root);
+    let helpers = root.join(".git").join("lfs").join("helpers");
+
+    // ---- serving: the marker is there, locked, and moves with each request.
+    let mut child = std::process::Command::new(HARNESS)
+        .args(["lfs", "filter-process", "--repo"])
+        .arg(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("start the helper");
+    let mut to_helper = child.stdin.take().expect("stdin");
+    let mut from_helper = child.stdout.take().expect("stdout");
+
+    // The handshake, as git opens it.
+    let mut hello = Vec::new();
+    pktline::write_line(&mut hello, "git-filter-client").expect("client");
+    pktline::write_line(&mut hello, "version=2").expect("version");
+    pktline::write_flush(&mut hello).expect("flush");
+    for capability in ["capability=clean", "capability=smudge", "capability=delay"] {
+        pktline::write_line(&mut hello, capability).expect("capability");
+    }
+    pktline::write_flush(&mut hello).expect("flush");
+    to_helper.write_all(&hello).expect("send hello");
+    to_helper.flush().expect("flush hello");
+    assert_eq!(
+        pktline::read_text_list(&mut from_helper).expect("server hello"),
+        Some(vec!["git-filter-server".to_owned(), "version=2".to_owned()])
+    );
+    assert_eq!(
+        pktline::read_text_list(&mut from_helper).expect("capabilities"),
+        Some(vec![
+            "capability=clean".to_owned(),
+            "capability=smudge".to_owned()
+        ])
+    );
+
+    // Handshake answered: the helper is registered, under its own pid.
+    let marker = helpers.join(child.id().to_string());
+    assert!(
+        marker.is_file(),
+        "a serving helper has a marker: {}",
+        marker.display()
+    );
+    let probe = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&marker)
+        .expect("open the marker");
+    assert!(
+        !probe.try_lock_exclusive().expect("try the lock"),
+        "the marker is locked while the helper serves"
+    );
+
+    // Back-date it, serve one request, and the touch has moved it forward
+    // again — the busy-for-forty-minutes helper is never stuck.
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+    probe.set_modified(long_ago).expect("back-date the marker");
+    let payload = std::fs::read(root.join("video.bin")).expect("read the fixture");
+    let mut request = Vec::new();
+    pktline::write_line(&mut request, "command=clean").expect("command");
+    pktline::write_line(&mut request, "pathname=video.bin").expect("pathname");
+    pktline::write_flush(&mut request).expect("flush");
+    for chunk in payload.chunks(pktline::MAX_DATA) {
+        pktline::write_data(&mut request, chunk).expect("content");
+    }
+    pktline::write_flush(&mut request).expect("flush");
+    to_helper.write_all(&request).expect("send the request");
+    to_helper.flush().expect("flush the request");
+    assert_eq!(
+        pktline::read_text_list(&mut from_helper).expect("status"),
+        Some(vec!["status=success".to_owned()])
+    );
+    let mut answer = Vec::new();
+    loop {
+        match pktline::read(&mut from_helper).expect("body packet") {
+            pktline::Packet::Data(bytes) => answer.extend(bytes),
+            pktline::Packet::Flush => break,
+            pktline::Packet::Eof => panic!("the helper hung up mid-answer"),
+        }
+    }
+    assert!(
+        pktline::read_text_list(&mut from_helper)
+            .expect("trailer")
+            .is_some_and(|trailer| trailer.is_empty()),
+        "an empty trailing status list ends a successful answer"
+    );
+    assert!(
+        Pointer::parse(&answer).is_some(),
+        "the clean of a stored object is its pointer: {}",
+        String::from_utf8_lossy(&answer)
+    );
+    let touched = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .expect("the marker's mtime");
+    assert!(
+        touched > long_ago + std::time::Duration::from_secs(3600),
+        "every request touches the marker; it reads {touched:?} against {long_ago:?}"
+    );
+    assert!(
+        !probe.try_lock_exclusive().expect("try the lock again"),
+        "and it stays locked between requests"
+    );
+    drop(probe);
+
+    // git hangs up: the helper returns, and its last act unlinks the marker.
+    drop(to_helper);
+    let exit = child.wait().expect("wait for the helper");
+    assert!(exit.success(), "the helper exits cleanly on EOF: {exit}");
+    assert!(
+        !marker.exists(),
+        "a helper that returns leaves no marker: {}",
+        marker.display()
+    );
+
+    // ---- dropped: the helpers a real gix walk started are gone with it.
+    let by_hand = child.id();
+    let status = git::repo::status_paths(&repo).expect("status");
+    assert!(
+        status.modified.is_empty(),
+        "the fixture must go through the filter, or no helper was started: {status:?}"
+    );
+    let launched: Vec<u32> = launched_filter_pids(root)
+        .into_iter()
+        .filter(|pid| *pid != by_hand)
+        .collect();
+    assert!(
+        !launched.is_empty(),
+        "no `process` filter was launched by gix, so the second arm is vacuous"
+    );
+    for pid in launched {
+        let marker = helpers.join(pid.to_string());
+        if !marker.exists() {
+            continue;
+        }
+        let probe = std::fs::File::open(&marker).expect("open a leftover");
+        assert!(
+            probe.try_lock_exclusive().expect("try a leftover's lock"),
+            "helper {pid} is gone, so its marker must be unlocked or gone: {}",
+            marker.display()
+        );
+    }
+}
+
 /// The pids the harness recorded for itself, one per `process` launch.
 #[cfg(unix)]
 fn launched_filter_pids(root: &std::path::Path) -> Vec<u32> {

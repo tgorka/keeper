@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::backoff::{jitter_sample, Backoff};
+use crate::backoff::{jitter_sample, Backoff, RETRY_BACKOFF_MAX};
 use crate::credential::{challenge_accepts_basic, AccessToken};
 use crate::db::{self, ActivityKind, ActivityRow, DeviceIdentity, WorkKind, WorkState};
 use crate::error::{Result, Retriability, SyncError};
@@ -98,6 +98,48 @@ struct Converged {
     copies: Vec<String>,
     /// Regenerable paths resolved to the remote with no copy kept.
     stale: Vec<String>,
+}
+
+/// What a leg, a unit or a whole pass proved about the remote.
+///
+/// [`Engine::mark_synced`] is the pass-level "it worked", and until this
+/// existed it took every pass that reached it as proof the remote was
+/// reachable: it called [`Engine::note_unit_succeeded`], which empties the
+/// sticky offline set and logs `sync reachable again`. But a pass reaches
+/// `mark_synced` whenever none of its *inline* legs raised — and the legs
+/// that talk to the remote are not always inline. A pull-only pass whose fetch
+/// was fine drained an `LfsUpload` unit that failed on the network, the drain
+/// swallowed that failure into the journal's backoff as it should, and the
+/// pass end then declared the remote reachable and wrote `watching` over the
+/// `offline` the failure had just recorded. Thirteen false `sync reachable
+/// again` lines on hesperia, 2026-09-09, beside 1 044 consecutive failures.
+///
+/// So every leg answers, the answers fold, and only [`Self::Reached`] earns
+/// the reset. `Failed` dominates `Reached` — a fetch that worked beside an
+/// upload that did not has not proved anything the failure did not already
+/// disprove — and `Reached` dominates `Skipped`, because one round trip that
+/// came back is one more than none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteContact {
+    /// A round trip was made and the remote answered it.
+    Reached,
+    /// No round trip: a direction that skips the leg, nothing to push, a
+    /// drain that claimed nothing. Proves nothing either way.
+    Skipped,
+    /// A unit this pass drained failed and was rescheduled. The failure is
+    /// already recorded beside the folder; the pass may not un-record it.
+    Failed,
+}
+
+impl RemoteContact {
+    /// Fold two answers, most pessimistic first.
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Failed, _) | (_, Self::Failed) => Self::Failed,
+            (Self::Reached, _) | (_, Self::Reached) => Self::Reached,
+            (Self::Skipped, Self::Skipped) => Self::Skipped,
+        }
+    }
 }
 
 /// What is asking for a recordings push (Story 41.5, FR-136).
@@ -509,6 +551,35 @@ const WAKE_WALK_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// wake. `wake_now` and `sync_once` still force it.
 pub const REMOTE_POLL_MS: i64 = 300_000;
 
+/// The longest one attempt against the remote can take before keeper gives
+/// up on it: the git-child deadline or the fetch deadline, whichever is
+/// longer. Derived rather than written down, so the seed window below moves
+/// if either does.
+const LONGEST_ATTEMPT_MS: i64 = {
+    let git = git::cli::GIT_DEADLINE.as_millis();
+    let fetch = git::fetch::FETCH_DEADLINE.as_millis();
+    (if git > fetch { git } else { fetch }) as i64
+};
+
+/// How old a persisted `offline` may be for a fresh process to believe it.
+///
+/// A row that says `offline` is an observation about a run that ended, and
+/// whether the remote answers *now* is a question for this run's first
+/// attempt — so [`Engine::seed_status`] used to seed every persisted `offline`
+/// as `Idle`. But `keeper-syncd status` is itself a fresh process, and it
+/// printed `idle` beside a row the daemon had re-stamped `offline` seconds
+/// earlier, on every one of its failed attempts.
+///
+/// The window is the retry backoff's ceiling plus the longest single attempt
+/// (20 min): a daemon whose unit has backed off to the cap re-stamps the row
+/// once per [`RETRY_BACKOFF_MAX`], and the attempt that does the stamping can
+/// itself run for [`LONGEST_ATTEMPT_MS`] before it fails. The window used to
+/// be two remote-poll intervals, which equals the cap exactly — so with a
+/// strict `<`, `status` printed `idle` in the gap between a capped daemon's
+/// stamps. A row older than this is one nothing has touched since, and it
+/// seeds `Idle` as before.
+pub const OFFLINE_SEED_MAX_AGE_MS: i64 = RETRY_BACKOFF_MAX.as_millis() as i64 + LONGEST_ATTEMPT_MS;
+
 /// How often a profile's tree is walked with nothing prompting it while its
 /// watcher is live (Story 70.6, AD-233).
 ///
@@ -595,6 +666,19 @@ pub const RELEASE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 /// advances its injected clock by this interval to reach a second pass, and a
 /// literal there would silently stop reaching one if this changed.
 pub const RELEASE_LOOK_EVERY_MS: i64 = 3_600_000;
+
+/// How often a folder's `filter.lfs.process` helpers are looked at.
+///
+/// An hour, [`RELEASE_LOOK_EVERY_MS`]'s shape and a look interval in the same
+/// sense: nothing fires on it, and the cost bounded by it is one `read_dir`
+/// and one `try_lock` per marker. The thing it detects is a helper idle for
+/// [`lfs::store::LfsStore::STUCK_HELPER_IDLE`] — thirty minutes — so asking
+/// hourly names a stuck helper within ninety minutes of its last request,
+/// against the three and a half hours the field ones had already been standing
+/// when a person found them by hand. Unlike the release look, **absent means
+/// now**: the first tick of a run looks, because a restart is the moment a
+/// helper orphaned by the previous run is most likely to be standing there.
+pub const HELPER_LOOK_EVERY_MS: i64 = 3_600_000;
 
 /// What a `Held` row says, with `{platform}` standing for
 /// [`host_platform_name`] (Epic 70, Story 70.7, AD-235).
@@ -846,6 +930,13 @@ const WATCH_REARM_INTERVAL_MS: i64 = 60_000;
 /// be retired again without disturbing anything else on display, and matching
 /// its own prefix is the only way to tell our message from someone else's.
 const WATCH_DEGRADED_PREFIX: &str = "keeper cannot watch this folder for changes";
+
+/// The opening words of the stuck-helper warning, for [`WATCH_DEGRADED_PREFIX`]'s
+/// reason: the helper look retires its own warning by these words and no
+/// other, so a look that finds nothing never wipes a warning about something
+/// else. The tail carries numbers that move between looks; the prefix must
+/// not.
+const HELPER_STUCK_PREFIX: &str = "a git run in this folder has left keeper's LFS helper waiting";
 
 /// The refusal when a merge in progress cannot be undone (Story 70.3, AD-229).
 ///
@@ -1239,6 +1330,24 @@ pub struct Engine {
     /// leaves scratch behind is the one that was killed, and the next start is
     /// the first moment anything can clean up after it.
     next_sweep_ms: Mutex<HashMap<String, i64>>,
+    /// When each profile's `filter.lfs.process` helpers may next be looked at.
+    ///
+    /// [`Self::next_sweep_ms`]'s shape, absent meaning "now", for the same
+    /// reason: a helper the previous run left standing is found on the first
+    /// tick of this one. See [`HELPER_LOOK_EVERY_MS`].
+    next_helper_look_ms: Mutex<HashMap<String, i64>>,
+    /// Profiles whose stuck-helper warning has already been announced.
+    ///
+    /// [`Self::task_faults`]'s shape, for [`Self::warn_watch_degraded`]'s
+    /// reason: `warn` keys its toast on the snapshot's `None → Some`, and
+    /// [`Self::clear_warning`] wipes the snapshot after every successful
+    /// unit — which a stuck helper does not stop. Without this set the hourly
+    /// look would find the field empty every time and post the same onset
+    /// once an hour for as long as the helper stands, the storm Story 29.6
+    /// exists to prevent. The set says "already told"; the look re-asserts
+    /// the text silently while it is in, and [`Self::clear_helper_warning`]
+    /// is the only way out of it.
+    helper_warned: Mutex<HashSet<String>>,
     /// When each profile's release candidates may next be looked at (Story
     /// 56.5).
     ///
@@ -1514,21 +1623,27 @@ impl Drop for WalkClaim<'_> {
     }
 }
 
-/// What [`Engine::walk_policy`]'s guard learned about the paths the gate is
-/// holding, from one probe of the index.
+/// What the pass's second look sorted the held paths its walk did not report
+/// into ([`Engine::paths_for_the_second_look`]). Every path here is
+/// repository-relative.
 ///
-/// Three answers, not two: an index that cannot be read says nothing about
-/// any held path, and reporting it as "missing" would send an operator after
-/// a phantom untracked file. Both of the non-`Indexed` answers widen the
-/// walk; they differ in what the log says.
-enum HeldIndexProbe {
-    /// Every held path is one the index carries, or nothing is held: a walk
-    /// without a directory scan can observe them all.
-    Indexed,
-    /// `missing` held paths the index does not carry, `first` among them.
-    Missing { missing: usize, first: PathBuf },
-    /// The index could not be read, so nothing is known about any held path.
-    Unreadable(String),
+/// A held path the walk could not report is owed one of four answers. A
+/// path to **sample** goes through the gate exactly as a walk-reported
+/// addition does. A path to keep **held** is one the pass could not judge —
+/// a `stat` refused for a reason other than absence, or an exclusion it
+/// could not consult — and is kept without a sample, the gate's own
+/// fail-closed rule applied here: forgetting it would be the file the sweep
+/// found and never committed, and failing the pass would be one path
+/// holding up the folder. A **collapsed** path has become a directory, for
+/// [`Engine::report_collapsed`] to name once, as the walk's are. And a path
+/// that is gone, ignored, carried by the index after all, or inside a
+/// nested repository is simply not listed, which leaves it to `retain` to
+/// forget — the whole of what any of those is owed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SecondLook {
+    sample: Vec<PathBuf>,
+    held: Vec<PathBuf>,
+    collapsed: Vec<PathBuf>,
 }
 
 /// What the last footprint sweep found, keyed by what it was measured against
@@ -1768,6 +1883,8 @@ impl Engine {
             next_remote_poll_ms: Mutex::new(HashMap::new()),
             footprint_memo: Mutex::new(HashMap::new()),
             next_sweep_ms: Mutex::new(HashMap::new()),
+            next_helper_look_ms: Mutex::new(HashMap::new()),
+            helper_warned: Mutex::new(HashSet::new()),
             next_release_ms: Mutex::new(HashMap::new()),
             release_cursor: Mutex::new(HashMap::new()),
             // `current_exe` is the daemon in a CLI run and the app binary in a
@@ -1913,12 +2030,12 @@ impl Engine {
     /// Same arithmetic as [`Self::poll_walk_policy`] plus the one input that
     /// matters here: this leg publishes untracked files, so it must not miss
     /// one. The watcher is what makes skipping safe — a file that appears sets
-    /// the profile's wake — and the gate is what makes it safe for the files
-    /// only a walk found: a pass that held an untracked path sets the same
-    /// flag ([`Self::collect_stable_changes`]), and behind the flag
-    /// [`Self::walk_policy`]'s guard widens for any held path the index does
-    /// not carry. A pass with neither has nothing new for a directory scan to
-    /// find.
+    /// the profile's wake, and a `Create` sets `untracked_appeared` — and the
+    /// pass is what makes it safe for the files only a walk found: a held
+    /// path the index does not carry is sampled by the pass itself
+    /// ([`Self::collect_stable_changes`]'s second look), so it owes no
+    /// directory scan. A pass with no `Create` and no sweep due has nothing
+    /// new for a directory scan to find.
     ///
     /// Measured on the field folder: a pass that spent the scan reported
     /// `elapsed_ms=9299355` — two and a half hours against a busy USB volume —
@@ -1952,16 +2069,19 @@ impl Engine {
     /// runs with, so a walk that took the list is the walk that answers it,
     /// and the full walks consume it too: a sweep of the whole tree answers
     /// every path on it. `with_held` brings the paths the gate is still
-    /// holding into the answer: a held path the index carries rides along as
-    /// an include of the narrowed walk, and a held path the index does not
-    /// carry widens the walk to a full one. The gate needs a second
-    /// observation to clear a settling path, and the walk is the only
-    /// observer; a walk that could not see a held path would report nothing
-    /// for it, and `collect_stable_changes` would then `retain` it away — the
-    /// episode forgotten, the file never committed, which is the exact shape
-    /// of the bug the wake was invented to fix. The gate holds only what is
-    /// mid-episode, so this is a handful. An empty list narrows nothing: the
-    /// whole index, as before.
+    /// holding into the answer as includes of the narrowed walk. The gate
+    /// needs a second observation to clear a settling path; for a held path
+    /// the index carries the walk is that observer, and a walk that could not
+    /// see it would report nothing for it, and `collect_stable_changes` would
+    /// then `retain` it away — the episode forgotten, the file never
+    /// committed, which is the exact shape of the bug the wake was invented
+    /// to fix. A held path the index does *not* carry rides along too but
+    /// comes back unreported, because an include pathspec names an index
+    /// entry and none of the walks below reads a directory; that one is the
+    /// pass's own to observe ([`Self::collect_stable_changes`]'s second look),
+    /// and it used to widen this policy to a full walk on every pass until it
+    /// settled. The gate holds only what is mid-episode, so this is a
+    /// handful. An empty list narrows nothing: the whole index, as before.
     fn walk_policy(&self, profile: &SyncProfile, with_held: bool) -> git::repo::WalkPolicy {
         let watched = self.watch_is_live(&profile.id);
         let now = Instant::now();
@@ -1985,59 +2105,12 @@ impl Engine {
             return git::repo::WalkPolicy::full();
         }
         drop(swept);
-        // The guard: a held path the index does not carry can only be observed
-        // by a walk that reads the directories. Neither walk below does — the
-        // whole-index walk the overflow buys no more than the narrowed one —
-        // so handing such a path to either is handing it to `retain` to
-        // forget, which is a file the sweep found and never committed
-        // (hesperia, 2026-09-09: `untracked=160`, then `untracked=0
-        // included=159` eight seconds later, 62.8 GB never published). The
-        // flag `collect_stable_changes` sets is the ordinary, cheap answer;
-        // this is what makes "a held path is re-observed" a property of the
-        // policy rather than something every caller has to remember. One
-        // index probe per held path, only when held paths exist and the
-        // policy has no scan; the walk parses the same index a moment later.
-        let held = if with_held {
-            self.held_paths(profile)
-        } else {
-            Vec::new()
-        };
-        // Either widening stamps the sweep clock, as the sweep branch above
-        // and the flag branch in `commit_walk_policy` do: a full walk answers
-        // every path, and a sweep falling due a moment later would otherwise
-        // repeat the directory walk for nothing.
-        match self.held_paths_the_index_lacks(profile, &held) {
-            HeldIndexProbe::Indexed => {}
-            HeldIndexProbe::Missing { missing, first } => {
-                tracing::warn!(
-                    profile = profile.name,
-                    missing,
-                    path = %first.display(),
-                    "the gate holds a path the index does not carry; \
-                     a walk without a directory scan cannot observe it; \
-                     widening to a full walk"
-                );
-                Self::lock(&self.untracked_sweep).insert(profile.id.clone(), now);
-                return git::repo::WalkPolicy::full();
-            }
-            HeldIndexProbe::Unreadable(err) => {
-                tracing::warn!(
-                    profile = profile.name,
-                    index = "unreadable",
-                    held = held.len(),
-                    %err,
-                    "the gate holds paths and the index cannot be read, so whether \
-                     a walk without a directory scan could observe them is unknown; \
-                     widening to a full walk"
-                );
-                Self::lock(&self.untracked_sweep).insert(profile.id.clone(), now);
-                return git::repo::WalkPolicy::full();
-            }
-        }
         let Some(mut include) = named else {
             return git::repo::WalkPolicy::tracked_only();
         };
-        include.extend(held);
+        if with_held {
+            include.extend(self.held_paths(profile));
+        }
         let mut include: Vec<PathBuf> = include.into_iter().collect();
         include.sort_unstable();
         include.dedup();
@@ -2056,10 +2129,12 @@ impl Engine {
     /// (the field log shows `caller="poll"` first after the 02:18 restart).
     ///
     /// The gate lock is taken for the export and released at the end of the
-    /// statement, before anything else in the policy runs: the index probe
-    /// that follows opens the repository, and a repository is never opened
-    /// under a gate guard ([`GateGuard`], AD-232, Story 70.6). The
-    /// `file_state` read is a SQLite transaction under the db lock alone.
+    /// statement, before anything else in the caller runs: no repository is
+    /// opened or index read under a gate guard ([`GateGuard`], AD-232, Story
+    /// 70.6). The `file_state` read is a SQLite transaction under the db lock
+    /// alone. The pass's own second look does not come through here — it has
+    /// the seeded gate in hand and takes the export itself
+    /// ([`Self::collect_stable_changes`]).
     fn held_paths(&self, profile: &SyncProfile) -> Vec<PathBuf> {
         let held = match self.existing_gate(&profile.id) {
             Some(gate) => GateGuard::take(&gate).export(),
@@ -2086,40 +2161,206 @@ impl Engine {
             .collect()
     }
 
-    /// Which of `held` the index does not carry, from one probe of the index
-    /// — the same probe [`Self::fold_watch_events`] asks of a watcher's path.
+    /// The held paths a pass must sample itself — the second look.
     ///
-    /// An index that cannot be read is its own answer, not "missing": the walk
-    /// is widened either way, at the cost of one directory walk, where the
-    /// other answer is a held path forgotten — but the log then names the
-    /// error rather than a path the index may well carry.
-    fn held_paths_the_index_lacks(
+    /// The gate needs two observations of the same bytes across a settle
+    /// window, and until this the walk was its only observer. A held path the
+    /// walk reported (`observed`) has had its look. A held path the walk did
+    /// not report is one of two things: a path the index carries that the
+    /// walk found clean — another leg committed it, say — which is finished
+    /// business for the gate and is left to `retain`; or a path the index
+    /// does not carry, which the narrowed walk cannot report however it is
+    /// asked (no directory is read), and which the pass must therefore look
+    /// at with its own `lstat`. This sorts the second kind into what the pass
+    /// owes each ([`SecondLook`]), for [`Self::collect_stable_changes`] to
+    /// sample in the same loop as the walk's own untracked paths.
+    ///
+    /// `held` is the gate's own export, absolute, taken by the caller from
+    /// the gate it has already seeded — not a second trip through
+    /// [`Self::held_paths`] and [`Self::existing_gate`]; `observed` is the
+    /// walk's report, absolute; everything returned is repository-relative.
+    /// "Which of them the index does not carry" is one probe of the index
+    /// per pass — the same probe [`Self::fold_watch_events`] asks of a
+    /// watcher's path — made here, outside the gate lock, because an index
+    /// read is never made under a gate guard ([`GateGuard`], AD-232, Story
+    /// 70.6). The probe's answer is only *which*: an index that cannot be
+    /// read leaves every unreported path to the sample, at the cost of an
+    /// `lstat` on a path the index may well carry — which the gate then
+    /// finds clean or settling exactly as it would have — where the other
+    /// choice is a file the sweep found and never committed. That case warns
+    /// once per pass; through `commit_local` it is reachable only by a race,
+    /// since the walk a moment earlier read the same index and would have
+    /// failed the pass first.
+    ///
+    /// Each candidate then gets what a walk-reported untracked path got on
+    /// the way in. One `lstat`, as [`Self::expand_untracked`] takes: gone
+    /// (`NotFound`) is not listed, a directory is `collapsed` for
+    /// [`Self::report_collapsed`], and any other refusal — a parent that lost
+    /// its permission, say — keeps the path `held` with a `warn` naming it
+    /// and the error, rather than failing the pass: a pass that fails before
+    /// `retain` and `save_file_state` would never forget the entry and would
+    /// commit nothing in the folder for as long as the refusal lasted. And
+    /// git's own exclusion, which the dirwalk applied to every path it
+    /// reported and which a path held since before a `.gitignore` was
+    /// written has not had: the repository's excludes are consulted
+    /// (`repo.excludes`), an ignored path is not listed, and neither is one
+    /// inside a nested repository — its files belong to that repository, as
+    /// the walk's collapsed entries say. An exclusion the pass cannot consult
+    /// is the same fail-closed answer as a refused `stat`: held, with a
+    /// `warn`.
+    fn paths_for_the_second_look(
         &self,
         profile: &SyncProfile,
+        repo: &gix::Repository,
         held: &[PathBuf],
-    ) -> HeldIndexProbe {
-        if held.is_empty() {
-            return HeldIndexProbe::Indexed;
+        observed: &HashSet<PathBuf>,
+    ) -> SecondLook {
+        let unreported: Vec<PathBuf> = held
+            .iter()
+            .filter(|absolute| !observed.contains(*absolute))
+            .filter_map(|absolute| {
+                absolute
+                    .strip_prefix(&profile.local_path)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .collect();
+        if unreported.is_empty() {
+            return SecondLook::default();
         }
-        let index = match self
-            .open_repo(profile)
-            .map_err(|err| err.to_string())
-            .and_then(|repo| repo.index_or_empty().map_err(|err| err.to_string()))
-        {
-            Ok(index) => index,
-            Err(err) => return HeldIndexProbe::Unreadable(err),
+        let index = match repo.index_or_empty() {
+            Ok(index) => Some(index),
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    index = "unreadable",
+                    held = unreported.len(),
+                    %err,
+                    "the gate holds paths the walk did not report and the index cannot \
+                     be read, so which of them a walk could have seen is unknown; \
+                     sampling every one of them"
+                );
+                None
+            }
         };
-        let mut missing = held.iter().filter(|rela| {
-            let key = gix::path::into_bstr(rela.as_path());
-            index.entry_index_by_path(key.as_ref()).is_err()
-        });
-        match missing.next() {
-            None => HeldIndexProbe::Indexed,
-            Some(first) => HeldIndexProbe::Missing {
-                first: first.clone(),
-                missing: 1 + missing.count(),
-            },
+        let candidates: Vec<PathBuf> = match &index {
+            Some(index) => unreported
+                .into_iter()
+                .filter(|rela| {
+                    let key = gix::path::into_bstr(rela.as_path());
+                    index.entry_index_by_path(key.as_ref()).is_err()
+                })
+                .collect(),
+            None => unreported,
+        };
+        if candidates.is_empty() {
+            return SecondLook::default();
         }
+        // The excludes want an index only for `.gitignore` files that are not
+        // checked out (skip-worktree); an unreadable one is stood in for by an
+        // empty state, and the worktree's own files are read either way.
+        let empty;
+        let state: &gix::index::State = match &index {
+            Some(index) => index,
+            None => {
+                empty = gix::index::State::new(repo.object_hash());
+                &empty
+            }
+        };
+        let mut excludes = match repo.excludes(state, None, Default::default()) {
+            Ok(excludes) => Some(excludes),
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    held = candidates.len(),
+                    %err,
+                    "the repository's excludes could not be read, so whether git ignores \
+                     a held path is unknown; keeping every one of them held"
+                );
+                None
+            }
+        };
+        let mut look = SecondLook::default();
+        for rela in candidates {
+            let absolute = profile.local_path.join(&rela);
+            let metadata = match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) => metadata,
+                // Gone before its second look: not listed, and `retain`
+                // forgets it.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        profile = profile.name,
+                        path = %rela.display(),
+                        %err,
+                        "a held path the walk did not report could not be stat'd; \
+                         keeping it held until it can be"
+                    );
+                    look.held.push(rela);
+                    continue;
+                }
+            };
+            if metadata.is_dir() {
+                look.collapsed.push(rela);
+                continue;
+            }
+            if Self::inside_a_nested_repository(&profile.local_path, &rela) {
+                tracing::info!(
+                    profile = profile.name,
+                    path = %rela.display(),
+                    "a held path now lies inside a nested repository, so it is not this \
+                     folder's to commit; forgetting it"
+                );
+                continue;
+            }
+            let Some(excludes) = excludes.as_mut() else {
+                look.held.push(rela);
+                continue;
+            };
+            let mode = if metadata.is_symlink() {
+                gix::index::entry::Mode::SYMLINK
+            } else {
+                gix::index::entry::Mode::FILE
+            };
+            match excludes.at_path(&rela, Some(mode)) {
+                Ok(platform) if platform.is_excluded() => {
+                    tracing::info!(
+                        profile = profile.name,
+                        path = %rela.display(),
+                        "a held path is one git ignores, so it is not this folder's to \
+                         commit; forgetting it"
+                    );
+                }
+                Ok(_) => look.sample.push(rela),
+                Err(err) => {
+                    tracing::warn!(
+                        profile = profile.name,
+                        path = %rela.display(),
+                        %err,
+                        "whether git ignores a held path could not be read; keeping it \
+                         held until it can be"
+                    );
+                    look.held.push(rela);
+                }
+            }
+        }
+        // The gate exports from a map, so the order is its own; the commit
+        // and the activity rows read better sorted.
+        look.sample.sort();
+        look.held.sort();
+        look.collapsed.sort();
+        look
+    }
+
+    /// Whether `rela` lies inside a repository nested in this one: some
+    /// proper ancestor of it, below the root, holds a `.git` — a directory or
+    /// a gitfile, which is why the test is presence, not kind. One `lstat`
+    /// per ancestor, for the handful of paths the second look sorts.
+    fn inside_a_nested_repository(root: &Path, rela: &Path) -> bool {
+        rela.ancestors()
+            .skip(1)
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .any(|ancestor| std::fs::symlink_metadata(root.join(ancestor).join(".git")).is_ok())
     }
 
     /// Report a walk's progress on every item, for tests.
@@ -2221,26 +2462,87 @@ impl Engine {
                 .with_db(|conn| db::load_file_state(conn, &profile.id))
                 .map(|held| held.len() as u32)
                 .unwrap_or(0);
+            // The three runtime columns in one read, so the word, the
+            // sentence and the stamp describe one moment. A row this cannot
+            // read seeds as if it said nothing — `Idle`, no error — and says
+            // so at debug: a status that could not be restored must never keep
+            // the engine from opening, but it must not vanish silently either.
+            let runtime = match self.with_db(|conn| db::get_profile_runtime(conn, &profile.id)) {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    tracing::debug!(
+                        profile = profile.name,
+                        error = %err,
+                        "could not restore the sync profile's stored status"
+                    );
+                    None
+                }
+            };
+            // The sentence beside the state, whatever the state seeds as. It
+            // is restored unconditionally because the row is the only record
+            // of it and the only thing that retires the row is
+            // `clear_warning`, which writes the column only when the
+            // *snapshot* carried an error. Seeded from the row, an error a
+            // previous run left behind is retired by this run's first
+            // successful unit like any other; left out, it stood for ever:
+            // the owner's tgdrive-light read "this folder's first copy never
+            // finished" nine days after it had, through a row whose `state`
+            // had long since gone back to `watching`.
+            snapshot.error = runtime.as_ref().and_then(|r| r.last_error.clone());
             snapshot.state = if !profile.enabled {
                 ProfileState::Paused
             } else {
-                // Restore what the last run observed, so a one-shot `status`
-                // tells the truth about a detached drive or a profile that
-                // stopped needing attention. Transient in-flight states are
-                // deliberately NOT restored — nothing is syncing yet.
-                let stored = self
-                    .with_db(|conn| db::get_profile_state(conn, &profile.id))
-                    .unwrap_or(None);
-                match stored {
-                    Some(state @ (ProfileState::MediaAbsent | ProfileState::NeedsAttention)) => {
-                        state
-                    }
-                    _ => ProfileState::Idle,
-                }
+                Self::seeded_state(runtime.as_ref(), self.platform.now_ms())
             };
             status.insert(profile.id.clone(), snapshot);
         }
         Ok(())
+    }
+
+    /// The word a fresh process believes from a profile row, if any.
+    ///
+    /// Restore what the last run observed, so a one-shot `status` tells the
+    /// truth about a detached drive or a folder that stopped — but only the
+    /// observations that are still evidence of anything:
+    ///
+    /// * **Any error ⇒ `NeedsAttention`, whatever the word.** The sentence is
+    ///   what a person reads, and a row can carry one under `watching` — every
+    ///   pass end used to write that word over a standing error — so the word
+    ///   is the less trustworthy of the two. Seeding the state off the error
+    ///   is also what lets this run's first success retire both together.
+    /// * `NeedsAttention` and `MediaAbsent` stand on their own: both describe
+    ///   a condition a human has to change, and the volume gate re-asserts
+    ///   the second on the first tick regardless.
+    /// * `Offline` stands while the row is fresh
+    ///   ([`OFFLINE_SEED_MAX_AGE_MS`]): a daemon that is still failing
+    ///   re-stamps it on every attempt, so a young `offline` is a live one and
+    ///   `keeper-syncd status` must not print `idle` beside it. Older, it is
+    ///   an observation nothing has confirmed since, and this run's first
+    ///   attempt is the one that gets to answer. A row stamped in the
+    ///   *future* — a clock that went backwards — is not young, it is
+    ///   unbelievable, and it seeds `Idle` too.
+    /// * `Syncing` never: nothing is syncing yet. Everything else is `Idle`.
+    ///
+    /// The word alone, deliberately: the sticky [`Self::offline`] set is not
+    /// seeded, because it is "as far as *this* log has been told", and a
+    /// remote that is still down gets its onset line in this run's log too.
+    fn seeded_state(runtime: Option<&db::ProfileRuntime>, now_ms: i64) -> ProfileState {
+        let Some(runtime) = runtime else {
+            return ProfileState::Idle;
+        };
+        if runtime.last_error.is_some() {
+            return ProfileState::NeedsAttention;
+        }
+        match runtime.state {
+            Some(state @ (ProfileState::MediaAbsent | ProfileState::NeedsAttention)) => state,
+            Some(ProfileState::Offline)
+                if (0..OFFLINE_SEED_MAX_AGE_MS)
+                    .contains(&now_ms.saturating_sub(runtime.updated_ms)) =>
+            {
+                ProfileState::Offline
+            }
+            _ => ProfileState::Idle,
+        }
     }
 
     fn pending_for(&self, profile_id: &str) -> Result<u32> {
@@ -2347,6 +2649,8 @@ impl Engine {
         Self::lock(&self.gates).remove(id);
         Self::lock(&self.next_scan_ms).remove(id);
         Self::lock(&self.next_sweep_ms).remove(id);
+        Self::lock(&self.next_helper_look_ms).remove(id);
+        Self::lock(&self.helper_warned).remove(id);
         Self::lock(&self.next_prune_ms).remove(id);
         Self::lock(&self.lfs_moved).remove(id);
         Self::lock(&self.next_release_ms).remove(id);
@@ -2389,6 +2693,7 @@ impl Engine {
             // a request to look now.
             Self::lock(&self.next_scan_ms).remove(id);
             Self::lock(&self.next_sweep_ms).remove(id);
+            Self::lock(&self.next_helper_look_ms).remove(id);
             Self::lock(&self.next_prune_ms).remove(id);
             Self::lock(&self.next_release_ms).remove(id);
             Self::lock(&self.release_cursor).remove(id);
@@ -2527,18 +2832,125 @@ impl Engine {
         if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
             snapshot.state = state;
         }
-        // Persist so a separate `keeper-syncd status` invocation reports the
-        // truth rather than a fresh "idle". Best-effort: failing to record a
-        // status must never fail the sync that produced it.
-        if let Err(err) = self.with_db(|conn| db::set_profile_state(conn, profile_id, state)) {
+        self.persist_state(profile_id, state);
+    }
+
+    /// The durable half of [`Self::set_state`], for a caller that has already
+    /// moved the snapshot under its own lock and must not take it twice.
+    ///
+    /// Persist so a separate `keeper-syncd status` invocation reports the
+    /// truth rather than a fresh "idle". Best-effort: failing to record a
+    /// status must never fail the sync that produced it. Stamped with the
+    /// engine's clock, so the row can say when it was last true.
+    fn persist_state(&self, profile_id: &str, state: ProfileState) {
+        let now = self.platform.now_ms();
+        if let Err(err) = self.with_db(|conn| db::set_profile_state(conn, profile_id, state, now)) {
             tracing::debug!(error = %err, "could not persist sync profile state");
         }
     }
 
-    /// The state word this profile is currently wearing, if the engine holds a
-    /// snapshot for it at all.
-    fn state_of(&self, profile_id: &str) -> Option<ProfileState> {
-        Self::lock(&self.status).get(profile_id).map(|s| s.state)
+    /// Move this profile to the state word that is still true of it once a
+    /// pass has nothing more to say — what "I am done" is allowed to write —
+    /// and write the row only if the word moved.
+    ///
+    /// Both places that used to write `Watching` unconditionally wrote over a
+    /// failure that was still standing. `sync_once` ends every pass with the
+    /// word, and [`Self::refresh_pending`] flips `Syncing` to it whenever the
+    /// queue is empty; neither asked whether the profile was still in
+    /// [`Self::offline`] or still carried an error, so on hesperia a folder
+    /// whose push had failed 1 044 times in a row read `watching` in the row
+    /// and in `keeper-syncd status`. The truth was in this process the whole
+    /// time — the sticky set and the snapshot's error — and this is where it
+    /// outranks the pass. See [`Self::settle`] for the precedence.
+    ///
+    /// Decided and assigned under **one** hold of the status lock, through
+    /// [`Self::settle_in`]. An earlier shape computed the word in one hold and
+    /// handed it to [`Self::set_state`], which took the lock again to write
+    /// it — and a [`Self::record_failure`] from another unit's thread in
+    /// between had its `Offline` or `NeedsAttention` overwritten by a word
+    /// decided before it happened. The row is written only when the word
+    /// moved: a successful pass has already had its word written by
+    /// [`Self::note_unit_succeeded`], and a second `UPDATE` saying the same
+    /// thing is a write on the pass's hot path for nothing.
+    fn settle_and_persist(&self, profile_id: &str) {
+        // Read before the status lock, never under it: the two are separate
+        // mutexes and this keeps them from ever nesting.
+        let offline = Self::lock(&self.offline).contains(profile_id);
+        let moved = Self::lock(&self.status)
+            .get_mut(profile_id)
+            .and_then(|snapshot| Self::settle_in(offline, snapshot));
+        if let Some(state) = moved {
+            self.persist_state(profile_id, state);
+        }
+    }
+
+    /// [`Self::settle`] applied to a snapshot the caller holds the lock on:
+    /// assigns the settled word and returns it if it differs from the one the
+    /// snapshot wore, `None` if nothing moved. `offline` is the sticky set's
+    /// answer, read before the lock was taken.
+    fn settle_in(offline: bool, snapshot: &mut SyncStatus) -> Option<ProfileState> {
+        let settled = Self::settle(offline, Some((snapshot.state, Self::has_problem(snapshot))));
+        (settled != snapshot.state).then(|| {
+            snapshot.state = settled;
+            settled
+        })
+    }
+
+    /// Whether a snapshot carries the sentence that stops a folder — the
+    /// `error`, and only that.
+    ///
+    /// Not the `warning`. `warn` is also how the engine says something
+    /// informational — a branch pushed and waiting for review, conflict
+    /// copies kept beside a merge, a watcher that fell back to polling, a
+    /// cloud placeholder it skipped — and none of those is a folder that has
+    /// stopped; promoting them to `NeedsAttention` here would make
+    /// `keeper-syncd doctor` report a healthy folder as one. The two writers
+    /// that raise `NeedsAttention` *without* an error are covered by the word
+    /// itself, which [`Self::settle`] keeps on its own: the foreign-volume arm
+    /// of [`Self::volume_ready`] sets the word beside its `warn`, and the
+    /// parked-upload arm of [`Self::record_failure`] sets the word with
+    /// neither a warning nor an error.
+    fn has_problem(snapshot: &SyncStatus) -> bool {
+        snapshot.error.is_some()
+    }
+
+    /// The word that is still true of a profile, over facts already read.
+    /// `standing` is the snapshot's `(state, has_problem)` — see
+    /// [`Self::has_problem`] — or `None` for a profile the engine holds no
+    /// snapshot for.
+    ///
+    /// The precedence is by what each word is evidence *of*, most durable
+    /// first:
+    ///
+    /// * `Paused` is never overwritten: it is a setting, not an observation,
+    ///   and only enabling the profile takes it back.
+    /// * `Offline` while the profile is in the sticky set, because the only
+    ///   things that end that set are a unit that reached the remote
+    ///   ([`Self::note_unit_succeeded`]) and a failure the remote answered
+    ///   with ([`Self::record_failure`]), and a pass that reached here with
+    ///   neither has not proved the remote reachable.
+    /// * `NeedsAttention` while the snapshot wears the word **or** carries an
+    ///   error. The word on its own counts because two writers set it without
+    ///   an error, and a pass that touched no remote has done nothing to
+    ///   retire it; the sentence on its own counts because it is what the
+    ///   person reads, and the same success that retires it
+    ///   ([`Self::clear_warning`]) is what may retire the word. A warning
+    ///   alone does not count — see [`Self::has_problem`].
+    /// * `MediaAbsent` while the snapshot says so: the volume gate owns that
+    ///   word, and only a re-attach ([`Self::volume_ready`]) takes it back.
+    /// * `Watching` otherwise — nothing standing means up to date.
+    fn settle(offline: bool, standing: Option<(ProfileState, bool)>) -> ProfileState {
+        if let Some((ProfileState::Paused, _)) = standing {
+            return ProfileState::Paused;
+        }
+        if offline {
+            return ProfileState::Offline;
+        }
+        match standing {
+            Some((ProfileState::NeedsAttention, _) | (_, true)) => ProfileState::NeedsAttention,
+            Some((ProfileState::MediaAbsent, false)) => ProfileState::MediaAbsent,
+            _ => ProfileState::Watching,
+        }
     }
 
     /// Record — or retire — the sentence a person reads beside this folder,
@@ -2558,7 +2970,8 @@ impl Engine {
         if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
             snapshot.error = error.map(str::to_owned);
         }
-        if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, error)) {
+        let now = self.platform.now_ms();
+        if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, error, now)) {
             tracing::debug!(error = %err, "could not persist the sync profile's error");
         }
     }
@@ -2647,7 +3060,11 @@ impl Engine {
     /// The durable half of the error goes with it, and **only when there was
     /// one**: this runs after every successful unit, so an unconditional
     /// `UPDATE` would put a write on the journal's hot path to clear a column
-    /// that is already `NULL` on every healthy folder.
+    /// that is already `NULL` on every healthy folder. That gate is why
+    /// [`Self::seed_status`] seeds the snapshot's error from the row: an error
+    /// a previous run persisted has to be *in* the snapshot for this to ever
+    /// reach it, and until it was, tgdrive-light carried "this folder's first
+    /// copy never finished" for nine days after the copy finished.
     fn clear_warning(&self, profile_id: &str) {
         let had_error = match Self::lock(&self.status).get_mut(profile_id) {
             Some(snapshot) => {
@@ -2657,7 +3074,10 @@ impl Engine {
             None => false,
         };
         if had_error {
-            if let Err(err) = self.with_db(|conn| db::set_profile_error(conn, profile_id, None)) {
+            let now = self.platform.now_ms();
+            if let Err(err) =
+                self.with_db(|conn| db::set_profile_error(conn, profile_id, None, now))
+            {
                 tracing::debug!(error = %err, "could not retire the sync profile's error");
             }
         }
@@ -2913,9 +3333,10 @@ impl Engine {
         Ok(())
     }
 
-    /// One profile's share of a tick: the hourly sweep, then the pass.
+    /// One profile's share of a tick: the housekeeping looks, then the pass.
     async fn tick_one(&self, profile: &SyncProfile) {
         self.sweep_scratch_if_due(profile).await;
+        self.look_at_helpers_if_due(profile).await;
         // `Ok` here is not success. `tick_profile` returns `Ok` after a
         // drain that rescheduled a failed unit, after a volume gate that
         // skipped the profile, after a reservation it could not take — so
@@ -4296,7 +4717,8 @@ impl Engine {
             self.enqueue_first_checkout(profile)?;
             return self
                 .drain_kind(profile, WorkKind::CHECKOUT, SyncSource::Watch)
-                .await;
+                .await
+                .map(drop);
         }
 
         // The volume gate's other half, and the same sentence for the same
@@ -4308,7 +4730,9 @@ impl Engine {
         let scan = self.scan_due(profile);
         // The supervisor's own pass. Nobody asked for this one — the clock
         // did — so it is the only genuinely `Watch` caller (AD-34-12).
-        self.drain_journal(profile, scan, SyncSource::Watch).await
+        self.drain_journal(profile, scan, SyncSource::Watch)
+            .await
+            .map(drop)
     }
 
     /// Whether this profile's first working copy has still not been made
@@ -4398,8 +4822,17 @@ impl Engine {
     /// died on the network is the one case where no such row would exist, and
     /// [`Self::enqueue_first_checkout`] writes one *above this gate* precisely
     /// so that it does.
+    ///
+    /// Keyed on the sticky set, not on the word. Since the seed rule believes
+    /// a fresh `offline` row, a process can start wearing the word without
+    /// ever having observed the failure — and such a run has no journal row of
+    /// its own to wait for, so a gate on the word would hold the folder off
+    /// until the row went stale, or forever if nothing re-stamped it. The set
+    /// belongs to the run that saw the failure: absent, the word is a label
+    /// for readers and the first tick re-probes exactly as an `Idle` seed
+    /// would; present, the row that put it there is the row this waits for.
     fn remote_within_reach(&self, profile: &SyncProfile) -> Result<bool> {
-        if self.state_of(&profile.id) != Some(ProfileState::Offline) {
+        if !Self::lock(&self.offline).contains(&profile.id) {
             return Ok(true);
         }
         let now = self.platform.now_ms();
@@ -4616,6 +5049,170 @@ impl Engine {
         }
         due.insert(profile.id.clone(), now.saturating_add(SWEEP_EVERY_MS));
         true
+    }
+
+    /// [`Self::sweep_is_due`]'s shape on [`HELPER_LOOK_EVERY_MS`]: first sight
+    /// looks, then hourly.
+    fn helper_look_is_due(&self, profile: &SyncProfile) -> bool {
+        let now = self.platform.now_ms();
+        let mut due = Self::lock(&self.next_helper_look_ms);
+        match due.get(&profile.id) {
+            None => {}
+            Some(at) if now >= *at => {}
+            Some(_) => return false,
+        }
+        due.insert(profile.id.clone(), now.saturating_add(HELPER_LOOK_EVERY_MS));
+        true
+    }
+
+    /// Look, once an hour, at the `filter.lfs.process` helpers alive in this
+    /// folder, and name the ones nobody is talking to.
+    ///
+    /// # Why keeper has to look at processes it did not start
+    ///
+    /// Keeper registers itself as the folder's LFS filter, so a `git` that
+    /// cleans or smudges a tracked path there starts a `keeper lfs
+    /// filter-process` helper — and until this look, keeper had no view of
+    /// those helpers at all. On hesperia (2026-09-09) eighteen `git status`
+    /// processes from an external caller each held one, idle for 3 h 22 min
+    /// on `/Volumes/merope/neuradrive`; keeper's own walks on that volume went
+    /// from seconds to 200–240 s and one never finished, and nothing in the
+    /// log said why. The helper's own watchdog covers a request that never
+    /// ends, not the wait between requests — that wait is by design — and
+    /// `GIT_DEADLINE` covers only the git children keeper spawned.
+    ///
+    /// # What it does, and what it never does
+    ///
+    /// [`lfs::store::LfsStore::look_at_helpers`]: a marker whose lock can be
+    /// taken is a dead helper's leftover and is removed; a locked marker idle
+    /// longer than [`lfs::store::LfsStore::STUCK_HELPER_IDLE`] is a stuck
+    /// helper. A marker the lock could not be tried on — a mount that refuses
+    /// `flock` — is placed by asking the pid table instead, so the look cannot
+    /// read as healthy on a filesystem that hides every helper. Keeper counts
+    /// them, names the oldest's idle time, its git and the process that ran
+    /// that git ([`helper_parent_command`], at look time, only for stuck
+    /// ones), writes one INFO line per look, raises one sticky warning per
+    /// onset — kept in [`Self::helper_warned`], because a stuck helper does
+    /// not stop units succeeding and every success wipes the snapshot's text —
+    /// and retires it, by its own words, see [`Self::clear_helper_warning`],
+    /// when none remain. It never kills, signals or closes a helper or its
+    /// parent: they belong to a git keeper did not start, and that git holds
+    /// state an ended filter would not release cleanly. The warning tells the
+    /// person which process to quit instead.
+    ///
+    /// Never fails the tick, for [`Self::sweep_scratch_if_due`]'s reason.
+    async fn look_at_helpers_if_due(&self, profile: &SyncProfile) {
+        if !self.helper_look_is_due(profile) {
+            return;
+        }
+        let store = lfs::store::LfsStore::in_git_dir(profile.local_path.join(".git"));
+        let helpers_dir = store.helpers_dir();
+        let looked = tokio::task::spawn_blocking(move || {
+            let idle = lfs::store::LfsStore::STUCK_HELPER_IDLE;
+            let mut look = store.look_at_helpers(std::time::SystemTime::now(), idle);
+            // The lock could not be tried on these, so the pid table answers
+            // the question the lock normally does. `ps` per marker, and only
+            // here: on a filesystem that locks, this loop is empty.
+            for (pid, idle_for) in &look.skipped {
+                if pid_is_alive(*pid) {
+                    look.alive += 1;
+                    if *idle_for >= idle {
+                        look.stuck.push((*pid, *idle_for));
+                    }
+                }
+            }
+            look
+        })
+        .await;
+        let look = match looked {
+            Ok(look) => look,
+            Err(err) => {
+                tracing::warn!(
+                    profile = profile.name,
+                    error = %err,
+                    "the helper look did not finish"
+                );
+                return;
+            }
+        };
+        tracing::info!(
+            profile = profile.name,
+            alive = look.alive,
+            stuck = look.stuck.len(),
+            removed = look.removed,
+            skipped = look.skipped.len(),
+            "helper look"
+        );
+        if !look.skipped.is_empty() {
+            crate::anomaly::Anomaly {
+                what: "LFS helper markers whose lock could not be tried",
+                measured: format!(
+                    "skipped={} dir={}",
+                    look.skipped.len(),
+                    helpers_dir.display()
+                ),
+                expected: "zero; a marker is a locked file, and the lock is what tells a live \
+                           helper from a dead one's leftover",
+                consequence: "those helpers were placed by pid instead, which says alive or gone \
+                              but never removes a leftover; a mount that refuses file locks is \
+                              the usual cause, and the folder's LFS store is on one",
+            }
+            .report(&profile.name);
+        }
+        let Some((pid, idle)) = look.oldest_stuck() else {
+            self.clear_helper_warning(&profile.id);
+            return;
+        };
+        // `ps` only now, and only for the stuck one worth naming: the look
+        // itself must stay one `read_dir` and one `try_lock` per marker.
+        let parent = helper_parent_command(pid).await;
+        let idle_min = idle.as_secs() / 60;
+        crate::anomaly::Anomaly {
+            what: "an LFS filter helper has had no request for longer than any walk takes",
+            measured: format!(
+                "stuck={} alive={} oldest_pid={pid} oldest_idle_min={idle_min} parent={parent}",
+                look.stuck.len(),
+                look.alive
+            ),
+            expected: "zero; a helper waits only between the requests of a git that is still \
+                       walking, and a walk is seconds",
+            consequence: "the git that started it is standing on this folder, and keeper's own \
+                          walks here slow from seconds to minutes while it does; keeper never \
+                          kills a helper — quit the process that ran that git",
+        }
+        .report(&profile.name);
+        let message = format!(
+            "{HELPER_STUCK_PREFIX}: {} LFS filter helper(s) idle, the oldest for {idle_min} min, \
+             waiting on {parent}. Every sync walk here is slower while it stands. keeper never \
+             ends another program's git — quit the process that ran it and the warning clears \
+             on the next look",
+            look.stuck.len()
+        );
+        // The onset is this set's, not the snapshot's: `warn` would read a
+        // fresh onset off every field a successful unit had wiped since the
+        // last look, and post the same toast once an hour.
+        let onset = Self::lock(&self.helper_warned).insert(profile.id.clone());
+        if onset {
+            self.warn(&profile.id, &profile.name, message);
+        } else if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
+            snapshot.warning = Some(message);
+        }
+    }
+
+    /// Retire the stuck-helper warning, and only that one — the
+    /// [`Self::clear_watch_warning`] idiom, keyed on [`HELPER_STUCK_PREFIX`] —
+    /// and re-arm its onset, so a helper that gets stuck again is a new toast.
+    fn clear_helper_warning(&self, profile_id: &str) {
+        Self::lock(&self.helper_warned).remove(profile_id);
+        if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
+            if snapshot
+                .warning
+                .as_deref()
+                .is_some_and(|shown| shown.starts_with(HELPER_STUCK_PREFIX))
+            {
+                snapshot.warning = None;
+            }
+        }
     }
 
     /// Whether this profile's LFS store may be pruned on this success edge
@@ -5963,7 +6560,7 @@ impl Engine {
             .do_push(&profile, SyncSource::Watch, None, TreeState::Unknown)
             .await
         {
-            Ok(()) => {
+            Ok(_) => {
                 tracing::info!(
                     profile = profile.name,
                     trigger = ?trigger,
@@ -6365,12 +6962,16 @@ impl Engine {
     /// rather than claiming the watcher did (AD-34-12).
     ///
     /// The caller owns the profile reservation.
+    ///
+    /// `Ok` carries what the drained units proved about the remote
+    /// ([`RemoteContact`]), folded: a pass that ends in [`Self::mark_synced`]
+    /// has to know whether a unit it drained failed on the way there.
     async fn drain_journal(
         &self,
         profile: &SyncProfile,
         scan_when_idle: bool,
         source: SyncSource,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         self.drain(profile, None, scan_when_idle, source).await
     }
 
@@ -6392,7 +6993,7 @@ impl Engine {
         profile: &SyncProfile,
         kind: &str,
         source: SyncSource,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         self.drain(profile, Some(kind), false, source).await
     }
 
@@ -6403,7 +7004,7 @@ impl Engine {
         only: Option<&str>,
         scan_when_idle: bool,
         source: SyncSource,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         let now = self.platform.now_ms();
         // Before a single unit is claimed, and on every drain: deferred work
         // waits on a condition rather than a clock, so the condition has to be
@@ -6424,9 +7025,10 @@ impl Engine {
                 // on the async worker while every other folder waited.
                 Self::blocking(|| self.scan_and_enqueue(profile, source))?;
             }
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
 
+        let mut contact = RemoteContact::Skipped;
         for item in claimed {
             // Between units, never inside one (Story 70.6, F-engine-11): a quit
             // that has set the flag is answered after the running unit ends,
@@ -6445,17 +7047,26 @@ impl Engine {
                 .execute(profile, &item.kind, item.id, item.label.as_deref(), source)
                 .await
             {
-                Ok(()) => {
+                Ok(reached) => {
+                    contact = contact.join(reached);
                     self.with_db(|conn| db::complete(conn, item.id))?;
-                    self.note_unit_succeeded(profile);
+                    // With what the unit proved: a `Push` that found nothing
+                    // to send, a `Checkout` that adopted in place, a transfer
+                    // whose object was already in the store each completes
+                    // without asking the remote a thing, and each used to
+                    // empty the sticky set and log `sync reachable again` —
+                    // the pass-end defect, one level down. The unit's own
+                    // sentence is still retired: the work it names is done.
+                    self.note_unit_succeeded(profile, reached);
                 }
                 Err(err) => {
+                    contact = contact.join(RemoteContact::Failed);
                     self.reschedule_after(profile, item.id, item.attempts, &err)?;
                 }
             }
         }
         self.refresh_pending(&profile.id);
-        Ok(())
+        Ok(contact)
     }
 
     /// Re-read every condition a deferred unit is waiting on, and release the
@@ -6567,6 +7178,16 @@ impl Engine {
     /// have repeated it, because remembering was the whole contract.
     fn record_failure(&self, profile: &SyncProfile, err: &SyncError) {
         self.clear_phase(&profile.id);
+        // A failure the remote *answered with* is a round trip that came back.
+        // The sticky set says "the remote cannot be reached", and a 403, a
+        // refused credential or a rejected push says the opposite — so the
+        // set is left here, and the word the arms below choose is the one
+        // `settle` shows, rather than the `offline` it would otherwise keep
+        // outranking a `NeedsAttention` the folder has just earned. The exit
+        // line is the same one a success logs, because it is the same edge.
+        if Self::remote_answered(err) && Self::lock(&self.offline).remove(&profile.id) {
+            tracing::info!(profile = profile.name, error = %err, "sync reachable again");
+        }
         match err.retriability() {
             // Both deferred conditions wait on a condition rather than a clock,
             // but they are waiting on utterly different things and a user reads
@@ -6665,26 +7286,105 @@ impl Engine {
         }
     }
 
+    /// Whether a failure is one the remote answered with — proof of a round
+    /// trip, whatever else it proves.
+    ///
+    /// Deliberately narrower than "not a network error". An `Io` on a local
+    /// file, a `Git` error opening the repository, a push held because its
+    /// large files have not landed ([`SyncError::LfsUploadPending`]) — none
+    /// of those touched the remote, and the last is raised on every pass of
+    /// exactly the folder whose uploads are failing on the network: reading
+    /// it as "reachable" would take that folder out of `offline` on each pass
+    /// and put it back on the next upload, flapping the word and the log. The
+    /// variants here are the ones a server produces: it refused, it rejected,
+    /// it ran out of room, it holds history this copy does not, or it sent
+    /// bytes that did not verify.
+    fn remote_answered(err: &SyncError) -> bool {
+        matches!(
+            err,
+            SyncError::Auth { .. }
+                | SyncError::Forbidden { .. }
+                | SyncError::Quota { .. }
+                | SyncError::Diverged { .. }
+                | SyncError::RemoteMoved { .. }
+                | SyncError::Integrity { .. }
+        )
+    }
+
     /// Record that a unit — or a whole pass — genuinely succeeded: retire the
-    /// warning, the failure count and the offline edge, and say so once.
+    /// warning, and — for a unit that reached the remote — the failure count
+    /// and the offline edge, saying so once.
     ///
     /// [`Self::record_failure`]'s opposite, and the **only** reset for
-    /// [`Self::transient_failures`] and [`Self::offline`]. It is called from
-    /// exactly two places: `drain`'s `complete` site, after `execute`
-    /// returned `Ok` for one journal row, and [`Self::mark_synced`], which
-    /// every leg of a successful pass ends in. Neither is reachable by a tick
-    /// that merely ran — the failure counter used to be reset by one, and that
-    /// is how a profile failing every attempt for a week never reached
+    /// [`Self::transient_failures`]. It is called from exactly two places:
+    /// `drain`'s `complete` site, after `execute` returned `Ok` for one
+    /// journal row, and [`Self::mark_synced`], for a pass whose legs reached
+    /// the remote and none failed. Neither is reachable by a tick that merely
+    /// ran — the failure counter used to be reset by one, and that is how a
+    /// profile failing every attempt for a week never reached
     /// `NeedsAttention` (F-engine-2).
+    ///
+    /// `contact` is what the unit proved about the remote, and it splits
+    /// this in two. The sentence beside the folder is about *this folder's
+    /// work*, and a unit that completed has done it: a checkout that finished
+    /// the copy an earlier run left half-made retires "this folder's first
+    /// copy never finished" whether it cloned or restored from the commits
+    /// already here — the restore is local, and the owner's tgdrive-light
+    /// carried that sentence for nine days after one. The failure count and
+    /// the sticky [`Self::offline`] set are about *the remote*, and only a
+    /// unit that [`RemoteContact::Reached`] it has proved anything there: a
+    /// push with nothing to send, a checkout adopted in place, a transfer
+    /// whose object was already in the store each complete without a round
+    /// trip, and each used to empty the set for a folder whose actual push
+    /// was still failing.
+    ///
+    /// The sticky set has one other exit, in [`Self::record_failure`]: a
+    /// failure the remote answered with.
     ///
     /// `sync reachable again` is the other half of `sync offline`, once per
     /// recovery: the same sticky set decides, so a profile that was never
     /// offline says nothing here.
-    fn note_unit_succeeded(&self, profile: &SyncProfile) {
+    ///
+    /// The word moves with the reasons. A snapshot wearing `Offline` or
+    /// `NeedsAttention` is wearing a word this success has just taken the
+    /// reasons from — the sentence is retired above, and the word on its own
+    /// is not evidence here the way it is for [`Self::settle`] at a quiet
+    /// pass end — so it is re-settled against the one thing that may still
+    /// stand, the sticky set: `Watching` once the set is left, `Offline`
+    /// while a unit that made no round trip leaves it standing. Nothing else
+    /// would take the word off: a push with nothing to send publishes no
+    /// phase, so the snapshot never reads `Syncing` and
+    /// [`Self::refresh_pending`] never sees the edge it flips on. The row
+    /// goes with it, because `keeper-syncd status` reads the row. A snapshot
+    /// mid-phase (`Syncing`) is left to that refresh, and every other word is
+    /// not this function's to change.
+    fn note_unit_succeeded(&self, profile: &SyncProfile, contact: RemoteContact) {
         self.clear_warning(&profile.id);
-        Self::lock(&self.transient_failures).remove(&profile.id);
-        if Self::lock(&self.offline).remove(&profile.id) {
-            tracing::info!(profile = profile.name, "sync reachable again");
+        if contact == RemoteContact::Reached {
+            Self::lock(&self.transient_failures).remove(&profile.id);
+            if Self::lock(&self.offline).remove(&profile.id) {
+                tracing::info!(profile = profile.name, "sync reachable again");
+            }
+        }
+        // Read before the status lock, never under it.
+        let offline = Self::lock(&self.offline).contains(&profile.id);
+        let moved = match Self::lock(&self.status).get_mut(&profile.id) {
+            Some(snapshot)
+                if matches!(
+                    snapshot.state,
+                    ProfileState::Offline | ProfileState::NeedsAttention
+                ) =>
+            {
+                let settled = Self::settle(offline, None);
+                (settled != snapshot.state).then(|| {
+                    snapshot.state = settled;
+                    settled
+                })
+            }
+            _ => None,
+        };
+        if let Some(state) = moved {
+            self.persist_state(&profile.id, state);
         }
     }
 
@@ -6713,22 +7413,53 @@ impl Engine {
     /// The gate is read, never recounted. An absent gate means nothing has been
     /// walked yet in this process, and the count seeded at open stands until the
     /// first walk measures a real one.
+    ///
+    /// An empty queue ends `Syncing`, but what it ends in is not always
+    /// `Watching`: a profile still in the sticky offline set, or still carrying
+    /// an error, settles into the word that is still true of it
+    /// ([`Self::settle`]). The flip used to be in-memory only, which left the
+    /// row saying whatever the last failure wrote; the row is written now, so
+    /// a unit that succeeds on the supervisor's tick — the path with no other
+    /// pass end — reaches `keeper-syncd status` too. One write per
+    /// `Syncing → settled` edge, never per unit, and only when the word
+    /// actually moved.
+    ///
+    /// The state and the phase move under **one** hold of the status lock.
+    /// An earlier shape computed the word under the lock and then handed it
+    /// to [`Self::set_state`], which took the lock again to write it — and a
+    /// [`Self::record_failure`] from another unit's thread in between had its
+    /// `Offline` or `NeedsAttention` overwritten by a word decided before it
+    /// happened. The row write stays outside the lock, as every database
+    /// call here does; it carries the word the snapshot already wears.
     fn refresh_pending(&self, profile_id: &str) {
         let now = self.platform.now_ms();
         let settling = self
             .existing_gate(profile_id)
             .map(|gate| GateGuard::take(&gate).tracked(now) as u32);
-        if let Ok(pending) = self.pending_for(profile_id) {
-            if let Some(snapshot) = Self::lock(&self.status).get_mut(profile_id) {
-                snapshot.pending = pending;
-                if let Some(settling) = settling {
-                    snapshot.settling = settling;
-                }
-                if pending == 0 && snapshot.state == ProfileState::Syncing {
-                    snapshot.state = ProfileState::Watching;
-                    snapshot.phase = SyncPhase::Idle;
-                }
+        let Ok(pending) = self.pending_for(profile_id) else {
+            return;
+        };
+        // Read before the status lock, never under it: the two are separate
+        // mutexes and this keeps them from ever nesting.
+        let offline = Self::lock(&self.offline).contains(profile_id);
+        let moved = {
+            let mut status = Self::lock(&self.status);
+            let Some(snapshot) = status.get_mut(profile_id) else {
+                return;
+            };
+            snapshot.pending = pending;
+            if let Some(settling) = settling {
+                snapshot.settling = settling;
             }
+            if pending == 0 && snapshot.state == ProfileState::Syncing {
+                snapshot.phase = SyncPhase::Idle;
+                Self::settle_in(offline, snapshot)
+            } else {
+                None
+            }
+        };
+        if let Some(state) = moved {
+            self.persist_state(profile_id, state);
         }
     }
 
@@ -6897,6 +7628,15 @@ impl Engine {
     /// cover — raises the urgency of a row this loop read before the person
     /// asked, so a `bool` copied out at claim time would drop that request
     /// silently. See [`db::unit_urgency`].
+    ///
+    /// `Ok` carries what the unit proved about the remote ([`RemoteContact`]),
+    /// and every leg answers for itself: a checkout is `Reached` only when it
+    /// cloned, a transfer only when bytes moved, a pull only when it fetched,
+    /// a push only when it pushed, a pull request only when the forge was
+    /// called. `Verify` is `Skipped` outright — it reads the worktree and the
+    /// store and asks the server nothing, and its journal kind is never
+    /// enqueued. An earlier shape mapped every kind but the two legs to
+    /// `Reached` on the claim that they always round-trip; none of them do.
     async fn execute(
         &self,
         profile: &SyncProfile,
@@ -6904,21 +7644,23 @@ impl Engine {
         unit_id: i64,
         label: Option<&str>,
         source: SyncSource,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         match kind {
             WorkKind::Checkout => self.do_checkout(profile).await,
             // The conflict copies are already recorded and warned about;
             // a journaled pull has no caller to hand them back to.
             WorkKind::Pull => {
                 self.do_pull(profile, source, TreeState::Unknown).await?;
-                self.mark_synced(profile).await;
-                Ok(())
+                let contact = Self::pull_contact(profile);
+                self.mark_synced(profile, contact).await;
+                Ok(contact)
             }
             WorkKind::Push => {
-                self.do_push(profile, source, Some(unit_id), TreeState::Unknown)
+                let contact = self
+                    .do_push(profile, source, Some(unit_id), TreeState::Unknown)
                     .await?;
-                self.mark_synced(profile).await;
-                Ok(())
+                self.mark_synced(profile, contact).await;
+                Ok(contact)
             }
             WorkKind::LfsDownload { oid, size } => {
                 self.do_lfs(profile, oid, *size, label, false, Some(unit_id))
@@ -6929,7 +7671,25 @@ impl Engine {
                     .await
             }
             WorkKind::OpenPullRequest { branch } => self.do_open_pr(profile, branch).await,
-            WorkKind::Verify => self.verify(&profile.id).await.map(drop),
+            WorkKind::Verify => self
+                .verify(&profile.id)
+                .await
+                .map(|_| RemoteContact::Skipped),
+        }
+    }
+
+    /// What a [`Self::do_pull`] that returned `Ok` proved about the remote.
+    ///
+    /// The leg has exactly one return that made no round trip — the direction
+    /// that never pulls, answered before anything is opened — and every other
+    /// `Ok` came back from a fetch the remote answered. Derived from the
+    /// direction rather than threaded through [`Converged`], whose many
+    /// returns all sit past the fetch.
+    fn pull_contact(profile: &SyncProfile) -> RemoteContact {
+        if profile.direction.pulls() {
+            RemoteContact::Reached
+        } else {
+            RemoteContact::Skipped
         }
     }
 
@@ -6962,14 +7722,22 @@ impl Engine {
     /// NOT raised here: a blip during a first clone is ordinary, and
     /// `record_failure`'s existing run-of-failures threshold is what decides a
     /// folder has stopped rather than stumbled.
-    async fn do_checkout(&self, profile: &SyncProfile) -> Result<()> {
+    ///
+    /// `Ok` says whether the remote was reached ([`RemoteContact`]): only a
+    /// clone asks it anything. A folder adopted in place, a `.git` that was
+    /// already there, and the restore of an unfinished checkout — which
+    /// rebuilds the index from the commits already on disk — all complete
+    /// without a round trip, and a unit that completes that way has not
+    /// proved a remote that was `offline` reachable.
+    async fn do_checkout(&self, profile: &SyncProfile) -> Result<RemoteContact> {
         // The clone, or the restore of an unfinished checkout: minutes of
         // network and disk that used to hold the async worker (Story 70.6).
         match Self::blocking(|| self.finish_first_checkout(profile)) {
-            Ok(()) => {
-                // `drain`'s success path calls `clear_warning`, which retires
-                // the sentence on both surfaces. Nothing to do but succeed.
-                Ok(())
+            Ok(contact) => {
+                // `drain`'s success path calls `clear_warning` for a unit that
+                // reached the remote, which retires the sentence on both
+                // surfaces. Nothing to do but succeed.
+                Ok(contact)
             }
             Err(cause) => {
                 let stated = match cause {
@@ -6992,11 +7760,14 @@ impl Engine {
     /// Split out so the error handling above reads as the one decision it is,
     /// and so both exits from the repair — "there was nothing to finish" and
     /// "it could not be finished" — are visible side by side.
-    fn finish_first_checkout(&self, profile: &SyncProfile) -> Result<()> {
-        let repo = self.open_repo(profile)?;
+    ///
+    /// `Ok` carries what [`Self::open_repo_with_contact`] proved: `Reached`
+    /// for a clone, `Skipped` for everything else. The repair below is local.
+    fn finish_first_checkout(&self, profile: &SyncProfile) -> Result<RemoteContact> {
+        let (repo, contact) = self.open_repo_with_contact(profile)?;
         if !git::repo::checkout_is_unfinished(&repo)? {
             // The clone or the adoption above was the whole job.
-            return Ok(());
+            return Ok(contact);
         }
         tracing::warn!(
             profile = profile.name,
@@ -7018,7 +7789,7 @@ impl Engine {
             kept = repair.kept,
             "finished the interrupted checkout"
         );
-        Ok(())
+        Ok(contact)
     }
 
     /// Record that a pass finished without error.
@@ -7065,17 +7836,27 @@ impl Engine {
     /// `async` since Story 56.5, because the sweep's per-object remote proof is
     /// a round trip. The `status` guard is scoped so no `MutexGuard` crosses
     /// the `.await`.
-    async fn mark_synced(&self, profile: &SyncProfile) {
+    ///
+    /// `contact` is what the pass's legs proved about the remote
+    /// ([`RemoteContact`]), and it gates the one thing here that is *about*
+    /// the remote: the reset of the failure count and the offline edge.
+    /// `sync_once` runs its legs inline with no journal row to complete, so
+    /// this is where a successful pass resets them — but only a pass that
+    /// [`RemoteContact::Reached`] the remote has proved it reachable. A pass
+    /// that touched no remote proves nothing, and a pass one of whose drained
+    /// units failed has proved the opposite; both used to reset the edge
+    /// anyway, which is what wrote `watching` over 1 044 failures on hesperia.
+    /// The timestamp, the prune and the sweep are about *this folder's* work
+    /// and stand on the pass alone.
+    async fn mark_synced(&self, profile: &SyncProfile, contact: RemoteContact) {
         {
             if let Some(snapshot) = Self::lock(&self.status).get_mut(&profile.id) {
                 snapshot.last_sync_ms = Some(self.platform.now_ms());
             }
         }
-        // A pass that reached here had every leg succeed, which is the other
-        // definition of "a unit succeeded" — `sync_once` runs its legs inline
-        // with no journal row to complete, so this is where its success resets
-        // the failure count and the offline edge.
-        self.note_unit_succeeded(profile);
+        if contact == RemoteContact::Reached {
+            self.note_unit_succeeded(profile, RemoteContact::Reached);
+        }
         if profile.lfs_prune_local
             && (self.take_lfs_moved(&profile.id) || self.prune_is_due(profile))
         {
@@ -7205,6 +7986,18 @@ impl Engine {
     ///
     /// Blocking; callers wrap it.
     fn open_repo(&self, profile: &SyncProfile) -> Result<gix::Repository> {
+        self.open_repo_with_contact(profile).map(|(repo, _)| repo)
+    }
+
+    /// [`Self::open_repo`], also saying whether the remote was asked anything
+    /// ([`RemoteContact`]): `Reached` when the folder was cloned — or when the
+    /// remote answered that it had nothing to clone, which is an answer —
+    /// and `Skipped` when the repository was already there or was adopted in
+    /// place, neither of which touches the network.
+    fn open_repo_with_contact(
+        &self,
+        profile: &SyncProfile,
+    ) -> Result<(gix::Repository, RemoteContact)> {
         // The rule [`GateGuard`] states, checked where it would be broken.
         #[cfg(test)]
         gate_depth::assert_none_held();
@@ -7221,7 +8014,7 @@ impl Engine {
                     // fall through to re-creating it, and a cone that could not
                     // be applied is not that. It must surface as itself.
                     self.reconcile_sparse_cone(profile, &repo)?;
-                    return Ok(repo);
+                    return Ok((repo, RemoteContact::Skipped));
                 }
                 Err(err) => {
                     // A kill inside `gix::init` — the first thing `adopt` does
@@ -7257,12 +8050,12 @@ impl Engine {
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(true);
 
-        let repo = if empty {
+        let (repo, contact) = if empty {
             tracing::info!(
                 profile = profile.name,
                 "cloning remote for a new sync profile"
             );
-            match git::repo::clone(
+            let repo = match git::repo::clone(
                 &profile.remote_url,
                 &profile.local_path,
                 &profile.branch,
@@ -7294,13 +8087,19 @@ impl Engine {
                     git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?
                 }
                 Err(err) => return Err(err),
-            }
+            };
+            // Either the clone came back or the remote said it was empty:
+            // both are the remote answering.
+            (repo, RemoteContact::Reached)
         } else {
             tracing::info!(
                 profile = profile.name,
                 "adopting an existing folder: initializing a repository in place"
             );
-            git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?
+            (
+                git::repo::adopt(&profile.local_path, &profile.remote_url, &profile.branch)?,
+                RemoteContact::Skipped,
+            )
         };
         git::repo::enforce_local_config_with_filter(
             &repo,
@@ -7308,7 +8107,7 @@ impl Engine {
             self.filter_serves_process,
         )?;
         self.reconcile_sparse_cone(profile, &repo)?;
-        Ok(repo)
+        Ok((repo, contact))
     }
 
     /// Make the working tree match the profile's `subpaths[]` (Story 27.2,
@@ -8594,15 +9393,21 @@ impl Engine {
 
     /// `tree` as on [`Self::do_pull`]: a pass that already walked hands its
     /// push `Committed`, and the leg publishes what that walk committed.
+    ///
+    /// `Ok` says whether a push was actually attempted ([`RemoteContact`]).
+    /// Three returns below make no round trip — the direction that never
+    /// pushes, a tree with nothing committed, a phone whose history the
+    /// remote already holds — and a pass that ends on one of them has not
+    /// proved the remote reachable, whatever the last failure said.
     async fn do_push(
         &self,
         profile: &SyncProfile,
         source: SyncSource,
         push_unit: Option<i64>,
         tree: TreeState,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         if !profile.direction.pushes() {
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
         let count = match tree {
             TreeState::Unknown => Self::blocking(|| self.commit_local(profile, source, push_unit))?,
@@ -8638,7 +9443,7 @@ impl Engine {
                 profile = profile.name,
                 "nothing committed yet, so there is nothing to push"
             );
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
         drop(repo);
         // A phone asks its own history first (AD-198): the desktop's `git
@@ -8650,7 +9455,7 @@ impl Engine {
                 profile = profile.name,
                 "the remote already holds every commit here, so the phone pushes nothing"
             );
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
 
         // A push with nothing freshly committed is republishing commits whose
@@ -8700,7 +9505,7 @@ impl Engine {
             };
             self.with_db(|conn| db::enqueue_unique(conn, &profile.id, &unit, now, now).map(drop))?;
         }
-        Ok(())
+        Ok(RemoteContact::Reached)
     }
 
     /// Pass untracked entries through, refusing anything that is not a file.
@@ -8935,20 +9740,56 @@ impl Engine {
         let (untracked, collapsed) =
             Self::expand_untracked(&profile.local_path, &status.untracked)?;
         self.report_collapsed(&profile.id, &collapsed);
-        // The third element says whether the group's paths are ones the
-        // index does not carry — the only group a walk without a directory
-        // scan cannot see, and so the only one whose held paths owe the next
-        // walk one.
-        let groups: [(&Vec<PathBuf>, bool, bool); 3] = [
-            (&status.added, true, false),
-            (&untracked, true, true),
-            (&status.modified, false, false),
-        ];
         // Everything the gate is legitimately allowed to remember this round.
         // Anything else it still holds is stale and must be pruned, or the
         // durable cache grows entries that can never resolve.
-        let mut observed: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::with_capacity(untracked.len() + status.modified.len());
+        let mut observed: std::collections::HashSet<PathBuf> = status
+            .added
+            .iter()
+            .chain(&untracked)
+            .chain(&status.modified)
+            .map(|rela| profile.local_path.join(rela))
+            .collect();
+        // The pass's own second look. A path the gate holds that the index
+        // does not carry is one only a walk that reads the directories could
+        // report, and the steady-state walk reads none: it is
+        // `tracked_only().including(held)`, and an include pathspec names an
+        // index entry, so an untracked path rides along and comes back
+        // unreported. Handing that to `retain` below is the file the sweep
+        // found and never committed (hesperia, 2026-09-09: `untracked=160`,
+        // then `untracked=0 included=159` eight seconds later, 62.8 GB never
+        // published). It used to buy a full walk on every pass until the path
+        // settled — 1.6–6.8 s of directory walk per settle window on the
+        // reference folder, against ~0.2 s for the narrowed one — for one
+        // `lstat` the pass can take itself. So it does: the gate's export is
+        // taken here (the lock is held for the one statement), the paths are
+        // sorted outside the gate lock (the index probe and git's excludes
+        // read files), and the ones to sample go below into the same loop as
+        // the walk's own, so the verdict, the exclusion, the dataless refusal
+        // and the sample tier 4 reads against are exactly a walk-reported
+        // addition's. The ones the pass could not judge stay held, counted
+        // and observed, so `retain` keeps them.
+        let held_now: Vec<PathBuf> = GateGuard::take(&gate)
+            .export()
+            .into_iter()
+            .map(|(absolute, _)| absolute)
+            .collect();
+        let look = self.paths_for_the_second_look(profile, &repo, &held_now, &observed);
+        self.report_collapsed(&profile.id, &look.collapsed);
+        observed.extend(
+            look.sample
+                .iter()
+                .chain(&look.held)
+                .map(|rela| profile.local_path.join(rela)),
+        );
+        held += u32::try_from(look.held.len()).unwrap_or(u32::MAX);
+        let resampled = look.sample;
+        let groups: [(&Vec<PathBuf>, bool); 4] = [
+            (&status.added, true),
+            (&untracked, true),
+            (&resampled, true),
+            (&status.modified, false),
+        ];
         // Under the guard, only the verdicts: one `lstat` per path and the
         // gate's own maps. What a `Stable` modification then costs — an LFS
         // pointer read for `truncated_media`, an attribute-stack build over
@@ -8958,21 +9799,16 @@ impl Engine {
         // other profile's settle check for the four stack builds.
         let mut stable_modified: Vec<PathBuf> = Vec::new();
         let mut dataless: Vec<PathBuf> = Vec::new();
-        let mut untracked_settling = false;
         let pending = {
             let mut gate = GateGuard::take(&gate);
-            for (paths, is_new, unindexed) in groups {
+            for (paths, is_new) in groups {
                 for rela in paths {
                     let absolute = profile.local_path.join(rela);
-                    observed.insert(absolute.clone());
                     match gate.is_stable(&absolute, now) {
                         StabilityVerdict::Stable if is_new => new_paths.push(rela.clone()),
                         StabilityVerdict::Stable => stable_modified.push(rela.clone()),
                         StabilityVerdict::Excluded | StabilityVerdict::Vanished => {}
-                        StabilityVerdict::Settling { .. } => {
-                            held += 1;
-                            untracked_settling |= unindexed;
-                        }
+                        StabilityVerdict::Settling { .. } => held += 1,
                         StabilityVerdict::Dataless => dataless.push(rela.clone()),
                     }
                 }
@@ -8985,20 +9821,6 @@ impl Engine {
             gate.export()
         };
         self.with_db(|conn| db::save_file_state(conn, &profile.id, &pending))?;
-        // A held path the index does not carry needs a second observation,
-        // and only a walk that reads the directories can take it. The
-        // steady-state walk while a watcher is live is `tracked_only()`, which
-        // cannot see an untracked path, after which `gate.retain` above prunes
-        // every entry the walk did not observe — the episode forgotten, the
-        // file never committed, and the next sweep (24 h) starting it over.
-        // The watcher's `Create` sets this flag for the files it announced;
-        // this sets it for the ones only the walk found — moved in by hand,
-        // created while keeper was down, or announced by an event the backend
-        // dropped — the same way `prime_moved_paths` does for a rename (Epic
-        // 70, F-GATE-7). Consumed by the walk that answers it, as ever.
-        if untracked_settling {
-            Self::lock(&self.untracked_appeared).insert(profile.id.clone());
-        }
         for rela in stable_modified {
             let absolute = profile.local_path.join(&rela);
             if let Some(bytes) = lfs::stage::truncated_media(&repo, &rela, &absolute) {
@@ -9651,6 +10473,11 @@ impl Engine {
     /// [`Self::materialize_landed`], which asks the journal whether anybody is
     /// waiting for it. `None` for a caller that is not draining a row. Ignored
     /// on the upload leg, which publishes nothing to the worktree.
+    ///
+    /// `Ok` says whether a transfer actually happened ([`RemoteContact`]).
+    /// Two returns below make none — large-file support is off, or the object
+    /// is already in this folder's store — and a unit that completes on one
+    /// of them has asked the remote nothing.
     async fn do_lfs(
         &self,
         profile: &SyncProfile,
@@ -9659,9 +10486,9 @@ impl Engine {
         label: Option<&str>,
         upload: bool,
         unit: Option<i64>,
-    ) -> Result<()> {
+    ) -> Result<RemoteContact> {
         if profile.lfs_mode == LfsMode::Disabled {
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         }
         // The object is already on this disk, so there is nothing to fetch and
         // the remaining job is the publish (Story 56.14).
@@ -9693,7 +10520,8 @@ impl Engine {
                     oid,
                     "the object is already in this folder's store; publishing without a transfer"
                 );
-                return self.materialize_landed(profile, &store, oid, label, unit);
+                self.materialize_landed(profile, &store, oid, label, unit)?;
+                return Ok(RemoteContact::Skipped);
             }
         }
         // The direction is in the phase because that is what the tray reads: an
@@ -9737,9 +10565,11 @@ impl Engine {
         // pendrive remote meant it.
         if lfsconfig.is_none() {
             if let Some(remote) = lfs::local::remote_store(&profile.remote_url) {
+                // A copy to a filesystem remote is the transfer, completed.
                 return self
                     .copy_lfs_object(profile, remote, oid, size, upload, label, unit)
-                    .await;
+                    .await
+                    .map(|()| RemoteContact::Reached);
             }
         }
         let operation = if upload {
@@ -9850,7 +10680,7 @@ impl Engine {
             // [`Self::materialize_landed`] for the 40 hours the sweep spent here.
             self.materialize_landed(profile, &store, oid, label, unit)?;
         }
-        Ok(())
+        Ok(RemoteContact::Reached)
     }
 
     /// Memo that the remote now holds the object one upload unit carried
@@ -10447,14 +11277,18 @@ impl Engine {
     /// missing token, an unreachable API or an already-open request all resolve
     /// to an actionable notice naming the branch — never a rollback, never a
     /// retry storm.
-    async fn do_open_pr(&self, profile: &SyncProfile, branch: &str) -> Result<()> {
+    ///
+    /// `Ok` says whether the forge was called ([`RemoteContact`]): a remote
+    /// with no API, or no credential to call it with, resolves to the notice
+    /// without a round trip.
+    async fn do_open_pr(&self, profile: &SyncProfile, branch: &str) -> Result<RemoteContact> {
         let Some(target) = forge_api_target(&profile.remote_url) else {
             self.warn(
                 &profile.id,
                 &profile.name,
                 format!("branch {branch} is pushed and waiting for review"),
             );
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         };
         let Some(token) = self.token(profile)? else {
             // Without a credential we cannot call the API, and prompting is not
@@ -10467,7 +11301,7 @@ impl Engine {
                     target.base
                 ),
             );
-            return Ok(());
+            return Ok(RemoteContact::Skipped);
         };
 
         let url = format!(
@@ -10522,7 +11356,7 @@ impl Engine {
                     None => format!("a pull request is open for {branch}"),
                 },
             );
-            return Ok(());
+            return Ok(RemoteContact::Reached);
         }
         // 409 is how Forgejo answers when a request for this head already
         // exists, which from the lane's point of view is success: a human
@@ -10533,14 +11367,14 @@ impl Engine {
                 branch,
                 "a pull request is already open"
             );
-            return Ok(());
+            return Ok(RemoteContact::Reached);
         }
         self.warn(
             &profile.id,
             &profile.name,
             format!("branch {branch} is pushed, but opening a pull request failed ({status})"),
         );
-        Ok(())
+        Ok(RemoteContact::Reached)
     }
 
     // -----------------------------------------------------------------------
@@ -10829,8 +11663,14 @@ impl Engine {
         // does not fire — a pass with a leg that raised is not a successful
         // pass, and the release sweep must not ride an edge that did not happen.
         let mut arrival_fault: Option<SyncError> = None;
+        // What this pass proves about the remote, folded leg by leg: every
+        // inline leg that raises leaves through `?` before the end, so what
+        // reaches `mark_synced` is either a round trip that came back, a pass
+        // that made none, or a drained unit's failure the drain absorbed.
+        let mut contact = RemoteContact::Skipped;
         if profile.direction.pulls() {
             let converged = self.do_pull(&profile, source, TreeState::Committed).await?;
+            contact = contact.join(Self::pull_contact(&profile));
             outcome.conflicts = converged.copies;
             outcome.stale = converged.stale;
             outcome.pulled = true;
@@ -10873,7 +11713,7 @@ impl Engine {
         // pass for nothing.
         let mut previous = u32::MAX;
         loop {
-            self.drain_journal(&profile, false, source).await?;
+            contact = contact.join(self.drain_journal(&profile, false, source).await?);
             let outstanding = self.lfs_uploads_outstanding(&profile)?;
             if outstanding == 0 || outstanding >= previous {
                 break;
@@ -10882,8 +11722,10 @@ impl Engine {
         }
 
         if profile.direction.pushes() {
-            self.do_push(&profile, source, None, TreeState::Committed)
-                .await?;
+            contact = contact.join(
+                self.do_push(&profile, source, None, TreeState::Committed)
+                    .await?,
+            );
             outcome.pushed = true;
         }
 
@@ -10892,7 +11734,7 @@ impl Engine {
         // tick to pick it up. `false`: the pull and the push this pass ran
         // inline are the rows a scan would queue, and its walk is the one
         // above.
-        self.drain_journal(&profile, false, source).await?;
+        contact = contact.join(self.drain_journal(&profile, false, source).await?);
         // The user's commits are published; now say what went wrong. See where
         // this was captured for why it waited until here and no longer.
         if let Some(err) = arrival_fault {
@@ -10905,10 +11747,15 @@ impl Engine {
         // Every leg this profile's direction calls for ran and none of them
         // raised: that is the whole definition of a successful pass, and it is
         // the only definition under which a pull-only profile — or a push with
-        // nothing staged — can ever record that it worked.
-        self.mark_synced(&profile).await;
+        // nothing staged — can ever record that it worked. What it proved
+        // about the remote is a separate question, and `contact` carries it.
+        self.mark_synced(&profile, contact).await;
 
-        self.set_state(&profile.id, ProfileState::Watching);
+        // Not `Watching` outright: the word a finished pass may write is the
+        // one that is still true of the folder, and a failure standing beside
+        // this pass — the sticky offline set, an error the pass did not earn
+        // the right to retire — outranks "I am done". See `settle_and_persist`.
+        self.settle_and_persist(&profile.id);
         self.publish(self.progress(&profile, SyncPhase::Idle));
         self.refresh_pending(&profile.id);
         Ok(outcome)
@@ -11951,6 +12798,7 @@ impl Engine {
         // means the footprint report, the release look and its rotation start
         // over, and the memo behind the report goes with them.
         Self::lock(&self.next_sweep_ms).remove(id);
+        Self::lock(&self.next_helper_look_ms).remove(id);
         Self::lock(&self.next_release_ms).remove(id);
         Self::lock(&self.release_cursor).remove(id);
         Self::lock(&self.footprint_memo).remove(id);
@@ -15828,6 +16676,134 @@ fn minute_of_day(hhmm: &str) -> Option<u16> {
     let hours: u16 = hours.parse().ok()?;
     let minutes: u16 = minutes.parse().ok()?;
     (hours < 24 && minutes < 60).then_some(hours * 60 + minutes)
+}
+
+/// How long the `ps` walk behind [`helper_parent_command`] may take before
+/// the look gives up on naming anyone.
+///
+/// Generous for five `ps` calls, which are milliseconds; the case it bounds is
+/// a `ps` that hangs, which on a machine whose process table is under a stuck
+/// volume is not unheard of, and the look must not hold the tick for it.
+const PS_WALK_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Name the git a stuck helper is waiting on, and the process that ran that
+/// git — `unknown` when `ps` cannot say in time.
+///
+/// The parent of a helper is always a `git`; the process a person has to quit
+/// is that git's own parent, or its parent's, when a script ran a `git` that
+/// ran a `git`. So the walk climbs the ppid chain — at most five hops — until
+/// the first command whose basename is not `git`, and names both ends. A
+/// parent of 1 at the first hop means the git has already exited and the
+/// helper's stdin is held by whatever inherited it, which is the case nothing
+/// but a stuck helper could ever show.
+///
+/// Bounded by [`PS_WALK_DEADLINE`] and never fatal: `unknown` with one `warn`
+/// line is what a `ps` that hangs, or a blocking task that panics, costs.
+async fn helper_parent_command(pid: u32) -> String {
+    let walk = tokio::task::spawn_blocking(move || helper_parent_command_blocking(pid));
+    match tokio::time::timeout(PS_WALK_DEADLINE, walk).await {
+        Ok(Ok(named)) => named,
+        Ok(Err(err)) => {
+            tracing::warn!(pid, error = %err, "naming a stuck LFS helper's parent did not finish");
+            "unknown".to_owned()
+        }
+        Err(_) => {
+            tracing::warn!(
+                pid,
+                "naming a stuck LFS helper's parent took longer than {PS_WALK_DEADLINE:?}; ps \
+                 is not answering"
+            );
+            "unknown".to_owned()
+        }
+    }
+}
+
+/// [`helper_parent_command`]'s walk, on the calling thread.
+///
+/// `ps` per hop rather than one table read: the look names one process an
+/// hour, and a whole-table read to find it would be the expensive idiom
+/// `tests/lfs_filter_process.rs` uses for a different question. `ps` rather
+/// than `libc` or `/proc`, for that test's reason too: no new crate, and the
+/// machine this was measured on is the Mac.
+fn helper_parent_command_blocking(pid: u32) -> String {
+    #[cfg(unix)]
+    {
+        const HOPS: usize = 5;
+        let Some((ppid, _)) = ps_row(pid) else {
+            return "unknown".to_owned();
+        };
+        if ppid <= 1 {
+            return "orphaned: its git has exited and pid 1 holds its stdin".to_owned();
+        }
+        let Some((mut ancestor, parent_command)) = ps_row(ppid) else {
+            return format!("pid {ppid} (unknown command)");
+        };
+        let parent = format!("`{parent_command}` (pid {ppid})");
+        for _ in 0..HOPS {
+            if ancestor <= 1 {
+                return format!("{parent}, orphaned: the process that ran it has exited");
+            }
+            let Some((next, command)) = ps_row(ancestor) else {
+                return format!("{parent}, run by pid {ancestor} (unknown command)");
+            };
+            if command_basename(&command) != "git" {
+                return format!("{parent}, run by `{command}` (pid {ancestor})");
+            }
+            ancestor = next;
+        }
+        format!("{parent}, run by pid {ancestor}")
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        "unknown".to_owned()
+    }
+}
+
+/// One process's parent pid and command line, from `ps`; `None` when there is
+/// no such process or `ps` will not say.
+#[cfg(unix)]
+fn ps_row(pid: u32) -> Option<(u32, String)> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=,command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (ppid, command) = text.trim().split_once(char::is_whitespace)?;
+    Some((ppid.parse().ok()?, command.trim().to_owned()))
+}
+
+/// The program name of a command line: `git` for both `git status` and
+/// `/usr/bin/git status`.
+#[cfg(unix)]
+fn command_basename(command: &str) -> &str {
+    let program = command.split_whitespace().next().unwrap_or_default();
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program)
+}
+
+/// Whether a process with this pid exists, by `ps -p`'s exit status — the
+/// fallback the helper look uses for a marker whose lock it could not try.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// The hydration capability a verified copy asks for (Story 56.6).
@@ -19820,6 +20796,323 @@ mod tests {
         assert!(!engine.sweep_is_due(&p), "still inside the hour");
         platform.advance_ms(1);
         assert!(engine.sweep_is_due(&p), "the hour has passed");
+    }
+
+    /// The eyes on the helpers: a marker the test itself locks and back-dates
+    /// stands in for a helper whose git stopped talking to it. Onset warns
+    /// once; a second look that finds it still there does not repeat the
+    /// notification, even after a successful unit has wiped the snapshot's
+    /// text in between; unlocking it — what the kernel does when the helper
+    /// dies — retires the warning on the next look, and only this warning.
+    ///
+    /// The marker carries this test's own pid, so the `ps` walk that names
+    /// the parent resolves to a real process rather than `unknown`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_helper_warns_once_and_the_warning_retires_when_it_goes() {
+        use fs4::fs_std::FileExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        store.ensure_layout().expect("layout");
+        let notifications = || {
+            platform
+                .notifications
+                .lock()
+                .map(|n| n.len())
+                .unwrap_or_default()
+        };
+
+        // A warning about something else is up; the look must leave it alone.
+        engine.warn(
+            &p.id,
+            &p.name,
+            format!("{WATCH_DEGRADED_PREFIX}, so nothing is quick here"),
+        );
+        assert_eq!(notifications(), 1);
+
+        // No helpers: one look, zeros, and the other warning still standing.
+        engine.look_at_helpers_if_due(&p).await;
+        let shown = engine.status(&p.id).expect("status").warning;
+        assert!(
+            shown
+                .as_deref()
+                .is_some_and(|w| w.starts_with(WATCH_DEGRADED_PREFIX)),
+            "a look that finds nothing retires nothing but its own: {shown:?}"
+        );
+        assert!(!engine.helper_look_is_due(&p), "and the hour is armed");
+
+        // A helper whose git went quiet thirty-one minutes ago: the lock is
+        // the test's own, so the kernel treats it exactly as a live process.
+        std::fs::create_dir_all(store.helpers_dir()).expect("helpers dir");
+        let marker = store.helpers_dir().join(std::process::id().to_string());
+        std::fs::write(&marker, b"").expect("write marker");
+        let held = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&marker)
+            .expect("open marker");
+        assert!(
+            held.try_lock_exclusive().expect("lock"),
+            "the test holds it"
+        );
+        held.set_modified(
+            std::time::SystemTime::now()
+                - lfs::store::LfsStore::STUCK_HELPER_IDLE
+                - Duration::from_secs(60),
+        )
+        .expect("back-date");
+
+        platform.advance_ms(HELPER_LOOK_EVERY_MS);
+        engine.look_at_helpers_if_due(&p).await;
+        let shown = engine.status(&p.id).expect("status").warning;
+        let shown = shown.expect("a stuck helper is a warning");
+        assert!(shown.starts_with(HELPER_STUCK_PREFIX), "{shown}");
+        assert!(shown.contains("1 LFS filter helper"), "the count: {shown}");
+        assert!(
+            shown.contains("waiting on `") && shown.contains("run by `"),
+            "the git and the process that ran it: {shown}"
+        );
+        assert!(
+            shown.contains("the oldest for 31 min"),
+            "the idle time: {shown}"
+        );
+        assert!(
+            marker.exists(),
+            "a look never removes a live helper's marker"
+        );
+        // The other warning was replaced, not added to, and the toast rode
+        // the level rather than a fresh onset — as `warn` does today.
+        assert_eq!(notifications(), 1, "no onset while another warning stands");
+
+        // A unit succeeds in between — a stuck helper does not stop the
+        // folder syncing — and wipes the snapshot's text, as it does after
+        // every success. Same helper, next hour: the warning is re-asserted,
+        // and the toast is not repeated, because the onset is the set's and
+        // not the field's.
+        engine.clear_warning(&p.id);
+        assert!(
+            engine.status(&p.id).expect("status").warning.is_none(),
+            "the success wiped the text"
+        );
+        platform.advance_ms(HELPER_LOOK_EVERY_MS);
+        engine.look_at_helpers_if_due(&p).await;
+        assert!(
+            engine
+                .status(&p.id)
+                .expect("status")
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.starts_with(HELPER_STUCK_PREFIX)),
+            "still stuck, still warned"
+        );
+        assert_eq!(
+            notifications(),
+            1,
+            "a second look does not repeat the toast, even after the field was wiped"
+        );
+
+        // The helper dies: the kernel drops the lock, the file stays.
+        held.unlock().expect("unlock");
+        drop(held);
+        platform.advance_ms(HELPER_LOOK_EVERY_MS);
+        engine.look_at_helpers_if_due(&p).await;
+        assert!(
+            engine.status(&p.id).expect("status").warning.is_none(),
+            "no stuck helper, no warning"
+        );
+        assert!(!marker.exists(), "the leftover is removed");
+
+        // And the onset re-arms: a helper that gets stuck again is a new
+        // toast, because the clear took the profile out of `helper_warned`.
+        let held = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&marker)
+            .expect("open marker again");
+        assert!(held.try_lock_exclusive().expect("lock again"));
+        held.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .expect("back-date again");
+        platform.advance_ms(HELPER_LOOK_EVERY_MS);
+        engine.look_at_helpers_if_due(&p).await;
+        assert_eq!(notifications(), 2, "a fresh onset notifies again");
+        drop(held);
+    }
+
+    /// The clock behind the look: the first tick of a run, then hourly.
+    #[test]
+    fn helpers_are_looked_at_on_the_first_tick_and_then_hourly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+
+        assert!(
+            engine.helper_look_is_due(&p),
+            "a folder is looked at when first seen"
+        );
+        assert!(
+            !engine.helper_look_is_due(&p),
+            "and not again on the next tick"
+        );
+
+        platform.advance_ms(HELPER_LOOK_EVERY_MS - 1);
+        assert!(!engine.helper_look_is_due(&p), "still inside the hour");
+        platform.advance_ms(1);
+        assert!(engine.helper_look_is_due(&p), "the hour has passed");
+    }
+
+    /// Two stuck at once: the warning carries the count, and the one it
+    /// names is the older.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_stuck_helpers_warn_with_the_count_and_name_the_older() {
+        use fs4::fs_std::FileExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        std::fs::create_dir_all(store.helpers_dir()).expect("helpers dir");
+
+        let now = std::time::SystemTime::now();
+        let lock_back_dated = |pid: u32, ago: Duration| {
+            let path = store.helpers_dir().join(pid.to_string());
+            std::fs::write(&path, b"").expect("write marker");
+            let held = std::fs::File::options()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open marker");
+            assert!(held.try_lock_exclusive().expect("lock"));
+            held.set_modified(now - ago).expect("back-date");
+            held
+        };
+        // The older one is this process, so the walk names a real parent;
+        // the younger is a pid nothing answers for.
+        let older = lock_back_dated(std::process::id(), Duration::from_secs(2 * 3600));
+        let younger = lock_back_dated(u32::MAX - 7, Duration::from_secs(3600));
+
+        engine.look_at_helpers_if_due(&p).await;
+        let shown = engine.status(&p.id).expect("status").warning;
+        let shown = shown.expect("two stuck helpers are a warning");
+        assert!(
+            shown.contains("2 LFS filter helper(s)"),
+            "the count: {shown}"
+        );
+        assert!(
+            shown.contains("the oldest for 120 min"),
+            "the older one's idle, not the younger's: {shown}"
+        );
+        assert!(
+            shown.contains("run by `"),
+            "named from the older's pid: {shown}"
+        );
+        drop(older);
+        drop(younger);
+    }
+
+    /// "Recheck all files" restarts the hourly clocks by name, this one
+    /// included: a person pressing it has a folder that is misbehaving, and a
+    /// stuck helper is one of the things that makes a folder misbehave.
+    #[test]
+    fn a_rescan_re_arms_the_helper_look() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+
+        assert!(engine.helper_look_is_due(&p), "first sight");
+        assert!(!engine.helper_look_is_due(&p), "then armed for an hour");
+        engine.rescan(&p.id).expect("rescan");
+        assert!(
+            engine.helper_look_is_due(&p),
+            "a rescan looks again without waiting out the hour"
+        );
+    }
+
+    /// The wiring, not the private method: a tick over a folder with a
+    /// locked, back-dated marker leaves the stuck-helper warning on the
+    /// folder's card. The reservation is held across the tick so the pass
+    /// itself declines — the look runs before it, and this test is about the
+    /// look reaching the snapshot, not about what a pass over a folder that
+    /// is not a repository would say afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tick_over_a_stuck_helper_puts_the_warning_on_the_card() {
+        use fs4::fs_std::FileExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(platform.clone()) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let store = lfs::store::LfsStore::in_git_dir(p.local_path.join(".git"));
+        std::fs::create_dir_all(store.helpers_dir()).expect("helpers dir");
+        let marker = store.helpers_dir().join(std::process::id().to_string());
+        std::fs::write(&marker, b"").expect("write marker");
+        let held = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&marker)
+            .expect("open marker");
+        assert!(held.try_lock_exclusive().expect("lock"));
+        held.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .expect("back-date");
+
+        let reserved = engine.reserve(&p.id).expect("free before the tick");
+        let _ = engine.tick().await;
+        drop(reserved);
+
+        let shown = engine.status(&p.id).expect("status").warning;
+        assert!(
+            shown
+                .as_deref()
+                .is_some_and(|w| w.starts_with(HELPER_STUCK_PREFIX)),
+            "the tick's look reached the card: {shown:?}"
+        );
+        drop(held);
+    }
+
+    /// The `ps` walk on a process that certainly exists — this one: it names
+    /// the parent by pid, climbs to something that is not `git`, and is not
+    /// `unknown`. A pid nothing answers for is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_parent_walk_names_this_tests_own_parent() {
+        let me = std::process::id();
+        let (ppid, _) = ps_row(me).expect("ps knows this process");
+        let named = helper_parent_command(me).await;
+        assert_ne!(named, "unknown");
+        assert!(
+            named.contains(&format!("(pid {ppid})")),
+            "the parent's pid is in it: {named}"
+        );
+        assert!(named.contains("run by "), "and who ran it: {named}");
+
+        assert_eq!(helper_parent_command(u32::MAX - 7).await, "unknown");
+        assert!(pid_is_alive(me));
+        assert!(!pid_is_alive(u32::MAX - 7));
+        assert_eq!(command_basename("/usr/bin/git status"), "git");
+        assert_eq!(command_basename("git status"), "git");
+        assert_eq!(command_basename("/bin/zsh -l"), "zsh");
     }
 
     /// A ledger row with nothing recorded but the instant content landed.
@@ -24545,8 +25838,9 @@ mod tests {
 
         // A prime that recorded nothing buys nothing of its own: the flag
         // stays clear. The gate still holds the earlier prime, which the index
-        // does not carry, and the policy's own guard widens for that — so it
-        // is the flag that is asserted here, and the scan is owed regardless.
+        // does not carry — and that is the pass's own to sample, not a
+        // directory scan's: the policy carries it as an include of the
+        // narrowed walk and widens for nothing.
         assert_eq!(
             engine
                 .prime_moved_paths(&p.id, &[p.local_path.join("never-there.bin")])
@@ -24557,25 +25851,47 @@ mod tests {
             !Engine::lock(&engine.untracked_appeared).contains(&p.id),
             "nothing new was primed, so the prime owes no scan"
         );
+        let policy = engine.commit_walk_policy(&p);
+        assert_eq!(
+            policy,
+            git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("moved.bin")]),
+            "the earlier prime is still held; it rides as an include, and the pass samples it itself"
+        );
         assert!(
-            engine.commit_walk_policy(&p).find_untracked,
-            "but the earlier prime is still held and untracked, and the policy widens for it"
+            !policy.find_untracked,
+            "a held path the pass can sample itself buys no directory walk"
         );
     }
 
-    /// The line `walk_policy`'s guard emits for a held path the index does not
-    /// carry — the tests below promise the line, not only the policy.
-    const WIDENING_WARN: &str = "the gate holds a path the index does not carry; \
-                                 a walk without a directory scan cannot observe it; \
-                                 widening to a full walk";
+    /// The line the untracked sweep logs when a walk reads every directory —
+    /// the tests below promise its absence between a held path's two looks.
+    const SWEEP_LINE: &str = "untracked sweep: this walk reads every directory";
 
-    /// A file the sweep finds is a file that gets committed. The first pass of
-    /// a run walks every directory and holds what it finds; the walk the settle
-    /// deadline runs must be able to see the same path again, and before this
-    /// it could not: it was `tracked_only().including(held)`, which has no
-    /// directory scan, reported nothing for the path, and `retain` forgot the
-    /// episode. hesperia's neuradrive went `untracked=160` to `untracked=0
-    /// included=159` eight seconds later, and 62.8 GB was never committed.
+    /// The `key=value` fields of the `status walk finished` line of the last
+    /// walk `log` recorded, for [`walk_says`].
+    fn last_walk(log: &RecordedLog) -> Vec<String> {
+        log.fields_of(tracing::Level::INFO, "status walk finished")
+            .last()
+            .expect("a walk finished")
+            .clone()
+    }
+
+    /// Whether a walk's line carries exactly `field` — matched by equality,
+    /// one field at a time, so `included=1` never matches `included=10`.
+    fn walk_says(walked: &[String], field: &str) -> bool {
+        walked.iter().any(|f| f == field)
+    }
+
+    /// A file the sweep finds is a file that gets committed — by a pass whose
+    /// walk read no directory. The first pass of a run walks every directory
+    /// and holds what it finds; the settle walk five seconds later is
+    /// `tracked_only().including(held)`, which has no directory scan and
+    /// cannot report an untracked path. Once that meant `retain` forgot the
+    /// episode (hesperia's neuradrive went `untracked=160` to `untracked=0
+    /// included=159` eight seconds later, and 62.8 GB was never committed);
+    /// then, from `1c26f53a`, it meant a full walk on every pass until the
+    /// path settled. Now the pass samples the held path itself, and the walk
+    /// between the two looks stays narrowed.
     #[tokio::test]
     async fn a_file_the_sweep_found_is_committed_once_it_settles() {
         let log = Arc::new(RecordedLog::default());
@@ -24600,9 +25916,14 @@ mod tests {
             0,
             "one sample is not two"
         );
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            1,
+            "the first pass of a run is the sweep"
+        );
         assert!(
-            Engine::lock(&engine.untracked_appeared).contains(&p.id),
-            "the pass that held an untracked path buys the next walk a directory scan"
+            !Engine::lock(&engine.untracked_appeared).contains(&p.id),
+            "a held path the pass can sample itself owes the next walk no directory scan"
         );
         let carried = engine
             .with_db(|conn| db::load_file_state(conn, &p.id))
@@ -24611,6 +25932,15 @@ mod tests {
             carried.iter().any(|(path, _)| path == &found),
             "the episode survives to the second pass"
         );
+        // The policy the second pass runs with: the narrowed walk, the held
+        // path riding as an include, no directory read.
+        let second = engine.commit_walk_policy(&p);
+        assert_eq!(
+            second,
+            git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("found.bin")]),
+            "the held path rides the narrowed walk as an include"
+        );
+        assert!(!second.find_untracked, "and no directory is read for it");
 
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
         assert_eq!(
@@ -24618,7 +25948,17 @@ mod tests {
                 .commit_local(&p, SyncSource::Watch, None)
                 .expect("the second pass"),
             1,
-            "the second look can see the path, and commits it"
+            "the pass's own sample is the second look, and it commits the path"
+        );
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            1,
+            "no directory walk ran between the two looks"
+        );
+        let walked = last_walk(&log);
+        assert!(
+            walk_says(&walked, "untracked=0") && walk_says(&walked, "included=1"),
+            "the second pass's walk was the narrowed one, which reported nothing for the path: {walked:?}"
         );
         let rows = engine.activity(&p.id, 10).await.expect("activity");
         let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
@@ -24626,14 +25966,18 @@ mod tests {
             paths.contains(&"found.bin"),
             "the sweep's find is what was committed: {paths:?}"
         );
-        // The mechanism, pinned: the flag is the ordinary path, and the guard
-        // behind it had nothing to widen — and once the file is committed the
-        // gate holds nothing, so the steady policy is the index-only walk.
+        let kinds: Vec<ActivityKind> = rows
+            .iter()
+            .filter(|row| row.path == "found.bin")
+            .map(|row| row.kind)
+            .collect();
         assert_eq!(
-            log.count(tracing::Level::WARN, WIDENING_WARN),
-            0,
-            "the flag answered the second look; the guard was never needed"
+            kinds,
+            vec![ActivityKind::Added],
+            "a path git has never seen is an addition, whichever look staged it"
         );
+        // Once the file is committed the gate holds nothing, so the steady
+        // policy is the index-only walk with no includes.
         assert_eq!(
             engine.commit_walk_policy(&p),
             git::repo::WalkPolicy::tracked_only(),
@@ -24641,20 +25985,17 @@ mod tests {
         );
     }
 
-    /// The guard behind the flag: a path the gate holds and the index does not
-    /// carry can only be observed by a walk that reads the directories, so the
-    /// commit leg's policy widens rather than hand it to a walk without a
-    /// directory scan — the narrowed one or the overflow's whole-index one —
-    /// that would report nothing and let `retain` forget it. A held tracked
-    /// path is what the narrowed walk was built for (Story 70.1), and stays
-    /// narrowed; the poll leg never carries held paths and is immune.
+    /// Matrix row "File still being written": a sweep-found file rewritten
+    /// between passes is sampled by every pass, stays `Settling`, and buys no
+    /// directory walk — three passes, three `lstat`s, no sweep line, and the
+    /// episode kept through all of them. Before this every one of those passes
+    /// was a full walk (the deferred-work entry against `1c26f53a`: 1.6–6.8 s
+    /// per settle window on the reference folder, for one file). A held
+    /// *tracked* path beside it is what the narrowed walk was built for
+    /// (Story 70.1) and stays the walk's business; the poll leg never carries
+    /// held paths and is untouched.
     #[test]
-    fn a_held_path_the_index_does_not_carry_makes_the_commit_walk_a_full_one() {
-        // The guard promises a line, not only a policy: the count and one
-        // path, so the log says which held path was about to be forgotten.
-        let log = Arc::new(RecordedLog::default());
-        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
-        let widening = WIDENING_WARN;
+    fn a_sweep_found_file_still_being_written_is_held_without_a_directory_walk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));
         let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
@@ -24678,19 +26019,10 @@ mod tests {
                 .expect("opens the episode"),
             0
         );
-        assert!(
-            !Engine::lock(&engine.untracked_appeared).contains(&p.id),
-            "a held tracked path owes no scan"
-        );
         assert_eq!(
             engine.commit_walk_policy(&p),
             git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("tracked.txt")]),
             "a held tracked path is the narrowed walk's whole job"
-        );
-        assert_eq!(
-            log.count(tracing::Level::WARN, widening),
-            0,
-            "and the guard has nothing to say about a path the index carries"
         );
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
         assert_eq!(
@@ -24702,7 +26034,8 @@ mod tests {
 
         // A file the watcher never announced, found by a sweep made due by
         // hand, so the gate holds a path the index does not carry.
-        std::fs::write(p.local_path.join("found.bin"), b"moved in by hand").expect("write");
+        let found = p.local_path.join("found.bin");
+        std::fs::write(&found, b"moved in by hand, still being written").expect("write");
         Engine::lock(&engine.untracked_sweep).remove(&p.id);
         assert_eq!(
             engine
@@ -24710,65 +26043,597 @@ mod tests {
                 .expect("the sweep holds it"),
             0
         );
-        // The flag that pass set is the ordinary answer; take it off by hand
-        // so what is measured is the guard alone.
         assert!(
-            Engine::lock(&engine.untracked_appeared).remove(&p.id),
-            "the sweep's find set the flag"
+            !Engine::lock(&engine.untracked_appeared).contains(&p.id),
+            "the sweep's find owes the next walk no directory scan"
+        );
+
+        // Recorded from here, so every count below is the settling passes'.
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        for pass in 1..=3usize {
+            // A different size is a different tuple: the gate's window
+            // restarts, and the pass finds the file still moving.
+            std::fs::write(&found, vec![b'w'; 64 + pass]).expect("rewrite");
+            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+            let policy = engine.commit_walk_policy(&p);
+            assert_eq!(
+                policy,
+                git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("found.bin")]),
+                "pass {pass}: the held path rides the narrowed walk as an include"
+            );
+            assert!(
+                !policy.find_untracked,
+                "pass {pass}: and no directory is read for it"
+            );
+            assert_eq!(
+                engine
+                    .commit_local(&p, SyncSource::Watch, None)
+                    .expect("a settling pass"),
+                0,
+                "pass {pass}: rewritten since the last look, so still held"
+            );
+            assert_eq!(
+                log.count(tracing::Level::INFO, SWEEP_LINE),
+                0,
+                "pass {pass}: no directory walk"
+            );
+            let walked = last_walk(&log);
+            assert!(
+                walk_says(&walked, "untracked=0") && walk_says(&walked, "included=1"),
+                "pass {pass}: the walk was the narrowed one, which reported nothing for the path: {walked:?}"
+            );
+            let carried = engine
+                .with_db(|conn| db::load_file_state(conn, &p.id))
+                .expect("rows");
+            assert!(
+                carried.iter().any(|(path, _)| path == &found),
+                "pass {pass}: the episode is kept, not forgotten"
+            );
+            assert_eq!(
+                Engine::lock(&engine.status)
+                    .get(&p.id)
+                    .map(|snapshot| snapshot.settling),
+                Some(1),
+                "pass {pass}: the pass's own sample counts as a held file"
+            );
+        }
+
+        // The writer stops: the next sample matches the last, the window
+        // runs out, and the file is committed — still without a directory
+        // walk.
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the pass after the writer stopped"),
+            1,
+            "commits once it stops"
         );
         assert_eq!(
-            engine.commit_walk_policy(&p),
-            git::repo::WalkPolicy::full(),
-            "a held path the index does not carry cannot be observed by a narrowed walk"
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            0,
+            "four passes, and none of them read a directory"
         );
-        // One line, carrying how many and which: the operator reading the log
-        // after the fact can tell a widened walk from a sweep, and name the
-        // file that would otherwise have been forgotten.
-        let warned = log.fields_of(tracing::Level::WARN, widening);
-        let [line] = warned.as_slice() else {
-            panic!(
-                "the guard warns exactly once, not {}: {warned:?}",
-                warned.len()
-            );
-        };
-        let line = line.join(" ");
-        assert!(line.contains("missing=1"), "the count: {line}");
-        assert!(line.contains("path=found.bin"), "and the path: {line}");
 
         // The poll leg does not observe into the gate, so it never carries
-        // held paths (`with_held` is false) and the guard has nothing to
-        // probe for it: the index-only listing, and no line.
+        // held paths (`with_held` is false): the index-only listing, always.
         assert_eq!(
             engine.poll_walk_policy(&p),
             git::repo::WalkPolicy::tracked_only(),
-            "the poll leg is immune: a held path is not its problem"
-        );
-        assert_eq!(
-            log.count(tracing::Level::WARN, widening),
-            1,
-            "and the guard said nothing to the poll"
-        );
-
-        // The overflow branch: the whole-index walk a spilled watcher list
-        // buys has no directory scan either, so the guard fires before it
-        // too — the Intent names any walk without a directory scan.
-        engine.widen_watch_paths(&p.id);
-        assert_eq!(
-            engine.commit_walk_policy(&p),
-            git::repo::WalkPolicy::full(),
-            "the overflow's whole-index walk cannot observe the held path either"
-        );
-        assert_eq!(
-            log.count(tracing::Level::WARN, widening),
-            2,
-            "one more line for one more widening"
+            "the poll leg is untouched: a held path is not its problem"
         );
     }
 
-    /// Matrix row "Sweep finds nothing new": the flag is set by a held
-    /// untracked path and by nothing else. A sweep over a clean tree reports
+    /// Matrix row "Held path vanished": a file the sweep found and the gate
+    /// held, deleted before its second look, is simply forgotten — nothing is
+    /// staged, nothing errors, `file_state` drops the row, and no directory
+    /// was read to learn any of it.
+    #[test]
+    fn a_held_path_that_vanished_before_its_second_look_is_forgotten() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let found = p.local_path.join("found.bin");
+        std::fs::write(&found, b"moved in by hand").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0,
+            "one sample is not two"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(
+            carried.iter().any(|(path, _)| path == &found),
+            "the sweep's find is held"
+        );
+
+        std::fs::remove_file(&found).expect("gone before its second look");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("a vanished held path is not an error"),
+            0,
+            "nothing is staged for a path that is gone"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(
+            carried.is_empty(),
+            "the episode is forgotten, not carried: {carried:?}"
+        );
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            1,
+            "only the first pass of the run read the directories"
+        );
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only(),
+            "nothing held, nothing named"
+        );
+    }
+
+    /// Matrix row "Index unreadable": the probe's answer is only *which* of
+    /// the held paths the walk could not have seen, so an index that cannot
+    /// be read leaves every one of them to the pass's own sample rather than
+    /// to `retain` — and says so once, naming the error rather than a phantom
+    /// untracked file.
+    #[test]
+    fn an_unreadable_index_leaves_every_unreported_held_path_to_the_second_look() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        std::fs::write(p.local_path.join("tracked.txt"), b"one").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        let found = p.local_path.join("found.bin");
+        std::fs::write(&found, b"moved in by hand").expect("write");
+        Engine::lock(&engine.untracked_sweep).remove(&p.id);
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the sweep holds it"),
+            0
+        );
+
+        // The index the probe reads is garbage from here; a repository opened
+        // now cannot decode it.
+        std::fs::write(p.local_path.join(".git").join("index"), b"not an index").expect("corrupt");
+        let repo = engine.open_repo(&p).expect("the repository still opens");
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let unreported = HashSet::new();
+        assert_eq!(
+            engine.paths_for_the_second_look(&p, &repo, std::slice::from_ref(&found), &unreported),
+            SecondLook {
+                sample: vec![PathBuf::from("found.bin")],
+                ..SecondLook::default()
+            },
+            "the held path is sampled anyway"
+        );
+        let warned = log.fields_of(
+            tracing::Level::WARN,
+            "the gate holds paths the walk did not report and the index cannot \
+             be read, so which of them a walk could have seen is unknown; \
+             sampling every one of them",
+        );
+        let [line] = warned.as_slice() else {
+            panic!("one warn, not {}: {warned:?}", warned.len());
+        };
+        let line = line.join(" ");
+        assert!(line.contains("held=1"), "the count: {line}");
+        assert!(line.contains("index=unreadable"), "and the reason: {line}");
+    }
+
+    /// Review row: a held path under a directory that lost its permission.
+    /// The second look's `stat` is refused for a reason other than absence,
+    /// and the gate's fail-closed rule applies: the path stays held, counted
+    /// and observed, with one `warn` per pass naming it and the error — and
+    /// the pass succeeds, so `retain` and `save_file_state` still run for
+    /// everything else. Before this the refusal propagated with `?`, failing
+    /// every commit-leg pass before either, so the entry could never be
+    /// forgotten and nothing in the folder committed. Restoring the
+    /// permission lets it commit.
+    #[test]
+    fn a_held_path_whose_parent_lost_its_permission_stays_held_and_commits_once_it_is_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let locked = p.local_path.join("locked");
+        std::fs::create_dir_all(&locked).expect("dir");
+        let found = locked.join("found.bin");
+        std::fs::write(&found, b"moved in by hand").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0,
+            "one sample is not two"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let restore = || {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod back");
+        };
+        if std::fs::symlink_metadata(&found).is_ok() {
+            // Running as root, where a mode of 000 refuses nothing: the row
+            // cannot be exercised here.
+            restore();
+            return;
+        }
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        let passed = engine.commit_local(&p, SyncSource::Watch, None);
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        let warned = log.fields_of(
+            tracing::Level::WARN,
+            "a held path the walk did not report could not be stat'd; \
+             keeping it held until it can be",
+        );
+        let settling = Engine::lock(&engine.status)
+            .get(&p.id)
+            .map(|snapshot| snapshot.settling);
+        restore();
+        assert_eq!(
+            passed.expect("a refused stat does not fail the pass"),
+            0,
+            "nothing is staged for a path the pass could not judge"
+        );
+        assert!(
+            carried.iter().any(|(path, _)| path == &found),
+            "the row stays: {carried:?}"
+        );
+        let [line] = warned.as_slice() else {
+            panic!("one warn per pass, not {}: {warned:?}", warned.len());
+        };
+        let line = line.join(" ");
+        assert!(line.contains("path=locked/found.bin"), "the path: {line}");
+        assert!(line.contains("err="), "and the error: {line}");
+        assert_eq!(settling, Some(1), "a path kept held counts as one");
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            0,
+            "and no directory was read for it"
+        );
+
+        // The permission is back: the same bytes, a window later.
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the pass after the permission came back"),
+            1,
+            "committed once the pass can look at it"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, SWEEP_LINE), 0);
+    }
+
+    /// Review row: a re-sampled path passes git's own exclusion like a
+    /// walk-reported one. A `.gitignore` written after the sweep held the
+    /// file is one the dirwalk never applied to it; the second look consults
+    /// the repository's excludes itself, and an ignored path is not staged
+    /// and is forgotten, with an info line.
+    #[test]
+    fn a_held_path_a_later_gitignore_covers_is_forgotten_not_staged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let found = p.local_path.join("found.bin");
+        std::fs::write(&found, b"moved in by hand").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0
+        );
+
+        // Written after the hold, and unseen by the narrowed walk itself.
+        {
+            use std::io::Write as _;
+            let mut ignore = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p.local_path.join(".gitignore"))
+                .expect(".gitignore");
+            writeln!(ignore, "found.bin").expect("write");
+        }
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("an ignored held path is not an error"),
+            0,
+            "nothing is staged for a path git ignores"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(carried.is_empty(), "forgotten, not carried: {carried:?}");
+        let said = log.fields_of(
+            tracing::Level::INFO,
+            "a held path is one git ignores, so it is not this folder's to \
+             commit; forgetting it",
+        );
+        let [line] = said.as_slice() else {
+            panic!("one line, not {}: {said:?}", said.len());
+        };
+        assert!(
+            line.iter().any(|f| f == "path=found.bin"),
+            "names it: {line:?}"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, SWEEP_LINE), 0);
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only(),
+            "nothing held, nothing named"
+        );
+    }
+
+    /// Review row: a held path that became a nested repository. One that is
+    /// now a directory is reported collapsed, once, as the walk's are, and
+    /// never handed to the commit as a file; one that now lies *inside* a
+    /// nested repository belongs to that repository and is forgotten with an
+    /// info line. Neither is staged, and no directory is read to learn it.
+    #[test]
+    fn a_held_path_that_became_a_nested_repository_is_reported_collapsed_not_staged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let became = p.local_path.join("became.bin");
+        std::fs::write(&became, b"a file, for now").expect("write");
+        let sub = p.local_path.join("sub");
+        std::fs::create_dir_all(&sub).expect("dir");
+        let inside = sub.join("inside.bin");
+        std::fs::write(&inside, b"a file in a plain folder, for now").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert_eq!(carried.len(), 2, "both held: {carried:?}");
+
+        // Between the looks: the file is now a repository of its own, and the
+        // folder beside it became one.
+        std::fs::remove_file(&became).expect("rm");
+        std::fs::create_dir_all(became.join(".git")).expect("a nested repository");
+        std::fs::create_dir_all(sub.join(".git")).expect("another");
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("a nested repository is not an error"),
+            0,
+            "nothing is staged"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(carried.is_empty(), "both forgotten: {carried:?}");
+        let collapsed = log.fields_of(
+            tracing::Level::WARN,
+            "sync: skipping an untracked directory git reported collapsed — it is its own \
+             repository, so its files are not this folder's to commit, and walking it here \
+             would ignore .gitignore",
+        );
+        let [line] = collapsed.as_slice() else {
+            panic!("one collapsed line, not {}: {collapsed:?}", collapsed.len());
+        };
+        assert!(
+            line.iter().any(|f| f == "path=became.bin"),
+            "names it: {line:?}"
+        );
+        let nested = log.fields_of(
+            tracing::Level::INFO,
+            "a held path now lies inside a nested repository, so it is not this \
+             folder's to commit; forgetting it",
+        );
+        let [line] = nested.as_slice() else {
+            panic!("one nested line, not {}: {nested:?}", nested.len());
+        };
+        assert!(
+            line.iter().any(|f| f == "path=sub/inside.bin"),
+            "names it: {line:?}"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, SWEEP_LINE), 0);
+    }
+
+    /// Matrix row "Held path now tracked": a held path the index carries is
+    /// the walk's business, never the second look's. `tracked.txt` is
+    /// committed, rewritten (held), then written back to its original bytes:
+    /// the next walk finds it clean and reports nothing, the second look
+    /// declines it because the index carries it, and `retain` forgets the
+    /// episode — `file_state` empty, nothing settling, nothing committed —
+    /// while `held_paths` listed it for the walk's includes right up to that
+    /// pass.
+    #[test]
+    fn a_held_path_the_index_carries_is_the_walks_business_not_the_second_looks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let tracked = p.local_path.join("tracked.txt");
+        std::fs::write(&tracked, b"one").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
+        let _tx = arm_watcher(&engine, &p);
+
+        std::fs::write(&tracked, b"two, for a moment").expect("rewrite");
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("opens the episode"),
+            0,
+            "held"
+        );
+        std::fs::write(&tracked, b"one").expect("the original bytes back");
+
+        assert_eq!(
+            engine.held_paths(&p),
+            vec![PathBuf::from("tracked.txt")],
+            "the policy still lists it as an include"
+        );
+        let repo = engine.open_repo(&p).expect("repo");
+        assert_eq!(
+            engine.paths_for_the_second_look(
+                &p,
+                &repo,
+                std::slice::from_ref(&tracked),
+                &HashSet::new()
+            ),
+            SecondLook::default(),
+            "but the second look declines a path the index carries"
+        );
+
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the pass after the bytes came back"),
+            0,
+            "nothing to commit: the file matches the index"
+        );
+        let carried = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows");
+        assert!(
+            carried.is_empty(),
+            "the episode is finished business: {carried:?}"
+        );
+        assert_eq!(
+            Engine::lock(&engine.status)
+                .get(&p.id)
+                .map(|snapshot| snapshot.settling),
+            Some(0)
+        );
+        assert_eq!(
+            engine.commit_walk_policy(&p),
+            git::repo::WalkPolicy::tracked_only()
+        );
+    }
+
+    /// The Ask-First evidence: five hundred held paths the index does not
+    /// carry are sorted by the second look well inside a second — one index
+    /// probe, one `lstat` and one excludes lookup each — and the pass that
+    /// then samples and commits them reads no directory. A cap on the
+    /// second look would be a cap on something cheaper than the walk it
+    /// replaced.
+    #[test]
+    fn five_hundred_held_unindexed_paths_get_their_second_look_inside_a_second() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        let many = p.local_path.join("many");
+        std::fs::create_dir_all(&many).expect("dir");
+        for i in 0..500u32 {
+            std::fs::write(many.join(format!("f{i:03}.bin")), format!("file {i}")).expect("write");
+        }
+        engine.upsert_profile(&p).expect("upsert");
+        let _tx = arm_watcher(&engine, &p);
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the first pass of a run sweeps"),
+            0
+        );
+        let held: Vec<PathBuf> = engine
+            .with_db(|conn| db::load_file_state(conn, &p.id))
+            .expect("rows")
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(held.len(), 500, "every one of them held");
+
+        let repo = engine.open_repo(&p).expect("repo");
+        let started = Instant::now();
+        let look = engine.paths_for_the_second_look(&p, &repo, &held, &HashSet::new());
+        let sorted_in = started.elapsed();
+        assert_eq!(look.sample.len(), 500);
+        assert!(look.held.is_empty() && look.collapsed.is_empty());
+        assert!(
+            sorted_in < Duration::from_secs(1),
+            "500 held unindexed paths sorted in {sorted_in:?}"
+        );
+
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        platform.advance_ms(p.effective_settle_ms() as i64 + 1);
+        let started = Instant::now();
+        assert_eq!(
+            engine
+                .commit_local(&p, SyncSource::Watch, None)
+                .expect("the second pass"),
+            500,
+            "all committed by the pass's own sample"
+        );
+        let passed_in = started.elapsed();
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            0,
+            "and no directory was read for any of them (pass took {passed_in:?})"
+        );
+        let walked = last_walk(&log);
+        assert!(
+            walk_says(&walked, "untracked=0") && walk_says(&walked, "included=500"),
+            "the narrowed walk carried all 500 as includes and reported none: {walked:?}"
+        );
+    }
+
+    /// Matrix row "Sweep finds nothing new": a sweep over a clean tree reports
     /// `untracked=0`, holds nothing, and buys the next walk no directory scan
     /// — the steady policy is the index-only walk it would have been anyway.
+    /// The `untracked_appeared` flag is the watcher's `Create` and the rename
+    /// prime's; a pass sets it for nothing it found.
     #[test]
     fn a_sweep_that_finds_nothing_new_buys_no_walk() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -24794,18 +26659,13 @@ mod tests {
             0
         );
         assert_eq!(
-            log.count(
-                tracing::Level::INFO,
-                "untracked sweep: this walk reads every directory"
-            ),
+            log.count(tracing::Level::INFO, SWEEP_LINE),
             1,
             "the pass was the sweep"
         );
-        let walked = log.fields_of(tracing::Level::INFO, "status walk finished");
+        let walked = last_walk(&log);
         assert!(
-            walked
-                .iter()
-                .any(|line| line.iter().any(|f| f == "untracked=0")),
+            walk_says(&walked, "untracked=0"),
             "and it found nothing: {walked:?}"
         );
         assert!(
@@ -24819,11 +26679,11 @@ mod tests {
         );
     }
 
-    /// Matrix row "Restart between pass 1 and 2": the flag lives with the
-    /// process, and the sweep on the first pass of a run is what covers a
-    /// restart between the two looks. `file_state` carries the episode across
-    /// the reopen; the new run's first pass reads every directory, so it can
-    /// see the path the last run held, and commits it once it has settled.
+    /// Matrix row "Restart between the looks": `file_state` carries the
+    /// episode across the reopen, and `gate_for` imports it before the new
+    /// run's first pass looks. That pass is the run's sweep, so it reads the
+    /// directories and reports the path itself; the sample it takes is the
+    /// second, and the file is committed on the spot.
     #[tokio::test]
     async fn a_sweeps_find_is_committed_after_a_restart_between_its_two_looks() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -24844,20 +26704,16 @@ mod tests {
             "one sample is not two"
         );
         assert!(
-            Engine::lock(&first.untracked_appeared).contains(&p.id),
-            "the sweep's find set the flag"
+            !Engine::lock(&first.untracked_appeared).contains(&p.id),
+            "the sweep's find owes no scan: the next pass samples it itself"
         );
         drop(tx);
         drop(first);
 
-        // The flag went down with the process; the rows did not.
+        // The gate went down with the process; the rows did not.
         let Ok(second) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
             return;
         };
-        assert!(
-            !Engine::lock(&second.untracked_appeared).contains(&p.id),
-            "the flag is process-local"
-        );
         let carried = second
             .with_db(|conn| db::load_file_state(conn, &p.id))
             .expect("rows");
@@ -24868,37 +26724,13 @@ mod tests {
         let _tx = arm_watcher(&second, &p);
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
 
-        // The first pass of the new run sweeps, and so can see the path; how
-        // many passes the gate then wants is the gate's business — what must
-        // hold is that none of them forgets the episode on the way.
-        let mut committed = 0;
-        for pass in 1..=3 {
-            committed = second
+        assert_eq!(
+            second
                 .commit_local(&p, SyncSource::Watch, None)
-                .expect("a pass of the new run");
-            if pass == 1 {
-                // The new run's first pass is the sweep, and the sweep can see
-                // the path: it either committed it outright or held it and
-                // bought the next walk the scan — there is no third outcome
-                // in which the episode is forgotten.
-                assert!(
-                    committed > 0 || Engine::lock(&second.untracked_appeared).contains(&p.id),
-                    "the first pass of the new run either commits the find or sets the flag"
-                );
-            }
-            if committed > 0 {
-                break;
-            }
-            let carried = second
-                .with_db(|conn| db::load_file_state(conn, &p.id))
-                .expect("rows");
-            assert!(
-                carried.iter().any(|(path, _)| path == &found),
-                "pass {pass} of the new run must not forget the episode"
-            );
-            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        }
-        assert_eq!(committed, 1, "the new run commits the last run's find");
+                .expect("the first pass of the new run"),
+            1,
+            "the new run's first pass seeds the gate from file_state, looks a second time, and commits"
+        );
         let rows = second.activity(&p.id, 10).await.expect("activity");
         let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
         assert!(
@@ -24907,14 +26739,16 @@ mod tests {
         );
     }
 
-    /// The restart ordering the field log shows (`caller="poll"` first after
-    /// the 02:18 restart): with the Sync pane open, the *poll* leg's walk is
-    /// the run's first, and it takes the run's sweep with it — `walk_policy`
-    /// stamps the clock for both legs. The commit leg's first walk is then the
-    /// narrowed one against a gate not yet seeded; `gate_for` would import the
-    /// last run's held untracked path from `file_state`, and `retain` would
-    /// forget it — the original loss, on a realistic ordering. The guard must
-    /// therefore see a held path that only `file_state` carries.
+    /// Matrix row "Poll walked first after restart" — the ordering the field
+    /// log shows (`caller="poll"` first after the 02:18 restart): with the
+    /// Sync pane open, the *poll* leg's walk is the run's first, and it takes
+    /// the run's sweep with it — `walk_policy` stamps the clock for both legs.
+    /// The commit leg's first walk is then the narrowed one against a gate not
+    /// yet seeded; `gate_for` imports the last run's held untracked path from
+    /// `file_state`, the walk reports nothing for it, and before `1c26f53a`
+    /// `retain` forgot it — the original loss, on a realistic ordering.
+    /// `1c26f53a` widened the walk for it; now the pass seeds, samples the
+    /// path itself, and commits it, with no widening and no line.
     #[tokio::test]
     async fn a_sweeps_find_survives_a_restart_whose_first_walk_was_the_polls() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -24955,45 +26789,43 @@ mod tests {
             second.existing_gate(&p.id).is_none(),
             "no walk has run, so the gate is not seeded and file_state is all there is"
         );
-        // The commit leg's turn: the sweep is spent, the flag went down with
-        // the last process, and the gate is empty — the held path is a row in
-        // `file_state` and nothing else, and the guard must find it there.
+        // The poll's policy logged the run's one sweep line; nothing below
+        // may add to it.
+        let swept = log.count(tracing::Level::INFO, SWEEP_LINE);
+        assert_eq!(swept, 1, "the poll took the run's sweep");
+        // The commit leg's turn: the sweep is spent and the gate is empty —
+        // the held path is a row in `file_state` and nothing else. The policy
+        // still names it, as an include of the narrowed walk, and widens for
+        // nothing.
+        let policy = second.commit_walk_policy(&p);
         assert_eq!(
-            second.commit_walk_policy(&p),
-            git::repo::WalkPolicy::full(),
-            "a held path only file_state carries still widens the commit walk"
+            policy,
+            git::repo::WalkPolicy::tracked_only().including(vec![PathBuf::from("found.bin")]),
+            "a held path only file_state carries rides the narrowed walk as an include"
         );
-        let warned = log.fields_of(tracing::Level::WARN, WIDENING_WARN);
-        let [line] = warned.as_slice() else {
-            panic!(
-                "the guard warns exactly once, not {}: {warned:?}",
-                warned.len()
-            );
-        };
-        let line = line.join(" ");
-        assert!(line.contains("missing=1"), "the count: {line}");
-        assert!(line.contains("path=found.bin"), "and the path: {line}");
+        assert!(!policy.find_untracked, "and buys no directory walk");
 
-        // And the walk that policy drives commits the file.
+        // The walk that policy drives reports nothing for the path; the pass
+        // seeds the gate from file_state, samples the path itself, and
+        // commits it — the first pass of the new run, no widening needed.
         platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        let mut committed = 0;
-        for pass in 1..=3 {
-            committed = second
+        assert_eq!(
+            second
                 .commit_local(&p, SyncSource::Watch, None)
-                .expect("a pass of the new run");
-            if committed > 0 {
-                break;
-            }
-            let carried = second
-                .with_db(|conn| db::load_file_state(conn, &p.id))
-                .expect("rows");
-            assert!(
-                carried.iter().any(|(path, _)| path == &found),
-                "pass {pass} of the new run must not forget the episode"
-            );
-            platform.advance_ms(p.effective_settle_ms() as i64 + 1);
-        }
-        assert_eq!(committed, 1, "the new run commits the last run's find");
+                .expect("the commit leg's first pass of the new run"),
+            1,
+            "the commit leg's pass seeds, re-samples, commits"
+        );
+        assert_eq!(
+            log.count(tracing::Level::INFO, SWEEP_LINE),
+            swept,
+            "and no directory was read for it"
+        );
+        let walked = last_walk(&log);
+        assert!(
+            walk_says(&walked, "untracked=0") && walk_says(&walked, "included=1"),
+            "the walk was the narrowed one, which reported nothing for the path: {walked:?}"
+        );
         let rows = second.activity(&p.id, 10).await.expect("activity");
         let paths: Vec<&str> = rows.iter().map(|row| row.path.as_str()).collect();
         assert!(
@@ -28384,8 +30216,8 @@ mod tests {
         assert_eq!(commit_after_settling(&engine, &platform, &p), 1);
         let plans = || engine.counters(&p.id).lfs_prune_plans;
 
-        engine.mark_synced(&p).await;
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(
             plans(),
             0,
@@ -28394,13 +30226,13 @@ mod tests {
 
         // The upload leg's confirmation — the label is irrelevant to the flag.
         engine.note_unit_synced(&p, None, &"a".repeat(64));
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(
             plans(),
             1,
             "a completed upload is what makes an object releasable"
         );
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(
             plans(),
             1,
@@ -28408,13 +30240,13 @@ mod tests {
         );
 
         platform.advance_ms(RELEASE_LOOK_EVERY_MS);
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(
             plans(),
             2,
             "the hourly look covers what the flag cannot see"
         );
-        engine.mark_synced(&p).await;
+        engine.mark_synced(&p, RemoteContact::Reached).await;
         assert_eq!(plans(), 2, "once, and the plan re-armed the look");
     }
 
@@ -29650,6 +31482,33 @@ mod tests {
             .expect("the profile row is readable")
     }
 
+    /// The row's `state` column as spelled on disk, read raw so a test can
+    /// tell `offline` from a word the reader would have mapped away.
+    fn stored_state(engine: &Engine, id: &str) -> String {
+        engine
+            .with_db(|conn| {
+                conn.query_row("SELECT state FROM profiles WHERE id = ?1", [id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(SyncError::from)
+            })
+            .expect("the profile row is readable")
+    }
+
+    /// The row's `updated_ms`: when the last durable writer touched it.
+    fn stored_updated_ms(engine: &Engine, id: &str) -> i64 {
+        engine
+            .with_db(|conn| {
+                conn.query_row(
+                    "SELECT updated_ms FROM profiles WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(SyncError::from)
+            })
+            .expect("the profile row is readable")
+    }
+
     /// How many journal rows of one kind this profile owns.
     fn units_of_kind(engine: &Engine, id: &str, kind: &str) -> u32 {
         engine
@@ -30601,6 +32460,1119 @@ mod tests {
                 .get(&p.id)
                 .is_none(),
             "a completed unit is the reset"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A folder's durable status tells the truth
+    // -----------------------------------------------------------------------
+
+    /// A network failure, the way every one of them arrives: through
+    /// `record_failure`, which is what a failing fetch, push or upload ends in
+    /// whether the pass was the supervisor's or an explicit sync.
+    fn go_offline(engine: &Engine, p: &SyncProfile) {
+        engine.record_failure(
+            p,
+            &SyncError::Network {
+                host: "127.0.0.1".to_owned(),
+                reason: "connection refused".to_owned(),
+            },
+        );
+    }
+
+    /// Row 1. A folder whose push keeps failing is in the sticky offline set,
+    /// and a pass that moves nothing must not write over that: neither the
+    /// queue refresh that ends `Syncing` nor the word a finished pass writes.
+    /// On hesperia both did — 1 044 consecutive push failures, and the row
+    /// and `keeper-syncd status` read `watching` throughout.
+    ///
+    /// The two writers are driven directly because neither `tick` nor
+    /// `sync_once` can reach them while the remote is down: the tick skips an
+    /// offline profile until a unit is due and the explicit pass fails on its
+    /// fetch. The sequence is the one a starting unit produces — `publish`
+    /// flips the snapshot to `Syncing` the moment a phase begins — followed by
+    /// the refresh a drain ends with, and then the pass end itself.
+    #[test]
+    fn an_offline_folder_stays_offline_through_a_pass_that_moves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+
+        // A retry starts moving, and nothing is left in the queue behind it.
+        engine.publish(engine.progress(&p, SyncPhase::Pushing));
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Syncing,
+            "arranged: a phase in flight reads as syncing"
+        );
+        engine.refresh_pending(&p.id);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Offline, "{snapshot:?}");
+        assert_eq!(
+            snapshot.phase,
+            SyncPhase::Idle,
+            "the phase is still retired"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+
+        // And the word a finished pass writes — which, unmoved, is no write.
+        let written = stored_updated_ms(&engine, &p.id);
+        platform.advance_ms(1_000);
+        engine.settle_and_persist(&p.id);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            written,
+            "a word that did not move is not written again"
+        );
+        assert!(
+            engine.status(&p.id).expect("status").error.is_none(),
+            "offline is a state, not an error"
+        );
+    }
+
+    /// Row 2. The one exit from `offline` is a unit succeeding, and when it
+    /// does the folder reads `watching` in memory **and in the row**, stamped
+    /// with the moment — through the supervisor's tick, which has no other
+    /// pass end than the queue refresh.
+    #[tokio::test]
+    async fn a_unit_succeeding_after_offline_writes_watching_to_the_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        let p = committed_fixture_at(&engine, &platform, dir.path(), &remote.to_string_lossy());
+        go_offline(&engine, &p);
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        let written_offline_at = stored_updated_ms(&engine, &p.id);
+
+        // An offline profile only ticks when a unit is due; give it one, and
+        // move the clock so the write it produces is distinguishable.
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Pull, 0, 0).map(drop))
+            .expect("enqueue");
+        platform.advance_ms(60_000);
+        let _ = engine.tick().await;
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert!(
+            !Engine::lock(&engine.offline).contains(&p.id),
+            "the success is what leaves the sticky set"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            platform.now_ms(),
+            "the row says when it became true"
+        );
+        assert!(stored_updated_ms(&engine, &p.id) > written_offline_at);
+    }
+
+    /// Row 3. A folder that stopped with an error keeps the error and the word
+    /// through a quiet pass: the queue emptying is not the success that
+    /// retires either.
+    #[test]
+    fn a_folder_needing_attention_keeps_its_error_through_a_quiet_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine.record_failure(
+            &p,
+            &SyncError::Forbidden {
+                host: "git.invalid".to_owned(),
+            },
+        );
+        let before = engine.status(&p.id).expect("status");
+        assert_eq!(before.state, ProfileState::NeedsAttention, "arranged");
+        let sentence = before.error.clone().expect("arranged: the error stands");
+        assert_eq!(
+            stored_last_error(&engine, &p.id).as_deref(),
+            Some(sentence.as_str())
+        );
+
+        // A retry runs and leaves nothing queued.
+        engine.publish(engine.progress(&p, SyncPhase::Fetching));
+        engine.refresh_pending(&p.id);
+        let after = engine.status(&p.id).expect("status");
+        assert_eq!(after.state, ProfileState::NeedsAttention, "{after:?}");
+        assert_eq!(after.error.as_deref(), Some(sentence.as_str()));
+        assert_eq!(stored_state(&engine, &p.id), "needsAttention");
+        assert_eq!(
+            stored_last_error(&engine, &p.id).as_deref(),
+            Some(sentence.as_str())
+        );
+
+        // The pass end says the same.
+        engine.settle_and_persist(&p.id);
+        let settled = engine.status(&p.id).expect("status");
+        assert_eq!(settled.state, ProfileState::NeedsAttention, "{settled:?}");
+        assert_eq!(settled.error.as_deref(), Some(sentence.as_str()));
+    }
+
+    /// Row 4. An error persisted by an earlier run is visible to a fresh
+    /// process — `keeper-syncd status` is one — and is retired, in memory and
+    /// in the row, by that process's first successful unit. Before this the
+    /// snapshot was seeded from `state` alone, so `clear_warning`'s "only when
+    /// the snapshot had one" gate never fired for it, and tgdrive-light read
+    /// "this folder's first copy never finished" nine days after it had.
+    #[tokio::test]
+    async fn an_error_from_a_previous_run_is_retired_by_this_runs_first_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        let sentence = "this folder's first copy never finished: connection reset";
+        let p = {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            let p = committed_fixture_at(&first, &platform, dir.path(), &remote.to_string_lossy());
+            first.set_state(&p.id, ProfileState::NeedsAttention);
+            first.set_error(&p.id, Some(sentence));
+            p
+        };
+
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+        let seeded = engine.status(&p.id).expect("status");
+        assert_eq!(seeded.state, ProfileState::NeedsAttention, "{seeded:?}");
+        assert_eq!(
+            seeded.error.as_deref(),
+            Some(sentence),
+            "a fresh process shows the error the last one left"
+        );
+
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Pull, 0, 0).map(drop))
+            .expect("enqueue");
+        platform.advance_ms(60_000);
+        let _ = engine.tick().await;
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert_eq!(
+            stored_last_error(&engine, &p.id),
+            None,
+            "and the row agrees"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            platform.now_ms(),
+            "the retire is dated"
+        );
+    }
+
+    /// Row 5, as amended. A persisted `offline` is believed while it is fresh
+    /// — `keeper-syncd status` is a fresh process too, and it must not print
+    /// `idle` beside a row the daemon re-stamped `offline` a minute ago — and
+    /// disbelieved once it is old: an hour-old `offline` is an observation
+    /// nothing has confirmed since, so a new run seeds `Idle` and re-probes,
+    /// and the next failure re-enters `offline` exactly as before. Neither
+    /// seeds the sticky set: that belongs to the run that observed the
+    /// failure, and this run's log gets its own onset line.
+    #[test]
+    fn a_persisted_offline_is_believed_while_fresh_and_re_probed_once_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let p = profile(dir.path());
+        {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            first.upsert_profile(&p).expect("upsert");
+            first.set_state(&p.id, ProfileState::Offline);
+            assert_eq!(stored_state(&first, &p.id), "offline");
+        }
+
+        // One minute later: the daemon that wrote this is still failing.
+        platform.advance_ms(60_000);
+        {
+            let Ok(fresh) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            let seeded = fresh.status(&p.id).expect("status");
+            assert_eq!(seeded.state, ProfileState::Offline, "{seeded:?}");
+            assert!(seeded.error.is_none(), "offline is a state, not an error");
+            assert!(
+                !Engine::lock(&fresh.offline).contains(&p.id),
+                "the word is seeded, the sticky set is not"
+            );
+        }
+
+        // An hour later: nobody has re-stamped it, so nobody is failing.
+        platform.advance_ms(3_600_000);
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let seeded = engine.status(&p.id).expect("status");
+        assert_eq!(seeded.state, ProfileState::Idle, "{seeded:?}");
+        assert!(seeded.error.is_none());
+        assert!(!Engine::lock(&engine.offline).contains(&p.id));
+
+        go_offline(&engine, &p);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            platform.now_ms(),
+            "and the re-entry is dated, which is what makes the next process believe it"
+        );
+    }
+
+    /// A seeded `offline` word is a label for readers, not a verdict this run
+    /// has reached: the sticky set is empty and there is no journal row to wait
+    /// for, so a tick gate that read the word would hold the folder off until
+    /// the row went stale — or forever, if the process that stamped it is the
+    /// one that died. The gate reads the set, so the first tick re-probes.
+    #[tokio::test]
+    async fn a_seeded_offline_word_does_not_hold_the_first_tick_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let p = adoptable(dir.path());
+        {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            // A file first: an empty folder is a first clone, which needs the
+            // network; a folder with content is adopted in place, which does not.
+            std::fs::write(p.local_path.join("note.md"), b"adopted in place").expect("write");
+            first.upsert_profile(&p).expect("upsert");
+            first.ensure_repo(&p).expect("adopt");
+            first.set_state(&p.id, ProfileState::Offline);
+            assert_eq!(stored_state(&first, &p.id), "offline");
+        }
+        platform.advance_ms(60_000);
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline,
+            "the fresh row is believed"
+        );
+        assert!(
+            engine.remote_within_reach(&p).expect("the gate answers"),
+            "but with no failure of its own to wait out, this run may look"
+        );
+        let before = engine.counters(&p.id).status_walks;
+        let engine = Arc::new(engine);
+        engine.tick().await.expect("tick");
+        assert!(
+            engine.counters(&p.id).status_walks > before,
+            "the first tick walked the folder instead of skipping it"
+        );
+    }
+
+    /// The seed rule, one row per word and per age, with the amended Always
+    /// spelled out cell by cell: any error is `NeedsAttention` whatever the
+    /// word — a `NULL` word included; `NeedsAttention` and `MediaAbsent`
+    /// stand on their own; `offline` stands for the backoff cap plus the
+    /// longest attempt and not a millisecond longer, nor for a stamp from
+    /// the future; `syncing` and everything else is `Idle`; no row at all is
+    /// `Idle`.
+    #[test]
+    fn the_seeded_word_follows_the_row_by_error_then_word_then_age() {
+        use ProfileState::{Idle, MediaAbsent, NeedsAttention, Offline, Paused, Syncing, Watching};
+        let now = 10_000_000;
+        let runtime = |state: Option<ProfileState>, error: bool, age_ms: i64| db::ProfileRuntime {
+            state,
+            last_error: error.then(|| "the remote refused the credential".to_owned()),
+            updated_ms: now - age_ms,
+        };
+        let fresh = OFFLINE_SEED_MAX_AGE_MS - 1;
+        let stale = OFFLINE_SEED_MAX_AGE_MS;
+
+        // (stored word, seeded word with no error, seeded word with an error)
+        let by_word = [
+            (Some(Idle), Idle, NeedsAttention),
+            (Some(Watching), Idle, NeedsAttention),
+            (Some(Syncing), Idle, NeedsAttention),
+            (Some(Paused), Idle, NeedsAttention),
+            (Some(NeedsAttention), NeedsAttention, NeedsAttention),
+            (Some(MediaAbsent), MediaAbsent, NeedsAttention),
+            (None, Idle, NeedsAttention),
+        ];
+        for (stored, clean, erring) in by_word {
+            for age in [0, fresh, stale] {
+                assert_eq!(
+                    Engine::seeded_state(Some(&runtime(stored, false, age)), now),
+                    clean,
+                    "{stored:?} with no error, {age} ms old"
+                );
+                assert_eq!(
+                    Engine::seeded_state(Some(&runtime(stored, true, age)), now),
+                    erring,
+                    "{stored:?} with an error, {age} ms old"
+                );
+            }
+        }
+
+        // A `NULL` word is no word, and the sentence beside it still decides.
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(None, true, 0)), now),
+            NeedsAttention,
+            "a row with no word and an error seeds off the error"
+        );
+
+        // `offline` is the one word whose age matters.
+        assert_eq!(
+            OFFLINE_SEED_MAX_AGE_MS,
+            20 * 60 * 1_000,
+            "the backoff cap (10 min) plus the longest attempt (10 min)"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), false, 0)), now),
+            Offline
+        );
+        assert_eq!(
+            Engine::seeded_state(
+                Some(&runtime(Some(Offline), false, 2 * REMOTE_POLL_MS)),
+                now
+            ),
+            Offline,
+            "the old 10-min boundary — the cap exactly, where a capped daemon's \
+             next stamp is due — is still fresh"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), false, fresh)), now),
+            Offline,
+            "one millisecond under the window is still fresh"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), false, stale)), now),
+            Idle,
+            "the window exactly is stale"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), false, -1)), now),
+            Idle,
+            "a stamp from the future is not young, it is unbelievable"
+        );
+        assert_eq!(
+            Engine::seeded_state(Some(&runtime(Some(Offline), true, 0)), now),
+            NeedsAttention,
+            "an error outranks even a fresh offline"
+        );
+        assert_eq!(Engine::seeded_state(None, now), Idle, "no row at all");
+    }
+
+    /// A folder switched off keeps its word — `Paused` is a setting — and
+    /// keeps the sentence the last run left beside it, so the person who
+    /// switches it back on sees why it had stopped before they did.
+    #[test]
+    fn a_paused_folder_with_a_persisted_error_seeds_paused_with_the_sentence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let sentence = "the remote refused the credential";
+        let mut p = profile(dir.path());
+        {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            first.upsert_profile(&p).expect("upsert");
+            first.set_state(&p.id, ProfileState::NeedsAttention);
+            first.set_error(&p.id, Some(sentence));
+            p.enabled = false;
+            first.upsert_profile(&p).expect("switch off");
+        }
+        let Ok(fresh) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let seeded = fresh.status(&p.id).expect("status");
+        assert_eq!(seeded.state, ProfileState::Paused, "{seeded:?}");
+        assert_eq!(
+            seeded.error.as_deref(),
+            Some(sentence),
+            "the sentence is kept"
+        );
+    }
+
+    /// `RemoteContact::join`, every cell: `Failed` dominates, then `Reached`,
+    /// and two `Skipped` are `Skipped`. Symmetric, so the order legs run in
+    /// cannot change what a pass proved.
+    #[test]
+    fn remote_contact_folds_most_pessimistic_first() {
+        use RemoteContact::{Failed, Reached, Skipped};
+        let table = [
+            (Skipped, Skipped, Skipped),
+            (Skipped, Reached, Reached),
+            (Skipped, Failed, Failed),
+            (Reached, Skipped, Reached),
+            (Reached, Reached, Reached),
+            (Reached, Failed, Failed),
+            (Failed, Skipped, Failed),
+            (Failed, Reached, Failed),
+            (Failed, Failed, Failed),
+        ];
+        for (left, right, folded) in table {
+            assert_eq!(left.join(right), folded, "{left:?} join {right:?}");
+            assert_eq!(right.join(left), folded, "{right:?} join {left:?}");
+        }
+    }
+
+    /// The legacy row: `watching` beside an error. Every pass end used to
+    /// write `watching` over a standing error, so this is the shape a store
+    /// from before the fix actually holds — and it seeds `NeedsAttention`
+    /// with the sentence, is shown by a fresh process, and is retired by that
+    /// process's first successful unit, in memory and in the row.
+    #[tokio::test]
+    async fn a_legacy_watching_row_with_an_error_seeds_needs_attention_until_a_unit_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        let sentence = "sync has failed 3 times in a row: the remote refused the credential";
+        let p = {
+            let Ok(first) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+                return;
+            };
+            let p = committed_fixture_at(&first, &platform, dir.path(), &remote.to_string_lossy());
+            first.set_error(&p.id, Some(sentence));
+            first.set_state(&p.id, ProfileState::Watching);
+            assert_eq!(stored_state(&first, &p.id), "watching", "arranged: the lie");
+            p
+        };
+
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let engine = Arc::new(engine);
+        let seeded = engine.status(&p.id).expect("status");
+        assert_eq!(seeded.state, ProfileState::NeedsAttention, "{seeded:?}");
+        assert_eq!(seeded.error.as_deref(), Some(sentence));
+
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Pull, 0, 0).map(drop))
+            .expect("enqueue");
+        platform.advance_ms(60_000);
+        let _ = engine.tick().await;
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert!(snapshot.error.is_none(), "{snapshot:?}");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert_eq!(stored_last_error(&engine, &p.id), None);
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+    }
+
+    /// `settle`, every cell by hand. Columns: nothing standing and not
+    /// offline; a warning or error standing; in the sticky set; both. The
+    /// rules the cells encode: `Paused` is never overwritten; the sticky set
+    /// outranks everything else; `NeedsAttention` stands by its word or by a
+    /// sentence; `MediaAbsent` stands by its word; the rest settle to
+    /// `Watching`.
+    #[test]
+    fn settle_over_every_combination_of_offline_word_and_problem() {
+        use ProfileState::{Idle, MediaAbsent, NeedsAttention, Offline, Paused, Syncing, Watching};
+        let table = [
+            //  word            clean     problem         offline  offline+problem
+            (Idle, Watching, NeedsAttention, Offline, Offline),
+            (Watching, Watching, NeedsAttention, Offline, Offline),
+            (Syncing, Watching, NeedsAttention, Offline, Offline),
+            (Offline, Watching, NeedsAttention, Offline, Offline),
+            (
+                NeedsAttention,
+                NeedsAttention,
+                NeedsAttention,
+                Offline,
+                Offline,
+            ),
+            (MediaAbsent, MediaAbsent, NeedsAttention, Offline, Offline),
+            (Paused, Paused, Paused, Paused, Paused),
+        ];
+        for (word, clean, problem, offline, both) in table {
+            assert_eq!(
+                Engine::settle(false, Some((word, false))),
+                clean,
+                "{word:?}"
+            );
+            assert_eq!(
+                Engine::settle(false, Some((word, true))),
+                problem,
+                "{word:?} with a problem"
+            );
+            assert_eq!(
+                Engine::settle(true, Some((word, false))),
+                offline,
+                "{word:?} in the sticky set"
+            );
+            assert_eq!(
+                Engine::settle(true, Some((word, true))),
+                both,
+                "{word:?} in the sticky set with a problem"
+            );
+        }
+        assert_eq!(
+            Engine::settle(false, None),
+            Watching,
+            "no snapshot: nothing standing"
+        );
+        assert_eq!(
+            Engine::settle(true, None),
+            Offline,
+            "no snapshot, but the set knows"
+        );
+    }
+
+    /// Only the error is a standing problem. `warn` is also how the engine
+    /// says something informational — a pull request open for review — and a
+    /// folder wearing one of those is not a folder that has stopped: at a
+    /// pass end that touched no remote it settles to `Watching`, the warning
+    /// still shown, and `keeper-syncd doctor` has nothing to report.
+    #[test]
+    fn a_warning_alone_is_not_a_standing_problem() {
+        let mut snapshot = SyncStatus::idle("01", "fixture");
+        assert!(!Engine::has_problem(&snapshot));
+        snapshot.warning = Some("pull request #7 is open for review".to_owned());
+        assert!(!Engine::has_problem(&snapshot), "a warning alone");
+        snapshot.error = Some("the remote refused the credential".to_owned());
+        assert!(Engine::has_problem(&snapshot), "an error beside it");
+        snapshot.warning = None;
+        assert!(Engine::has_problem(&snapshot), "an error alone");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        engine.warn(
+            &p.id,
+            &p.name,
+            "pull request #7 is open for review".to_owned(),
+        );
+        engine.publish(engine.progress(&p, SyncPhase::Pushing));
+        // The pass end after a `Skipped` pass: nothing reached, nothing failed.
+        engine.settle_and_persist(&p.id);
+        let settled = engine.status(&p.id).expect("status");
+        assert_eq!(settled.state, ProfileState::Watching, "{settled:?}");
+        assert_eq!(
+            settled.warning.as_deref(),
+            Some("pull request #7 is open for review"),
+            "the warning is still shown"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+    }
+
+    /// A failure the remote *answered with* — a 403 here — is a round trip,
+    /// and the sticky set is about a remote that cannot be reached. After
+    /// `offline`, such a failure leaves the set, logs the exit once, and lets
+    /// the `NeedsAttention` the folder just earned stand instead of a stale
+    /// `offline` outranking it at the pass end.
+    #[test]
+    fn a_failure_the_remote_answered_with_ends_offline_and_reads_needs_attention() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+        assert!(Engine::lock(&engine.offline).contains(&p.id), "arranged");
+
+        engine.record_failure(
+            &p,
+            &SyncError::Forbidden {
+                host: "git.invalid".to_owned(),
+            },
+        );
+        assert!(
+            !Engine::lock(&engine.offline).contains(&p.id),
+            "the remote answered, so it is not unreachable"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 1);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::NeedsAttention, "{snapshot:?}");
+        assert!(snapshot.error.is_some(), "and the sentence stands");
+        assert_eq!(stored_state(&engine, &p.id), "needsAttention");
+
+        // The pass end keeps what the failure earned.
+        engine.settle_and_persist(&p.id);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::NeedsAttention
+        );
+        assert_eq!(stored_state(&engine, &p.id), "needsAttention");
+
+        // A failure the remote did not answer — a push held for its large
+        // files — is not an exit: it is raised on every pass of exactly the
+        // folder whose uploads are failing, and reading it as reachable would
+        // flap the word.
+        go_offline(&engine, &p);
+        engine.record_failure(&p, &SyncError::LfsUploadPending { objects: 1 });
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "a held push proves nothing about the remote"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 1);
+    }
+
+    /// A `Push` unit that finds nothing to send completes without a round
+    /// trip, and a unit that completes that way must not empty the sticky
+    /// set or log `sync reachable again` — the pass-end defect, one level
+    /// down: `drain` used to reset on every `Ok`, whatever the unit proved.
+    #[tokio::test]
+    async fn a_push_with_nothing_to_send_does_not_end_offline() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = adoptable(dir.path());
+        // A file inside the settle window: adopted in place, nothing committed
+        // yet, so the push has no commit to send and never asks the remote.
+        std::fs::write(p.local_path.join("note.md"), b"still settling").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        engine.ensure_repo(&p).expect("adopt");
+        go_offline(&engine, &p);
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Push, 0, 0).map(drop))
+            .expect("enqueue");
+
+        let engine = Arc::new(engine);
+        platform.advance_ms(1_000);
+        let _ = engine.tick().await;
+
+        assert_eq!(
+            units_of_kind(&engine, &p.id, WorkKind::PUSH),
+            0,
+            "arranged: the unit completed"
+        );
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "a push that sent nothing proved nothing"
+        );
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 0);
+    }
+
+    /// A transfer unit on a folder with large-file support off returns at
+    /// once, and a checkout of a folder with files in it adopts in place —
+    /// neither asks the remote anything, and neither may end `offline`.
+    #[tokio::test]
+    async fn a_unit_that_made_no_round_trip_does_not_end_offline() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.lfs_mode = LfsMode::Disabled;
+        std::fs::write(p.local_path.join("note.md"), b"adopted in place").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+
+        // The checkout: `.git` does not exist yet, and the folder has content.
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Checkout, 0, 0).map(drop))
+            .expect("enqueue checkout");
+        let contact = engine
+            .drain_kind(&p, WorkKind::CHECKOUT, SyncSource::Watch)
+            .await
+            .expect("the adoption succeeds");
+        assert_eq!(contact, RemoteContact::Skipped, "adopted, not cloned");
+        assert!(
+            p.local_path.join(".git").exists(),
+            "arranged: the repository exists"
+        );
+        assert_eq!(units_of_kind(&engine, &p.id, WorkKind::CHECKOUT), 0);
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "an adoption proves nothing"
+        );
+
+        // The transfer: large-file support is off, so there is nothing to move.
+        engine
+            .with_db(|conn| {
+                db::enqueue_unique(
+                    conn,
+                    &p.id,
+                    &WorkKind::LfsDownload {
+                        oid: "a".repeat(64),
+                        size: 7,
+                    },
+                    0,
+                    0,
+                )
+                .map(drop)
+            })
+            .expect("enqueue download");
+        let contact = engine
+            .drain_kind(&p, WorkKind::LFS_DOWNLOAD, SyncSource::Watch)
+            .await
+            .expect("a disabled transfer succeeds");
+        assert_eq!(contact, RemoteContact::Skipped, "nothing was transferred");
+        assert_eq!(units_of_kind(&engine, &p.id, WorkKind::LFS_DOWNLOAD), 0);
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "a disabled transfer proves nothing"
+        );
+
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 0);
+    }
+
+    /// The positive path, through `sync_once`: a fetch that comes back is a
+    /// round trip, so the pass empties the sticky set, logs the exit once and
+    /// writes `watching` with the moment — the one time `mark_synced` may.
+    #[tokio::test]
+    async fn a_pass_whose_fetch_came_back_ends_offline_once() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        let p = committed_fixture_at(&engine, &platform, dir.path(), &remote.to_string_lossy());
+        go_offline(&engine, &p);
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+
+        platform.advance_ms(60_000);
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("the fetch against the loopback remote comes back");
+        assert!(outcome.pulled, "arranged: the fetch ran");
+
+        assert!(
+            !Engine::lock(&engine.offline).contains(&p.id),
+            "a round trip that came back is the exit"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 1);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+    }
+
+    /// A pass that touched no remote at all — push-only, nothing committed,
+    /// nothing queued — proves nothing, and leaves the set and the row alone.
+    #[tokio::test]
+    async fn a_pass_that_skipped_every_leg_leaves_offline_standing() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let mut p = adoptable(dir.path());
+        p.direction = SyncDirection::PushOnly;
+        std::fs::write(p.local_path.join("note.md"), b"still settling").expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        engine.ensure_repo(&p).expect("adopt");
+        go_offline(&engine, &p);
+        let written = stored_updated_ms(&engine, &p.id);
+
+        platform.advance_ms(1_000);
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("every leg is skipped, none raises");
+        assert!(!outcome.pulled, "arranged: push-only");
+
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "nothing was proved"
+        );
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Offline
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            written,
+            "an unmoved word is not written"
+        );
+        assert_eq!(log.count(tracing::Level::INFO, "sync reachable again"), 0);
+    }
+
+    /// The hesperia shape, through `sync_once`. A pull-only folder whose
+    /// fetch is fine drains an `LfsUpload` unit that fails on the network —
+    /// the LFS server is a different host from the git remote — so the drain
+    /// records `offline` and reschedules the unit, and the pass reaches its
+    /// end with every inline leg clean. That end used to call
+    /// `note_unit_succeeded`, empty the sticky set, log `sync reachable again`
+    /// and write `watching`: thirteen times on 2026-09-09, beside 1 044
+    /// failures. Now the pass knows what it proved, and a drained failure
+    /// means it proved nothing the failure did not already disprove.
+    #[tokio::test]
+    async fn a_pass_whose_drained_unit_failed_does_not_declare_the_remote_reachable() {
+        let log = Arc::new(RecordedLog::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&log));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let remote = dir.path().join("remote.git");
+        gix::init_bare(&remote).expect("bare remote");
+        // A port nothing listens on: bound to learn the number, then closed,
+        // so the LFS batch call is refused at once rather than timing out.
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            listener.local_addr().expect("addr").port()
+        };
+
+        let mut p = SyncProfile::new(
+            "01JTESTPROFILE",
+            "fixture",
+            dir.path().join("work"),
+            remote.to_string_lossy().as_ref(),
+        );
+        p.lfs_threshold_bytes = 1024;
+        std::fs::create_dir_all(&p.local_path).expect("work dir");
+        std::fs::write(
+            p.local_path.join(".lfsconfig"),
+            format!("[lfs]\n\turl = http://127.0.0.1:{refused}/info/lfs\n"),
+        )
+        .expect("write .lfsconfig");
+        std::fs::write(p.local_path.join("clip.mp4"), vec![42u8; 200_000]).expect("write");
+        engine.upsert_profile(&p).expect("upsert");
+        assert_eq!(
+            commit_after_settling(&engine, &platform, &p),
+            2,
+            "arranged: the pointer and the config are committed"
+        );
+        assert_eq!(
+            engine.lfs_uploads_outstanding(&p).expect("count"),
+            1,
+            "arranged: the commit queued the upload it owes"
+        );
+        // Pull-only from here: the inline push leg is skipped, which is what
+        // lets the pass reach its end with the upload still owed.
+        p.direction = SyncDirection::PullOnly;
+        engine.upsert_profile(&p).expect("upsert pull-only");
+
+        let outcome = engine
+            .sync_once(&p.id, SyncSource::Manual)
+            .await
+            .expect("every inline leg is clean; the failure is the drained unit's");
+        assert!(outcome.pulled, "arranged: the fetch ran and came back");
+        assert_eq!(
+            engine.lfs_uploads_outstanding(&p).expect("count"),
+            1,
+            "arranged: the upload is still owed"
+        );
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Offline, "{snapshot:?}");
+        assert!(
+            Engine::lock(&engine.offline).contains(&p.id),
+            "the pass end did not empty the sticky set"
+        );
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(log.count(tracing::Level::INFO, "sync offline"), 1);
+        assert_eq!(
+            log.count(tracing::Level::INFO, "sync reachable again"),
+            0,
+            "a fetch that worked beside an upload that did not proves nothing"
+        );
+        assert!(
+            snapshot.last_sync_ms.is_some(),
+            "the pass itself still counts as this folder's work having run"
+        );
+    }
+
+    /// The only exit from `offline` moves the word with it, even when no
+    /// phase was ever published: a push with nothing to send never reads
+    /// `Syncing`, so `refresh_pending` never sees the edge it flips on, and
+    /// without this the folder stayed `offline` in the row after the unit
+    /// that proved otherwise.
+    #[test]
+    fn a_unit_succeeding_without_a_phase_still_writes_watching() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+        assert_eq!(stored_state(&engine, &p.id), "offline");
+        assert_eq!(
+            engine.status(&p.id).expect("status").phase,
+            SyncPhase::Idle,
+            "arranged: no phase in flight"
+        );
+
+        platform.advance_ms(1_000);
+        engine.note_unit_succeeded(&p, RemoteContact::Reached);
+
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+
+        // And the same for the word an error put there, once the error is
+        // gone: a `NeedsAttention` with nothing left to say why is `Watching`.
+        engine.record_failure(
+            &p,
+            &SyncError::Forbidden {
+                host: "git.invalid".to_owned(),
+            },
+        );
+        assert_eq!(stored_state(&engine, &p.id), "needsAttention", "arranged");
+        engine.note_unit_succeeded(&p, RemoteContact::Reached);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Watching, "{snapshot:?}");
+        assert!(snapshot.error.is_none());
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+
+        // A snapshot mid-phase is left to the refresh that ends the phase.
+        engine.publish(engine.progress(&p, SyncPhase::Pushing));
+        let written = stored_updated_ms(&engine, &p.id);
+        platform.advance_ms(1_000);
+        engine.note_unit_succeeded(&p, RemoteContact::Reached);
+        assert_eq!(
+            engine.status(&p.id).expect("status").state,
+            ProfileState::Syncing
+        );
+        assert_eq!(stored_updated_ms(&engine, &p.id), written, "no write");
+    }
+
+    /// `refresh_pending` writes the row only on the edge it owns: a snapshot
+    /// that is not `Syncing` is not its to move, and a queue that is not
+    /// empty ends nothing.
+    #[test]
+    fn refresh_pending_writes_the_row_only_when_it_moved_the_word() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        go_offline(&engine, &p);
+        let written = stored_updated_ms(&engine, &p.id);
+
+        // Not syncing: nothing to end.
+        platform.advance_ms(1_000);
+        engine.refresh_pending(&p.id);
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            written,
+            "no edge, no write"
+        );
+
+        // Syncing with work still queued: the phase is not over.
+        engine
+            .with_db(|conn| db::enqueue_unique(conn, &p.id, &WorkKind::Pull, 0, 0).map(drop))
+            .expect("enqueue");
+        engine.publish(engine.progress(&p, SyncPhase::Fetching));
+        engine.refresh_pending(&p.id);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Syncing, "{snapshot:?}");
+        assert_eq!(snapshot.pending, 1);
+        assert_eq!(stored_updated_ms(&engine, &p.id), written, "still no write");
+
+        // Empty queue: the edge, and one write, dated.
+        engine
+            .with_db(|conn| {
+                conn.execute("DELETE FROM journal WHERE profile_id = ?1", [&p.id])
+                    .map(drop)
+                    .map_err(SyncError::from)
+            })
+            .expect("empty the queue");
+        platform.advance_ms(1_000);
+        engine.refresh_pending(&p.id);
+        let snapshot = engine.status(&p.id).expect("status");
+        assert_eq!(snapshot.state, ProfileState::Offline, "{snapshot:?}");
+        assert_eq!(snapshot.phase, SyncPhase::Idle);
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+    }
+
+    /// Row 6. Both durable writers stamp `updated_ms` with the engine's clock,
+    /// so a reader can tell a row written a second ago from one the last run
+    /// left in August — and the retire that skips the write (no error to
+    /// retire) leaves the stamp alone, because nothing changed.
+    #[test]
+    fn every_state_and_error_write_stamps_updated_ms() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let platform = Arc::new(TestPlatform::new(dir.path()));
+        let Ok(engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
+            return;
+        };
+        let p = profile(dir.path());
+        engine.upsert_profile(&p).expect("upsert");
+        let created = stored_updated_ms(&engine, &p.id);
+        assert_eq!(created, platform.now_ms(), "arranged: the upsert stamps");
+
+        platform.advance_ms(1_000);
+        engine.set_state(&p.id, ProfileState::Watching);
+        assert_eq!(stored_state(&engine, &p.id), "watching");
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+
+        platform.advance_ms(1_000);
+        engine.set_error(&p.id, Some("the remote refused the credential"));
+        assert_eq!(stored_updated_ms(&engine, &p.id), platform.now_ms());
+
+        platform.advance_ms(1_000);
+        engine.clear_warning(&p.id);
+        assert_eq!(stored_last_error(&engine, &p.id), None);
+        let retired_at = stored_updated_ms(&engine, &p.id);
+        assert_eq!(
+            retired_at,
+            platform.now_ms(),
+            "the retire is a write, and dated"
+        );
+
+        platform.advance_ms(1_000);
+        engine.clear_warning(&p.id);
+        assert_eq!(
+            stored_updated_ms(&engine, &p.id),
+            retired_at,
+            "nothing to retire is no write at all"
         );
     }
 

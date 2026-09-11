@@ -404,10 +404,11 @@ pub fn index_recording(conn: &Connection, row: &RecordingRow) -> Result<(), Arch
 /// entry leaves exactly one entry, never two, and deleting an entry that is
 /// already gone deletes nothing and is not an error.
 ///
-/// `doc_id` is never recycled in practice because a `recordings_fts_docs` row
-/// is never deleted — Story 42.1 never deletes a session row either, since a
-/// missing folder is a fact for a later story to present rather than a reason
-/// to forget the session. Even if one were, the unconditional delete below
+/// A `doc_id` is recycled only once the table has emptied: an `INTEGER
+/// PRIMARY KEY` rowid is minted one above the largest id PRESENT, so while any
+/// row remains every id ever issued stays above the water line, and only a
+/// `recordings_fts_docs` table [`unindex_recording`] has emptied entirely
+/// starts again at 1. Harmless either way: the unconditional delete below
 /// means a reissued id inherits no stale text.
 fn index_text(conn: &Connection, session_id: &str, text: &str) -> Result<(), ArchiveError> {
     conn.execute(
@@ -432,6 +433,50 @@ fn index_text(conn: &Connection, session_id: &str, text: &str) -> Result<(), Arc
         rusqlite::params![doc_id, text],
     )
     .map_err(|e| ArchiveError::Sqlite(format!("could not index a recording: {e}")))?;
+    Ok(())
+}
+
+/// Remove a session's search entry — the trigrams and the `doc_id` that named
+/// them — so the session cannot be a hit any more.
+///
+/// The other half of [`index_recording`], called by
+/// [`super::recordings::rebuild_from_disk`] inside the transaction that
+/// deletes the row: a session whose row is gone and whose index entry is not
+/// would be a hit the search could not resolve to a row, which is the
+/// inconsistency Story 42.2 made the row-and-index pairing to prevent. A
+/// session that was never indexed deletes nothing and is not an error.
+///
+/// `recordings_fts` holds its own content (it is not an external-content
+/// table), so a plain `DELETE … WHERE rowid` is the correct removal — there
+/// is no `'delete'` command to issue and no content to hand back, unlike
+/// `events_fts` in [`super::db::delete_account_archive`].
+pub(super) fn unindex_recording(conn: &Connection, session_id: &str) -> Result<(), ArchiveError> {
+    let doc_id: Option<i64> = conn
+        .query_row(
+            "SELECT doc_id FROM recordings_fts_docs WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(ArchiveError::Sqlite(format!(
+                "could not read a search doc id: {other}"
+            ))),
+        })?;
+    let Some(doc_id) = doc_id else {
+        return Ok(());
+    };
+    conn.execute(
+        "DELETE FROM recordings_fts WHERE rowid = ?1",
+        rusqlite::params![doc_id],
+    )
+    .map_err(|e| ArchiveError::Sqlite(format!("could not clear a recording index entry: {e}")))?;
+    conn.execute(
+        "DELETE FROM recordings_fts_docs WHERE doc_id = ?1",
+        rusqlite::params![doc_id],
+    )
+    .map_err(|e| ArchiveError::Sqlite(format!("could not release a search doc id: {e}")))?;
     Ok(())
 }
 
@@ -1119,7 +1164,7 @@ mod tests {
 
     use crate::archive::recordings::{
         durability_label, ensure_recordings_schema, move_session, rebuild_from_disk,
-        upsert_recording, upsert_segment, RecordingSegmentRow,
+        upsert_recording, upsert_segment, RebuildRequest, RecordingSegmentRow,
     };
     use crate::recording::{
         CaptureTarget, SessionDevices, SessionManifest, SessionMeta, SessionMetaField,
@@ -1938,7 +1983,9 @@ mod tests {
         // already-indexed tree changes nothing.
         for _ in 0..2 {
             assert_eq!(
-                rebuild_from_disk(&conn, &root, "folder", None).expect("rebuild"),
+                rebuild_from_disk(&conn, &RebuildRequest::new(&root, "folder", None))
+                    .expect("rebuild")
+                    .written,
                 2
             );
         }

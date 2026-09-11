@@ -164,6 +164,39 @@ which is how the local signed path reuses the same chain.
 > script produces an identity-based requirement instead and fails loudly if it cannot. See
 > [recording.md](recording.md#for-developers-dev-builds).
 
+## What `commit=` and `sha_source=` mean
+
+Every log starts with a `build_identity` line: `keeper <version> commit=<sha>[-dirty]
+sha_source=<file|env|git|none> built=… profile=… target=…`. Read `sha_source` before trusting
+`commit`: the sha is baked in by `src-tauri/crates/keeper/build.rs` from the first of four sources
+that answers, and the field says which one did.
+
+- **`file`** — the gitignored stamp `src-tauri/crates/keeper/build-sha.txt`, the primary channel.
+  It is written by exactly one function, `keeper_stamp_build_sha` in `scripts/lib/build-sha.sh`,
+  from the checkout a script actually runs in; `-dirty` means that checkout had uncommitted
+  changes to tracked files. Four scripts call it before they rsync or build — `install-macos.sh`,
+  `install-ios.sh` and `check-macos.sh` on the workstation, before the rsync; `build-macos-signed.sh`
+  on whatever tree it builds — and where there is no `.git` to ask, the stamp is removed rather
+  than left stale. The stamp is the build directory's only word about itself on purpose: the Mac's
+  `~/keeper-check` has no `.git` (the three rsyncing scripts delete any leftover one before syncing),
+  and a `git` probe there would answer for the dotfiles checkout at `~/.git` instead, which is what
+  a build logged as `220f8bde27d2-dirty` on 2026-09-05. The library's header keeps the account.
+- **`env`** — `KEEPER_BUILD_SHA`, which the install scripts also export; it is the fallback when
+  the file is missing, not the other way round, because the export does not survive every hop of
+  the iOS build.
+- **`git`** — probed at build time from the tree's own `.git` (never a parent's). This is what CI
+  builds say, and what a developer's `cargo build` says when there is no stamp. A stamp on a
+  developer checkout is a statement made by the last script run and then left behind while the
+  developer keeps committing, so `build.rs` asks `git` as well whenever it can and, when the two
+  disagree, uses `git` and warns `keeper build sha: stamp <x> disagrees with git <y>; using git`.
+- **`none`** — `commit=unknown`: no stamp, no export, no `.git`.
+
+`build-macos-signed.sh` re-stamps only where `.git` exists; on the Mac's rsynced copy — where
+`install-macos.sh` dispatches it and where `release-macos.sh` runs it by hand — it keeps the stamp
+the workstation wrote and prints it, so a release names the commit the workstation was at when it
+rsynced. `cargo` prints the same fact as `warning: keeper build sha <sha> from <source>` on every
+build; a value that is not a sha is ignored with a warning rather than believed.
+
 ## How to cut a release
 
 1. Ensure `main` is green (CI passes, including the license firewall).

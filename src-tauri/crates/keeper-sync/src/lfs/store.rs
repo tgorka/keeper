@@ -7,7 +7,14 @@
 //! <git-dir>/lfs/objects/<oid[0:2]>/<oid[2:4]>/<oid>   published objects
 //! <git-dir>/lfs/incomplete/<oid>.part                 resumable download staging
 //! <git-dir>/lfs/tmp/                                  atomic-publish scratch
+//! <git-dir>/lfs/helpers/<pid>                         one per live filter-process helper
 //! ```
+//!
+//! `helpers/` is keeper's own and git-lfs never reads it: a marker per
+//! long-running `filter.lfs.process` helper, held under an exclusive lock for
+//! the helper's lifetime so the engine can tell a live helper from a dead one's
+//! leftover without a pid table — see [`LfsStore::register_helper`] and
+//! [`LfsStore::look_at_helpers`].
 //!
 //! # Blocking
 //!
@@ -20,10 +27,13 @@
 //! implementation of the same hash loop.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
+use fs4::fs_std::FileExt as _;
 use sha2::{Digest, Sha256};
 
 use crate::error::{Result, SyncError};
@@ -118,6 +128,138 @@ pub struct ScratchSweep {
     pub removed_bytes: u64,
 }
 
+/// What one look at the helpers found.
+///
+/// Four numbers and not one, because "2 helpers" alone cannot say whether the
+/// folder is healthy: `alive` is the count a person expects to see while a git
+/// is running here, `stuck` is the count that explains a slow walk, `removed`
+/// is the count that says how many helpers died without unregistering — every
+/// one of them a process that was killed rather than finished — and `skipped`
+/// is the count that says the other three could not be trusted, because a
+/// marker the lock could not be tried on is a helper this look cannot place.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HelperLook {
+    /// Markers whose lock is held: a helper process is alive behind each.
+    pub alive: u64,
+    /// The alive helpers idle for at least the look's threshold, as
+    /// `(pid, idle)`. A subset of `alive`.
+    pub stuck: Vec<(u32, Duration)>,
+    /// Markers whose lock could be taken — a dead helper's leftover — and were
+    /// unlinked.
+    pub removed: u64,
+    /// Markers the look could not open or try the lock on, as `(pid, idle)`
+    /// with the idle read off the mtime as for `stuck`. Not counted in
+    /// `alive` or `stuck`: a filesystem that refuses `flock` (some network
+    /// mounts do) would otherwise make every helper on it invisible and the
+    /// look read as healthy. The caller falls back to asking the pid table
+    /// whether each is alive, which is the question the lock normally answers.
+    pub skipped: Vec<(u32, Duration)>,
+}
+
+impl HelperLook {
+    /// The stuck helper idle the longest, if any.
+    ///
+    /// The one worth naming in a warning: on the folder this was measured on
+    /// eighteen helpers were stuck at once, and the reader wants the first one
+    /// and its parent, not eighteen lines.
+    pub fn oldest_stuck(&self) -> Option<(u32, Duration)> {
+        self.stuck.iter().copied().max_by_key(|(_, idle)| *idle)
+    }
+}
+
+/// A live helper's registration: the marker file and the exclusive lock on it.
+///
+/// Hold it for as long as the helper serves. Dropping it unlocks and unlinks
+/// the marker, so a helper that returns leaves nothing behind; a helper that
+/// is killed leaves the file, the kernel releases the lock with the process,
+/// and the next [`LfsStore::look_at_helpers`] tells the two apart by trying
+/// the lock.
+#[derive(Debug)]
+pub struct HelperMarker {
+    /// Kept open because the lock lives on this open file description, not on
+    /// the path.
+    file: File,
+    path: PathBuf,
+}
+
+impl HelperMarker {
+    /// Where the marker is.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Say "a request just finished": set the marker's mtime to now.
+    ///
+    /// The mtime is the whole idle signal, so a helper that serves for forty
+    /// minutes without pause is never mistaken for a stuck one — every request
+    /// it answers moves the clock.
+    pub fn touch(&self) -> std::io::Result<()> {
+        self.file.set_modified(SystemTime::now())
+    }
+}
+
+impl Drop for HelperMarker {
+    fn drop(&mut self) {
+        // Best effort on both counts: a helper on its way out has nobody to
+        // report to, and a marker it could not unlink is exactly what the
+        // look's `removed` arm exists for.
+        let _ = self.file.unlock();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The two places a test can stand between [`LfsStore::look_at_helpers`] and
+/// the filesystem. Private, and not `cfg(test)`: the production look runs
+/// through the same function with both seams closed, so what the tests drive
+/// is what ships.
+struct LookSeams<'a> {
+    /// How a marker's lock is tried; the real one is `try_lock_exclusive`.
+    try_lock: &'a dyn Fn(&File) -> std::io::Result<bool>,
+    /// Runs after a leftover's lock was taken and before its path is
+    /// unlinked — the instant a helper under a reused pid can rename a fresh
+    /// marker into place.
+    before_unlink: &'a mut dyn FnMut(&Path),
+}
+
+/// What a file name under `helpers/` says it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerName {
+    /// `<pid>`: a registered helper's marker.
+    Helper(u32),
+    /// `.<pid>.registering`: a marker being created, private to its process
+    /// until the rename that gives it its real name.
+    Staging(u32),
+}
+
+impl MarkerName {
+    fn parse(name: &str) -> Option<Self> {
+        if let Ok(pid) = name.parse::<u32>() {
+            return Some(Self::Helper(pid));
+        }
+        name.strip_prefix('.')
+            .and_then(|rest| rest.strip_suffix(".registering"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .map(Self::Staging)
+    }
+}
+
+/// Whether two metadata readings describe the same file, by identity rather
+/// than by name: the check that keeps a look from unlinking a fresh marker a
+/// reused pid renamed over a leftover's path.
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Without a stable file identity on this platform the look unlinks by path,
+/// as it did before the check existed; the race it guards against needs a
+/// pid to be reused inside one look, which is a Unix-shaped problem.
+#[cfg(not(unix))]
+fn same_file(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    true
+}
+
 impl LfsStore {
     /// Wrap an existing `…/lfs` directory path.
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -160,6 +302,211 @@ impl LfsStore {
     /// `objects/`, which is what makes the final rename atomic.
     pub fn tmp_dir(&self) -> PathBuf {
         self.root.join("tmp")
+    }
+
+    /// Where the live helpers' markers are: `<git-dir>/lfs/helpers`.
+    pub fn helpers_dir(&self) -> PathBuf {
+        self.root.join("helpers")
+    }
+
+    /// How long a helper may go without a request before a look calls it
+    /// stuck.
+    ///
+    /// A helper is idle between the requests of a git that is still running,
+    /// and a git walk over this folder is seconds — the field measurement was
+    /// two to four minutes with eighteen stuck helpers slowing it. Thirty
+    /// minutes is far past any walk that is still making progress and far
+    /// short of the three and a half hours the stuck ones were found at, so
+    /// the look can say "stuck" without ever saying it about a git that is
+    /// merely slow.
+    pub const STUCK_HELPER_IDLE: Duration = Duration::from_secs(30 * 60);
+
+    /// Register a long-running helper: create `helpers/<pid>`, take the
+    /// exclusive lock, and hand back both so the caller keeps them alive.
+    ///
+    /// An error means the helper serves unregistered — the caller says so once
+    /// on stderr, with the error, and goes on, because a filter that refused to
+    /// serve over a directory it could not create would turn housekeeping into
+    /// a failed `git status` (DW-206's shape, from the other side). That is
+    /// also why `helpers/` is created here and not in [`Self::ensure_layout`]:
+    /// the layout is what [`crate::lfs::filter::run_process`] fails on, and a
+    /// `helpers` path that cannot be a directory must cost the helper its
+    /// registration, never its service.
+    ///
+    /// The file is created and locked under a staging name and then renamed
+    /// into place, so there is no instant at which `helpers/<pid>` exists
+    /// unlocked: a look racing the registration either sees the locked marker
+    /// or nothing, never a fresh marker it would mistake for a leftover and
+    /// unlink out from under a live helper. The rename also replaces a dead
+    /// predecessor's leftover under a reused pid.
+    pub fn register_helper(&self, pid: u32) -> std::io::Result<HelperMarker> {
+        let dir = self.helpers_dir();
+        std::fs::create_dir_all(&dir)?;
+        let staging = dir.join(format!(".{pid}.registering"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&staging)?;
+        // `try_`, never the blocking form: this file is private to this
+        // process until the rename, so a lock somebody else holds is a
+        // fact worth refusing on, not waiting out.
+        if !file.try_lock_exclusive()? {
+            let _ = std::fs::remove_file(&staging);
+            return Err(fs4::lock_contended_error());
+        }
+        file.set_modified(SystemTime::now())?;
+        let path = dir.join(pid.to_string());
+        if let Err(err) = std::fs::rename(&staging, &path) {
+            let _ = std::fs::remove_file(&staging);
+            return Err(err);
+        }
+        Ok(HelperMarker { file, path })
+    }
+
+    /// Look at every registered helper: remove the dead ones' leftovers, count
+    /// the live ones, and name those idle for `idle` or longer as of `now`.
+    ///
+    /// The lock is the liveness test and the mtime the idle signal, so this
+    /// costs one `read_dir` and one `open` + `try_lock` per marker — no pid
+    /// table, no signal, nothing that touches the helper itself. A helper is
+    /// never killed here, whatever it looks like: it belongs to a git keeper
+    /// did not start, and that git holds state — an index lock, a half-written
+    /// index — that ending its filter would not release cleanly.
+    ///
+    /// Only a name that is a pid is a helper's marker. A `.<pid>.registering`
+    /// staging file is a helper mid-registration and is left alone — it is
+    /// counted on a later look, under its real name — unless it is older than
+    /// `idle`, when it is a registration that died between `open` and `rename`
+    /// and is unlinked if its lock is free, without counting as `removed`.
+    /// Anything else in the directory is not keeper's and is not touched.
+    ///
+    /// Never fails the caller: a look is housekeeping. A marker that cannot be
+    /// opened or whose lock cannot be tried is reported in
+    /// [`HelperLook::skipped`] rather than dropped, so a filesystem that
+    /// refuses locks cannot make the look read as healthy.
+    pub fn look_at_helpers(&self, now: SystemTime, idle: Duration) -> HelperLook {
+        self.look_at_helpers_via(
+            now,
+            idle,
+            &mut LookSeams {
+                try_lock: &|file| file.try_lock_exclusive(),
+                before_unlink: &mut |_| {},
+            },
+        )
+    }
+
+    /// [`Self::look_at_helpers`] with its two seams open. One function, not a
+    /// tested twin of the production one, so the two cannot drift.
+    fn look_at_helpers_via(
+        &self,
+        now: SystemTime,
+        idle: Duration,
+        seams: &mut LookSeams<'_>,
+    ) -> HelperLook {
+        let mut look = HelperLook::default();
+        let Ok(entries) = std::fs::read_dir(self.helpers_dir()) else {
+            return look;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(kind) = name.to_str().and_then(MarkerName::parse) else {
+                continue;
+            };
+            // A clock that moved backwards reads as "just touched", which is
+            // the arm that never accuses anyone.
+            let idle_for = meta
+                .modified()
+                .ok()
+                .and_then(|touched| now.duration_since(touched).ok())
+                .unwrap_or_default();
+            let pid = match kind {
+                MarkerName::Helper(pid) => pid,
+                MarkerName::Staging(_) => {
+                    if idle_for < idle {
+                        continue;
+                    }
+                    let Ok(file) = OpenOptions::new().read(true).open(&path) else {
+                        continue;
+                    };
+                    if matches!((seams.try_lock)(&file), Ok(true)) {
+                        Self::unlink_if_unchanged(&path, file, seams);
+                    }
+                    continue;
+                }
+            };
+            let file = match OpenOptions::new().read(true).open(&path) {
+                Ok(file) => file,
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), %err, "cannot open an lfs helper marker");
+                    look.skipped.push((pid, idle_for));
+                    continue;
+                }
+            };
+            match (seams.try_lock)(&file) {
+                // The kernel handed the lock over: whoever held it is gone.
+                Ok(true) => {
+                    if Self::unlink_if_unchanged(&path, file, seams) {
+                        look.removed += 1;
+                    }
+                }
+                Ok(false) => {
+                    look.alive += 1;
+                    if idle_for >= idle {
+                        look.stuck.push((pid, idle_for));
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(path = %path.display(), %err, "cannot try the lock on an lfs helper marker");
+                    look.skipped.push((pid, idle_for));
+                }
+            }
+        }
+        look
+    }
+
+    /// Unlink a leftover whose lock this look has just taken — but only the
+    /// file that was opened, never whatever now stands at its path.
+    ///
+    /// Between the `open` and the `remove_file` a helper under a reused pid
+    /// can rename its fresh, locked marker over the same name; unlinking by
+    /// path then would take a live helper's marker out from under it, and the
+    /// next look would call that helper dead. So the opened file's identity is
+    /// compared with the path's before the unlink, and a mismatch leaves the
+    /// path alone. `true` when the leftover is gone — by this unlink, or by
+    /// its own helper's between the two calls.
+    fn unlink_if_unchanged(path: &Path, opened: File, seams: &mut LookSeams<'_>) -> bool {
+        (seams.before_unlink)(path);
+        let identity = opened.metadata();
+        let _ = opened.unlock();
+        drop(opened);
+        match (identity, std::fs::metadata(path)) {
+            (Ok(opened), Ok(on_disk)) if !same_file(&opened, &on_disk) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    "a new lfs helper took this marker's name between open and unlink; leaving it"
+                );
+                return false;
+            }
+            // Unlinked by its own helper between our `open` and now — the
+            // helper is gone either way.
+            (_, Err(err)) if err.kind() == std::io::ErrorKind::NotFound => return true,
+            _ => {}
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => {
+                tracing::debug!(path = %path.display(), %err, "cannot remove a dead lfs helper's marker");
+                false
+            }
+        }
     }
 
     /// How old scratch has to be before a sweep is willing to call it debris.
@@ -763,5 +1110,342 @@ mod tests {
             hex::encode(honest.finalize()),
             "forgotten state means the file is read, as it is after a restart"
         );
+    }
+
+    /// The mechanism behind the helper look, one matrix row at a time and
+    /// without a process: the marker is a locked file, and a lock is what a
+    /// dead process cannot keep.
+    mod helpers {
+        use super::*;
+
+        const A_MINUTE: Duration = Duration::from_secs(60);
+
+        #[test]
+        fn a_registered_helper_holds_a_locked_marker_a_look_counts_alive() {
+            let (_dir, store) = store();
+            let marker = store.register_helper(4242).expect("register");
+            assert_eq!(marker.path(), store.helpers_dir().join("4242"));
+            assert!(marker.path().is_file());
+            assert!(
+                !store.helpers_dir().join(".4242.registering").exists(),
+                "the staging name is gone once the marker is in place"
+            );
+
+            let look = store.look_at_helpers(SystemTime::now(), LfsStore::STUCK_HELPER_IDLE);
+            assert_eq!(
+                look,
+                HelperLook {
+                    alive: 1,
+                    stuck: Vec::new(),
+                    removed: 0,
+                    skipped: Vec::new()
+                },
+                "a locked marker is a live helper, and one seconds old is not stuck"
+            );
+            assert!(
+                marker.path().is_file(),
+                "a look never unlinks a live helper's marker"
+            );
+        }
+
+        #[test]
+        fn a_helper_idle_past_the_threshold_is_stuck_and_a_touch_makes_it_busy_again() {
+            let (_dir, store) = store();
+            let marker = store.register_helper(4242).expect("register");
+
+            // The clock, not the file, is what moves: `now` is what the look
+            // measures idle against, and thirty-one minutes of it is one past
+            // the line.
+            let later = SystemTime::now() + LfsStore::STUCK_HELPER_IDLE + A_MINUTE;
+            let look = store.look_at_helpers(later, LfsStore::STUCK_HELPER_IDLE);
+            assert_eq!(look.alive, 1);
+            assert_eq!(look.removed, 0);
+            let (pid, idle) = look.oldest_stuck().expect("stuck after the threshold");
+            assert_eq!(pid, 4242);
+            assert!(idle >= LfsStore::STUCK_HELPER_IDLE, "idle={idle:?}");
+
+            // A request finished: the helper on a forty-minute conversion is
+            // as busy as one answering every second.
+            marker.touch().expect("touch");
+            let look =
+                store.look_at_helpers(SystemTime::now() + A_MINUTE, LfsStore::STUCK_HELPER_IDLE);
+            assert_eq!(look.alive, 1);
+            assert!(
+                look.stuck.is_empty(),
+                "a touched marker is not stuck: {look:?}"
+            );
+        }
+
+        #[test]
+        fn a_dead_helpers_leftover_is_removed_and_never_stuck() {
+            let (_dir, store) = store();
+            // What a killed helper leaves: the file, and no lock — the kernel
+            // released that with the process. Old enough that an idle rule
+            // alone would have called it stuck.
+            std::fs::create_dir_all(store.helpers_dir()).expect("helpers dir");
+            let leftover = store.helpers_dir().join("31337");
+            std::fs::write(&leftover, b"").expect("write leftover");
+            let long_ago = SystemTime::now() - Duration::from_secs(4 * 3600);
+            File::options()
+                .write(true)
+                .open(&leftover)
+                .expect("open leftover")
+                .set_modified(long_ago)
+                .expect("age leftover");
+
+            let look = store.look_at_helpers(SystemTime::now(), LfsStore::STUCK_HELPER_IDLE);
+            assert_eq!(
+                look,
+                HelperLook {
+                    alive: 0,
+                    stuck: Vec::new(),
+                    removed: 1,
+                    skipped: Vec::new()
+                }
+            );
+            assert!(!leftover.exists(), "the leftover is unlinked");
+
+            // And the next look has nothing to say about it.
+            let look = store.look_at_helpers(SystemTime::now(), LfsStore::STUCK_HELPER_IDLE);
+            assert_eq!(look, HelperLook::default());
+        }
+
+        #[test]
+        fn a_live_marker_beside_a_leftover_is_told_apart_by_the_lock_alone() {
+            let (_dir, store) = store();
+            let live = store.register_helper(1).expect("register");
+            std::fs::write(store.helpers_dir().join("2"), b"").expect("write leftover");
+
+            let later = SystemTime::now() + LfsStore::STUCK_HELPER_IDLE + A_MINUTE;
+            let look = store.look_at_helpers(later, LfsStore::STUCK_HELPER_IDLE);
+            assert_eq!(look.alive, 1);
+            assert_eq!(look.removed, 1);
+            assert_eq!(look.stuck, vec![(1, look.stuck[0].1)]);
+            assert!(live.path().exists());
+            assert!(!store.helpers_dir().join("2").exists());
+        }
+
+        #[test]
+        fn dropping_the_registration_unlinks_the_marker() {
+            let (_dir, store) = store();
+            let marker = store.register_helper(4242).expect("register");
+            let path = marker.path().to_path_buf();
+            drop(marker);
+            assert!(
+                !path.exists(),
+                "a helper that returns leaves nothing behind"
+            );
+            assert_eq!(
+                store.look_at_helpers(SystemTime::now(), LfsStore::STUCK_HELPER_IDLE),
+                HelperLook::default()
+            );
+        }
+
+        #[test]
+        fn a_look_with_no_helpers_directory_is_not_an_error() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let store = LfsStore::in_git_dir(dir.path());
+            assert_eq!(
+                store.look_at_helpers(SystemTime::now(), LfsStore::STUCK_HELPER_IDLE),
+                HelperLook::default()
+            );
+        }
+
+        #[test]
+        fn registration_that_cannot_create_the_directory_is_an_error_not_a_failure() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let store = LfsStore::in_git_dir(dir.path());
+            std::fs::create_dir_all(store.root()).expect("lfs dir");
+            // A regular file where the directory has to go.
+            std::fs::write(store.helpers_dir(), b"not a directory").expect("block it");
+            let err = store.register_helper(4242).expect_err("cannot register");
+            assert!(
+                !err.to_string().is_empty(),
+                "the caller puts the reason on stderr, so there has to be one"
+            );
+        }
+
+        /// The layout is what `run_process` fails on before it serves, so
+        /// `helpers/` must not be part of it: a helper that cannot register
+        /// still serves, and that needs the directory to be registration's
+        /// problem alone.
+        #[test]
+        fn the_layout_leaves_helpers_to_registration() {
+            let (_dir, store) = store();
+            assert!(
+                !store.helpers_dir().exists(),
+                "ensure_layout does not create helpers/"
+            );
+            let marker = store.register_helper(4242).expect("register");
+            assert!(store.helpers_dir().is_dir(), "register_helper does");
+            drop(marker);
+        }
+
+        /// Eighteen stuck at once is the field case; the warning names one,
+        /// and it has to be the one idle longest.
+        #[test]
+        fn of_two_stuck_helpers_the_look_names_the_older() {
+            let (_dir, store) = store();
+            let younger = store.register_helper(10).expect("register 10");
+            let older = store.register_helper(20).expect("register 20");
+            let now = SystemTime::now();
+            older
+                .file
+                .set_modified(now - Duration::from_secs(2 * 3600))
+                .expect("age the older");
+            younger
+                .file
+                .set_modified(now - Duration::from_secs(3600))
+                .expect("age the younger");
+
+            let look = store.look_at_helpers(now, LfsStore::STUCK_HELPER_IDLE);
+            assert_eq!(look.alive, 2);
+            assert_eq!(look.stuck.len(), 2, "{look:?}");
+            let (pid, idle) = look.oldest_stuck().expect("two stuck");
+            assert_eq!(pid, 20, "the older of the two");
+            assert!(idle >= Duration::from_secs(2 * 3600), "idle={idle:?}");
+        }
+
+        /// The pid-reuse race: between the look's `open` of a leftover and its
+        /// `remove_file`, a new helper that drew the same pid renames its
+        /// fresh, locked marker over the leftover's name. Unlinking by path
+        /// would take the live helper's marker; unlinking by identity leaves
+        /// it.
+        #[test]
+        fn a_leftover_replaced_by_a_new_helper_under_the_same_pid_is_left_alone() {
+            let (_dir, store) = store();
+            let path = store.helpers_dir().join("4242");
+            std::fs::create_dir_all(store.helpers_dir()).expect("helpers dir");
+            std::fs::write(&path, b"").expect("write leftover");
+
+            // The seam: the new helper registers at the instant the look has
+            // the leftover's lock and has not yet unlinked its path.
+            let mut replacement: Option<HelperMarker> = None;
+            let store_for_seam = store.clone();
+            let mut before_unlink = |at: &Path| {
+                assert_eq!(at, path.as_path());
+                replacement = Some(
+                    store_for_seam
+                        .register_helper(4242)
+                        .expect("the new helper registers"),
+                );
+            };
+            let look = store.look_at_helpers_via(
+                SystemTime::now(),
+                LfsStore::STUCK_HELPER_IDLE,
+                &mut LookSeams {
+                    try_lock: &|file| file.try_lock_exclusive(),
+                    before_unlink: &mut before_unlink,
+                },
+            );
+            assert_eq!(look.removed, 0, "nothing unlinked by name: {look:?}");
+            let replacement = replacement.expect("the seam ran");
+            assert!(
+                path.is_file(),
+                "the new helper's marker still stands at the reused name"
+            );
+            let probe = File::options()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("open the marker");
+            assert!(
+                !probe.try_lock_exclusive().expect("try"),
+                "and it is the new helper's, still locked"
+            );
+            drop(probe);
+
+            // The next look sees one live helper and no leftover.
+            let look = store.look_at_helpers(SystemTime::now(), LfsStore::STUCK_HELPER_IDLE);
+            assert_eq!(look.alive, 1);
+            assert_eq!(look.removed, 0);
+            drop(replacement);
+        }
+
+        /// A filesystem that refuses `flock` must not make the look read as
+        /// healthy: the markers it could not place are reported, with their
+        /// idle, for the caller to place by pid.
+        #[test]
+        fn markers_whose_lock_cannot_be_tried_are_skipped_not_dropped() {
+            let (_dir, store) = store();
+            let live = store.register_helper(1).expect("register");
+            live.file
+                .set_modified(SystemTime::now() - Duration::from_secs(3600))
+                .expect("age");
+            std::fs::write(store.helpers_dir().join("2"), b"").expect("leftover");
+
+            let refused = |_: &File| -> std::io::Result<bool> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "no locks here",
+                ))
+            };
+            let look = store.look_at_helpers_via(
+                SystemTime::now(),
+                LfsStore::STUCK_HELPER_IDLE,
+                &mut LookSeams {
+                    try_lock: &refused,
+                    before_unlink: &mut |_| {},
+                },
+            );
+            assert_eq!(look.alive, 0);
+            assert_eq!(look.removed, 0);
+            assert!(look.stuck.is_empty());
+            let mut skipped: Vec<u32> = look.skipped.iter().map(|(pid, _)| *pid).collect();
+            skipped.sort_unstable();
+            assert_eq!(skipped, vec![1, 2], "both markers, neither placed");
+            let (_, idle) = look
+                .skipped
+                .iter()
+                .find(|(pid, _)| *pid == 1)
+                .expect("pid 1");
+            assert!(
+                *idle >= Duration::from_secs(3600),
+                "with its idle: {idle:?}"
+            );
+            assert!(
+                store.helpers_dir().join("2").exists(),
+                "nothing is unlinked on a lock the look could not try"
+            );
+        }
+
+        /// A staging file is a helper mid-registration: young, it is left
+        /// alone; old and unlocked, it is a registration that died and is
+        /// unlinked without counting as a removed helper. Anything that is
+        /// not keeper's name is not keeper's to touch.
+        #[test]
+        fn staging_files_are_left_alone_unless_stale_and_foreign_files_always() {
+            let (_dir, store) = store();
+            let dir = store.helpers_dir();
+            std::fs::create_dir_all(&dir).expect("helpers dir");
+            let young = dir.join(".7.registering");
+            let stale = dir.join(".8.registering");
+            let foreign = dir.join("README");
+            for path in [&young, &stale, &foreign] {
+                std::fs::write(path, b"").expect("write");
+            }
+            let long_ago = SystemTime::now() - Duration::from_secs(4 * 3600);
+            for path in [&stale, &foreign] {
+                File::options()
+                    .write(true)
+                    .open(path)
+                    .expect("open")
+                    .set_modified(long_ago)
+                    .expect("age");
+            }
+
+            let look = store.look_at_helpers(SystemTime::now(), LfsStore::STUCK_HELPER_IDLE);
+            assert_eq!(
+                look,
+                HelperLook::default(),
+                "none of these is a helper, alive, stuck, removed or skipped"
+            );
+            assert!(young.exists(), "a registration in progress is left alone");
+            assert!(!stale.exists(), "a registration that died is cleaned up");
+            assert!(
+                foreign.exists(),
+                "a file keeper did not name is not keeper's"
+            );
+        }
     }
 }

@@ -86,21 +86,15 @@ BUNDLE_ID="$(keeper_bundle_id)"
 # found` for exactly that reason, so the same PATH is exported inside the
 # dispatched payload below.
 REMOTE_ENV='export PATH="$HOME/.bun/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"'
-# The commit the rsynced source came FROM, stated rather than probed. The build
-# directory on the Mac can hold a `.git` from an older rsync — hesperia's did,
-# and on 2026-09-05 a freshly installed build of 4cce07c19538 logged
-# 220f8bde27d2-dirty, which sends the next reader to a diff that is not the one
-# running. `crates/keeper/build.rs` prefers this over its own `git` answer, and
-# an empty value leaves it to probe as before.
-BUILD_SHA="$(git -C "$(dirname "$0")/.." rev-parse --short=12 HEAD 2>/dev/null || true)"
-if [ -n "$BUILD_SHA" ] && [ -n "$(git -C "$(dirname "$0")/.." status --porcelain --untracked-files=no 2>/dev/null)" ]; then
-  BUILD_SHA="$BUILD_SHA-dirty"
-fi
+# The commit the rsynced source came FROM, stated as a file inside the tree
+# before the rsync carries it over. Why a stamp and not a probe on the Mac, and
+# why a FILE rather than only the env (which does not survive every hop of the
+# Xcode build phase; build.rs says which): the header of
+# scripts/lib/build-sha.sh. The export is empty when this checkout has no
+# `.git`, and empty means "not stated".
+. "$REPO_ROOT/scripts/lib/build-sha.sh"
+BUILD_SHA="$(keeper_stamp_build_sha "$REPO_ROOT")"
 REMOTE_ENV="$REMOTE_ENV KEEPER_BUILD_SHA=\"$BUILD_SHA\""
-# And as a file inside the tree that is about to be rsynced, because the env
-# does not survive every hop of the iOS build (build.rs says which). Gitignored
-# there, so it never reaches a commit.
-printf '%s' "$BUILD_SHA" > "$(dirname "$0")/../src-tauri/crates/keeper/build-sha.txt"
 
 # A connect timeout because the whole point of the first check is to say
 # quickly that the Mac is not there; ssh's own default waits two minutes.
@@ -241,6 +235,12 @@ say "team: $APPLE_DEVELOPMENT_TEAM"
 # fail. The four under gen/apple are XcodeGen's and CocoaPods' own output
 # (docs/ios.md, AD-32): gitignored, so absent here, and `--delete` would
 # otherwise wipe the Mac's copies on every run.
+#
+# A `.git` already on the remote is removed first: `--delete` never touches
+# what `--exclude` skips, so one left by an older sync would outlive every run
+# and answer `git` with a head that is not this tree's. The copy has no
+# repository of its own; the stamp above is its only word.
+"${SSH[@]}" "$HOST" "rm -rf \"\$HOME/$REMOTE_DIR/.git\""
 say "syncing working tree"
 rsync -az --delete \
   --exclude '.git' \
