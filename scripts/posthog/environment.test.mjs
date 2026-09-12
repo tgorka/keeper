@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { maintainerEnvironmentReady } from "./environment.mjs";
 
 const environment = {
@@ -58,4 +60,21 @@ test("a same-named tag cannot satisfy the main branch restriction", () => {
 
 test("a truncated policy page cannot hide an additional allowed branch", () => {
   assert.equal(maintainerEnvironmentReady(environment, { ...policies, total_count: 2 }), false);
+});
+
+test("the preflight job can read the protection it is required to verify", () => {
+  const workflow = readFileSync(
+    fileURLToPath(new URL("../../.github/workflows/posthog.yml", import.meta.url)),
+    "utf8",
+  );
+  const protection = workflow.slice(
+    workflow.indexOf("\n  protection:"),
+    workflow.indexOf("\n  maintainer:"),
+  );
+  assert.ok(protection.length > 0, "the protection job must exist");
+  // GitHub serves environment protection rules under `actions=read`. Without it the
+  // lookup answers 403, the fail-closed preflight refuses, and the reviewed
+  // maintainer job can never run however the environment is configured.
+  assert.match(protection, /^ {6}actions: read$/m);
+  assert.match(protection, /^ {6}contents: read$/m);
 });
