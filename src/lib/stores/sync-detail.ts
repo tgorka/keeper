@@ -173,6 +173,22 @@ export const syncDetailStore = createStore<SyncDetailState>()((set) => ({
 }));
 
 /**
+ * A stream frame may refine only the active, non-idle phase the poll reports.
+ * Keep unmatched frames in the mirror: a later snapshot can catch up with them.
+ */
+export function syncLiveProgress(
+  status: SyncStatusVm | undefined,
+  progress: SyncProgressVm | undefined,
+): SyncProgressVm | undefined {
+  return status !== undefined &&
+    isSyncStatusActive(status) &&
+    status.phase !== "idle" &&
+    progress?.phase === status.phase
+    ? progress
+    : undefined;
+}
+
+/**
  * The fraction to draw for a profile in `[0, 1]`, or `null` when there is
  * nothing honest to draw.
  *
@@ -181,20 +197,20 @@ export const syncDetailStore = createStore<SyncDetailState>()((set) => ({
  * the engine sent, so an idle profile whose final event never arrived would
  * otherwise keep a filled bar forever.
  *
- * The streamed fraction wins when present because it is composed from
- * denominators the poll has not caught up with — and it is clamped, because a
- * byte total legitimately grows mid-transfer as concurrent large-file objects
- * are announced.
+ * A matching streamed fraction wins when present because it is composed from
+ * denominators the poll has not caught up with. Otherwise the current snapshot
+ * supplies its own counters. Clamp because byte totals can grow mid-transfer.
  */
 export function syncLiveFraction(
   status: SyncStatusVm | undefined,
   progress: SyncProgressVm | undefined,
 ): number | null {
-  if (status === undefined || !isSyncStatusActive(status)) {
+  if (status === undefined || status.phase === "idle" || !isSyncStatusActive(status)) {
     return null;
   }
-  if (progress !== undefined && progress.fraction !== null) {
-    return Math.min(1, Math.max(0, progress.fraction));
+  const live = syncLiveProgress(status, progress);
+  if (live !== undefined && live.fraction !== null) {
+    return Math.min(1, Math.max(0, live.fraction));
   }
   return syncProgressFraction(status);
 }
@@ -217,10 +233,7 @@ export function syncLiveRate(
   status: SyncStatusVm | undefined,
   progress: SyncProgressVm | undefined,
 ): number | null {
-  if (status === undefined || !isSyncStatusActive(status)) {
-    return null;
-  }
-  const rate = progress?.bytesPerSecond ?? 0;
+  const rate = syncLiveProgress(status, progress)?.bytesPerSecond ?? 0;
   return rate > 0 ? rate : null;
 }
 

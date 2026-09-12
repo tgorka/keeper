@@ -46,7 +46,7 @@ use crate::lfs;
 use crate::platform::{OpenFileState, SyncPlatform};
 use crate::profile::{LfsMode, ProfileState, PushPolicy, SyncDirection, SyncLane, SyncProfile};
 use crate::progress::{
-    ProgressSink, RateMeter, SyncPhase, SyncProgress, SyncStatus, TransferTally,
+    ProgressSink, RateMeter, RemoteRelation, SyncPhase, SyncProgress, SyncStatus, TransferTally,
 };
 use crate::provenance::{commit_message, Provenance, SyncSource};
 use crate::sparse::SparseCone;
@@ -1191,6 +1191,13 @@ pub struct Engine {
     transfer_http: reqwest::Client,
     /// Live status per profile id, the polled snapshot the tray reads.
     status: Mutex<HashMap<String, SyncStatus>>,
+    /// Read-only history comparisons, one independently locked memo per profile.
+    remote_relations: Mutex<HashMap<String, RemoteRelationCache>>,
+    /// Pending owns only these transient frames, never the primary snapshot.
+    poll_progress: Mutex<HashMap<String, (u64, Option<SyncProgress>)>>,
+    next_poll: AtomicU64,
+    #[cfg(test)]
+    remote_comparisons: AtomicU64,
     /// Per-profile completeness gates, retained across ticks so a settling file
     /// is remembered rather than re-observed from scratch every time.
     ///
@@ -1392,7 +1399,7 @@ pub struct Engine {
     /// Whether [`Self::filter_program`] answered the `lfs filter-process`
     /// handshake, and may therefore be registered as `filter.lfs.process`.
     filter_serves_process: bool,
-    sinks: Mutex<Vec<(u64, ProgressSink)>>,
+    sinks: Mutex<Vec<(u64, SharedProgressSink)>>,
     next_sink: AtomicU64,
     interrupt: Arc<AtomicBool>,
     /// Bytes moved over the network per profile, monotonic for the life of the
@@ -1621,6 +1628,44 @@ impl Drop for WalkClaim<'_> {
     fn drop(&mut self) {
         Engine::lock(self.walking).remove(&self.profile_id);
     }
+}
+
+type SharedProgressSink = Arc<dyn Fn(SyncProgress) -> bool + Send + Sync>;
+type RemoteRelationCache = Arc<Mutex<Option<RemoteRelationMemo>>>;
+
+/// Removed by scope exit, including cancellation of Pending's async future.
+/// This does not own or change the blocking walk's existing claim lifetime.
+struct PollProgress<'a> {
+    engine: &'a Engine,
+    profile_id: String,
+    token: u64,
+}
+
+impl Drop for PollProgress<'_> {
+    fn drop(&mut self) {
+        let mut polls = Engine::lock(&self.engine.poll_progress);
+        if polls
+            .get(&self.profile_id)
+            .is_some_and(|(token, _)| *token == self.token)
+        {
+            polls.remove(&self.profile_id);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RemoteRelationKey {
+    root: PathBuf,
+    git_dir: PathBuf,
+    branch: String,
+    remote_url: String,
+    head: gix::ObjectId,
+    tracking: gix::ObjectId,
+}
+
+struct RemoteRelationMemo {
+    key: RemoteRelationKey,
+    relation: RemoteRelation,
 }
 
 /// What the pass's second look sorted the held paths its walk did not report
@@ -1870,6 +1915,11 @@ impl Engine {
             http,
             transfer_http,
             status: Mutex::new(HashMap::new()),
+            remote_relations: Mutex::new(HashMap::new()),
+            poll_progress: Mutex::new(HashMap::new()),
+            next_poll: AtomicU64::new(1),
+            #[cfg(test)]
+            remote_comparisons: AtomicU64::new(0),
             gates: Mutex::new(HashMap::new()),
             busy: Mutex::new(HashMap::new()),
             collapsed_reported: Mutex::new(HashSet::new()),
@@ -2495,6 +2545,8 @@ impl Engine {
                 Self::seeded_state(runtime.as_ref(), self.platform.now_ms())
             };
             status.insert(profile.id.clone(), snapshot);
+            Self::lock(&self.remote_relations)
+                .insert(profile.id.clone(), Arc::new(Mutex::new(None)));
         }
         Ok(())
     }
@@ -2575,6 +2627,8 @@ impl Engine {
         // (Epic 70). `keeper-syncd` writes its `config.toml` folders through
         // this door too.
         self.seed_gc_task(&profile.id, now)?;
+        Self::lock(&self.remote_relations).insert(profile.id.clone(), Arc::new(Mutex::new(None)));
+        Self::lock(&self.poll_progress).remove(&profile.id);
         let mut status = Self::lock(&self.status);
         let entry = status
             .entry(profile.id.clone())
@@ -2646,6 +2700,8 @@ impl Engine {
         }
         self.with_db(|conn| db::delete_profile(conn, id))?;
         Self::lock(&self.status).remove(id);
+        Self::lock(&self.remote_relations).remove(id);
+        Self::lock(&self.poll_progress).remove(id);
         Self::lock(&self.gates).remove(id);
         Self::lock(&self.next_scan_ms).remove(id);
         Self::lock(&self.next_sweep_ms).remove(id);
@@ -2702,18 +2758,35 @@ impl Engine {
     }
 
     pub fn status(&self, id: &str) -> Result<SyncStatus> {
-        let mut snapshot = Self::lock(&self.status)
-            .get(id)
-            .cloned()
-            .ok_or_else(|| SyncError::Config(format!("no such sync profile: {id}")))?;
+        let mut snapshot = {
+            let status = Self::lock(&self.status);
+            let mut snapshot = status
+                .get(id)
+                .cloned()
+                .ok_or_else(|| SyncError::Config(format!("no such sync profile: {id}")))?;
+            self.overlay_poll(&mut snapshot);
+            snapshot
+        };
         self.fill_queued(&mut snapshot);
+        self.fill_remote_relation(&mut snapshot);
         Ok(snapshot)
     }
 
     pub fn statuses(&self) -> Result<Vec<SyncStatus>> {
-        let mut all: Vec<SyncStatus> = Self::lock(&self.status).values().cloned().collect();
+        let mut all: Vec<SyncStatus> = {
+            let status = Self::lock(&self.status);
+            status
+                .values()
+                .cloned()
+                .map(|mut snapshot| {
+                    self.overlay_poll(&mut snapshot);
+                    snapshot
+                })
+                .collect()
+        };
         for snapshot in &mut all {
             self.fill_queued(snapshot);
+            self.fill_remote_relation(snapshot);
         }
         all.sort_by(|a, b| a.profile_name.cmp(&b.profile_name));
         Ok(all)
@@ -2746,13 +2819,212 @@ impl Engine {
         }
     }
 
+    /// The refs are re-read on every query; only ancestry is memoized. No
+    /// repairing open, index access, network call or persistent write belongs
+    /// on this observational path. The per-profile handle cannot be reinserted
+    /// by an old query after removal or a profile edit.
+    fn fill_remote_relation(&self, snapshot: &mut SyncStatus) {
+        snapshot.remote_relation = None;
+        if matches!(
+            snapshot.state,
+            ProfileState::Paused | ProfileState::MediaAbsent
+        ) {
+            return;
+        }
+        let memo = Self::lock(&self.remote_relations)
+            .get(&snapshot.profile_id)
+            .cloned();
+        let Some(memo) = memo else {
+            return;
+        };
+        let profile = self
+            .with_db(|conn| db::get_profile(conn, &snapshot.profile_id))
+            .ok()
+            .flatten();
+        let mut memo = Self::lock(&memo);
+        let Some((mut repo, key)) = profile.as_ref().and_then(Self::remote_relation_inputs) else {
+            // This read is unknown, but an earlier proof remains reusable if
+            // fresh identity/ref checks succeed again with the same key.
+            return;
+        };
+        if let Some(cached) = memo.as_ref().filter(|cached| cached.key == key) {
+            snapshot.remote_relation = Some(cached.relation);
+            return;
+        }
+        #[cfg(test)]
+        self.remote_comparisons.fetch_add(1, Ordering::Relaxed);
+        let relation = if key.head == key.tracking {
+            Some(RemoteRelation::Same)
+        } else {
+            // Match the history reader's cache, only for a cold comparison.
+            repo.object_cache_size_if_unset(4 * 1024 * 1024);
+            Self::known_remote_relation(&repo, key.head, key.tracking)
+        };
+        snapshot.remote_relation = relation;
+        // Missing parent objects can arrive without either ref moving. Only
+        // proven relations are memoized; a failed walk must be retryable.
+        *memo = relation.map(|relation| RemoteRelationMemo { key, relation });
+    }
+
+    /// A missing parent is unknown, not proof that two histories diverged.
+    /// Merge-base's `NotFound` also covers incomplete graphs, so status uses a
+    /// fallible revision walk without changing the sync path's merge policy.
+    /// Interleave both tips so a short ahead/behind gap does not first require
+    /// proving the opposite direction false through the entire older history.
+    fn known_remote_relation(
+        repo: &gix::Repository,
+        head: gix::ObjectId,
+        tracking: gix::ObjectId,
+    ) -> Option<RemoteRelation> {
+        let mut local = repo.rev_walk([head]).all().ok()?;
+        let mut remote = repo.rev_walk([tracking]).all().ok()?;
+        loop {
+            let local = local.next().transpose().ok()?;
+            let remote = remote.next().transpose().ok()?;
+            if remote.as_ref().is_some_and(|commit| commit.id == head) {
+                return Some(RemoteRelation::Behind);
+            }
+            if local.as_ref().is_some_and(|commit| commit.id == tracking) {
+                return Some(RemoteRelation::Ahead);
+            }
+            if local.is_none() && remote.is_none() {
+                return Some(RemoteRelation::Diverged);
+            }
+        }
+    }
+
+    fn remote_relation_inputs(
+        profile: &SyncProfile,
+    ) -> Option<(gix::Repository, RemoteRelationKey)> {
+        let repo = git::repo::open_read_only(&profile.local_path, profile.removable).ok()?;
+        let root = profile.local_path.canonicalize().ok()?;
+        if repo.workdir()?.canonicalize().ok()? != root {
+            return None;
+        }
+        let branch = Self::working_branch(profile);
+        if repo.head_name().ok()??.as_bstr() != format!("refs/heads/{branch}").as_str() {
+            return None;
+        }
+        let config = repo.config_snapshot();
+        let origin = config.string("remote.origin.url")?;
+        let origin_bytes: &[u8] = origin.as_ref();
+        if origin_bytes != profile.remote_url.as_bytes() {
+            return None;
+        }
+        let head = git::repo::head_commit_id(&repo).ok()??;
+        let tracking =
+            git::repo::resolve_reference(&repo, &format!("refs/remotes/origin/{branch}"))
+                .ok()??;
+        // A dangling/non-commit ref is not evidence of matching history.
+        repo.find_commit(head).ok()?.decode().ok()?;
+        if tracking != head {
+            repo.find_commit(tracking).ok()?.decode().ok()?;
+        }
+        // Negative ancestry from truncated history cannot prove divergence.
+        // Conservatively leave unequal shallow tips unknown; equality needs
+        // no parent history. Read this before the memo, so deepening or
+        // truncating a repository invalidates an earlier verdict.
+        if repo.shallow_commits().ok()?.is_some() && head != tracking {
+            return None;
+        }
+        let key = RemoteRelationKey {
+            root,
+            git_dir: repo.git_dir().canonicalize().ok()?,
+            branch,
+            remote_url: profile.remote_url.clone(),
+            head,
+            tracking,
+        };
+        Some((repo, key))
+    }
+
+    fn poll_may_report(snapshot: &SyncStatus) -> bool {
+        snapshot.phase == SyncPhase::Idle
+            && snapshot.error.is_none()
+            && matches!(
+                snapshot.state,
+                ProfileState::Idle | ProfileState::Watching | ProfileState::Syncing
+            )
+    }
+
+    /// Caller holds the primary status lock; all nested access uses the order
+    /// status → poll_progress. No sink runs while either lock is held.
+    fn overlay_poll(&self, snapshot: &mut SyncStatus) {
+        if !Self::poll_may_report(snapshot) {
+            return;
+        }
+        if let Some((_, Some(event))) = Self::lock(&self.poll_progress).get(&snapshot.profile_id) {
+            snapshot.state = ProfileState::Syncing;
+            snapshot.phase = event.phase;
+            snapshot.files_done = event.files_done;
+            snapshot.files_total = event.files_total;
+            snapshot.bytes_done = event.bytes_done;
+            snapshot.bytes_total = event.bytes_total;
+        }
+    }
+
+    fn begin_poll_progress<'a>(&'a self, profile_id: &str) -> PollProgress<'a> {
+        let token = self.next_poll.fetch_add(1, Ordering::Relaxed);
+        Self::lock(&self.poll_progress).insert(profile_id.to_owned(), (token, None));
+        PollProgress {
+            engine: self,
+            profile_id: profile_id.to_owned(),
+            token,
+        }
+    }
+
+    fn publish_poll(&self, poll: &PollProgress<'_>, event: SyncProgress) {
+        {
+            let status = Self::lock(&self.status);
+            if !status
+                .get(&poll.profile_id)
+                .is_some_and(Self::poll_may_report)
+            {
+                return;
+            }
+            let mut polls = Self::lock(&self.poll_progress);
+            let Some((token, frame)) = polls.get_mut(&poll.profile_id) else {
+                return;
+            };
+            if *token != poll.token {
+                return;
+            }
+            *frame = Some(event.clone());
+        }
+        self.emit_progress(&event, || {
+            let status = Self::lock(&self.status);
+            status
+                .get(&poll.profile_id)
+                .is_some_and(Self::poll_may_report)
+                && Self::lock(&self.poll_progress)
+                    .get(&poll.profile_id)
+                    .is_some_and(|(token, frame)| {
+                        *token == poll.token && frame.as_ref() == Some(&event)
+                    })
+        });
+    }
+
+    fn emit_progress(&self, event: &SyncProgress, may_emit: impl Fn() -> bool) {
+        let sinks = Self::lock(&self.sinks).clone();
+        for (id, sink) in sinks {
+            // Recheck for each sink: an earlier callback can start primary
+            // activity, pause the profile, or unsubscribe itself.
+            if !may_emit() {
+                break;
+            }
+            if !sink(event.clone()) {
+                self.unsubscribe(id);
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Progress fan-out
     // -----------------------------------------------------------------------
 
     pub fn subscribe(&self, sink: ProgressSink) -> u64 {
         let id = self.next_sink.fetch_add(1, Ordering::SeqCst);
-        Self::lock(&self.sinks).push((id, sink));
+        Self::lock(&self.sinks).push((id, Arc::from(sink)));
         id
     }
 
@@ -2791,8 +3063,7 @@ impl Engine {
                 }
             }
         }
-        let mut sinks = Self::lock(&self.sinks);
-        sinks.retain(|(_, sink)| sink(event.clone()));
+        self.emit_progress(&event, || true);
     }
 
     /// Retire whatever in-flight progress a profile's snapshot is still
@@ -2938,7 +3209,7 @@ impl Engine {
     ///   alone does not count — see [`Self::has_problem`].
     /// * `MediaAbsent` while the snapshot says so: the volume gate owns that
     ///   word, and only a re-attach ([`Self::volume_ready`]) takes it back.
-    /// * `Watching` otherwise — nothing standing means up to date.
+    /// * `Watching` otherwise — no standing stop; history comparison is separate.
     fn settle(offline: bool, standing: Option<(ProfileState, bool)>) -> ProfileState {
         if let Some((ProfileState::Paused, _)) = standing {
             return ProfileState::Paused;
@@ -15246,6 +15517,7 @@ impl Engine {
             .then(|| self.claim_walk(profile_id))
             .flatten();
         if walk_claim.is_some() {
+            let poll = self.begin_poll_progress(profile_id);
             let repo_path = profile.local_path.clone();
             let removable = profile.removable;
             let filter = excludes.clone();
@@ -15310,6 +15582,8 @@ impl Engine {
                     // The poll reports what is waiting; the commit walk owns
                     // saying why a nested repository never will be.
                     let (untracked, _collapsed) = Self::expand_untracked(&repo_path, &candidates)?;
+                    #[cfg(test)]
+                    after_walk::fire(&repo_path);
                     Ok((status, untracked, deleted_sizes))
                 },
             );
@@ -15331,7 +15605,7 @@ impl Engine {
                 event.files_done = scanned;
                 // Index entries on both sides; see [`git::repo::WalkReport`].
                 event.files_total = (entries > 0).then_some(entries);
-                self.publish(event);
+                self.publish_poll(&poll, event);
             }
             let walked = task
                 .await
@@ -15341,6 +15615,7 @@ impl Engine {
             // seconds because of that is the shape this floor exists to stop.
             self.poll_walk_finished(profile_id);
             let (status, untracked, deleted_sizes) = walked??;
+            drop(poll);
 
             let buckets: [(&Vec<PathBuf>, PendingReason); 4] = [
                 (&status.added, PendingReason::Added),
@@ -17019,6 +17294,574 @@ mod after_walk {
 
 #[cfg(test)]
 mod tests {
+    fn history_commit(
+        repo: &gix::Repository,
+        message: &str,
+        parents: &[gix::ObjectId],
+    ) -> gix::ObjectId {
+        let tree = repo
+            .write_object(&gix::objs::Tree {
+                entries: Vec::new(),
+            })
+            .expect("empty tree")
+            .detach();
+        let author = gix::actor::Signature {
+            name: "History fixture".into(),
+            email: "history@keeper.invalid".into(),
+            time: gix::date::Time::new(1_700_000_000, 0),
+        };
+        let mut buf = gix::date::parse::TimeBuf::default();
+        let author = author.to_ref(&mut buf);
+        repo.commit_as(
+            author,
+            author,
+            "HEAD",
+            message,
+            tree,
+            parents.iter().copied(),
+        )
+        .expect("commit")
+        .detach()
+    }
+
+    fn move_history_ref(repo: &gix::Repository, name: &str, tip: gix::ObjectId) {
+        let path = repo.git_dir().join(name);
+        std::fs::create_dir_all(path.parent().expect("ref parent")).expect("ref directory");
+        std::fs::write(path, format!("{tip}\n")).expect("external ref update");
+    }
+
+    fn history_fixture(dir: &Path) -> (Engine, SyncProfile, gix::Repository, [gix::ObjectId; 3]) {
+        let platform = Arc::new(TestPlatform::new(dir));
+        let engine = Engine::open_with_engine(platform, GitEngine::Gix).expect("engine");
+        let mut p = adoptable(dir);
+        p.lfs_mode = LfsMode::Disabled;
+        engine.upsert_profile(&p).expect("profile");
+        let repo = git::repo::adopt(&p.local_path, &p.remote_url, &p.branch).expect("adopt");
+        let root = history_commit(&repo, "root", &[]);
+        let middle = history_commit(&repo, "middle", &[root]);
+        let tip = history_commit(&repo, "tip", &[middle]);
+        move_history_ref(&repo, "refs/heads/main", root);
+        move_history_ref(&repo, "refs/remotes/origin/main", tip);
+        (engine, p, repo, [root, middle, tip])
+    }
+
+    #[test]
+    fn status_history_tracks_external_refs_and_reuses_proven_ancestry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, p, repo, [root, _, tip]) = history_fixture(dir.path());
+        let config = std::fs::read(repo.git_dir().join("config")).expect("config");
+        let changes = engine
+            .with_db(|conn| Ok(conn.total_changes()))
+            .expect("changes");
+
+        let behind = engine.status(&p.id).expect("status");
+        assert_eq!(behind.remote_relation, Some(RemoteRelation::Behind));
+        assert_eq!(
+            (behind.pending, behind.queued_files, behind.queued_bytes),
+            (0, 0, 0)
+        );
+        let comparisons = engine.remote_comparisons.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            assert_eq!(
+                engine.statuses().expect("statuses")[0].remote_relation,
+                Some(RemoteRelation::Behind)
+            );
+        }
+        assert_eq!(
+            engine.remote_comparisons.load(Ordering::Relaxed),
+            comparisons
+        );
+        assert_eq!(engine.counters(&p.id).status_walks, 0);
+        assert_eq!(
+            engine
+                .with_db(|conn| Ok(conn.total_changes()))
+                .expect("changes"),
+            changes
+        );
+        assert_eq!(
+            std::fs::read(repo.git_dir().join("config")).expect("config"),
+            config
+        );
+        assert!(
+            !repo.git_dir().join("index").exists(),
+            "status must not create an index"
+        );
+        assert!(
+            !repo.git_dir().join("FETCH_HEAD").exists(),
+            "status must not fetch"
+        );
+
+        // Neither index readability nor a stale lock is a prerequisite for
+        // reference inspection, and a read must not repair either one.
+        std::fs::write(repo.git_dir().join("index"), b"invalid index").expect("index");
+        std::fs::write(repo.git_dir().join("index.lock"), b"owned elsewhere").expect("lock");
+        move_history_ref(&repo, "refs/heads/main", tip);
+        assert_eq!(
+            engine.status(&p.id).expect("equal").remote_relation,
+            Some(RemoteRelation::Same)
+        );
+        move_history_ref(&repo, "refs/remotes/origin/main", root);
+        assert_eq!(
+            engine.status(&p.id).expect("ahead").remote_relation,
+            Some(RemoteRelation::Ahead)
+        );
+        assert_eq!(
+            std::fs::read(repo.git_dir().join("index")).expect("index"),
+            b"invalid index"
+        );
+        assert_eq!(
+            std::fs::read(repo.git_dir().join("index.lock")).expect("lock"),
+            b"owned elsewhere"
+        );
+        std::fs::remove_file(repo.git_dir().join("index.lock")).expect("release lock");
+
+        move_history_ref(&repo, "refs/heads/main", root);
+        history_commit(&repo, "local side", &[root]);
+        move_history_ref(&repo, "refs/remotes/origin/main", tip);
+        assert_eq!(
+            engine.status(&p.id).expect("diverged").remote_relation,
+            Some(RemoteRelation::Diverged)
+        );
+    }
+
+    #[test]
+    fn status_history_compares_the_worktree_lane_not_its_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, mut p, repo, [root, _, tip]) = history_fixture(dir.path());
+        p.lane = SyncLane::Worktree;
+        p.direction = SyncDirection::PushOnly;
+        engine.upsert_profile(&p).expect("lane profile");
+        let working = Engine::working_branch(&p);
+        let tracking = format!("refs/remotes/origin/{working}");
+        move_history_ref(&repo, &format!("refs/heads/{working}"), tip);
+        std::fs::write(
+            repo.git_dir().join("HEAD"),
+            format!("ref: refs/heads/{working}\n"),
+        )
+        .expect("lane checked out");
+        move_history_ref(&repo, &tracking, tip);
+        move_history_ref(&repo, "refs/remotes/origin/main", root);
+        assert_eq!(
+            engine
+                .status(&p.id)
+                .expect("published lane")
+                .remote_relation,
+            Some(RemoteRelation::Same)
+        );
+        std::fs::remove_file(repo.git_dir().join(tracking)).expect("remove lane tracking");
+        assert_eq!(
+            engine
+                .status(&p.id)
+                .expect("unfetched lane")
+                .remote_relation,
+            None,
+            "the base tracking ref cannot stand in for the lane"
+        );
+    }
+
+    #[test]
+    fn status_history_is_unknown_for_missing_refs_and_wrong_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, mut p, repo, [root, _, tip]) = history_fixture(dir.path());
+        assert_eq!(
+            engine.status(&p.id).expect("behind").remote_relation,
+            Some(RemoteRelation::Behind)
+        );
+        let tracking = repo.git_dir().join("refs/remotes/origin/main");
+        std::fs::remove_file(&tracking).expect("remove tracking");
+        assert_eq!(
+            engine.status(&p.id).expect("no tracking").remote_relation,
+            None
+        );
+        std::fs::write(&tracking, b"not a ref\n").expect("broken tracking");
+        assert_eq!(
+            engine
+                .status(&p.id)
+                .expect("broken tracking")
+                .remote_relation,
+            None
+        );
+        move_history_ref(&repo, "refs/remotes/origin/main", tip);
+
+        std::fs::write(repo.git_dir().join("HEAD"), format!("{root}\n")).expect("detach");
+        assert_eq!(
+            engine.status(&p.id).expect("detached").remote_relation,
+            None
+        );
+        std::fs::write(repo.git_dir().join("HEAD"), b"ref: refs/heads/main\n").expect("reattach");
+        std::fs::remove_file(repo.git_dir().join("refs/heads/main")).expect("unborn branch");
+        assert_eq!(engine.status(&p.id).expect("unborn").remote_relation, None);
+        move_history_ref(&repo, "refs/heads/main", root);
+        let config_path = repo.git_dir().join("config");
+        let config = std::fs::read(&config_path).expect("config");
+        std::fs::write(&config_path, b"[unterminated").expect("unreadable config");
+        assert_eq!(
+            engine
+                .status(&p.id)
+                .expect("unreadable repository")
+                .remote_relation,
+            None
+        );
+        assert_eq!(
+            std::fs::read(&config_path).expect("unchanged config"),
+            b"[unterminated"
+        );
+        std::fs::write(&config_path, config).expect("restore config");
+        p.branch = "different".to_owned();
+        engine.upsert_profile(&p).expect("change branch");
+        assert_eq!(
+            engine.status(&p.id).expect("wrong branch").remote_relation,
+            None
+        );
+        p.branch = "main".to_owned();
+        let original_remote = p.remote_url.clone();
+        p.remote_url = "https://another.invalid/repo.git".to_owned();
+        engine.upsert_profile(&p).expect("change remote");
+        assert_eq!(
+            engine.status(&p.id).expect("wrong remote").remote_relation,
+            None
+        );
+        p.remote_url = original_remote;
+        let original_root = p.local_path.clone();
+        p.local_path = dir.path().join("absent");
+        engine.upsert_profile(&p).expect("change root");
+        assert_eq!(
+            engine.status(&p.id).expect("absent root").remote_relation,
+            None
+        );
+        p.local_path = original_root;
+        engine.upsert_profile(&p).expect("restore root");
+        assert_eq!(
+            engine.status(&p.id).expect("restored").remote_relation,
+            Some(RemoteRelation::Behind)
+        );
+        engine.remove_profile(&p.id).expect("remove profile");
+        assert!(engine.status(&p.id).is_err());
+        move_history_ref(&repo, "refs/heads/main", tip);
+        engine.upsert_profile(&p).expect("re-add");
+        assert_eq!(
+            engine.status(&p.id).expect("re-added").remote_relation,
+            Some(RemoteRelation::Same)
+        );
+    }
+
+    #[test]
+    fn status_history_recovers_missing_ancestry_without_refs_moving() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, p, repo, [_, middle, _]) = history_fixture(dir.path());
+        let hex = middle.to_string();
+        let object = repo
+            .git_dir()
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        let content = std::fs::read(&object).expect("loose parent");
+        std::fs::remove_file(&object).expect("missing parent");
+        assert_eq!(
+            engine
+                .status(&p.id)
+                .expect("incomplete history")
+                .remote_relation,
+            None
+        );
+        std::fs::write(&object, content).expect("restore parent without changing refs");
+        assert_eq!(
+            engine
+                .status(&p.id)
+                .expect("repaired history")
+                .remote_relation,
+            Some(RemoteRelation::Behind)
+        );
+
+        let shallow = repo.shallow_file();
+        std::fs::write(&shallow, format!("{middle}\n")).expect("truncate history");
+        assert_eq!(engine.status(&p.id).expect("shallow").remote_relation, None);
+        std::fs::remove_file(&shallow).expect("deepen history");
+        assert_eq!(
+            engine.status(&p.id).expect("deepened").remote_relation,
+            Some(RemoteRelation::Behind)
+        );
+        std::fs::create_dir(&shallow).expect("unreadable shallow file");
+        assert_eq!(
+            engine
+                .status(&p.id)
+                .expect("unreadable history")
+                .remote_relation,
+            None
+        );
+    }
+
+    fn pending_scan_fixture(dir: &Path) -> (Arc<Engine>, SyncProfile) {
+        let platform = Arc::new(TestPlatform::new(dir));
+        let mut engine =
+            Engine::open_with_engine(platform.clone(), GitEngine::Gix).expect("engine");
+        engine.report_every_walk_item();
+        let (mut p, _) = committed_fixture(&engine, &platform, dir);
+        p.lfs_mode = LfsMode::Disabled;
+        engine
+            .upsert_profile(&p)
+            .expect("disable filters for the scan fixture");
+        engine.clear_phase(&p.id);
+        engine.settle_and_persist(&p.id);
+        (Arc::new(engine), p)
+    }
+
+    #[tokio::test]
+    async fn pending_scan_yields_to_primary_and_stopped_states_between_sinks() {
+        for state in [
+            ProfileState::Syncing,
+            ProfileState::Paused,
+            ProfileState::Offline,
+            ProfileState::MediaAbsent,
+            ProfileState::NeedsAttention,
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (engine, p) = pending_scan_fixture(dir.path());
+            let weak = Arc::downgrade(&engine);
+            let profile = p.clone();
+            let transitioned = Arc::new(AtomicBool::new(false));
+            let fired = Arc::clone(&transitioned);
+            engine.subscribe(Box::new(move |event| {
+                if event.phase == SyncPhase::Scanning && !fired.swap(true, Ordering::SeqCst) {
+                    let engine = weak.upgrade().expect("engine lives through Pending");
+                    let live = engine.status(&profile.id).expect("live scan snapshot");
+                    assert_eq!(live.phase, SyncPhase::Scanning);
+                    assert_eq!(live.files_done, event.files_done);
+                    assert_eq!(live.state, ProfileState::Syncing);
+                    // These callbacks intentionally re-enter the engine. A
+                    // status, poll or sink lock across delivery deadlocks here.
+                    match state {
+                        ProfileState::Syncing => arrange_a_pass_in_flight(&engine, &profile),
+                        ProfileState::Paused => {
+                            engine.set_enabled(&profile.id, false).expect("pause")
+                        }
+                        ProfileState::Offline => engine.record_failure(
+                            &profile,
+                            &SyncError::Network {
+                                host: "remote.invalid".to_owned(),
+                                reason: "network unavailable".to_owned(),
+                            },
+                        ),
+                        ProfileState::NeedsAttention => engine.record_failure(
+                            &profile,
+                            &SyncError::Config("repository needs repair".to_owned()),
+                        ),
+                        _ => engine.set_state(&profile.id, state),
+                    }
+                }
+                true
+            }));
+            let delivered = Arc::new(Mutex::new(Vec::<SyncProgress>::new()));
+            let observed = Arc::clone(&delivered);
+            engine.subscribe(Box::new(move |event| {
+                Engine::lock(&observed).push(event);
+                true
+            }));
+            engine.pending(&p.id).await.expect("pending");
+            assert!(
+                transitioned.load(Ordering::SeqCst),
+                "the real scan must report"
+            );
+            assert!(
+                Engine::lock(&delivered)
+                    .iter()
+                    .all(|event| event.phase != SyncPhase::Scanning),
+                "a poll frame must not be delivered after the first sink starts primary work/stops"
+            );
+            let finished = engine.status(&p.id).expect("finished");
+            assert_eq!(finished.state, state);
+            if state == ProfileState::Syncing {
+                assert_eq!(finished.phase, SyncPhase::Pushing);
+                assert_eq!((finished.files_done, finished.files_total), (4, Some(9)));
+                assert_eq!(
+                    (finished.bytes_done, finished.bytes_total),
+                    (1_800_000, Some(4_000_000))
+                );
+            } else {
+                assert_eq!(finished.phase, SyncPhase::Idle);
+                assert_eq!((finished.files_done, finished.files_total), (0, None));
+                if state == ProfileState::NeedsAttention {
+                    assert!(
+                        finished.error.is_some(),
+                        "poll cleanup must not erase the failure"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_scan_never_revives_an_already_stopped_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, p) = pending_scan_fixture(dir.path());
+        engine.set_state(&p.id, ProfileState::Offline);
+        let delivered = Arc::new(Mutex::new(Vec::<SyncProgress>::new()));
+        let observed = Arc::clone(&delivered);
+        engine.subscribe(Box::new(move |event| {
+            Engine::lock(&observed).push(event);
+            true
+        }));
+        let walks = engine.counters(&p.id).status_walks;
+        engine.pending(&p.id).await.expect("pending still answers");
+        assert_eq!(engine.counters(&p.id).status_walks, walks + 1);
+        assert!(
+            Engine::lock(&delivered).is_empty(),
+            "stopped profiles own the stream"
+        );
+        let finished = engine.status(&p.id).expect("finished");
+        assert_eq!(
+            (finished.state, finished.phase),
+            (ProfileState::Offline, SyncPhase::Idle)
+        );
+        assert_eq!((finished.files_done, finished.files_total), (0, None));
+    }
+
+    #[tokio::test]
+    async fn pending_scan_cannot_cover_an_error_on_an_idle_primary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, p) = pending_scan_fixture(dir.path());
+        engine.set_error(&p.id, Some("history cannot be read"));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&delivered);
+        engine.subscribe(Box::new(move |_| {
+            observed.store(true, Ordering::SeqCst);
+            true
+        }));
+        engine.pending(&p.id).await.expect("pending");
+        assert!(!delivered.load(Ordering::SeqCst));
+        let finished = engine.status(&p.id).expect("error remains");
+        assert_eq!(
+            (finished.state, finished.phase),
+            (ProfileState::Watching, SyncPhase::Idle)
+        );
+        assert_eq!(finished.error.as_deref(), Some("history cannot be read"));
+        assert_eq!((finished.files_done, finished.files_total), (0, None));
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_retires_its_live_scan_without_settling_primary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, p) = pending_scan_fixture(dir.path());
+        // Keep the blocking walk alive after its real reports. The bounded
+        // wait is only a deadlock fail-safe, never a scheduling assertion.
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Mutex::new(wait);
+        after_walk::install(&p.local_path, move || {
+            Engine::lock(&wait)
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release blocked walk");
+        });
+        let (seen, observed) = tokio::sync::oneshot::channel();
+        let seen = Mutex::new(Some(seen));
+        engine.subscribe(Box::new(move |event| {
+            if event.phase == SyncPhase::Scanning {
+                if let Some(seen) = Engine::lock(&seen).take() {
+                    let _ = seen.send(());
+                }
+            }
+            true
+        }));
+        let mut pending = Box::pin(engine.pending(&p.id));
+        tokio::select! {
+            result = &mut pending => panic!("the walk must still be held: {result:?}"),
+            seen = observed => seen.expect("the scan published a frame"),
+        }
+        assert_eq!(
+            engine.status(&p.id).expect("live").phase,
+            SyncPhase::Scanning
+        );
+        drop(pending);
+        let finished = engine.status(&p.id).expect("cancelled");
+        assert_eq!(
+            (finished.state, finished.phase),
+            (ProfileState::Watching, SyncPhase::Idle)
+        );
+        assert_eq!((finished.files_done, finished.files_total), (0, None));
+        release
+            .send(())
+            .expect("let the pre-existing blocking walk finish");
+    }
+
+    #[tokio::test]
+    async fn pending_worker_error_retires_reported_scan_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, p) = pending_scan_fixture(dir.path());
+        after_walk::install(&p.local_path, || {
+            panic!("fixture worker failure after scan")
+        });
+        let reported = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&reported);
+        engine.subscribe(Box::new(move |event| {
+            if event.phase == SyncPhase::Scanning {
+                observed.store(true, Ordering::SeqCst);
+            }
+            true
+        }));
+        assert!(
+            engine.pending(&p.id).await.is_err(),
+            "the worker error must propagate"
+        );
+        assert!(
+            reported.load(Ordering::SeqCst),
+            "failure followed a real reported walk"
+        );
+        let finished = engine.status(&p.id).expect("failed poll");
+        assert_eq!(
+            (finished.state, finished.phase),
+            (ProfileState::Watching, SyncPhase::Idle)
+        );
+        assert_eq!((finished.files_done, finished.files_total), (0, None));
+    }
+
+    #[tokio::test]
+    async fn pending_sink_unwind_retires_reported_scan_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, p) = pending_scan_fixture(dir.path());
+        engine.subscribe(Box::new(|event| {
+            assert_ne!(event.phase, SyncPhase::Scanning, "fixture subscriber panic");
+            true
+        }));
+        let worker = Arc::clone(&engine);
+        let id = p.id.clone();
+        let result = tokio::spawn(async move { worker.pending(&id).await }).await;
+        assert!(result.expect_err("the sink unwinds").is_panic());
+        let finished = engine.status(&p.id).expect("unwound poll");
+        assert_eq!(
+            (finished.state, finished.phase),
+            (ProfileState::Watching, SyncPhase::Idle)
+        );
+        assert_eq!((finished.files_done, finished.files_total), (0, None));
+    }
+
+    #[test]
+    fn an_old_poll_owner_cannot_erase_a_readded_profiles_new_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (engine, p, _repo, _) = history_fixture(dir.path());
+        let old = engine.begin_poll_progress(&p.id);
+        let mut old_frame = engine.progress(&p, SyncPhase::Scanning);
+        old_frame.files_done = 1;
+        engine.publish_poll(&old, old_frame.clone());
+        engine.remove_profile(&p.id).expect("remove");
+        engine.upsert_profile(&p).expect("re-add");
+        let new = engine.begin_poll_progress(&p.id);
+        let mut new_frame = engine.progress(&p, SyncPhase::Scanning);
+        new_frame.files_done = 7;
+        new_frame.files_total = Some(10);
+        engine.publish_poll(&new, new_frame);
+        engine.publish_poll(&old, old_frame);
+        drop(old);
+        let live = engine.status(&p.id).expect("new scan");
+        assert_eq!(live.phase, SyncPhase::Scanning);
+        assert_eq!((live.files_done, live.files_total), (7, Some(10)));
+        drop(new);
+        let finished = engine.status(&p.id).expect("new scan done");
+        assert_eq!(
+            (finished.state, finished.phase),
+            (ProfileState::Idle, SyncPhase::Idle)
+        );
+        assert_eq!((finished.files_done, finished.files_total), (0, None));
+    }
+
     #[test]
     fn a_run_of_transient_failures_stops_calling_the_profile_healthy() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -24308,9 +25151,8 @@ mod tests {
     async fn a_pending_poll_publishes_the_progress_of_its_own_walk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let platform = Arc::new(TestPlatform::new(dir.path()));
-        let Ok(mut engine) = Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>) else {
-            return;
-        };
+        let mut engine =
+            Engine::open(Arc::clone(&platform) as Arc<dyn SyncPlatform>).expect("engine");
         engine.report_every_walk_item();
         let p = adoptable(dir.path());
         // The seed ignores itself, so the first commit needs a file of its own.
@@ -24328,6 +25170,8 @@ mod tests {
         // first sync is what adopts it - so the fixture commits once before
         // there is anything for a poll to find.
         assert_eq!(commit_after_settling(&engine, &platform, &p), 400);
+        engine.clear_phase(&p.id);
+        engine.settle_and_persist(&p.id);
         for i in 0..6 {
             std::fs::write(p.local_path.join(format!("waiting-{i}.txt")), b"x").expect("write");
         }
@@ -24363,6 +25207,15 @@ mod tests {
                 .all(|pair| pair[1] >= pair[0] || pair[1] <= 1),
             "a count moved backwards without restarting: {counts:?}"
         );
+
+        let finished = engine.status(&p.id).expect("finished status");
+        assert_ne!(
+            finished.state,
+            ProfileState::Syncing,
+            "the poll has finished"
+        );
+        assert_eq!(finished.phase, SyncPhase::Idle);
+        assert_eq!((finished.files_done, finished.files_total), (0, None));
     }
 
     /// A second version arriving is not the same thing as a file arriving, and
@@ -29887,11 +30740,6 @@ mod tests {
         engine.upsert_profile(&p).expect("upsert");
 
         assert!(engine.collect_stable_changes(&p).expect("scan").is_empty());
-        assert_eq!(
-            crate::progress::status_line(&engine.status(&p.id).expect("status")),
-            format!("{} — up to date", p.name),
-            "a genuinely clean folder is up to date"
-        );
 
         // Two files inside their settle window. Neither has a journal row, so
         // `pending` is zero — which is exactly how "up to date" came to be

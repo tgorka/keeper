@@ -542,6 +542,16 @@ describe("SyncSection progress meter", () => {
     await screen.findByText(RUST_LINE);
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
   });
+
+  it("does not turn queued work or retired counters into live progress", async () => {
+    mockStatuses.mockResolvedValue([
+      statusVm({ state: "watching", phase: "idle", pending: 3, filesDone: 100, filesTotal: 100 }),
+    ]);
+    render(<SyncSection open />);
+
+    await screen.findByText(RUST_LINE);
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
 });
 
 describe("SyncSection remove", () => {

@@ -619,7 +619,7 @@ function SyncProfileRow({
           </Button>
         </div>
       </div>
-      {status !== undefined && isSyncStatusActive(status) && (
+      {status !== undefined && status.phase !== "idle" && isSyncStatusActive(status) && (
         // Indeterminate (no `aria-valuenow`) whenever no total is known — a
         // meter that invents a percentage is worse than one that admits it
         // cannot say. The shadcn wrapper spends `value` on the bar width and

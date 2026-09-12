@@ -99,7 +99,7 @@ pub enum LfsMode {
 pub enum ProfileState {
     /// Configured but not started.
     Idle,
-    /// Watching and up to date.
+    /// Watching for work; remote-history comparison is a separate observation.
     Watching,
     /// A sync operation is in flight.
     Syncing,
@@ -1103,7 +1103,7 @@ impl SyncProfile {
     /// (AD-34-8).
     ///
     /// While a watcher IS live the paced walk is only a backstop, and the
-    /// engine paces it at `LIVE_WATCH_BACKSTOP_MS` (five minutes) or this
+    /// engine paces it at `LIVE_WATCH_BACKSTOP_MS` (one hour) or this
     /// value, whichever is longer (Story 70.6, AD-233): the watcher is the
     /// source for every change, and the 15 s default bought a full-tree walk
     /// four times a minute on an idle folder. This value is the whole cadence
