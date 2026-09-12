@@ -29,6 +29,12 @@ jobs:
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    # The preflight reads the environment's protection rules, which GitHub serves
+    # under `actions=read`; `contents: read` alone makes the lookup 403 and blocks
+    # the management-key job forever. No write permission is granted here.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
