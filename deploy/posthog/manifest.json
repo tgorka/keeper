@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "target": {
+    "host": "https://us.posthog.com",
+    "ingestHost": "https://us.i.posthog.com",
+    "projectId": "605256",
+    "projectName": "keeper"
+  },
+  "governance": {
+    "metricStatus": "proposed",
+    "aiProcessing": false,
+    "personEnrichment": false,
+    "humanReviewRequired": true,
+    "limitations": "Opt-in installation events, not people or all installations. No cross-device attribution. All admitted events are sampled at 100% until fixed rate/queue limits; offline, revoked, unsupported and dropped clients are missing. Ingestion tokens are forgeable; these are not audit or authorization records."
+  },
+  "events": [
+    {
+      "name": "keeper_app_ready",
+      "category": "diagnostics",
+      "description": "Application readiness duration, not browser web vitals or Rust startup completeness."
+    },
+    {
+      "name": "keeper_command_palette_opened",
+      "category": "productAnalytics",
+      "description": "Explicit command palette opening; contains no command, search text or account data."
+    },
+    {
+      "name": "keeper_settings_opened",
+      "category": "productAnalytics",
+      "description": "Explicit settings opening; contains no setting values or account data."
+    },
+    {
+      "name": "keeper_frontend_error",
+      "category": "diagnostics",
+      "description": "Closed frontend error category; no exception message, stack or payload."
+    },
+    {
+      "name": "keeper_interaction",
+      "category": "diagnostics",
+      "description": "Bounded interaction duration; no target text or input values."
+    }
+  ],
+  "remoteConfig": {
+    "key": "keeper-client-config",
+    "supportMessage": "Optional diagnostics contain no messages, filenames, notes or recordings."
+  },
+  "personas": [
+    {
+      "name": "keeper-persona-palette-30d",
+      "event": "keeper_command_palette_opened",
+      "description": "Behavioral segment of consented palette activity in 30 days, not an inferred human identity. Personless ingestion may leave person-based cohort membership empty; never enrich people to fill this cohort."
+    },
+    {
+      "name": "keeper-persona-settings-30d",
+      "event": "keeper_settings_opened",
+      "description": "Behavioral segment of consented settings activity in 30 days, not a demographic persona. Personless ingestion may leave person-based cohort membership empty; never enrich people to fill this cohort."
+    }
+  ],
+  "metrics": [
+    {
+      "name": "keeper_palette_active_installations_30d",
+      "displayName": "Keeper palette-active installations (30d; proposed)",
+      "unit": "installations",
+      "description": "Personless behavioral segment: distinct consented installation IDs with palette activity in 30 days, not people. No profiles or cross-device linkage. Synthetic events are excluded; reinstall/identity resets, opt-in bias, rate/queue limits and offline clients prevent population estimates.",
+      "sql": "SELECT uniqExact(distinct_id) AS installation_count FROM events WHERE timestamp >= now() - INTERVAL 30 DAY AND event = 'keeper_command_palette_opened' AND properties.consent_category = 'productAnalytics' AND properties.synthetic = false"
+    },
+    {
+      "name": "keeper_settings_active_installations_30d",
+      "displayName": "Keeper settings-active installations (30d; proposed)",
+      "unit": "installations",
+      "description": "Personless behavioral segment: distinct consented installation IDs with settings activity in 30 days, not people. No profiles or cross-device linkage. Synthetic events are excluded; reinstall/identity resets, opt-in bias, rate/queue limits and offline clients prevent population estimates.",
+      "sql": "SELECT uniqExact(distinct_id) AS installation_count FROM events WHERE timestamp >= now() - INTERVAL 30 DAY AND event = 'keeper_settings_opened' AND properties.consent_category = 'productAnalytics' AND properties.synthetic = false"
+    },
+    {
+      "name": "keeper_product_events_7d",
+      "displayName": "Keeper consented product events (7d; proposed)",
+      "unit": "events",
+      "description": "Opt-in palette and settings event counts in seven days, not active people or total adoption. Excludes synthetic records. Sampling, revocation, queue/rate limits and offline clients bias the observed population; public tokens are forgeable.",
+      "sql": "SELECT count() AS event_count FROM events WHERE timestamp >= now() - INTERVAL 7 DAY AND event IN ('keeper_command_palette_opened', 'keeper_settings_opened') AND properties.consent_category = 'productAnalytics' AND properties.synthetic = false"
+    },
+    {
+      "name": "keeper_ready_p95_ms_7d",
+      "displayName": "Keeper readiness p95 milliseconds (7d; proposed)",
+      "unit": "milliseconds",
+      "description": "Readiness p95 among observed diagnostics-consenting installations, not web vitals or a whole-population SLA. Excludes synthetic and absent durations; rate/queue limits, offline clients and revocation create missing observations.",
+      "sql": "SELECT quantile(0.95)(toFloat(properties.duration_ms)) AS p95_ms FROM events WHERE timestamp >= now() - INTERVAL 7 DAY AND event = 'keeper_app_ready' AND properties.consent_category = 'diagnostics' AND properties.synthetic = false AND properties.duration_ms IS NOT NULL AND toFloat(properties.duration_ms) >= 0 AND toFloat(properties.duration_ms) <= 600000"
+    }
+  ],
+  "dashboard": {
+    "name": "keeper-observability-proposed",
+    "description": "Keeper managed definitions. Proposed, noncanonical metrics; consented and incomplete client observations only. No person identity, content, revenue or total-installation claims."
+  },
+  "marketing": {
+    "conversionName": "keeper-consented-settings-engagement",
+    "event": "keeper_settings_opened",
+    "sourceMappings": [
+      {
+        "source": "tgsite",
+        "channel": "owned",
+        "campaign": "keeper",
+        "scope": "Future separately consented website events only; no cross-project identity joins."
+      },
+      {
+        "source": "github",
+        "channel": "community",
+        "campaign": "keeper",
+        "scope": "Future separately consented website events only; no ad-account mapping inferred."
+      }
+    ],
+    "attribution": "No current Keeper event sends UTM values. Missing source remains unattributed, never direct. Source mappings are maintainer-owned boundary definitions, not changes to tgsite or an advertising integration. No revenue or customer conversion is claimed.",
+    "publishSourceMappings": false
+  },
+  "sources": [
+    "https://posthog.com/docs/api",
+    "https://posthog.com/docs/open-api-spec/feature_flags_create.md",
+    "https://posthog.com/docs/feature-flags/remote-config.md",
+    "https://posthog.com/docs/api/cohorts",
+    "https://posthog.com/docs/open-api-spec/data_catalog_metrics_create.md",
+    "https://posthog.com/docs/semantic-layer/governance.md",
+    "https://posthog.com/docs/api/dashboards",
+    "https://posthog.com/docs/open-api-spec/insights_create.md",
+    "https://posthog.com/docs/api/endpoints",
+    "https://posthog.com/docs/endpoints/surfaces/api.md",
+    "https://posthog.com/docs/web-analytics/marketing-analytics.md",
+    "https://posthog.com/docs/open-api-spec/marketing_analytics_conversion_goals_create_create.md",
+    "https://posthog.com/docs/open-api-spec/marketing_analytics_conversion_goals_update_partial_update.md",
+    "https://posthog.com/docs/open-api-spec/marketing_analytics_apply_setup_ops_create.md"
+  ]
+}

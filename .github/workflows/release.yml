@@ -50,9 +50,9 @@ jobs:
       # here, in seconds, for the same reason the tag check above does it here: a build that
       # can only ship a lie should not take 16 minutes to say so. Every notarization secret
       # counts, not just the certificate — tauri-action skips notarization silently when the
-      # API-key trio is incomplete, which is the same defect wearing a different hat. The
-      # keeper-syncd job below is unaffected: it is ordered after this one with
-      # `if: always()`, so a Linux box still gets its daemon.
+      # API-key trio is incomplete, which is the same defect wearing a different hat.
+      # Companion uploads also require this job's success:
+      # a failed release gate must not receive additional release assets.
       - name: Apple signing material must be present
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -133,10 +133,13 @@ jobs:
             --sign "$APPLE_SIGNING_IDENTITY" "$BIN"
           codesign -dv --verbose=2 "$BIN"
 
-      - name: Build, sign, notarize, and publish release
+      - name: Build, sign, notarize, scan, and upload draft release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Public ingestion configuration only; never pass a personal API key to a build.
+          KEEPER_POSTHOG_HOST: ${{ vars.KEEPER_POSTHOG_HOST }}
+          KEEPER_POSTHOG_PROJECT_TOKEN: ${{ vars.KEEPER_POSTHOG_PROJECT_TOKEN }}
           # Developer ID signing (base64 .p12 + password + identity + keychain password).
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -155,6 +158,10 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          # This runner returns success only after scanning the built .app and sidecar.
+          # tauri-action creates/uploads the draft only after its build runner succeeds.
+          tauriScript: bun scripts/posthog/release-build.mjs
+          retryAttempts: 0
           tagName: ${{ github.ref_name }}
           releaseName: "keeper ${{ github.ref_name }}"
           releaseDraft: true
@@ -207,18 +214,9 @@ jobs:
   # -------------------------------------------------------------------------
   # keeper-syncd, the standalone folder-sync daemon (AD-52).
   #
-  # A separate job from the macOS app on purpose: the daemon is Linux-first, is
-  # deliberately NOT bundled into the app, and must not be gated on Apple
-  # signing secrets. Without this the binary was never published at all, so
-  # `keeper-syncd update` had nothing to find and installing it meant building
-  # from source on every host.
-  #
-  # `needs: release` + `if: always()` orders it after the app job WITHOUT making
-  # it depend on that job succeeding: a failed or skipped app build still
-  # publishes the daemon. The ordering is what matters — when both jobs opened
-  # the release themselves, the fast one (this) won and the app's assets went
-  # into a SECOND, untagged draft, because GitHub does not key a draft by tag.
-  # Running after the app job means exactly one creator at any moment.
+  # The daemon is a separate artifact, not bundled into the app. Both targets
+  # wait for the app's credential gate and upload to its existing draft.
+  # A failed/skipped app job must not create or receive companion assets.
   #
   # Each artifact ships a .sha256 sidecar. `keeper-syncd update` refuses an
   # asset whose checksum is missing or does not match, so the sidecar is not
@@ -229,7 +227,7 @@ jobs:
   syncd:
     name: keeper-syncd (${{ matrix.target }})
     needs: release
-    if: always()
+    if: ${{ needs.release.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       # One target failing must not withhold the others: a Linux box should
@@ -243,6 +241,9 @@ jobs:
             runner: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -279,7 +280,12 @@ jobs:
           else
             shasum -a 256 "$OUT" > "$OUT.sha256"
           fi
-          echo "published $(cat "$OUT.sha256")"
+          echo "packaged $(cat "$OUT.sha256")"
+
+      - name: Check packaged syncd executable for privileged credentials
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bun scripts/check-client-secrets.ts "src-tauri/keeper-syncd-$TARGET"
 
       - name: Attach to the release
         working-directory: src-tauri
@@ -289,16 +295,12 @@ jobs:
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # This job runs after the app job (`needs` + `if: always()`), so the
-          # release it uploads into normally already exists. It still opens one
-          # when absent — the app job can have failed before publishing, and a
-          # Linux box should get its daemon regardless — which is safe here only
-          # because the ordering guarantees no second creator is running: two
-          # concurrent creators produce two drafts, not one shared release.
-          if ! gh release view "$REF" >/dev/null 2>&1; then
-            gh release create "$REF" --draft --title "keeper $REF" \
-              --notes "Release assets are still uploading."
-          fi
+          # No fallback creator: the app gate must have succeeded and left a draft.
+          # Owner manual publication is outside this workflow's control.
+          test "$(gh release view "$REF" --json isDraft --jq '.isDraft')" = true || {
+            echo "::error::companion assets require the existing human-reviewed draft"
+            exit 1
+          }
           # --clobber so re-running a release replaces the asset instead of
           # failing on a name collision.
           gh release upload "$REF" \

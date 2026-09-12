@@ -1,0 +1,82 @@
+name: PostHog maintainer operations
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Read-only plan, verify, reviewed apply, or synthetic smoke
+        type: choice
+        options: [plan, verify, apply, smoke]
+        default: plan
+        required: true
+      reviewed_sha256:
+        description: Manifest SHA-256 reviewed by a maintainer (required for apply and smoke)
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: posthog-keeper-605256
+  cancel-in-progress: false
+
+jobs:
+  protection:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'tgorka/keeper' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/posthog
+      - name: Refuse missing approval protection before loading the management key
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/posthog/environment.mjs
+
+  maintainer:
+    needs: protection
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.repository == 'tgorka/keeper' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Configure required human reviewers and main-only deployment protection.
+    # Reuse the existing repository secret; this protected job is its only consumer.
+    environment: posthog-maintainers
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/posthog
+            deploy/posthog
+      # No dependency install, application build, PR checkout, artifact upload,
+      # cache restore, or external executable receives these credentials.
+      - name: Run reviewed maintainer operation
+        env:
+          POSTHOG_HOST: https://us.posthog.com
+          POSTHOG_PROJECT_ID: "605256"
+          POSTHOG_INGEST_HOST: ${{ vars.KEEPER_POSTHOG_HOST }}
+          POSTHOG_PERSONAL_API_KEY: ${{ secrets.POSTHOG_PERSONAL_API_KEY }}
+          POSTHOG_PROJECT_API_KEY: ${{ vars.KEEPER_POSTHOG_PROJECT_TOKEN }}
+          OPERATION: ${{ inputs.mode }}
+          REVIEWED_SHA256: ${{ inputs.reviewed_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$OPERATION" in
+            plan) node scripts/posthog/cli.mjs --plan ;;
+            verify) node scripts/posthog/cli.mjs --verify ;;
+            apply) node scripts/posthog/cli.mjs --apply "--reviewed-sha256=$REVIEWED_SHA256" ;;
+            smoke) node scripts/posthog/cli.mjs --smoke --apply "--reviewed-sha256=$REVIEWED_SHA256" ;;
+            *) echo 'Unsupported maintainer operation.'; exit 1 ;;
+          esac
